@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+s3-live = ["vot-object-store/s3-live"]
+
 [dependencies]
 vot-commit-model = { path = "../vot-commit-model" }
 vot-journal = { path = "../vot-journal" }

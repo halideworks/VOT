@@ -5,7 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+s3-live = ["dep:aws-sdk-s3", "dep:base64", "dep:tokio"]
+
 [dependencies]
+aws-sdk-s3 = { version = "=1.96.0", default-features = false, features = ["default-https-client", "rt-tokio", "rustls"], optional = true }
+base64 = { version = "0.22.1", optional = true }
+tokio = { version = "1.45.1", features = ["rt-multi-thread"], optional = true }
 vot-journal = { path = "../vot-journal" }
 
 [lints]

@@ -26,3 +26,15 @@ Wave 1 runtime dependencies:
 - `unicode-normalization` 0.1.25 provides NFC normalization for portable path collision checks.
 
 All three are registry dependencies locked by checksum. Their licenses are accepted by `deny.toml`, and their APIs are wrapped by VOT conformance tests and independent vectors.
+
+Wave 2 runtime dependencies:
+
+- `aligned-vec` 0.6.4 provides aligned buffers for direct read-back.
+- `rustix` 1.1.4 provides the safe Linux `O_DIRECT` descriptor API.
+- `hmac` 0.12.1 provides RustCrypto HMAC-SHA-256 receipt authentication.
+
+The optional `s3-live` feature uses `aws-sdk-s3` 1.96.0, `base64` 0.22.1,
+and `tokio`. Version 1.96.0 is the newest AWS S3 SDK release compatible with
+the project Rust 1.85 minimum. The larger SDK dependency graph is isolated
+behind the feature and exercised against MinIO in CI. The MinIO server and
+client images are pinned by digest.

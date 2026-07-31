@@ -4,6 +4,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(feature = "s3-live")]
+pub mod aws;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartReceipt {
     pub number: u32,
@@ -26,6 +29,7 @@ pub enum Error {
     CompletionMismatch,
     AlreadyExists,
     AlreadyCompleted,
+    Backend,
 }
 
 pub trait S3Compatible {

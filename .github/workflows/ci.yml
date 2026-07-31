@@ -31,6 +31,14 @@ jobs:
           python3 tools/validate_wave0.py
           python3 tools/verify_wave1_vectors.py
           python3 tools/verify_manifest_pack_vectors.py
+          python3 tools/validate_commit_fixtures.py
+
+      - name: Model-check commit invariants
+        run: |
+          curl -fL https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar -o /tmp/tla2tools.jar
+          echo "bee4a54f3ee3d4afc347c3240ec2d9e93b075104  /tmp/tla2tools.jar" | sha1sum -c -
+          cd models/tla
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -config Commit.cfg Commit.tla
 
       - name: Check formatting
         run: cargo +1.85.0 fmt --all --check

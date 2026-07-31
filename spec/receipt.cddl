@@ -1,0 +1,48 @@
+; VOT v0.3 authenticated assurance receipt.
+; RFC 8949 core deterministic encoding is mandatory in addition to CDDL.
+
+authenticated-receipt = {
+  0: receipt,
+  1: receipt-auth-scheme,
+  2: bstr .size (1..64),        ; deployment key identifier
+  3: bstr .size (32..512),      ; MAC or signature; scheme fixes exact size
+}
+
+receipt = {
+  0: 0,                         ; receipt format version
+  1: subject-id,
+  2: assurance-level,
+  3: commit-profile,
+  4: assurance-level,           ; actual publication predecessor
+  5: commit-provider,
+  6: [uint, uint, uint],        ; provider semantic version
+  7: id128,                     ; session_id
+  8: id128,                     ; incarnation_id
+  9: uint,                      ; monotonic issuer sequence
+  10: tstr .size (20..35),      ; RFC 3339 wall observation
+  11: clock-source,
+  12: suite-id,
+  13: uint .le 15,              ; receipt flags bitset
+  ? 14: uint,                   ; delegated mechanism registry value
+  ? 15: uint,                   ; unsupported feature registry value
+  ? 16: uint,                   ; experimental extension identifier
+}
+
+subject-id = [
+  subject-kind,
+  suite-id,
+  bstr .size 32,
+  uint .le 9223372036854775807,
+]
+
+subject-kind = 0 / 1            ; object / package
+suite-id = 1 / 2
+assurance-level = 1 / 2 / 3 / 4 / 5
+commit-profile = 1 / 2 / 3
+commit-provider = 1 / 2 / 3 / 4
+receipt-auth-scheme = 1 / 2     ; Ed25519 / HMAC-SHA-256
+clock-source = 0 / 1 / 2        ; system UTC / disciplined UTC / provider UTC
+id128 = bstr .size 16
+
+; flags: bit 0 delegation, bit 1 explicit downgrade history,
+; bit 2 unsupported feature observed, bit 3 experimental behavior involved.

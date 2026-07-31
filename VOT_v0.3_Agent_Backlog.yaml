@@ -1,0 +1,471 @@
+project: VOT
+baseline: v0.3
+snapshot: 2026-07-31
+policy:
+  default_profile: shared-internet-reliable
+  license: AGPL-3.0-only
+  experimental_features_default_off:
+    - datagram-fec
+    - vcrc
+    - public-multi-rail
+    - custom-congestion-control
+    - multipath-quic
+  invariants:
+    - never_publish_without_required_assurance_predecessors
+    - never_treat_transport_ack_as_durability
+    - never_accept_stale_journal_incarnation
+    - never_silently_downgrade_assurance
+    - never_allocate_from_untrusted_length_without_bound
+    - never_bypass_job_or_congestion_domain_caps
+
+gates:
+  W0:
+    name: specification-freeze
+    requires:
+      - all_R1_R8_dispositions_normative
+      - proof_formats_and_transport_frozen
+      - assurance_state_machine_complete
+      - version_extension_error_registries_testable
+  W1:
+    name: object-layer
+    requires:
+      - independent_vectors_for_both_suites
+      - arbitrary_64KiB_range_verification
+      - progressive_mutation_and_truncation_rejected
+      - million_file_manifest_bounded
+  W2:
+    name: commit-correctness
+    requires:
+      - tla_model_no_false_publish
+      - injected_faults_zero_false_publish
+      - strict_direct_read_catches_backing_corruption
+      - balanced_overhead_percent_lte_5
+  W3:
+    name: deterministic-simulation
+    requires:
+      - seeded_replay
+      - grease_and_unknown_frame_tests
+      - parser_fuzz_no_unbounded_allocation
+  W4:
+    name: reliable-transfer
+    requires:
+      - root_verified_publication
+      - bounded_receiver_staging
+      - verified_state_survives_disconnect
+  W5:
+    name: resume-fallback
+    requires:
+      - checkpoint_bounded_retransmission
+      - quic_to_tcp_preserves_verified_state
+      - platform_receipts_state_actual_assurance
+  W6:
+    name: fast-path
+    requires:
+      - production_quic_backend_selected_by_data
+      - primary_10Gbps_target_attains_95_percent_of_attainable_rate
+      - cycles_per_verified_GiB_published
+  W7:
+    name: service-layer
+    requires:
+      - multi_source_liveness_with_one_honest_source
+      - cross_job_quotas_enforced
+      - active_cache_lease_prevents_gc
+  W8:
+    name: fec
+    requires:
+      - preregistered_tail_improvement_percent_gte_20
+      - speculative_wire_overhead_percent_lte_5
+      - no_receiver_overload_parity_loop
+  W9:
+    name: vcrc
+    requires:
+      - cvar95_estimator_uncertainty_reported
+      - spend_down_ledger_modeled
+      - strong_baselines_and_oracle_reported
+      - no_deadline_certificate_overclaim
+
+work_items:
+  - id: SPEC-001
+    agent: A00
+    wave: 0
+    title: Incorporate v0.3 dispositions
+    depends_on: []
+    deliverables:
+      - spec/architecture.md
+      - adr/0001-strict-readback.md
+      - adr/0002-vcrc-certificate.md
+      - adr/0003-proof-transport.md
+      - adr/0004-rail-policy.md
+    acceptance:
+      - every_final_review_item_has_accept_reject_or_waive_record
+      - no_undefined_budget_exhaustion_state
+
+  - id: SPEC-002
+    agent: A01
+    wave: 0
+    title: Freeze wire envelope and registries
+    depends_on: [SPEC-001]
+    deliverables:
+      - spec/wire.md
+      - spec/registries.md
+      - test-vectors/wire
+    acceptance:
+      - optional_unknown_frames_skipped
+      - critical_unknown_frames_fail
+      - grease_frames_tolerated
+      - all_lengths_bounded
+
+  - id: SEC-001
+    agent: A16
+    wave: 0
+    title: Threat model and telemetry policy
+    depends_on: [SPEC-001]
+    deliverables:
+      - spec/security.md
+      - spec/telemetry.md
+      - security/abuse-cases.yaml
+    acceptance:
+      - amplification_replay_staging_token_source_privacy_cases_covered
+      - default_trace_contains_no_raw_path_or_token
+
+  - id: OBJ-001
+    agent: A02
+    wave: 1
+    title: Implement blake3-bao64
+    depends_on: [SPEC-001]
+    deliverables:
+      - crates/vot-proof-blake3
+      - test-vectors/blake3-bao64
+    acceptance:
+      - range_proofs_verify_at_64KiB
+      - corrupted_data_or_proof_rejected
+      - independent_verifier_agrees
+
+  - id: OBJ-002
+    agent: A03
+    wave: 1
+    title: Implement sha256-bep52-64k
+    depends_on: [SPEC-001]
+    deliverables:
+      - crates/vot-proof-sha256
+      - test-vectors/sha256-bep52-64k
+    acceptance:
+      - exact_BEP52_tree_geometry
+      - no_bespoke_alternate_tree
+      - independent_verifier_agrees
+
+  - id: OBJ-003
+    agent: A04
+    wave: 1
+    title: Deterministic manifest and path profiles
+    depends_on: [OBJ-001, OBJ-002]
+    deliverables:
+      - spec/manifest.cddl
+      - crates/vot-manifest
+      - test-vectors/manifest
+    acceptance:
+      - canonical_encoding_stable
+      - million_file_index_memory_bounded
+      - path_collision_corpus_passes
+
+  - id: OBJ-004
+    agent: A04
+    wave: 1
+    title: Progressive page chain and seal
+    depends_on: [OBJ-003]
+    deliverables:
+      - progressive_ingest_state_machine
+      - mutation_and_truncation_tests
+    acceptance:
+      - reordered_replayed_or_missing_page_rejected
+      - source_mutation_prevents_seal
+
+  - id: OBJ-005
+    agent: A04
+    wave: 1
+    title: Deterministic pack objects
+    depends_on: [OBJ-003]
+    deliverables:
+      - crates/vot-pack
+      - pack_vectors
+    acceptance:
+      - no_logical_file_straddles_pack
+      - extraction_matches_logical_hash
+      - pack_max_128MiB
+
+  - id: COM-001
+    agent: A05
+    wave: 2
+    title: Model commit and assurance ladder
+    depends_on: [SPEC-001]
+    deliverables:
+      - models/tla/Commit.tla
+      - executable_transition_fixtures
+    acceptance:
+      - no_published_without_predecessors
+      - stale_incarnation_never_accepted
+      - flush_failure_poisoning_modeled
+
+  - id: COM-002
+    agent: A06
+    wave: 2
+    title: POSIX journal and providers
+    depends_on: [COM-001, OBJ-003]
+    deliverables:
+      - crates/vot-journal
+      - crates/vot-commit-posix
+    acceptance:
+      - crash_after_each_transition_recovers
+      - directory_flush_precedes_receipt
+      - failed_flush_cannot_retry_to_success
+
+  - id: COM-003
+    agent: A06
+    wave: 2
+    title: Strict independent read-back
+    depends_on: [COM-002]
+    deliverables:
+      - aligned_O_DIRECT_reader
+      - device_corruption_fault_test
+    acceptance:
+      - strict_catches_backing_corruption
+      - buffered_control_demonstrably_does_not
+      - unsupported_backend_reports_no_strict
+
+  - id: COM-004
+    agent: A07
+    wave: 2
+    title: Object-store commit provider and GC
+    depends_on: [COM-001, OBJ-003]
+    deliverables:
+      - crates/vot-commit-object
+      - crates/vot-object-store
+      - mock_and_S3_compatible_adapter
+    acceptance:
+      - multipart_checksum_and_complete_semantics_mapped
+      - active_lease_prevents_collection
+      - orphan_cleanup_idempotent
+
+  - id: SIM-001
+    agent: A08
+    wave: 3
+    title: Seeded distributed simulator
+    depends_on: [SPEC-002, COM-001]
+    deliverables:
+      - crates/vot-transport-sim
+      - sim/scenarios
+      - trace_replay_tool
+    acceptance:
+      - no_real_sleep
+      - seed_reproduces_failure
+      - network_and_storage_faults_composable
+
+  - id: SIM-002
+    agent: A08
+    wave: 3
+    title: Fuzz and shrink protocol traces
+    depends_on: [SIM-001]
+    deliverables:
+      - fuzz/frame_codec
+      - fuzz/manifest
+      - failing_trace_shrinker
+    acceptance:
+      - no_unbounded_allocation
+      - malformed_inputs_do_not_panic
+
+  - id: XFER-001
+    agent: A09
+    wave: 4
+    title: Transport abstraction and reliable scheduler
+    depends_on: [OBJ-003, COM-002, SIM-001, SPEC-002]
+    deliverables:
+      - crates/vot-transport-api
+      - crates/vot-scheduler
+    acceptance:
+      - complete_transfer_over_simulator
+      - flow_control_tracks_staging_capacity
+      - transport_ack_never_maps_to_durability
+
+  - id: XFER-002
+    agent: A10
+    wave: 4
+    title: MsQuic live backend
+    depends_on: [XFER-001]
+    deliverables:
+      - crates/vot-transport-msquic
+      - live_interop_tests
+    acceptance:
+      - simulator_and_live_semantics_match
+      - no_FFI_leaks_or_use_after_free
+      - datagram_send_state_exposed_for_later_use
+
+  - id: XFER-003
+    agent: A09
+    wave: 4
+    title: CLI reliable package transfer
+    depends_on: [XFER-002, COM-003, OBJ-005]
+    deliverables:
+      - crates/vot-cli
+      - end_to_end_vectors
+    acceptance:
+      - independent_root_recomputation_matches_receipt
+      - one_million_small_file_package_supported
+
+  - id: MOB-001
+    agent: A11
+    wave: 5
+    title: TLS/TCP fallback and carrier race
+    depends_on: [XFER-001, XFER-003]
+    deliverables:
+      - crates/vot-transport-tcp
+      - degraded_udp_detector
+    acceptance:
+      - quic_to_tcp_preserves_verified_state
+      - startup_does_not_wait_for_long_udp_timeout
+
+  - id: MOB-002
+    agent: A11
+    wave: 5
+    title: Resume, migration, and Careful Resume
+    depends_on: [MOB-001, SIM-001]
+    deliverables:
+      - E_RESUME_scenario_suite
+      - resume_state_store
+    acceptance:
+      - retransmission_bounded_by_checkpoint_plus_active_units
+      - stale_path_state_not_reused_unsafely
+
+  - id: PERF-001
+    agent: A12
+    wave: 6
+    title: QUIC engine ceiling bakeoff
+    depends_on: [XFER-003]
+    deliverables:
+      - MsQuic_vs_quiche_report
+      - selected_default_backend_ADR
+    acceptance:
+      - one_rail_one_worker_and_multi_worker_measured
+      - provisioned_multi_rail_labeled
+      - serialized_spine_hypothesis_tested
+
+  - id: PERF-002
+    agent: A12
+    wave: 6
+    title: Linux offload and pacing fast path
+    depends_on: [PERF-001]
+    deliverables:
+      - GSO_GRO_batching
+      - pacing_backend
+      - cycles_per_byte_metrics
+    acceptance:
+      - primary_10Gbps_target_gte_95_percent_attainable
+      - no_unbounded_GSO_burst_time
+
+  - id: SVC-001
+    agent: A13
+    wave: 7
+    title: Relay cache and multi-source scheduler
+    depends_on: [MOB-002, COM-004]
+    deliverables:
+      - crates/vot-relay
+      - source_scoring_and_quarantine
+    acceptance:
+      - one_honest_source_guarantees_progress
+      - dual_suite_aliases_share_extent
+      - hedges_count_against_caps
+
+  - id: SVC-002
+    agent: A13
+    wave: 7
+    title: Broker and cross-job scheduling
+    depends_on: [SVC-001, SEC-001]
+    deliverables:
+      - crates/vot-broker
+      - priority_and_SLO_scheduler
+    acceptance:
+      - first_usable_and_full_publish_distinct
+      - quotas_enforced_across_network_CPU_IO_storage
+
+  - id: FEC-001
+    agent: A14
+    wave: 8
+    title: Datagram epoch and Reed-Solomon profile
+    depends_on: [PERF-002, XFER-002, SIM-001]
+    deliverables:
+      - crates/vot-fec
+      - coding_epoch_protocol
+    acceptance:
+      - GF256_k_plus_r_lte_255
+      - geometry_never_changes_mid_epoch
+      - reliable_repair_fallback
+
+  - id: FEC-002
+    agent: A14
+    wave: 8
+    title: Datagram credit and dual feedback
+    depends_on: [FEC-001]
+    deliverables:
+      - credit_epoch_state_machine
+      - transport_and_application_loss_attribution
+    acceptance:
+      - zero_credit_stops_new_generations
+      - acked_then_app_dropped_case_repaired
+      - receiver_overload_does_not_increase_parity_unboundedly
+
+  - id: VCRC-001
+    agent: A15
+    wave: 9
+    title: Scenario engine and CVaR95 ranking
+    depends_on: [FEC-002, SVC-002, SIM-001]
+    deliverables:
+      - crates/vot-vcrc
+      - block_bootstrap_engine
+      - adaptive_ensemble
+    acceptance:
+      - paired_common_random_numbers
+      - estimator_uncertainty_exposed
+      - block_length_ablations
+
+  - id: VCRC-002
+    agent: A15
+    wave: 9
+    title: Spend-down ledger and oracle
+    depends_on: [VCRC-001, COM-001]
+    deliverables:
+      - ledger_state_machine
+      - hindsight_oracle
+      - calibration_and_regret_report
+    acceptance:
+      - exhausted_state_reliable_only
+      - no_automatic_budget_reset
+      - no_deadline_certificate_claim
+
+  - id: RESEARCH-001
+    agent: A15
+    wave: 10
+    title: Normalized clean-room congestion controller simulation
+    depends_on: [VCRC-002, PERF-001]
+    deliverables:
+      - simulator_only_controller
+      - RFC9743_evaluation_plan
+      - prior_art_positioning
+    acceptance:
+      - all_control_terms_dimensionless
+      - application_limited_guard
+      - min_RTT_aging_and_route_reset
+      - competitor_coexistence_or_provisioned_only_scope
+
+  - id: RELEASE-001
+    agent: A17
+    wave: 11
+    title: Reproducible benchmark and interoperability bundle
+    depends_on: [XFER-003, MOB-002, PERF-002]
+    deliverables:
+      - bench/workloads
+      - bench/impairments
+      - public_result_schema
+      - interop_runner
+    acceptance:
+      - every_result_has_seed_config_and_machine_metadata
+      - named_commercial_baseline_requires_legal_flag
+      - primary_metric_is_verified_declared_assurance_publication

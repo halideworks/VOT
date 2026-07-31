@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy
+
+      - name: Validate specifications and vectors
+        run: |
+          python3 tools/validate_registries.py
+          python3 tools/validate_wire_vectors.py
+          python3 tools/validate_security_matrix.py
+          python3 tools/validate_wave0.py
+
+      - name: Check formatting
+        run: cargo +1.85.0 fmt --all --check
+
+      - name: Lint
+        run: cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo +1.85.0 test --workspace --locked
+
+      - name: Build standalone frame fuzz driver
+        run: cargo +1.85.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked

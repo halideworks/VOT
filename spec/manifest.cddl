@@ -1,0 +1,70 @@
+; VOT v0.3 deterministic manifest, progressive page, and seal schemas.
+; RFC 8949 core deterministic encoding is mandatory in addition to CDDL.
+
+manifest-page = {
+  0: 0,                         ; page format version
+  1: id128,                     ; manifest/session identity
+  2: uint,                      ; zero-based page index
+  3: uint / null,               ; total page count; null while progressive
+  4: bstr .size 32,             ; prior page digest; all zero on page zero
+  5: path-profile,
+  6: [* manifest-entry],
+}
+
+manifest-entry = {
+  0: package-path,
+  1: entry-kind,
+  ? 2: uint .le 9223372036854775807, ; logical byte length for files
+  ? 3: storage-ref,
+  ? 4: file-metadata,
+}
+
+package-path = [1* path-component]
+path-component = tstr .size (1..255) / bstr .size (1..255)
+path-profile = 0 / 1            ; portable / raw POSIX
+entry-kind = 0 / 1              ; regular file / directory
+
+storage-ref = direct-ref / pack-ref
+direct-ref = [0, object-id]
+pack-ref = [
+  1,
+  object-id,                    ; pack object
+  uint .le 134217728,           ; offset
+  uint .le 262144,              ; logical length
+  object-id,                    ; logical-file identity
+]
+
+file-metadata = {
+  ? 0: uint .le 511,            ; portable permission bits
+  ? 1: int,                     ; mtime whole seconds
+  ? 2: uint .le 999999999,      ; mtime nanoseconds
+  ? 3: tstr .size (1..127),     ; bounded media type
+}
+
+progressive-page = manifest-page
+
+seal = {
+  0: 0,                         ; seal format version
+  1: id128,
+  2: uint,                      ; final page count, at least one by validation
+  3: bstr .size 32,             ; final page digest
+  4: subject-id,                ; canonical package identity
+  5: [1* page-commitment],
+}
+
+page-commitment = [
+  uint,                         ; page index
+  bstr .size 32,                ; deterministic page digest
+  [* group-commitment],
+]
+
+group-commitment = [
+  object-id,
+  uint,                         ; verification group index
+  bstr .size 32,
+]
+
+object-id = [suite-id, bstr .size 32, uint .le 9223372036854775807]
+subject-id = [1, suite-id, bstr .size 32, uint .le 9223372036854775807]
+suite-id = 1 / 2
+id128 = bstr .size 16

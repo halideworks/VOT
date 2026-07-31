@@ -1,0 +1,82 @@
+{
+  "format": "vot-wire-envelope-v1",
+  "alpn": "vot-draft-03",
+  "criticality": "least-significant-bit: even optional, odd critical",
+  "hard_max_frame_payload": 16777216,
+  "default_max_unknown_payload": 1048576,
+  "varints": [
+    { "value": 0, "canonical_hex": "00" },
+    { "value": 63, "canonical_hex": "3f" },
+    { "value": 64, "canonical_hex": "4040" },
+    { "value": 16383, "canonical_hex": "7fff" },
+    { "value": 16384, "canonical_hex": "80004000" },
+    { "value": 1073741823, "canonical_hex": "bfffffff" },
+    { "value": 1073741824, "canonical_hex": "c000000040000000" },
+    { "value": 4611686018427387903, "canonical_hex": "ffffffffffffffff" }
+  ],
+  "frames": [
+    {
+      "name": "known-empty-hello",
+      "hex": "0100",
+      "expected": { "result": "ok", "frames": [{ "kind": "known", "type": 1, "payload_hex": "" }] }
+    },
+    {
+      "name": "known-data-record",
+      "hex": "3104deadbeef",
+      "expected": { "result": "ok", "frames": [{ "kind": "known", "type": 49, "payload_hex": "deadbeef" }] }
+    },
+    {
+      "name": "unknown-optional-skipped",
+      "hex": "1e03aabbcc",
+      "expected": { "result": "ok", "frames": [{ "kind": "skipped_optional", "type": 30, "payload_length": 3 }] }
+    },
+    {
+      "name": "unknown-critical-fails",
+      "hex": "1f00",
+      "expected": { "result": "error", "error": "UNKNOWN_CRITICAL_FRAME", "type": 31 }
+    },
+    {
+      "name": "grease-tolerated",
+      "hex": "5f0003dec0de",
+      "expected": { "result": "ok", "frames": [{ "kind": "skipped_optional", "type": 7936, "payload_length": 3 }] }
+    },
+    {
+      "name": "unknown-length-rejected-before-payload",
+      "hex": "409080100001",
+      "expected": { "result": "error", "error": "FRAME_TOO_LARGE", "type": 144, "length": 1048577, "limit": 1048576 }
+    },
+    {
+      "name": "data-record-limit-rejected-before-payload",
+      "hex": "3180040001",
+      "expected": { "result": "error", "error": "FRAME_TOO_LARGE", "type": 49, "length": 262145, "limit": 262144 }
+    },
+    {
+      "name": "truncated-varint",
+      "hex": "40",
+      "expected": { "result": "error", "error": "INCOMPLETE" }
+    },
+    {
+      "name": "truncated-payload",
+      "hex": "3104dead",
+      "expected": { "result": "error", "error": "INCOMPLETE" }
+    },
+    {
+      "name": "non-minimal-legal-varint-accepted",
+      "hex": "400100",
+      "canonical_encoding": false,
+      "expected": { "result": "ok", "frames": [{ "kind": "known", "type": 1, "payload_hex": "" }] }
+    },
+    {
+      "name": "mixed-known-and-optional",
+      "hex": "01001e01aa3104deadbeef",
+      "expected": {
+        "result": "ok",
+        "frames": [
+          { "kind": "known", "type": 1, "payload_hex": "" },
+          { "kind": "skipped_optional", "type": 30, "payload_length": 1 },
+          { "kind": "known", "type": 49, "payload_hex": "deadbeef" }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,267 @@
+{
+  "schema": "vot-security-abuse-cases-v1",
+  "baseline": "v0.3",
+  "default_telemetry_level": "pseudonymous",
+  "cases": [
+    {
+      "id": "SEC-AMP-001",
+      "title": "Unauthenticated reflection and response amplification",
+      "actor": "unauthenticated network client",
+      "attack": "Spoof or rotate source addresses and request manifests, proofs, data, or verbose errors whose responses exceed received traffic.",
+      "assets": ["network capacity", "third-party availability"],
+      "controls": [
+        "carrier address validation and amplification limit",
+        "no manifest, proof, data, or source-list response before authentication",
+        "bounded handshake and error frames",
+        "per-path and per-principal request rate limits"
+      ],
+      "tests": ["amp_pre_auth_three_x_bound", "amp_no_bulk_before_auth", "amp_error_response_bounded"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "Authenticated principals can consume their assigned network quota.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-RPL-001",
+      "title": "Session and request replay",
+      "actor": "network attacker or authenticated principal",
+      "attack": "Replay early data, session opens, range requests, receipts, or stale monotonic epochs.",
+      "assets": ["authorization freshness", "receiver resources", "receipt ordering"],
+      "controls": [
+        "no v0.3 application frame in 0-RTT",
+        "128-bit random session and incarnation identifiers",
+        "idempotent exact replay and conflicting duplicate rejection",
+        "monotonic receipt, credit, coding, and budget epochs"
+      ],
+      "tests": ["reject_all_application_0rtt", "exact_request_replay_idempotent", "conflicting_duplicate_rejected", "stale_epoch_ignored"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "Replay within a deliberately idempotent operation returns the original authorized result.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-STG-001",
+      "title": "Untrusted object length staging exhaustion",
+      "actor": "malicious authenticated source or client",
+      "attack": "Declare a huge or overflowing object, manifest, count, range, or decoded length to force allocation.",
+      "assets": ["memory", "staging storage", "CPU"],
+      "controls": [
+        "frame limit checked before payload allocation",
+        "checked arithmetic for lengths, counts, and offsets",
+        "authorized exact-length bound",
+        "atomic reservation before ADMITTED"
+      ],
+      "tests": ["frame_length_preallocation_rejection", "object_length_overflow_rejected", "nested_count_bounded", "no_admission_without_reservation"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "An authorized in-policy large transfer consumes explicitly reserved quota.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-STG-002",
+      "title": "Aggregate multi-session quota exhaustion",
+      "actor": "authenticated tenant",
+      "attack": "Open many individually valid sessions or progressive ingests to exceed aggregate receiver capacity.",
+      "assets": ["tenant fairness", "receiver memory", "storage", "journal capacity"],
+      "controls": [
+        "tenant, principal, job, session, and provider aggregate quotas",
+        "lease creation and renewal consume quota",
+        "flow-control credit never exceeds assigned staging",
+        "idempotent orphan cleanup"
+      ],
+      "tests": ["aggregate_quota_across_connections", "credit_bounded_by_reservation", "orphan_cleanup_releases_quota"],
+      "telemetry": ["vot.receiver.admitted", "vot.session.closed"],
+      "residual_risk": "Capacity planning remains an operator responsibility.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-TOK-001",
+      "title": "Capability theft, scope escalation, and token leakage",
+      "actor": "network attacker, local user, or malicious tenant",
+      "attack": "Steal a bearer capability, alter mandatory claims, use it for another audience or object, or recover it from logs.",
+      "assets": ["media confidentiality", "operation authorization", "tenant isolation"],
+      "controls": [
+        "authenticated capability with issuer, audience, scope, bounds, expiry, and token ID",
+        "TLS exporter, peer key, or proof-of-possession binding when supported",
+        "unknown mandatory claims fail closed",
+        "tokens forbidden from telemetry, diagnostics, and crash output"
+      ],
+      "tests": ["token_signature_rejected", "token_audience_rejected", "token_scope_rejected", "token_expiry_rejected", "token_channel_binding_rejected", "trace_token_sentinel_absent"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "A deployment allowing unbound bearer tokens accepts declared replay exposure until expiry.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-SRC-001",
+      "title": "Malicious data or range proof",
+      "actor": "source or relay",
+      "attack": "Return corrupt bytes, a wrong-length proof, reordered nodes, a wrong root, or a proof from another suite.",
+      "assets": ["object integrity", "verified cache state", "publication integrity"],
+      "controls": [
+        "exact suite, root, and byte-length identity",
+        "range verification before verified-state mutation",
+        "suite-separated identities",
+        "source scoring and quarantine after proof failure"
+      ],
+      "tests": ["corrupt_data_rejected", "wrong_length_rejected", "wrong_root_rejected", "reordered_proof_rejected", "cross_suite_proof_rejected"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "A malicious source can waste its bounded request and verification budget.",
+      "gate": "W1"
+    },
+    {
+      "id": "SEC-SRC-002",
+      "title": "Progressive source mutation and equivocation",
+      "actor": "progressive ingest source",
+      "attack": "Replay, reorder, omit, truncate, or change authenticated pages while attempting to produce the old seal.",
+      "assets": ["package identity", "manifest integrity"],
+      "controls": [
+        "ordered authenticated page chain",
+        "verification-group commitments in each page",
+        "final SEAL binds the complete canonical root",
+        "mutation prevents sealing"
+      ],
+      "tests": ["progressive_reorder_rejected", "progressive_replay_rejected", "progressive_gap_rejected", "progressive_truncation_rejected", "source_mutation_prevents_seal"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "A malicious source can prevent its own session from completing.",
+      "gate": "W1"
+    },
+    {
+      "id": "SEC-PRV-001",
+      "title": "Workflow metadata disclosure through traces",
+      "actor": "operator, support recipient, or trace consumer",
+      "attack": "Recover filenames, paths, object roots, tenant identity, tokens, manifest data, or payload sentinels from default VOT or qlog traces.",
+      "assets": ["workflow confidentiality", "principal privacy", "capability secrecy"],
+      "controls": [
+        "pseudonymous default telemetry",
+        "domain-separated deployment-keyed pseudonyms",
+        "raw paths, roots, tokens, manifests, and payloads forbidden",
+        "bounded locally selected error text",
+        "receipt and ordinary telemetry sinks separated"
+      ],
+      "tests": ["default_trace_path_sentinel_absent", "default_trace_token_sentinel_absent", "default_trace_payload_sentinel_absent", "qlog_redaction_applied", "receipt_not_routed_to_qlog"],
+      "telemetry": [],
+      "residual_risk": "Packet sizes and timing may permit traffic analysis and require deployment review.",
+      "gate": "required"
+    },
+    {
+      "id": "SEC-CCH-001",
+      "title": "Cross-tenant cache presence and alias oracle",
+      "actor": "authenticated tenant",
+      "attack": "Probe whether another tenant has an object or use a dual-suite alias to expand authorization.",
+      "assets": ["tenant isolation", "content possession privacy", "media confidentiality"],
+      "controls": [
+        "authorization checked independently of cache presence",
+        "aliases do not merge object identities or capability scope",
+        "presence-oblivious unauthorized response policy",
+        "identity verified before extent deduplication"
+      ],
+      "tests": ["unauthorized_hit_matches_miss", "alias_does_not_expand_scope", "dedup_only_after_full_identity_verification"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "Authorized timing differences may reveal local cache state unless deployment policy adds padding.",
+      "gate": "W7"
+    },
+    {
+      "id": "SEC-COM-001",
+      "title": "Stale journal incarnation or VM rollback",
+      "actor": "faulty storage, stale snapshot, or local attacker",
+      "attack": "Restore an older but checksummed journal and attempt publication from stale verified or durable state.",
+      "assets": ["commit correctness", "receipt integrity"],
+      "controls": [
+        "unique incarnation and current-incarnation selection",
+        "stale valid journal rejected",
+        "poisoned incarnation terminal",
+        "revalidation or reconstruction before retry"
+      ],
+      "tests": ["stale_valid_journal_rejected", "vm_snapshot_rollback_rejected", "poisoned_incarnation_never_published"],
+      "telemetry": ["vot.commit.poisoned", "vot.session.closed"],
+      "residual_risk": "Rollback resistance depends on the provider profile's trusted freshness anchor.",
+      "gate": "W2"
+    },
+    {
+      "id": "SEC-DWN-001",
+      "title": "Silent assurance or carrier-security downgrade",
+      "actor": "network attacker, incompatible backend, or misconfiguration",
+      "attack": "Request Strict but publish as Balanced, omit delegation flags, or switch to a carrier with weaker authentication.",
+      "assets": ["assurance accuracy", "peer authentication", "receipt integrity"],
+      "controls": [
+        "profile-specific publication predecessors",
+        "unsupported profile fails instead of downgrading",
+        "receipt binds requested and actual assurance plus flags",
+        "fallback carrier provides equivalent TLS policy"
+      ],
+      "tests": ["strict_unsupported_no_downgrade", "delegation_flag_bound_to_receipt", "fallback_auth_policy_equal", "transport_ack_no_receipt"],
+      "telemetry": ["vot.session.closed", "vot.carrier.switched"],
+      "residual_risk": "A verifier must validate the authenticated receipt and provider profile.",
+      "gate": "W2"
+    },
+    {
+      "id": "SEC-PRS-001",
+      "title": "Parser extension and frame-length abuse",
+      "actor": "network peer",
+      "attack": "Send truncated varints, oversized lengths, grease, unknown critical frames, or many empty frames to consume memory or desynchronize parsing.",
+      "assets": ["parser memory safety", "session availability", "version integrity"],
+      "controls": [
+        "checked QUIC-varint decoding",
+        "pre-allocation hard and per-type limits",
+        "unknown optional stream discard",
+        "unknown critical close",
+        "bounded frames per decode batch"
+      ],
+      "tests": ["wire_vector_validation", "unknown_optional_skipped", "unknown_critical_fails", "grease_tolerated", "truncated_frame_rejected", "frame_batch_count_bounded"],
+      "telemetry": ["vot.frame.unknown_optional", "vot.frame.unknown_critical"],
+      "residual_risk": "Connection churn is controlled by deployment rate limits.",
+      "gate": "W3"
+    },
+    {
+      "id": "SEC-FEC-001",
+      "title": "Receiver overload creates an unbounded parity loop",
+      "actor": "malicious peer or unstable controller",
+      "attack": "Use stale credit or application drops to trigger more parity while decode and staging queues are overloaded.",
+      "assets": ["receiver CPU", "memory", "wire fairness"],
+      "controls": [
+        "new session starts with zero datagram credit",
+        "monotonic absolute credit epochs",
+        "caps on unretired bytes, generations, and decode work",
+        "zero credit stops new generations",
+        "reliable repair fallback"
+      ],
+      "tests": ["stale_credit_epoch_ignored", "zero_credit_stops_generations", "acked_then_app_dropped_repaired", "overload_does_not_raise_parity_unboundedly"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "Enabled FEC consumes explicitly configured bounded overhead.",
+      "gate": "W8"
+    },
+    {
+      "id": "SEC-VCR-001",
+      "title": "VCRC risk-budget bypass or automatic reset",
+      "actor": "controller bug or malicious policy input",
+      "attack": "Authorize parity or hedges after exhaustion, double-spend a replayed decision, or reset the budget without a logged epoch.",
+      "assets": ["risk accounting", "wire budget", "fairness"],
+      "controls": [
+        "monotonic spend-down ledger",
+        "idempotent decision identity",
+        "reliable-only behavior at zero budget",
+        "new budget requires explicit logged epoch",
+        "job, receiver, and congestion-domain caps remain authoritative"
+      ],
+      "tests": ["zero_budget_no_speculation", "decision_replay_no_double_spend", "budget_never_negative", "no_automatic_reset", "reliable_repair_continues"],
+      "telemetry": ["vcrc.budget_exhausted"],
+      "residual_risk": "The certificate covers first-wave frontier failure, not deadline attainment.",
+      "gate": "W9"
+    },
+    {
+      "id": "SEC-GC-001",
+      "title": "Lease bypass, unsafe orphan cleanup, or premature collection",
+      "actor": "tenant, cleanup worker, or malformed stored metadata",
+      "attack": "Collect an active extent, renew leases without quota, traverse outside staging, or repeatedly delete inconsistent state.",
+      "assets": ["active transfer liveness", "stored objects", "filesystem boundary", "audit integrity"],
+      "controls": [
+        "authenticated active lease prevents collection",
+        "lease and renewal consume quota",
+        "provider-root-confined object identifiers instead of untrusted paths",
+        "tombstone and grace-period state machine",
+        "idempotent auditable deletion"
+      ],
+      "tests": ["active_lease_prevents_gc", "lease_quota_enforced", "cleanup_cannot_escape_root", "orphan_cleanup_idempotent"],
+      "telemetry": ["vot.session.closed"],
+      "residual_risk": "Operator retention policy determines how long unleased recoverable data remains.",
+      "gate": "W7"
+    }
+  ]
+}

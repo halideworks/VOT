@@ -31,14 +31,8 @@ fn minio_and_mock_emit_identical_assurance_receipts() {
         live_store.head(&key),
         Some((mock_object.bytes.len() as u64, mock_object.checksum_crc32c))
     );
-    let conflict_store = AwsS3Store::new(
-        &endpoint,
-        &bucket,
-        "us-east-1",
-        &access_key,
-        &secret_key,
-    )
-    .unwrap();
+    let conflict_store =
+        AwsS3Store::new(&endpoint, &bucket, "us-east-1", &access_key, &secret_key).unwrap();
     let mut conflict = ObjectCommit::create(conflict_store, &key, 1).unwrap();
     conflict.upload_verified_part(1, &first).unwrap();
     conflict.upload_verified_part(2, &second).unwrap();

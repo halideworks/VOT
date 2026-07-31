@@ -1,0 +1,15 @@
+[package]
+name = "vot-commit-posix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+vot-commit-model = { path = "../vot-commit-model" }
+vot-journal = { path = "../vot-journal" }
+vot-commit-strict = { path = "../vot-commit-strict" }
+
+[lints]
+workspace = true

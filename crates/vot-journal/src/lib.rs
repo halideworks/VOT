@@ -2,14 +2,17 @@
 
 #![allow(clippy::missing_errors_doc, clippy::cast_possible_truncation)]
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: [u8; 4] = *b"VOTJ";
 const VERSION: u8 = 0;
 const HEADER_LEN: usize = 4 + 1 + 16 + 8 + 1 + 4;
 const MAX_PAYLOAD: usize = 1_048_576;
+const CHECKPOINT_FLAG: u8 = 0x80;
+static NEXT_CHECKPOINT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Record {
@@ -17,6 +20,7 @@ pub struct Record {
     pub sequence: u64,
     pub state: u8,
     pub payload: Vec<u8>,
+    pub checkpoint: bool,
 }
 
 #[derive(Debug)]
@@ -29,6 +33,8 @@ pub enum Error {
     SequenceGap,
     SequenceConflict,
     StaleIncarnation,
+    InvalidState,
+    Empty,
 }
 
 impl From<io::Error> for Error {
@@ -41,6 +47,7 @@ impl From<io::Error> for Error {
 pub struct Replay {
     pub records: Vec<Record>,
     pub torn_tail: bool,
+    pub valid_bytes: u64,
 }
 
 pub struct Journal {
@@ -68,6 +75,10 @@ impl Journal {
     pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let replay = replay_reader(&mut file, incarnation)?;
+        if replay.torn_tail {
+            file.set_len(replay.valid_bytes)?;
+            file.sync_data()?;
+        }
         file.seek(SeekFrom::End(0))?;
         let next_sequence = replay
             .records
@@ -91,12 +102,16 @@ impl Journal {
         if payload.len() > MAX_PAYLOAD {
             return Err(Error::PayloadTooLarge);
         }
+        if state & CHECKPOINT_FLAG != 0 {
+            return Err(Error::InvalidState);
+        }
         let sequence = self.next_sequence;
         let record = Record {
             incarnation: self.incarnation,
             sequence,
             state,
             payload: payload.to_vec(),
+            checkpoint: false,
         };
         let encoded = encode(&record)?;
         if let Err(error) = self
@@ -117,6 +132,54 @@ impl Journal {
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Replaces a journal with one durable checkpoint at its latest sequence.
+    pub fn compact_checkpoint(
+        path: &Path,
+        incarnation: [u8; 16],
+        state: u8,
+        payload: &[u8],
+    ) -> Result<Self, Error> {
+        if state & CHECKPOINT_FLAG != 0 {
+            return Err(Error::InvalidState);
+        }
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Error::PayloadTooLarge);
+        }
+        let replayed = replay(path, incarnation)?;
+        let sequence = replayed.records.last().ok_or(Error::Empty)?.sequence;
+        let record = Record {
+            incarnation,
+            sequence,
+            state,
+            payload: payload.to_vec(),
+            checkpoint: true,
+        };
+        let encoded = encode(&record)?;
+        let suffix = NEXT_CHECKPOINT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let file_name = path.file_name().ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal has no file name",
+            ))
+        })?;
+        let temporary = path.with_file_name(format!(
+            "{}.checkpoint-{}-{suffix}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        let (journal, _) = Self::open_current(path, incarnation)?;
+        Ok(journal)
     }
 }
 
@@ -141,7 +204,13 @@ fn encode(record: &Record) -> Result<Vec<u8>, Error> {
     bytes.push(VERSION);
     bytes.extend_from_slice(&record.incarnation);
     bytes.extend_from_slice(&record.sequence.to_le_bytes());
-    bytes.push(record.state);
+    let encoded_state = record.state
+        | if record.checkpoint {
+            CHECKPOINT_FLAG
+        } else {
+            0
+        };
+    bytes.push(encoded_state);
     bytes.extend_from_slice(&(record.payload.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&record.payload);
     bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
@@ -174,7 +243,9 @@ fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Resul
             return Err(Error::StaleIncarnation);
         }
         let sequence = u64::from_le_bytes(header[21..29].try_into().unwrap());
-        let state = header[29];
+        let encoded_state = header[29];
+        let checkpoint = encoded_state & CHECKPOINT_FLAG != 0;
+        let state = encoded_state & !CHECKPOINT_FLAG;
         let length = u32::from_le_bytes(header[30..34].try_into().unwrap()) as usize;
         if length > MAX_PAYLOAD {
             return Err(Error::PayloadTooLarge);
@@ -196,6 +267,7 @@ fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Resul
             sequence,
             state,
             payload: bytes[offset + HEADER_LEN..checksum_at].to_vec(),
+            checkpoint,
         };
         if let Some(previous) = records.last() {
             if sequence == previous.sequence {
@@ -207,14 +279,18 @@ fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Resul
             } else {
                 records.push(record);
             }
-        } else if sequence == 0 {
+        } else if sequence == 0 || checkpoint {
             records.push(record);
         } else {
             return Err(Error::SequenceGap);
         }
         offset = record_end;
     }
-    Ok(Replay { records, torn_tail })
+    Ok(Replay {
+        records,
+        torn_tail,
+        valid_bytes: offset as u64,
+    })
 }
 
 #[cfg(test)]
@@ -293,5 +369,55 @@ mod tests {
     #[test]
     fn crc32c_matches_standard_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
+    fn checkpoint_bounds_recovery_to_checkpoint_and_active_records() {
+        let path = temp_path("checkpoint");
+        let incarnation = [5; 16];
+        let mut journal = Journal::create(&path, incarnation).unwrap();
+        for sequence in 0..100 {
+            journal.append_durable(1, &[sequence]).unwrap();
+        }
+        drop(journal);
+        let mut journal =
+            Journal::compact_checkpoint(&path, incarnation, 2, b"sealed-through=99").unwrap();
+        journal.append_durable(3, b"active-100").unwrap();
+        journal.append_durable(3, b"active-101").unwrap();
+        drop(journal);
+        let recovered = replay(&path, incarnation).unwrap();
+        assert_eq!(recovered.records.len(), 3);
+        assert!(recovered.records[0].checkpoint);
+        assert_eq!(recovered.records[0].sequence, 99);
+        assert_eq!(recovered.records[2].sequence, 101);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopening_truncates_torn_tail_before_new_append() {
+        let path = temp_path("resume-torn");
+        let incarnation = [6; 16];
+        let mut journal = Journal::create(&path, incarnation).unwrap();
+        journal.append_durable(1, b"complete").unwrap();
+        journal.append_durable(2, b"torn").unwrap();
+        drop(journal);
+        let length = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 2)
+            .unwrap();
+        let (mut journal, recovered) = Journal::open_current(&path, incarnation).unwrap();
+        assert!(recovered.torn_tail);
+        assert_eq!(recovered.records.len(), 1);
+        journal.append_durable(3, b"replacement").unwrap();
+        drop(journal);
+        let recovered = replay(&path, incarnation).unwrap();
+        assert!(!recovered.torn_tail);
+        assert_eq!(recovered.records.len(), 2);
+        assert_eq!(recovered.records[1].state, 3);
+        assert_eq!(recovered.records[1].sequence, 1);
+        std::fs::remove_file(path).unwrap();
     }
 }

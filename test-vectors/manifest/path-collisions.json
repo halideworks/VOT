@@ -1,0 +1,8 @@
+{
+  "portable_collisions": [
+    ["Readme", "README"],
+    ["é", "é"]
+  ],
+  "portable_invalid": ["CON", "aux.txt", "LPT9", "bad/part", "trail.", ".."],
+  "raw_posix_invalid_hex": ["", "610062", "612f62"]
+}

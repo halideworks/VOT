@@ -1,0 +1,11 @@
+{
+  "suite": "sha256-bep52-64k",
+  "pattern": "byte[i]=(i*17)%251",
+  "empty_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "cases": [
+    {"object_length":1,"request_offset":0,"request_length":1,"covered_offset":0,"covered_length":1,"root":"6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d","proof":"","piece_layer":"6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"},
+    {"object_length":65536,"request_offset":65535,"request_length":1,"covered_offset":0,"covered_length":65536,"root":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae0","proof":"","piece_layer":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae0"},
+    {"object_length":327699,"request_offset":65540,"request_length":8,"covered_offset":65536,"covered_length":65536,"root":"3bc7fc08b51b9bb438542846bde6e5714d2509fb1fe7761e0c3d47a9e353032e","proof":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae0d75e5a1dead76afdebe70de8f62ee04fadd50789834f2d55232f17ac85c8a559ad7a73364a82161562576acbecd39e21fe035b15619d89517882577d5534ab0d","piece_layer":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae010247d156f95f39d10f6f3221e60928997c809e0dfccd0f0270c7912d248d0e66b4564a5d27bb75c66e0f1dbbd9d99f8244c5d836f8e2eea1fb36cb3bbd0867ea84744ea171b7e5f9845a51a5242a1a843df1dd0d158a5c75e73c87c710bb45034dd6a441c8bcc4bc3df02c2f38e0c40038c7e4f499ed38c7494ff79bd4f7fc65cf7c0a5425130ef6a0ece1d3c8efedb86d13333e2e6a9c45f255f710bbe1ab2"},
+    {"object_length":327699,"request_offset":70000,"request_length":140000,"covered_offset":65536,"covered_length":196608,"root":"3bc7fc08b51b9bb438542846bde6e5714d2509fb1fe7761e0c3d47a9e353032e","proof":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae0ad7a73364a82161562576acbecd39e21fe035b15619d89517882577d5534ab0d","piece_layer":"5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae010247d156f95f39d10f6f3221e60928997c809e0dfccd0f0270c7912d248d0e66b4564a5d27bb75c66e0f1dbbd9d99f8244c5d836f8e2eea1fb36cb3bbd0867ea84744ea171b7e5f9845a51a5242a1a843df1dd0d158a5c75e73c87c710bb45034dd6a441c8bcc4bc3df02c2f38e0c40038c7e4f499ed38c7494ff79bd4f7fc65cf7c0a5425130ef6a0ece1d3c8efedb86d13333e2e6a9c45f255f710bbe1ab2"}
+  ]
+}

@@ -14,6 +14,8 @@ python3 tools/validate_registries.py
 python3 tools/validate_wire_vectors.py
 python3 tools/validate_security_matrix.py
 python3 tools/validate_wave0.py
+python3 tools/verify_wave1_vectors.py
+python3 tools/verify_manifest_pack_vectors.py
 cargo test --workspace --locked
 ```
 

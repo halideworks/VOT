@@ -1,11 +1,16 @@
 [workspace]
-members = ["crates/vot-codec"]
+members = ["crates/vot-codec", "crates/vot-proof-blake3", "crates/vot-proof-sha256", "crates/vot-manifest", "crates/vot-pack"]
 resolver = "3"
 
 [workspace.package]
+version = "0.0.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.85"
+[workspace.dependencies]
+blake3 = "1.8.5"
+sha2 = "0.10.9"
+unicode-normalization = "0.1.24"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

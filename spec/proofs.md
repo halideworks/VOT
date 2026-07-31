@@ -128,9 +128,10 @@ its 32-byte tree hash in increasing piece index. Hashes covering only padding
 beyond end of object are omitted. Concatenation has no header; exact object
 length determines its expected number of hashes.
 
-Rebuilding the upper tree from this layer uses zero 32-byte nodes for missing
-piece positions until the next power of two, consistent with the underlying
-BEP 52 leaf padding. The resulting root MUST match the object identity.
+Rebuilding the upper tree derives each missing piece node from four zero 32-byte
+leaf nodes and recursively hashes missing subtrees until the next power of two.
+This is the exact result of the underlying BEP 52 leaf padding; using a raw zero
+node at the piece layer would produce a different root. The resulting root MUST match the object identity.
 
 ### 3.3 Range proof bytes
 

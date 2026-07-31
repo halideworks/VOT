@@ -1,0 +1,10 @@
+{
+  "profile": "portable",
+  "bytes": "6f6e6500000000006d6964646c6500006c617374",
+  "root": "5ffd09bee9cde5e642aadde56f315c882c4af96ed2301059648d9b40adde9e39",
+  "entries": [
+    {"path":"a","offset":0,"length":3,"logical_root":"7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed","plaintext":"6f6e65"},
+    {"path":"m","offset":8,"length":6,"logical_root":"a4888af4e46c129c695ee32775a8c233f113c82e7cd4e6fd3cbb1fda5659f36a","plaintext":"6d6964646c65"},
+    {"path":"z","offset":16,"length":4,"logical_root":"3547cb112ac4489af2310c0626cdba6f3097a2ad5a3b42ddd3b59c76c7a079a3","plaintext":"6c617374"}
+  ]
+}

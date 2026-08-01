@@ -296,12 +296,6 @@ pub fn receive_bundle(
     if actual != expected {
         return Err(Error::RootMismatch);
     }
-    if sync_directories(&staging)? == 0 {
-        return Err(Error::InvalidBundle);
-    }
-    fs::rename(&staging, destination)?;
-    File::open(parent_directory(destination))?.sync_all()?;
-
     let mut session_id = [0; 16];
     session_id.copy_from_slice(&actual.root[..16]);
     let mut incarnation_id = [0; 16];
@@ -325,6 +319,12 @@ pub fn receive_bundle(
     };
     let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
     let encoded = encode_authenticated(&authenticated)?;
+    if sync_directories(&staging)? == 0 {
+        return Err(Error::InvalidBundle);
+    }
+    fs::rename(&staging, destination)?;
+    File::open(parent_directory(destination))?.sync_all()?;
+
     let mut receipt_file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -612,7 +612,11 @@ fn receive_object(
         root,
         length,
     };
-    receiver.begin(subject)?;
+    let already_verified = receiver.is_verified(subject);
+    if !already_verified {
+        receiver.begin(subject)?;
+    }
+    let mut verifier = already_verified.then(|| StreamVerifier::new(Suite::Sha256Bep52));
     let mut bytes = Vec::with_capacity(capacity);
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
@@ -620,10 +624,20 @@ fn receive_object(
         if read == 0 {
             break;
         }
-        receiver.receive(subject, &buffer[..read])?;
+        if let Some(verifier) = verifier.as_mut() {
+            verifier.update(&buffer[..read])?;
+        } else {
+            receiver.receive(subject, &buffer[..read])?;
+        }
         bytes.extend_from_slice(&buffer[..read]);
     }
-    receiver.finish(subject)?;
+    if let Some(verifier) = verifier {
+        if verifier.finish()? != root {
+            return Err(Error::RootMismatch);
+        }
+    } else {
+        receiver.finish(subject)?;
+    }
     Ok(bytes)
 }
 
@@ -912,6 +926,62 @@ mod tests {
         if staging.exists() {
             fs::remove_dir_all(staging).unwrap();
         }
+    }
+
+    #[test]
+    fn invalid_receipt_metadata_cannot_publish_destination() {
+        let source = temporary("timestamp-source");
+        let bundle = temporary("timestamp-bundle");
+        let destination = temporary("timestamp-destination");
+        let receipt = temporary("timestamp-receipt.cbor");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"contents").unwrap();
+        build_bundle(&source, &bundle).unwrap();
+        assert!(matches!(
+            receive_bundle(&bundle, &destination, &receipt, &[7; 32], "not-rfc3339"),
+            Err(Error::Receipt(vot_receipt::Error::InvalidTimestamp))
+        ));
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(bundle).unwrap();
+        let staging = staging_path(&destination).unwrap();
+        if staging.exists() {
+            fs::remove_dir_all(staging).unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_pack_can_be_reloaded_after_cache_eviction() {
+        let source = temporary("repeated-pack-source");
+        let bundle = temporary("repeated-pack-bundle");
+        let destination = temporary("repeated-pack-destination");
+        let receipt = temporary("repeated-pack-receipt.cbor");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a"), [0x11]).unwrap();
+        fs::write(source.join("b"), vec![0x31; CANDIDATE_MAX + 1]).unwrap();
+        fs::write(source.join("c"), [0x22]).unwrap();
+        fs::write(source.join("d"), vec![0x32; CANDIDATE_MAX + 1]).unwrap();
+        fs::write(source.join("e"), [0x11]).unwrap();
+        build_bundle(&source, &bundle).unwrap();
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &[7; 32],
+            "2026-07-31T23:59:59Z",
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination.join("a")).unwrap(), [0x11]);
+        assert_eq!(fs::read(destination.join("c")).unwrap(), [0x22]);
+        assert_eq!(fs::read(destination.join("e")).unwrap(), [0x11]);
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_file(receipt.with_extension("json")).unwrap();
+        fs::remove_file(receipt).unwrap();
     }
 
     #[test]

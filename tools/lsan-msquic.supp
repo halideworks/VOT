@@ -1,0 +1,3 @@
+# quictls retains its process-global provider registry until OpenSSL cleanup.
+# Keep this scoped to the allocation root. VOT and MsQuic handle leaks remain visible.
+leak:CRYPTO_zalloc

@@ -166,6 +166,50 @@ jobs:
       - name: Test Strict against backing corruption
         run: sh tools/test_strict_backing_corruption.sh
 
+  msquic-live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      - name: Test live MsQuic interop
+        run: cargo +1.85.0 test -p vot-transport-msquic --features live --locked
+
+      - name: Lint isolated FFI crate
+        run: cargo +1.85.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
+
+  msquic-sanitizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        run: rustup toolchain install nightly-2026-07-15 --profile minimal
+
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y binutils cmake openssl
+
+      - name: Run live ASan and LSan gate
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:symbolize=1:allow_addr2line=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/tools/lsan-msquic.supp:print_suppressions=1
+        run: >-
+          cargo +nightly-2026-07-15 test -p vot-transport-msquic
+          --features live --target x86_64-unknown-linux-gnu --locked
+          localhost_reliable_stream_round_trip
+
   mutation:
     name: mutation (${{ matrix.package }})
     runs-on: ubuntu-24.04
@@ -189,6 +233,7 @@ jobs:
           - { package: vot-receipt, required: false }
           - { package: vot-transport-api, required: true }
           - { package: vot-transport-sim, required: true }
+          - { package: vot-transport-msquic, required: true }
           - { package: vot-scheduler, required: true }
     steps:
       - uses: actions/checkout@v4.3.1

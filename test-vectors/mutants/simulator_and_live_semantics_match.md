@@ -1,0 +1,24 @@
+# simulator_and_live_semantics_match
+
+The MsQuic bridge consumes the same `TransportAdapter` contract as the
+deterministic simulator. A live localhost test sends one 192 KiB reliable stream
+over the pinned MsQuic v2.5.9 release and compares every received byte.
+
+Mutant:
+
+```diff
+-self.commands.push_back(Command::Reliable { stream, bytes: record.to_vec() });
++return Ok(());
+```
+
+Observed failure:
+
+```text
+test tests::simulator_and_live_semantics_share_the_transport_contract ... FAILED
+assertion `left == right` failed
+left: Some(ReceiveCredit(4096))
+right: Some(Reliable { stream: StreamId(2), bytes: [...] })
+```
+
+The required bridge mutation run reported 13 caught and 2 unviable mutants,
+with no surviving mutant.

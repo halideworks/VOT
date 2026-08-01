@@ -1,0 +1,22 @@
+[package]
+name = "vot-transport-msquic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+live = ["dep:msquic"]
+
+[dependencies]
+msquic = { git = "https://github.com/microsoft/msquic.git", rev = "87b53085d76bd7920d490a6f226c9999b6614d14", optional = true }
+vot-transport-api = { path = "../vot-transport-api" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+undocumented_unsafe_blocks = "deny"

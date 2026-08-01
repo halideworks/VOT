@@ -1,0 +1,508 @@
+//! `MsQuic` event bridge for the backend-neutral VOT transport API.
+
+#![deny(unsafe_code)]
+
+use std::collections::VecDeque;
+
+use vot_transport_api::{
+    ConnectionId, DatagramSendState, Error, Event, StreamId, TransportAck, TransportAdapter,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Command {
+    Control(Vec<u8>),
+    Reliable { stream: StreamId, bytes: Vec<u8> },
+    ReceiveCredit(u64),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeEvent {
+    Connected(u64),
+    Disconnected(u64),
+    Control(Vec<u8>),
+    Reliable {
+        stream: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    Acknowledged {
+        stream: u64,
+        sequence: u64,
+    },
+    DatagramState {
+        context: u64,
+        state: NativeDatagramSendState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDatagramSendState {
+    Sent,
+    LostSuspect,
+    Acknowledged,
+    AcknowledgedSpurious,
+    Canceled,
+}
+
+/// Owns bounded outbound commands and events translated from `MsQuic` callbacks.
+#[derive(Default)]
+pub struct MsQuicAdapter {
+    commands: VecDeque<Command>,
+    events: VecDeque<Event>,
+}
+
+impl MsQuicAdapter {
+    pub fn record_native_event(&mut self, event: NativeEvent) {
+        self.events.push_back(match event {
+            NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
+            NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
+            NativeEvent::Control(bytes) => Event::Control(bytes),
+            NativeEvent::Reliable {
+                stream,
+                sequence,
+                bytes,
+            } => Event::Reliable {
+                stream: StreamId(stream),
+                sequence,
+                bytes,
+            },
+            NativeEvent::Acknowledged { stream, sequence } => {
+                Event::Acknowledged(TransportAck::new(stream, sequence))
+            }
+            NativeEvent::DatagramState { context, state } => Event::DatagramState {
+                context,
+                state: match state {
+                    NativeDatagramSendState::Sent => DatagramSendState::Sent,
+                    NativeDatagramSendState::LostSuspect => DatagramSendState::SuspectedLost,
+                    NativeDatagramSendState::Acknowledged
+                    | NativeDatagramSendState::AcknowledgedSpurious => {
+                        DatagramSendState::Acknowledged
+                    }
+                    NativeDatagramSendState::Canceled => DatagramSendState::Canceled,
+                },
+            },
+        });
+    }
+
+    pub fn next_command(&mut self) -> Option<Command> {
+        self.commands.pop_front()
+    }
+}
+
+impl TransportAdapter for MsQuicAdapter {
+    fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
+        if frame.len() > vot_codec_limit() {
+            return Err(Error::RecordTooLarge);
+        }
+        self.commands.push_back(Command::Control(frame.to_vec()));
+        Ok(())
+    }
+
+    fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+        vot_transport_api::validate_data_record(record)?;
+        self.commands.push_back(Command::Reliable {
+            stream,
+            bytes: record.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
+        self.commands.push_back(Command::ReceiveCredit(bytes));
+        Ok(())
+    }
+}
+
+const fn vot_codec_limit() -> usize {
+    1024 * 1024
+}
+
+#[cfg(feature = "live")]
+#[allow(unsafe_code)]
+pub mod live {
+    //! Narrow ownership helpers around the official `MsQuic` Rust FFI wrapper.
+
+    use std::ffi::c_void;
+
+    use msquic::{
+        BufferRef, Connection, ConnectionRef, Registration, RegistrationConfig, SendFlags, Stream,
+        StreamRef,
+    };
+
+    pub struct SendBuffer {
+        storage: Vec<u8>,
+        buffers: Box<[BufferRef; 1]>,
+    }
+
+    impl SendBuffer {
+        fn new(bytes: &[u8]) -> Self {
+            let storage = bytes.to_vec();
+            let buffers = Box::new([BufferRef::from(storage.as_slice())]);
+            Self { storage, buffers }
+        }
+    }
+
+    /// Opens an actual `MsQuic` registration and validates the linked API table.
+    ///
+    /// # Errors
+    /// Propagates an `MsQuic` registration failure.
+    pub fn registration() -> Result<Registration, msquic::Status> {
+        Registration::new(&RegistrationConfig::default())
+    }
+
+    /// Sends bytes while transferring buffer ownership to the completion callback.
+    ///
+    /// # Errors
+    /// Returns an `MsQuic` error and retains no detached allocation when send fails.
+    pub fn send_owned(
+        stream: &Stream,
+        bytes: &[u8],
+        flags: SendFlags,
+    ) -> Result<(), msquic::Status> {
+        let context = Box::new(SendBuffer::new(bytes));
+        let pointer = context.as_ref() as *const SendBuffer;
+        // SAFETY: storage owns the allocation referenced by buffers. The whole
+        // context is detached only after Stream::send succeeds and is reclaimed
+        // exactly once by complete_send from the SendComplete callback.
+        let result =
+            unsafe { stream.send(context.buffers.as_ref(), flags, pointer.cast::<c_void>()) };
+        if result.is_ok() {
+            let _ = Box::into_raw(context);
+        }
+        result
+    }
+
+    /// Reclaims a send allocation returned by `MsQuic` on `SendComplete`.
+    ///
+    /// # Safety
+    /// The context must be the non-null value from one successful `send_owned` call
+    /// and must be passed exactly once.
+    pub unsafe fn complete_send(context: *const c_void) {
+        if !context.is_null() {
+            // SAFETY: the caller contract guarantees this pointer came from one
+            // successful send_owned call and has not previously been reclaimed.
+            let buffer = unsafe { Box::from_raw(context.cast_mut().cast::<SendBuffer>()) };
+            debug_assert_eq!(buffer.storage.len(), buffer.buffers[0].as_bytes().len());
+        }
+    }
+
+    /// Closes a peer-created stream after its shutdown-complete callback.
+    ///
+    /// # Safety
+    /// The stream reference must be in `ShutdownComplete` and not already adopted.
+    pub unsafe fn close_peer_stream(stream: &StreamRef) {
+        // SAFETY: the caller contract limits adoption to ShutdownComplete and
+        // transfers the sole close responsibility to this temporary owner.
+        let _ = unsafe { Stream::from_raw(stream.as_raw()) };
+    }
+
+    /// Closes a peer-created connection after its shutdown-complete callback.
+    ///
+    /// # Safety
+    /// The connection must be in `ShutdownComplete` and not already adopted.
+    pub unsafe fn close_peer_connection(connection: &ConnectionRef) {
+        // SAFETY: the caller contract limits adoption to ShutdownComplete and
+        // transfers the sole close responsibility to this temporary owner.
+        let _ = unsafe { Connection::from_raw(connection.as_raw()) };
+    }
+
+    /// Transfers an application-created stream to its callback for final close.
+    ///
+    /// # Safety
+    /// The callback must adopt the stream exactly once at `ShutdownComplete`.
+    pub unsafe fn detach_stream(stream: Stream) {
+        // SAFETY: ownership is deliberately transferred to the MsQuic callback.
+        let _ = unsafe { stream.into_raw() };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::process::Command;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        use msquic::{
+            Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Credential,
+            CredentialConfig, CredentialFlags, Listener, ListenerEvent, SendFlags, Settings,
+            Status, Stream, StreamEvent, StreamOpenFlags, StreamRef, StreamStartFlags,
+        };
+
+        use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
+
+        fn test_credential() -> Credential {
+            let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let key = directory.join("key.pem");
+            let certificate = directory.join("cert.pem");
+            if !key.exists() || !certificate.exists() {
+                let status = Command::new("openssl")
+                    .args([
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:2048",
+                        "-keyout",
+                        key.to_str().unwrap(),
+                        "-out",
+                        certificate.to_str().unwrap(),
+                        "-sha256",
+                        "-days",
+                        "1",
+                        "-nodes",
+                        "-subj",
+                        "/CN=localhost",
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            Credential::CertificateFile(msquic::CertificateFile::new(
+                key.display().to_string(),
+                certificate.display().to_string(),
+            ))
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn localhost_reliable_stream_round_trip() {
+            let payload = vec![0x6d; 192 * 1024];
+            let expected_length = payload.len();
+            let registration = super::registration().unwrap();
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let settings = Settings::new().set_PeerBidiStreamCount(4);
+
+            let server_configuration =
+                Configuration::open(&registration, &alpn, Some(&settings)).unwrap();
+            server_configuration
+                .load_credential(
+                    &CredentialConfig::new()
+                        .set_credential_flags(CredentialFlags::NONE)
+                        .set_credential(test_credential()),
+                )
+                .unwrap();
+            let server_configuration = Arc::new(server_configuration);
+
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let (complete_tx, complete_rx) = mpsc::channel();
+            let (server_closed_tx, server_closed_rx) = mpsc::channel();
+            let (listener_stopped_tx, listener_stopped_rx) = mpsc::channel();
+            let stream_received = Arc::clone(&received);
+            let server_stream = move |stream: StreamRef, event: StreamEvent| {
+                match event {
+                    StreamEvent::Receive { buffers, .. } => {
+                        let mut received = stream_received.lock().unwrap();
+                        for buffer in buffers {
+                            received.extend_from_slice(buffer.as_bytes());
+                        }
+                        if received.len() == expected_length {
+                            complete_tx.send(()).unwrap();
+                        }
+                    }
+                    StreamEvent::ShutdownComplete { .. } => {
+                        // SAFETY: MsQuic delivered ShutdownComplete for this
+                        // peer-created stream and no other owner adopted it.
+                        unsafe { close_peer_stream(&stream) };
+                    }
+                    StreamEvent::PeerSendShutdown => {
+                        stream.shutdown(msquic::StreamShutdownFlags::GRACEFUL, 0)?;
+                    }
+                    _ => {}
+                }
+                Ok::<(), Status>(())
+            };
+
+            let server_connection = move |connection: ConnectionRef, event: ConnectionEvent| {
+                match event {
+                    ConnectionEvent::PeerStreamStarted { stream, .. } => {
+                        stream.set_callback_handler(server_stream.clone());
+                    }
+                    ConnectionEvent::ShutdownComplete { .. } => {
+                        server_closed_tx.send(()).unwrap();
+                        // SAFETY: MsQuic delivered ShutdownComplete for this
+                        // peer-created connection and no other owner adopted it.
+                        unsafe { close_peer_connection(&connection) };
+                    }
+                    _ => {}
+                }
+                Ok::<(), Status>(())
+            };
+
+            let configuration = Arc::clone(&server_configuration);
+            let listener = Listener::open(&registration, move |_, event: ListenerEvent| {
+                match event {
+                    ListenerEvent::NewConnection { connection, .. } => {
+                        connection.set_callback_handler(server_connection.clone());
+                        connection.set_configuration(&configuration)?;
+                    }
+                    ListenerEvent::StopComplete { .. } => {
+                        listener_stopped_tx.send(()).unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+            let listen_address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            listener.start(&alpn, Some(&listen_address)).unwrap();
+            let port = listener.get_local_addr().unwrap().port();
+
+            let client_configuration =
+                Configuration::open(&registration, &alpn, Some(&settings)).unwrap();
+            client_configuration
+                .load_credential(
+                    &CredentialConfig::new_client()
+                        .set_credential_flags(CredentialFlags::NO_CERTIFICATE_VALIDATION),
+                )
+                .unwrap();
+
+            let outbound = payload.clone();
+            let (stream_closed_tx, stream_closed_rx) = mpsc::channel();
+            let (client_closed_tx, client_closed_rx) = mpsc::channel();
+            let client_stream = move |stream: StreamRef, event: StreamEvent| {
+                match event {
+                    StreamEvent::SendComplete { client_context, .. } => {
+                        // SAFETY: send_owned returned this exact context once.
+                        unsafe { complete_send(client_context) };
+                    }
+                    StreamEvent::ShutdownComplete { .. } => {
+                        stream_closed_tx.send(()).unwrap();
+                        // SAFETY: the stream was detached after start and this
+                        // is its unique ShutdownComplete callback.
+                        unsafe { close_peer_stream(&stream) };
+                    }
+                    _ => {}
+                }
+                Ok::<(), Status>(())
+            };
+            let client_connection = Connection::open(
+                &registration,
+                move |connection: ConnectionRef, event: ConnectionEvent| {
+                    match event {
+                        ConnectionEvent::Connected { .. } => {
+                            let stream = Stream::open(
+                                &connection,
+                                StreamOpenFlags::NONE,
+                                client_stream.clone(),
+                            )?;
+                            stream.start(StreamStartFlags::NONE)?;
+                            super::send_owned(&stream, &outbound, SendFlags::FIN)?;
+                            // SAFETY: client_stream adopts this handle in its unique
+                            // ShutdownComplete callback.
+                            unsafe { detach_stream(stream) };
+                        }
+                        ConnectionEvent::ShutdownComplete { .. } => {
+                            client_closed_tx.send(()).unwrap();
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            client_connection
+                .start(&client_configuration, "127.0.0.1", port)
+                .unwrap();
+
+            complete_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(*received.lock().unwrap(), payload);
+            stream_closed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            client_connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
+            client_closed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            server_closed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            listener.stop();
+            listener_stopped_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            drop(client_connection);
+            drop(client_configuration);
+            drop(listener);
+            drop(server_configuration);
+            registration.shutdown();
+            drop(registration);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_and_live_semantics_share_the_transport_contract() {
+        let mut adapter = MsQuicAdapter::default();
+        adapter.send_control(b"hello").unwrap();
+        adapter
+            .send_reliable(StreamId(2), b"verified bytes")
+            .unwrap();
+        adapter.set_receive_credit(4096).unwrap();
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Control(b"hello".to_vec()))
+        );
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Reliable {
+                stream: StreamId(2),
+                bytes: b"verified bytes".to_vec(),
+            })
+        );
+        assert_eq!(adapter.next_command(), Some(Command::ReceiveCredit(4096)));
+    }
+
+    #[test]
+    fn datagram_send_state_is_exposed_for_later_use() {
+        let mut adapter = MsQuicAdapter::default();
+        adapter.record_native_event(NativeEvent::DatagramState {
+            context: 77,
+            state: NativeDatagramSendState::LostSuspect,
+        });
+        assert_eq!(
+            adapter.poll(),
+            Some(Event::DatagramState {
+                context: 77,
+                state: DatagramSendState::SuspectedLost,
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_reliable_record_is_rejected_before_ffi() {
+        let mut adapter = MsQuicAdapter::default();
+        assert_eq!(
+            adapter.send_reliable(
+                StreamId(1),
+                &vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1]
+            ),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
+    fn control_frames_obey_the_exact_backend_limit() {
+        assert_eq!(vot_codec_limit(), 1_048_576);
+        let mut adapter = MsQuicAdapter::default();
+        adapter.send_control(&vec![0; vot_codec_limit()]).unwrap();
+        assert_eq!(
+            adapter.send_control(&vec![0; vot_codec_limit() + 1]),
+            Err(Error::RecordTooLarge)
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn official_msquic_api_opens_and_closes() {
+        let registration = live::registration().unwrap();
+        drop(registration);
+    }
+}

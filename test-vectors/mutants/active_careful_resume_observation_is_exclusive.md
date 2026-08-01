@@ -20,5 +20,5 @@ expected AlreadyInUse, received Ok(())
 assertion failed: !cache.release(endpoint, &first, false)
 ```
 
-The required `vot-resume` mutation run reports 139 total, 132 caught, 7
+The required `vot-resume` mutation run reports 144 total, 137 caught, 7
 unviable, and 0 missed.

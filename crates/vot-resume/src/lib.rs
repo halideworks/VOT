@@ -186,9 +186,7 @@ impl ResumeTracker {
         checkpoint_window: usize,
     ) -> Result<Self, Error> {
         validate_total_units(total_units)?;
-        if checkpoint_window == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
+        validate_checkpoint_window(total_units, checkpoint_window)?;
         let checkpointed = store.reserve_object(subject, total_units)?;
         Ok(Self {
             subject,
@@ -475,6 +473,16 @@ impl CarefulResumeCache {
 
 fn validate_total_units(total_units: u64) -> Result<(), Error> {
     if total_units == 0 || total_units > MAX_UNITS_PER_OBJECT {
+        Err(Error::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_checkpoint_window(total_units: u64, checkpoint_window: usize) -> Result<(), Error> {
+    let checkpoint_window =
+        u64::try_from(checkpoint_window).map_err(|_| Error::InvalidConfiguration)?;
+    if checkpoint_window == 0 || checkpoint_window > total_units {
         Err(Error::InvalidConfiguration)
     } else {
         Ok(())
@@ -913,6 +921,14 @@ mod tests {
 
         let exact_path = temp_path("exact-bounds");
         let mut exact_store = ResumeStore::open(&exact_path).unwrap();
+        assert!(matches!(
+            ResumeTracker::discover(&mut exact_store, subject(6), 1, usize::MAX),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(matches!(
+            ResumeTracker::discover(&mut exact_store, subject(6), 1, 2),
+            Err(Error::InvalidConfiguration)
+        ));
         let mut exact = ResumeTracker::discover(&mut exact_store, subject(6), 1, 1).unwrap();
         assert!(exact.begin_unit(0).unwrap());
         assert!(matches!(exact.begin_unit(1), Err(Error::InvalidUnit)));

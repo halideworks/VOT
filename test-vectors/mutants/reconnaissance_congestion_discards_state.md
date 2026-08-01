@@ -17,5 +17,5 @@ left: Err(InitialFlightUnacknowledged)
 right: Err(Congestion)
 ```
 
-The required `vot-resume` mutation run reports 139 total, 132 caught, 7
+The required `vot-resume` mutation run reports 144 total, 137 caught, 7
 unviable, and 0 missed.

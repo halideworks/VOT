@@ -298,7 +298,7 @@ pub struct Observation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SavedPath {
     observation: Observation,
-    in_use: bool,
+    owner: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +316,7 @@ pub struct Reconnaissance {
 pub struct ResumePermit {
     pub jump_cwnd: u64,
     pub paced_rtt: u64,
+    owner: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,6 +337,7 @@ pub enum PathReject {
 #[derive(Default)]
 pub struct CarefulResumeCache {
     saved: BTreeMap<RemoteEndpoint, SavedPath>,
+    next_owner: u64,
 }
 
 impl CarefulResumeCache {
@@ -348,14 +350,18 @@ impl CarefulResumeCache {
         {
             return Err(PathReject::InvalidObservation);
         }
-        if self.saved.get(&endpoint).is_some_and(|saved| saved.in_use) {
+        if self
+            .saved
+            .get(&endpoint)
+            .is_some_and(|saved| saved.owner.is_some())
+        {
             return Err(PathReject::AlreadyInUse);
         }
         self.saved.insert(
             endpoint,
             SavedPath {
                 observation,
-                in_use: false,
+                owner: None,
             },
         );
         Ok(())
@@ -386,7 +392,7 @@ impl CarefulResumeCache {
             self.saved.remove(&saved_endpoint);
             return Err(PathReject::ConfigurationChanged);
         }
-        if saved.in_use {
+        if saved.owner.is_some() {
             return Err(PathReject::AlreadyInUse);
         }
         if !input.initial_flight_acknowledged {
@@ -402,19 +408,34 @@ impl CarefulResumeCache {
         if jump_cwnd == 0 {
             return Err(PathReject::InvalidObservation);
         }
-        saved.in_use = true;
+        let owner = self
+            .next_owner
+            .checked_add(1)
+            .ok_or(PathReject::InvalidObservation)?;
+        self.next_owner = owner;
+        saved.owner = Some(owner);
         Ok(ResumePermit {
             jump_cwnd,
             paced_rtt: input.current_min_rtt,
+            owner,
         })
     }
 
-    pub fn release(&mut self, endpoint: RemoteEndpoint, congestion_detected: bool) {
+    pub fn release(
+        &mut self,
+        endpoint: RemoteEndpoint,
+        permit: &ResumePermit,
+        congestion_detected: bool,
+    ) -> bool {
+        if self.saved.get(&endpoint).and_then(|saved| saved.owner) != Some(permit.owner) {
+            return false;
+        }
         if congestion_detected {
             self.saved.remove(&endpoint);
         } else if let Some(saved) = self.saved.get_mut(&endpoint) {
-            saved.in_use = false;
+            saved.owner = None;
         }
+        true
     }
 }
 
@@ -910,9 +931,9 @@ mod tests {
             cache.reconnoitre(endpoint, endpoint, input),
             Err(PathReject::AlreadyInUse)
         );
-        cache.release(endpoint, false);
-        assert!(cache.reconnoitre(endpoint, endpoint, input).is_ok());
-        cache.release(endpoint, true);
+        assert!(cache.release(endpoint, &permit, false));
+        let permit = cache.reconnoitre(endpoint, endpoint, input).unwrap();
+        assert!(cache.release(endpoint, &permit, true));
         assert_eq!(
             cache.reconnoitre(endpoint, endpoint, input),
             Err(PathReject::Unknown)
@@ -1036,6 +1057,42 @@ mod tests {
     }
 
     #[test]
+    fn delayed_release_cannot_clear_a_newer_permit_owner() {
+        let endpoint = RemoteEndpoint {
+            interface: 1,
+            destination: [10; 16],
+            dscp: 1,
+        };
+        let observation = Observation {
+            saved_cwnd: 1_000,
+            saved_rtt: 100,
+            expires_at: 1_000,
+            configuration_epoch: 4,
+        };
+        let input = Reconnaissance {
+            now: 1,
+            current_min_rtt: 100,
+            initial_flight_acknowledged: true,
+            congestion_detected: false,
+            local_path_changed: false,
+            configuration_epoch: 4,
+            max_jump: 900,
+        };
+        let mut cache = CarefulResumeCache::default();
+        cache.observe(endpoint, observation).unwrap();
+        let first = cache.reconnoitre(endpoint, endpoint, input).unwrap();
+        assert!(cache.release(endpoint, &first, false));
+        let second = cache.reconnoitre(endpoint, endpoint, input).unwrap();
+        assert!(!cache.release(endpoint, &first, false));
+        assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, input),
+            Err(PathReject::AlreadyInUse)
+        );
+        assert!(cache.release(endpoint, &second, false));
+        assert!(cache.reconnoitre(endpoint, endpoint, input).is_ok());
+    }
+
+    #[test]
     fn careful_resume_rejects_each_condition_and_accepts_exact_rtt_edge() {
         let endpoint = RemoteEndpoint {
             interface: 1,
@@ -1081,7 +1138,7 @@ mod tests {
         cache.observe(endpoint, observation).unwrap();
         let permit = cache.reconnoitre(endpoint, endpoint, base).unwrap();
         assert_eq!(permit.jump_cwnd, 500);
-        cache.release(endpoint, false);
+        assert!(cache.release(endpoint, &permit, false));
         assert_eq!(
             cache.reconnoitre(
                 endpoint,

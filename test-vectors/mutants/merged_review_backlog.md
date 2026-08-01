@@ -31,5 +31,11 @@ These checks close correctness findings left on merged pull requests.
 | Empty canonical package | Seal one empty manifest page with the empty package transcript root | `empty_canonical_manifest_cannot_publish` rejects it before destination or receipt publication |
 | Resume store read race | Check metadata and then read a separately resolved path to EOF | `store_and_unit_bounds_are_exact_and_checkpoint_failure_is_atomic` enforces the cap through one open handle |
 | Unacknowledged congested reconnaissance | Check initial-flight acknowledgement before the congestion signal | `reconnaissance_congestion_discards_saved_state` requires `Congestion` and removes the saved state for either acknowledgement value |
+| Stale path and configuration reuse | Reject a changed path or epoch without deleting the saved parameters | `stale_path_state_not_reused_unsafely` and E-RESUME require the next attempt to be `Unknown` |
+| Receipt recovery against unrelated data | Authenticate prepared evidence without verifying the visible destination | `existing_destination_must_match_before_receipt_recovery` refuses to finalize either receipt output |
+| Partial receipt cleanup | Require both preparation files after both authenticated final files are durable | `receipt_recovery_completes_after_one_preparation_was_cleaned` covers either remaining preparation |
+| macOS linked publication retry | Retry `hard_link` after the first link succeeded but directory sync failed | `macos_namespace_failure_retains_staging` recognizes the same inode and resumes at the namespace barrier |
+| Delayed Careful Resume release | Clear `in_use` without matching the permit owner | `delayed_release_cannot_clear_a_newer_permit_owner` proves the newer connection remains exclusive |
+| Unbounded inbound transport callbacks | Queue native TCP or MsQuic events without count, byte, or record limits | Both inbound backpressure tests reject full queues and oversized peer-controlled records |
 
 The safe TLC capability model explores 2,389,496 distinct states without violation. `CommitUnsupportedAdvance.cfg` reaches `PUBLISHED` for an unsupported profile and TLC reports `Invariant UnsupportedNeverAdvanced is violated`.

@@ -142,6 +142,7 @@ fn publish_for(
 
 trait Operations {
     fn sync_file(&mut self, path: &Path) -> Result<(), Error>;
+    fn same_file(&mut self, source: &Path, destination: &Path) -> Result<bool, Error>;
     fn link(&mut self, source: &Path, destination: &Path) -> Result<(), Error>;
     fn remove(&mut self, path: &Path) -> Result<(), Error>;
     fn sync_parent(&mut self, path: &Path) -> Result<(), Error>;
@@ -153,6 +154,26 @@ impl Operations for NativeOperations {
     fn sync_file(&mut self, path: &Path) -> Result<(), Error> {
         File::open(path)?.sync_all()?;
         Ok(())
+    }
+
+    fn same_file(&mut self, source: &Path, destination: &Path) -> Result<bool, Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let source = fs::metadata(source)?;
+            let destination = match fs::metadata(destination) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(Error::Io(error)),
+            };
+            Ok(source.dev() == destination.dev() && source.ino() == destination.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, destination);
+            Err(Error::UnsupportedPlatform)
+        }
     }
 
     fn link(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
@@ -194,9 +215,16 @@ fn publish_with(
     if profile == CommitProfile::Balanced {
         operations.sync_file(staging)?;
     }
-    operations.link(staging, destination)?;
+    let already_linked =
+        platform == Platform::MacOs && operations.same_file(staging, destination)?;
+    if !already_linked {
+        operations.link(staging, destination)?;
+    }
     if platform == Platform::MacOs {
         operations.sync_parent(destination)?;
+        if !operations.same_file(staging, destination)? {
+            return Err(Error::InvalidLayout);
+        }
     }
     operations.remove(staging)?;
     Ok(claim)
@@ -214,6 +242,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingOperations {
         trace: Vec<&'static str>,
+        linked: bool,
     }
 
     impl Operations for RecordingOperations {
@@ -222,8 +251,14 @@ mod tests {
             Ok(())
         }
 
+        fn same_file(&mut self, _source: &Path, _destination: &Path) -> Result<bool, Error> {
+            self.trace.push("same-file");
+            Ok(self.linked)
+        }
+
         fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
             self.trace.push("link");
+            self.linked = true;
             Ok(())
         }
 
@@ -235,6 +270,61 @@ mod tests {
         fn sync_parent(&mut self, _path: &Path) -> Result<(), Error> {
             self.trace.push("sync-parent");
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SyncBehavior {
+        Fail,
+        Succeed,
+        ReplaceDestination,
+    }
+
+    struct FaultOperations {
+        trace: Vec<&'static str>,
+        linked: bool,
+        sync_behavior: SyncBehavior,
+        removed: bool,
+    }
+
+    impl Operations for FaultOperations {
+        fn sync_file(&mut self, _path: &Path) -> Result<(), Error> {
+            self.trace.push("sync-file");
+            Ok(())
+        }
+
+        fn same_file(&mut self, _source: &Path, _destination: &Path) -> Result<bool, Error> {
+            self.trace.push("same-file");
+            Ok(self.linked)
+        }
+
+        fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
+            self.trace.push("link");
+            if self.linked {
+                return Err(Error::Io(io::Error::from(io::ErrorKind::AlreadyExists)));
+            }
+            self.linked = true;
+            Ok(())
+        }
+
+        fn remove(&mut self, _path: &Path) -> Result<(), Error> {
+            self.trace.push("remove");
+            self.removed = true;
+            Ok(())
+        }
+
+        fn sync_parent(&mut self, _path: &Path) -> Result<(), Error> {
+            self.trace.push("sync-parent");
+            match self.sync_behavior {
+                SyncBehavior::Fail => {
+                    Err(Error::Io(io::Error::other("injected namespace failure")))
+                }
+                SyncBehavior::Succeed => Ok(()),
+                SyncBehavior::ReplaceDestination => {
+                    self.linked = false;
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -291,6 +381,32 @@ mod tests {
         assert_eq!(result.actual_predecessor, AssuranceLevel::Durable);
         assert!(!staging.exists());
         assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_same_file_identity_is_exact() {
+        let root = directory("same-file");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        let linked = root.join("linked");
+        let other = root.join("other");
+        fs::write(&source, b"source").unwrap();
+        fs::hard_link(&source, &linked).unwrap();
+        fs::write(&other, b"other").unwrap();
+        let mut operations = NativeOperations;
+        assert!(operations.same_file(&source, &linked).unwrap());
+        assert!(!operations.same_file(&source, &other).unwrap());
+        assert!(
+            !operations
+                .same_file(&source, &root.join("missing"))
+                .unwrap()
+        );
+        assert!(matches!(
+            operations.same_file(&source, &source.join("child")),
+            Err(Error::Io(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -353,38 +469,27 @@ mod tests {
             &mut macos,
         )
         .unwrap();
-        assert_eq!(macos.trace, ["sync-file", "link", "sync-parent", "remove"]);
+        assert_eq!(
+            macos.trace,
+            [
+                "sync-file",
+                "same-file",
+                "link",
+                "sync-parent",
+                "same-file",
+                "remove",
+            ]
+        );
     }
 
     #[test]
     fn macos_namespace_failure_retains_staging() {
-        struct FailedNamespace {
-            trace: Vec<&'static str>,
-        }
-
-        impl Operations for FailedNamespace {
-            fn sync_file(&mut self, _path: &Path) -> Result<(), Error> {
-                self.trace.push("sync-file");
-                Ok(())
-            }
-
-            fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
-                self.trace.push("link");
-                Ok(())
-            }
-
-            fn remove(&mut self, _path: &Path) -> Result<(), Error> {
-                self.trace.push("remove");
-                Ok(())
-            }
-
-            fn sync_parent(&mut self, _path: &Path) -> Result<(), Error> {
-                self.trace.push("sync-parent");
-                Err(Error::Io(io::Error::other("injected namespace failure")))
-            }
-        }
-
-        let mut operations = FailedNamespace { trace: Vec::new() };
+        let mut operations = FaultOperations {
+            trace: Vec::new(),
+            linked: false,
+            sync_behavior: SyncBehavior::Fail,
+            removed: false,
+        };
         assert!(matches!(
             publish_with(
                 Platform::MacOs,
@@ -395,7 +500,53 @@ mod tests {
             ),
             Err(Error::Io(_))
         ));
-        assert_eq!(operations.trace, ["sync-file", "link", "sync-parent"]);
+        assert!(operations.linked);
+        assert!(!operations.removed);
+        operations.sync_behavior = SyncBehavior::Succeed;
+        publish_with(
+            Platform::MacOs,
+            Path::new("root/staging"),
+            Path::new("root/destination"),
+            CommitProfile::Balanced,
+            &mut operations,
+        )
+        .unwrap();
+        assert!(operations.removed);
+        assert_eq!(
+            operations.trace,
+            [
+                "sync-file",
+                "same-file",
+                "link",
+                "sync-parent",
+                "sync-file",
+                "same-file",
+                "sync-parent",
+                "same-file",
+                "remove",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_destination_replacement_after_sync_retains_staging() {
+        let mut replaced = FaultOperations {
+            trace: Vec::new(),
+            linked: false,
+            sync_behavior: SyncBehavior::ReplaceDestination,
+            removed: false,
+        };
+        assert!(matches!(
+            publish_with(
+                Platform::MacOs,
+                Path::new("root/staging"),
+                Path::new("root/destination"),
+                CommitProfile::Balanced,
+                &mut replaced,
+            ),
+            Err(Error::InvalidLayout)
+        ));
+        assert!(!replaced.removed);
     }
 
     #[test]

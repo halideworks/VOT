@@ -83,6 +83,7 @@ pub enum Error {
     InvalidConfiguration,
     RecordTooLarge,
     OutboundQueueFull,
+    InboundQueueFull,
     StagingExhausted,
     ArithmeticOverflow,
     Backend,

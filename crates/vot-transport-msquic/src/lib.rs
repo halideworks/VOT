@@ -54,6 +54,9 @@ pub struct MsQuicAdapter {
     command_count_limit: usize,
     command_byte_limit: usize,
     events: VecDeque<Event>,
+    event_bytes: usize,
+    event_count_limit: usize,
+    event_byte_limit: usize,
 }
 
 impl Default for MsQuicAdapter {
@@ -64,12 +67,15 @@ impl Default for MsQuicAdapter {
             command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
             events: VecDeque::new(),
+            event_bytes: 0,
+            event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
+            event_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
         }
     }
 }
 
 impl MsQuicAdapter {
-    /// Creates an adapter with explicit outbound queue limits.
+    /// Creates an adapter with explicit inbound and outbound queue limits.
     ///
     /// # Errors
     /// Rejects a zero command-count or byte limit.
@@ -80,11 +86,40 @@ impl MsQuicAdapter {
         Ok(Self {
             command_count_limit: command_count,
             command_byte_limit: command_bytes,
+            event_count_limit: command_count,
+            event_byte_limit: command_bytes,
             ..Self::default()
         })
     }
 
-    pub fn record_native_event(&mut self, event: NativeEvent) {
+    /// Queues a native callback after enforcing protocol and memory bounds.
+    ///
+    /// # Errors
+    /// Rejects oversized records, arithmetic overflow, or a full inbound queue.
+    pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
+        let payload_len = match &event {
+            NativeEvent::Control(bytes) => {
+                if bytes.len() > vot_codec_limit() {
+                    return Err(Error::RecordTooLarge);
+                }
+                bytes.len()
+            }
+            NativeEvent::Reliable { bytes, .. } => {
+                vot_transport_api::validate_data_record(bytes)?;
+                bytes.len()
+            }
+            NativeEvent::Connected(_)
+            | NativeEvent::Disconnected(_)
+            | NativeEvent::Acknowledged { .. }
+            | NativeEvent::DatagramState { .. } => 0,
+        };
+        let next_bytes = self
+            .event_bytes
+            .checked_add(payload_len)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
+            return Err(Error::InboundQueueFull);
+        }
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
             NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
@@ -114,6 +149,8 @@ impl MsQuicAdapter {
                 },
             },
         });
+        self.event_bytes = next_bytes;
+        Ok(())
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
@@ -162,11 +199,23 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn poll(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
+        Some(event)
     }
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
         self.enqueue(Command::ReceiveCredit(bytes))
+    }
+}
+
+fn event_payload_len(event: &Event) -> usize {
+    match event {
+        Event::Control(bytes) | Event::Reliable { bytes, .. } => bytes.len(),
+        Event::Connected(_)
+        | Event::Disconnected(_)
+        | Event::Acknowledged(_)
+        | Event::DatagramState { .. } => 0,
     }
 }
 
@@ -518,10 +567,12 @@ mod tests {
     #[test]
     fn datagram_send_state_is_exposed_for_later_use() {
         let mut adapter = MsQuicAdapter::default();
-        adapter.record_native_event(NativeEvent::DatagramState {
-            context: 77,
-            state: NativeDatagramSendState::LostSuspect,
-        });
+        adapter
+            .record_native_event(NativeEvent::DatagramState {
+                context: 77,
+                state: NativeDatagramSendState::LostSuspect,
+            })
+            .unwrap();
         assert_eq!(
             adapter.poll(),
             Some(Event::DatagramState {
@@ -577,6 +628,62 @@ mod tests {
             Some(Command::Reliable { .. })
         ));
         adapter.send_control(b"6789").unwrap();
+    }
+
+    #[test]
+    fn inbound_queue_applies_record_count_and_byte_backpressure() {
+        let mut adapter = MsQuicAdapter::with_queue_limits(2, 5).unwrap();
+        adapter
+            .record_native_event(NativeEvent::Control(b"123".to_vec()))
+            .unwrap();
+        adapter
+            .record_native_event(NativeEvent::Reliable {
+                stream: 1,
+                sequence: 2,
+                bytes: b"45".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::DatagramState {
+                context: 3,
+                state: NativeDatagramSendState::Sent,
+            }),
+            Err(Error::InboundQueueFull)
+        );
+        assert!(matches!(adapter.poll(), Some(Event::Control(_))));
+        adapter
+            .record_native_event(NativeEvent::Control(b"678".to_vec()))
+            .unwrap();
+        assert!(matches!(adapter.poll(), Some(Event::Reliable { .. })));
+        assert!(matches!(adapter.poll(), Some(Event::Control(_))));
+
+        let mut bytes = MsQuicAdapter::with_queue_limits(3, 5).unwrap();
+        bytes
+            .record_native_event(NativeEvent::Control(b"123".to_vec()))
+            .unwrap();
+        assert_eq!(
+            bytes.record_native_event(NativeEvent::Control(b"456".to_vec())),
+            Err(Error::InboundQueueFull)
+        );
+
+        let mut oversized = MsQuicAdapter::default();
+        oversized
+            .record_native_event(NativeEvent::Control(vec![0; vot_codec_limit()]))
+            .unwrap();
+        assert!(matches!(oversized.poll(), Some(Event::Control(_))));
+        assert_eq!(
+            oversized.record_native_event(NativeEvent::Control(vec![0; vot_codec_limit() + 1])),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            oversized.record_native_event(NativeEvent::Reliable {
+                stream: 1,
+                sequence: 1,
+                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1],
+            }),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(oversized.poll(), None);
     }
 
     #[cfg(feature = "live")]

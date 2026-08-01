@@ -62,6 +62,9 @@ pub struct TcpAdapter {
     command_count_limit: usize,
     command_byte_limit: usize,
     events: VecDeque<Event>,
+    event_bytes: usize,
+    event_count_limit: usize,
+    event_byte_limit: usize,
 }
 
 impl Default for TcpAdapter {
@@ -72,6 +75,9 @@ impl Default for TcpAdapter {
             command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
             events: VecDeque::new(),
+            event_bytes: 0,
+            event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
+            event_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
         }
     }
 }
@@ -84,11 +90,39 @@ impl TcpAdapter {
         Ok(Self {
             command_count_limit: command_count,
             command_byte_limit: command_bytes,
+            event_count_limit: command_count,
+            event_byte_limit: command_bytes,
             ..Self::default()
         })
     }
 
-    pub fn record_native_event(&mut self, event: NativeEvent) {
+    /// Queues a native callback after enforcing protocol and memory bounds.
+    ///
+    /// # Errors
+    /// Rejects oversized records, arithmetic overflow, or a full inbound queue.
+    pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
+        let payload_len = match &event {
+            NativeEvent::Control(bytes) => {
+                if bytes.len() > CONTROL_LIMIT {
+                    return Err(Error::RecordTooLarge);
+                }
+                bytes.len()
+            }
+            NativeEvent::Reliable { bytes, .. } => {
+                vot_transport_api::validate_data_record(bytes)?;
+                bytes.len()
+            }
+            NativeEvent::Connected(_)
+            | NativeEvent::Disconnected(_)
+            | NativeEvent::Acknowledged { .. } => 0,
+        };
+        let next_bytes = self
+            .event_bytes
+            .checked_add(payload_len)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
+            return Err(Error::InboundQueueFull);
+        }
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
             NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
@@ -106,6 +140,8 @@ impl TcpAdapter {
                 Event::Acknowledged(TransportAck::new(stream, sequence))
             }
         });
+        self.event_bytes = next_bytes;
+        Ok(())
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
@@ -145,11 +181,23 @@ impl TransportAdapter for TcpAdapter {
     }
 
     fn poll(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
+        Some(event)
     }
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
         self.enqueue(Command::ReceiveCredit(bytes))
+    }
+}
+
+fn event_payload_len(event: &Event) -> usize {
+    match event {
+        Event::Control(bytes) | Event::Reliable { bytes, .. } => bytes.len(),
+        Event::Connected(_)
+        | Event::Disconnected(_)
+        | Event::Acknowledged(_)
+        | Event::DatagramState { .. } => 0,
     }
 }
 
@@ -495,7 +543,7 @@ mod tests {
             NativeEvent::Disconnected(1),
         ];
         for event in events {
-            control.record_native_event(event);
+            control.record_native_event(event).unwrap();
         }
         assert_eq!(control.poll(), Some(Event::Connected(ConnectionId(1))));
         assert_eq!(control.poll(), Some(Event::Control(b"control".to_vec())));
@@ -503,6 +551,63 @@ mod tests {
         assert!(matches!(control.poll(), Some(Event::Acknowledged(_))));
         assert_eq!(control.poll(), Some(Event::Disconnected(ConnectionId(1))));
         assert_eq!(control.poll(), None);
+    }
+
+    #[test]
+    fn inbound_events_apply_record_count_and_byte_backpressure() {
+        let mut adapter = TcpAdapter::with_queue_limits(2, 5).unwrap();
+        adapter
+            .record_native_event(NativeEvent::Control(b"123".to_vec()))
+            .unwrap();
+        adapter
+            .record_native_event(NativeEvent::Reliable {
+                stream: 1,
+                sequence: 2,
+                bytes: b"45".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::Acknowledged {
+                stream: 1,
+                sequence: 2,
+            }),
+            Err(Error::InboundQueueFull)
+        );
+        assert!(matches!(adapter.poll(), Some(Event::Control(_))));
+        adapter
+            .record_native_event(NativeEvent::Control(b"678".to_vec()))
+            .unwrap();
+        assert!(matches!(adapter.poll(), Some(Event::Reliable { .. })));
+        assert!(matches!(adapter.poll(), Some(Event::Control(_))));
+        assert_eq!(adapter.poll(), None);
+
+        let mut bytes = TcpAdapter::with_queue_limits(3, 5).unwrap();
+        bytes
+            .record_native_event(NativeEvent::Control(b"123".to_vec()))
+            .unwrap();
+        assert_eq!(
+            bytes.record_native_event(NativeEvent::Control(b"456".to_vec())),
+            Err(Error::InboundQueueFull)
+        );
+
+        let mut oversized = TcpAdapter::default();
+        oversized
+            .record_native_event(NativeEvent::Control(vec![0; CONTROL_LIMIT]))
+            .unwrap();
+        assert!(matches!(oversized.poll(), Some(Event::Control(_))));
+        assert_eq!(
+            oversized.record_native_event(NativeEvent::Control(vec![0; CONTROL_LIMIT + 1])),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            oversized.record_native_event(NativeEvent::Reliable {
+                stream: 1,
+                sequence: 1,
+                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1],
+            }),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(oversized.poll(), None);
     }
 
     #[test]

@@ -20,5 +20,5 @@ Observed failure:
 assertion failed: !client.is_authenticated()
 ```
 
-The required `vot-transport-tcp` mutation run reports 78 total, 69 caught, 9
+The required `vot-transport-tcp` mutation run reports 90 total, 81 caught, 9
 unviable, and 0 missed.

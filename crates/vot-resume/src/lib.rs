@@ -405,6 +405,13 @@ impl CarefulResumeCache {
         current_endpoint: RemoteEndpoint,
         input: Reconnaissance,
     ) -> Result<ResumePermit, PathReject> {
+        if self
+            .saved
+            .get(&saved_endpoint)
+            .is_some_and(|saved| saved.owner.is_some())
+        {
+            return Err(PathReject::AlreadyInUse);
+        }
         if saved_endpoint != current_endpoint || input.local_path_changed {
             self.saved.remove(&saved_endpoint);
             return Err(PathReject::PathChanged);
@@ -423,9 +430,6 @@ impl CarefulResumeCache {
         if input.configuration_epoch != saved.observation.configuration_epoch {
             self.saved.remove(&saved_endpoint);
             return Err(PathReject::ConfigurationChanged);
-        }
-        if saved.owner.is_some() {
-            return Err(PathReject::AlreadyInUse);
         }
         if !input.initial_flight_acknowledged {
             return Err(PathReject::InitialFlightUnacknowledged);
@@ -1161,7 +1165,7 @@ mod tests {
         };
         let mut cache = CarefulResumeCache::default();
         cache.observe(endpoint, observation).unwrap();
-        cache.reconnoitre(endpoint, endpoint, input).unwrap();
+        let permit = cache.reconnoitre(endpoint, endpoint, input).unwrap();
         assert_eq!(
             cache.observe(
                 endpoint,
@@ -1175,6 +1179,52 @@ mod tests {
         assert_eq!(
             cache.reconnoitre(endpoint, endpoint, input),
             Err(PathReject::AlreadyInUse)
+        );
+        assert_eq!(
+            cache.reconnoitre(
+                endpoint,
+                RemoteEndpoint {
+                    interface: 2,
+                    ..endpoint
+                },
+                input
+            ),
+            Err(PathReject::AlreadyInUse)
+        );
+        for invalidation in [
+            Reconnaissance {
+                local_path_changed: true,
+                ..input
+            },
+            Reconnaissance {
+                congestion_detected: true,
+                ..input
+            },
+            Reconnaissance {
+                now: observation.expires_at,
+                ..input
+            },
+            Reconnaissance {
+                configuration_epoch: observation.configuration_epoch + 1,
+                ..input
+            },
+        ] {
+            assert_eq!(
+                cache.reconnoitre(endpoint, endpoint, invalidation),
+                Err(PathReject::AlreadyInUse)
+            );
+        }
+        assert!(cache.release(endpoint, &permit, false));
+        assert_eq!(
+            cache.reconnoitre(
+                endpoint,
+                endpoint,
+                Reconnaissance {
+                    local_path_changed: true,
+                    ..input
+                }
+            ),
+            Err(PathReject::PathChanged)
         );
     }
 

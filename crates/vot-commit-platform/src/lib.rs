@@ -403,10 +403,17 @@ mod tests {
                 .same_file(&source, &root.join("missing"))
                 .unwrap()
         );
+        #[cfg(unix)]
         assert!(matches!(
             operations.same_file(&source, &source.join("child")),
             Err(Error::Io(_))
         ));
+        #[cfg(windows)]
+        assert!(
+            !operations
+                .same_file(&source, &source.join("child"))
+                .unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

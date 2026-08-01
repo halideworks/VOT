@@ -600,6 +600,32 @@ mod tests {
     }
 
     #[test]
+    fn command_drain_preserves_order_and_removes_submitted_commands() {
+        let mut adapter = TcpAdapter::default();
+        adapter.send_control(b"control").unwrap();
+        adapter.send_reliable(StreamId(4), b"payload").unwrap();
+
+        let mut seen = Vec::new();
+        adapter
+            .drain_commands(|command| {
+                seen.push(command);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                Command::Control(shared_payload(b"control")),
+                Command::Reliable {
+                    stream: StreamId(4),
+                    bytes: shared_payload(b"payload"),
+                },
+            ]
+        );
+        assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
     fn adapter_preserves_identical_vot_bytes_and_bounds_queues() {
         let mut adapter = TcpAdapter::with_queue_limits(2, 8).unwrap();
         adapter.send_control(b"abc").unwrap();
@@ -672,6 +698,12 @@ mod tests {
             })
         );
         assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
+    fn path_stats_are_unavailable_without_a_native_path() {
+        let adapter = TcpAdapter::default();
+        assert_eq!(adapter.path_stats(), None);
     }
 
     #[test]

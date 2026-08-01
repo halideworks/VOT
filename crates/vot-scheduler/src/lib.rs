@@ -590,6 +590,40 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_begin_modes_are_rejected_while_active() {
+        let object = subject(b"duplicate");
+        let mut sequential =
+            ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
+        sequential.begin(object).unwrap();
+        assert_eq!(sequential.begin(object), Err(Error::AlreadyReceiving));
+
+        let mut ranged =
+            ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
+        ranged.begin_ranges(object).unwrap();
+        assert_eq!(ranged.begin_ranges(object), Err(Error::AlreadyReceiving));
+    }
+
+    #[test]
+    fn finish_ranges_requires_the_expected_unit_set() {
+        let object = SubjectId {
+            suite: 1,
+            root: [0; 32],
+            length: 2 * RANGE_UNIT_BYTES,
+        };
+        let mut receiver =
+            ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
+        receiver.range_active.insert(
+            object,
+            RangeState {
+                segments: BTreeMap::new(),
+                covered_units: BTreeSet::from([1, 2]),
+                bytes: 0,
+            },
+        );
+        assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
+    }
+
+    #[test]
     fn path_stats_update_staging_bdp_target() {
         let mut receiver = ReliableReceiver::new(4096, 1, 4096).unwrap();
         assert_eq!(receiver.advertised_credit(), 1);
@@ -607,6 +641,22 @@ mod tests {
             mtu_bytes: Some(1500),
         });
         assert_eq!(receiver.advertised_credit(), 2_048);
+
+        let mut zero_bdp = ReliableReceiver::new(4096, 1, 4096).unwrap();
+        zero_bdp.observe_path_stats(PathStats {
+            pacing_rate_bps: Some(1),
+            smoothed_rtt_us: Some(1),
+            congestion_window_bytes: None,
+            mtu_bytes: None,
+        });
+        assert_eq!(zero_bdp.advertised_credit(), 1);
+        zero_bdp.observe_path_stats(PathStats {
+            pacing_rate_bps: None,
+            smoothed_rtt_us: None,
+            congestion_window_bytes: Some(0),
+            mtu_bytes: None,
+        });
+        assert_eq!(zero_bdp.advertised_credit(), 1);
     }
 
     #[test]

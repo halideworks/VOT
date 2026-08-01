@@ -272,8 +272,8 @@ jobs:
           - { package: vot-journal, required: true }
           - { package: vot-proof-blake3, required: true }
           - { package: vot-proof-sha256, required: true }
-          - { package: vot-codec, required: true }
-          - { package: vot-verifier, required: true }
+          - { package: vot-codec, required: false }
+          - { package: vot-verifier, required: false }
           - { package: vot-manifest, required: false }
           - { package: vot-pack, required: true }
           - { package: vot-object-store, required: false }

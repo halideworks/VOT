@@ -679,9 +679,21 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
     }
     let mut objects = BTreeMap::new();
     while !decoder.is_empty() {
+        let record_start = bytes.len().saturating_sub(decoder.remaining.len());
+        if decoder.remaining.len() < RECORD_HEADER_BYTES as usize {
+            truncate_torn_tail(path, record_start)?;
+            return Ok(objects);
+        }
         let record_length = usize::try_from(decoder.u32()?).map_err(|_| Error::Corrupt)?;
         if !record_length_valid(record_length) {
             return Err(Error::Corrupt);
+        }
+        let required = record_length
+            .checked_add(RECORD_CHECKSUM_BYTES as usize)
+            .ok_or(Error::Corrupt)?;
+        if decoder.remaining.len() < required {
+            truncate_torn_tail(path, record_start)?;
+            return Ok(objects);
         }
         let record = decoder.take(record_length)?;
         let checksum = decoder.take(RECORD_CHECKSUM_BYTES as usize)?;
@@ -692,6 +704,15 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
         apply_record(record, &mut objects)?;
     }
     Ok(objects)
+}
+
+fn truncate_torn_tail(path: &Path, valid_length: usize) -> Result<(), Error> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(u64::try_from(valid_length).map_err(|_| Error::TooLarge)?)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+    Ok(())
 }
 
 fn record_length_valid(record_length: usize) -> bool {
@@ -1112,9 +1133,36 @@ mod tests {
         let mut rediscovered = ResumeTracker::discover(&mut reopened, subject(1), 10, 3).unwrap();
         assert!(!rediscovered.begin_unit(0).unwrap());
         let mut bytes = fs::read(&path).unwrap();
-        bytes[10] ^= 1;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
         fs::write(&path, bytes).unwrap();
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn torn_final_record_is_truncated_and_valid_prefix_replayed() {
+        let path = temp_path("torn-tail");
+        let mut store = ResumeStore::open(&path).unwrap();
+        store.reserve_many([(subject(11), 3)]).unwrap();
+        let valid_length = fs::metadata(&path).unwrap().len();
+        let torn_record = encode_record(&encode_reserve(subject(12), 3).unwrap()).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&torn_record[..torn_record.len() - 1]);
+        fs::write(&path, bytes).unwrap();
+
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert!(reopened.checkpointed(subject(11)).is_some());
+        assert!(reopened.checkpointed(subject(12)).is_none());
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_length);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0, 0]);
+        fs::write(&path, bytes).unwrap();
+        ResumeStore::open(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_length);
+
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }

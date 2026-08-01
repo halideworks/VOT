@@ -217,16 +217,6 @@ impl TransportAdapter for TcpAdapter {
         })
     }
 
-    fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
-        if payload.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
-            return Err(Error::RecordTooLarge);
-        }
-        self.enqueue(Command::Datagram {
-            context,
-            bytes: shared_payload(payload),
-        })
-    }
-
     fn poll(&mut self) -> Option<Event> {
         let event = self.events.pop_front()?;
         self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
@@ -604,6 +594,16 @@ mod tests {
             ),
             Err(Error::RecordTooLarge)
         );
+    }
+
+    #[test]
+    fn tcp_datagrams_are_explicitly_unsupported() {
+        let mut adapter = TcpAdapter::default();
+        assert_eq!(
+            adapter.send_datagram(7, b"datagram"),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(adapter.next_command(), None);
     }
 
     #[test]

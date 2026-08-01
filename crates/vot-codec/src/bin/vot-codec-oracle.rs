@@ -75,3 +75,52 @@ fn encode_hex(input: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_helpers_cover_digits_letters_and_invalid_input() {
+        assert_eq!(decode_hex("00af10"), Some(vec![0, 0xaf, 0x10]));
+        assert_eq!(decode_hex("0"), None);
+        assert_eq!(decode_hex("0g"), None);
+        assert_eq!(encode_hex(&[0, 1, 0xaf, 0xff]), "0001afff");
+    }
+
+    #[test]
+    fn error_names_cover_protocol_errors() {
+        assert_eq!(
+            error_name(&DecodeError::Incomplete {
+                needed: 2,
+                available: 1
+            }),
+            "INCOMPLETE"
+        );
+        assert_eq!(
+            error_name(&DecodeError::FrameTooLarge {
+                frame_type: 1,
+                length: 2,
+                limit: 1
+            }),
+            "FRAME_TOO_LARGE"
+        );
+        assert_eq!(
+            error_name(&DecodeError::UnknownCritical(1)),
+            "UNKNOWN_CRITICAL_FRAME"
+        );
+        assert_eq!(
+            error_name(&DecodeError::TooManyFrames { limit: 1 }),
+            "TOO_MANY_FRAMES"
+        );
+        assert_eq!(
+            error_name(&DecodeError::ValueOutOfRange(1)),
+            "MALFORMED_FRAME"
+        );
+        assert_eq!(error_name(&DecodeError::InvalidLimits), "MALFORMED_FRAME");
+        assert_eq!(
+            error_name(&DecodeError::LengthOverflow(1)),
+            "MALFORMED_FRAME"
+        );
+    }
+}

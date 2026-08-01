@@ -560,13 +560,47 @@ fn validate_data_record(value: &DataRecord) -> Result<(), Error> {
         || value.plaintext_length == 0
         || value.plaintext_length > MAX_DATA_BYTES as u64
         || encoded_length == 0
-        || encoded_length > MAX_DATA_BYTES as u64
+        || data_record_payload_len(value) > MAX_DATA_BYTES
         || !matches!(value.compression, 0 | 1)
         || (value.compression == 0 && value.plaintext_length != encoded_length)
     {
         Err(Error::InvalidValue)
     } else {
         Ok(())
+    }
+}
+
+fn data_record_payload_len(value: &DataRecord) -> usize {
+    cbor_head_len(8)
+        .saturating_add(cbor_head_len(0))
+        .saturating_add(cbor_head_len(0))
+        .saturating_add(cbor_head_len(1))
+        .saturating_add(cbor_byte_string_len(16))
+        .saturating_add(cbor_head_len(2))
+        .saturating_add(cbor_head_len(value.record_index))
+        .saturating_add(cbor_head_len(3))
+        .saturating_add(cbor_head_len(value.plaintext_offset))
+        .saturating_add(cbor_head_len(4))
+        .saturating_add(cbor_head_len(value.plaintext_length))
+        .saturating_add(cbor_head_len(5))
+        .saturating_add(cbor_head_len(u64::from(value.compression)))
+        .saturating_add(cbor_head_len(6))
+        .saturating_add(cbor_head_len(value.encoded.len() as u64))
+        .saturating_add(cbor_head_len(7))
+        .saturating_add(cbor_byte_string_len(value.encoded.len()))
+}
+
+fn cbor_byte_string_len(length: usize) -> usize {
+    cbor_head_len(length as u64).saturating_add(length)
+}
+
+fn cbor_head_len(value: u64) -> usize {
+    match value {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
     }
 }
 
@@ -980,6 +1014,95 @@ mod tests {
         let (decoded_data, _) = decode(&encoded[used..], DecodeLimits::default()).unwrap();
         assert_eq!(decoded_bundle, bundle);
         assert_eq!(decoded_data, data);
+    }
+
+    #[test]
+    fn data_record_limit_includes_typed_payload_overhead() {
+        let make_data = |encoded_length: usize| DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: encoded_length as u64,
+            compression: 0,
+            encoded: vec![0xaa; encoded_length],
+        };
+        let mut maximum_encoded_length = MAX_DATA_BYTES;
+        while data_record_payload_len(&make_data(maximum_encoded_length)) > MAX_DATA_BYTES {
+            maximum_encoded_length -= 1;
+        }
+        let valid = make_data(maximum_encoded_length);
+        assert!(valid.validate().is_ok());
+        assert!(encode(&TypedFrame::DataRecord(valid), &mut Vec::new()).is_ok());
+
+        let invalid = make_data(maximum_encoded_length + 1);
+        assert!(data_record_payload_len(&invalid) > MAX_DATA_BYTES);
+        assert_eq!(invalid.validate(), Err(Error::InvalidValue));
+        assert_eq!(
+            encode(&TypedFrame::DataRecord(invalid), &mut Vec::new()),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn data_record_validation_boundaries_are_explicit() {
+        let mut data = DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: 1,
+            compression: 0,
+            encoded: vec![0xaa],
+        };
+        data.record_index = 16;
+        assert!(data.validate().is_ok());
+        data.record_index = 17;
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+
+        data.record_index = 0;
+        data.plaintext_offset = MAX_OBJECT_LENGTH;
+        assert!(data.validate().is_ok());
+        data.plaintext_offset += 1;
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+
+        data.plaintext_offset = 0;
+        data.plaintext_length = MAX_DATA_BYTES as u64;
+        data.compression = 1;
+        assert!(data.validate().is_ok());
+        data.plaintext_length += 1;
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+
+        data.plaintext_length = 1;
+        data.compression = 0;
+        data.encoded.clear();
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+
+        data.encoded.push(0xaa);
+        data.compression = 2;
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+
+        data.compression = 0;
+        data.plaintext_length = 2;
+        assert_eq!(data.validate(), Err(Error::InvalidValue));
+        data.compression = 1;
+        assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn cbor_head_width_boundaries_are_canonical() {
+        assert_eq!(
+            [
+                cbor_head_len(0),
+                cbor_head_len(23),
+                cbor_head_len(24),
+                cbor_head_len(255),
+                cbor_head_len(256),
+                cbor_head_len(65_535),
+                cbor_head_len(65_536),
+                cbor_head_len(u64::from(u32::MAX)),
+                cbor_head_len(u64::from(u32::MAX) + 1),
+            ],
+            [1, 1, 2, 2, 3, 3, 5, 5, 9]
+        );
     }
 
     #[test]

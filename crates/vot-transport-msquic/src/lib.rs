@@ -557,6 +557,8 @@ mod tests {
 
     #[test]
     fn outbound_queue_applies_count_and_byte_backpressure() {
+        assert_eq!(DEFAULT_COMMAND_COUNT_LIMIT, 64);
+        assert_eq!(DEFAULT_COMMAND_BYTE_LIMIT, 4_194_304);
         assert_eq!(
             MsQuicAdapter::with_queue_limits(0, 1).err(),
             Some(Error::InvalidConfiguration)

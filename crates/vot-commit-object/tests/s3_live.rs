@@ -17,18 +17,18 @@ fn minio_and_mock_emit_identical_assurance_receipts() {
     let mut mock = ObjectCommit::create(MockStore::default(), &key, 0).unwrap();
     mock.upload_verified_part(1, &first).unwrap();
     mock.upload_verified_part(2, &second).unwrap();
-    let (_, mock_object, mock_receipt) = mock.complete().unwrap();
+    let (mock_object, mock_receipt) = mock.complete().unwrap();
 
     let store = AwsS3Store::new(&endpoint, &bucket, "us-east-1", &access_key, &secret_key).unwrap();
     let mut live = ObjectCommit::create(store, &key, 0).unwrap();
     live.upload_verified_part(1, &first).unwrap();
     live.upload_verified_part(2, &second).unwrap();
-    let (live_store, live_object, live_receipt) = live.complete().unwrap();
+    let (live_object, live_receipt) = live.complete().unwrap();
 
     assert_eq!(live_object, mock_object);
     assert_eq!(live_receipt, mock_receipt);
     assert_eq!(
-        live_store.head(&key),
+        live.store().head(&key),
         Some((mock_object.bytes.len() as u64, mock_object.checksum_crc32c))
     );
     let conflict_store =
@@ -41,5 +41,5 @@ fn minio_and_mock_emit_identical_assurance_receipts() {
         Err(CommitError::Store(StoreError::Backend))
     ));
 
-    live_store.delete_object(&key).unwrap();
+    live.store().delete_object(&key).unwrap();
 }

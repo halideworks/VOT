@@ -4,10 +4,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use vot_commit_model::{Assurance, Event, Machine, Profile, State};
-use vot_commit_strict::{ReadBack, Suite};
+use vot_commit_strict::{LinuxDirectReader, ReadBack, Suite};
 use vot_journal::Journal;
 
 const JOURNAL_ADMITTED: u8 = 1;
@@ -72,6 +73,8 @@ pub enum Error {
     UnsupportedProfile,
     Poisoned,
     MissingObservation,
+    DestinationIdentityMismatch,
+    StrictIdentityMismatch,
 }
 
 impl From<io::Error> for Error {
@@ -140,6 +143,9 @@ impl<F: FaultInjector> PosixCommit<F> {
         if self.machine.state() == State::Poisoned {
             return Err(Error::Poisoned);
         }
+        if self.machine.state() != State::Admitted {
+            return Err(Error::Model(vot_commit_model::Error::InvalidTransition));
+        }
         if let Err(error) = self
             .faults
             .check(FaultPoint::Write)
@@ -169,16 +175,35 @@ impl<F: FaultInjector> PosixCommit<F> {
         self.publish_namespace()
     }
 
-    pub fn publish_strict<R: ReadBack>(
+    pub fn publish_strict(
         &mut self,
-        reader: &R,
         suite: Suite,
         expected: &[u8; 32],
+        alignment: usize,
     ) -> Result<Receipt, Error> {
         if self.profile != Profile::Strict {
             return Err(Error::UnsupportedProfile);
         }
         self.prepare_durable()?;
+        let logical_length = self.staging.metadata()?.len();
+        let reader = LinuxDirectReader::open(&self.staging_path, logical_length, alignment)
+            .map_err(Error::Strict)?;
+        match reader.identity(&self.staging).map_err(Error::Strict)? {
+            vot_commit_strict::DirectIdentity::Match
+            | vot_commit_strict::DirectIdentity::Unsupported => {}
+            vot_commit_strict::DirectIdentity::Mismatch => {
+                return Err(Error::StrictIdentityMismatch);
+            }
+        }
+        self.finish_strict(&reader, suite, expected)
+    }
+
+    fn finish_strict<R: ReadBack>(
+        &mut self,
+        reader: &R,
+        suite: Suite,
+        expected: &[u8; 32],
+    ) -> Result<Receipt, Error> {
         let verification =
             vot_commit_strict::verify_and_advance(&mut self.machine, reader, suite, expected)
                 .map_err(Error::Strict)?;
@@ -199,6 +224,20 @@ impl<F: FaultInjector> PosixCommit<F> {
         }
         self.trace.push(TraceEvent::AtRestVerified);
         self.publish_namespace()
+    }
+
+    #[cfg(test)]
+    fn publish_strict_with_test_reader<R: ReadBack>(
+        &mut self,
+        reader: &R,
+        suite: Suite,
+        expected: &[u8; 32],
+    ) -> Result<Receipt, Error> {
+        if self.profile != Profile::Strict {
+            return Err(Error::UnsupportedProfile);
+        }
+        self.prepare_durable()?;
+        self.finish_strict(reader, suite, expected)
     }
 
     fn prepare_durable(&mut self) -> Result<(), Error> {
@@ -306,6 +345,9 @@ pub fn recover(
         if last == Some(JOURNAL_PUBLISHED) {
             return Ok(RecoveryDisposition::AlreadyPublished);
         }
+        if !same_file(staging_path, destination)? {
+            return Err(Error::DestinationIdentityMismatch);
+        }
         return Ok(RecoveryDisposition::FinishDirectoryFlush);
     }
     if staging_path.exists() {
@@ -315,6 +357,12 @@ pub fn recover(
         io::ErrorKind::NotFound,
         "no recoverable object",
     )))
+}
+
+fn same_file(left: &Path, right: &Path) -> Result<bool, Error> {
+    let left = fs::metadata(left)?;
+    let right = fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 #[cfg(test)]
@@ -432,6 +480,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_verified_write_cannot_mutate_published_bytes() {
+        let directory = directory("repeat-write");
+        let mut commit = provider(&directory, Profile::Fast, None);
+        commit.write_transit_verified(b"first").unwrap();
+        assert!(matches!(
+            commit.write_transit_verified(b"second"),
+            Err(Error::Model(vot_commit_model::Error::InvalidTransition))
+        ));
+        commit.publish().unwrap();
+        assert_eq!(fs::read(directory.join("object")).unwrap(), b"first");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_unrelated_destination_identity() {
+        let directory = directory("recovery-identity");
+        let mut commit = provider(&directory, Profile::Fast, None);
+        commit.write_transit_verified(b"staged").unwrap();
+        fs::write(directory.join("object"), b"unrelated").unwrap();
+        assert!(matches!(
+            recover(
+                &directory.join("journal"),
+                [4; 16],
+                &directory.join("stage"),
+                &directory.join("object")
+            ),
+            Err(Error::DestinationIdentityMismatch)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn every_injected_commit_fault_emits_no_false_receipt() {
         let faults = [
             FaultPoint::Write,
@@ -544,7 +624,7 @@ mod tests {
             let mut commit = provider(&directory, Profile::Strict, None);
             commit.write_transit_verified(&bytes).unwrap();
             let receipt = commit
-                .publish_strict(
+                .publish_strict_with_test_reader(
                     &MemoryReader(DirectHash::Supported(expected)),
                     Suite::Blake3Bao64,
                     &expected,
@@ -573,7 +653,7 @@ mod tests {
             let mut corrupted_hash = expected;
             corrupted_hash[0] ^= 1;
             assert!(matches!(
-                commit.publish_strict(
+                commit.publish_strict_with_test_reader(
                     &MemoryReader(DirectHash::Supported(corrupted_hash)),
                     Suite::Blake3Bao64,
                     &expected,
@@ -592,7 +672,7 @@ mod tests {
             let mut commit = provider(&directory, Profile::Strict, None);
             commit.write_transit_verified(b"bytes").unwrap();
             assert!(matches!(
-                commit.publish_strict(
+                commit.publish_strict_with_test_reader(
                     &MemoryReader(DirectHash::Unsupported),
                     Suite::Blake3Bao64,
                     &blake3::hash(b"bytes").into(),
@@ -603,5 +683,20 @@ mod tests {
             drop(commit);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn strict_public_api_reads_back_its_own_staging_file() {
+        let directory = directory("strict-bound-reader");
+        let bytes = b"provider-owned strict reader";
+        let expected = *blake3::hash(bytes).as_bytes();
+        let mut commit = provider(&directory, Profile::Strict, None);
+        commit.write_transit_verified(bytes).unwrap();
+        match commit.publish_strict(Suite::Blake3Bao64, &expected, 4096) {
+            Ok(receipt) => assert_eq!(receipt.level, Assurance::Published),
+            Err(Error::StrictUnsupported) => assert!(!directory.join("object").exists()),
+            Err(error) => panic!("unexpected Strict result: {error:?}"),
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }

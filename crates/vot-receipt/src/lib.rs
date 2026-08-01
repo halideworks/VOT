@@ -86,7 +86,7 @@ impl Receipt {
         if self.sequence == 0 {
             return Err(Error::InvalidSequence);
         }
-        if !(20..=35).contains(&self.observed_at.len()) || !self.observed_at.is_ascii() {
+        if !valid_rfc3339(&self.observed_at) {
             return Err(Error::InvalidTimestamp);
         }
         if self.clock_source > 2 {
@@ -139,6 +139,85 @@ impl Receipt {
         encode_uint(13, &mut output);
         encode_uint(u64::from(self.flags), &mut output);
         Ok(output)
+    }
+}
+
+fn valid_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.len() > 35
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let Some(year) = decimal(&bytes[0..4]) else {
+        return false;
+    };
+    let Some(month) = decimal(&bytes[5..7]) else {
+        return false;
+    };
+    let Some(day) = decimal(&bytes[8..10]) else {
+        return false;
+    };
+    let Some(hour) = decimal(&bytes[11..13]) else {
+        return false;
+    };
+    let Some(minute) = decimal(&bytes[14..16]) else {
+        return false;
+    };
+    let Some(second) = decimal(&bytes[17..19]) else {
+        return false;
+    };
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return false;
+    }
+
+    let mut offset = 19;
+    if bytes.get(offset) == Some(&b'.') {
+        offset += 1;
+        let fraction_start = offset;
+        while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+            offset += 1;
+        }
+        if offset == fraction_start {
+            return false;
+        }
+    }
+    match bytes.get(offset) {
+        Some(b'Z') => offset + 1 == bytes.len(),
+        Some(b'+' | b'-') => {
+            bytes.len() == offset + 6
+                && bytes.get(offset + 3) == Some(&b':')
+                && decimal(&bytes[offset + 1..offset + 3]).is_some_and(|hours| hours <= 23)
+                && decimal(&bytes[offset + 4..offset + 6]).is_some_and(|minutes| minutes <= 59)
+        }
+        _ => false,
+    }
+}
+
+fn decimal(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u32::from(byte - b'0'))
+    })
+}
+
+const fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
     }
 }
 
@@ -274,6 +353,67 @@ mod tests {
             verify_hmac_sha256(&changed, &key),
             Err(Error::Authentication)
         );
+    }
+
+    #[test]
+    fn timestamps_require_rfc3339_syntax_and_ranges() {
+        let mut receipt = receipt();
+        for valid in [
+            "2024-02-29T23:59:60Z",
+            "2000-02-29T00:00:00Z",
+            "2026-07-31T16:00:00.123456789-04:00",
+            "2026-07-31T20:00:00+00:00",
+        ] {
+            receipt.observed_at = valid.to_owned();
+            assert_eq!(receipt.validate(), Ok(()), "{valid}");
+        }
+        for invalid in [
+            "xxxxxxxxxxxxxxxxxxxx",
+            "2026-01-01T00:00:0Z",
+            "2026-01-01T00:00:00.1234567890123456Z",
+            "2026/07-31T16:00:00Z",
+            "2026-07/31T16:00:00Z",
+            "2026-07-31 16:00:00Z",
+            "2026-07-31T16.00:00Z",
+            "2026-07-31T16:00.00Z",
+            "2026-00-31T16:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-07-00T00:00:00Z",
+            "2026-07-31T24:00:00Z",
+            "2026-07-31T16:60:00Z",
+            "2026-07-31T16:00:61Z",
+            "2026-07-31T16:00:00.Z",
+            "2026-07-31T16:00:00+24:00",
+            "2026-07-31T16:00:00+00:60",
+        ] {
+            receipt.observed_at = invalid.to_owned();
+            assert_eq!(
+                receipt.validate(),
+                Err(Error::InvalidTimestamp),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_numeric_bounds_are_exact() {
+        let mut receipt = receipt();
+        receipt.subject_length = i64::MAX as u64;
+        receipt.clock_source = 2;
+        receipt.flags = 15;
+        assert_eq!(receipt.validate(), Ok(()));
+
+        receipt.subject_length = i64::MAX as u64 + 1;
+        assert_eq!(receipt.validate(), Err(Error::InvalidSubjectLength));
+        receipt.subject_length = 0;
+        receipt.clock_source = 3;
+        assert_eq!(receipt.validate(), Err(Error::InvalidClockSource));
+        receipt.clock_source = 0;
+        receipt.flags = 16;
+        assert_eq!(receipt.validate(), Err(Error::InvalidFlags));
     }
 
     #[test]

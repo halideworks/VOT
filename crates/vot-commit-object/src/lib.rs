@@ -2,6 +2,8 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use std::collections::BTreeMap;
+
 use vot_commit_model::{Assurance, Event, Machine, Profile, State};
 use vot_object_store::{CompletedObject, Error as StoreError, PartReceipt, S3Compatible};
 
@@ -38,7 +40,7 @@ pub struct ObjectCommit<S> {
     machine: Machine,
     upload_id: String,
     key: String,
-    parts: Vec<PartReceipt>,
+    parts: BTreeMap<u32, PartReceipt>,
 }
 
 impl<S: S3Compatible> ObjectCommit<S> {
@@ -51,7 +53,7 @@ impl<S: S3Compatible> ObjectCommit<S> {
             machine,
             upload_id,
             key: key.to_owned(),
-            parts: Vec::new(),
+            parts: BTreeMap::new(),
         })
     }
 
@@ -60,16 +62,29 @@ impl<S: S3Compatible> ObjectCommit<S> {
         let receipt = self
             .store
             .upload_part(&self.upload_id, number, bytes, checksum)?;
-        self.parts.push(receipt);
+        self.parts.insert(number, receipt);
         Ok(())
     }
 
-    pub fn complete(mut self) -> Result<(S, CompletedObject, Receipt), Error> {
-        self.machine.apply(Event::TransitVerified)?;
-        self.machine.apply(Event::DataFlushSucceeded)?;
-        self.machine.apply(Event::JournalFlushSucceeded)?;
-        let object = match self.store.complete_multipart(&self.upload_id, &self.parts) {
+    pub fn complete(&mut self) -> Result<(CompletedObject, Receipt), Error> {
+        match self.machine.state() {
+            State::Admitted => {
+                self.machine.apply(Event::TransitVerified)?;
+                self.machine.apply(Event::DataFlushSucceeded)?;
+                self.machine.apply(Event::JournalFlushSucceeded)?;
+            }
+            State::RecoveryRequired => {
+                self.machine.apply(Event::Recover)?;
+            }
+            _ => return Err(Error::Model(vot_commit_model::Error::InvalidTransition)),
+        }
+        let parts: Vec<_> = self.parts.values().cloned().collect();
+        let object = match self.store.complete_multipart(&self.upload_id, &parts) {
             Ok(object) => object,
+            Err(StoreError::CompletionAmbiguous) => {
+                self.machine.apply(Event::NamespaceLinkAmbiguous)?;
+                return Err(Error::Store(StoreError::CompletionAmbiguous));
+            }
             Err(error) => {
                 self.machine.apply(Event::AtRestVerificationFailed)?;
                 return Err(Error::Store(error));
@@ -88,10 +103,20 @@ impl<S: S3Compatible> ObjectCommit<S> {
         let receipt = Receipt {
             assurance: observation.level,
             sequence: observation.sequence,
-            key: self.key,
+            key: self.key.clone(),
             checksum_crc32c: object.checksum_crc32c,
         };
-        Ok((self.store, object, receipt))
+        Ok((object, receipt))
+    }
+
+    #[must_use]
+    pub const fn store(&self) -> &S {
+        &self.store
+    }
+
+    #[must_use]
+    pub fn into_store(self) -> S {
+        self.store
     }
 
     #[must_use]
@@ -103,15 +128,83 @@ impl<S: S3Compatible> ObjectCommit<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vot_object_store::MockStore;
+    use vot_object_store::{Error as StoreError, MockStore, S3Compatible};
+
+    #[derive(Default)]
+    struct AmbiguousOnce {
+        inner: MockStore,
+        completed: Option<CompletedObject>,
+    }
+
+    impl S3Compatible for AmbiguousOnce {
+        fn create_multipart(&mut self, key: &str, now: u64) -> Result<String, StoreError> {
+            self.inner.create_multipart(key, now)
+        }
+
+        fn upload_part(
+            &mut self,
+            upload_id: &str,
+            number: u32,
+            bytes: &[u8],
+            checksum_crc32c: u32,
+        ) -> Result<PartReceipt, StoreError> {
+            self.inner
+                .upload_part(upload_id, number, bytes, checksum_crc32c)
+        }
+
+        fn complete_multipart(
+            &mut self,
+            upload_id: &str,
+            parts: &[PartReceipt],
+        ) -> Result<CompletedObject, StoreError> {
+            if let Some(completed) = &self.completed {
+                return Ok(completed.clone());
+            }
+            let completed = self.inner.complete_multipart(upload_id, parts)?;
+            self.completed = Some(completed);
+            Err(StoreError::CompletionAmbiguous)
+        }
+
+        fn head(&self, key: &str) -> Option<(u64, u32)> {
+            self.inner.head(key)
+        }
+    }
 
     #[test]
     fn backend_checksum_precedes_strict_publication() {
         let mut commit = ObjectCommit::create(MockStore::default(), "object", 0).unwrap();
         commit.upload_verified_part(1, b"one").unwrap();
         commit.upload_verified_part(2, b"two").unwrap();
-        let (store, object, receipt) = commit.complete().unwrap();
+        let (object, receipt) = commit.complete().unwrap();
         assert_eq!(receipt.assurance, Assurance::Published);
-        assert_eq!(store.head("object"), Some((6, object.checksum_crc32c)));
+        assert_eq!(
+            commit.store().head("object"),
+            Some((6, object.checksum_crc32c))
+        );
+    }
+
+    #[test]
+    fn out_of_order_and_replaced_parts_complete_in_number_order() {
+        let mut commit = ObjectCommit::create(MockStore::default(), "object", 0).unwrap();
+        commit.upload_verified_part(2, b"old").unwrap();
+        commit.upload_verified_part(1, b"one").unwrap();
+        commit.upload_verified_part(2, b"two").unwrap();
+        let (object, receipt) = commit.complete().unwrap();
+        assert_eq!(object.bytes, b"onetwo");
+        assert_eq!(receipt.assurance, Assurance::Published);
+    }
+
+    #[test]
+    fn ambiguous_completion_preserves_state_and_reconciles_on_retry() {
+        let mut commit = ObjectCommit::create(AmbiguousOnce::default(), "object", 0).unwrap();
+        commit.upload_verified_part(1, b"bytes").unwrap();
+        assert!(matches!(
+            commit.complete(),
+            Err(Error::Store(StoreError::CompletionAmbiguous))
+        ));
+        assert_eq!(commit.state(), State::RecoveryRequired);
+        let (object, receipt) = commit.complete().unwrap();
+        assert_eq!(object.bytes, b"bytes");
+        assert_eq!(receipt.assurance, Assurance::Published);
     }
 }

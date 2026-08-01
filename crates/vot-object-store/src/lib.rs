@@ -29,6 +29,7 @@ pub enum Error {
     CompletionMismatch,
     AlreadyExists,
     AlreadyCompleted,
+    CompletionAmbiguous,
     Backend,
 }
 

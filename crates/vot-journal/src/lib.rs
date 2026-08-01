@@ -67,6 +67,7 @@ impl Journal {
             .read(true)
             .write(true)
             .open(path)?;
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
         Ok(Self {
             file,
             incarnation,

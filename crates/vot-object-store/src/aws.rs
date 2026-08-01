@@ -11,14 +11,12 @@ use tokio::runtime::Runtime;
 
 use crate::{CompletedObject, Error, PartReceipt, S3Compatible};
 
-#[derive(Clone)]
 struct LivePart {
     bytes: Vec<u8>,
     checksum_crc32c: u32,
     etag: String,
 }
 
-#[derive(Clone)]
 struct LiveUpload {
     key: String,
     parts: BTreeMap<u32, LivePart>,
@@ -172,33 +170,41 @@ impl S3Compatible for AwsS3Store {
         upload_id: &str,
         parts: &[PartReceipt],
     ) -> Result<CompletedObject, Error> {
-        let upload = self
-            .uploads
-            .get(upload_id)
-            .ok_or(Error::UnknownUpload)?
-            .clone();
+        let upload = self.uploads.remove(upload_id).ok_or(Error::UnknownUpload)?;
         if parts.len() != upload.parts.len()
             || parts.first().is_none_or(|part| part.number != 1)
             || parts
                 .windows(2)
                 .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
         {
+            self.uploads.insert(upload_id.to_owned(), upload);
             return Err(Error::CompletionMismatch);
         }
+        let expected_length = upload.parts.values().try_fold(0_u64, |total, part| {
+            total.checked_add(part.bytes.len() as u64)
+        });
+        let Some(expected_length) = expected_length else {
+            self.uploads.insert(upload_id.to_owned(), upload);
+            return Err(Error::CompletionMismatch);
+        };
+        let expected_checksum = crc32c_parts(&upload.parts);
         let mut completed_parts = Vec::with_capacity(parts.len());
         for receipt in parts {
-            let part = upload
-                .parts
-                .get(&receipt.number)
-                .ok_or(Error::CompletionMismatch)?;
+            let Some(part) = upload.parts.get(&receipt.number) else {
+                self.uploads.insert(upload_id.to_owned(), upload);
+                return Err(Error::CompletionMismatch);
+            };
             if receipt.length != part.bytes.len() as u64
                 || receipt.checksum_crc32c != part.checksum_crc32c
             {
+                self.uploads.insert(upload_id.to_owned(), upload);
                 return Err(Error::CompletionMismatch);
             }
             completed_parts.push(
                 CompletedPart::builder()
-                    .part_number(i32::try_from(receipt.number).map_err(|_| Error::InvalidPart)?)
+                    .part_number(
+                        i32::try_from(receipt.number).expect("part number is at most 10000"),
+                    )
                     .e_tag(&part.etag)
                     .checksum_crc32_c(BASE64.encode(part.checksum_crc32c.to_be_bytes()))
                     .build(),
@@ -207,30 +213,112 @@ impl S3Compatible for AwsS3Store {
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
-        self.runtime
-            .block_on(
-                self.client
-                    .complete_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(&upload.key)
-                    .upload_id(upload_id)
-                    .if_none_match("*")
-                    .multipart_upload(completed)
-                    .send(),
-            )
-            .map_err(|_| Error::Backend)?;
-        let bytes = self.read_object(&upload.key)?;
+        let completion = self.runtime.block_on(
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&upload.key)
+                .upload_id(upload_id)
+                .if_none_match("*")
+                .multipart_upload(completed)
+                .send(),
+        );
+        let completion_was_ambiguous = match completion {
+            Ok(_) => false,
+            Err(error) if error.as_service_error().is_some() => {
+                self.uploads.insert(upload_id.to_owned(), upload);
+                return Err(Error::Backend);
+            }
+            Err(_) => true,
+        };
+        let Ok(bytes) = self.read_object(&upload.key) else {
+            self.uploads.insert(upload_id.to_owned(), upload);
+            return Err(Error::CompletionAmbiguous);
+        };
+        let actual_checksum = vot_journal::crc32c(&bytes);
+        if !read_back_matches(
+            expected_length,
+            expected_checksum,
+            bytes.len() as u64,
+            actual_checksum,
+        ) {
+            self.uploads.insert(upload_id.to_owned(), upload);
+            return Err(if completion_was_ambiguous {
+                Error::CompletionAmbiguous
+            } else {
+                Error::ChecksumMismatch
+            });
+        }
         let object = CompletedObject {
             key: upload.key,
-            checksum_crc32c: vot_journal::crc32c(&bytes),
+            checksum_crc32c: actual_checksum,
             bytes,
         };
-        self.uploads.remove(upload_id);
         Ok(object)
     }
 
     fn head(&self, key: &str) -> Option<(u64, u32)> {
         let bytes = self.read_object(key).ok()?;
         Some((bytes.len() as u64, vot_journal::crc32c(&bytes)))
+    }
+}
+
+fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
+    let mut crc = !0_u32;
+    for byte in parts.values().flat_map(|part| part.bytes.iter()) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+const fn read_back_matches(
+    expected_length: u64,
+    expected_checksum: u32,
+    actual_length: u64,
+    actual_checksum: u32,
+) -> bool {
+    actual_length == expected_length && actual_checksum == expected_checksum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_parts_detect_stable_read_back_corruption() {
+        let mut parts = BTreeMap::new();
+        parts.insert(
+            2,
+            LivePart {
+                bytes: b"two".to_vec(),
+                checksum_crc32c: vot_journal::crc32c(b"two"),
+                etag: "two".to_owned(),
+            },
+        );
+        parts.insert(
+            1,
+            LivePart {
+                bytes: b"one".to_vec(),
+                checksum_crc32c: vot_journal::crc32c(b"one"),
+                etag: "one".to_owned(),
+            },
+        );
+        let expected_checksum = crc32c_parts(&parts);
+        assert_eq!(expected_checksum, vot_journal::crc32c(b"onetwo"));
+        assert!(read_back_matches(
+            6,
+            expected_checksum,
+            6,
+            vot_journal::crc32c(b"onetwo")
+        ));
+        assert!(!read_back_matches(
+            6,
+            expected_checksum,
+            6,
+            vot_journal::crc32c(b"oneXwo")
+        ));
     }
 }

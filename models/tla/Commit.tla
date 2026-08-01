@@ -2,7 +2,8 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS InjectUnsafeReceipt, InjectStalePublish, InjectUnsafePublish,
-          InjectPoisonAfterPublish, InjectRetrySuccess, InjectRecoverySink
+          InjectPoisonAfterPublish, InjectRetrySuccess, InjectRecoverySink,
+          InjectUnsupportedAdvance
 
 \* Keep these mappings synchronized with the Rust Event enum. CI verifies that
 \* every Rust event names a model action and every named action exists.
@@ -25,16 +26,18 @@ CONSTANTS InjectUnsafeReceipt, InjectStalePublish, InjectUnsafePublish,
 Profiles == {"Fast", "Balanced", "Strict"}
 Incarnations == {0, 1}
 Assurances == {"ADMITTED", "TRANSIT_VERIFIED", "DURABLE", "AT_REST_VERIFIED", "PUBLISHED"}
-Terminal == {"PUBLISHED", "POISONED", "ABORTED"}
+Terminal == {"PUBLISHED", "POISONED", "ABORTED", "REJECTED_UNSUPPORTED"}
 States == {"NEW", "ADMITTED", "TRANSIT_VERIFIED", "DATA_FLUSHED", "DURABLE",
            "AT_REST_VERIFIED", "NAMESPACE_LINKED", "PUBLISHED",
-           "RECOVERY_REQUIRED", "POISONED", "ABORTED"}
+           "RECOVERY_REQUIRED", "POISONED", "ABORTED", "REJECTED_UNSUPPORTED"}
 
-VARIABLES state, profile, current, performed, receipts, recovery,
-          flushFailed, rejectedRetries, staleAttempts, staleRejected
+VARIABLES state, profile, supported, current, performed, receipts, recovery,
+          flushFailed, rejectedRetries, staleAttempts, staleRejected,
+          unsupportedRejected
 
-vars == <<state, profile, current, performed, receipts, recovery,
-          flushFailed, rejectedRetries, staleAttempts, staleRejected>>
+vars == <<state, profile, supported, current, performed, receipts, recovery,
+          flushFailed, rejectedRetries, staleAttempts, staleRejected,
+          unsupportedRejected>>
 
 Required(p) ==
     CASE p = "Fast" -> "TRANSIT_VERIFIED"
@@ -46,6 +49,7 @@ Observation(i, level) == [incarnation |-> i, assurance |-> level]
 Init ==
     /\ state = [i \in Incarnations |-> "NEW"]
     /\ profile \in Profiles
+    /\ supported \in SUBSET Profiles
     /\ current = 0
     /\ performed = [i \in Incarnations |-> {}]
     /\ receipts = {}
@@ -54,24 +58,37 @@ Init ==
     /\ rejectedRetries = {}
     /\ staleAttempts = {}
     /\ staleRejected = {}
+    /\ unsupportedRejected = {}
 
 Step(i, from, to, assurance) ==
     /\ i = current
     /\ state[i] = from
     /\ state' = [state EXCEPT ![i] = to]
     /\ performed' = [performed EXCEPT ![i] = @ \cup {assurance}]
-    /\ UNCHANGED <<profile, current, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
-Admit(i) == Step(i, "NEW", "ADMITTED", "ADMITTED")
+Admit(i) ==
+    /\ profile \in supported
+    /\ Step(i, "NEW", "ADMITTED", "ADMITTED")
+
+RejectUnsupported(i) ==
+    /\ i = current
+    /\ state[i] = "NEW"
+    /\ profile \notin supported
+    /\ state' = [state EXCEPT ![i] = "REJECTED_UNSUPPORTED"]
+    /\ unsupportedRejected' = unsupportedRejected \cup {i}
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected>>
 VerifyTransit(i) == Step(i, "ADMITTED", "TRANSIT_VERIFIED", "TRANSIT_VERIFIED")
 
 FlushData(i) ==
     /\ i = current
     /\ state[i] = "TRANSIT_VERIFIED"
     /\ state' = [state EXCEPT ![i] = "DATA_FLUSHED"]
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected, unsupportedRejected>>
 
 FlushJournal(i) == Step(i, "DATA_FLUSHED", "DURABLE", "DURABLE")
 VerifyAtRest(i) == Step(i, "DURABLE", "AT_REST_VERIFIED", "AT_REST_VERIFIED")
@@ -80,8 +97,9 @@ LinkNamespace(i) ==
     /\ i = current
     /\ state[i] = Required(profile)
     /\ state' = [state EXCEPT ![i] = "NAMESPACE_LINKED"]
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 Publish(i) ==
     /\ i = current
@@ -89,8 +107,9 @@ Publish(i) ==
     /\ Required(profile) \in performed[i]
     /\ state' = [state EXCEPT ![i] = "PUBLISHED"]
     /\ performed' = [performed EXCEPT ![i] = @ \cup {"PUBLISHED"}]
-    /\ UNCHANGED <<profile, current, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 EmitReceipt(i, level) ==
     /\ i = current
@@ -99,16 +118,18 @@ EmitReceipt(i, level) ==
     /\ \/ level \in performed[i]
        \/ InjectUnsafeReceipt
     /\ receipts' = receipts \cup {Observation(i, level)}
-    /\ UNCHANGED <<state, profile, current, performed, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<state, profile, supported, current, performed, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 FlushFailure(i, from) ==
     /\ i = current
     /\ state[i] = from
     /\ state' = [state EXCEPT ![i] = "POISONED"]
     /\ flushFailed' = flushFailed \cup {i}
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 RetryFailedFlush(i) ==
     /\ i = current
@@ -116,16 +137,18 @@ RetryFailedFlush(i) ==
     /\ i \notin rejectedRetries
     /\ state[i] = "POISONED"
     /\ rejectedRetries' = rejectedRetries \cup {i}
-    /\ UNCHANGED <<state, profile, current, performed, receipts, recovery,
-                    flushFailed, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<state, profile, supported, current, performed, receipts,
+                    recovery, flushFailed, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 EnterRecovery(i) ==
     /\ i = current
     /\ state[i] \notin Terminal \cup {"RECOVERY_REQUIRED"}
     /\ recovery' = [recovery EXCEPT ![i] = state[i]]
     /\ state' = [state EXCEPT ![i] = "RECOVERY_REQUIRED"]
-    /\ UNCHANGED <<profile, current, performed, receipts, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 Recover(i) ==
     /\ i = current
@@ -133,22 +156,25 @@ Recover(i) ==
     /\ state[i] = "RECOVERY_REQUIRED"
     /\ recovery[i] \in States \ {"RECOVERY_REQUIRED"}
     /\ state' = [state EXCEPT ![i] = recovery[i]]
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 Abort(i) ==
     /\ i = current
     /\ state[i] \notin Terminal \cup {"RECOVERY_REQUIRED", "NAMESPACE_LINKED"}
     /\ state' = [state EXCEPT ![i] = "ABORTED"]
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 RotateIncarnation ==
     /\ current = 0
     /\ state[0] \notin Terminal \cup {"RECOVERY_REQUIRED"}
     /\ current' = 1
-    /\ UNCHANGED <<state, profile, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<state, profile, supported, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 RejectStalePublish(i) ==
     /\ i # current
@@ -156,8 +182,8 @@ RejectStalePublish(i) ==
     /\ i \notin staleAttempts
     /\ staleAttempts' = staleAttempts \cup {i}
     /\ staleRejected' = staleRejected \cup {i}
-    /\ UNCHANGED <<state, profile, current, performed, receipts, recovery,
-                    flushFailed, rejectedRetries>>
+    /\ UNCHANGED <<state, profile, supported, current, performed, receipts,
+                    recovery, flushFailed, rejectedRetries, unsupportedRejected>>
 
 UnsafeStalePublish(i) ==
     /\ InjectStalePublish
@@ -167,8 +193,8 @@ UnsafeStalePublish(i) ==
     /\ staleAttempts' = staleAttempts \cup {i}
     /\ state' = [state EXCEPT ![i] = "PUBLISHED"]
     /\ performed' = [performed EXCEPT ![i] = @ \cup {"PUBLISHED"}]
-    /\ UNCHANGED <<profile, current, receipts, recovery, flushFailed,
-                    rejectedRetries, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleRejected, unsupportedRejected>>
 
 UnsafePublishWithoutPredecessor(i) ==
     /\ InjectUnsafePublish
@@ -176,16 +202,18 @@ UnsafePublishWithoutPredecessor(i) ==
     /\ state[i] = "NEW"
     /\ state' = [state EXCEPT ![i] = "PUBLISHED"]
     /\ performed' = [performed EXCEPT ![i] = @ \cup {"PUBLISHED"}]
-    /\ UNCHANGED <<profile, current, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 UnsafePoisonAfterPublish(i) ==
     /\ InjectPoisonAfterPublish
     /\ i = current
     /\ state[i] = "PUBLISHED"
     /\ state' = [state EXCEPT ![i] = "POISONED"]
-    /\ UNCHANGED <<profile, current, performed, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, performed, receipts, recovery,
+                    flushFailed, rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 UnsafeRetrySuccess(i) ==
     /\ InjectRetrySuccess
@@ -194,15 +222,28 @@ UnsafeRetrySuccess(i) ==
     /\ state[i] = "POISONED"
     /\ state' = [state EXCEPT ![i] = "PUBLISHED"]
     /\ performed' = [performed EXCEPT ![i] = @ \cup {"PUBLISHED"}]
-    /\ UNCHANGED <<profile, current, receipts, recovery, flushFailed,
-                    rejectedRetries, staleAttempts, staleRejected>>
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
+
+UnsafeUnsupportedAdvance(i) ==
+    /\ InjectUnsupportedAdvance
+    /\ i = current
+    /\ state[i] = "NEW"
+    /\ profile \notin supported
+    /\ state' = [state EXCEPT ![i] = "PUBLISHED"]
+    /\ performed' = [performed EXCEPT ![i] = @ \cup {"PUBLISHED"}]
+    /\ UNCHANGED <<profile, supported, current, receipts, recovery, flushFailed,
+                    rejectedRetries, staleAttempts, staleRejected,
+                    unsupportedRejected>>
 
 TerminalStutter ==
     /\ state[current] \in Terminal
     /\ UNCHANGED vars
 
 Next ==
-    \/ \E i \in Incarnations : Admit(i) \/ VerifyTransit(i) \/ FlushData(i)
+    \/ \E i \in Incarnations : Admit(i) \/ RejectUnsupported(i)
+                                \/ VerifyTransit(i) \/ FlushData(i)
                                 \/ FlushJournal(i) \/ VerifyAtRest(i)
                                 \/ LinkNamespace(i) \/ Publish(i)
                                 \/ FlushFailure(i, "TRANSIT_VERIFIED")
@@ -213,6 +254,7 @@ Next ==
                                 \/ RejectStalePublish(i) \/ UnsafeStalePublish(i)
                                 \/ UnsafePublishWithoutPredecessor(i)
                                 \/ UnsafePoisonAfterPublish(i) \/ UnsafeRetrySuccess(i)
+                                \/ UnsafeUnsupportedAdvance(i)
                                 \/ \E level \in Assurances : EmitReceipt(i, level)
     \/ RotateIncarnation
     \/ TerminalStutter
@@ -220,6 +262,7 @@ Next ==
 TypeOK ==
     /\ state \in [Incarnations -> States]
     /\ profile \in Profiles
+    /\ supported \subseteq Profiles
     /\ current \in Incarnations
     /\ performed \in [Incarnations -> SUBSET Assurances]
     /\ receipts \subseteq {Observation(i, level) : i \in Incarnations, level \in Assurances}
@@ -228,6 +271,7 @@ TypeOK ==
     /\ rejectedRetries \subseteq Incarnations
     /\ staleAttempts \subseteq Incarnations
     /\ staleRejected \subseteq Incarnations
+    /\ unsupportedRejected \subseteq Incarnations
 
 PublishedHasPredecessor ==
     \A i \in Incarnations : state[i] = "PUBLISHED" => Required(profile) \in performed[i]
@@ -245,6 +289,9 @@ StaleAttemptsRejected == staleAttempts \subseteq staleRejected
 
 StaleNeverPublished ==
     \A i \in Incarnations : i # current => "PUBLISHED" \notin performed[i]
+
+UnsupportedNeverAdvanced ==
+    profile \notin supported => \A i \in Incarnations : performed[i] = {}
 
 RecoveryEventuallyProgresses ==
     \A i \in Incarnations : state[i] = "RECOVERY_REQUIRED" ~> state[i] # "RECOVERY_REQUIRED"

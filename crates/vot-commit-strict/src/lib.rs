@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use aligned_vec::{AVec, RuntimeAlign};
@@ -25,6 +26,13 @@ pub enum VerificationOutcome {
     Verified,
     Unsupported,
     Mismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectIdentity {
+    Match,
+    Mismatch,
+    Unsupported,
 }
 
 #[derive(Debug)]
@@ -99,6 +107,24 @@ impl LinuxDirectReader {
                 }),
                 CapabilityFailure::Hard(error) => Err(error),
             },
+        }
+    }
+
+    /// Confirms that the direct descriptor and the staged descriptor name the same object.
+    pub fn identity(&self, staged: &File) -> Result<DirectIdentity, Error> {
+        let DirectBackend::Supported(descriptor) = &self.backend else {
+            return Ok(DirectIdentity::Unsupported);
+        };
+        let direct = descriptor.metadata().map_err(Error::Io)?;
+        let staged = staged.metadata().map_err(Error::Io)?;
+        if direct.dev() == staged.dev()
+            && direct.ino() == staged.ino()
+            && direct.len() == staged.len()
+            && direct.len() == self.logical_length
+        {
+            Ok(DirectIdentity::Match)
+        } else {
+            Ok(DirectIdentity::Mismatch)
         }
     }
 }
@@ -319,6 +345,38 @@ mod tests {
     #[test]
     fn direct_reader_buffer_is_bounded_independent_of_object_length() {
         assert_eq!(checked_buffer_size(4096).unwrap(), DIRECT_READ_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn direct_reader_is_bound_to_the_staged_descriptor() {
+        let staged_path = path();
+        let other_path = path();
+        fs::write(&staged_path, b"staged").unwrap();
+        fs::write(&other_path, b"staged").unwrap();
+        let staged = File::open(&staged_path).unwrap();
+        let reader = LinuxDirectReader {
+            backend: DirectBackend::Supported(File::open(&staged_path).unwrap()),
+            logical_length: 6,
+            alignment: 4096,
+            buffer_size: DIRECT_READ_BUFFER_BYTES,
+        };
+        assert_eq!(reader.identity(&staged).unwrap(), DirectIdentity::Match);
+        assert_eq!(
+            reader.identity(&File::open(&other_path).unwrap()).unwrap(),
+            DirectIdentity::Mismatch
+        );
+        let unsupported = LinuxDirectReader {
+            backend: DirectBackend::Unsupported,
+            logical_length: 6,
+            alignment: 4096,
+            buffer_size: DIRECT_READ_BUFFER_BYTES,
+        };
+        assert_eq!(
+            unsupported.identity(&staged).unwrap(),
+            DirectIdentity::Unsupported
+        );
+        fs::remove_file(staged_path).unwrap();
+        fs::remove_file(other_path).unwrap();
     }
 
     #[test]

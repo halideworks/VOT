@@ -55,6 +55,8 @@ jobs:
           retry_status=$?
           java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-recovery-sink -config CommitRecoverySink.cfg Commit.tla > /tmp/tlc-recovery-sink.log 2>&1
           recovery_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsupported -config CommitUnsupportedAdvance.cfg Commit.tla > /tmp/tlc-unsupported.log 2>&1
+          unsupported_status=$?
           set -e
           test "$receipt_status" -ne 0
           test "$stale_status" -ne 0
@@ -62,12 +64,14 @@ jobs:
           test "$poison_status" -ne 0
           test "$retry_status" -ne 0
           test "$recovery_status" -ne 0
+          test "$unsupported_status" -ne 0
           grep -q "Invariant ReceiptWasPerformed is violated" /tmp/tlc-unsafe-receipt.log
           grep -q "Invariant StaleAttemptsRejected is violated" /tmp/tlc-unsafe-stale.log
           grep -q "Invariant PublishedHasPredecessor is violated" /tmp/tlc-unsafe-publish.log
           grep -q "Invariant PoisonedNeverPublished is violated" /tmp/tlc-unsafe-poison.log
           grep -q "Invariant FailedFlushNeverAdvances is violated" /tmp/tlc-unsafe-retry.log
           grep -q "Deadlock reached" /tmp/tlc-recovery-sink.log
+          grep -q "Invariant UnsupportedNeverAdvanced is violated" /tmp/tlc-unsupported.log
 
       - name: Check formatting
         run: cargo +1.85.0 fmt --all --check

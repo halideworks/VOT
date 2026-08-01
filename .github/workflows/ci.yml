@@ -73,7 +73,10 @@ jobs:
         run: cargo +1.85.0 fmt --all --check
 
       - name: Lint
-        run: cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
+          CLIPPY_CONF_DIR=crates/vot-transport-sim \
+            cargo +1.85.0 clippy -p vot-transport-sim --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo +1.85.0 test --workspace --locked
@@ -83,7 +86,13 @@ jobs:
           if rg 'thread::sleep|tokio::time::sleep' crates/vot-transport-sim; then
             exit 1
           fi
-          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind.trace
+          seed_a="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+          seed_b="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
+          test "$seed_a" != "$seed_b"
+          RUST_SEED="$seed_a" cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-a.trace 2> /tmp/rebind-a.digest
+          RUST_SEED="$seed_b" cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-b.trace 2> /tmp/rebind-b.digest
+          cmp /tmp/rebind-a.trace /tmp/rebind-b.trace
+          cmp /tmp/rebind-a.digest /tmp/rebind-b.digest
           cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/storage-fault.vot > /tmp/storage.trace
           cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-shrink -- sim/scenarios/storage-fault.vot > /tmp/storage-minimized.vot
           cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- /tmp/storage-minimized.vot > /tmp/storage-minimized.trace
@@ -178,7 +187,7 @@ jobs:
           - { package: vot-object-store, required: false }
           - { package: vot-commit-object, required: false }
           - { package: vot-receipt, required: false }
-          - { package: vot-transport-sim, required: false }
+          - { package: vot-transport-sim, required: true }
     steps:
       - uses: actions/checkout@v4.3.1
         with:

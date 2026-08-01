@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use vot_commit_strict::{Error, LinuxDirectReader, Suite, verify};
+use vot_commit_strict::{LinuxDirectReader, Suite, VerificationOutcome, verify};
 
 #[test]
 #[ignore = "requires the privileged loop-device harness"]
@@ -33,11 +33,16 @@ fn direct_read_detects_corruption_hidden_by_buffered_cache() {
         "buffered control did not retain cached bytes"
     );
 
-    let reader = LinuxDirectReader::new(Path::new(&file_path), original.len() as u64, 4096);
+    let reader = LinuxDirectReader::open(Path::new(&file_path), original.len() as u64, 4096)
+        .expect("open and probe direct reader");
     match verify(&reader, Suite::Blake3Bao64, &expected) {
-        Err(Error::HashMismatch) => {}
-        Ok(false) => panic!("O_DIRECT was unsupported on the designated storage runner"),
-        Ok(true) => panic!("direct read returned cached bytes instead of backing corruption"),
+        Ok(VerificationOutcome::Mismatch) => {}
+        Ok(VerificationOutcome::Unsupported) => {
+            panic!("O_DIRECT was unsupported on the designated storage runner")
+        }
+        Ok(VerificationOutcome::Verified) => {
+            panic!("direct read returned cached bytes instead of backing corruption")
+        }
         Err(error) => panic!("direct verification failed before comparison: {error:?}"),
     }
 }

@@ -2,6 +2,8 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use aligned_vec::{AVec, RuntimeAlign};
@@ -18,6 +20,13 @@ pub enum DirectHash {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationOutcome {
+    Verified,
+    Unsupported,
+    Mismatch,
+}
+
 #[derive(Debug)]
 pub enum Error {
     InvalidAlignment,
@@ -32,58 +41,91 @@ pub trait ReadBack {
     fn hash(&self, suite: Suite) -> Result<DirectHash, Error>;
 }
 
-pub struct LinuxDirectReader<'a> {
-    path: &'a Path,
+enum DirectBackend {
+    Supported(File),
+    Unsupported,
+}
+
+enum CapabilityFailure {
+    Unsupported,
+    Hard(Error),
+}
+
+pub struct LinuxDirectReader {
+    backend: DirectBackend,
     logical_length: u64,
     alignment: usize,
+    buffer_size: usize,
 }
 
-impl<'a> LinuxDirectReader<'a> {
-    #[must_use]
-    pub const fn new(path: &'a Path, logical_length: u64, alignment: usize) -> Self {
-        Self {
-            path,
-            logical_length,
-            alignment,
-        }
-    }
-
-    fn buffer_size(&self) -> Result<usize, Error> {
-        if !self.alignment.is_power_of_two()
-            || self.alignment < 512
-            || self.alignment > MAX_DIRECT_ALIGNMENT
-        {
-            return Err(Error::InvalidAlignment);
-        }
-        DIRECT_READ_BUFFER_BYTES
-            .div_ceil(self.alignment)
-            .checked_mul(self.alignment)
-            .ok_or(Error::BufferSizeOverflow)
-    }
-}
-
-impl ReadBack for LinuxDirectReader<'_> {
-    fn hash(&self, suite: Suite) -> Result<DirectHash, Error> {
-        let buffer_size = self.buffer_size()?;
+impl LinuxDirectReader {
+    /// Opens and probes direct-I/O support once with an aligned read at offset zero.
+    ///
+    /// An `EINVAL` during this capability probe means the backend is unsupported.
+    /// Any `EINVAL` after a successful probe is returned as a hard I/O error.
+    pub fn open(path: &Path, logical_length: u64, alignment: usize) -> Result<Self, Error> {
+        let buffer_size = checked_buffer_size(alignment)?;
         let descriptor =
-            match rustix::fs::open(self.path, direct_open_flags(), rustix::fs::Mode::empty()) {
+            match rustix::fs::open(path, direct_open_flags(), rustix::fs::Mode::empty()) {
                 Ok(descriptor) => descriptor,
-                Err(error) => return classify_direct_error(error),
+                Err(error) => match classify_open_failure(error) {
+                    CapabilityFailure::Unsupported => {
+                        return Ok(Self {
+                            backend: DirectBackend::Unsupported,
+                            logical_length,
+                            alignment,
+                            buffer_size,
+                        });
+                    }
+                    CapabilityFailure::Hard(error) => return Err(error),
+                },
             };
+        let file = File::from(descriptor);
+        let mut probe = AVec::<u8, RuntimeAlign>::new(alignment);
+        probe.resize(alignment, 0);
+        match file.read_at(&mut probe, 0) {
+            Ok(_) => Ok(Self {
+                backend: DirectBackend::Supported(file),
+                logical_length,
+                alignment,
+                buffer_size,
+            }),
+            Err(error) => match classify_probe_failure(error) {
+                CapabilityFailure::Unsupported => Ok(Self {
+                    backend: DirectBackend::Unsupported,
+                    logical_length,
+                    alignment,
+                    buffer_size,
+                }),
+                CapabilityFailure::Hard(error) => Err(error),
+            },
+        }
+    }
+}
+
+impl ReadBack for LinuxDirectReader {
+    fn hash(&self, suite: Suite) -> Result<DirectHash, Error> {
+        let DirectBackend::Supported(descriptor) = &self.backend else {
+            return Ok(DirectHash::Unsupported);
+        };
         let mut block = AVec::<u8, RuntimeAlign>::new(self.alignment);
-        block.resize(buffer_size, 0);
+        block.resize(self.buffer_size, 0);
         let mut remaining = self.logical_length;
+        let mut offset = 0;
         let mut verifier = StreamVerifier::new(suite);
         while remaining > 0 {
-            match rustix::io::read(&descriptor, &mut block[..]) {
+            match descriptor.read_at(&mut block, offset) {
                 Ok(0) => return Err(short_read()),
                 Ok(read) => {
                     let consumed = usize::try_from(remaining.min(read as u64))
                         .map_err(|_| Error::BufferSizeOverflow)?;
                     verifier.update(&block[..consumed]).map_err(Error::Verify)?;
                     remaining -= consumed as u64;
+                    offset = offset
+                        .checked_add(read as u64)
+                        .ok_or(Error::BufferSizeOverflow)?;
                 }
-                Err(error) => return classify_direct_error(error),
+                Err(error) => return Err(post_probe_io_error(error)),
             }
         }
         Ok(DirectHash::Supported(
@@ -103,12 +145,14 @@ fn direct_open_flags() -> rustix::fs::OFlags {
     flags
 }
 
-fn classify_direct_error(error: rustix::io::Errno) -> Result<DirectHash, Error> {
-    if unsupported(error) {
-        Ok(DirectHash::Unsupported)
-    } else {
-        Err(io_error(error))
+fn checked_buffer_size(alignment: usize) -> Result<usize, Error> {
+    if !alignment.is_power_of_two() || !(512..=MAX_DIRECT_ALIGNMENT).contains(&alignment) {
+        return Err(Error::InvalidAlignment);
     }
+    DIRECT_READ_BUFFER_BYTES
+        .div_ceil(alignment)
+        .checked_mul(alignment)
+        .ok_or(Error::BufferSizeOverflow)
 }
 
 fn short_read() -> Error {
@@ -118,21 +162,50 @@ fn short_read() -> Error {
     ))
 }
 
-fn unsupported(error: rustix::io::Errno) -> bool {
+fn capability_unsupported(error: rustix::io::Errno) -> bool {
     matches!(
         error,
         rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS
     )
 }
 
-pub fn verify<R: ReadBack>(reader: &R, suite: Suite, expected: &[u8; 32]) -> Result<bool, Error> {
-    let DirectHash::Supported(actual) = reader.hash(suite)? else {
-        return Ok(false);
-    };
-    if actual == *expected {
-        Ok(true)
+fn classify_open_failure(error: rustix::io::Errno) -> CapabilityFailure {
+    if capability_unsupported(error) {
+        CapabilityFailure::Unsupported
     } else {
-        Err(Error::HashMismatch)
+        CapabilityFailure::Hard(io_error(error))
+    }
+}
+
+fn classify_probe_failure(error: std::io::Error) -> CapabilityFailure {
+    let unsupported = error.raw_os_error().is_some_and(|raw| {
+        matches!(
+            raw,
+            value if value == rustix::io::Errno::INVAL.raw_os_error()
+                || value == rustix::io::Errno::OPNOTSUPP.raw_os_error()
+                || value == rustix::io::Errno::NOSYS.raw_os_error()
+        )
+    });
+    if unsupported {
+        CapabilityFailure::Unsupported
+    } else {
+        CapabilityFailure::Hard(Error::Io(error))
+    }
+}
+
+fn post_probe_io_error(error: std::io::Error) -> Error {
+    Error::Io(error)
+}
+
+pub fn verify<R: ReadBack>(
+    reader: &R,
+    suite: Suite,
+    expected: &[u8; 32],
+) -> Result<VerificationOutcome, Error> {
+    match reader.hash(suite)? {
+        DirectHash::Unsupported => Ok(VerificationOutcome::Unsupported),
+        DirectHash::Supported(actual) if actual == *expected => Ok(VerificationOutcome::Verified),
+        DirectHash::Supported(_) => Ok(VerificationOutcome::Mismatch),
     }
 }
 
@@ -141,18 +214,18 @@ pub fn verify_and_advance<R: ReadBack>(
     reader: &R,
     suite: Suite,
     expected: &[u8; 32],
-) -> Result<bool, Error> {
+) -> Result<VerificationOutcome, Error> {
     match verify(reader, suite, expected) {
-        Ok(true) => {
+        Ok(VerificationOutcome::Verified) => {
             machine.apply(Event::AtRestVerified).map_err(Error::Model)?;
-            Ok(true)
+            Ok(VerificationOutcome::Verified)
         }
-        Ok(false) => Ok(false),
-        Err(Error::HashMismatch) => {
+        Ok(VerificationOutcome::Unsupported) => Ok(VerificationOutcome::Unsupported),
+        Ok(VerificationOutcome::Mismatch) => {
             machine
                 .apply(Event::AtRestVerificationFailed)
                 .map_err(Error::Model)?;
-            Err(Error::HashMismatch)
+            Ok(VerificationOutcome::Mismatch)
         }
         Err(error) => Err(error),
     }
@@ -185,10 +258,42 @@ mod tests {
     #[test]
     fn unsupported_backend_is_explicit() {
         let reader = MemoryReader(DirectHash::Unsupported);
-        assert!(matches!(
-            verify(&reader, Suite::Blake3Bao64, &[0; 32]),
-            Ok(false)
-        ));
+        assert_eq!(
+            verify(&reader, Suite::Blake3Bao64, &[0; 32]).unwrap(),
+            VerificationOutcome::Unsupported
+        );
+    }
+
+    #[test]
+    fn verification_outcomes_are_distinct() {
+        let expected = [7; 32];
+        assert_eq!(
+            verify(
+                &MemoryReader(DirectHash::Supported(expected)),
+                Suite::Blake3Bao64,
+                &expected
+            )
+            .unwrap(),
+            VerificationOutcome::Verified
+        );
+        assert_eq!(
+            verify(
+                &MemoryReader(DirectHash::Supported([8; 32])),
+                Suite::Blake3Bao64,
+                &expected
+            )
+            .unwrap(),
+            VerificationOutcome::Mismatch
+        );
+        assert_eq!(
+            verify(
+                &MemoryReader(DirectHash::Unsupported),
+                Suite::Blake3Bao64,
+                &expected
+            )
+            .unwrap(),
+            VerificationOutcome::Unsupported
+        );
     }
 
     #[test]
@@ -199,22 +304,21 @@ mod tests {
             .collect();
         fs::write(&path, &data).unwrap();
         fs::File::open(&path).unwrap().sync_all().unwrap();
-        let reader = LinuxDirectReader::new(&path, data.len() as u64, 4096);
+        let reader = LinuxDirectReader::open(&path, data.len() as u64, 4096).unwrap();
         let expected = vot_verifier::root(Suite::Blake3Bao64, &data).unwrap();
         match reader.hash(Suite::Blake3Bao64).unwrap() {
             DirectHash::Supported(actual) => assert_eq!(actual, expected),
-            DirectHash::Unsupported => assert!(matches!(
-                verify(&reader, Suite::Blake3Bao64, &expected),
-                Ok(false)
-            )),
+            DirectHash::Unsupported => assert_eq!(
+                verify(&reader, Suite::Blake3Bao64, &expected).unwrap(),
+                VerificationOutcome::Unsupported
+            ),
         }
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn direct_reader_buffer_is_bounded_independent_of_object_length() {
-        let reader = LinuxDirectReader::new(Path::new("unused"), 500 * 1024 * 1024 * 1024, 4096);
-        assert_eq!(reader.buffer_size().unwrap(), DIRECT_READ_BUFFER_BYTES);
+        assert_eq!(checked_buffer_size(4096).unwrap(), DIRECT_READ_BUFFER_BYTES);
     }
 
     #[test]
@@ -223,26 +327,19 @@ mod tests {
         assert_eq!(MAX_DIRECT_ALIGNMENT, 4_194_304);
         for alignment in [0, 256, 511, 513, MAX_DIRECT_ALIGNMENT * 2] {
             assert!(matches!(
-                LinuxDirectReader::new(Path::new("unused"), 0, alignment).buffer_size(),
+                checked_buffer_size(alignment),
                 Err(Error::InvalidAlignment)
             ));
         }
+        assert_eq!(checked_buffer_size(512).unwrap(), DIRECT_READ_BUFFER_BYTES);
         assert_eq!(
-            LinuxDirectReader::new(Path::new("unused"), 0, 512)
-                .buffer_size()
-                .unwrap(),
-            DIRECT_READ_BUFFER_BYTES
-        );
-        assert_eq!(
-            LinuxDirectReader::new(Path::new("unused"), 0, MAX_DIRECT_ALIGNMENT)
-                .buffer_size()
-                .unwrap(),
+            checked_buffer_size(MAX_DIRECT_ALIGNMENT).unwrap(),
             MAX_DIRECT_ALIGNMENT
         );
     }
 
     #[test]
-    fn direct_flags_and_errno_classification_are_exact() {
+    fn direct_flags_and_capability_classification_are_exact() {
         let flags = direct_open_flags();
         assert!(flags.contains(rustix::fs::OFlags::DIRECT));
         assert!(flags.contains(rustix::fs::OFlags::CLOEXEC));
@@ -251,14 +348,35 @@ mod tests {
             rustix::io::Errno::OPNOTSUPP,
             rustix::io::Errno::NOSYS,
         ] {
+            assert!(capability_unsupported(error));
             assert!(matches!(
-                classify_direct_error(error),
-                Ok(DirectHash::Unsupported)
+                classify_open_failure(error),
+                CapabilityFailure::Unsupported
+            ));
+            assert!(matches!(
+                classify_probe_failure(std::io::Error::from_raw_os_error(error.raw_os_error())),
+                CapabilityFailure::Unsupported
             ));
         }
         assert!(matches!(
-            classify_direct_error(rustix::io::Errno::NOENT),
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+            post_probe_io_error(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::INVAL.raw_os_error()
+            )),
+            Error::Io(error) if error.raw_os_error()
+                == Some(rustix::io::Errno::INVAL.raw_os_error())
+        ));
+        assert!(!capability_unsupported(rustix::io::Errno::NOENT));
+        assert!(matches!(
+            classify_open_failure(rustix::io::Errno::NOENT),
+            CapabilityFailure::Hard(Error::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            classify_probe_failure(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::NOENT.raw_os_error()
+            )),
+            CapabilityFailure::Hard(Error::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
         ));
     }
 
@@ -276,40 +394,43 @@ mod tests {
         let expected = vot_verifier::root(Suite::Blake3Bao64, b"verified bytes").unwrap();
 
         let mut verified = durable_machine();
-        assert!(
+        assert_eq!(
             verify_and_advance(
                 &mut verified,
                 &MemoryReader(DirectHash::Supported(expected)),
                 Suite::Blake3Bao64,
                 &expected
             )
-            .unwrap()
+            .unwrap(),
+            VerificationOutcome::Verified
         );
         assert_eq!(verified.state(), vot_commit_model::State::AtRestVerified);
 
         let mut corrupted_hash = expected;
         corrupted_hash[0] ^= 1;
         let mut poisoned = durable_machine();
-        assert!(matches!(
+        assert_eq!(
             verify_and_advance(
                 &mut poisoned,
                 &MemoryReader(DirectHash::Supported(corrupted_hash)),
                 Suite::Blake3Bao64,
                 &expected
-            ),
-            Err(Error::HashMismatch)
-        ));
+            )
+            .unwrap(),
+            VerificationOutcome::Mismatch
+        );
         assert_eq!(poisoned.state(), vot_commit_model::State::Poisoned);
 
         let mut unsupported = durable_machine();
-        assert!(
-            !verify_and_advance(
+        assert_eq!(
+            verify_and_advance(
                 &mut unsupported,
                 &MemoryReader(DirectHash::Unsupported),
                 Suite::Blake3Bao64,
                 &expected
             )
-            .unwrap()
+            .unwrap(),
+            VerificationOutcome::Unsupported
         );
         assert_eq!(unsupported.state(), vot_commit_model::State::Durable);
     }

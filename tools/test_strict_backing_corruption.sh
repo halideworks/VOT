@@ -64,11 +64,25 @@ sync
 # Populate the page cache while the mapping is healthy. Then make dm-flakey
 # corrupt the first byte of every read bio during an immediate down interval.
 dd if="$payload" of=/dev/null bs=4096 count=1 status=none
+corrupt_table="0 $sectors flakey $loop 0 1 3600 5 corrupt_bio_byte 1 r 1 0"
 $privilege dmsetup suspend "$name"
-echo "0 $sectors flakey $loop 0 1 3600 5 corrupt_bio_byte 1 r 1 0" | \
+echo "$corrupt_table" | \
     $privilege dmsetup reload "$name"
 $privilege dmsetup resume "$name"
-sleep 2
+
+attempt=0
+while :; do
+    active_table=$($privilege dmsetup table "$name")
+    case "$active_table" in
+        *"corrupt_bio_byte 1 r 1 0") break ;;
+    esac
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 100 ]; then
+        echo "dm-flakey corruption table did not become active" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
 
 if [ -n "${VOT_STRICT_TEST_BIN:-}" ]; then
     VOT_STORAGE_RUNNER=1 VOT_STRICT_TEST_FILE="$payload" \

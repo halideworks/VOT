@@ -179,14 +179,17 @@ impl<F: FaultInjector> PosixCommit<F> {
             return Err(Error::UnsupportedProfile);
         }
         self.prepare_durable()?;
-        match vot_commit_strict::verify_and_advance(&mut self.machine, reader, suite, expected) {
-            Ok(true) => {}
-            Ok(false) => return Err(Error::StrictUnsupported),
-            Err(error) => {
-                if self.machine.state() == State::Poisoned {
-                    self.trace.push(TraceEvent::Poisoned);
-                }
-                return Err(Error::Strict(error));
+        let verification =
+            vot_commit_strict::verify_and_advance(&mut self.machine, reader, suite, expected)
+                .map_err(Error::Strict)?;
+        match verification {
+            vot_commit_strict::VerificationOutcome::Verified => {}
+            vot_commit_strict::VerificationOutcome::Unsupported => {
+                return Err(Error::StrictUnsupported);
+            }
+            vot_commit_strict::VerificationOutcome::Mismatch => {
+                self.trace.push(TraceEvent::Poisoned);
+                return Err(Error::Strict(vot_commit_strict::Error::HashMismatch));
             }
         }
         if let Err(error) = self.journal.append_durable(JOURNAL_AT_REST_VERIFIED, &[]) {

@@ -921,7 +921,10 @@ impl Simulator {
             return;
         }
         if path_state.loss_remaining > 0 {
-            path_state.loss_remaining -= 1;
+            path_state.loss_remaining = path_state
+                .loss_remaining
+                .checked_sub(1)
+                .expect("positive loss count");
             let latency = path_state.latency;
             self.record(format!(
                 "transport.loss carrier={} path={path} transfer={transfer} attempt={attempt}",
@@ -976,7 +979,10 @@ impl Simulator {
     fn queue_enter(&mut self, queue: QueueKind, transfer: u64, bytes: u64) {
         let state = self.queues.get_mut(&queue).expect("all queues configured");
         if state.failures_remaining > 0 {
-            state.failures_remaining -= 1;
+            state.failures_remaining = state
+                .failures_remaining
+                .checked_sub(1)
+                .expect("positive failure count");
             self.fail(Failure::QueueFault { queue });
             return;
         }
@@ -1061,18 +1067,20 @@ impl Simulator {
 #[must_use]
 pub fn shrink_failing(scenario: &Scenario) -> Scenario {
     let target = Simulator::run(scenario).outcome;
-    if !matches!(target, Outcome::Failed(_)) {
+    let Outcome::Failed(_) = target else {
         return scenario.clone();
-    }
+    };
     let mut candidate = scenario.clone();
     candidate.expected_trace = None;
     let mut granularity = 2;
-    while candidate.actions.len() >= 2 {
+    for _ in 0..MAX_ACTIONS {
+        let Some(_) = candidate.actions.len().checked_sub(2) else {
+            break;
+        };
         let chunk = candidate.actions.len().div_ceil(granularity);
         let mut reduced = false;
-        let mut start = 0;
-        while start < candidate.actions.len() {
-            let end = (start + chunk).min(candidate.actions.len());
+        for start in (0..candidate.actions.len()).step_by(chunk) {
+            let end = start.saturating_add(chunk).min(candidate.actions.len());
             let mut trial = candidate.clone();
             trial.actions.drain(start..end);
             if Simulator::run(&trial).outcome == target {
@@ -1081,13 +1089,14 @@ pub fn shrink_failing(scenario: &Scenario) -> Scenario {
                 reduced = true;
                 break;
             }
-            start = end;
         }
         if !reduced {
-            if granularity >= candidate.actions.len() {
+            let Some(_) = candidate.actions.len().checked_sub(granularity) else {
                 break;
-            }
-            granularity = (granularity * 2).min(candidate.actions.len());
+            };
+            granularity = granularity
+                .saturating_add(granularity)
+                .min(candidate.actions.len());
         }
     }
     candidate
@@ -1251,5 +1260,284 @@ mod tests {
             Simulator::run(&scenario).outcome,
             Outcome::Failed(Failure::InvalidScenario)
         );
+    }
+
+    fn scenario_text(name: &str, expected: &str, body: &str) -> String {
+        format!("VOT_SIM_SCENARIO_V1\nname {name}\nseed 1\nexpect {expected}\ntrace -\n{body}")
+    }
+
+    fn direct_scenario(name: String, actions: Vec<ScheduledAction>) -> Scenario {
+        Scenario {
+            name,
+            seed: 1,
+            expected: ExpectedOutcome::Quiescent,
+            expected_trace: None,
+            actions,
+        }
+    }
+
+    #[test]
+    fn public_limits_are_frozen() {
+        assert_eq!(MAX_SCENARIO_BYTES, 1_048_576);
+        assert_eq!(MAX_ACTIONS, 4096);
+        assert_eq!(MAX_NAME_BYTES, 64);
+        assert_eq!(MAX_TRANSFER_BYTES, 134_217_728);
+        assert_eq!(TransportAck::new(42).sequence(), 42);
+    }
+
+    #[test]
+    fn parser_accepts_exact_size_and_rejects_one_byte_more() {
+        let prefix = scenario_text("boundary", "quiescent", "#");
+        let exact = format!("{prefix}{}", "x".repeat(MAX_SCENARIO_BYTES - prefix.len()));
+        assert_eq!(exact.len(), MAX_SCENARIO_BYTES);
+        assert!(Scenario::parse(&exact).is_ok());
+        let over = format!("{exact}x");
+        assert_eq!(Scenario::parse(&over), Err(ScenarioError::TooLarge));
+    }
+
+    #[test]
+    fn parser_validates_each_name_condition() {
+        assert_eq!(
+            Scenario::parse(&scenario_text("", "quiescent", "")),
+            Err(ScenarioError::InvalidName)
+        );
+        assert!(
+            Scenario::parse(&scenario_text(&"a".repeat(MAX_NAME_BYTES), "quiescent", "")).is_ok()
+        );
+        assert_eq!(
+            Scenario::parse(&scenario_text(
+                &"a".repeat(MAX_NAME_BYTES + 1),
+                "quiescent",
+                ""
+            )),
+            Err(ScenarioError::InvalidName)
+        );
+        assert_eq!(
+            Scenario::parse(&scenario_text("bad/name", "quiescent", "")),
+            Err(ScenarioError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn parser_covers_outcomes_carriers_and_remove_path() {
+        let scenario = Scenario::parse(&scenario_text(
+            "grammar",
+            "quiescent",
+            "at 0 switch reliable\nat 1 remove-path 7\n",
+        ))
+        .unwrap();
+        assert_eq!(scenario.expected, ExpectedOutcome::Quiescent);
+        assert_eq!(
+            scenario.actions,
+            vec![
+                ScheduledAction {
+                    at: 0,
+                    action: Action::SwitchTransport {
+                        carrier: Carrier::Reliable
+                    }
+                },
+                ScheduledAction {
+                    at: 1,
+                    action: Action::RemovePath { path: 7 }
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_enforces_action_count_exactly() {
+        let line = "at 0 switch reliable\n";
+        let exact = scenario_text("actions", "quiescent", &line.repeat(MAX_ACTIONS));
+        assert_eq!(Scenario::parse(&exact).unwrap().actions.len(), MAX_ACTIONS);
+        let over = scenario_text("actions", "quiescent", &line.repeat(MAX_ACTIONS + 1));
+        assert_eq!(Scenario::parse(&over), Err(ScenarioError::TooManyActions));
+    }
+
+    #[test]
+    fn every_action_bound_rejects_each_bad_operand() {
+        let invalid = [
+            Action::AddPath {
+                path: 1,
+                mtu: 575,
+                latency: 1,
+            },
+            Action::AddPath {
+                path: 1,
+                mtu: 576,
+                latency: 0,
+            },
+            Action::ChangeMtu { path: 1, mtu: 575 },
+            Action::LossBurst {
+                path: 1,
+                packets: u32::try_from(MAX_ACTIONS).unwrap() + 1,
+            },
+            Action::Reorder {
+                path: 1,
+                window: 1_000_000_001,
+            },
+            Action::Send {
+                path: 1,
+                transfer: 1,
+                bytes: 0,
+            },
+            Action::Send {
+                path: 1,
+                transfer: 1,
+                bytes: MAX_TRANSFER_BYTES + 1,
+            },
+            Action::QueueLimit {
+                queue: QueueKind::Memory,
+                bytes: 0,
+                latency: 1,
+            },
+            Action::QueueLimit {
+                queue: QueueKind::Memory,
+                bytes: MAX_TRANSFER_BYTES + 1,
+                latency: 1,
+            },
+            Action::QueueLimit {
+                queue: QueueKind::Memory,
+                bytes: 1,
+                latency: 0,
+            },
+            Action::QueueFault {
+                queue: QueueKind::Memory,
+                operations: u32::try_from(MAX_ACTIONS).unwrap() + 1,
+            },
+        ];
+        for action in invalid {
+            assert_eq!(validate_action(&action), Err(ScenarioError::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn every_action_bound_accepts_its_exact_edge() {
+        let valid = [
+            Action::AddPath {
+                path: 1,
+                mtu: 576,
+                latency: 1,
+            },
+            Action::ChangeMtu { path: 1, mtu: 576 },
+            Action::LossBurst {
+                path: 1,
+                packets: u32::try_from(MAX_ACTIONS).unwrap(),
+            },
+            Action::Reorder {
+                path: 1,
+                window: 1_000_000_000,
+            },
+            Action::Send {
+                path: 1,
+                transfer: 1,
+                bytes: 1,
+            },
+            Action::Send {
+                path: 1,
+                transfer: 1,
+                bytes: MAX_TRANSFER_BYTES,
+            },
+            Action::QueueLimit {
+                queue: QueueKind::Memory,
+                bytes: MAX_TRANSFER_BYTES,
+                latency: 1,
+            },
+            Action::QueueFault {
+                queue: QueueKind::Memory,
+                operations: u32::try_from(MAX_ACTIONS).unwrap(),
+            },
+        ];
+        for action in valid {
+            assert_eq!(validate_action(&action), Ok(()));
+        }
+    }
+
+    #[test]
+    fn direct_scenarios_enforce_name_and_action_edges() {
+        assert!(matches!(
+            Simulator::run(&direct_scenario(String::new(), vec![])).outcome,
+            Outcome::Failed(Failure::InvalidScenario)
+        ));
+        assert_eq!(
+            Simulator::run(&direct_scenario("a".repeat(MAX_NAME_BYTES), vec![])).outcome,
+            Outcome::Quiescent
+        );
+        assert!(matches!(
+            Simulator::run(&direct_scenario("a".repeat(MAX_NAME_BYTES + 1), vec![])).outcome,
+            Outcome::Failed(Failure::InvalidScenario)
+        ));
+        let switches = vec![
+            ScheduledAction {
+                at: 0,
+                action: Action::SwitchTransport {
+                    carrier: Carrier::Reliable,
+                },
+            };
+            MAX_ACTIONS
+        ];
+        assert_eq!(
+            Simulator::run(&direct_scenario("edge".to_owned(), switches)).outcome,
+            Outcome::Quiescent
+        );
+        let invalid = vec![ScheduledAction {
+            at: 0,
+            action: Action::Send {
+                path: 1,
+                transfer: 1,
+                bytes: 0,
+            },
+        }];
+        assert!(matches!(
+            Simulator::run(&direct_scenario("invalid".to_owned(), invalid)).outcome,
+            Outcome::Failed(Failure::InvalidScenario)
+        ));
+    }
+
+    #[test]
+    fn exact_capacity_and_exact_mtu_complete() {
+        let queue = Scenario::parse(&scenario_text(
+            "capacity",
+            "complete",
+            "at 0 add-path 1 1500 1\nat 1 queue-limit memory 1024 1\nat 2 send 1 1 1024\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            Simulator::run(&queue).outcome,
+            Outcome::Complete { published: 1 }
+        );
+        let datagram = Scenario::parse(&scenario_text(
+            "mtu-edge",
+            "complete",
+            "at 0 add-path 1 1200 1\nat 1 switch datagram\nat 2 send 1 1 1200\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            Simulator::run(&datagram).outcome,
+            Outcome::Complete { published: 1 }
+        );
+    }
+
+    #[test]
+    fn trace_digest_and_prng_are_exact() {
+        let trace = Simulator::run(&Scenario::parse(FALLBACK).unwrap());
+        assert_eq!(trace.digest_hex(), hex_digest(&trace.digest()));
+        let mut prng = Prng::new(1);
+        assert_eq!(prng.next(), 10_451_216_379_200_822_465);
+    }
+
+    #[test]
+    fn shrinker_result_is_exact_and_nonfailures_are_unchanged() {
+        let scenario = Scenario::parse(STORAGE_FAULT).unwrap();
+        let shrunk = shrink_failing(&scenario);
+        assert_eq!(shrunk.actions.len(), 3);
+        assert_eq!(
+            shrunk.encode(),
+            "VOT_SIM_SCENARIO_V1\nname storage-fault\nseed 1099511627791\nexpect failed\ntrace -\n\
+             at 0 add-path 3 1500 3\n\
+             at 3 queue-fault journal 1\n\
+             at 4 send 3 22 1024\n"
+        );
+        let quiescent = direct_scenario("quiet".to_owned(), vec![]);
+        assert_eq!(shrink_failing(&quiescent), quiescent);
     }
 }

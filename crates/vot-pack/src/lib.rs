@@ -7,6 +7,7 @@ use vot_manifest::{PackagePath, PathProfile, canonical_path_key};
 pub const CANDIDATE_MAX: usize = 262_144;
 pub const TARGET_SIZE: usize = 67_108_864;
 pub const HARD_MAX: usize = 134_217_728;
+pub const MAX_ENTRIES_PER_PACK: usize = 8192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalFile {
@@ -35,6 +36,7 @@ pub enum Error {
     FileTooLarge,
     DuplicatePath,
     PackTooLarge,
+    EntriesUnsorted,
     Bounds,
     HashMismatch,
 }
@@ -43,14 +45,104 @@ pub fn build(files: Vec<LogicalFile>, profile: PathProfile) -> Result<Vec<Pack>,
     build_with_target(files, profile, TARGET_SIZE)
 }
 
+/// Bounded pack construction for a canonical-path-ordered input stream.
+pub struct StreamingPacker {
+    profile: PathProfile,
+    target_size: usize,
+    last_key: Option<Vec<u8>>,
+    bytes: Vec<u8>,
+    entries: Vec<PackedEntry>,
+}
+
+impl StreamingPacker {
+    #[must_use]
+    pub fn new(profile: PathProfile) -> Self {
+        Self {
+            profile,
+            target_size: TARGET_SIZE,
+            last_key: None,
+            bytes: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn with_target(profile: PathProfile, target_size: usize) -> Result<Self, Error> {
+        if target_size == 0 || target_size > HARD_MAX {
+            return Err(Error::PackTooLarge);
+        }
+        Ok(Self {
+            profile,
+            target_size,
+            last_key: None,
+            bytes: Vec::new(),
+            entries: Vec::new(),
+        })
+    }
+
+    /// Adds one small file and returns a completed preceding pack when needed.
+    pub fn push(&mut self, file: LogicalFile) -> Result<Option<Pack>, Error> {
+        if file.bytes.len() > CANDIDATE_MAX {
+            return Err(Error::FileTooLarge);
+        }
+        let key = canonical_path_key(&file.path, self.profile).map_err(|_| Error::InvalidPath)?;
+        if self
+            .last_key
+            .as_ref()
+            .is_some_and(|last| key.as_slice() <= last.as_slice())
+        {
+            return Err(Error::EntriesUnsorted);
+        }
+        self.last_key = Some(key);
+
+        let padding = (8 - self.bytes.len() % 8) % 8;
+        let needed = padding
+            .checked_add(file.bytes.len())
+            .ok_or(Error::PackTooLarge)?;
+        let must_flush = !self.entries.is_empty()
+            && (self.entries.len() == MAX_ENTRIES_PER_PACK
+                || self.bytes.len().saturating_add(needed) > self.target_size);
+        let completed = must_flush.then(|| {
+            finish_pack(
+                std::mem::take(&mut self.bytes),
+                std::mem::take(&mut self.entries),
+            )
+        });
+
+        let padding = (8 - self.bytes.len() % 8) % 8;
+        self.bytes.resize(self.bytes.len() + padding, 0);
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&file.bytes);
+        self.entries.push(PackedEntry {
+            path: file.path,
+            offset: offset as u64,
+            length: file.bytes.len() as u64,
+            logical_root: vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &file.bytes)
+                .map_err(|_| Error::PackTooLarge)?,
+        });
+        Ok(completed)
+    }
+
+    #[must_use]
+    pub fn flush(&mut self) -> Option<Pack> {
+        (!self.entries.is_empty()).then(|| {
+            finish_pack(
+                std::mem::take(&mut self.bytes),
+                std::mem::take(&mut self.entries),
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn finish(mut self) -> Option<Pack> {
+        self.flush()
+    }
+}
+
 fn build_with_target(
     mut files: Vec<LogicalFile>,
     profile: PathProfile,
     target_size: usize,
 ) -> Result<Vec<Pack>, Error> {
-    if target_size == 0 || target_size > HARD_MAX {
-        return Err(Error::PackTooLarge);
-    }
     let mut keyed = Vec::with_capacity(files.len());
     for file in files.drain(..) {
         if file.bytes.len() > CANDIDATE_MAX {
@@ -64,36 +156,15 @@ fn build_with_target(
         return Err(Error::DuplicatePath);
     }
 
+    let mut packer = StreamingPacker::with_target(profile, target_size)?;
     let mut packs = Vec::new();
-    let mut bytes = Vec::new();
-    let mut entries = Vec::new();
     for (_, file) in keyed {
-        let padding = (8 - bytes.len() % 8) % 8;
-        let needed = padding
-            .checked_add(file.bytes.len())
-            .ok_or(Error::PackTooLarge)?;
-        if !bytes.is_empty() && bytes.len() + needed > target_size {
-            packs.push(finish_pack(bytes, entries));
-            bytes = Vec::new();
-            entries = Vec::new();
+        if let Some(pack) = packer.push(file)? {
+            packs.push(pack);
         }
-        let padding = (8 - bytes.len() % 8) % 8;
-        bytes.resize(bytes.len() + padding, 0);
-        let offset = bytes.len();
-        bytes.extend_from_slice(&file.bytes);
-        if bytes.len() > HARD_MAX {
-            return Err(Error::PackTooLarge);
-        }
-        entries.push(PackedEntry {
-            path: file.path,
-            offset: offset as u64,
-            length: file.bytes.len() as u64,
-            logical_root: vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &file.bytes)
-                .expect("a bounded pack candidate is a valid verifier stream"),
-        });
     }
-    if !bytes.is_empty() || !entries.is_empty() {
-        packs.push(finish_pack(bytes, entries));
+    if let Some(pack) = packer.finish() {
+        packs.push(pack);
     }
     Ok(packs)
 }
@@ -165,6 +236,71 @@ mod tests {
             assert_eq!(pack.entries.len(), 1);
             extract(pack, &pack.entries[0]).unwrap();
         }
+    }
+
+    #[test]
+    fn streaming_packer_flushes_at_the_entry_bound() {
+        let mut packer = StreamingPacker::new(PathProfile::Portable);
+        for index in 0..=MAX_ENTRIES_PER_PACK {
+            let completed = packer.push(file(&format!("{index:05}"), b"")).unwrap();
+            if index < MAX_ENTRIES_PER_PACK {
+                assert!(completed.is_none());
+            } else {
+                assert_eq!(completed.unwrap().entries.len(), MAX_ENTRIES_PER_PACK);
+            }
+        }
+        assert_eq!(packer.finish().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn streaming_packer_rejects_noncanonical_input_order() {
+        let mut packer = StreamingPacker::new(PathProfile::Portable);
+        packer.push(file("b", b"one")).unwrap();
+        assert_eq!(packer.push(file("a", b"two")), Err(Error::EntriesUnsorted));
+    }
+
+    #[test]
+    fn streaming_packer_size_and_padding_edges_are_exact() {
+        assert!(StreamingPacker::with_target(PathProfile::Portable, 0).is_err());
+        assert!(StreamingPacker::with_target(PathProfile::Portable, HARD_MAX).is_ok());
+        assert!(StreamingPacker::with_target(PathProfile::Portable, HARD_MAX + 1).is_err());
+
+        let mut packer = StreamingPacker::with_target(PathProfile::Portable, 16).unwrap();
+        assert!(packer.push(file("a", &[1; 8])).unwrap().is_none());
+        assert!(packer.push(file("b", &[2; 8])).unwrap().is_none());
+        let completed = packer.push(file("c", &[3])).unwrap().unwrap();
+        assert_eq!(completed.bytes.len(), 16);
+        assert_eq!(
+            completed
+                .entries
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 8]
+        );
+        assert_eq!(packer.finish().unwrap().entries[0].offset, 0);
+
+        let mut alignment = StreamingPacker::with_target(PathProfile::Portable, 32).unwrap();
+        alignment.push(file("a", &[1; 3])).unwrap();
+        alignment.push(file("b", &[2])).unwrap();
+        let aligned = alignment.finish().unwrap();
+        assert_eq!(aligned.entries[1].offset, 8);
+        assert_eq!(&aligned.bytes[3..8], &[0; 5]);
+
+        let mut padding_flush = StreamingPacker::with_target(PathProfile::Portable, 8).unwrap();
+        padding_flush.push(file("a", &[1; 3])).unwrap();
+        let completed = padding_flush.push(file("b", &[2])).unwrap().unwrap();
+        assert_eq!(completed.bytes.len(), 3);
+        assert_eq!(padding_flush.finish().unwrap().bytes.len(), 1);
+
+        let exact = file("exact", &vec![0; CANDIDATE_MAX]);
+        assert!(build(vec![exact], PathProfile::Portable).is_ok());
+        let mut direct = StreamingPacker::new(PathProfile::Portable);
+        assert!(direct.push(file("exact", &vec![0; CANDIDATE_MAX])).is_ok());
+        assert_eq!(
+            direct.push(file("over", &vec![0; CANDIDATE_MAX + 1])),
+            Err(Error::FileTooLarge)
+        );
     }
 
     #[test]

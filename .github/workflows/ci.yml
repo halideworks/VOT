@@ -32,6 +32,7 @@ jobs:
           python3 tools/validate_wave0.py
           python3 tools/verify_wave1_vectors.py
           python3 tools/verify_manifest_pack_vectors.py
+          python3 tools/verify_wave4_package.py
           python3 tools/validate_commit_fixtures.py
           python3 tools/validate_commit_model_sync.py
           VOT_CARGO="cargo +1.85.0" python3 tools/differential_fuzz_codec.py
@@ -83,7 +84,9 @@ jobs:
             cargo +1.85.0 clippy -p vot-transport-sim --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo +1.85.0 test --workspace --locked
+        run: |
+          cargo +1.85.0 test --workspace --locked
+          cargo +1.85.0 test -p vot-pack --test million_package --locked -- --ignored
 
       - name: Validate deterministic simulation
         run: |
@@ -231,7 +234,7 @@ jobs:
           - { package: vot-codec, required: false }
           - { package: vot-verifier, required: false }
           - { package: vot-manifest, required: false }
-          - { package: vot-pack, required: false }
+          - { package: vot-pack, required: true }
           - { package: vot-object-store, required: false }
           - { package: vot-commit-object, required: false }
           - { package: vot-receipt, required: false }
@@ -239,6 +242,7 @@ jobs:
           - { package: vot-transport-sim, required: true }
           - { package: vot-transport-msquic, required: true }
           - { package: vot-scheduler, required: true }
+          - { package: vot-cli, required: true }
     steps:
       - uses: actions/checkout@v4.3.1
         with:

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vot-codec", "crates/vot-verifier", "crates/vot-proof-blake3", "crates/vot-proof-sha256", "crates/vot-manifest", "crates/vot-pack", "crates/vot-commit-model", "crates/vot-journal", "crates/vot-commit-posix", "crates/vot-commit-strict", "crates/vot-object-store", "crates/vot-commit-object", "crates/vot-receipt", "crates/vot-transport-api", "crates/vot-transport-sim", "crates/vot-transport-msquic", "crates/vot-scheduler"]
+members = ["crates/vot-codec", "crates/vot-verifier", "crates/vot-proof-blake3", "crates/vot-proof-sha256", "crates/vot-manifest", "crates/vot-pack", "crates/vot-commit-model", "crates/vot-journal", "crates/vot-commit-posix", "crates/vot-commit-strict", "crates/vot-object-store", "crates/vot-commit-object", "crates/vot-receipt", "crates/vot-transport-api", "crates/vot-transport-sim", "crates/vot-transport-msquic", "crates/vot-scheduler", "crates/vot-cli"]
 resolver = "3"
 
 [workspace.package]

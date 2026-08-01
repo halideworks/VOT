@@ -90,6 +90,24 @@ commitments. `SEAL` binds the final page count, terminal page digest, and
 canonical package root. Reorder, replay conflict, omission, truncation, or source
 mutation prevents sealing.
 
+### 5.1 Canonical package root
+
+The v0 package identity uses `blake3-bao64` over one canonical transcript. The
+transcript begins with the bytes `VOT package v0` followed by one zero byte.
+Each regular-file entry then contributes the following fields in canonical path
+order:
+
+1. the four-byte big-endian length of the encoded path;
+2. the encoded path, consisting of a two-byte big-endian component count and,
+   for every UTF-8 component, its two-byte big-endian byte length and bytes;
+3. the two-byte big-endian logical object suite identifier;
+4. the eight-byte big-endian logical file length; and
+5. the 32-byte logical object root.
+
+The package transcript describes logical files. Pack roots, pack offsets, and
+carrier choices do not affect package identity. v0 package entries use the
+`sha256-bep52-64k` logical object suite identifier `2`.
+
 ## 6. Path profiles
 
 Manifest paths are arrays of components, never separator-containing strings.

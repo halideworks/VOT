@@ -25,6 +25,23 @@ cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 ```
 
+## Package transfer
+
+Build a deterministic transfer bundle:
+
+```sh
+cargo run -p vot-cli -- send SOURCE_DIRECTORY BUNDLE_DIRECTORY
+```
+
+Verify and publish a bundle, then write an authenticated receipt:
+
+```sh
+cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor HMAC_KEY_HEX 2026-07-31T20:00:00Z
+```
+
+The HMAC key must be at least 32 bytes. The receiver refuses to replace an
+existing destination or receipt.
+
 ## License
 
 The Rust implementation and project files are licensed under

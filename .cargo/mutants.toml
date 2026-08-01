@@ -2,3 +2,4 @@ gitignore = true
 minimum_test_timeout = 20.0
 timeout_multiplier = 4.0
 exclude_re = ["live::registration", "live::send_owned"]
+exclude_globs = ["crates/vot-cli/src/main.rs"]

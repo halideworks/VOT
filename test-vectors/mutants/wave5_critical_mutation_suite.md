@@ -5,9 +5,9 @@ crate is required in CI.
 
 ```text
 vot-transport-tcp:    78 total,  69 caught,  9 unviable, 0 missed
-vot-resume:          118 total, 111 caught,  7 unviable, 0 missed
+vot-resume:          122 total, 114 caught,  8 unviable, 0 missed
 vot-commit-platform:  16 total,   9 caught,  7 unviable, 0 missed
-aggregate:           212 total, 189 caught, 23 unviable, 0 missed
+aggregate:           216 total, 192 caught, 24 unviable, 0 missed
 ```
 
 The review-critical publication and recovery dependencies are also required:
@@ -19,8 +19,8 @@ vot-platform-fs:   1 total,   1 caught,  0 unviable, 0 missed
 aggregate:       423 total, 399 caught, 24 unviable, 0 missed
 ```
 
-Across the Wave 5 crates and those dependencies, 635 mutants were tested: 588
-were caught, 47 were unviable, and none were missed.
+Across the Wave 5 crates and those dependencies, 639 mutants were tested: 591
+were caught, 48 were unviable, and none were missed.
 
 The only platform exclusions are the thin native `sync_file` and `sync_parent`
 standard-library wrappers. Their required operation ordering is mutation-tested

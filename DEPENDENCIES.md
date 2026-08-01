@@ -43,6 +43,14 @@ Wave 3 adds no new third-party runtime packages. The deterministic simulator
 reuses the workspace `blake3` package for canonical trace digests. The frame and
 manifest fuzz drivers depend only on their corresponding workspace crates.
 
+Wave 5 runtime dependencies:
+
+- `fs4` 1.1.0 provides safe, cross-platform exclusive file locking for
+  serialized resume-store transactions. Only its synchronous feature is
+  enabled. The crate is maintained, supports Rust 1.75 and later with that
+  feature, uses `rustix` instead of direct libc calls on Unix, and is licensed
+  under Apache-2.0 or MIT.
+
 Test-only dependencies:
 
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz

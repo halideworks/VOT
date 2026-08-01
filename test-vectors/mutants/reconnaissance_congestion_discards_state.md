@@ -15,5 +15,5 @@ Observed failure:
 assertion failed: second reconnaissance result is Unknown
 ```
 
-The required `vot-resume` mutation run reports 118 total, 111 caught, 7
+The required `vot-resume` mutation run reports 122 total, 114 caught, 8
 unviable, and 0 missed.

@@ -27,5 +27,6 @@ These checks close correctness findings left on merged pull requests.
 | Active Careful Resume refresh | Replace an in-use saved path through `observe` | `active_careful_resume_observation_cannot_be_replaced` requires `AlreadyInUse` and proves the existing permit remains exclusive |
 | Unauthenticated receipt recovery | Finalize predictable prepared files without decoding, HMAC verification, and package-field checks | `receipt_recovery_authenticates_prepared_evidence` rejects wrong-key and tampered-summary preparations; `recovered_receipt_requires_every_publication_field` rejects each mismatched claim |
 | Concurrent receipt preparation deletion | Delete deterministic preparation files before a competing publication finishes | `live_receipt_preparation_is_not_removed_by_a_contender` proves a second invocation can validate or reject the evidence but cannot remove it |
+| Concurrent resume checkpoints | Remove the exclusive store lock or replace the durable map from a stale in-memory snapshot | `checkpoint_waits_for_the_store_transaction_lock` and `stale_store_writers_reload_and_merge_checkpointed_units` fail |
 
 The safe TLC capability model explores 2,389,496 distinct states without violation. `CommitUnsupportedAdvance.cfg` reaches `PUBLISHED` for an unsupported profile and TLC reports `Invariant UnsupportedNeverAdvanced is violated`.

@@ -26,6 +26,11 @@ keyed by immutable object identity. Verified and durable state is independent of
 carrier and connection identifiers. Retransmission after a crash is bounded by
 the checkpoint window plus active unverified units.
 
+Writers for one resume-store path take a cross-platform exclusive file lock,
+reload the current durable store, merge checkpointed units, and only then
+atomically replace it. A stale process cannot discard another process's
+checkpoint progress.
+
 RFC 9959 Careful Resume state is keyed by interface, destination, and DSCP. It
 has a lifetime and configuration epoch, is exclusive to one connection, and is
 used only after an acknowledged reconnaissance flight without congestion or path

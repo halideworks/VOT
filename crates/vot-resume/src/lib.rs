@@ -75,29 +75,38 @@ impl ResumeStore {
         subject: SubjectId,
         total_units: u64,
         checkpointed: BTreeSet<u64>,
-    ) -> Result<(), Error> {
+    ) -> Result<BTreeSet<u64>, Error> {
         validate_total_units(total_units)?;
         if checkpointed.iter().any(|unit| *unit >= total_units) {
             return Err(Error::InvalidUnit);
         }
-        if self
-            .objects
+        let lock = lock_store(&self.path)?;
+        let mut candidate = if self.path.exists() {
+            decode_store(&self.path)?
+        } else {
+            BTreeMap::new()
+        };
+        if candidate
             .get(&subject)
             .is_some_and(|object| object.total_units != total_units)
         {
             return Err(Error::IdentityMismatch);
         }
-        let mut candidate = self.objects.clone();
+        let mut merged = candidate
+            .get(&subject)
+            .map_or_else(BTreeSet::new, |object| object.checkpointed.clone());
+        merged.extend(checkpointed);
         candidate.insert(
             subject,
             StoredObject {
                 total_units,
-                checkpointed,
+                checkpointed: merged.clone(),
             },
         );
         Self::flush(&self.path, &candidate)?;
         self.objects = candidate;
-        Ok(())
+        drop(lock);
+        Ok(merged)
     }
 
     fn flush(path: &Path, objects: &BTreeMap<SubjectId, StoredObject>) -> Result<(), Error> {
@@ -185,7 +194,7 @@ impl ResumeTracker {
     pub fn checkpoint(&mut self, store: &mut ResumeStore) -> Result<(), Error> {
         let mut checkpointed = self.checkpointed.clone();
         checkpointed.extend(&self.completed_since_checkpoint);
-        store.save_object(self.subject, self.total_units, checkpointed.clone())?;
+        let checkpointed = store.save_object(self.subject, self.total_units, checkpointed)?;
         self.checkpointed = checkpointed;
         self.completed_since_checkpoint.clear();
         Ok(())
@@ -544,6 +553,24 @@ fn temporary_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(path.with_file_name(temporary))
 }
 
+fn lock_path(path: &Path) -> Result<PathBuf, Error> {
+    let name = path.file_name().ok_or(Error::InvalidConfiguration)?;
+    let mut lock = name.to_os_string();
+    lock.push(".lock");
+    Ok(path.with_file_name(lock))
+}
+
+fn lock_store(path: &Path) -> Result<File, Error> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path(path)?)?;
+    fs4::FileExt::lock(&lock)?;
+    Ok(lock)
+}
+
 fn validate_payload_length(length: u64) -> Result<(), Error> {
     if length > MAX_STORE_PAYLOAD_BYTES {
         Err(Error::TooLarge)
@@ -669,6 +696,65 @@ mod tests {
             &BTreeSet::from([0, 1])
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stale_store_writers_reload_and_merge_checkpointed_units() {
+        let path = temp_path("merged-checkpoints");
+        let mut first_store = ResumeStore::open(&path).unwrap();
+        let mut second_store = ResumeStore::open(&path).unwrap();
+        let mut first = ResumeTracker::discover(&first_store, subject(9), 3, 1).unwrap();
+        let mut second = ResumeTracker::discover(&second_store, subject(9), 3, 1).unwrap();
+        first.begin_unit(0).unwrap();
+        first.complete_unit(0).unwrap();
+        second.begin_unit(1).unwrap();
+        second.complete_unit(1).unwrap();
+
+        first.checkpoint(&mut first_store).unwrap();
+        second.checkpoint(&mut second_store).unwrap();
+
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.checkpointed(subject(9)).unwrap(),
+            &BTreeSet::from([0, 1])
+        );
+        assert!(second.is_checkpointed(0));
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_waits_for_the_store_transaction_lock() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let path = temp_path("checkpoint-lock");
+        let held = lock_store(&path).unwrap();
+        let thread_path = path.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut store = ResumeStore::open(&thread_path).unwrap();
+            let mut tracker = ResumeTracker::discover(&store, subject(10), 1, 1).unwrap();
+            tracker.begin_unit(0).unwrap();
+            tracker.complete_unit(0).unwrap();
+            started_tx.send(()).unwrap();
+            finished_tx.send(tracker.checkpoint(&mut store)).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]

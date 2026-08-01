@@ -86,7 +86,19 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), TransportError> {
+        vot_transport_api::validate_data_record(record)?;
         self.send_reliable_shared(stream, vot_transport_api::shared_payload(record))
+    }
+
+    fn preflight_reliable_batch(
+        &self,
+        _stream: StreamId,
+        records: &[Payload],
+    ) -> Result<(), TransportError> {
+        for record in records {
+            vot_transport_api::validate_data_record(record)?;
+        }
+        Ok(())
     }
 
     fn send_reliable_shared(
@@ -1221,9 +1233,35 @@ pub fn shrink_failing(scenario: &Scenario) -> Scenario {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vot_transport_api::{TransportAdapter, shared_payload};
 
     const FALLBACK: &str = include_str!("../../../sim/scenarios/rebind-fallback.vot");
     const STORAGE_FAULT: &str = include_str!("../../../sim/scenarios/storage-fault.vot");
+
+    #[test]
+    fn adapter_submission_preflight_preserves_queue_state() {
+        let mut adapter = SimulatorAdapter::default();
+        adapter.send_reliable(StreamId(1), b"one").unwrap();
+        assert_eq!(adapter.pending_submissions(), 1);
+        let records = [
+            shared_payload(b"two"),
+            shared_payload(&vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1]),
+        ];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(TransportError::RecordTooLarge)
+        );
+        assert_eq!(adapter.pending_submissions(), 1);
+        adapter.flush().unwrap();
+        assert!(matches!(
+            adapter.poll(),
+            Some(TransportEvent::Reliable {
+                stream: StreamId(1),
+                sequence: 1,
+                bytes,
+            }) if &*bytes == b"one"
+        ));
+    }
 
     #[test]
     fn same_seed_replays_byte_for_byte() {

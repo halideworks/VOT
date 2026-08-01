@@ -141,11 +141,33 @@ pub trait TransportAdapter {
         self.send_reliable(stream, &record)
     }
 
+    /// Checks a reliable batch without changing adapter state.
+    ///
+    /// Implementations with bounded queues must include their available queue
+    /// capacity in this check so `send_reliable_batch` cannot partially enqueue.
+    ///
+    /// # Errors
+    /// Rejects protocol-limit or queue-capacity failures before submission.
+    fn preflight_reliable_batch(
+        &self,
+        _stream: StreamId,
+        records: &[Payload],
+    ) -> Result<(), Error> {
+        for record in records {
+            validate_data_record(record)?;
+        }
+        Ok(())
+    }
+
     /// Submits a batch before the caller requests a backend flush.
+    ///
+    /// The preflight is required to be side-effect free; a failure therefore
+    /// leaves the adapter unchanged and never accepts only a prefix of `records`.
     ///
     /// # Errors
     /// Propagates the first backend or protocol limit failure.
     fn send_reliable_batch(&mut self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
+        self.preflight_reliable_batch(stream, records)?;
         for record in records {
             self.send_reliable_shared(stream, record.clone())?;
         }
@@ -387,6 +409,17 @@ mod tests {
                 (StreamId(7), b"two".to_vec()),
             ]
         );
+
+        let mut preflight = ContractAdapter::default();
+        let invalid_records = [
+            shared_payload(b"accepted only after preflight"),
+            shared_payload(&vec![0; MAX_DATA_RECORD_BYTES + 1]),
+        ];
+        assert_eq!(
+            preflight.send_reliable_batch(StreamId(8), &invalid_records),
+            Err(Error::RecordTooLarge)
+        );
+        assert!(preflight.reliable.is_empty());
 
         assert_eq!(
             adapter.send_datagram(9, b"unreliable"),

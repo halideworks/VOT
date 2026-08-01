@@ -206,7 +206,33 @@ impl TransportAdapter for TcpAdapter {
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+        vot_transport_api::validate_data_record(record)?;
         self.send_reliable_shared(stream, shared_payload(record))
+    }
+
+    fn preflight_reliable_batch(
+        &self,
+        _stream: StreamId,
+        records: &[Payload],
+    ) -> Result<(), Error> {
+        let next_bytes = records
+            .iter()
+            .try_fold(self.command_bytes, |bytes, record| {
+                vot_transport_api::validate_data_record(record)?;
+                bytes
+                    .checked_add(record.len())
+                    .ok_or(Error::ArithmeticOverflow)
+            })?;
+        let next_count = self
+            .commands
+            .len()
+            .checked_add(records.len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        if next_count > self.command_count_limit || next_bytes > self.command_byte_limit {
+            Err(Error::OutboundQueueFull)
+        } else {
+            Ok(())
+        }
     }
 
     fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
@@ -594,6 +620,58 @@ mod tests {
             ),
             Err(Error::RecordTooLarge)
         );
+    }
+
+    #[test]
+    fn reliable_batch_preflight_keeps_queue_unchanged_on_count_failure() {
+        let mut adapter = TcpAdapter::with_queue_limits(2, 100).unwrap();
+        adapter.send_reliable(StreamId(1), b"first").unwrap();
+        let records = [shared_payload(b"second"), shared_payload(b"third")];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(Error::OutboundQueueFull)
+        );
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Reliable {
+                stream: StreamId(1),
+                bytes: shared_payload(b"first"),
+            })
+        );
+        assert_eq!(adapter.next_command(), None);
+
+        let mut exact_count = TcpAdapter::with_queue_limits(2, 100).unwrap();
+        exact_count.send_reliable(StreamId(1), b"first").unwrap();
+        assert_eq!(
+            exact_count.send_reliable_batch(StreamId(1), &[shared_payload(b"second")]),
+            Ok(())
+        );
+
+        let mut exact_bytes = TcpAdapter::with_queue_limits(3, 8).unwrap();
+        exact_bytes.send_reliable(StreamId(1), b"one").unwrap();
+        assert_eq!(
+            exact_bytes.send_reliable_batch(StreamId(1), &[shared_payload(b"12345")]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reliable_batch_preflight_keeps_queue_unchanged_on_byte_failure() {
+        let mut adapter = TcpAdapter::with_queue_limits(3, 8).unwrap();
+        adapter.send_reliable(StreamId(1), b"one").unwrap();
+        let records = [shared_payload(b"two"), shared_payload(b"three")];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(Error::OutboundQueueFull)
+        );
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Reliable {
+                stream: StreamId(1),
+                bytes: shared_payload(b"one"),
+            })
+        );
+        assert_eq!(adapter.next_command(), None);
     }
 
     #[test]

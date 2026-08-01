@@ -473,6 +473,8 @@ fn validate_proof_bundle(value: &ProofBundle) -> Result<(), Error> {
         || value.data_record_count > 17
         || value.total_plaintext_length != value.covered_length
         || value.proof.len() > MAX_PROOF_BYTES
+        || crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
+            .is_some_and(|limit| proof_bundle_payload_len(value) > limit)
     {
         return Err(Error::InvalidValue);
     }
@@ -492,6 +494,37 @@ fn validate_proof_bundle(value: &ProofBundle) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+fn proof_bundle_payload_len(value: &ProofBundle) -> usize {
+    let object_length = cbor_head_len(4)
+        .saturating_add(cbor_head_len(1))
+        .saturating_add(cbor_head_len(u64::from(value.object.suite)))
+        .saturating_add(cbor_byte_string_len(32))
+        .saturating_add(cbor_head_len(value.object.length));
+    cbor_head_len(11)
+        .saturating_add(cbor_head_len(0))
+        .saturating_add(cbor_head_len(0))
+        .saturating_add(cbor_head_len(1))
+        .saturating_add(cbor_byte_string_len(16))
+        .saturating_add(cbor_head_len(2))
+        .saturating_add(cbor_byte_string_len(16))
+        .saturating_add(cbor_head_len(3))
+        .saturating_add(object_length)
+        .saturating_add(cbor_head_len(4))
+        .saturating_add(cbor_head_len(value.requested_offset))
+        .saturating_add(cbor_head_len(5))
+        .saturating_add(cbor_head_len(value.requested_length))
+        .saturating_add(cbor_head_len(6))
+        .saturating_add(cbor_head_len(value.covered_offset))
+        .saturating_add(cbor_head_len(7))
+        .saturating_add(cbor_head_len(value.covered_length))
+        .saturating_add(cbor_head_len(8))
+        .saturating_add(cbor_head_len(value.data_record_count))
+        .saturating_add(cbor_head_len(9))
+        .saturating_add(cbor_head_len(value.total_plaintext_length))
+        .saturating_add(cbor_head_len(10))
+        .saturating_add(cbor_byte_string_len(value.proof.len()))
 }
 
 fn encode_data_record(value: &DataRecord, output: &mut Vec<u8>) -> Result<(), Error> {
@@ -1043,6 +1076,41 @@ mod tests {
         let (decoded_data, _) = decode(&encoded[used..], DecodeLimits::default()).unwrap();
         assert_eq!(decoded_bundle, bundle);
         assert_eq!(decoded_data, data);
+    }
+
+    #[test]
+    fn proof_bundle_limit_includes_typed_payload_overhead() {
+        let limit = crate::registered_payload_limit(frame_type::PROOF_BUNDLE).unwrap();
+        let empty = ProofBundle {
+            request_id: [1; 16],
+            bundle_id: [2; 16],
+            object: object(),
+            requested_offset: GROUP_BYTES,
+            requested_length: GROUP_BYTES,
+            covered_offset: GROUP_BYTES,
+            covered_length: GROUP_BYTES,
+            data_record_count: 1,
+            total_plaintext_length: GROUP_BYTES,
+            proof: Vec::new(),
+        };
+        let metadata = proof_bundle_payload_len(&empty) - cbor_byte_string_len(0);
+        let mut maximum_proof_length = MAX_PROOF_BYTES.min(limit.saturating_sub(metadata));
+        while metadata.saturating_add(cbor_byte_string_len(maximum_proof_length)) > limit {
+            maximum_proof_length -= 1;
+        }
+        let mut valid = empty.clone();
+        valid.proof = vec![0xaa; maximum_proof_length];
+        assert!(valid.validate().is_ok());
+        assert!(encode(&TypedFrame::ProofBundle(valid), &mut Vec::new()).is_ok());
+
+        let mut invalid = empty;
+        invalid.proof = vec![0xaa; maximum_proof_length + 1];
+        assert!(proof_bundle_payload_len(&invalid) > limit);
+        assert_eq!(invalid.validate(), Err(Error::InvalidValue));
+        assert_eq!(
+            encode(&TypedFrame::ProofBundle(invalid), &mut Vec::new()),
+            Err(Error::InvalidValue)
+        );
     }
 
     #[test]

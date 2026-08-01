@@ -67,7 +67,7 @@ impl Journal {
             .read(true)
             .write(true)
             .open(path)?;
-        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        File::open(parent_directory(path))?.sync_all()?;
         Ok(Self {
             file,
             incarnation,
@@ -190,10 +190,16 @@ impl Journal {
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
-        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        File::open(parent_directory(path))?.sync_all()?;
         let (journal, _) = Self::open_current(path, incarnation)?;
         Ok(journal)
     }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[must_use]
@@ -336,6 +342,15 @@ mod tests {
         assert!(replayed.records.iter().all(|record| !record.checkpoint));
         assert!(!replayed.torn_tail);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bare_relative_journal_uses_current_directory_for_durability() {
+        assert_eq!(parent_directory(Path::new("journal")), Path::new("."));
+        assert_eq!(
+            parent_directory(Path::new("nested/journal")),
+            Path::new("nested")
+        );
     }
 
     #[test]

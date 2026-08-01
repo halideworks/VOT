@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata as _;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
 use base64::Engine as _;
@@ -226,8 +227,14 @@ impl S3Compatible for AwsS3Store {
         let completion_was_ambiguous = match completion {
             Ok(_) => false,
             Err(error) if error.as_service_error().is_some() => {
-                self.uploads.insert(upload_id.to_owned(), upload);
-                return Err(Error::Backend);
+                let could_be_completed = error
+                    .as_service_error()
+                    .is_some_and(|service| service_error_may_be_completed(service.code()));
+                if !could_be_completed {
+                    self.uploads.insert(upload_id.to_owned(), upload);
+                    return Err(Error::Backend);
+                }
+                true
             }
             Err(_) => true,
         };
@@ -272,6 +279,10 @@ fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
         }
     }
     !crc
+}
+
+fn service_error_may_be_completed(code: Option<&str>) -> bool {
+    matches!(code, Some("NoSuchUpload"))
 }
 
 const fn read_back_matches(
@@ -320,5 +331,12 @@ mod tests {
             6,
             vot_journal::crc32c(b"oneXwo")
         ));
+    }
+
+    #[test]
+    fn only_consumed_upload_service_error_enters_reconciliation() {
+        assert!(service_error_may_be_completed(Some("NoSuchUpload")));
+        assert!(!service_error_may_be_completed(Some("PreconditionFailed")));
+        assert!(!service_error_may_be_completed(None));
     }
 }

@@ -1,0 +1,7 @@
+VOT_SIM_SCENARIO_V1
+name negative-drop
+seed 7
+expect complete
+trace -
+at 0 add-path 1 1500 1
+at 1 send 1 9 1024

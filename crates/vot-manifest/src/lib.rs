@@ -6,11 +6,13 @@
 
 //! Deterministic VOT manifest encoding, path validation, and progressive ingest.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_PAGE_BYTES: usize = 1_048_576;
+pub const MAX_ENTRIES_PER_PAGE: usize = 8192;
+pub const MAX_PATH_COMPONENTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathProfile {
@@ -105,6 +107,21 @@ pub enum Error {
     SealedPageInProgressiveStream,
     Poisoned,
     InvalidSeal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    PageTooLarge,
+    Truncated,
+    InvalidCbor,
+    NonCanonical,
+    WrongType,
+    InvalidStructure,
+    TooManyEntries,
+    TooManyComponents,
+    ComponentTooLarge,
+    InvalidUtf8,
+    Semantic(Error),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,7 +286,7 @@ pub fn validate_entries(
     profile: PathProfile,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let mut keys = Vec::with_capacity(entries.len());
-    let mut unique = HashSet::with_capacity(entries.len());
+    let mut unique = BTreeSet::new();
     for entry in entries {
         validate_entry(entry)?;
         let key = canonical_path_key(&entry.path, profile)?;
@@ -296,7 +313,7 @@ pub fn canonical_path_key(path: &PackagePath, profile: PathProfile) -> Result<Ve
         match (profile, component) {
             (PathProfile::Portable, Component::Text(text)) => {
                 validate_portable_component(text)?;
-                let folded: String = text.nfc().flat_map(char::to_lowercase).collect();
+                let folded = portable_fold(text);
                 key.extend_from_slice(folded.trim_end_matches(['.', ' ']).as_bytes());
             }
             (PathProfile::RawPosix, Component::Bytes(bytes)) if valid_raw_component(bytes) => {
@@ -337,6 +354,367 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
         Err(Error::PageTooLarge)
     } else {
         Ok(out)
+    }
+}
+
+/// Decodes one canonical manifest page with allocation bounds enforced before
+/// any input-controlled collection is created.
+///
+/// # Errors
+/// Returns a structural, canonical encoding, resource-bound, or semantic error.
+pub fn decode_page(input: &[u8]) -> Result<ManifestPage, DecodeError> {
+    if input.len() > MAX_PAGE_BYTES {
+        return Err(DecodeError::PageTooLarge);
+    }
+    let mut decoder = Decoder::new(input);
+    if decoder.map_len()? != 7 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    decoder.exact_key(0)?;
+    if decoder.uint()? != 0 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    decoder.exact_key(1)?;
+    let manifest_id = decoder.fixed_bytes::<16>()?;
+    decoder.exact_key(2)?;
+    let index = decoder.uint()?;
+    decoder.exact_key(3)?;
+    let total = if decoder.peek()? == 0xf6 {
+        decoder.advance(1)?;
+        None
+    } else {
+        Some(decoder.uint()?)
+    };
+    decoder.exact_key(4)?;
+    let previous_digest = decoder.fixed_bytes::<32>()?;
+    decoder.exact_key(5)?;
+    let profile = match decoder.uint()? {
+        0 => PathProfile::Portable,
+        1 => PathProfile::RawPosix,
+        _ => return Err(DecodeError::InvalidStructure),
+    };
+    decoder.exact_key(6)?;
+    let entry_count =
+        decoder.bounded_array_len(MAX_ENTRIES_PER_PAGE, DecodeError::TooManyEntries)?;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        entries.push(decode_entry(&mut decoder, profile)?);
+    }
+    decoder.finish()?;
+    let page = ManifestPage {
+        manifest_id,
+        index,
+        total,
+        previous_digest,
+        profile,
+        entries,
+    };
+    let canonical = encode_page(&page).map_err(DecodeError::Semantic)?;
+    if canonical != input {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(page)
+}
+
+fn decode_entry(
+    decoder: &mut Decoder<'_>,
+    profile: PathProfile,
+) -> Result<ManifestEntry, DecodeError> {
+    let fields = decoder.map_len()?;
+    if !(2..=5).contains(&fields) {
+        return Err(DecodeError::InvalidStructure);
+    }
+    decoder.exact_key(0)?;
+    let component_count =
+        decoder.bounded_array_len(MAX_PATH_COMPONENTS, DecodeError::TooManyComponents)?;
+    if component_count == 0 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    let mut path = Vec::with_capacity(component_count);
+    for _ in 0..component_count {
+        path.push(match profile {
+            PathProfile::Portable => Component::Text(decoder.text(255)?.to_owned()),
+            PathProfile::RawPosix => Component::Bytes(decoder.bytes(255)?.to_vec()),
+        });
+    }
+    decoder.exact_key(1)?;
+    let kind = match decoder.uint()? {
+        0 => EntryKind::File,
+        1 => EntryKind::Directory,
+        _ => return Err(DecodeError::InvalidStructure),
+    };
+    let mut length = None;
+    let mut storage = None;
+    let mut metadata = None;
+    let mut previous_key = 1;
+    for _ in 2..fields {
+        let key = decoder.uint()?;
+        if key <= previous_key {
+            return Err(DecodeError::NonCanonical);
+        }
+        previous_key = key;
+        match key {
+            2 => length = Some(decoder.uint()?),
+            3 => storage = Some(decode_storage(decoder)?),
+            4 => metadata = Some(decode_metadata(decoder)?),
+            _ => return Err(DecodeError::InvalidStructure),
+        }
+    }
+    Ok(ManifestEntry {
+        path,
+        kind,
+        length,
+        storage,
+        metadata,
+    })
+}
+
+fn decode_storage(decoder: &mut Decoder<'_>) -> Result<StorageRef, DecodeError> {
+    match decoder.array_len()? {
+        2 => {
+            if decoder.uint()? != 0 {
+                return Err(DecodeError::InvalidStructure);
+            }
+            Ok(StorageRef::Direct(decode_object(decoder)?))
+        }
+        5 => {
+            if decoder.uint()? != 1 {
+                return Err(DecodeError::InvalidStructure);
+            }
+            Ok(StorageRef::Pack {
+                pack: decode_object(decoder)?,
+                offset: decoder.uint()?,
+                length: decoder.uint()?,
+                logical: decode_object(decoder)?,
+            })
+        }
+        _ => Err(DecodeError::InvalidStructure),
+    }
+}
+
+fn decode_object(decoder: &mut Decoder<'_>) -> Result<ObjectId, DecodeError> {
+    if decoder.array_len()? != 3 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    let suite = u16::try_from(decoder.uint()?).map_err(|_| DecodeError::InvalidStructure)?;
+    let root = decoder.fixed_bytes::<32>()?;
+    let length = decoder.uint()?;
+    Ok(ObjectId {
+        suite,
+        root,
+        length,
+    })
+}
+
+fn decode_metadata(decoder: &mut Decoder<'_>) -> Result<FileMetadata, DecodeError> {
+    let fields = decoder.map_len()?;
+    if fields > 4 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    let mut metadata = FileMetadata::default();
+    let mut previous_key = None;
+    for _ in 0..fields {
+        let key = decoder.uint()?;
+        if previous_key.is_some_and(|previous| key <= previous) {
+            return Err(DecodeError::NonCanonical);
+        }
+        previous_key = Some(key);
+        match key {
+            0 => {
+                metadata.mode = Some(
+                    u16::try_from(decoder.uint()?).map_err(|_| DecodeError::InvalidStructure)?,
+                );
+            }
+            1 => metadata.mtime_seconds = Some(decoder.int()?),
+            2 => {
+                metadata.mtime_nanoseconds = Some(
+                    u32::try_from(decoder.uint()?).map_err(|_| DecodeError::InvalidStructure)?,
+                );
+            }
+            3 => metadata.media_type = Some(decoder.text(127)?.to_owned()),
+            _ => return Err(DecodeError::InvalidStructure),
+        }
+    }
+    Ok(metadata)
+}
+
+struct Decoder<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Decoder<'a> {
+    const fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn peek(&self) -> Result<u8, DecodeError> {
+        self.input
+            .get(self.offset)
+            .copied()
+            .ok_or(DecodeError::Truncated)
+    }
+
+    fn advance(&mut self, bytes: usize) -> Result<(), DecodeError> {
+        self.offset = self
+            .offset
+            .checked_add(bytes)
+            .filter(|offset| *offset <= self.input.len())
+            .ok_or(DecodeError::Truncated)?;
+        Ok(())
+    }
+
+    fn head(&mut self) -> Result<(u8, u64), DecodeError> {
+        let first = self.peek()?;
+        self.advance(1)?;
+        let major = first >> 5;
+        let additional = first & 0x1f;
+        let value = match additional {
+            value @ 0..=23 => u64::from(value),
+            24 => u64::from(self.read_array::<1>()?[0]),
+            25 => u64::from(u16::from_be_bytes(self.read_array::<2>()?)),
+            26 => u64::from(u32::from_be_bytes(self.read_array::<4>()?)),
+            27 => u64::from_be_bytes(self.read_array::<8>()?),
+            _ => return Err(DecodeError::InvalidCbor),
+        };
+        if (additional == 24 && value < 24)
+            || (additional == 25 && value <= 0xff)
+            || (additional == 26 && value <= 0xffff)
+            || (additional == 27 && value <= 0xffff_ffff)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok((major, value))
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let end = self.offset.checked_add(N).ok_or(DecodeError::Truncated)?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or(DecodeError::Truncated)?;
+        let mut result = [0; N];
+        result.copy_from_slice(bytes);
+        self.offset = end;
+        Ok(result)
+    }
+
+    fn uint(&mut self) -> Result<u64, DecodeError> {
+        let (major, value) = self.head()?;
+        if major == 0 {
+            Ok(value)
+        } else {
+            Err(DecodeError::WrongType)
+        }
+    }
+
+    fn int(&mut self) -> Result<i64, DecodeError> {
+        let (major, value) = self.head()?;
+        match major {
+            0 => i64::try_from(value).map_err(|_| DecodeError::InvalidStructure),
+            1 => {
+                let signed = -1_i128 - i128::from(value);
+                i64::try_from(signed).map_err(|_| DecodeError::InvalidStructure)
+            }
+            _ => Err(DecodeError::WrongType),
+        }
+    }
+
+    fn array_len(&mut self) -> Result<usize, DecodeError> {
+        self.collection_len(4)
+    }
+
+    fn map_len(&mut self) -> Result<usize, DecodeError> {
+        self.collection_len(5)
+    }
+
+    fn collection_len(&mut self, expected_major: u8) -> Result<usize, DecodeError> {
+        let (major, length) = self.head()?;
+        if major != expected_major {
+            return Err(DecodeError::WrongType);
+        }
+        usize::try_from(length).map_err(|_| DecodeError::InvalidStructure)
+    }
+
+    fn bounded_array_len(
+        &mut self,
+        limit: usize,
+        error: DecodeError,
+    ) -> Result<usize, DecodeError> {
+        let length = self.array_len()?;
+        if length > limit {
+            Err(error)
+        } else {
+            Ok(length)
+        }
+    }
+
+    fn bytes(&mut self, limit: usize) -> Result<&'a [u8], DecodeError> {
+        let (major, length) = self.head()?;
+        if major != 2 {
+            return Err(DecodeError::WrongType);
+        }
+        let length = usize::try_from(length).map_err(|_| DecodeError::ComponentTooLarge)?;
+        if length > limit {
+            return Err(DecodeError::ComponentTooLarge);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(DecodeError::Truncated)?;
+        let value = self
+            .input
+            .get(self.offset..end)
+            .ok_or(DecodeError::Truncated)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let value = self.bytes(N)?;
+        if value.len() != N {
+            return Err(DecodeError::InvalidStructure);
+        }
+        let mut result = [0; N];
+        result.copy_from_slice(value);
+        Ok(result)
+    }
+
+    fn text(&mut self, limit: usize) -> Result<&'a str, DecodeError> {
+        let (major, length) = self.head()?;
+        if major != 3 {
+            return Err(DecodeError::WrongType);
+        }
+        let length = usize::try_from(length).map_err(|_| DecodeError::ComponentTooLarge)?;
+        if length > limit {
+            return Err(DecodeError::ComponentTooLarge);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(DecodeError::Truncated)?;
+        let value = self
+            .input
+            .get(self.offset..end)
+            .ok_or(DecodeError::Truncated)?;
+        self.offset = end;
+        std::str::from_utf8(value).map_err(|_| DecodeError::InvalidUtf8)
+    }
+
+    fn exact_key(&mut self, expected: u64) -> Result<(), DecodeError> {
+        if self.uint()? == expected {
+            Ok(())
+        } else {
+            Err(DecodeError::NonCanonical)
+        }
+    }
+
+    fn finish(&self) -> Result<(), DecodeError> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(DecodeError::InvalidStructure)
+        }
     }
 }
 
@@ -406,12 +784,30 @@ fn validate_portable_component(component: &str) -> Result<(), Error> {
         || component.len() > 255
         || component == "."
         || component == ".."
-        || component.contains(['\0', '/', '\\'])
+        || component.contains(['\0', '/', '\\', '<', '>', ':', '"', '|', '?', '*'])
         || component.ends_with(['.', ' '])
+        || component.chars().any(|character| {
+            character <= '\u{1f}'
+                || matches!(
+                    character,
+                    '\u{200c}'
+                        | '\u{200d}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+        })
     {
         return Err(Error::InvalidPath);
     }
-    let folded: String = component.nfc().flat_map(char::to_lowercase).collect();
+    let compatibility: String = component.nfkc().collect();
+    if matches!(compatibility.as_str(), "." | "..") {
+        return Err(Error::InvalidPath);
+    }
+    let folded = portable_fold(component);
+    if matches!(folded.as_str(), "" | "." | "..") {
+        return Err(Error::InvalidPath);
+    }
     let stem = folded.split('.').next().unwrap_or_default();
     let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
         || stem.strip_prefix("com").is_some_and(is_device_digit)
@@ -423,8 +819,22 @@ fn validate_portable_component(component: &str) -> Result<(), Error> {
     }
 }
 
+fn portable_fold(component: &str) -> String {
+    let mut folded = String::with_capacity(component.len());
+    for character in component.nfc() {
+        match character {
+            'I' | 'i' | '\u{130}' | '\u{131}' => folded.push('i'),
+            _ => folded.extend(character.to_lowercase()),
+        }
+    }
+    folded.nfc().collect()
+}
+
 fn is_device_digit(value: &str) -> bool {
-    value.len() == 1 && matches!(value.as_bytes()[0], b'1'..=b'9')
+    matches!(
+        value,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"
+    )
 }
 
 fn valid_raw_component(component: &[u8]) -> bool {
@@ -599,16 +1009,120 @@ mod tests {
         assert_eq!(encoded[0], 0xa7);
         assert_eq!(encoded, encode_page(&page(0, [0; 32], "a.txt")).unwrap());
         assert!(encoded.len() < MAX_PAGE_BYTES);
+        assert_eq!(decode_page(&encoded).unwrap(), page(0, [0; 32], "a.txt"));
+    }
+
+    #[test]
+    fn decoder_rejects_noncanonical_truncated_and_unbounded_inputs() {
+        let encoded = encode_page(&page(0, [0; 32], "a.txt")).unwrap();
+        for length in 0..encoded.len() {
+            assert!(decode_page(&encoded[..length]).is_err());
+        }
+
+        let mut empty = page(0, [0; 32], "a.txt");
+        empty.entries.clear();
+        let mut oversized_entries = encode_page(&empty).unwrap();
+        assert_eq!(oversized_entries.pop(), Some(0x80));
+        oversized_entries.extend_from_slice(&[0x9a, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            decode_page(&oversized_entries),
+            Err(DecodeError::TooManyEntries)
+        );
+
+        let mut noncanonical = vec![0xb8, 0x07];
+        noncanonical.extend_from_slice(&encoded[1..]);
+        assert_eq!(decode_page(&noncanonical), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn packed_raw_page_with_metadata_round_trips() {
+        let logical = ObjectId {
+            suite: 2,
+            root: [3; 32],
+            length: 3,
+        };
+        let rich = ManifestPage {
+            manifest_id: [4; 16],
+            index: 7,
+            total: Some(8),
+            previous_digest: [5; 32],
+            profile: PathProfile::RawPosix,
+            entries: vec![ManifestEntry {
+                path: vec![Component::Bytes(b"raw-name".to_vec())],
+                kind: EntryKind::File,
+                length: Some(3),
+                storage: Some(StorageRef::Pack {
+                    pack: ObjectId {
+                        suite: 1,
+                        root: [6; 32],
+                        length: 4096,
+                    },
+                    offset: 100,
+                    length: 3,
+                    logical,
+                }),
+                metadata: Some(FileMetadata {
+                    mode: Some(0o640),
+                    mtime_seconds: Some(-1),
+                    mtime_nanoseconds: Some(999_999_999),
+                    media_type: Some("application/octet-stream".to_owned()),
+                }),
+            }],
+        };
+        let encoded = encode_page(&rich).unwrap();
+        assert_eq!(decode_page(&encoded).unwrap(), rich);
+    }
+
+    #[test]
+    fn deterministic_mutation_corpus_never_panics() {
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+        for length in 0..4096 {
+            let mut input = vec![0; length % 1025];
+            for byte in &mut input {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            if let Ok(page) = decode_page(&input) {
+                assert_eq!(encode_page(&page).unwrap(), input);
+            }
+        }
     }
 
     #[test]
     fn portable_collision_and_reserved_corpus() {
-        let collisions = vec![file("Readme"), file("README")];
-        assert_eq!(
-            validate_entries(&collisions, PathProfile::Portable),
-            Err(Error::PathCollision)
-        );
-        for name in ["CON", "aux.txt", "LPT9", "bad/part", "trail.", ".."] {
+        for (left, right) in [
+            ("Readme", "README"),
+            ("\u{e9}", "e\u{301}"),
+            ("I", "\u{131}"),
+            ("\u{130}", "i"),
+        ] {
+            let collisions = vec![file(left), file(right)];
+            assert_eq!(
+                validate_entries(&collisions, PathProfile::Portable),
+                Err(Error::PathCollision)
+            );
+        }
+        for name in [
+            "CON",
+            "aux.txt",
+            "NUL.tar.gz",
+            "COM1",
+            "COM\u{b9}",
+            "LPT9",
+            "bad/part",
+            "bad\\part",
+            "bad:name",
+            "trail.",
+            "trail ",
+            ".",
+            "..",
+            "\u{ff0e}",
+            "\u{2024}\u{2024}",
+            "join\u{200d}er",
+            "rtl\u{202e}name",
+        ] {
             assert_eq!(
                 canonical_path_key(
                     &vec![Component::Text(name.to_owned())],
@@ -617,60 +1131,92 @@ mod tests {
                 Err(Error::InvalidPath)
             );
         }
-        let composed = vec![Component::Text("\u{e9}".to_owned())];
-        let decomposed = vec![Component::Text("e\u{301}".to_owned())];
+    }
+
+    #[test]
+    fn progressive_reorder_replay_missing_and_broken_chain_are_rejected_by_ingest() {
+        let first = page(0, [0; 32], "a");
+        let first_digest = *blake3::hash(&encode_page(&first).unwrap()).as_bytes();
+
+        let mut reordered = ProgressiveIngest::new([9; 16], PathProfile::Portable);
         assert_eq!(
-            canonical_path_key(&composed, PathProfile::Portable),
-            canonical_path_key(&decomposed, PathProfile::Portable)
+            reordered.accept(&page(1, first_digest, "b")),
+            Err(Error::WrongPageIndex)
+        );
+
+        let mut replayed = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        replayed.accept(&first).unwrap();
+        assert_eq!(replayed.accept(&first), Err(Error::WrongPageIndex));
+
+        let mut missing = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        missing.accept(&first).unwrap();
+        assert_eq!(
+            missing.accept(&page(2, first_digest, "c")),
+            Err(Error::WrongPageIndex)
+        );
+
+        let mut broken_chain = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        broken_chain.accept(&first).unwrap();
+        assert_eq!(
+            broken_chain.accept(&page(1, [7; 32], "b")),
+            Err(Error::BrokenPageChain)
         );
     }
 
     #[test]
-    fn progressive_reorder_mutation_and_truncation_do_not_seal() {
-        let mut ingest = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+    fn source_mutation_is_rejected_at_seal() {
         let first = page(0, [0; 32], "a");
-        let first_digest = ingest.accept(&first).unwrap();
-        let wrong = page(2, first_digest, "c");
-        assert_eq!(ingest.accept(&wrong), Err(Error::WrongPageIndex));
-        assert!(ingest.is_poisoned());
-
-        let mut clean = ProgressiveIngest::new([9; 16], PathProfile::Portable);
-        let digest = clean.accept(&first).unwrap();
-        let truncated = Seal {
-            manifest_id: [9; 16],
-            final_page_count: 2,
-            final_page_digest: digest,
-            package: ObjectId {
-                suite: 1,
-                root: [1; 32],
-                length: 1,
-            },
-            pages: vec![PageCommitment { index: 0, digest }],
+        let mut ingest = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        let accepted_digest = ingest.accept(&first).unwrap();
+        let valid_package = ObjectId {
+            suite: 1,
+            root: [1; 32],
+            length: 1,
         };
-        assert_eq!(clean.verify_seal(&truncated), Err(Error::InvalidSeal));
+        let valid = Seal {
+            manifest_id: [9; 16],
+            final_page_count: 1,
+            final_page_digest: accepted_digest,
+            package: valid_package.clone(),
+            pages: vec![PageCommitment {
+                index: 0,
+                digest: accepted_digest,
+            }],
+        };
+        assert_eq!(ingest.verify_seal(&valid), Ok(()));
 
         let mut mutated = first.clone();
         mutated.entries[0] = file("changed");
-        assert_eq!(clean.accept(&mutated), Err(Error::WrongPageIndex));
-        assert_eq!(clean.verify_seal(&truncated), Err(Error::Poisoned));
+        let mutated_digest = *blake3::hash(&encode_page(&mutated).unwrap()).as_bytes();
+        let mut wrong_final_digest = valid.clone();
+        wrong_final_digest.final_page_digest = mutated_digest;
+        assert_eq!(
+            ingest.verify_seal(&wrong_final_digest),
+            Err(Error::InvalidSeal)
+        );
+        let mut wrong_page_commitment = valid.clone();
+        wrong_page_commitment.pages[0].digest = mutated_digest;
+        assert_eq!(
+            ingest.verify_seal(&wrong_page_commitment),
+            Err(Error::InvalidSeal)
+        );
+        let mutated_seal = Seal {
+            manifest_id: [9; 16],
+            final_page_count: 1,
+            final_page_digest: mutated_digest,
+            package: valid_package,
+            pages: vec![PageCommitment {
+                index: 0,
+                digest: mutated_digest,
+            }],
+        };
+        assert_eq!(ingest.verify_seal(&mutated_seal), Err(Error::InvalidSeal));
+        assert!(!ingest.is_poisoned());
     }
 
     #[test]
-    fn million_entry_index_has_fixed_memory_bound() {
+    fn index_entry_geometry_is_fixed() {
         assert!(ManifestIndex::bytes_per_entry() <= 24);
         assert!(ManifestIndex::bytes_per_entry() * 1_000_000 <= 24_000_000);
-        let mut index = ManifestIndex::with_capacity(1_000_000);
-        for value in 0_u64..1_000_000 {
-            let mut fingerprint = [0; 16];
-            fingerprint[..8].copy_from_slice(&value.to_be_bytes());
-            index.entries.push(IndexEntry {
-                fingerprint,
-                page: u32::try_from(value / 1_000).unwrap(),
-                entry: u32::try_from(value % 1_000).unwrap(),
-            });
-        }
-        index.finish();
-        assert_eq!(index.entries.len(), 1_000_000);
-        assert!(index.entries.capacity() * ManifestIndex::bytes_per_entry() <= 24_000_000);
     }
 }

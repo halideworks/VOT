@@ -1,0 +1,9 @@
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "use the simulator Clock abstraction" },
+  { path = "std::time::SystemTime::now", reason = "wall clock is audit-only" },
+  { path = "std::thread::sleep", reason = "no_real_sleep is a Wave 3 gate" },
+]
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "use BTreeMap in simulator paths" },
+  { path = "std::collections::HashSet", reason = "use BTreeSet in simulator paths" },
+]

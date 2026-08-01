@@ -5,6 +5,7 @@
     {"name":"strict_publish","profile":"Strict","events":["Admit","TransitVerified","DataFlushSucceeded","JournalFlushSucceeded","AtRestVerified","NamespaceLinked","NamespaceDurable"],"state":"Published","receipts":["Admitted","TransitVerified","Durable","AtRestVerified","Published"]},
     {"name":"flush_poison","profile":"Balanced","events":["Admit","TransitVerified","DataFlushFailed","DataFlushSucceeded"],"state":"Poisoned","error":"Terminal"},
     {"name":"strict_rejects_durable_publish","profile":"Strict","events":["Admit","TransitVerified","DataFlushSucceeded","JournalFlushSucceeded","NamespaceLinked"],"state":"Durable","error":"InvalidTransition"},
-    {"name":"namespace_flush_requires_recovery","profile":"Fast","events":["Admit","TransitVerified","NamespaceLinked","NamespaceFlushFailed"],"state":"RecoveryRequired"}
+    {"name":"namespace_flush_requires_recovery","profile":"Fast","events":["Admit","TransitVerified","NamespaceLinked","NamespaceFlushFailed"],"state":"RecoveryRequired"},
+    {"name":"crash_recovers_exact_state","profile":"Balanced","events":["Admit","TransitVerified","DataFlushSucceeded","Crash","Recover","JournalFlushSucceeded","NamespaceLinked","NamespaceDurable"],"state":"Published","receipts":["Admitted","TransitVerified","Durable","Published"]}
   ]
 }

@@ -57,6 +57,9 @@ pub struct Journal {
     poisoned: bool,
 }
 
+#[derive(Debug)]
+pub struct DurableWitness(());
+
 impl Journal {
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
         let file = OpenOptions::new()
@@ -129,6 +132,15 @@ impl Journal {
         Ok(sequence)
     }
 
+    pub fn append_durable_witness(
+        &mut self,
+        state: u8,
+        payload: &[u8],
+    ) -> Result<(u64, DurableWitness), Error> {
+        self.append_durable(state, payload)
+            .map(|sequence| (sequence, DurableWitness(())))
+    }
+
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -199,17 +211,19 @@ fn encode(record: &Record) -> Result<Vec<u8>, Error> {
     if record.payload.len() > MAX_PAYLOAD {
         return Err(Error::PayloadTooLarge);
     }
+    if record.state & CHECKPOINT_FLAG != 0 {
+        return Err(Error::InvalidState);
+    }
     let mut bytes = Vec::with_capacity(HEADER_LEN + record.payload.len() + 4);
     bytes.extend_from_slice(&MAGIC);
     bytes.push(VERSION);
     bytes.extend_from_slice(&record.incarnation);
     bytes.extend_from_slice(&record.sequence.to_le_bytes());
-    let encoded_state = record.state
-        | if record.checkpoint {
-            CHECKPOINT_FLAG
-        } else {
-            0
-        };
+    let encoded_state = if record.checkpoint {
+        record.state + CHECKPOINT_FLAG
+    } else {
+        record.state
+    };
     bytes.push(encoded_state);
     bytes.extend_from_slice(&(record.payload.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&record.payload);
@@ -229,7 +243,7 @@ fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Resul
     let mut records: Vec<Record> = Vec::new();
     let mut torn_tail = false;
     while offset < bytes.len() {
-        if bytes.len() - offset < HEADER_LEN {
+        if bytes.len() - offset < HEADER_LEN + 4 {
             torn_tail = true;
             break;
         }
@@ -318,6 +332,7 @@ mod tests {
         drop(journal);
         let replayed = replay(&path, incarnation).unwrap();
         assert_eq!(replayed.records.len(), 2);
+        assert!(replayed.records.iter().all(|record| !record.checkpoint));
         assert!(!replayed.torn_tail);
         std::fs::remove_file(path).unwrap();
     }
@@ -419,5 +434,122 @@ mod tests {
         assert_eq!(recovered.records[1].state, 3);
         assert_eq!(recovered.records[1].sequence, 1);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn record(sequence: u64, state: u8, payload: Vec<u8>, checkpoint: bool) -> Record {
+        Record {
+            incarnation: [2; 16],
+            sequence,
+            state,
+            payload,
+            checkpoint,
+        }
+    }
+
+    #[test]
+    fn payload_bounds_are_exact_for_append_encode_and_checkpoint() {
+        let path = temp_path("payload-bounds");
+        let mut journal = Journal::create(&path, [2; 16]).unwrap();
+        let maximum = vec![0; MAX_PAYLOAD];
+        let oversized = vec![0; MAX_PAYLOAD + 1];
+        assert_eq!(journal.append_durable(1, &maximum).unwrap(), 0);
+        assert!(matches!(
+            journal.append_durable(1, &oversized),
+            Err(Error::PayloadTooLarge)
+        ));
+        drop(journal);
+
+        assert!(encode(&record(0, 1, maximum.clone(), false)).is_ok());
+        assert!(matches!(
+            encode(&record(0, 1, oversized.clone(), false)),
+            Err(Error::PayloadTooLarge)
+        ));
+        assert!(matches!(
+            encode(&record(0, CHECKPOINT_FLAG, Vec::new(), false)),
+            Err(Error::InvalidState)
+        ));
+
+        let compacted = Journal::compact_checkpoint(&path, [2; 16], 2, &maximum).unwrap();
+        drop(compacted);
+        assert!(matches!(
+            Journal::compact_checkpoint(&path, [2; 16], 2, &oversized),
+            Err(Error::PayloadTooLarge)
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn poison_status_is_observable_and_blocks_appends() {
+        let path = temp_path("poison-status");
+        let mut journal = Journal::create(&path, [2; 16]).unwrap();
+        assert!(!journal.is_poisoned());
+        journal.poisoned = true;
+        assert!(journal.is_poisoned());
+        assert!(matches!(
+            journal.append_durable(1, &[]),
+            Err(Error::Poisoned)
+        ));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn minimum_record_and_header_fields_are_validated_independently() {
+        let encoded = encode(&record(0, 1, Vec::new(), false)).unwrap();
+        assert_eq!(encoded.len(), HEADER_LEN + 4);
+        let mut reader = encoded.as_slice();
+        assert_eq!(
+            replay_reader(&mut reader, [2; 16]).unwrap().records.len(),
+            1
+        );
+
+        for index in [0, 4] {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= 1;
+            let mut reader = corrupted.as_slice();
+            assert!(matches!(
+                replay_reader(&mut reader, [2; 16]),
+                Err(Error::InvalidHeader)
+            ));
+        }
+    }
+
+    #[test]
+    fn declared_payload_bounds_are_checked_before_tail_handling() {
+        for (declared, expected_too_large) in [
+            (u32::try_from(MAX_PAYLOAD).unwrap(), false),
+            (u32::try_from(MAX_PAYLOAD + 1).unwrap(), true),
+        ] {
+            let mut bytes = encode(&record(0, 1, Vec::new(), false)).unwrap();
+            bytes[30..34].copy_from_slice(&declared.to_le_bytes());
+            let mut reader = bytes.as_slice();
+            let result = replay_reader(&mut reader, [2; 16]);
+            if expected_too_large {
+                assert!(matches!(result, Err(Error::PayloadTooLarge)));
+            } else {
+                assert!(result.unwrap().torn_tail);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_sequence_must_be_byte_identical() {
+        let first = encode(&record(0, 1, b"same".to_vec(), false)).unwrap();
+        let mut identical = first.clone();
+        identical.extend_from_slice(&first);
+        let mut reader = identical.as_slice();
+        assert_eq!(
+            replay_reader(&mut reader, [2; 16]).unwrap().records.len(),
+            1
+        );
+
+        let second = encode(&record(0, 2, b"different".to_vec(), false)).unwrap();
+        let mut conflicting = first;
+        conflicting.extend_from_slice(&second);
+        let mut reader = conflicting.as_slice();
+        assert!(matches!(
+            replay_reader(&mut reader, [2; 16]),
+            Err(Error::SequenceConflict)
+        ));
     }
 }

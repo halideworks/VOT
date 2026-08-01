@@ -48,6 +48,7 @@ pub enum Event {
     NamespaceDurable,
     NamespaceFlushFailed,
     Crash,
+    Recover,
     Abort,
 }
 
@@ -70,6 +71,7 @@ pub struct Machine {
     profile: Profile,
     state: State,
     current_incarnation: bool,
+    recovery_state: Option<State>,
     sequence: u64,
     performed: Vec<Assurance>,
 }
@@ -81,6 +83,7 @@ impl Machine {
             profile,
             state: State::New,
             current_incarnation: true,
+            recovery_state: None,
             sequence: 0,
             performed: Vec::new(),
         }
@@ -116,6 +119,19 @@ impl Machine {
             return Err(Error::Terminal);
         }
 
+        if event == Event::Recover {
+            if self.state != State::RecoveryRequired {
+                return Err(Error::InvalidTransition);
+            }
+            let recovered = self.recovery_state.take().ok_or(Error::InvalidTransition)?;
+            self.sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or(Error::InvalidTransition)?;
+            self.state = recovered;
+            return Ok(None);
+        }
+
         let (next, observation) = match (self.state, event) {
             (State::New, Event::Admit) => (State::Admitted, Some(Assurance::Admitted)),
             (State::Admitted, Event::TransitVerified) => {
@@ -149,7 +165,10 @@ impl Machine {
                 | Event::JournalFlushFailed
                 | Event::AtRestVerificationFailed,
             ) => (State::Poisoned, None),
-            (_, Event::NamespaceLinkAmbiguous | Event::NamespaceFlushFailed | Event::Crash) => {
+            (state, Event::NamespaceLinkAmbiguous | Event::NamespaceFlushFailed | Event::Crash)
+                if state != State::RecoveryRequired =>
+            {
+                self.recovery_state = Some(state);
                 (State::RecoveryRequired, None)
             }
             _ => return Err(Error::InvalidTransition),
@@ -250,6 +269,32 @@ mod tests {
     }
 
     #[test]
+    fn crash_after_each_nonterminal_transition_recovers_exact_state() {
+        let mut machine = Machine::new(Profile::Strict);
+        for event in [
+            None,
+            Some(Event::Admit),
+            Some(Event::TransitVerified),
+            Some(Event::DataFlushSucceeded),
+            Some(Event::JournalFlushSucceeded),
+            Some(Event::AtRestVerified),
+            Some(Event::NamespaceLinked),
+        ] {
+            if let Some(event) = event {
+                machine.apply(event).unwrap();
+            }
+            let mut crashed = machine.clone();
+            let state_before_crash = crashed.state();
+            let performed_before_crash = crashed.performed.clone();
+            crashed.apply(Event::Crash).unwrap();
+            assert_eq!(crashed.state(), State::RecoveryRequired);
+            crashed.apply(Event::Recover).unwrap();
+            assert_eq!(crashed.state(), state_before_crash);
+            assert_eq!(crashed.performed, performed_before_crash);
+        }
+    }
+
+    #[test]
     fn weaker_state_cannot_publish() {
         let mut machine = Machine::new(Profile::Strict);
         reach_durable(&mut machine);
@@ -257,5 +302,69 @@ mod tests {
             machine.apply(Event::NamespaceLinked),
             Err(Error::InvalidTransition)
         );
+    }
+
+    #[test]
+    fn sequence_counts_every_accepted_transition() {
+        let mut machine = Machine::new(Profile::Fast);
+        assert_eq!(machine.sequence(), 0);
+        assert_eq!(machine.apply(Event::Admit).unwrap().unwrap().sequence, 1);
+        assert_eq!(
+            machine
+                .apply(Event::TransitVerified)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert_eq!(machine.apply(Event::Abort), Ok(None));
+        assert_eq!(machine.sequence(), 3);
+    }
+
+    #[test]
+    fn every_nonterminal_work_state_can_abort() {
+        let mut machine = Machine::new(Profile::Strict);
+        for event in [
+            None,
+            Some(Event::Admit),
+            Some(Event::TransitVerified),
+            Some(Event::DataFlushSucceeded),
+            Some(Event::JournalFlushSucceeded),
+            Some(Event::AtRestVerified),
+        ] {
+            if let Some(event) = event {
+                machine.apply(event).unwrap();
+            }
+            let mut aborted = machine.clone();
+            assert_eq!(aborted.apply(Event::Abort), Ok(None));
+            assert_eq!(aborted.state(), State::Aborted);
+        }
+    }
+
+    #[test]
+    fn recovery_event_cannot_replace_the_saved_state() {
+        let mut machine = Machine::new(Profile::Fast);
+        machine.apply(Event::Admit).unwrap();
+        machine.apply(Event::Crash).unwrap();
+        assert_eq!(machine.apply(Event::Crash), Err(Error::InvalidTransition));
+        machine.apply(Event::Recover).unwrap();
+        assert_eq!(machine.state(), State::Admitted);
+    }
+
+    #[test]
+    fn publication_defense_rechecks_recorded_predecessor() {
+        let mut machine = Machine {
+            profile: Profile::Strict,
+            state: State::NamespaceLinked,
+            current_incarnation: true,
+            recovery_state: None,
+            sequence: 0,
+            performed: Vec::new(),
+        };
+        assert_eq!(
+            machine.apply(Event::NamespaceDurable),
+            Err(Error::MissingPredecessor)
+        );
+        assert!(!machine.performed(Assurance::Published));
     }
 }

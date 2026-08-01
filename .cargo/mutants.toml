@@ -1,0 +1,3 @@
+gitignore = true
+minimum_test_timeout = 20.0
+timeout_multiplier = 4.0

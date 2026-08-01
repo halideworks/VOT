@@ -480,7 +480,13 @@ All externally parsed structures have a borrowed decode path and an owned valida
 
 ### 5.1 Repository rules
 
-- AGPL-3.0-only source license.
+- AGPL-3.0-only for the implementation and project files. Apache-2.0 for
+  `spec/`, `test-vectors/`, and `models/` so independent implementations can
+  consume the protocol artifacts without implementation copyleft.
+- Explicit Apache-2.0 section 3 style patent grant across both license scopes.
+- A signed contributor license agreement for non-trivial outside contributions;
+  DCO sign-off remains required for provenance but does not grant relicensing
+  rights.
 - `NOTICE`, `SECURITY.md`, `PATENTS.md`, `PRIOR_ART.md`, and contributor provenance policy from the first commit.
 - Signed-off commits or equivalent provenance attestation.
 - No copied proprietary code, decompiled logic, or undocumented protocol cloning.
@@ -506,6 +512,9 @@ Every implementation pull request must contain:
 - Telemetry events for externally diagnosable state changes.
 - No silent fallback or assurance downgrade.
 - A note on memory, CPU, storage, and wire amplification.
+- For every claimed acceptance criterion, a passing test, a minimal deliberate
+  mutant, and captured output proving the test rejects that mutant under
+  `test-vectors/mutants/`.
 
 Agents may not:
 
@@ -642,6 +651,11 @@ Gate W3:
 - Grease frames are tolerated.
 - Fuzzing finds no unbounded allocation or panic on malformed input.
 - Simulator can replay all later benchmark scenarios from versioned trace files.
+- The negative-control transport is caught when it drops a reliable frame,
+  reorders manifest pages, replays an old incarnation, or publishes before its
+  assurance predecessors.
+- Codec acceptance and parsed structure agree with the independent Python
+  decoder over the differential fuzz corpus.
 
 ### Wave 4 — Reliable single-rail transfer MVP
 

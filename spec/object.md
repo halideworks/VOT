@@ -101,6 +101,8 @@ The portable profile additionally rejects:
 - absolute, drive-qualified, UNC, or device paths;
 - Windows reserved device names after case folding and trailing-dot/space
   normalization;
+- Win32 reserved punctuation, control characters, bidi overrides, isolated join
+  controls, and names that normalize to dot components under NFKC;
 - collisions after Unicode normalization and platform case folding; and
 - components or total paths above declared portable limits.
 
@@ -108,6 +110,9 @@ The raw-POSIX profile carries nonempty byte-string components excluding NUL and
 `/`. A receiver MUST preflight collisions and target-policy validity before
 creating any path. Sanitization does not silently merge two manifest entries;
 the package is rejected or an explicit, audited materialization mapping is used.
+Portable collision keys conservatively fold the Turkish dotted and dotless I
+pairs to the same key. This is locale independent and prevents a package that is
+distinct on one host from colliding under a Turkish locale on another.
 
 ## 7. Pack objects
 

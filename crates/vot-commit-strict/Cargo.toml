@@ -7,10 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 aligned-vec = "0.6.4"
-blake3.workspace = true
 rustix = { version = "1.1.4", features = ["fs"] }
-sha2.workspace = true
 vot-commit-model = { path = "../vot-commit-model" }
+vot-verifier = { path = "../vot-verifier" }
 
 [lints]
 workspace = true

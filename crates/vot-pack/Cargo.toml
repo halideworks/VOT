@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 vot-manifest = { path = "../vot-manifest" }
-vot-proof-sha256 = { path = "../vot-proof-sha256" }
+vot-verifier = { path = "../vot-verifier" }
 
 [lints]
 workspace = true

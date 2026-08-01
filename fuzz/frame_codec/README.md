@@ -1,9 +1,10 @@
 # Frame codec fuzz driver
 
 The standalone driver reads at most the hard frame ceiling plus 64 KiB from
-standard input and invokes the borrowed decoder with a bounded frame count. Any
-parse error is an expected result; a panic, abort, excessive allocation, or hang
-is a failure.
+standard input and invokes the borrowed decoder with a bounded frame count.
+SETTINGS frames also exercise bounded negotiation, duplicate detection, unknown
+identifier handling, and registered value ranges. Any parse error is an expected
+result; a panic, abort, excessive allocation, or hang is a failure.
 
 Build with the pinned lockfile:
 

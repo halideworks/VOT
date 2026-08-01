@@ -38,3 +38,13 @@ and `tokio`. Version 1.96.0 is the newest AWS S3 SDK release compatible with
 the project Rust 1.85 minimum. The larger SDK dependency graph is isolated
 behind the feature and exercised against MinIO in CI. The MinIO server and
 client images are pinned by digest.
+
+Wave 3 adds no new third-party runtime packages. The deterministic simulator
+reuses the workspace `blake3` package for canonical trace digests. The frame and
+manifest fuzz drivers depend only on their corresponding workspace crates.
+
+Test-only dependencies:
+
+- `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz
+  processes. It enforces a hard allocation ceiling without adding unsafe code to
+  VOT.

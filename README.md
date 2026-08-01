@@ -17,9 +17,17 @@ python3 tools/validate_wave0.py
 python3 tools/verify_wave1_vectors.py
 python3 tools/verify_manifest_pack_vectors.py
 python3 tools/validate_commit_fixtures.py
+python3 tools/validate_commit_model_sync.py
+python3 tools/differential_fuzz_codec.py
 cargo test --workspace --locked
+cargo run -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot
+cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
+cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 ```
 
 ## License
 
-GNU Affero General Public License version 3 only. See `LICENSE`.
+The Rust implementation and project files are licensed under
+AGPL-3.0-only. The protocol specifications, test vectors, and formal models in
+`spec/`, `test-vectors/`, and `models/` are licensed under Apache-2.0. See
+`LICENSE`, `LICENSE-APACHE`, and the license marker in each permissive directory.

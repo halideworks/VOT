@@ -2,7 +2,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "s3-live")]
 pub mod aws;
@@ -60,10 +60,10 @@ struct Upload {
 #[derive(Default)]
 pub struct MockStore {
     next_upload: u64,
-    uploads: HashMap<String, Upload>,
-    objects: HashMap<String, CompletedObject>,
-    leases: HashMap<String, u64>,
-    tombstones: HashSet<String>,
+    uploads: BTreeMap<String, Upload>,
+    objects: BTreeMap<String, CompletedObject>,
+    leases: BTreeMap<String, u64>,
+    tombstones: BTreeSet<String>,
 }
 
 impl MockStore {

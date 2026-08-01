@@ -5,32 +5,31 @@
 use std::path::Path;
 
 use aligned_vec::{AVec, RuntimeAlign};
-use sha2::{Digest, Sha256};
 use vot_commit_model::{Event, Machine};
+use vot_verifier::StreamVerifier;
+pub use vot_verifier::Suite;
+
+pub const DIRECT_READ_BUFFER_BYTES: usize = 1024 * 1024;
+pub const MAX_DIRECT_ALIGNMENT: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Suite {
-    Blake3,
-    Sha256,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DirectRead {
-    Supported(Vec<u8>),
+pub enum DirectHash {
+    Supported([u8; 32]),
     Unsupported,
 }
 
 #[derive(Debug)]
 pub enum Error {
     InvalidAlignment,
-    LengthOverflow,
+    BufferSizeOverflow,
     Io(std::io::Error),
+    Verify(vot_verifier::VerifyError),
     HashMismatch,
     Model(vot_commit_model::Error),
 }
 
 pub trait ReadBack {
-    fn read_back(&self) -> Result<DirectRead, Error>;
+    fn hash(&self, suite: Suite) -> Result<DirectHash, Error>;
 }
 
 pub struct LinuxDirectReader<'a> {
@@ -48,51 +47,75 @@ impl<'a> LinuxDirectReader<'a> {
             alignment,
         }
     }
+
+    fn buffer_size(&self) -> Result<usize, Error> {
+        if !self.alignment.is_power_of_two()
+            || self.alignment < 512
+            || self.alignment > MAX_DIRECT_ALIGNMENT
+        {
+            return Err(Error::InvalidAlignment);
+        }
+        DIRECT_READ_BUFFER_BYTES
+            .div_ceil(self.alignment)
+            .checked_mul(self.alignment)
+            .ok_or(Error::BufferSizeOverflow)
+    }
 }
 
 impl ReadBack for LinuxDirectReader<'_> {
-    fn read_back(&self) -> Result<DirectRead, Error> {
-        if !self.alignment.is_power_of_two() || self.alignment < 512 {
-            return Err(Error::InvalidAlignment);
-        }
-        let flags =
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECT | rustix::fs::OFlags::CLOEXEC;
-        let descriptor = match rustix::fs::open(self.path, flags, rustix::fs::Mode::empty()) {
-            Ok(descriptor) => descriptor,
-            Err(error) if unsupported(error) => return Ok(DirectRead::Unsupported),
-            Err(error) => {
-                return Err(Error::Io(std::io::Error::from_raw_os_error(
-                    error.raw_os_error(),
-                )));
-            }
-        };
-        let capacity = usize::try_from(self.logical_length).map_err(|_| Error::LengthOverflow)?;
-        let mut output = Vec::with_capacity(capacity);
+    fn hash(&self, suite: Suite) -> Result<DirectHash, Error> {
+        let buffer_size = self.buffer_size()?;
+        let descriptor =
+            match rustix::fs::open(self.path, direct_open_flags(), rustix::fs::Mode::empty()) {
+                Ok(descriptor) => descriptor,
+                Err(error) => return classify_direct_error(error),
+            };
         let mut block = AVec::<u8, RuntimeAlign>::new(self.alignment);
-        block.resize(self.alignment, 0);
-        while output.len() < capacity {
+        block.resize(buffer_size, 0);
+        let mut remaining = self.logical_length;
+        let mut verifier = StreamVerifier::new(suite);
+        while remaining > 0 {
             match rustix::io::read(&descriptor, &mut block[..]) {
-                Ok(0) => break,
+                Ok(0) => return Err(short_read()),
                 Ok(read) => {
-                    let remaining = capacity - output.len();
-                    output.extend_from_slice(&block[..read.min(remaining)]);
+                    let consumed = usize::try_from(remaining.min(read as u64))
+                        .map_err(|_| Error::BufferSizeOverflow)?;
+                    verifier.update(&block[..consumed]).map_err(Error::Verify)?;
+                    remaining -= consumed as u64;
                 }
-                Err(error) if unsupported(error) => return Ok(DirectRead::Unsupported),
-                Err(error) => {
-                    return Err(Error::Io(std::io::Error::from_raw_os_error(
-                        error.raw_os_error(),
-                    )));
-                }
+                Err(error) => return classify_direct_error(error),
             }
         }
-        if output.len() != capacity {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "short direct read",
-            )));
-        }
-        Ok(DirectRead::Supported(output))
+        Ok(DirectHash::Supported(
+            verifier.finish().map_err(Error::Verify)?,
+        ))
     }
+}
+
+fn io_error(error: rustix::io::Errno) -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+fn direct_open_flags() -> rustix::fs::OFlags {
+    let mut flags = rustix::fs::OFlags::RDONLY;
+    flags.insert(rustix::fs::OFlags::DIRECT);
+    flags.insert(rustix::fs::OFlags::CLOEXEC);
+    flags
+}
+
+fn classify_direct_error(error: rustix::io::Errno) -> Result<DirectHash, Error> {
+    if unsupported(error) {
+        Ok(DirectHash::Unsupported)
+    } else {
+        Err(io_error(error))
+    }
+}
+
+fn short_read() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "short direct read",
+    ))
 }
 
 fn unsupported(error: rustix::io::Errno) -> bool {
@@ -103,12 +126,8 @@ fn unsupported(error: rustix::io::Errno) -> bool {
 }
 
 pub fn verify<R: ReadBack>(reader: &R, suite: Suite, expected: &[u8; 32]) -> Result<bool, Error> {
-    let DirectRead::Supported(bytes) = reader.read_back()? else {
+    let DirectHash::Supported(actual) = reader.hash(suite)? else {
         return Ok(false);
-    };
-    let actual = match suite {
-        Suite::Blake3 => *blake3::hash(&bytes).as_bytes(),
-        Suite::Sha256 => Sha256::digest(&bytes).into(),
     };
     if actual == *expected {
         Ok(true)
@@ -147,11 +166,11 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    struct MemoryReader(DirectRead);
+    struct MemoryReader(DirectHash);
 
     impl ReadBack for MemoryReader {
-        fn read_back(&self) -> Result<DirectRead, Error> {
-            Ok(self.0.clone())
+        fn hash(&self, _suite: Suite) -> Result<DirectHash, Error> {
+            Ok(self.0)
         }
     }
 
@@ -164,55 +183,85 @@ mod tests {
     }
 
     #[test]
-    fn strict_catches_backing_corruption_buffered_control_does_not() {
-        let original = b"verified bytes".to_vec();
-        let expected = *blake3::hash(&original).as_bytes();
-        let mut backing = original.clone();
-        backing[0] ^= 1;
-        let strict = MemoryReader(DirectRead::Supported(backing));
-        let buffered_control = MemoryReader(DirectRead::Supported(original));
-        assert!(matches!(
-            verify(&strict, Suite::Blake3, &expected),
-            Err(Error::HashMismatch)
-        ));
-        assert!(matches!(
-            verify(&buffered_control, Suite::Blake3, &expected),
-            Ok(true)
-        ));
-    }
-
-    #[test]
     fn unsupported_backend_is_explicit() {
-        let reader = MemoryReader(DirectRead::Unsupported);
+        let reader = MemoryReader(DirectHash::Unsupported);
         assert!(matches!(
-            verify(&reader, Suite::Blake3, &[0; 32]),
+            verify(&reader, Suite::Blake3Bao64, &[0; 32]),
             Ok(false)
         ));
     }
 
     #[test]
-    fn linux_direct_reader_handles_aligned_and_tail_lengths_when_supported() {
+    fn direct_reader_hashes_aligned_and_tail_lengths_when_supported() {
         let path = path();
-        let data: Vec<_> = (0..8_213)
+        let data: Vec<_> = (0..DIRECT_READ_BUFFER_BYTES + 8_213)
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect();
         fs::write(&path, &data).unwrap();
-        FileSync::sync(&path);
+        fs::File::open(&path).unwrap().sync_all().unwrap();
         let reader = LinuxDirectReader::new(&path, data.len() as u64, 4096);
-        match reader.read_back().unwrap() {
-            DirectRead::Supported(read) => assert_eq!(read, data),
-            DirectRead::Unsupported => {}
+        let expected = vot_verifier::root(Suite::Blake3Bao64, &data).unwrap();
+        match reader.hash(Suite::Blake3Bao64).unwrap() {
+            DirectHash::Supported(actual) => assert_eq!(actual, expected),
+            DirectHash::Unsupported => assert!(matches!(
+                verify(&reader, Suite::Blake3Bao64, &expected),
+                Ok(false)
+            )),
         }
         fs::remove_file(path).unwrap();
     }
 
-    struct FileSync;
-
-    impl FileSync {
-        fn sync(path: &Path) {
-            fs::File::open(path).unwrap().sync_all().unwrap();
-        }
+    #[test]
+    fn direct_reader_buffer_is_bounded_independent_of_object_length() {
+        let reader = LinuxDirectReader::new(Path::new("unused"), 500 * 1024 * 1024 * 1024, 4096);
+        assert_eq!(reader.buffer_size().unwrap(), DIRECT_READ_BUFFER_BYTES);
     }
+
+    #[test]
+    fn direct_reader_alignment_bounds_are_exact() {
+        assert_eq!(DIRECT_READ_BUFFER_BYTES, 1_048_576);
+        assert_eq!(MAX_DIRECT_ALIGNMENT, 4_194_304);
+        for alignment in [0, 256, 511, 513, MAX_DIRECT_ALIGNMENT * 2] {
+            assert!(matches!(
+                LinuxDirectReader::new(Path::new("unused"), 0, alignment).buffer_size(),
+                Err(Error::InvalidAlignment)
+            ));
+        }
+        assert_eq!(
+            LinuxDirectReader::new(Path::new("unused"), 0, 512)
+                .buffer_size()
+                .unwrap(),
+            DIRECT_READ_BUFFER_BYTES
+        );
+        assert_eq!(
+            LinuxDirectReader::new(Path::new("unused"), 0, MAX_DIRECT_ALIGNMENT)
+                .buffer_size()
+                .unwrap(),
+            MAX_DIRECT_ALIGNMENT
+        );
+    }
+
+    #[test]
+    fn direct_flags_and_errno_classification_are_exact() {
+        let flags = direct_open_flags();
+        assert!(flags.contains(rustix::fs::OFlags::DIRECT));
+        assert!(flags.contains(rustix::fs::OFlags::CLOEXEC));
+        for error in [
+            rustix::io::Errno::INVAL,
+            rustix::io::Errno::OPNOTSUPP,
+            rustix::io::Errno::NOSYS,
+        ] {
+            assert!(matches!(
+                classify_direct_error(error),
+                Ok(DirectHash::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            classify_direct_error(rustix::io::Errno::NOENT),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
     fn durable_machine() -> Machine {
         let mut machine = Machine::new(vot_commit_model::Profile::Strict);
         machine.apply(Event::Admit).unwrap();
@@ -224,29 +273,28 @@ mod tests {
 
     #[test]
     fn strict_outcome_advances_or_poisons_the_commit_state() {
-        let bytes = b"verified bytes".to_vec();
-        let expected = *blake3::hash(&bytes).as_bytes();
+        let expected = vot_verifier::root(Suite::Blake3Bao64, b"verified bytes").unwrap();
 
         let mut verified = durable_machine();
         assert!(
             verify_and_advance(
                 &mut verified,
-                &MemoryReader(DirectRead::Supported(bytes.clone())),
-                Suite::Blake3,
+                &MemoryReader(DirectHash::Supported(expected)),
+                Suite::Blake3Bao64,
                 &expected
             )
             .unwrap()
         );
         assert_eq!(verified.state(), vot_commit_model::State::AtRestVerified);
 
-        let mut corrupted = bytes;
-        corrupted[0] ^= 1;
+        let mut corrupted_hash = expected;
+        corrupted_hash[0] ^= 1;
         let mut poisoned = durable_machine();
         assert!(matches!(
             verify_and_advance(
                 &mut poisoned,
-                &MemoryReader(DirectRead::Supported(corrupted)),
-                Suite::Blake3,
+                &MemoryReader(DirectHash::Supported(corrupted_hash)),
+                Suite::Blake3Bao64,
                 &expected
             ),
             Err(Error::HashMismatch)
@@ -257,8 +305,8 @@ mod tests {
         assert!(
             !verify_and_advance(
                 &mut unsupported,
-                &MemoryReader(DirectRead::Unsupported),
-                Suite::Blake3,
+                &MemoryReader(DirectHash::Unsupported),
+                Suite::Blake3Bao64,
                 &expected
             )
             .unwrap()

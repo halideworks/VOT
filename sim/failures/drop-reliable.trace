@@ -1,0 +1,8 @@
+VOT_SIM_TRACE_V1
+scenario negative-drop
+seed 7
+0 path.add path=1 mtu=1500 latency=1
+1 transport.send carrier=reliable path=1 transfer=9 bytes=1024
+1 negative.drop carrier=reliable path=1 transfer=9
+1 failure IncompleteReliable { missing: 1 }
+outcome failed:IncompleteReliable { missing: 1 }

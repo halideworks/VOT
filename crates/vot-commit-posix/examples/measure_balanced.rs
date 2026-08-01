@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // This executable measures real wall-clock time.
+
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::Write;
@@ -66,7 +68,9 @@ fn main() {
     let bytes: Vec<u8> = (0..length)
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect();
-    let root = std::env::temp_dir().join(format!("vot-balanced-bench-{}", std::process::id()));
+    let storage_root = std::env::var_os("VOT_BENCH_ROOT")
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let root = storage_root.join(format!("vot-balanced-bench-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
     let mut baseline_samples = Vec::with_capacity(iterations);
     let mut balanced_samples = Vec::with_capacity(iterations);

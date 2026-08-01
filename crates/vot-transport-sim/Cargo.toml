@@ -1,0 +1,18 @@
+[package]
+name = "vot-transport-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+
+[dev-dependencies]
+vot-commit-model = { path = "../vot-commit-model" }
+vot-journal = { path = "../vot-journal" }
+vot-manifest = { path = "../vot-manifest" }
+
+[lints]
+workspace = true

@@ -24,12 +24,12 @@ pub enum Error {
 }
 
 #[must_use]
+/// # Panics
+/// Panics only if the shared verifier rejects a contiguous bounded slice,
+/// which cannot violate its group-order or length rules.
 pub fn root(data: &[u8]) -> [u8; 32] {
-    if data.is_empty() {
-        return hash(data);
-    }
-    let leaves = leaf_hashes(data);
-    reduce(leaves)
+    vot_verifier::root(vot_verifier::Suite::Sha256Bep52, data)
+        .expect("a bounded slice is a valid verifier stream")
 }
 
 #[must_use]
@@ -55,10 +55,9 @@ pub fn prove(data: &[u8], offset: u64, length: u64) -> Result<RangeProof, Error>
     }
     let covered_offset = offset / PIECE_SIZE * PIECE_SIZE;
     let covered_end = request_end
-        .checked_add(PIECE_SIZE - 1)
-        .ok_or(Error::LengthOverflow)?
-        / PIECE_SIZE
-        * PIECE_SIZE;
+        .div_ceil(PIECE_SIZE)
+        .checked_mul(PIECE_SIZE)
+        .ok_or(Error::LengthOverflow)?;
     let covered_end = covered_end.min(object_len);
     let first = covered_offset / PIECE_SIZE;
     let end = covered_end.div_ceil(PIECE_SIZE);
@@ -80,7 +79,7 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if object_len == 0 || covered_offset % PIECE_SIZE != 0 || data.is_empty() {
+    if covered_offset % PIECE_SIZE != 0 || data.is_empty() {
         return Err(Error::OutOfBounds);
     }
     let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
@@ -120,6 +119,7 @@ fn parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     hash(&input)
 }
 
+#[cfg(test)]
 fn leaf_hashes(data: &[u8]) -> Vec<[u8; 32]> {
     let mut leaves: Vec<_> = data.chunks(LEAF_SIZE).map(hash).collect();
     leaves.resize(leaves.len().next_power_of_two(), [0; 32]);
@@ -194,7 +194,7 @@ fn encode_proof(pieces: &[[u8; 32]], first: u64, end: u64) -> Vec<u8> {
     let mut start = window_start;
     let mut width = window_width;
     let mut level = width.trailing_zeros() as usize;
-    while width < tree_width {
+    while width != tree_width {
         let node_index = start / width;
         let sibling = node_index ^ 1;
         let sibling_start = sibling * width;
@@ -260,13 +260,19 @@ fn decode_root(
     let mut start = window_start;
     let mut width = window_width;
     while width < tree_width {
-        let sibling_start = ((start / width) ^ 1) * width;
+        let node_index = start / width;
+        let sibling_on_left = node_index & 1 == 1;
+        let sibling_start = if sibling_on_left {
+            start - width
+        } else {
+            start + width
+        };
         let sibling = if sibling_start < piece_count {
             read_hash(proof, &mut cursor)?
         } else {
             zero_subtree(width)
         };
-        value = if sibling_start < start {
+        value = if sibling_on_left {
             parent(&sibling, &value)
         } else {
             parent(&value, &sibling)
@@ -304,8 +310,15 @@ mod tests {
     fn arbitrary_ranges_verify() {
         let data = fixture(7 * PIECE_SIZE as usize + 37);
         let expected = root(&data);
-        for (offset, length) in [(1, 1), (70_000, 100_000), (196_700, 200_000), (458_752, 37)] {
+        for (offset, length, covered_offset, covered_length) in [
+            (1, 1, 0, PIECE_SIZE),
+            (70_000, 100_000, PIECE_SIZE, 2 * PIECE_SIZE),
+            (196_700, 200_000, 3 * PIECE_SIZE, 4 * PIECE_SIZE),
+            (458_752, 37, 7 * PIECE_SIZE, 37),
+        ] {
             let bundle = prove(&data, offset, length).unwrap();
+            assert_eq!(bundle.covered_offset, covered_offset);
+            assert_eq!(bundle.data.len() as u64, covered_length);
             verify(
                 &expected,
                 data.len() as u64,
@@ -366,5 +379,155 @@ mod tests {
             root(&data),
             *padded_piece_tree(&pieces).last().unwrap().first().unwrap()
         );
+    }
+
+    #[test]
+    fn proof_request_and_verifier_bounds_are_exact() {
+        let data = fixture(2 * PIECE_SIZE as usize);
+        let expected = root(&data);
+        assert_eq!(prove(&data, 0, 0), Err(Error::EmptyRange));
+        assert_eq!(prove(&data, u64::MAX, 2), Err(Error::LengthOverflow));
+        assert_eq!(prove(&data, data.len() as u64, 1), Err(Error::OutOfBounds));
+
+        assert_eq!(verify(&expected, 0, 0, &[1], &[]), Err(Error::OutOfBounds));
+        assert_eq!(
+            verify(&expected, data.len() as u64, 1, &[1], &[]),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(&expected, data.len() as u64, 0, &[], &[]),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(
+                &expected,
+                data.len() as u64,
+                0,
+                &fixture(data.len() + 1),
+                &[]
+            ),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(&expected, data.len() as u64, 0, &[1], &[]),
+            Err(Error::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn single_piece_requires_exact_root_and_empty_proof() {
+        let data = fixture(1234);
+        let expected = root(&data);
+        assert_eq!(verify(&expected, data.len() as u64, 0, &data, &[]), Ok(()));
+
+        let mut wrong_root = expected;
+        wrong_root[0] ^= 1;
+        assert_eq!(
+            verify(&wrong_root, data.len() as u64, 0, &data, &[]),
+            Err(Error::HashMismatch)
+        );
+        assert_eq!(
+            verify(&expected, data.len() as u64, 0, &data, &[0]),
+            Err(Error::MalformedProof)
+        );
+    }
+
+    #[test]
+    fn proof_windows_are_exact_and_aligned() {
+        for (first, end, tree_width, expected) in [
+            (0, 1, 1, (0, 1)),
+            (0, 1, 4, (0, 2)),
+            (2, 4, 8, (2, 2)),
+            (3, 5, 8, (0, 8)),
+            (3, 7, 8, (0, 8)),
+            (4, 6, 8, (4, 2)),
+        ] {
+            assert_eq!(proof_window(first, end, tree_width), expected);
+        }
+    }
+
+    #[test]
+    fn encoded_proofs_contain_only_required_siblings() {
+        let pieces = [[1; 32], [2; 32], [3; 32], [4; 32]];
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&pieces[0]);
+        expected.extend_from_slice(&parent(&pieces[2], &pieces[3]));
+        assert_eq!(encode_proof(&pieces, 1, 2), expected);
+
+        let padded = [[1; 32], [2; 32], [3; 32]];
+        assert_eq!(
+            encode_proof(&padded, 2, 3),
+            parent(&padded[0], &padded[1]).to_vec()
+        );
+
+        let right_edge = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
+        assert_eq!(
+            encode_proof(&right_edge, 4, 6),
+            parent(
+                &parent(&right_edge[0], &right_edge[1]),
+                &parent(&right_edge[2], &right_edge[3])
+            )
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn zero_subtrees_match_repeated_bep52_padding() {
+        let width_one = zero_piece();
+        let width_two = parent(&width_one, &width_one);
+        let width_four = parent(&width_two, &width_two);
+        assert_eq!(zero_subtree(1), width_one);
+        assert_eq!(zero_subtree(2), width_two);
+        assert_eq!(zero_subtree(4), width_four);
+    }
+
+    #[test]
+    fn single_piece_decoder_rejects_each_malformed_dimension() {
+        let covered = [[7; 32]];
+        assert_eq!(decode_root(1, 0, 1, &covered, &[]), Ok(covered[0]));
+        assert_eq!(
+            decode_root(1, 1, 1, &covered, &[]),
+            Err(Error::MalformedProof)
+        );
+        assert_eq!(
+            decode_root(1, 0, 2, &covered, &[]),
+            Err(Error::MalformedProof)
+        );
+        assert_eq!(decode_root(1, 0, 1, &[], &[]), Err(Error::MalformedProof));
+        assert_eq!(
+            decode_root(1, 0, 1, &covered, &[0]),
+            Err(Error::MalformedProof)
+        );
+    }
+
+    #[test]
+    fn proof_decoder_rebuilds_every_subrange_across_padding() {
+        for piece_count in 2_usize..=9 {
+            let pieces: Vec<[u8; 32]> = (0..piece_count)
+                .map(|index| [u8::try_from(index + 1).unwrap(); 32])
+                .collect();
+            let expected = padded_piece_tree(&pieces)
+                .last()
+                .unwrap()
+                .first()
+                .copied()
+                .unwrap();
+            for first in 0..piece_count {
+                for end in first + 1..=piece_count {
+                    let proof = encode_proof(&pieces, first as u64, end as u64);
+                    assert_eq!(
+                        decode_root(
+                            piece_count as u64,
+                            first as u64,
+                            end as u64,
+                            &pieces[first..end],
+                            &proof
+                        ),
+                        Ok(expected),
+                        "piece_count={piece_count} range={first}..{end}"
+                    );
+                }
+            }
+        }
     }
 }

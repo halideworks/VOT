@@ -1,6 +1,26 @@
 # Patent and Provenance Policy
 
-This document is not legal advice and does not modify the AGPL-3.0-only license.
+This document is not legal advice. It supplements the copyright licenses in
+this repository.
+
+## Patent grant
+
+Subject to the termination condition below, David Torcivia and each contributor
+grant every recipient a perpetual, worldwide, non-exclusive, no-charge,
+royalty-free, irrevocable patent license to make, have made, use, offer to sell,
+sell, import, and otherwise transfer the work. The grant covers only patent
+claims licensable by the grantor that are necessarily infringed by the grantor's
+contribution alone or by combination of that contribution with the work to
+which it was submitted.
+
+If a recipient institutes patent litigation alleging that the work or a
+contribution within it directly or contributorily infringes a patent, patent
+licenses granted to that recipient under this file terminate as of the filing
+date of that litigation.
+
+This grant uses the scope and termination structure of Apache License 2.0
+section 3 and applies regardless of whether the relevant path is distributed
+under AGPL-3.0-only or Apache-2.0.
 
 Contributors must disclose known patent claims they own or control that are
 necessarily infringed by their contribution. Contributions must be original or

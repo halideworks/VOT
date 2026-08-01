@@ -32,13 +32,41 @@ jobs:
           python3 tools/verify_wave1_vectors.py
           python3 tools/verify_manifest_pack_vectors.py
           python3 tools/validate_commit_fixtures.py
+          python3 tools/validate_commit_model_sync.py
+          VOT_CARGO="cargo +1.85.0" python3 tools/differential_fuzz_codec.py
 
       - name: Model-check commit invariants
         run: |
           curl -fL https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar -o /tmp/tla2tools.jar
           echo "bee4a54f3ee3d4afc347c3240ec2d9e93b075104  /tmp/tla2tools.jar" | sha1sum -c -
           cd models/tla
-          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -config Commit.cfg Commit.tla
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-safe -config Commit.cfg Commit.tla
+          set +e
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsafe-receipt -config CommitUnsafeReceipt.cfg Commit.tla > /tmp/tlc-unsafe-receipt.log 2>&1
+          receipt_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsafe-stale -config CommitUnsafeStale.cfg Commit.tla > /tmp/tlc-unsafe-stale.log 2>&1
+          stale_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsafe-publish -config CommitUnsafePublish.cfg Commit.tla > /tmp/tlc-unsafe-publish.log 2>&1
+          publish_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsafe-poison -config CommitUnsafePoison.cfg Commit.tla > /tmp/tlc-unsafe-poison.log 2>&1
+          poison_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-unsafe-retry -config CommitUnsafeRetry.cfg Commit.tla > /tmp/tlc-unsafe-retry.log 2>&1
+          retry_status=$?
+          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -metadir /tmp/tlc-recovery-sink -config CommitRecoverySink.cfg Commit.tla > /tmp/tlc-recovery-sink.log 2>&1
+          recovery_status=$?
+          set -e
+          test "$receipt_status" -ne 0
+          test "$stale_status" -ne 0
+          test "$publish_status" -ne 0
+          test "$poison_status" -ne 0
+          test "$retry_status" -ne 0
+          test "$recovery_status" -ne 0
+          grep -q "Invariant ReceiptWasPerformed is violated" /tmp/tlc-unsafe-receipt.log
+          grep -q "Invariant StaleAttemptsRejected is violated" /tmp/tlc-unsafe-stale.log
+          grep -q "Invariant PublishedHasPredecessor is violated" /tmp/tlc-unsafe-publish.log
+          grep -q "Invariant PoisonedNeverPublished is violated" /tmp/tlc-unsafe-poison.log
+          grep -q "Invariant FailedFlushNeverAdvances is violated" /tmp/tlc-unsafe-retry.log
+          grep -q "Deadlock reached" /tmp/tlc-recovery-sink.log
 
       - name: Check formatting
         run: cargo +1.85.0 fmt --all --check
@@ -49,8 +77,20 @@ jobs:
       - name: Test
         run: cargo +1.85.0 test --workspace --locked
 
-      - name: Build standalone frame fuzz driver
-        run: cargo +1.85.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
+      - name: Validate deterministic simulation
+        run: |
+          if rg 'thread::sleep|tokio::time::sleep' crates/vot-transport-sim; then
+            exit 1
+          fi
+          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind.trace
+          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/storage-fault.vot > /tmp/storage.trace
+          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-shrink -- sim/scenarios/storage-fault.vot > /tmp/storage-minimized.vot
+          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- /tmp/storage-minimized.vot > /tmp/storage-minimized.trace
+
+      - name: Build standalone fuzz drivers
+        run: |
+          cargo +1.85.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
+          cargo +1.85.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
 
   s3-live:
     runs-on: ubuntu-24.04
@@ -98,3 +138,57 @@ jobs:
           docker logs vot-wave2-minio || true
           docker rm -f vot-wave2-minio || true
           docker network rm vot-wave2-s3 || true
+
+  strict-device:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Install storage harness tools
+        run: sudo apt-get update && sudo apt-get install -y dmsetup e2fsprogs util-linux
+
+      - name: Test Strict against backing corruption
+        run: sh tools/test_strict_backing_corruption.sh
+
+  mutation:
+    name: mutation (${{ matrix.package }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: ${{ !matrix.required }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { package: vot-commit-model, required: true }
+          - { package: vot-commit-posix, required: true }
+          - { package: vot-commit-strict, required: true }
+          - { package: vot-journal, required: true }
+          - { package: vot-proof-blake3, required: true }
+          - { package: vot-proof-sha256, required: true }
+          - { package: vot-codec, required: false }
+          - { package: vot-verifier, required: false }
+          - { package: vot-manifest, required: false }
+          - { package: vot-pack, required: false }
+          - { package: vot-object-store, required: false }
+          - { package: vot-commit-object, required: false }
+          - { package: vot-receipt, required: false }
+          - { package: vot-transport-sim, required: false }
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Install pinned cargo-mutants
+        run: cargo +1.85.0 install --locked cargo-mutants --version 26.0.0
+
+      - name: Test mutants
+        run: cargo +1.85.0 mutants --package "${{ matrix.package }}" --jobs 2

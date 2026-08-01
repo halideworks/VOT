@@ -49,8 +49,12 @@ impl Node {
 }
 
 #[must_use]
+/// # Panics
+/// Panics only if the shared verifier rejects a contiguous bounded slice,
+/// which cannot violate its group-order or length rules.
 pub fn root(data: &[u8]) -> [u8; 32] {
-    *blake3::hash(data).as_bytes()
+    vot_verifier::root(vot_verifier::Suite::Blake3Bao64, data)
+        .expect("a bounded slice is a valid verifier stream")
 }
 
 #[must_use]
@@ -58,16 +62,14 @@ pub fn canonical_outboard(data: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&(data.len() as u64).to_le_bytes());
     let groups = group_count(data.len() as u64);
-    if groups > 1 {
-        encode_all(
-            Node {
-                start: 0,
-                count: groups,
-            },
-            data,
-            &mut encoded,
-        );
-    }
+    encode_all(
+        Node {
+            start: 0,
+            count: groups,
+        },
+        data,
+        &mut encoded,
+    );
     encoded
 }
 
@@ -82,27 +84,24 @@ pub fn prove(data: &[u8], offset: u64, length: u64) -> Result<RangeProof, Error>
     }
     let covered_offset = offset / GROUP_SIZE * GROUP_SIZE;
     let covered_end = request_end
-        .checked_add(GROUP_SIZE - 1)
-        .ok_or(Error::LengthOverflow)?
-        / GROUP_SIZE
-        * GROUP_SIZE;
+        .div_ceil(GROUP_SIZE)
+        .checked_mul(GROUP_SIZE)
+        .ok_or(Error::LengthOverflow)?;
     let covered_end = covered_end.min(object_len);
     let first = covered_offset / GROUP_SIZE;
     let end = covered_end.div_ceil(GROUP_SIZE);
     let mut proof = Vec::new();
     let groups = group_count(object_len);
-    if groups > 1 {
-        encode_selected(
-            Node {
-                start: 0,
-                count: groups,
-            },
-            first,
-            end,
-            data,
-            &mut proof,
-        );
-    }
+    encode_selected(
+        Node {
+            start: 0,
+            count: groups,
+        },
+        first,
+        end,
+        data,
+        &mut proof,
+    );
     let start = usize::try_from(covered_offset).map_err(|_| Error::OutOfBounds)?;
     let stop = usize::try_from(covered_end).map_err(|_| Error::OutOfBounds)?;
     Ok(RangeProof {
@@ -119,7 +118,7 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if object_len == 0 || covered_offset % GROUP_SIZE != 0 || data.is_empty() {
+    if covered_offset % GROUP_SIZE != 0 || data.is_empty() {
         return Err(Error::OutOfBounds);
     }
     let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
@@ -136,7 +135,7 @@ pub fn verify(
         return Err(Error::OutOfBounds);
     }
     if groups == 1 {
-        if covered_offset != 0 || covered_end != object_len || !proof.is_empty() {
+        if !proof.is_empty() {
             return Err(Error::MalformedProof);
         }
         return if root(data) == *expected_root {
@@ -321,8 +320,15 @@ mod tests {
     fn arbitrary_request_expands_and_verifies() {
         let data = fixture(5 * GROUP_SIZE as usize + 71);
         let expected = root(&data);
-        for (offset, length) in [(1, 1), (70_000, 90_000), (196_700, 130_000), (327_680, 71)] {
+        for (offset, length, covered_offset, covered_length) in [
+            (1, 1, 0, GROUP_SIZE),
+            (70_000, 90_000, GROUP_SIZE, 2 * GROUP_SIZE),
+            (196_700, 130_000, 3 * GROUP_SIZE, 2 * GROUP_SIZE),
+            (327_680, 71, 5 * GROUP_SIZE, 71),
+        ] {
             let bundle = prove(&data, offset, length).unwrap();
+            assert_eq!(bundle.covered_offset, covered_offset);
+            assert_eq!(bundle.data.len() as u64, covered_length);
             verify(
                 &expected,
                 data.len() as u64,
@@ -381,5 +387,60 @@ mod tests {
         let outboard = canonical_outboard(&data);
         assert_eq!(&outboard[..8], &(data.len() as u64).to_le_bytes());
         assert_eq!(outboard.len(), 8 + 64 * 5);
+    }
+
+    #[test]
+    fn proof_request_bounds_are_exact() {
+        let data = fixture(GROUP_SIZE as usize + 1);
+        assert_eq!(prove(&data, 0, 0), Err(Error::EmptyRange));
+        assert_eq!(prove(&data, u64::MAX, 2), Err(Error::LengthOverflow));
+        assert_eq!(prove(&data, data.len() as u64, 1), Err(Error::OutOfBounds));
+    }
+
+    #[test]
+    fn verifier_rejects_each_invalid_range_dimension() {
+        let object_len = 2 * GROUP_SIZE;
+        let expected = root(&fixture(object_len as usize));
+        assert_eq!(verify(&expected, 0, 0, &[1], &[]), Err(Error::OutOfBounds));
+        assert_eq!(
+            verify(&expected, object_len, 1, &[1], &[]),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(&expected, object_len, 0, &[], &[]),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(
+                &expected,
+                object_len,
+                0,
+                &fixture(object_len as usize + 1),
+                &[]
+            ),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            verify(&expected, object_len, 0, &[1], &[]),
+            Err(Error::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn single_group_requires_exact_root_and_empty_proof() {
+        let data = fixture(1234);
+        let expected = root(&data);
+        assert_eq!(verify(&expected, data.len() as u64, 0, &data, &[]), Ok(()));
+
+        let mut wrong_root = expected;
+        wrong_root[0] ^= 1;
+        assert_eq!(
+            verify(&wrong_root, data.len() as u64, 0, &data, &[]),
+            Err(Error::HashMismatch)
+        );
+        assert_eq!(
+            verify(&expected, data.len() as u64, 0, &data, &[0]),
+            Err(Error::MalformedProof)
+        );
     }
 }

@@ -443,6 +443,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f125eb85b84a24c36b02ed1d22c9dd8632f53b3cde6e4d23512f94021030003"
+
+[[package]]
 name = "cc"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1988,10 +1994,9 @@ name = "vot-commit-strict"
 version = "0.0.1"
 dependencies = [
  "aligned-vec",
- "blake3",
  "rustix",
- "sha2",
  "vot-commit-model",
+ "vot-verifier",
 ]
 
 [[package]]
@@ -2003,6 +2008,7 @@ name = "vot-manifest"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "cap",
  "unicode-normalization",
 ]
 
@@ -2021,7 +2027,7 @@ name = "vot-pack"
 version = "0.0.1"
 dependencies = [
  "vot-manifest",
- "vot-proof-sha256",
+ "vot-verifier",
 ]
 
 [[package]]
@@ -2029,6 +2035,7 @@ name = "vot-proof-blake3"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "vot-verifier",
 ]
 
 [[package]]
@@ -2036,6 +2043,7 @@ name = "vot-proof-sha256"
 version = "0.0.1"
 dependencies = [
  "sha2",
+ "vot-verifier",
 ]
 
 [[package]]
@@ -2043,6 +2051,24 @@ name = "vot-receipt"
 version = "0.0.1"
 dependencies = [
  "hmac",
+ "sha2",
+]
+
+[[package]]
+name = "vot-transport-sim"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "vot-commit-model",
+ "vot-journal",
+ "vot-manifest",
+]
+
+[[package]]
+name = "vot-verifier"
+version = "0.0.1"
+dependencies = [
+ "blake3",
  "sha2",
 ]
 

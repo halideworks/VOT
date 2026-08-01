@@ -88,7 +88,8 @@ fn build_with_target(
             path: file.path,
             offset: offset as u64,
             length: file.bytes.len() as u64,
-            logical_root: vot_proof_sha256::root(&file.bytes),
+            logical_root: vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &file.bytes)
+                .expect("a bounded pack candidate is a valid verifier stream"),
         });
     }
     if !bytes.is_empty() || !entries.is_empty() {
@@ -98,7 +99,8 @@ fn build_with_target(
 }
 
 fn finish_pack(bytes: Vec<u8>, entries: Vec<PackedEntry>) -> Pack {
-    let root = vot_proof_sha256::root(&bytes);
+    let root = vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &bytes)
+        .expect("a bounded pack is a valid verifier stream");
     Pack {
         bytes,
         entries,
@@ -111,7 +113,9 @@ pub fn extract<'a>(pack: &'a Pack, entry: &PackedEntry) -> Result<&'a [u8], Erro
     let length = usize::try_from(entry.length).map_err(|_| Error::Bounds)?;
     let end = start.checked_add(length).ok_or(Error::Bounds)?;
     let bytes = pack.bytes.get(start..end).ok_or(Error::Bounds)?;
-    if vot_proof_sha256::root(bytes) == entry.logical_root {
+    if vot_verifier::root(vot_verifier::Suite::Sha256Bep52, bytes).map_err(|_| Error::Bounds)?
+        == entry.logical_root
+    {
         Ok(bytes)
     } else {
         Err(Error::HashMismatch)

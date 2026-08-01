@@ -13,22 +13,23 @@ Environment:
 
 - Linux 6.8.0-110-generic
 - x86_64
-- Docker rust:1.85.0-bookworm
-- overlayfs temporary storage
+- Docker rust:1.85
+- `nvme-mirror` ZFS mirror on two 3.7 TB NVMe devices
+- ZFS `sync=standard`, `compression=lz4`, `recordsize=128K`
 
 Result:
 
-- Journal disabled median: 1101.760 ms
-- Balanced median: 1106.528 ms
-- Measured overhead: 0.433%
+- Journal disabled median: 1089.389 ms
+- Balanced median: 1097.538 ms
+- Measured overhead: 0.748%
 - Gate: at most 5%
 - Status: pass
 
 Run:
 
 ```sh
-cargo run --release --locked -p vot-commit-posix \
-  --example measure_balanced -- 256 7
+VOT_BENCH_ROOT=/path/on/storage sh tools/run_storage_benchmark.sh
 ```
 
-The executable exits with failure when measured overhead exceeds 5%.
+The wrapper refuses overlayfs and tmpfs. The executable exits with failure when
+measured overhead exceeds 5%.

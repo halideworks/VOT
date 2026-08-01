@@ -1,0 +1,16 @@
+VOT_SIM_SCENARIO_V1
+name storage-fault
+seed 1099511627791
+expect failed
+trace a4385f5671097cfeab6aa5941f08b348b8031687a398c26860dad8c1a21bb0e2
+at 0 add-path 3 1500 3
+at 0 queue-limit memory 1048576 1
+at 0 queue-limit hash 1048576 1
+at 0 queue-limit decode 1048576 1
+at 0 queue-limit disk 1048576 1
+at 0 queue-limit journal 1048576 1
+at 0 queue-limit commit 1048576 1
+at 1 reorder 3 4
+at 2 loss 3 1
+at 3 queue-fault journal 1
+at 4 send 3 22 1024

@@ -25,6 +25,13 @@ def section(document: str, heading: str, next_heading: str) -> str:
     return document[start:end]
 
 
+def rust_module(source: str, name: str) -> str:
+    marker = f"pub mod {name} {{"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n}", start)
+    return source[start:end]
+
+
 def validate(root: Path) -> None:
     registry_text = (root / "spec" / "registries.md").read_text(encoding="utf-8")
     frame_text = section(registry_text, "## 2. Frame types", "## 3. Settings")
@@ -46,14 +53,15 @@ def validate(root: Path) -> None:
     rust_text = (root / "crates" / "vot-codec" / "src" / "lib.rs").read_text(
         encoding="utf-8"
     )
-    rust_rows = {
+    frame_rust_rows = {
         match["name"]: int(match["value"], 16)
-        for match in RUST_CONSTANT.finditer(rust_text)
+        for match in RUST_CONSTANT.finditer(rust_module(rust_text, "frame_type"))
     }
     registry_rows = {name: value for value, name, _ in rows}
-    assert rust_rows == registry_rows, (
-        f"Rust/registry mismatch: Rust-only={rust_rows.keys() - registry_rows.keys()}, "
-        f"registry-only={registry_rows.keys() - rust_rows.keys()}"
+    assert frame_rust_rows == registry_rows, (
+        "Rust/frame registry mismatch: "
+        f"Rust-only={frame_rust_rows.keys() - registry_rows.keys()}, "
+        f"registry-only={registry_rows.keys() - frame_rust_rows.keys()}"
     )
 
     setting_text = section(registry_text, "## 3. Settings", "## 4. Extension identifiers")
@@ -67,6 +75,17 @@ def validate(root: Path) -> None:
     for value, name, handling in setting_rows:
         expected = "critical" if value & 1 else "optional"
         assert handling == expected, f"setting {name}: {handling}, expected {expected}"
+
+    setting_rust_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in RUST_CONSTANT.finditer(rust_module(rust_text, "setting_id"))
+    }
+    setting_registry_rows = {name: value for value, name, _ in setting_rows}
+    assert setting_rust_rows == setting_registry_rows, (
+        "Rust/settings registry mismatch: "
+        f"Rust-only={setting_rust_rows.keys() - setting_registry_rows.keys()}, "
+        f"registry-only={setting_registry_rows.keys() - setting_rust_rows.keys()}"
+    )
 
     grease_values = range(0x1F00, 0x1FFF, 2)
     assert all(value % 2 == 0 for value in grease_values)

@@ -318,7 +318,7 @@ pub fn recover(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use vot_commit_strict::{DirectRead, Error as StrictError};
+    use vot_commit_strict::{DirectHash, Error as StrictError};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -523,11 +523,11 @@ mod tests {
         fs::remove_dir_all(published).unwrap();
     }
 
-    struct MemoryReader(DirectRead);
+    struct MemoryReader(DirectHash);
 
     impl ReadBack for MemoryReader {
-        fn read_back(&self) -> Result<DirectRead, StrictError> {
-            Ok(self.0.clone())
+        fn hash(&self, _suite: Suite) -> Result<DirectHash, StrictError> {
+            Ok(self.0)
         }
     }
 
@@ -542,8 +542,8 @@ mod tests {
             commit.write_transit_verified(&bytes).unwrap();
             let receipt = commit
                 .publish_strict(
-                    &MemoryReader(DirectRead::Supported(bytes.clone())),
-                    Suite::Blake3,
+                    &MemoryReader(DirectHash::Supported(expected)),
+                    Suite::Blake3Bao64,
                     &expected,
                 )
                 .unwrap();
@@ -567,17 +567,18 @@ mod tests {
             let directory = directory("strict-corruption");
             let mut commit = provider(&directory, Profile::Strict, None);
             commit.write_transit_verified(&bytes).unwrap();
-            let mut corrupted = bytes;
-            corrupted[0] ^= 1;
+            let mut corrupted_hash = expected;
+            corrupted_hash[0] ^= 1;
             assert!(matches!(
                 commit.publish_strict(
-                    &MemoryReader(DirectRead::Supported(corrupted)),
-                    Suite::Blake3,
+                    &MemoryReader(DirectHash::Supported(corrupted_hash)),
+                    Suite::Blake3Bao64,
                     &expected,
                 ),
                 Err(Error::Strict(StrictError::HashMismatch))
             ));
             assert_eq!(commit.state(), State::Poisoned);
+            assert!(commit.trace().contains(&TraceEvent::Poisoned));
             assert!(!directory.join("object").exists());
             drop(commit);
             fs::remove_dir_all(directory).unwrap();
@@ -589,8 +590,8 @@ mod tests {
             commit.write_transit_verified(b"bytes").unwrap();
             assert!(matches!(
                 commit.publish_strict(
-                    &MemoryReader(DirectRead::Unsupported),
-                    Suite::Blake3,
+                    &MemoryReader(DirectHash::Unsupported),
+                    Suite::Blake3Bao64,
                     &blake3::hash(b"bytes").into(),
                 ),
                 Err(Error::StrictUnsupported)

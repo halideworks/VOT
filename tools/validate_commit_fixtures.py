@@ -11,6 +11,7 @@ REQUIRED = {"Fast": "TransitVerified", "Balanced": "Durable", "Strict": "AtRestV
 
 def execute(fixture):
     state = "New"
+    recovery_state = None
     performed = []
     error = None
     for event in fixture["events"]:
@@ -28,7 +29,11 @@ def execute(fixture):
         if event in {"DataFlushFailed", "JournalFlushFailed", "AtRestVerificationFailed"}:
             transition = ("Poisoned", None)
         elif event in {"NamespaceLinkAmbiguous", "NamespaceFlushFailed", "Crash"}:
+            recovery_state = state
             transition = ("RecoveryRequired", None)
+        elif event == "Recover" and state == "RecoveryRequired" and recovery_state:
+            transition = (recovery_state, None)
+            recovery_state = None
         elif event == "NamespaceLinked" and state == REQUIRED[fixture["profile"]]:
             transition = ("NamespaceLinked", None)
         if transition is None:

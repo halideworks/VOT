@@ -1,8 +1,33 @@
 {
   "portable_collisions": [
     ["Readme", "README"],
-    ["é", "é"]
+    ["\u00e9", "e\u0301"],
+    ["I", "\u0131"],
+    ["\u0130", "i"]
   ],
-  "portable_invalid": ["CON", "aux.txt", "LPT9", "bad/part", "trail.", ".."],
-  "raw_posix_invalid_hex": ["", "610062", "612f62"]
+  "portable_invalid": [
+    "CON",
+    "NUL.tar.gz",
+    "aux.txt",
+    "COM1",
+    "COM\u00b9",
+    "LPT9",
+    "bad/part",
+    "bad\\part",
+    "bad:name",
+    "trail.",
+    "trail ",
+    ".",
+    "..",
+    "\uff0e",
+    "\u2024\u2024",
+    "join\u200der",
+    "rtl\u202ename"
+  ],
+  "portable_invalid_utf8_hex": ["c0af", "eda080", "f0808080"],
+  "raw_posix_invalid_hex": ["", "610062", "612f62"],
+  "sources": [
+    "https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file",
+    "https://www.unicode.org/reports/tr39/"
+  ]
 }

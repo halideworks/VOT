@@ -1,0 +1,19 @@
+VOT_SIM_SCENARIO_V1
+name rebind-fallback
+seed 6840335614489015467
+expect complete
+trace 4454ffe490b7f2906a49fb6d2c22b02f7b292f40adc939889ae719f6872d6bd3
+at 0 add-path 1 1500 4
+at 0 queue-limit memory 1048576 1
+at 0 queue-limit hash 1048576 2
+at 0 queue-limit decode 1048576 1
+at 0 queue-limit disk 1048576 3
+at 0 queue-limit journal 1048576 2
+at 0 queue-limit commit 1048576 1
+at 1 reorder 1 7
+at 2 loss 1 1
+at 3 send 1 10 1200
+at 4 rebind 1 92821
+at 5 mtu 1 1280
+at 6 switch tcp
+at 7 send 1 11 900

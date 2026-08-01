@@ -74,15 +74,31 @@ def encode_manifest(vector: dict) -> bytes:
 
 
 def portable_key(value: str) -> str:
-    if not value or value in {".", ".."} or any(character in value for character in "\0/\\"):
+    forbidden = "\0/\\<>:\"|?*"
+    format_controls = {
+        "\u200c", "\u200d", "\u202a", "\u202b", "\u202c", "\u202d",
+        "\u202e", "\u2066", "\u2067", "\u2068", "\u2069", "\ufeff",
+    }
+    if (
+        not value
+        or value in {".", ".."}
+        or any(character in value for character in forbidden)
+        or any(ord(character) <= 0x1F or character in format_controls for character in value)
+    ):
         raise ValueError(value)
     if value.endswith((".", " ")):
         raise ValueError(value)
-    folded = unicodedata.normalize("NFC", value).lower()
+    if unicodedata.normalize("NFKC", value) in {".", ".."}:
+        raise ValueError(value)
+    folded = "".join(
+        "i" if character in {"I", "i", "\u0130", "\u0131"} else character.lower()
+        for character in unicodedata.normalize("NFC", value)
+    )
+    folded = unicodedata.normalize("NFC", folded)
     stem = folded.split(".", 1)[0]
     if stem in {"con", "prn", "aux", "nul"}:
         raise ValueError(value)
-    if len(stem) == 4 and stem[:3] in {"com", "lpt"} and stem[3] in "123456789":
+    if len(stem) == 4 and stem[:3] in {"com", "lpt"} and stem[3] in "123456789\u00b9\u00b2\u00b3":
         raise ValueError(value)
     return folded
 
@@ -106,6 +122,13 @@ def verify_manifest() -> None:
     for encoded_hex in corpus["raw_posix_invalid_hex"]:
         value = bytes.fromhex(encoded_hex)
         assert not value or b"\0" in value or b"/" in value
+    for encoded_hex in corpus["portable_invalid_utf8_hex"]:
+        try:
+            bytes.fromhex(encoded_hex).decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise AssertionError(f"invalid UTF-8 accepted: {encoded_hex}")
 
 
 def verify_pack() -> None:

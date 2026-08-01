@@ -1,6 +1,6 @@
 //! Live S3-compatible multipart adapter backed by the AWS Rust SDK.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
@@ -28,7 +28,7 @@ pub struct AwsS3Store {
     runtime: Runtime,
     client: aws_sdk_s3::Client,
     bucket: String,
-    uploads: HashMap<String, LiveUpload>,
+    uploads: BTreeMap<String, LiveUpload>,
 }
 
 impl AwsS3Store {
@@ -52,7 +52,7 @@ impl AwsS3Store {
             runtime,
             client: aws_sdk_s3::Client::from_conf(config),
             bucket: bucket.to_owned(),
-            uploads: HashMap::new(),
+            uploads: BTreeMap::new(),
         })
     }
 

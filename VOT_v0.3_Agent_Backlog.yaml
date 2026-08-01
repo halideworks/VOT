@@ -3,7 +3,15 @@ baseline: v0.3
 snapshot: 2026-07-31
 policy:
   default_profile: shared-internet-reliable
-  license: AGPL-3.0-only
+  license:
+    implementation: AGPL-3.0-only
+    protocol_artifacts: Apache-2.0
+    protocol_paths: [spec, test-vectors, models]
+    inbound_nontrivial_contributions: CLA-required
+  acceptance_evidence:
+    - passing_test
+    - minimal_deliberate_mutant
+    - captured_mutant_failure
   experimental_features_default_off:
     - datagram-fec
     - vcrc
@@ -32,7 +40,7 @@ gates:
       - independent_vectors_for_both_suites
       - arbitrary_64KiB_range_verification
       - progressive_mutation_and_truncation_rejected
-      - million_file_manifest_bounded
+      - million_file_manifest_index_peak_allocation_lte_512MiB
   W2:
     name: commit-correctness
     requires:
@@ -46,6 +54,8 @@ gates:
       - seeded_replay
       - grease_and_unknown_frame_tests
       - parser_fuzz_no_unbounded_allocation
+      - negative_control_faults_are_detected
+      - rust_python_codec_differential_agrees
   W4:
     name: reliable-transfer
     requires:
@@ -259,6 +269,8 @@ work_items:
       - no_real_sleep
       - seed_reproduces_failure
       - network_and_storage_faults_composable
+      - broken_transport_negative_controls_detected
+      - versioned_failure_trace_archived
 
   - id: SIM-002
     agent: A08
@@ -272,6 +284,7 @@ work_items:
     acceptance:
       - no_unbounded_allocation
       - malformed_inputs_do_not_panic
+      - rust_python_codec_differential_agrees
 
   - id: XFER-001
     agent: A09

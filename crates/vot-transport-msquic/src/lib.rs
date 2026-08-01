@@ -704,6 +704,32 @@ mod tests {
     }
 
     #[test]
+    fn datagram_submission_obeys_the_exact_payload_limit() {
+        let mut adapter = MsQuicAdapter::default();
+        let exact = vec![0; vot_transport_api::MAX_DATAGRAM_BYTES];
+        adapter.send_datagram(9, &exact).unwrap();
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Datagram {
+                context: 9,
+                bytes: exact.into(),
+            })
+        );
+
+        assert_eq!(
+            adapter.send_datagram(10, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES + 1]),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
+    fn path_stats_are_unavailable_without_a_native_path() {
+        let adapter = MsQuicAdapter::default();
+        assert_eq!(adapter.path_stats(), None);
+    }
+
+    #[test]
     fn oversized_reliable_record_is_rejected_before_ffi() {
         let mut adapter = MsQuicAdapter::default();
         assert_eq!(

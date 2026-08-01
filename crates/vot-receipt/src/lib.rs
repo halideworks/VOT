@@ -148,7 +148,7 @@ fn valid_rfc3339(value: &str) -> bool {
         || bytes.len() > 35
         || bytes.get(4) != Some(&b'-')
         || bytes.get(7) != Some(&b'-')
-        || bytes.get(10) != Some(&b'T')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
         || bytes.get(13) != Some(&b':')
         || bytes.get(16) != Some(&b':')
     {
@@ -194,7 +194,7 @@ fn valid_rfc3339(value: &str) -> bool {
         }
     }
     match bytes.get(offset) {
-        Some(b'Z') => offset + 1 == bytes.len(),
+        Some(b'Z' | b'z') => offset + 1 == bytes.len(),
         Some(b'+' | b'-') => {
             bytes.len() == offset + 6
                 && bytes.get(offset + 3) == Some(&b':')
@@ -363,6 +363,8 @@ mod tests {
             "2000-02-29T00:00:00Z",
             "2026-07-31T16:00:00.123456789-04:00",
             "2026-07-31T20:00:00+00:00",
+            "2026-07-31t20:00:00z",
+            "2026-07-31t20:00:00Z",
         ] {
             receipt.observed_at = valid.to_owned();
             assert_eq!(receipt.validate(), Ok(()), "{valid}");

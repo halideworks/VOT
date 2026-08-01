@@ -15,5 +15,7 @@ These checks close correctness findings left on merged pull requests.
 | S3 completion allocation | Clone `LiveUpload` before completion | `LiveUpload` is not `Clone`; completion removes and owns one upload record, restoring it only on failure |
 | S3 consumed-upload retry | Treat `NoSuchUpload` as a definitive completion failure | `only_consumed_upload_service_error_enters_reconciliation` fails and the retry cannot reconcile an already published object |
 | Bare relative journal path | Use an empty relative parent rather than the current directory | `bare_relative_journal_uses_current_directory_for_durability` fails |
+| Planner complexity | Scan all jobs on every pop | `Planner::pop` uses the priority-ordered `BTreeSet::pop_first`; the required scheduler mutation run reports 27 caught, 6 unviable, and zero missed |
+| Lowercase RFC 3339 separators | Accept uppercase `T` and `Z` only | `timestamps_require_rfc3339_syntax_and_ranges` exercises lowercase `t` and `z` independently and together |
 
 The safe TLC capability model explores 2,389,496 distinct states without violation. `CommitUnsupportedAdvance.cfg` reaches `PUBLISHED` for an unsupported profile and TLC reports `Invariant UnsupportedNeverAdvanced is violated`.

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
 use vot_transport_api::{ConnectionId, StagingCapacity, SubjectId, TransportAck};
@@ -183,11 +184,27 @@ fn suite(id: u16) -> Result<Suite, Error> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Job {
     pub priority: u8,
     pub sequence: u64,
     pub subject: SubjectId,
+}
+
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (Reverse(self.priority), self.sequence, self.subject).cmp(&(
+            Reverse(other.priority),
+            other.sequence,
+            other.subject,
+        ))
+    }
+}
+
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Deterministic highest-priority-first planner with FIFO tie breaking.
@@ -202,13 +219,7 @@ impl Planner {
     }
 
     pub fn pop(&mut self) -> Option<Job> {
-        let selected = self
-            .jobs
-            .iter()
-            .min_by_key(|job| (u8::MAX - job.priority, job.sequence))
-            .copied()?;
-        self.jobs.remove(&selected);
-        Some(selected)
+        self.jobs.pop_first()
     }
 }
 
@@ -325,6 +336,17 @@ mod tests {
             sequence: 1,
             subject: second,
         });
+        let higher = Job {
+            priority: 9,
+            sequence: 1,
+            subject: second,
+        };
+        let lower = Job {
+            priority: 0,
+            sequence: 0,
+            subject: first,
+        };
+        assert_eq!(higher.partial_cmp(&lower), Some(Ordering::Less));
         assert_eq!(planner.pop().unwrap().subject, second);
         assert_eq!(planner.pop().unwrap().subject, first);
     }

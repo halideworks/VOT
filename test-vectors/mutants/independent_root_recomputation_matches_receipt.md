@@ -14,7 +14,7 @@ package-transcript, or receipt equality assertion.
 The required Rust mutation runs also completed with no viable survivors:
 
 ```text
-vot-cli: 128 total, 113 caught, 15 unviable, 0 missed
+vot-cli: 138 total, 123 caught, 15 unviable, 0 missed
 ```
 
 The thin argument dispatcher in `crates/vot-cli/src/main.rs` is excluded. All

@@ -6,12 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+getrandom = "=0.3.4"
 vot-manifest = { path = "../vot-manifest" }
 vot-pack = { path = "../vot-pack" }
 vot-receipt = { path = "../vot-receipt" }
 vot-scheduler = { path = "../vot-scheduler" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-verifier = { path = "../vot-verifier" }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
 
 [lints]
 workspace = true

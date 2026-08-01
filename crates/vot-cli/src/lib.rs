@@ -32,6 +32,7 @@ pub enum Error {
     DestinationExists,
     SourceMutation,
     RootMismatch,
+    Randomness,
     Pack(vot_pack::Error),
     Scheduler(vot_scheduler::Error),
     Verifier(vot_verifier::VerifyError),
@@ -227,7 +228,17 @@ pub fn receive_bundle(
     key: &[u8],
     observed_at: &str,
 ) -> Result<ReceiveReport, Error> {
-    if destination.exists() || receipt_path.exists() {
+    let receipt_summary_path = receipt_path.with_extension("json");
+    if receipt_path == receipt_summary_path {
+        return Err(Error::InvalidArguments);
+    }
+    if destination.exists() {
+        return Err(Error::DestinationExists);
+    }
+    if receipt_path.exists() {
+        return Err(Error::DestinationExists);
+    }
+    if receipt_summary_path.exists() {
         return Err(Error::DestinationExists);
     }
     let (expected, mut manifest) = read_header(&bundle.join("manifest.vot"))?;
@@ -296,10 +307,11 @@ pub fn receive_bundle(
     if actual != expected {
         return Err(Error::RootMismatch);
     }
+    let freshness = fresh_receipt_identifiers()?;
     let mut session_id = [0; 16];
-    session_id.copy_from_slice(&actual.root[..16]);
+    session_id.copy_from_slice(&freshness[..16]);
     let mut incarnation_id = [0; 16];
-    incarnation_id.copy_from_slice(&actual.root[16..]);
+    incarnation_id.copy_from_slice(&freshness[16..]);
     let receipt = Receipt {
         subject_kind: SubjectKind::Package,
         suite_id: 1,
@@ -319,19 +331,19 @@ pub fn receive_bundle(
     };
     let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
     let encoded = encode_authenticated(&authenticated)?;
+    let summary = receipt_summary_bytes(&actual);
+    let suffix = object_name(&freshness);
+    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
+    let prepared_receipt = PreparedFile::new(receipt_path, &encoded, suffix, "receipt")?;
+    let prepared_summary =
+        PreparedFile::new(&receipt_summary_path, summary.as_bytes(), suffix, "summary")?;
     if sync_directories(&staging)? == 0 {
         return Err(Error::InvalidBundle);
     }
-    fs::rename(&staging, destination)?;
+    atomic_rename_noreplace(&staging, destination)?;
     File::open(parent_directory(destination))?.sync_all()?;
-
-    let mut receipt_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(receipt_path)?;
-    receipt_file.write_all(&encoded)?;
-    receipt_file.sync_all()?;
-    write_receipt_summary(receipt_path, &actual)?;
+    prepared_receipt.publish()?;
+    prepared_summary.publish()?;
     File::open(parent_directory(receipt_path))?.sync_all()?;
     Ok(ReceiveReport {
         package: actual,
@@ -573,22 +585,31 @@ fn receive_direct(
         .create_new(true)
         .write(true)
         .open(output)?;
-    if receiver.is_verified(subject) {
-        io::copy(&mut source, &mut destination)?;
-        destination.sync_all()?;
-        return Ok(());
+    let already_verified = receiver.is_verified(subject);
+    if !already_verified {
+        receiver.begin(subject)?;
     }
-    receiver.begin(subject)?;
+    let mut verifier = already_verified.then(|| StreamVerifier::new(Suite::Sha256Bep52));
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
         let read = source.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        receiver.receive(subject, &buffer[..read])?;
+        if let Some(verifier) = verifier.as_mut() {
+            verifier.update(&buffer[..read])?;
+        } else {
+            receiver.receive(subject, &buffer[..read])?;
+        }
         destination.write_all(&buffer[..read])?;
     }
-    receiver.finish(subject)?;
+    if let Some(verifier) = verifier {
+        if verifier.finish()? != root {
+            return Err(Error::RootMismatch);
+        }
+    } else {
+        receiver.finish(subject)?;
+    }
     destination.sync_all()?;
     Ok(())
 }
@@ -769,19 +790,96 @@ fn object_name(root: &[u8; 32]) -> String {
     output
 }
 
-fn write_receipt_summary(receipt_path: &Path, package: &PackageSummary) -> Result<(), Error> {
-    let path = receipt_path.with_extension("json");
+fn receipt_summary_bytes(package: &PackageSummary) -> String {
     let root = object_name(&package.root);
     let root = root.strip_suffix(".obj").expect("known suffix");
-    let body = format!(
+    format!(
         "{{\"assurance\":\"PUBLISHED\",\"suite\":1,\"root\":\"{root}\",\"length\":{},\"entries\":{}}}\n",
         package.logical_length, package.entries
-    );
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
-    file.write_all(body.as_bytes())?;
-    file.sync_all()?;
+    )
+}
+
+fn fresh_receipt_identifiers() -> Result<[u8; 32], Error> {
+    let mut identifiers = [0; 32];
+    getrandom::fill(&mut identifiers).map_err(|_| Error::Randomness)?;
+    Ok(identifiers)
+}
+
+struct PreparedFile {
+    temporary: Option<PathBuf>,
+    destination: PathBuf,
+}
+
+impl PreparedFile {
+    fn new(destination: &Path, bytes: &[u8], suffix: &str, kind: &str) -> Result<Self, Error> {
+        let parent = parent_directory(destination);
+        if !fs::metadata(parent)?.is_dir() {
+            return Err(Error::InvalidPath);
+        }
+        if destination.exists() {
+            return Err(Error::DestinationExists);
+        }
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::InvalidPath)?;
+        let temporary = destination.with_file_name(format!(".{name}.vot-{kind}-{suffix}"));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(Self {
+            temporary: Some(temporary),
+            destination: destination.to_owned(),
+        })
+    }
+
+    fn publish(mut self) -> Result<(), Error> {
+        let temporary = self.temporary.as_ref().ok_or(Error::InvalidBundle)?;
+        atomic_rename_noreplace(temporary, &self.destination)?;
+        self.temporary = None;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedFile {
+    fn drop(&mut self) {
+        if let Some(temporary) = &self.temporary {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_rename_noreplace(source: &Path, destination: &Path) -> Result<(), Error> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_rename_noreplace(source: &Path, destination: &Path) -> Result<(), Error> {
+    fs::rename(source, destination)?;
     Ok(())
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn unsupported_rename_noreplace(_source: &Path, _destination: &Path) -> Result<(), Error> {
+    Err(Error::InvalidArguments)
+}
+
+#[cfg(target_os = "windows")]
+use windows_rename_noreplace as atomic_rename_noreplace;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+use unsupported_rename_noreplace as atomic_rename_noreplace;
 
 fn staging_path(destination: &Path) -> Result<PathBuf, Error> {
     let name = destination
@@ -953,6 +1051,108 @@ mod tests {
     }
 
     #[test]
+    fn receipt_outputs_are_prepared_before_destination_publication() {
+        let source = temporary("receipt-output-source");
+        let bundle = temporary("receipt-output-bundle");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"contents").unwrap();
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("missing-receipt-parent-destination");
+        let receipt = temporary("missing-receipt-parent").join("receipt.cbor");
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &[7; 32],
+                "2026-07-31T23:59:59Z"
+            ),
+            Err(Error::Io(_))
+        ));
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+        let staging = staging_path(&destination).unwrap();
+        if staging.exists() {
+            fs::remove_dir_all(staging).unwrap();
+        }
+
+        let collision_destination = temporary("summary-collision-destination");
+        let collision_receipt = temporary("receipt.json");
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &collision_destination,
+                &collision_receipt,
+                &[7; 32],
+                "2026-07-31T23:59:59Z"
+            ),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(!collision_destination.exists());
+        assert!(!collision_receipt.exists());
+
+        let existing_summary_destination = temporary("existing-summary-destination");
+        let existing_summary_receipt = temporary("existing-summary.cbor");
+        let existing_summary = existing_summary_receipt.with_extension("json");
+        fs::write(&existing_summary, b"existing").unwrap();
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &existing_summary_destination,
+                &existing_summary_receipt,
+                &[7; 32],
+                "2026-07-31T23:59:59Z"
+            ),
+            Err(Error::DestinationExists)
+        ));
+        assert!(!existing_summary_destination.exists());
+        assert!(!existing_summary_receipt.exists());
+        fs::remove_file(existing_summary).unwrap();
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(bundle).unwrap();
+    }
+
+    #[test]
+    fn destination_publication_is_atomic_and_no_replace() {
+        let source = temporary("atomic-source");
+        let destination = temporary("atomic-destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"verified").unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(matches!(
+            atomic_rename_noreplace(&source, &destination),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(fs::read(source.join("file")).unwrap(), b"verified");
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir(destination).unwrap();
+    }
+
+    #[test]
+    fn receipt_identifiers_are_fresh_for_each_publication() {
+        let first = fresh_receipt_identifiers().unwrap();
+        let second = fresh_receipt_identifiers().unwrap();
+        assert_ne!(first, [0; 32]);
+        assert_ne!(second, [0; 32]);
+        assert_ne!(first, second);
+        assert_ne!(&first[..16], &first[16..]);
+    }
+
+    #[test]
+    fn abandoned_prepared_receipt_is_removed() {
+        let destination = temporary("prepared-final");
+        let prepared = PreparedFile::new(&destination, b"receipt", "unique", "receipt").unwrap();
+        let temporary = prepared.temporary.clone().unwrap();
+        assert!(temporary.exists());
+        drop(prepared);
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn verified_pack_can_be_reloaded_after_cache_eviction() {
         let source = temporary("repeated-pack-source");
         let bundle = temporary("repeated-pack-bundle");
@@ -982,6 +1182,40 @@ mod tests {
         fs::remove_dir_all(destination).unwrap();
         fs::remove_file(receipt.with_extension("json")).unwrap();
         fs::remove_file(receipt).unwrap();
+    }
+
+    #[test]
+    fn repeated_direct_object_is_reverified_before_copy() {
+        let object = temporary("repeated-direct-object");
+        let first = temporary("repeated-direct-first");
+        let second = temporary("repeated-direct-second");
+        let bytes = vec![0x5a; CANDIDATE_MAX + 1];
+        let root = vot_verifier::root(Suite::Sha256Bep52, &bytes).unwrap();
+        fs::write(&object, &bytes).unwrap();
+        let limit = (MAX_DATA_RECORD_BYTES + vot_verifier::GROUP_SIZE) as u64;
+        let mut receiver = ReliableReceiver::new(
+            limit,
+            MAX_DATA_RECORD_BYTES as u64,
+            MAX_DATA_RECORD_BYTES as u64,
+        )
+        .unwrap();
+        receive_direct(&object, &first, root, bytes.len() as u64, &mut receiver).unwrap();
+        let mut corrupted = bytes;
+        corrupted[0] ^= 1;
+        fs::write(&object, corrupted).unwrap();
+        assert!(matches!(
+            receive_direct(
+                &object,
+                &second,
+                root,
+                fs::metadata(&object).unwrap().len(),
+                &mut receiver
+            ),
+            Err(Error::RootMismatch)
+        ));
+        fs::remove_file(object).unwrap();
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
     }
 
     #[test]

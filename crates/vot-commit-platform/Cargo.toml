@@ -1,0 +1,12 @@
+[package]
+name = "vot-commit-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vot-receipt = { path = "../vot-receipt" }
+
+[lints]
+workspace = true

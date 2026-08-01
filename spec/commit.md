@@ -148,6 +148,19 @@ Multipart mismatch, failed completion, or ambiguous timeout enters poisoning or
 recovery as declared by whether prior state can be proven. Active authenticated
 leases prevent orphan collection during recovery.
 
+### 8.1 Windows and macOS local providers
+
+The Windows local provider advertises Fast only. Its receipt names provider
+`WINDOWS_LOCAL` and records `TRANSIT_VERIFIED` as the actual predecessor. It
+uses atomic no-overwrite link publication and does not claim provider durability
+or Strict read-back.
+
+The macOS local provider advertises Fast and Balanced. Balanced requires data
+synchronization and parent-directory synchronization before a receipt names
+`DURABLE` as the actual predecessor. The provider does not advertise Strict;
+ordinary buffered reads and cache-control hints are not independent at-rest
+verification.
+
 ## 9. Receipts
 
 The deterministic data model is `spec/receipt.cddl`. `PUBLISH_RECEIPT` binds:

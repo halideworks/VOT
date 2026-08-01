@@ -1,0 +1,14 @@
+[package]
+name = "vot-resume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+vot-transport-api = { path = "../vot-transport-api" }
+vot-transport-tcp = { path = "../vot-transport-tcp" }
+
+[lints]
+workspace = true

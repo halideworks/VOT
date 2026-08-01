@@ -1,0 +1,16 @@
+[package]
+name = "vot-transport-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustls.workspace = true
+vot-transport-api = { path = "../vot-transport-api" }
+
+[dev-dependencies]
+base64.workspace = true
+
+[lints]
+workspace = true

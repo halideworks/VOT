@@ -16,10 +16,14 @@ python3 tools/validate_security_matrix.py
 python3 tools/validate_wave0.py
 python3 tools/verify_wave1_vectors.py
 python3 tools/verify_manifest_pack_vectors.py
+python3 tools/verify_wave4_package.py
 python3 tools/validate_commit_fixtures.py
 python3 tools/validate_commit_model_sync.py
 python3 tools/differential_fuzz_codec.py
 cargo test --workspace --locked
+cargo test -p vot-resume --test e_resume --locked
+cargo test -p vot-transport-tcp --locked
+cargo test -p vot-commit-platform --locked
 cargo run -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot
 cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 cargo build --manifest-path fuzz/manifest/Cargo.toml --locked

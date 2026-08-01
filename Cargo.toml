@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vot-codec", "crates/vot-verifier", "crates/vot-proof-blake3", "crates/vot-proof-sha256", "crates/vot-manifest", "crates/vot-pack", "crates/vot-commit-model", "crates/vot-journal", "crates/vot-commit-posix", "crates/vot-commit-strict", "crates/vot-object-store", "crates/vot-commit-object", "crates/vot-receipt", "crates/vot-transport-api", "crates/vot-transport-sim", "crates/vot-transport-msquic", "crates/vot-scheduler", "crates/vot-cli"]
+members = ["crates/vot-codec", "crates/vot-verifier", "crates/vot-proof-blake3", "crates/vot-proof-sha256", "crates/vot-manifest", "crates/vot-pack", "crates/vot-commit-model", "crates/vot-journal", "crates/vot-commit-posix", "crates/vot-commit-strict", "crates/vot-object-store", "crates/vot-commit-object", "crates/vot-commit-platform", "crates/vot-receipt", "crates/vot-transport-api", "crates/vot-transport-sim", "crates/vot-transport-msquic", "crates/vot-transport-tcp", "crates/vot-resume", "crates/vot-scheduler", "crates/vot-cli"]
 resolver = "3"
 
 [workspace.package]
@@ -11,6 +11,8 @@ rust-version = "1.85"
 blake3 = "1.8.5"
 sha2 = "0.10.9"
 unicode-normalization = "0.1.24"
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+base64 = "=0.21.7"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -2048,6 +2048,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-commit-platform"
+version = "0.0.1"
+dependencies = [
+ "vot-receipt",
+]
+
+[[package]]
 name = "vot-commit-posix"
 version = "0.0.1"
 dependencies = [
@@ -2123,6 +2130,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-resume"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "vot-transport-api",
+ "vot-transport-tcp",
+]
+
+[[package]]
 name = "vot-scheduler"
 version = "0.0.1"
 dependencies = [
@@ -2154,6 +2170,15 @@ dependencies = [
  "vot-commit-model",
  "vot-journal",
  "vot-manifest",
+]
+
+[[package]]
+name = "vot-transport-tcp"
+version = "0.0.1"
+dependencies = [
+ "base64 0.21.7",
+ "rustls 0.23.43",
+ "vot-transport-api",
 ]
 
 [[package]]

@@ -179,6 +179,13 @@ The TLS/TCP fallback uses the identical VOT frame bytes on a reliable byte
 stream. Switching carriers preserves object, package, verified-range, durable,
 and receipt state; it does not reuse unsafe path or congestion state.
 
+An implementation SHOULD start QUIC first and start authenticated TLS/TCP after
+a short configurable delay rather than waiting for a long UDP timeout. It may
+switch from selected QUIC only after TLS authentication succeeds and bounded
+observation windows show no QUIC data or probe acknowledgement. Connection IDs
+are carrier-local and never key resume state. Resume discovery uses immutable
+object or package identity.
+
 ## 8. Conformance vectors
 
 `test-vectors/wire/frame-envelope.json` is normative for the envelope. Each case

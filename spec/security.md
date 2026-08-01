@@ -234,6 +234,21 @@ carrier-neutral verified, durable, and request state. It does not carry old
 packet-number, congestion, RTT, address-validation, or unsafe Careful Resume
 state onto a new path.
 
+Careful Resume follows RFC 9959 only when the QUIC backend exposes the required
+congestion state. A saved parameter set is keyed by the complete Remote Endpoint:
+local interface, remote destination, and DSCP. Only one saved set exists for an
+endpoint and only one connection may use it at a time. Saved state expires and
+is invalid after a local configuration epoch change.
+
+Before increasing the congestion window, the sender uses the initial congestion
+window and waits for acknowledgement of the reconnaissance flight. It rejects
+reuse after congestion, a path or interface change, an unacknowledged initial
+flight, a current minimum RTT at or below half the saved RTT, or a current RTT
+above ten times the saved RTT. The increase is capped by both the local limit and
+half the saved congestion window and is paced at the current RTT. Congestion
+during reuse discards the saved state. A backend that cannot prove these
+conditions starts with ordinary congestion control.
+
 ## 14. Metadata and telemetry privacy
 
 Telemetry follows `spec/telemetry.md`. The default level is pseudonymous. Raw

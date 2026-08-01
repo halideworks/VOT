@@ -90,7 +90,8 @@ jobs:
 
       - name: Validate deterministic simulation
         run: |
-          if rg 'thread::sleep|tokio::time::sleep' crates/vot-transport-sim; then
+          if rg --glob '*.rs' 'thread::sleep|tokio::time::sleep' \
+            crates/vot-transport-sim crates/vot-transport-tcp crates/vot-resume; then
             exit 1
           fi
           seed_a="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
@@ -108,6 +109,25 @@ jobs:
         run: |
           cargo +1.85.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
           cargo +1.85.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
+
+  platform-native:
+    name: platform native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Test native commit provider
+        run: cargo +1.85.0 test -p vot-commit-platform --locked
 
   s3-live:
     runs-on: ubuntu-24.04
@@ -243,6 +263,9 @@ jobs:
           - { package: vot-transport-msquic, required: true }
           - { package: vot-scheduler, required: true }
           - { package: vot-cli, required: true }
+          - { package: vot-transport-tcp, required: true }
+          - { package: vot-resume, required: true }
+          - { package: vot-commit-platform, required: true }
     steps:
       - uses: actions/checkout@v4.3.1
         with:

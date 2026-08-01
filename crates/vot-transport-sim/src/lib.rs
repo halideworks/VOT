@@ -4,8 +4,10 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fmt::Write as _;
+
+use vot_transport_api::{Error as TransportError, Event as TransportEvent, Payload, StreamId};
 
 pub const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
 pub const MAX_ACTIONS: usize = 4096;
@@ -37,6 +39,120 @@ impl TransportAck {
     #[must_use]
     pub const fn sequence(self) -> u64 {
         self.sequence
+    }
+}
+/// Deterministic loopback adapter used by integration tests and the simulator.
+///
+/// It deliberately keeps application submissions separate from backend events:
+/// callers must flush before polling, just as they must with a live backend.
+#[derive(Clone, Debug)]
+enum Submission {
+    Control(Payload),
+    Reliable { stream: StreamId, bytes: Payload },
+    Datagram { context: u64, bytes: Payload },
+    ReceiveCredit(u64),
+}
+
+#[derive(Default)]
+pub struct SimulatorAdapter {
+    submissions: VecDeque<Submission>,
+    events: VecDeque<TransportEvent>,
+    next_sequence: u64,
+    receive_credit: u64,
+}
+
+impl SimulatorAdapter {
+    #[must_use]
+    pub fn pending_submissions(&self) -> usize {
+        self.submissions.len()
+    }
+
+    #[must_use]
+    pub const fn receive_credit(&self) -> u64 {
+        self.receive_credit
+    }
+}
+
+impl vot_transport_api::TransportAdapter for SimulatorAdapter {
+    fn send_control(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        if frame.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
+            return Err(TransportError::RecordTooLarge);
+        }
+        self.submissions
+            .push_back(Submission::Control(vot_transport_api::shared_payload(
+                frame,
+            )));
+        Ok(())
+    }
+
+    fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), TransportError> {
+        self.send_reliable_shared(stream, vot_transport_api::shared_payload(record))
+    }
+
+    fn send_reliable_shared(
+        &mut self,
+        stream: StreamId,
+        record: Payload,
+    ) -> Result<(), TransportError> {
+        vot_transport_api::validate_data_record(&record)?;
+        self.submissions.push_back(Submission::Reliable {
+            stream,
+            bytes: record,
+        });
+        Ok(())
+    }
+
+    fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), TransportError> {
+        if payload.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
+            return Err(TransportError::RecordTooLarge);
+        }
+        self.submissions.push_back(Submission::Datagram {
+            context,
+            bytes: vot_transport_api::shared_payload(payload),
+        });
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), TransportError> {
+        while let Some(submission) = self.submissions.pop_front() {
+            match submission {
+                Submission::Control(bytes) => self.events.push_back(TransportEvent::Control(bytes)),
+                Submission::Reliable { stream, bytes } => {
+                    let sequence = self
+                        .next_sequence
+                        .checked_add(1)
+                        .ok_or(TransportError::ArithmeticOverflow)?;
+                    self.next_sequence = sequence;
+                    self.events.push_back(TransportEvent::Reliable {
+                        stream,
+                        sequence,
+                        bytes,
+                    });
+                }
+                Submission::Datagram { context, bytes } => {
+                    self.events.push_back(TransportEvent::DatagramState {
+                        context,
+                        state: vot_transport_api::DatagramSendState::Queued,
+                    });
+                    self.events.push_back(TransportEvent::DatagramState {
+                        context,
+                        state: vot_transport_api::DatagramSendState::Sent,
+                    });
+                    let _ = bytes;
+                }
+                Submission::ReceiveCredit(bytes) => self.receive_credit = bytes,
+            }
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<TransportEvent> {
+        self.events.pop_front()
+    }
+
+    fn set_receive_credit(&mut self, bytes: u64) -> Result<(), TransportError> {
+        self.submissions.push_back(Submission::ReceiveCredit(bytes));
+        Ok(())
     }
 }
 

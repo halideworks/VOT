@@ -1,10 +1,10 @@
 # Windows resume checkpoint replacement
 
-Criterion: a second resume checkpoint atomically replaces the first snapshot on
-Windows.
+Criterion: a compacted resume snapshot atomically replaces the previous log
+snapshot on Windows.
 
-Passing evidence: `repeated_checkpoints_replace_the_previous_snapshot` writes
-two checkpoint windows and reopens both units. Native Windows CI runs this test
+Passing evidence: `repeated_checkpoints_append_and_replay` appends two
+checkpoint windows and reopens both units. Native Windows CI runs this test
 and `replacement_overwrites_existing_file_atomically` in `vot-platform-fs`.
 
 Mutant: use `std::fs::rename` on Windows after the destination exists.

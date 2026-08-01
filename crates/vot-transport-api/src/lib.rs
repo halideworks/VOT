@@ -2,8 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 pub const ALPN: &[u8] = b"vot-draft-03";
+pub const MAX_CONTROL_FRAME_PAYLOAD: usize = vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD;
 pub const MAX_DATA_RECORD_BYTES: usize = 256 * 1024;
+pub const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(pub u64);
@@ -61,15 +65,24 @@ pub enum DatagramSendState {
     Canceled,
 }
 
+/// A payload whose allocation can be shared between the transport driver and
+/// application workers.
+pub type Payload = Arc<[u8]>;
+
+#[must_use]
+pub fn shared_payload(bytes: &[u8]) -> Payload {
+    Arc::from(bytes)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     Connected(ConnectionId),
     Disconnected(ConnectionId),
-    Control(Vec<u8>),
+    Control(Payload),
     Reliable {
         stream: StreamId,
         sequence: u64,
-        bytes: Vec<u8>,
+        bytes: Payload,
     },
     Acknowledged(TransportAck),
     DatagramState {
@@ -86,7 +99,20 @@ pub enum Error {
     InboundQueueFull,
     StagingExhausted,
     ArithmeticOverflow,
+    Unsupported,
     Backend,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PathStats {
+    /// Smoothed round-trip time in microseconds, when available.
+    pub smoothed_rtt_us: Option<u64>,
+    /// Current congestion window in bytes, when available.
+    pub congestion_window_bytes: Option<u64>,
+    /// Current path MTU in bytes, when available.
+    pub mtu_bytes: Option<u64>,
+    /// Current pacing rate in bits per second, when available.
+    pub pacing_rate_bps: Option<u64>,
 }
 
 pub trait TransportAdapter {
@@ -94,12 +120,74 @@ pub trait TransportAdapter {
     /// Reports a backend or protocol limit failure.
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error>;
 
+    /// Sends an already shared control payload without an adapter-side copy.
+    ///
+    /// # Errors
+    /// Propagates backend or protocol limit failures.
+    fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
+        self.send_control(&frame)
+    }
+
     /// # Errors
     /// Rejects records larger than 256 KiB and backend failures.
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error>;
 
+    /// Sends an already shared reliable payload. Adapters can override this to
+    /// avoid another application-level copy.
+    ///
+    /// # Errors
+    /// Propagates backend or protocol limit failures.
+    fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
+        self.send_reliable(stream, &record)
+    }
+
+    /// Submits a batch before the caller requests a backend flush.
+    ///
+    /// # Errors
+    /// Propagates the first backend or protocol limit failure.
+    fn send_reliable_batch(&mut self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
+        for record in records {
+            self.send_reliable_shared(stream, record.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Sends an experimental unreliable datagram.
+    ///
+    /// # Errors
+    /// Returns `Error::Unsupported` when the backend has no datagram path.
+    fn send_datagram(&mut self, _context: u64, _payload: &[u8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    /// Flushes pending application submissions into the backend.
+    ///
+    /// # Errors
+    /// Reports a backend failure.
+    fn flush(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Returns the next backend event without blocking.
     fn poll(&mut self) -> Option<Event>;
+
+    /// Drains at most limit events without changing their ordering.
+    fn poll_batch(&mut self, out: &mut Vec<Event>, limit: usize) -> usize {
+        let mut drained = 0;
+        while drained < limit {
+            let Some(event) = self.poll() else {
+                break;
+            };
+            out.push(event);
+            drained += 1;
+        }
+        drained
+    }
+
+    /// Returns backend path measurements when available.
+    fn path_stats(&self) -> Option<PathStats> {
+        None
+    }
 
     /// # Errors
     /// Reports a backend failure. Credit is absolute, not additive.
@@ -148,6 +236,11 @@ impl StagingCapacity {
         self.used = self.used.saturating_sub(bytes);
     }
 
+    /// Updates the current BDP target while preserving the configured hard cap.
+    pub fn set_bdp_target(&mut self, bdp_target: u64) {
+        self.bdp_target = bdp_target;
+    }
+
     #[must_use]
     pub const fn used(&self) -> u64 {
         self.used
@@ -155,7 +248,7 @@ impl StagingCapacity {
 
     #[must_use]
     pub const fn remaining(&self) -> u64 {
-        self.limit - self.used
+        self.limit.saturating_sub(self.used)
     }
 
     /// Credit is a pure function of the current staging state.

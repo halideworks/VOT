@@ -1,0 +1,1 @@
+{"id":"ram-to-ram-root-verified-v1","version":1,"source":"ram","destination":"ram","object_bytes":[67108864,1073741824],"record_bytes":65536,"worker_counts":[1,2,4,8],"suites":["blake3-bao64","sha256-bep52"],"assurance":"root-verified","seed_required":true,"warmup_iterations":2,"measurement_iterations":7}

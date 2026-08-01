@@ -10,3 +10,6 @@ workspace = true
 
 [dependencies]
 vot-codec = { path = "../vot-codec" }
+
+[dev-dependencies]
+vot-journal = { path = "../vot-journal" }

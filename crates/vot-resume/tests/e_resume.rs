@@ -39,7 +39,7 @@ fn random_process_kills_at_every_percent_keep_waste_bounded() {
         let mut reopened = ResumeStore::open(&store_path).unwrap();
         let restarted = ResumeTracker::discover(&mut reopened, subject(), 100, 8).unwrap();
         assert_eq!(
-            restarted.missing_units().count(),
+            restarted.missing_units().take(101).count(),
             100 - usize::try_from(kill_percent / 8 * 8).unwrap()
         );
         if store_path.exists() {
@@ -70,7 +70,7 @@ fn vm_stale_snapshot_resends_but_never_invents_verified_units() {
     let stale = ResumeTracker::discover(&mut snapshot_store, subject(), 100, 4).unwrap();
     assert!(stale.is_checkpointed(3));
     assert!(!stale.is_checkpointed(4));
-    assert_eq!(stale.missing_units().count(), 96);
+    assert_eq!(stale.missing_units().take(101).count(), 96);
     fs::remove_file(current_path).unwrap();
     fs::remove_file(snapshot_path).unwrap();
 }
@@ -177,6 +177,6 @@ fn source_loss_allows_alternate_source_for_same_identity() {
     let mut alternate_store = ResumeStore::open(&store_path).unwrap();
     let alternate = ResumeTracker::discover(&mut alternate_store, subject(), 100, 4).unwrap();
     assert!(alternate.is_checkpointed(0));
-    assert_eq!(alternate.missing_units().count(), 96);
+    assert_eq!(alternate.missing_units().take(101).count(), 96);
     fs::remove_file(store_path).unwrap();
 }

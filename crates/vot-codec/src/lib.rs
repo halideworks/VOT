@@ -1,13 +1,15 @@
-//! Bounded codec primitives for the `vot-draft-03` frame envelope.
+//! Typed payload schemas and bounded framing for the VOT v0.3 wire protocol.
 //!
-//! Payload schemas live in their owning protocol modules. This crate validates
-//! the common envelope, criticality convention, grease handling, and registered
-//! per-frame limits before a payload parser can allocate or mutate state.
+//! This crate validates the common envelope, criticality convention, grease
+//! handling, registered per-frame limits, and typed application payloads before
+//! a parser can allocate or mutate state.
 
 #![forbid(unsafe_code)]
 
 use core::cmp::min;
 use std::collections::BTreeSet;
+
+pub mod frames;
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
 pub const HARD_MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;

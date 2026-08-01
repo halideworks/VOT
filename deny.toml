@@ -17,9 +17,11 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace members intentionally use path dependencies; keep external wildcard use visible without rejecting these internal edges.
+wildcards = "warn"
 highlight = "all"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/microsoft/msquic.git"]

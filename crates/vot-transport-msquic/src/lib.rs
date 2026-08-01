@@ -5,13 +5,15 @@
 use std::collections::VecDeque;
 
 use vot_transport_api::{
-    ConnectionId, DatagramSendState, Error, Event, StreamId, TransportAck, TransportAdapter,
+    ConnectionId, DatagramSendState, Error, Event, PathStats, Payload, StreamId, TransportAck,
+    TransportAdapter, shared_payload,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
-    Control(Vec<u8>),
-    Reliable { stream: StreamId, bytes: Vec<u8> },
+    Control(Payload),
+    Reliable { stream: StreamId, bytes: Payload },
+    Datagram { context: u64, bytes: Payload },
     ReceiveCredit(u64),
 }
 
@@ -99,7 +101,7 @@ impl MsQuicAdapter {
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let payload_len = match &event {
             NativeEvent::Control(bytes) => {
-                if bytes.len() > vot_codec_limit() {
+                if bytes.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
                     return Err(Error::RecordTooLarge);
                 }
                 bytes.len()
@@ -123,7 +125,7 @@ impl MsQuicAdapter {
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
             NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
-            NativeEvent::Control(bytes) => Event::Control(bytes),
+            NativeEvent::Control(bytes) => Event::Control(bytes.into()),
             NativeEvent::Reliable {
                 stream,
                 sequence,
@@ -131,7 +133,7 @@ impl MsQuicAdapter {
             } => Event::Reliable {
                 stream: StreamId(stream),
                 sequence,
-                bytes,
+                bytes: bytes.into(),
             },
             NativeEvent::Acknowledged { stream, sequence } => {
                 Event::Acknowledged(TransportAck::new(stream, sequence))
@@ -159,6 +161,27 @@ impl MsQuicAdapter {
         Some(command)
     }
 
+    /// Gives a backend driver one queued command at a time.
+    ///
+    /// A failed submission remains at the head of the queue so the driver can
+    /// apply its own retry or shutdown policy without silently dropping data.
+    ///
+    /// # Errors
+    /// Returns the first backend error reported by `submit`.
+    pub fn drain_commands<F, E>(&mut self, mut submit: F) -> Result<(), E>
+    where
+        F: FnMut(Command) -> Result<(), E>,
+    {
+        while let Some(command) = self.commands.front().cloned() {
+            submit(command)?;
+            let Some(command) = self.commands.pop_front() else {
+                break;
+            };
+            self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
+        }
+        Ok(())
+    }
+
     fn enqueue(&mut self, command: Command) -> Result<(), Error> {
         let next_bytes = self
             .command_bytes
@@ -176,7 +199,9 @@ impl MsQuicAdapter {
 impl Command {
     fn payload_len(&self) -> usize {
         match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } => bytes.len(),
+            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
+                bytes.len()
+            }
             Self::ReceiveCredit(_) => 0,
         }
     }
@@ -184,17 +209,35 @@ impl Command {
 
 impl TransportAdapter for MsQuicAdapter {
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
-        if frame.len() > vot_codec_limit() {
+        self.send_control_shared(shared_payload(frame))
+    }
+
+    fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
+        if frame.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
             return Err(Error::RecordTooLarge);
         }
-        self.enqueue(Command::Control(frame.to_vec()))
+        self.enqueue(Command::Control(frame))
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
-        vot_transport_api::validate_data_record(record)?;
+        self.send_reliable_shared(stream, shared_payload(record))
+    }
+
+    fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
+        vot_transport_api::validate_data_record(&record)?;
         self.enqueue(Command::Reliable {
             stream,
-            bytes: record.to_vec(),
+            bytes: record,
+        })
+    }
+
+    fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
+        if payload.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
+            return Err(Error::RecordTooLarge);
+        }
+        self.enqueue(Command::Datagram {
+            context,
+            bytes: shared_payload(payload),
         })
     }
 
@@ -206,6 +249,10 @@ impl TransportAdapter for MsQuicAdapter {
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
         self.enqueue(Command::ReceiveCredit(bytes))
+    }
+
+    fn path_stats(&self) -> Option<PathStats> {
+        None
     }
 }
 
@@ -219,8 +266,9 @@ fn event_payload_len(event: &Event) -> usize {
     }
 }
 
+#[cfg(test)]
 const fn vot_codec_limit() -> usize {
-    1024 * 1024
+    vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
 }
 
 #[cfg(feature = "live")]
@@ -236,14 +284,14 @@ pub mod live {
     };
 
     pub struct SendBuffer {
-        storage: Vec<u8>,
+        storage: Box<[u8]>,
         buffers: Box<[BufferRef; 1]>,
     }
 
     impl SendBuffer {
         fn new(bytes: &[u8]) -> Self {
-            let storage = bytes.to_vec();
-            let buffers = Box::new([BufferRef::from(storage.as_slice())]);
+            let storage: Box<[u8]> = bytes.into();
+            let buffers = Box::new([BufferRef::from(storage.as_ref())]);
             Self { storage, buffers }
         }
     }
@@ -337,7 +385,9 @@ pub mod live {
             Status, Stream, StreamEvent, StreamOpenFlags, StreamRef, StreamStartFlags,
         };
 
+        use super::super::{Command as AdapterCommand, MsQuicAdapter};
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
+        use vot_transport_api::{StreamId, TransportAdapter};
 
         fn test_credential() -> Credential {
             let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
@@ -464,8 +514,10 @@ pub mod live {
                 )
                 .unwrap();
 
-            let outbound = payload.clone();
+            let mut adapter = MsQuicAdapter::default();
+            adapter.send_reliable(StreamId(1), &payload).unwrap();
             let (stream_closed_tx, stream_closed_rx) = mpsc::channel();
+            let client_adapter_for_callback = Arc::new(Mutex::new(adapter));
             let (client_closed_tx, client_closed_rx) = mpsc::channel();
             let client_stream = move |stream: StreamRef, event: StreamEvent| {
                 match event {
@@ -494,7 +546,15 @@ pub mod live {
                                 client_stream.clone(),
                             )?;
                             stream.start(StreamStartFlags::NONE)?;
-                            super::send_owned(&stream, &outbound, SendFlags::FIN)?;
+                            let mut adapter = client_adapter_for_callback.lock().unwrap();
+                            adapter.drain_commands(|command| match command {
+                                AdapterCommand::Reliable { bytes, .. } => {
+                                    super::send_owned(&stream, &bytes, SendFlags::FIN)
+                                }
+                                AdapterCommand::Control(_)
+                                | AdapterCommand::Datagram { .. }
+                                | AdapterCommand::ReceiveCredit(_) => Ok(()),
+                            })?;
                             // SAFETY: client_stream adopts this handle in its unique
                             // ShutdownComplete callback.
                             unsafe { detach_stream(stream) };
@@ -543,7 +603,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn simulator_and_live_semantics_share_the_transport_contract() {
+    fn queue_adapter_preserves_transport_contract() {
         let mut adapter = MsQuicAdapter::default();
         adapter.send_control(b"hello").unwrap();
         adapter
@@ -552,16 +612,51 @@ mod tests {
         adapter.set_receive_credit(4096).unwrap();
         assert_eq!(
             adapter.next_command(),
-            Some(Command::Control(b"hello".to_vec()))
+            Some(Command::Control(b"hello".to_vec().into()))
         );
         assert_eq!(
             adapter.next_command(),
             Some(Command::Reliable {
                 stream: StreamId(2),
-                bytes: b"verified bytes".to_vec(),
+                bytes: b"verified bytes".to_vec().into(),
             })
         );
         assert_eq!(adapter.next_command(), Some(Command::ReceiveCredit(4096)));
+    }
+
+    #[test]
+    fn command_drain_is_retryable_and_preserves_order() {
+        let mut adapter = MsQuicAdapter::default();
+        adapter.send_control(b"control").unwrap();
+        adapter.send_reliable(StreamId(4), b"payload").unwrap();
+        let mut attempts = 0;
+        assert_eq!(
+            adapter.drain_commands(|_| {
+                attempts += 1;
+                Err::<(), _>(Error::Backend)
+            }),
+            Err(Error::Backend)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Control(b"control".to_vec().into()))
+        );
+
+        let mut seen = Vec::new();
+        adapter
+            .drain_commands(|command| {
+                seen.push(command);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec![Command::Reliable {
+                stream: StreamId(4),
+                bytes: b"payload".to_vec().into(),
+            }]
+        );
     }
 
     #[test]
@@ -620,7 +715,7 @@ mod tests {
         assert_eq!(adapter.set_receive_credit(1), Err(Error::OutboundQueueFull));
         assert_eq!(
             adapter.next_command(),
-            Some(Command::Control(b"123".to_vec()))
+            Some(Command::Control(b"123".to_vec().into()))
         );
         assert_eq!(adapter.send_control(b"6789"), Err(Error::OutboundQueueFull));
         assert!(matches!(

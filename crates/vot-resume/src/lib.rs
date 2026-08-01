@@ -1,25 +1,27 @@
 //! Persistent carrier-neutral resume state and RFC 9959 Careful Resume policy.
 
 #![forbid(unsafe_code)]
-#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::cast_possible_truncation, clippy::missing_errors_doc)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use vot_transport_api::SubjectId;
+use vot_transport_api::{PathStats, SubjectId};
 use vot_transport_tcp::Carrier;
 
-const MAGIC: &[u8; 8] = b"VOTRES01";
+const MAGIC: &[u8; 8] = b"VOTRES02";
 const MAX_STORE_BYTES: u64 = 67_108_864;
-const MAX_STORE_PAYLOAD_BYTES: u64 = MAX_STORE_BYTES - 32;
-const MIN_STORE_BYTES: u64 = 44;
-const STORE_HEADER_BYTES: u64 = 12;
-const OBJECT_HEADER_BYTES: u64 = 54;
-const UNIT_BYTES: u64 = 8;
-const MAX_UNITS_PER_OBJECT: u64 =
-    (MAX_STORE_PAYLOAD_BYTES - STORE_HEADER_BYTES - OBJECT_HEADER_BYTES) / UNIT_BYTES;
+const MAX_STORE_PAYLOAD_BYTES: u64 = MAX_STORE_BYTES - 20;
+const MIN_STORE_BYTES: u64 = 8;
+const MAX_UNITS_PER_OBJECT: u64 = 8_388_595;
+const RECORD_HEADER_BYTES: u64 = 4;
+const RECORD_CHECKSUM_BYTES: u64 = 8;
+const RESERVE_RECORD: u8 = 1;
+const CHECKPOINT_RECORD: u8 = 2;
+const SNAPSHOT_RECORD: u8 = 3;
+const COMPACTION_THRESHOLD: u64 = MAX_STORE_BYTES * 3 / 4;
 
 #[derive(Debug)]
 pub enum Error {
@@ -46,10 +48,11 @@ struct StoredObject {
     checkpointed: BTreeSet<u64>,
 }
 
-/// Checksummed state store keyed by immutable object identity, never connection ID.
+/// Checksummed append-only state keyed by immutable object identity, never connection ID.
 pub struct ResumeStore {
     path: PathBuf,
     objects: BTreeMap<SubjectId, StoredObject>,
+    signature: FileSignature,
 }
 
 impl ResumeStore {
@@ -60,7 +63,12 @@ impl ResumeStore {
         } else {
             BTreeMap::new()
         };
-        Ok(Self { path, objects })
+        let signature = file_signature(&path)?;
+        Ok(Self {
+            path,
+            objects,
+            signature,
+        })
     }
 
     #[must_use]
@@ -70,6 +78,46 @@ impl ResumeStore {
             .map(|object| &object.checkpointed)
     }
 
+    /// Reserves a batch of immutable objects in one compacted transaction.
+    ///
+    /// # Errors
+    /// Rejects identity conflicts, invalid unit counts, or a store that exceeds
+    /// the bounded on-disk representation.
+    pub fn reserve_many<I>(&mut self, objects: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = (SubjectId, u64)>,
+    {
+        let lock = lock_store(&self.path)?;
+        self.refresh_locked()?;
+        let mut candidate = self.objects.clone();
+        let mut changed = false;
+        for (subject, total_units) in objects {
+            validate_total_units(total_units)?;
+            if let Some(existing) = candidate.get(&subject) {
+                if existing.total_units != total_units {
+                    return Err(Error::IdentityMismatch);
+                }
+            } else {
+                candidate.insert(
+                    subject,
+                    StoredObject {
+                        total_units,
+                        checkpointed: BTreeSet::new(),
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            validate_reserved_capacity(&candidate)?;
+            Self::compact(&self.path, &candidate)?;
+            self.objects = candidate;
+            self.signature = file_signature(&self.path)?;
+        }
+        drop(lock);
+        Ok(())
+    }
+
     fn reserve_object(
         &mut self,
         subject: SubjectId,
@@ -77,32 +125,30 @@ impl ResumeStore {
     ) -> Result<BTreeSet<u64>, Error> {
         validate_total_units(total_units)?;
         let lock = lock_store(&self.path)?;
-        let mut candidate = if self.path.exists() {
-            decode_store(&self.path)?
-        } else {
-            BTreeMap::new()
-        };
-        if let Some(object) = candidate.get(&subject) {
+        self.refresh_locked()?;
+        let checkpointed = if let Some(object) = self.objects.get(&subject) {
             if object.total_units != total_units {
                 return Err(Error::IdentityMismatch);
             }
+            object.checkpointed.clone()
         } else {
-            candidate.insert(
-                subject,
-                StoredObject {
-                    total_units,
-                    checkpointed: BTreeSet::new(),
-                },
-            );
-        }
-        validate_reserved_capacity(&candidate)?;
-        Self::flush(&self.path, &candidate)?;
-        let checkpointed = candidate
-            .get(&subject)
-            .ok_or(Error::IdentityMismatch)?
-            .checkpointed
-            .clone();
-        self.objects = candidate;
+            let object = StoredObject {
+                total_units,
+                checkpointed: BTreeSet::new(),
+            };
+            let current_length = file_len(&self.path)?;
+            if reserve_requires_compaction(self.path.exists(), current_length) {
+                let mut candidate = self.objects.clone();
+                candidate.insert(subject, object.clone());
+                Self::compact(&self.path, &candidate)?;
+                self.objects = candidate;
+            } else {
+                append_record(&self.path, &encode_reserve(subject, total_units)?)?;
+                self.objects.insert(subject, object);
+            }
+            BTreeSet::new()
+        };
+        self.signature = file_signature(&self.path)?;
         drop(lock);
         Ok(checkpointed)
     }
@@ -118,20 +164,14 @@ impl ResumeStore {
             return Err(Error::InvalidUnit);
         }
         let lock = lock_store(&self.path)?;
-        let mut candidate = if self.path.exists() {
-            decode_store(&self.path)?
-        } else {
-            BTreeMap::new()
-        };
-        if candidate
-            .get(&subject)
-            .is_some_and(|object| object.total_units != total_units)
-        {
+        self.refresh_locked()?;
+        let mut candidate = self.objects.clone();
+        let existing = candidate.get(&subject).ok_or(Error::IdentityMismatch)?;
+        if existing.total_units != total_units {
             return Err(Error::IdentityMismatch);
         }
-        let mut merged = candidate
-            .get(&subject)
-            .map_or_else(BTreeSet::new, |object| object.checkpointed.clone());
+        let previous = existing.checkpointed.clone();
+        let mut merged = previous.clone();
         merged.extend(checkpointed);
         candidate.insert(
             subject,
@@ -140,15 +180,30 @@ impl ResumeStore {
                 checkpointed: merged.clone(),
             },
         );
-        validate_reserved_capacity(&candidate)?;
-        Self::flush(&self.path, &candidate)?;
+        let delta = difference(&merged, &previous);
+        if !delta.is_empty() {
+            let record = encode_checkpoint(subject, total_units, &delta)?;
+            let projected = file_len(&self.path)?
+                .saturating_add(u64::try_from(record.len()).map_err(|_| Error::TooLarge)?);
+            if should_compact(projected) {
+                Self::compact(&self.path, &candidate)?;
+            } else {
+                append_record(&self.path, &record)?;
+            }
+        }
         self.objects = candidate;
+        self.signature = file_signature(&self.path)?;
         drop(lock);
         Ok(merged)
     }
 
-    fn flush(path: &Path, objects: &BTreeMap<SubjectId, StoredObject>) -> Result<(), Error> {
-        let bytes = encode_store(objects)?;
+    fn compact(path: &Path, objects: &BTreeMap<SubjectId, StoredObject>) -> Result<(), Error> {
+        let bytes = encode_snapshot(objects)?;
+        let record = encode_record(&bytes)?;
+        let record_length = u64::try_from(record.len()).map_err(|_| Error::TooLarge)?;
+        if !compact_fits(record_length) {
+            return Err(Error::TooLarge);
+        }
         let temporary = temporary_path(path)?;
         match fs::remove_file(&temporary) {
             Ok(()) => {}
@@ -159,11 +214,25 @@ impl ResumeStore {
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        file.write_all(MAGIC)?;
+        file.write_all(&record)?;
         file.sync_all()?;
         vot_platform_fs::atomic_replace(&temporary, path)?;
         #[cfg(unix)]
         File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+        Ok(())
+    }
+
+    fn refresh_locked(&mut self) -> Result<(), Error> {
+        let current = file_signature(&self.path)?;
+        if current != self.signature {
+            self.objects = if self.path.exists() {
+                decode_store(&self.path)?
+            } else {
+                BTreeMap::new()
+            };
+            self.signature = current;
+        }
         Ok(())
     }
 }
@@ -248,7 +317,11 @@ impl ResumeTracker {
     }
 
     pub fn missing_units(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..self.total_units).filter(|unit| !self.checkpointed.contains(unit))
+        MissingUnits {
+            total_units: self.total_units,
+            next: 0,
+            checkpointed: self.checkpointed.iter().peekable(),
+        }
     }
 
     fn validate_unit(&self, unit: u64) -> Result<(), Error> {
@@ -256,6 +329,35 @@ impl ResumeTracker {
             Err(Error::InvalidUnit)
         } else {
             Ok(())
+        }
+    }
+}
+struct MissingUnits<'a> {
+    total_units: u64,
+    next: u64,
+    checkpointed: std::iter::Peekable<std::collections::btree_set::Iter<'a, u64>>,
+}
+
+impl Iterator for MissingUnits<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.next >= self.total_units {
+                return None;
+            }
+            if self
+                .checkpointed
+                .peek()
+                .is_some_and(|unit| **unit == self.next)
+            {
+                self.checkpointed.next();
+                self.next = self.next.saturating_add(1);
+                continue;
+            }
+            let missing = self.next;
+            self.next = self.next.saturating_add(1);
+            return Some(missing);
         }
     }
 }
@@ -325,6 +427,29 @@ pub struct Observation {
     pub saved_rtt: u64,
     pub expires_at: u64,
     pub configuration_epoch: u64,
+}
+
+impl Observation {
+    /// Builds a resumable observation from the backend-neutral path metrics.
+    ///
+    /// # Errors
+    /// Rejects adapters that cannot expose both RTT and congestion window.
+    pub fn from_path_stats(
+        stats: PathStats,
+        expires_at: u64,
+        configuration_epoch: u64,
+    ) -> Result<Self, PathReject> {
+        Ok(Self {
+            saved_cwnd: stats
+                .congestion_window_bytes
+                .ok_or(PathReject::InvalidObservation)?,
+            saved_rtt: stats
+                .smoothed_rtt_us
+                .ok_or(PathReject::InvalidObservation)?,
+            expires_at,
+            configuration_epoch,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,47 +628,42 @@ fn validate_checkpoint_window(total_units: u64, checkpoint_window: usize) -> Res
 }
 
 fn validate_reserved_capacity(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<(), Error> {
-    let object_count = u64::try_from(objects.len()).map_err(|_| Error::InvalidConfiguration)?;
-    let units = objects.values().try_fold(0_u64, |total, object| {
-        total
-            .checked_add(object.total_units)
-            .ok_or(Error::InvalidConfiguration)
-    })?;
-    let length = STORE_HEADER_BYTES
-        .checked_add(
-            object_count
-                .checked_mul(OBJECT_HEADER_BYTES)
-                .ok_or(Error::InvalidConfiguration)?,
-        )
-        .and_then(|length| length.checked_add(units.checked_mul(UNIT_BYTES)?))
-        .ok_or(Error::InvalidConfiguration)?;
-    if length > MAX_STORE_PAYLOAD_BYTES {
-        Err(Error::InvalidConfiguration)
-    } else {
+    let payload = encode_snapshot(objects)?;
+    let record = encode_record(&payload)?;
+    let record_length = u64::try_from(record.len()).map_err(|_| Error::TooLarge)?;
+    if compact_fits(record_length) {
         Ok(())
+    } else {
+        Err(Error::TooLarge)
     }
 }
 
-fn encode_store(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<Vec<u8>, Error> {
-    let count = u32::try_from(objects.len()).map_err(|_| Error::TooLarge)?;
+fn store_size_fits(length: u64) -> bool {
+    length <= MAX_STORE_BYTES
+}
+
+fn reserve_requires_compaction(path_exists: bool, current_length: u64) -> bool {
+    !path_exists || should_compact(current_length)
+}
+
+fn should_compact(projected: u64) -> bool {
+    projected >= COMPACTION_THRESHOLD
+}
+
+fn encode_snapshot(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<Vec<u8>, Error> {
     let mut output = Vec::new();
-    output.extend_from_slice(MAGIC);
-    output.extend_from_slice(&count.to_be_bytes());
+    output.push(SNAPSHOT_RECORD);
+    encode_uvarint(
+        u64::try_from(objects.len()).map_err(|_| Error::TooLarge)?,
+        &mut output,
+    );
     for (subject, object) in objects {
         validate_total_units(object.total_units)?;
-        let units = u32::try_from(object.checkpointed.len()).map_err(|_| Error::TooLarge)?;
-        output.extend_from_slice(&subject.suite.to_be_bytes());
-        output.extend_from_slice(&subject.root);
-        output.extend_from_slice(&subject.length.to_be_bytes());
-        output.extend_from_slice(&object.total_units.to_be_bytes());
-        output.extend_from_slice(&units.to_be_bytes());
-        for unit in &object.checkpointed {
-            output.extend_from_slice(&unit.to_be_bytes());
-        }
-        validate_payload_length(output.len() as u64)?;
+        encode_subject(subject, &mut output);
+        encode_uvarint(object.total_units, &mut output);
+        encode_ranges(&object.checkpointed, &mut output);
     }
-    let digest = blake3::hash(&output);
-    output.extend_from_slice(digest.as_bytes());
+    validate_payload_length(u64::try_from(output.len()).map_err(|_| Error::TooLarge)?)?;
     Ok(output)
 }
 
@@ -553,53 +673,265 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
     if !(MIN_STORE_BYTES..=MAX_STORE_BYTES).contains(&length) {
         return Err(Error::Corrupt);
     }
-    let (payload, declared_digest) = bytes.split_at(bytes.len() - 32);
-    if blake3::hash(payload).as_bytes() != declared_digest {
+    let mut decoder = Decoder::new(&bytes);
+    if decoder.take(MAGIC.len())? != MAGIC {
         return Err(Error::Corrupt);
     }
-    let mut decoder = Decoder::new(payload);
-    if decoder.take(8)? != MAGIC {
-        return Err(Error::Corrupt);
-    }
-    let count = decoder.u32()?;
     let mut objects = BTreeMap::new();
-    for _ in 0..count {
-        let suite = decoder.u16()?;
-        let root = decoder.array()?;
-        let subject_length = decoder.u64()?;
-        let total_units = decoder.u64()?;
-        validate_total_units(total_units)?;
-        let unit_count = decoder.u32()?;
-        let mut checkpointed = BTreeSet::new();
-        for _ in 0..unit_count {
-            let unit = decoder.u64()?;
-            if unit >= total_units || !checkpointed.insert(unit) {
-                return Err(Error::Corrupt);
-            }
-        }
-        let subject = SubjectId {
-            suite,
-            root,
-            length: subject_length,
-        };
-        if objects
-            .insert(
-                subject,
-                StoredObject {
-                    total_units,
-                    checkpointed,
-                },
-            )
-            .is_some()
-        {
+    while !decoder.is_empty() {
+        let record_length = usize::try_from(decoder.u32()?).map_err(|_| Error::Corrupt)?;
+        if !record_length_valid(record_length) {
             return Err(Error::Corrupt);
         }
+        let record = decoder.take(record_length)?;
+        let checksum = decoder.take(RECORD_CHECKSUM_BYTES as usize)?;
+        let digest = blake3::hash(record);
+        if checksum != &digest.as_bytes()[..RECORD_CHECKSUM_BYTES as usize] {
+            return Err(Error::Corrupt);
+        }
+        apply_record(record, &mut objects)?;
     }
-    if !decoder.is_empty() {
-        return Err(Error::Corrupt);
-    }
-    validate_reserved_capacity(&objects).map_err(|_| Error::Corrupt)?;
     Ok(objects)
+}
+
+fn record_length_valid(record_length: usize) -> bool {
+    record_length != 0 && record_length <= MAX_STORE_BYTES as usize
+}
+
+fn encode_reserve(subject: SubjectId, total_units: u64) -> Result<Vec<u8>, Error> {
+    validate_total_units(total_units)?;
+    let mut output = Vec::with_capacity(1 + 42 + 10);
+    output.push(RESERVE_RECORD);
+    encode_subject(&subject, &mut output);
+    encode_uvarint(total_units, &mut output);
+    Ok(output)
+}
+
+fn encode_checkpoint(
+    subject: SubjectId,
+    total_units: u64,
+    units: &BTreeSet<u64>,
+) -> Result<Vec<u8>, Error> {
+    validate_total_units(total_units)?;
+    let mut output = Vec::new();
+    output.push(CHECKPOINT_RECORD);
+    encode_subject(&subject, &mut output);
+    encode_uvarint(total_units, &mut output);
+    encode_ranges(units, &mut output);
+    Ok(output)
+}
+
+fn encode_subject(subject: &SubjectId, output: &mut Vec<u8>) {
+    output.extend_from_slice(&subject.suite.to_be_bytes());
+    output.extend_from_slice(&subject.root);
+    output.extend_from_slice(&subject.length.to_be_bytes());
+}
+
+fn encode_ranges(units: &BTreeSet<u64>, output: &mut Vec<u8>) {
+    let mut range_count = 0_u64;
+    let mut previous: Option<u64> = None;
+    for unit in units {
+        if previous.is_none_or(|last| *unit != last.saturating_add(1)) {
+            range_count = range_count.saturating_add(1);
+        }
+        previous = Some(*unit);
+    }
+    encode_uvarint(range_count, output);
+    let Some(first) = units.first().copied() else {
+        return;
+    };
+    let mut start = first;
+    let mut last = first;
+    for unit in units.iter().copied().skip(1) {
+        if unit == last.saturating_add(1) {
+            last = unit;
+        } else {
+            encode_uvarint(start, output);
+            encode_uvarint(last - start + 1, output);
+            start = unit;
+            last = unit;
+        }
+    }
+    encode_uvarint(start, output);
+    encode_uvarint(last - start + 1, output);
+}
+
+fn difference(merged: &BTreeSet<u64>, previous: &BTreeSet<u64>) -> BTreeSet<u64> {
+    merged.difference(previous).copied().collect()
+}
+
+fn encode_uvarint(mut value: u64, output: &mut Vec<u8>) {
+    for _ in 0..10 {
+        let low = (value as u8) & 0x7f;
+        if value < 0x80 {
+            output.push(low);
+            return;
+        }
+        output.push(low + 0x80);
+        value >>= 7;
+    }
+    unreachable!("a u64 varint fits in ten bytes");
+}
+
+fn encode_record(payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let length = u32::try_from(payload.len()).map_err(|_| Error::TooLarge)?;
+    let mut output = Vec::with_capacity(
+        RECORD_HEADER_BYTES as usize + payload.len() + RECORD_CHECKSUM_BYTES as usize,
+    );
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(payload);
+    output.extend_from_slice(&blake3::hash(payload).as_bytes()[..RECORD_CHECKSUM_BYTES as usize]);
+    Ok(output)
+}
+
+fn append_record(path: &Path, payload: &[u8]) -> Result<(), Error> {
+    let record = encode_record(payload)?;
+    let record_length = u64::try_from(record.len()).map_err(|_| Error::TooLarge)?;
+    let current_length = file_len(path)?;
+    let header_length = append_header_length(current_length);
+    if !append_fits(current_length, header_length, record_length) {
+        return Err(Error::TooLarge);
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if current_length == 0 {
+        file.write_all(MAGIC)?;
+    }
+    file.write_all(&record)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+    Ok(())
+}
+
+fn append_header_length(current_length: u64) -> u64 {
+    if current_length == 0 {
+        MAGIC.len() as u64
+    } else {
+        0
+    }
+}
+
+fn compact_fits(record_length: u64) -> bool {
+    record_length
+        .checked_add(MAGIC.len() as u64)
+        .is_some_and(store_size_fits)
+}
+
+fn append_fits(current_length: u64, header_length: u64, record_length: u64) -> bool {
+    current_length
+        .checked_add(header_length)
+        .and_then(|length| length.checked_add(record_length))
+        .is_some_and(store_size_fits)
+}
+
+fn apply_record(
+    record: &[u8],
+    objects: &mut BTreeMap<SubjectId, StoredObject>,
+) -> Result<(), Error> {
+    let mut decoder = Decoder::new(record);
+    let kind = decoder.take(1)?.first().copied().ok_or(Error::Corrupt)?;
+    match kind {
+        RESERVE_RECORD => {
+            let subject = decode_subject(&mut decoder)?;
+            let total_units = decoder.uvar()?;
+            validate_total_units(total_units)?;
+            if !decoder.is_empty() {
+                return Err(Error::Corrupt);
+            }
+            if let Some(existing) = objects.get(&subject) {
+                if existing.total_units != total_units {
+                    return Err(Error::Corrupt);
+                }
+            } else {
+                objects.insert(
+                    subject,
+                    StoredObject {
+                        total_units,
+                        checkpointed: BTreeSet::new(),
+                    },
+                );
+            }
+        }
+        CHECKPOINT_RECORD => {
+            let subject = decode_subject(&mut decoder)?;
+            let total_units = decoder.uvar()?;
+            validate_total_units(total_units)?;
+            let mut delta = BTreeSet::new();
+            decode_ranges(&mut decoder, total_units, &mut delta)?;
+            if !decoder.is_empty() {
+                return Err(Error::Corrupt);
+            }
+            let Some(object) = objects.get_mut(&subject) else {
+                return Err(Error::Corrupt);
+            };
+            if object.total_units != total_units {
+                return Err(Error::Corrupt);
+            }
+            object.checkpointed.extend(delta);
+        }
+        SNAPSHOT_RECORD => {
+            let count = decoder.uvar()?;
+            let mut snapshot = BTreeMap::new();
+            for _ in 0..count {
+                let subject = decode_subject(&mut decoder)?;
+                let total_units = decoder.uvar()?;
+                validate_total_units(total_units)?;
+                let mut checkpointed = BTreeSet::new();
+                decode_ranges(&mut decoder, total_units, &mut checkpointed)?;
+                if snapshot
+                    .insert(
+                        subject,
+                        StoredObject {
+                            total_units,
+                            checkpointed,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(Error::Corrupt);
+                }
+            }
+            if !decoder.is_empty() {
+                return Err(Error::Corrupt);
+            }
+            *objects = snapshot;
+        }
+        _ => return Err(Error::Corrupt),
+    }
+    Ok(())
+}
+
+fn decode_subject(decoder: &mut Decoder<'_>) -> Result<SubjectId, Error> {
+    Ok(SubjectId {
+        suite: decoder.u16()?,
+        root: decoder.array()?,
+        length: decoder.u64()?,
+    })
+}
+
+fn decode_ranges(
+    decoder: &mut Decoder<'_>,
+    total_units: u64,
+    output: &mut BTreeSet<u64>,
+) -> Result<(), Error> {
+    let count = decoder.uvar()?;
+    let mut previous_end = 0_u64;
+    for _ in 0..count {
+        let start = decoder.uvar()?;
+        let length = decoder.uvar()?;
+        if length == 0 || start < previous_end {
+            return Err(Error::Corrupt);
+        }
+        let end = start.checked_add(length).ok_or(Error::Corrupt)?;
+        if end > total_units {
+            return Err(Error::Corrupt);
+        }
+        for unit in start..end {
+            output.insert(unit);
+        }
+        previous_end = end;
+    }
+    Ok(())
 }
 
 fn read_bounded_store(path: &Path, maximum: u64) -> Result<Vec<u8>, Error> {
@@ -651,10 +983,56 @@ impl<'a> Decoder<'a> {
     fn array(&mut self) -> Result<[u8; 32], Error> {
         self.take(32)?.try_into().map_err(|_| Error::Corrupt)
     }
+    fn uvar(&mut self) -> Result<u64, Error> {
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = self.take(1)?.first().copied().ok_or(Error::Corrupt)?;
+            let bits = u64::from(byte & 0x7f);
+            if shift >= 64 || (shift == 63 && bits > 1) {
+                return Err(Error::Corrupt);
+            }
+            value |= bits << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift = shift.checked_add(7).ok_or(Error::Corrupt)?;
+        }
+    }
 
     const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileSignature {
+    length: u64,
+    tail: [u8; 8],
+}
+
+fn file_len(path: &Path) -> Result<u64, Error> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn file_signature(path: &Path) -> Result<FileSignature, Error> {
+    let length = file_len(path)?;
+    if length == 0 {
+        return Ok(FileSignature {
+            length,
+            tail: [0; 8],
+        });
+    }
+    let mut file = File::open(path)?;
+    let mut tail = [0; 8];
+    let count = usize::try_from(length.min(8)).map_err(|_| Error::TooLarge)?;
+    file.seek(SeekFrom::Start(length.saturating_sub(8)))?;
+    file.read_exact(&mut tail[..count])?;
+    Ok(FileSignature { length, tail })
 }
 
 fn temporary_path(path: &Path) -> Result<PathBuf, Error> {
@@ -711,8 +1089,8 @@ mod tests {
     }
 
     fn write_raw(path: &Path, payload: &[u8]) {
-        let mut bytes = payload.to_vec();
-        bytes.extend_from_slice(blake3::hash(payload).as_bytes());
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&encode_record(payload).unwrap());
         fs::write(path, bytes).unwrap();
     }
 
@@ -765,7 +1143,11 @@ mod tests {
         for unit in 0..4 {
             assert!(restarted.is_checkpointed(unit));
         }
-        assert_eq!(restarted.missing_units().count(), 16);
+        assert_eq!(restarted.missing_units().take(21).count(), 16);
+        assert_eq!(
+            restarted.missing_units().take(21).collect::<Vec<_>>(),
+            (4..20).collect::<Vec<_>>()
+        );
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
@@ -794,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_checkpoints_replace_the_previous_snapshot() {
+    fn repeated_checkpoints_append_and_replay() {
         let path = temp_path("repeated-checkpoint");
         let mut store = ResumeStore::open(&path).unwrap();
         let mut tracker = ResumeTracker::discover(&mut store, subject(8), 3, 1).unwrap();
@@ -874,16 +1256,9 @@ mod tests {
     #[test]
     fn store_and_unit_bounds_are_exact_and_checkpoint_failure_is_atomic() {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
-        assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_832);
-        assert_eq!(MIN_STORE_BYTES, 44);
+        assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_844);
+        assert_eq!(MIN_STORE_BYTES, 8);
         assert_eq!(MAX_UNITS_PER_OBJECT, 8_388_595);
-        let maximum_object_payload =
-            STORE_HEADER_BYTES + OBJECT_HEADER_BYTES + MAX_UNITS_PER_OBJECT * UNIT_BYTES;
-        assert!(validate_payload_length(maximum_object_payload).is_ok());
-        assert!(matches!(
-            validate_payload_length(maximum_object_payload + UNIT_BYTES),
-            Err(Error::TooLarge)
-        ));
         assert!(validate_payload_length(MAX_STORE_PAYLOAD_BYTES).is_ok());
         assert!(matches!(
             validate_payload_length(MAX_STORE_PAYLOAD_BYTES + 1),
@@ -950,76 +1325,267 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_capacity_is_reserved_before_transfer() {
-        let path = temp_path("aggregate-capacity");
-        let mut store = ResumeStore::open(&path).unwrap();
-        let aggregate_units =
-            (MAX_STORE_PAYLOAD_BYTES - STORE_HEADER_BYTES - 2 * OBJECT_HEADER_BYTES) / UNIT_BYTES;
-        let first_units = aggregate_units / 2;
-        let second_units = aggregate_units - first_units;
-
-        assert!(ResumeTracker::discover(&mut store, subject(11), first_units, 1).is_ok());
-        assert!(ResumeTracker::discover(&mut store, subject(12), second_units, 1).is_ok());
+    fn resume_store_boundaries_are_explicit() {
+        assert_eq!(COMPACTION_THRESHOLD, 50_331_648);
+        assert!(store_size_fits(MAX_STORE_BYTES - 1));
+        assert!(store_size_fits(MAX_STORE_BYTES));
+        assert!(!store_size_fits(MAX_STORE_BYTES + 1));
+        assert!(reserve_requires_compaction(false, COMPACTION_THRESHOLD - 1));
+        assert!(!reserve_requires_compaction(true, COMPACTION_THRESHOLD - 1));
+        assert!(reserve_requires_compaction(true, COMPACTION_THRESHOLD));
+        assert!(!should_compact(COMPACTION_THRESHOLD - 1));
+        assert!(should_compact(COMPACTION_THRESHOLD));
+        assert!(append_fits(
+            0,
+            MAGIC.len() as u64,
+            MAX_STORE_BYTES - MAGIC.len() as u64
+        ));
+        assert!(!append_fits(
+            0,
+            MAGIC.len() as u64,
+            MAX_STORE_BYTES - MAGIC.len() as u64 + 1
+        ));
+        assert!(!append_fits(u64::MAX, 0, 1));
+        assert_eq!(append_header_length(0), MAGIC.len() as u64);
+        assert_eq!(append_header_length(1), 0);
+        assert!(!record_length_valid(0));
+        assert!(record_length_valid(1));
+        assert!(record_length_valid(MAX_STORE_BYTES as usize));
+        assert!(!record_length_valid(MAX_STORE_BYTES as usize + 1));
+        assert!(compact_fits(MAX_STORE_BYTES - MAGIC.len() as u64));
+        assert!(!compact_fits(MAX_STORE_BYTES - MAGIC.len() as u64 + 1));
+        assert!(!compact_fits(u64::MAX));
+        assert!(validate_checkpoint_window(1, 1).is_ok());
         assert!(matches!(
-            ResumeTracker::discover(&mut store, subject(13), 1, 1),
+            validate_checkpoint_window(1, 0),
             Err(Error::InvalidConfiguration)
         ));
+        assert!(matches!(
+            validate_checkpoint_window(1, 2),
+            Err(Error::InvalidConfiguration)
+        ));
+        let mut invalid_objects = BTreeMap::new();
+        invalid_objects.insert(
+            subject(15),
+            StoredObject {
+                total_units: 0,
+                checkpointed: BTreeSet::new(),
+            },
+        );
+        assert!(matches!(
+            validate_reserved_capacity(&invalid_objects),
+            Err(Error::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn resume_codecs_round_trip() {
+        let units = BTreeSet::from([1, 2, 4, 7, 8]);
+        let mut encoded_ranges = Vec::new();
+        encode_ranges(&units, &mut encoded_ranges);
+        let mut decoded_ranges = BTreeSet::new();
+        let mut range_decoder = Decoder::new(&encoded_ranges);
+        decode_ranges(&mut range_decoder, 9, &mut decoded_ranges).unwrap();
+        assert!(range_decoder.is_empty());
+        assert_eq!(decoded_ranges, units);
+
+        let mut encoded_varint = Vec::new();
+        encode_uvarint(128, &mut encoded_varint);
+        assert_eq!(encoded_varint, [0x80, 0x01]);
+        encoded_varint.clear();
+        encode_uvarint(255, &mut encoded_varint);
+        assert_eq!(encoded_varint, [0xff, 0x01]);
+        let mut valid_u64 = vec![0x80; 9];
+        valid_u64.push(0x01);
+        assert_eq!(Decoder::new(&valid_u64).uvar().unwrap(), 1_u64 << 63);
+        let mut invalid_u64 = vec![0x80; 9];
+        invalid_u64.push(0x02);
+        assert!(matches!(
+            Decoder::new(&invalid_u64).uvar(),
+            Err(Error::Corrupt)
+        ));
+
+        let mut snapshot_objects = BTreeMap::new();
+        snapshot_objects.insert(
+            subject(11),
+            StoredObject {
+                total_units: 9,
+                checkpointed: units.clone(),
+            },
+        );
+        let snapshot = encode_snapshot(&snapshot_objects).unwrap();
+        assert_eq!(snapshot.first().copied(), Some(SNAPSHOT_RECORD));
+        let mut replayed_snapshot = BTreeMap::new();
+        apply_record(&snapshot, &mut replayed_snapshot).unwrap();
+        assert_eq!(replayed_snapshot, snapshot_objects);
+
+        let reserve = encode_reserve(subject(12), 42).unwrap();
+        assert_eq!(reserve.first().copied(), Some(RESERVE_RECORD));
+        let mut replayed_reserve = BTreeMap::new();
+        apply_record(&reserve, &mut replayed_reserve).unwrap();
+        assert_eq!(replayed_reserve[&subject(12)].total_units, 42);
+        let conflicting_reserve = encode_reserve(subject(12), 43).unwrap();
+        assert!(matches!(
+            apply_record(&conflicting_reserve, &mut replayed_reserve),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn resume_append_log_replays_and_preserves_errors() {
+        let compact_path = temp_path("compact-codecs");
+        let mut compact_objects = BTreeMap::new();
+        compact_objects.insert(
+            subject(14),
+            StoredObject {
+                total_units: 2,
+                checkpointed: BTreeSet::from([0]),
+            },
+        );
+        ResumeStore::compact(&compact_path, &compact_objects).unwrap();
+        assert!(compact_path.exists());
+        assert_eq!(
+            ResumeStore::open(&compact_path)
+                .unwrap()
+                .checkpointed(subject(14))
+                .unwrap(),
+            &BTreeSet::from([0])
+        );
+        fs::remove_file(&compact_path).unwrap();
+
+        let path = temp_path("append-codecs");
+        let reserve = encode_reserve(subject(12), 42).unwrap();
+        append_record(&path, &reserve).unwrap();
+        let checkpoint = encode_checkpoint(subject(12), 42, &BTreeSet::from([3])).unwrap();
+        append_record(&path, &checkpoint).unwrap();
+        let decoded_store = decode_store(&path).unwrap();
+        assert_eq!(
+            decoded_store[&subject(12)].checkpointed,
+            BTreeSet::from([3])
+        );
+        fs::remove_file(&path).unwrap();
+
+        for malformed in [&[1, 0, 0][..], &[2, 0, 2, 1, 1][..]] {
+            let mut malformed_decoder = Decoder::new(malformed);
+            let mut output = BTreeSet::new();
+            assert!(matches!(
+                decode_ranges(&mut malformed_decoder, 4, &mut output),
+                Err(Error::Corrupt)
+            ));
+        }
+
+        let file_path = temp_path("file-len");
+        assert_eq!(file_len(&file_path).unwrap(), 0);
+        fs::write(&file_path, b"abc").unwrap();
+        assert_eq!(file_len(&file_path).unwrap(), 3);
+        fs::remove_file(&file_path).unwrap();
+        assert!(matches!(
+            file_len(Path::new("\0")),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        let reserve_many_path = temp_path("reserve-many-identity");
+        let mut reserve_many_store = ResumeStore::open(&reserve_many_path).unwrap();
+        reserve_many_store.reserve_many([(subject(16), 2)]).unwrap();
+        assert!(matches!(
+            reserve_many_store.reserve_many([(subject(16), 3)]),
+            Err(Error::IdentityMismatch)
+        ));
+        fs::remove_file(&reserve_many_path).unwrap();
+        fs::remove_file(lock_path(&reserve_many_path).unwrap()).unwrap();
+
+        let no_op_path = temp_path("no-op-checkpoint");
+        let mut store = ResumeStore::open(&no_op_path).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(13), 2, 1).unwrap();
+        let before = file_len(&no_op_path).unwrap();
+        tracker.checkpoint(&mut store).unwrap();
+        assert_eq!(file_len(&no_op_path).unwrap(), before);
+        fs::remove_file(&no_op_path).unwrap();
+        fs::remove_file(lock_path(&no_op_path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn resume_store_handles_million_small_file_workload() {
+        let path = temp_path("million-small-files");
+        let subject_for = |index: u32| {
+            let mut root = [0; 32];
+            root[..4].copy_from_slice(&index.to_be_bytes());
+            SubjectId {
+                suite: 1,
+                root,
+                length: 1,
+            }
+        };
+        let large_subject = SubjectId {
+            suite: 1,
+            root: [0xaa; 32],
+            length: 100 * 65_536,
+        };
+        let mut store = ResumeStore::open(&path).unwrap();
+        store
+            .reserve_many(
+                (0_u32..1_000_000)
+                    .map(|index| (subject_for(index), 1))
+                    .chain(std::iter::once((large_subject, 100))),
+            )
+            .unwrap();
+
+        let mut tracker = ResumeTracker::discover(&mut store, large_subject, 100, 3).unwrap();
+        for unit in 0..3 {
+            tracker.begin_unit(unit).unwrap();
+            assert_eq!(tracker.complete_unit(unit).unwrap(), unit == 2);
+        }
+        tracker.checkpoint(&mut store).unwrap();
 
         let reopened = ResumeStore::open(&path).unwrap();
-        assert!(reopened.checkpointed(subject(11)).is_some());
-        assert!(reopened.checkpointed(subject(12)).is_some());
-        assert!(reopened.checkpointed(subject(13)).is_none());
+        assert!(reopened.checkpointed(subject_for(0)).is_some());
+        assert!(reopened.checkpointed(subject_for(999_999)).is_some());
+        assert_eq!(
+            reopened.checkpointed(large_subject).unwrap(),
+            &BTreeSet::from([0, 1, 2])
+        );
+        assert!(file_len(&path).unwrap() < MAX_STORE_BYTES);
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
-    fn decoder_rejects_count_overrun_duplicate_and_trailing_data() {
+    fn decoder_rejects_malformed_records_and_accepts_empty_log() {
         let path = temp_path("raw");
-        let mut payload = Vec::new();
-        payload.extend_from_slice(MAGIC);
-        payload.extend_from_slice(&1_u32.to_be_bytes());
-        payload.extend_from_slice(&1_u16.to_be_bytes());
-        payload.extend_from_slice(&[1; 32]);
-        payload.extend_from_slice(&100_u64.to_be_bytes());
-        payload.extend_from_slice(&1_u64.to_be_bytes());
-        payload.extend_from_slice(&2_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u64.to_be_bytes());
-        payload.extend_from_slice(&0_u64.to_be_bytes());
-        write_raw(&path, &payload);
+
+        let mut trailing = encode_reserve(subject(1), 1).unwrap();
+        trailing.push(0xff);
+        write_raw(&path, &trailing);
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
 
-        payload.truncate(payload.len() - 8);
-        payload[62..66].copy_from_slice(&1_u32.to_be_bytes());
-        payload.push(0xff);
-        write_raw(&path, &payload);
+        let malformed_range = encode_checkpoint(subject(1), 1, &BTreeSet::from([1])).unwrap();
+        write_raw(&path, &malformed_range);
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
 
-        let mut empty = Vec::new();
-        empty.extend_from_slice(MAGIC);
-        empty.extend_from_slice(&0_u32.to_be_bytes());
-        write_raw(&path, &empty);
+        let mut bytes = MAGIC.to_vec();
+        let mut record = encode_record(&encode_reserve(subject(2), 1).unwrap()).unwrap();
+        let last = record.len() - 1;
+        record[last] ^= 1;
+        bytes.extend_from_slice(&record);
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
+
+        fs::write(&path, MAGIC).unwrap();
         assert!(ResumeStore::open(&path).is_ok());
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn temporary_store_collision_preserves_the_real_error_kind() {
+    fn compaction_collision_preserves_the_real_error_kind() {
         let path = temp_path("temporary-collision");
         let temporary = temporary_path(&path).unwrap();
-        let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&mut store, subject(5), 1, 1).unwrap();
         fs::create_dir(&temporary).unwrap();
-        tracker.begin_unit(0).unwrap();
-        tracker.complete_unit(0).unwrap();
-        let error = tracker.checkpoint(&mut store).unwrap_err();
+        let error = ResumeStore::compact(&path, &BTreeMap::new()).unwrap_err();
         let Error::Io(error) = error else {
             panic!("expected I/O error");
         };
         assert_ne!(error.kind(), io::ErrorKind::AlreadyExists);
         fs::remove_dir(temporary).unwrap();
-        fs::remove_file(&path).unwrap();
-        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]

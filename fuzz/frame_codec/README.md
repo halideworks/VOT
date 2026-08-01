@@ -15,3 +15,7 @@ cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 Coverage-guided engines may execute the resulting binary repeatedly with mutated
 stdin. Seed from `test-vectors/wire/frame-envelope.json`. Crashing inputs must be
 minimized and committed without customer data, paths, tokens, or payloads.
+
+CI also runs --iterations 256 against the committed corpus and the canonical
+wire seed. A scheduled workflow runs the same bounded driver for 10,000
+iterations.

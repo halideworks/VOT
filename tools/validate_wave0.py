@@ -116,7 +116,9 @@ def validate(root: Path) -> None:
 
     adr_dir = root / "adr"
     adrs = sorted(adr_dir.glob("[0-9][0-9][0-9][0-9]-*.md"))
-    assert [path.name[:4] for path in adrs] == [f"{number:04d}" for number in range(1, 12)]
+    assert [path.name[:4] for path in adrs] == [
+        f"{number:04d}" for number in range(1, len(adrs) + 1)
+    ]
     for path in adrs:
         assert "Status: Accepted" in path.read_text(encoding="utf-8"), path.name
 

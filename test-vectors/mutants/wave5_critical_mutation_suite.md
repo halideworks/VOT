@@ -5,18 +5,18 @@ crate is required in CI.
 
 ```text
 vot-transport-tcp:    90 total,  81 caught,  9 unviable, 0 missed
-vot-resume:          130 total, 122 caught,  8 unviable, 0 missed
+vot-resume:          136 total, 128 caught,  8 unviable, 0 missed
 vot-commit-platform:  21 total,  14 caught,  7 unviable, 0 missed
-aggregate:           241 total, 217 caught, 24 unviable, 0 missed
+aggregate:           247 total, 223 caught, 24 unviable, 0 missed
 ```
 
 The review-critical publication and recovery dependencies are also required:
 
 ```text
-vot-cli:         226 total, 206 caught, 20 unviable, 0 missed
+vot-cli:         227 total, 207 caught, 20 unviable, 0 missed
 vot-receipt:     219 total, 215 caught,  4 unviable, 0 missed
 vot-platform-fs:  11 total,  11 caught,  0 unviable, 0 missed
-aggregate:       456 total, 432 caught, 24 unviable, 0 missed
+aggregate:       457 total, 433 caught, 24 unviable, 0 missed
 ```
 
 The shared carrier dependencies changed during the final review also remain
@@ -28,7 +28,7 @@ vot-transport-msquic:  45 total, 43 caught, 2 unviable, 0 missed
 aggregate:             67 total, 64 caught, 3 unviable, 0 missed
 ```
 
-Across the Wave 5 crates and those dependencies, 764 mutants were tested: 713
+Across the Wave 5 crates and those dependencies, 771 mutants were tested: 720
 were caught, 51 were unviable, and none were missed.
 
 The only platform exclusions are the thin native `sync_file` and `sync_parent`

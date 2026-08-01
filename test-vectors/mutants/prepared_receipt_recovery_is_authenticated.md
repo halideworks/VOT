@@ -24,6 +24,6 @@ unauthenticated or mismatched prepared evidence was accepted
 assertion failed: receive_bundle(...).is_err()
 ```
 
-The required `vot-cli` mutation run reports 226 total, 206 caught, 20
+The required `vot-cli` mutation run reports 227 total, 207 caught, 20
 unviable, and 0 missed. The required `vot-receipt` run reports 219 total, 215
 caught, 4 unviable, and 0 missed.

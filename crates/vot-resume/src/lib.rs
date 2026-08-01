@@ -15,7 +15,11 @@ const MAGIC: &[u8; 8] = b"VOTRES01";
 const MAX_STORE_BYTES: u64 = 67_108_864;
 const MAX_STORE_PAYLOAD_BYTES: u64 = MAX_STORE_BYTES - 32;
 const MIN_STORE_BYTES: u64 = 44;
-const MAX_UNITS_PER_OBJECT: u64 = 16_777_216;
+const STORE_HEADER_BYTES: u64 = 12;
+const OBJECT_HEADER_BYTES: u64 = 54;
+const UNIT_BYTES: u64 = 8;
+const MAX_UNITS_PER_OBJECT: u64 =
+    (MAX_STORE_PAYLOAD_BYTES - STORE_HEADER_BYTES - OBJECT_HEADER_BYTES) / UNIT_BYTES;
 
 #[derive(Debug)]
 pub enum Error {
@@ -795,7 +799,14 @@ mod tests {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
         assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_832);
         assert_eq!(MIN_STORE_BYTES, 44);
-        assert_eq!(MAX_UNITS_PER_OBJECT, 16_777_216);
+        assert_eq!(MAX_UNITS_PER_OBJECT, 8_388_595);
+        let maximum_object_payload =
+            STORE_HEADER_BYTES + OBJECT_HEADER_BYTES + MAX_UNITS_PER_OBJECT * UNIT_BYTES;
+        assert!(validate_payload_length(maximum_object_payload).is_ok());
+        assert!(matches!(
+            validate_payload_length(maximum_object_payload + UNIT_BYTES),
+            Err(Error::TooLarge)
+        ));
         assert!(validate_payload_length(MAX_STORE_PAYLOAD_BYTES).is_ok());
         assert!(matches!(
             validate_payload_length(MAX_STORE_PAYLOAD_BYTES + 1),

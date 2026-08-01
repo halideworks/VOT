@@ -750,14 +750,16 @@ pub fn receive_bundle(
     if sync_directories(&staging)? == 0 {
         return Err(Error::InvalidBundle);
     }
-    atomic_rename_noreplace(&staging, destination)?;
-    File::open(parent_directory(destination))?.sync_all()?;
-    if let Some(prepared) = &mut owned_receipt {
-        prepared.preserve_for_recovery();
-    }
-    if let Some(prepared) = &mut owned_summary {
-        prepared.preserve_for_recovery();
-    }
+    publish_staging_with(
+        &staging,
+        destination,
+        &mut owned_receipt,
+        &mut owned_summary,
+        |parent| {
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        },
+    )?;
     finalize_prepared_receipts(
         receipt_path,
         &receipt_summary_path,
@@ -768,6 +770,23 @@ pub fn receive_bundle(
         package: actual,
         peak_staging: receiver.peak_staging(),
     })
+}
+
+fn publish_staging_with(
+    staging: &Path,
+    destination: &Path,
+    owned_receipt: &mut Option<PreparedFile>,
+    owned_summary: &mut Option<PreparedFile>,
+    sync_parent: impl FnOnce(&Path) -> Result<(), Error>,
+) -> Result<(), Error> {
+    atomic_rename_noreplace(staging, destination)?;
+    if let Some(prepared) = owned_receipt {
+        prepared.preserve_for_recovery();
+    }
+    if let Some(prepared) = owned_summary {
+        prepared.preserve_for_recovery();
+    }
+    sync_parent(parent_directory(destination))
 }
 
 fn publication_receipt(
@@ -1761,6 +1780,50 @@ mod tests {
         assert!(!prepared_receipt_path.exists());
         assert!(!prepared_summary_path.exists());
         assert!(recover_prepared_receipts(&receipt, &summary, &package, &key).unwrap());
+        fs::remove_file(receipt).unwrap();
+        fs::remove_file(summary).unwrap();
+    }
+
+    #[test]
+    fn destination_sync_failure_preserves_receipt_recovery_evidence() {
+        let staging = temporary("sync-failure-staging");
+        let destination = temporary("sync-failure-destination");
+        let receipt = temporary("sync-failure-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let package = PackageSummary {
+            root: [14; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let key = [9; 32];
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("file"), b"published").unwrap();
+        let (prepared_receipt, prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &key);
+        let prepared_receipt_path = prepared_receipt.path().unwrap();
+        let prepared_summary_path = prepared_summary.path().unwrap();
+        let mut owned_receipt = Some(prepared_receipt);
+        let mut owned_summary = Some(prepared_summary);
+
+        assert!(matches!(
+            publish_staging_with(
+                &staging,
+                &destination,
+                &mut owned_receipt,
+                &mut owned_summary,
+                |_| Err(Error::Io(io::Error::other(
+                    "injected directory sync failure"
+                ))),
+            ),
+            Err(Error::Io(_))
+        ));
+        drop((owned_receipt, owned_summary));
+        assert!(destination.exists());
+        assert!(prepared_receipt_path.exists());
+        assert!(prepared_summary_path.exists());
+        assert!(recover_prepared_receipts(&receipt, &summary, &package, &key).unwrap());
+
+        fs::remove_dir_all(destination).unwrap();
         fs::remove_file(receipt).unwrap();
         fs::remove_file(summary).unwrap();
     }

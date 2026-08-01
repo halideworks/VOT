@@ -55,6 +55,12 @@ def main() -> None:
     assert environment["VOT_BENCH_IMPAIRMENT_LOSS_PPM"] == "0"
     assert environment["VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS"] == "10000000000"
     assert environment["VOT_BENCH_IMPAIRMENT_QUEUE_BYTES"] == "33554432"
+    try:
+        runner_module.validate_positive_matrix([True])
+    except ValueError as error:
+        assert str(error) == "workload matrix values must be positive integers"
+    else:
+        raise AssertionError("boolean workload matrix values must be rejected")
     assert schema["properties"]["machine"]["required"] == [
         "os", "kernel", "arch", "cpu_model", "logical_cpus", "memory_bytes"
     ]

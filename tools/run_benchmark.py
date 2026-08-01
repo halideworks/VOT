@@ -88,6 +88,11 @@ def measured_int(value: Any, name: str, minimum: int = 0) -> int:
     return value
 
 
+def validate_positive_matrix(values: list[Any]) -> None:
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
+        raise ValueError("workload matrix values must be positive integers")
+
+
 def build_result(
     measured: dict[str, Any],
     *,
@@ -212,8 +217,7 @@ def main() -> int:
         raise ValueError("workload has no suite, worker, or object-size matrix")
     if any(suite not in SUITE_NAMES for suite in suites):
         raise ValueError("workload contains an unsupported suite")
-    if any(not isinstance(value, int) or value < 1 for value in workers + object_sizes):
-        raise ValueError("workload matrix values must be positive integers")
+    validate_positive_matrix(workers + object_sizes)
     if args.workers is not None and args.workers < 1:
         raise ValueError("--workers must be positive")
 

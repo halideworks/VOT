@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -160,7 +161,6 @@ jobs:
     name: mutation (${{ matrix.package }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    continue-on-error: ${{ !matrix.required }}
     strategy:
       fail-fast: false
       matrix:
@@ -191,4 +191,5 @@ jobs:
         run: cargo +1.85.0 install --locked cargo-mutants --version 26.0.0
 
       - name: Test mutants
+        continue-on-error: ${{ !matrix.required }}
         run: cargo +1.85.0 mutants --package "${{ matrix.package }}" --jobs 2

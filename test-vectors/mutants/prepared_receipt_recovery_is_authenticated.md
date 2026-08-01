@@ -19,6 +19,6 @@ Observed failure:
 unauthenticated or mismatched prepared evidence was accepted
 ```
 
-The required `vot-cli` mutation run reports 203 total, 183 caught, 20
+The required `vot-cli` mutation run reports 204 total, 184 caught, 20
 unviable, and 0 missed. The required `vot-receipt` run reports 219 total, 215
 caught, 4 unviable, and 0 missed.

@@ -482,6 +482,9 @@ fn scan_manifest(bundle: &Path) -> Result<PackageSummary, Error> {
         return Err(Error::InvalidBundle);
     }
     let actual = package.finish()?;
+    if actual.entries == 0 {
+        return Err(Error::InvalidBundle);
+    }
     if actual.root != expected.root {
         return Err(Error::RootMismatch);
     }
@@ -2092,6 +2095,61 @@ mod tests {
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(new_bundle).unwrap();
         fs::remove_file(receipt).unwrap();
+    }
+
+    #[test]
+    fn empty_canonical_manifest_cannot_publish() {
+        let bundle = temporary("empty-canonical-bundle");
+        let manifest_directory = bundle.join(MANIFEST_DIRECTORY);
+        fs::create_dir_all(&manifest_directory).unwrap();
+        let package = PackageRootBuilder::new().unwrap().finish().unwrap();
+        let mut manifest_id = [0; 16];
+        manifest_id.copy_from_slice(&package.root[..16]);
+        let page = ManifestPage {
+            manifest_id,
+            index: 0,
+            total: None,
+            previous_digest: [0; 32],
+            profile: PathProfile::Portable,
+            entries: Vec::new(),
+        };
+        let encoded_page = encode_page(&page).unwrap();
+        let page_digest = *blake3::hash(&encoded_page).as_bytes();
+        let seal = Seal {
+            manifest_id,
+            final_page_count: 1,
+            final_page_digest: page_digest,
+            package: ObjectId {
+                suite: 1,
+                root: package.root,
+                length: 0,
+            },
+            pages: vec![PageCommitment {
+                index: 0,
+                digest: page_digest,
+            }],
+        };
+        fs::write(manifest_page_path(&manifest_directory, 0), encoded_page).unwrap();
+        fs::write(
+            manifest_directory.join(MANIFEST_SEAL),
+            encode_seal(&seal).unwrap(),
+        )
+        .unwrap();
+        let destination = temporary("empty-canonical-destination");
+        let receipt = temporary("empty-canonical-receipt.cbor");
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &[7; 32],
+                "2026-07-31T23:59:59Z"
+            ),
+            Err(Error::InvalidBundle)
+        ));
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+        fs::remove_dir_all(bundle).unwrap();
     }
 
     #[test]

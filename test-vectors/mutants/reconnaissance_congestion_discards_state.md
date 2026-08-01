@@ -3,17 +3,19 @@
 Criterion: congestion observed during a Careful Resume reconnaissance flight
 invalidates the saved congestion-control parameters.
 
-Passing evidence: `reconnaissance_congestion_discards_saved_state` receives a
-congestion rejection and proves a second attempt for the same endpoint is
-`Unknown` until a new observation is stored.
+Passing evidence: `reconnaissance_congestion_discards_saved_state` exercises
+both acknowledged and unacknowledged reconnaissance samples containing
+congestion. Both return `Congestion`, and the next attempt is `Unknown`.
 
-Mutant: return `PathReject::Congestion` without removing the saved entry.
+Mutant: check `initial_flight_acknowledged` before
+`congestion_detected`, or return `Congestion` without removing the entry.
 
 Observed failure:
 
 ```text
-assertion failed: second reconnaissance result is Unknown
+left: Err(InitialFlightUnacknowledged)
+right: Err(Congestion)
 ```
 
-The required `vot-resume` mutation run reports 122 total, 114 caught, 8
+The required `vot-resume` mutation run reports 128 total, 120 caught, 8
 unviable, and 0 missed.

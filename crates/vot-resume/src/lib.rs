@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use vot_transport_api::SubjectId;
@@ -373,6 +373,10 @@ impl CarefulResumeCache {
         let Some(saved) = self.saved.get_mut(&saved_endpoint) else {
             return Err(PathReject::Unknown);
         };
+        if input.congestion_detected {
+            self.saved.remove(&saved_endpoint);
+            return Err(PathReject::Congestion);
+        }
         if input.now >= saved.observation.expires_at {
             self.saved.remove(&saved_endpoint);
             return Err(PathReject::Expired);
@@ -385,10 +389,6 @@ impl CarefulResumeCache {
         }
         if !input.initial_flight_acknowledged {
             return Err(PathReject::InitialFlightUnacknowledged);
-        }
-        if input.congestion_detected {
-            self.saved.remove(&saved_endpoint);
-            return Err(PathReject::Congestion);
         }
         if input.current_min_rtt.saturating_mul(2) <= saved.observation.saved_rtt {
             return Err(PathReject::RttTooSmall);
@@ -448,11 +448,11 @@ fn encode_store(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<Vec<u8>, 
 }
 
 fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error> {
-    let length = fs::metadata(path)?.len();
+    let bytes = read_bounded_store(path, MAX_STORE_BYTES)?;
+    let length = u64::try_from(bytes.len()).map_err(|_| Error::Corrupt)?;
     if !(MIN_STORE_BYTES..=MAX_STORE_BYTES).contains(&length) {
         return Err(Error::Corrupt);
     }
-    let bytes = fs::read(path)?;
     let (payload, declared_digest) = bytes.split_at(bytes.len() - 32);
     if blake3::hash(payload).as_bytes() != declared_digest {
         return Err(Error::Corrupt);
@@ -499,6 +499,16 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
         return Err(Error::Corrupt);
     }
     Ok(objects)
+}
+
+fn read_bounded_store(path: &Path, maximum: u64) -> Result<Vec<u8>, Error> {
+    let mut input = File::open(path)?.take(maximum.saturating_add(1));
+    let mut output = Vec::with_capacity(4096);
+    input.read_to_end(&mut output)?;
+    if u64::try_from(output.len()).map_err(|_| Error::TooLarge)? > maximum {
+        return Err(Error::TooLarge);
+    }
+    Ok(output)
 }
 
 struct Decoder<'a> {
@@ -768,6 +778,20 @@ mod tests {
             validate_payload_length(MAX_STORE_PAYLOAD_BYTES + 1),
             Err(Error::TooLarge)
         ));
+        let bounded = temp_path("bounded-read");
+        fs::write(&bounded, b"12345").unwrap();
+        assert_eq!(read_bounded_store(&bounded, 5).unwrap(), b"12345");
+        assert!(matches!(
+            read_bounded_store(&bounded, 4),
+            Err(Error::TooLarge)
+        ));
+        fs::write(
+            &bounded,
+            vec![0; usize::try_from(MIN_STORE_BYTES - 1).unwrap()],
+        )
+        .unwrap();
+        assert!(matches!(ResumeStore::open(&bounded), Err(Error::Corrupt)));
+        fs::remove_file(bounded).unwrap();
 
         let missing_parent = temp_path("missing-parent").join("state");
         let mut store = ResumeStore::open(&missing_parent).unwrap();
@@ -927,32 +951,35 @@ mod tests {
             expires_at: 1_000,
             configuration_epoch: 4,
         };
-        let input = Reconnaissance {
-            now: 1,
-            current_min_rtt: 100,
-            initial_flight_acknowledged: true,
-            congestion_detected: true,
-            local_path_changed: false,
-            configuration_epoch: 4,
-            max_jump: 900,
-        };
         let mut cache = CarefulResumeCache::default();
-        cache.observe(endpoint, observation).unwrap();
-        assert_eq!(
-            cache.reconnoitre(endpoint, endpoint, input),
-            Err(PathReject::Congestion)
-        );
-        assert_eq!(
-            cache.reconnoitre(
-                endpoint,
-                endpoint,
-                Reconnaissance {
-                    congestion_detected: false,
-                    ..input
-                }
-            ),
-            Err(PathReject::Unknown)
-        );
+        for initial_flight_acknowledged in [false, true] {
+            let input = Reconnaissance {
+                now: 1,
+                current_min_rtt: 100,
+                initial_flight_acknowledged,
+                congestion_detected: true,
+                local_path_changed: false,
+                configuration_epoch: 4,
+                max_jump: 900,
+            };
+            cache.observe(endpoint, observation).unwrap();
+            assert_eq!(
+                cache.reconnoitre(endpoint, endpoint, input),
+                Err(PathReject::Congestion)
+            );
+            assert_eq!(
+                cache.reconnoitre(
+                    endpoint,
+                    endpoint,
+                    Reconnaissance {
+                        initial_flight_acknowledged: true,
+                        congestion_detected: false,
+                        ..input
+                    }
+                ),
+                Err(PathReject::Unknown)
+            );
+        }
     }
 
     #[test]

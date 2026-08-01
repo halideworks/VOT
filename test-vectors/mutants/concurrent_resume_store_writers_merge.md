@@ -23,7 +23,7 @@ assertion failed: matches!(finished_rx.recv_timeout(...),
     Err(RecvTimeoutError::Timeout))
 ```
 
-The required `vot-resume` mutation run reports 122 total, 114 caught, 8
+The required `vot-resume` mutation run reports 128 total, 120 caught, 8
 unviable, and 0 missed. Replacement and merge mutants are caught. The direct
 lock-deletion mutant above is recorded separately because cargo-mutants cannot
 construct a default `File` for its whole-function replacement.

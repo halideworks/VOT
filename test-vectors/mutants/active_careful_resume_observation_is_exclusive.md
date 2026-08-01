@@ -15,5 +15,5 @@ Observed failure:
 expected AlreadyInUse, received Ok(())
 ```
 
-The required `vot-resume` mutation run reports 122 total, 114 caught, 8
+The required `vot-resume` mutation run reports 128 total, 120 caught, 8
 unviable, and 0 missed.

@@ -13,7 +13,10 @@ use unicode_normalization::UnicodeNormalization;
 pub const MAX_PAGE_BYTES: usize = 1_048_576;
 pub const MAX_ENTRIES_PER_PAGE: usize = 8192;
 pub const MAX_PATH_COMPONENTS: usize = 256;
-pub const MAX_PAGE_COMMITMENTS: usize = MAX_PAGE_BYTES / 36;
+const MAX_SEAL_FIXED_BYTES: usize = 113;
+const MAX_ENCODED_PAGE_COMMITMENT_BYTES: usize = 39;
+pub const MAX_PAGE_COMMITMENTS: usize =
+    (MAX_PAGE_BYTES - MAX_SEAL_FIXED_BYTES) / MAX_ENCODED_PAGE_COMMITMENT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathProfile {
@@ -1254,7 +1257,11 @@ mod tests {
         wrong = seal.clone();
         wrong.final_page_count = pages.len() as u64;
         wrong.pages = pages;
+        wrong.package.suite = 2;
+        wrong.package.length = i64::MAX as u64;
         assert_eq!(validate_seal(&wrong), Ok(()));
+        let encoded = encode_seal(&wrong).unwrap();
+        assert!(encoded.len() <= MAX_PAGE_BYTES);
 
         wrong.pages.push(PageCommitment {
             index: MAX_PAGE_COMMITMENTS as u64,
@@ -1266,7 +1273,7 @@ mod tests {
 
     #[test]
     fn manifest_collection_and_byte_bounds_are_exact() {
-        assert_eq!(MAX_PAGE_COMMITMENTS, 29_127);
+        assert_eq!(MAX_PAGE_COMMITMENTS, 26_883);
         assert!(validate_entry_count(MAX_ENTRIES_PER_PAGE).is_ok());
         assert_eq!(
             validate_entry_count(MAX_ENTRIES_PER_PAGE + 1),

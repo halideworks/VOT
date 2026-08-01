@@ -70,8 +70,41 @@ impl ResumeStore {
             .map(|object| &object.checkpointed)
     }
 
-    fn object(&self, subject: SubjectId) -> Option<&StoredObject> {
-        self.objects.get(&subject)
+    fn reserve_object(
+        &mut self,
+        subject: SubjectId,
+        total_units: u64,
+    ) -> Result<BTreeSet<u64>, Error> {
+        validate_total_units(total_units)?;
+        let lock = lock_store(&self.path)?;
+        let mut candidate = if self.path.exists() {
+            decode_store(&self.path)?
+        } else {
+            BTreeMap::new()
+        };
+        if let Some(object) = candidate.get(&subject) {
+            if object.total_units != total_units {
+                return Err(Error::IdentityMismatch);
+            }
+        } else {
+            candidate.insert(
+                subject,
+                StoredObject {
+                    total_units,
+                    checkpointed: BTreeSet::new(),
+                },
+            );
+        }
+        validate_reserved_capacity(&candidate)?;
+        Self::flush(&self.path, &candidate)?;
+        let checkpointed = candidate
+            .get(&subject)
+            .ok_or(Error::IdentityMismatch)?
+            .checkpointed
+            .clone();
+        self.objects = candidate;
+        drop(lock);
+        Ok(checkpointed)
     }
 
     fn save_object(
@@ -107,6 +140,7 @@ impl ResumeStore {
                 checkpointed: merged.clone(),
             },
         );
+        validate_reserved_capacity(&candidate)?;
         Self::flush(&self.path, &candidate)?;
         self.objects = candidate;
         drop(lock);
@@ -146,7 +180,7 @@ pub struct ResumeTracker {
 
 impl ResumeTracker {
     pub fn discover(
-        store: &ResumeStore,
+        store: &mut ResumeStore,
         subject: SubjectId,
         total_units: u64,
         checkpoint_window: usize,
@@ -155,11 +189,7 @@ impl ResumeTracker {
         if checkpoint_window == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        let checkpointed = match store.object(subject) {
-            Some(object) if object.total_units == total_units => object.checkpointed.clone(),
-            Some(_) => return Err(Error::IdentityMismatch),
-            None => BTreeSet::new(),
-        };
+        let checkpointed = store.reserve_object(subject, total_units)?;
         Ok(Self {
             subject,
             total_units,
@@ -451,6 +481,28 @@ fn validate_total_units(total_units: u64) -> Result<(), Error> {
     }
 }
 
+fn validate_reserved_capacity(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<(), Error> {
+    let object_count = u64::try_from(objects.len()).map_err(|_| Error::InvalidConfiguration)?;
+    let units = objects.values().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.total_units)
+            .ok_or(Error::InvalidConfiguration)
+    })?;
+    let length = STORE_HEADER_BYTES
+        .checked_add(
+            object_count
+                .checked_mul(OBJECT_HEADER_BYTES)
+                .ok_or(Error::InvalidConfiguration)?,
+        )
+        .and_then(|length| length.checked_add(units.checked_mul(UNIT_BYTES)?))
+        .ok_or(Error::InvalidConfiguration)?;
+    if length > MAX_STORE_PAYLOAD_BYTES {
+        Err(Error::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
 fn encode_store(objects: &BTreeMap<SubjectId, StoredObject>) -> Result<Vec<u8>, Error> {
     let count = u32::try_from(objects.len()).map_err(|_| Error::TooLarge)?;
     let mut output = Vec::new();
@@ -525,6 +577,7 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
     if !decoder.is_empty() {
         return Err(Error::Corrupt);
     }
+    validate_reserved_capacity(&objects).map_err(|_| Error::Corrupt)?;
     Ok(objects)
 }
 
@@ -646,31 +699,32 @@ mod tests {
     fn store_is_keyed_by_subject_and_rejects_corruption() {
         let path = temp_path("store");
         let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(1), 10, 3).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(1), 10, 3).unwrap();
         tracker.begin_unit(0).unwrap();
         tracker.complete_unit(0).unwrap();
         tracker.checkpoint(&mut store).unwrap();
-        let reopened = ResumeStore::open(&path).unwrap();
+        let mut reopened = ResumeStore::open(&path).unwrap();
         assert!(reopened.checkpointed(subject(1)).unwrap().contains(&0));
         assert!(reopened.checkpointed(subject(9)).is_none());
         assert!(matches!(
-            ResumeTracker::discover(&reopened, subject(1), 11, 3),
+            ResumeTracker::discover(&mut reopened, subject(1), 11, 3),
             Err(Error::IdentityMismatch)
         ));
-        let mut rediscovered = ResumeTracker::discover(&reopened, subject(1), 10, 3).unwrap();
+        let mut rediscovered = ResumeTracker::discover(&mut reopened, subject(1), 10, 3).unwrap();
         assert!(!rediscovered.begin_unit(0).unwrap());
         let mut bytes = fs::read(&path).unwrap();
         bytes[10] ^= 1;
         fs::write(&path, bytes).unwrap();
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
     fn retransmission_is_bounded_by_window_plus_active_units() {
         let path = temp_path("bounded");
         let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(2), 20, 4).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(2), 20, 4).unwrap();
         for unit in 0..7 {
             tracker.begin_unit(unit).unwrap();
             let checkpoint_due = tracker.complete_unit(unit).unwrap();
@@ -685,20 +739,21 @@ mod tests {
         assert_eq!(tracker.retransmission_bound(), 6);
         assert!(tracker.retransmission_units_after_crash() <= tracker.retransmission_bound());
 
-        let restarted =
-            ResumeTracker::discover(&ResumeStore::open(&path).unwrap(), subject(2), 20, 4).unwrap();
+        let mut reopened = ResumeStore::open(&path).unwrap();
+        let restarted = ResumeTracker::discover(&mut reopened, subject(2), 20, 4).unwrap();
         for unit in 0..4 {
             assert!(restarted.is_checkpointed(unit));
         }
         assert_eq!(restarted.missing_units().count(), 16);
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
     fn full_window_blocks_completion_until_checkpoint_succeeds() {
         let path = temp_path("full-window");
         let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(7), 4, 2).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(7), 4, 2).unwrap();
         for unit in 0..3 {
             tracker.begin_unit(unit).unwrap();
         }
@@ -713,14 +768,15 @@ mod tests {
         tracker.checkpoint(&mut store).unwrap();
         assert!(!tracker.complete_unit(2).unwrap());
         assert_eq!(tracker.retransmission_units_after_crash(), 1);
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
     fn repeated_checkpoints_replace_the_previous_snapshot() {
         let path = temp_path("repeated-checkpoint");
         let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(8), 3, 1).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(8), 3, 1).unwrap();
         tracker.begin_unit(0).unwrap();
         assert!(tracker.complete_unit(0).unwrap());
         tracker.checkpoint(&mut store).unwrap();
@@ -732,7 +788,8 @@ mod tests {
             reopened.checkpointed(subject(8)).unwrap(),
             &BTreeSet::from([0, 1])
         );
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
@@ -740,8 +797,8 @@ mod tests {
         let path = temp_path("merged-checkpoints");
         let mut first_store = ResumeStore::open(&path).unwrap();
         let mut second_store = ResumeStore::open(&path).unwrap();
-        let mut first = ResumeTracker::discover(&first_store, subject(9), 3, 1).unwrap();
-        let mut second = ResumeTracker::discover(&second_store, subject(9), 3, 1).unwrap();
+        let mut first = ResumeTracker::discover(&mut first_store, subject(9), 3, 1).unwrap();
+        let mut second = ResumeTracker::discover(&mut second_store, subject(9), 3, 1).unwrap();
         first.begin_unit(0).unwrap();
         first.complete_unit(0).unwrap();
         second.begin_unit(1).unwrap();
@@ -766,13 +823,12 @@ mod tests {
         use std::time::Duration;
 
         let path = temp_path("checkpoint-lock");
+        let mut store = ResumeStore::open(&path).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(10), 1, 1).unwrap();
         let held = lock_store(&path).unwrap();
-        let thread_path = path.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
-            let mut store = ResumeStore::open(&thread_path).unwrap();
-            let mut tracker = ResumeTracker::discover(&store, subject(10), 1, 1).unwrap();
             tracker.begin_unit(0).unwrap();
             tracker.complete_unit(0).unwrap();
             started_tx.send(()).unwrap();
@@ -827,28 +883,65 @@ mod tests {
         assert!(matches!(ResumeStore::open(&bounded), Err(Error::Corrupt)));
         fs::remove_file(bounded).unwrap();
 
-        let missing_parent = temp_path("missing-parent").join("state");
+        let missing_root = temp_path("missing-parent");
+        fs::create_dir(&missing_root).unwrap();
+        let missing_parent = missing_root.join("state");
         let mut store = ResumeStore::open(&missing_parent).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(3), 1, 1).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(3), 1, 1).unwrap();
+        fs::remove_file(&missing_parent).unwrap();
+        fs::remove_file(lock_path(&missing_parent).unwrap()).unwrap();
+        fs::remove_dir(&missing_root).unwrap();
         tracker.begin_unit(0).unwrap();
         tracker.complete_unit(0).unwrap();
         assert!(matches!(tracker.checkpoint(&mut store), Err(Error::Io(_))));
         assert_eq!(tracker.retransmission_units_after_crash(), 1);
         assert!(!tracker.is_checkpointed(0));
 
-        let store = ResumeStore::open(temp_path("bounds")).unwrap();
+        let bounds_path = temp_path("bounds");
+        let mut store = ResumeStore::open(&bounds_path).unwrap();
         assert!(matches!(
-            ResumeTracker::discover(&store, subject(4), 0, 1),
+            ResumeTracker::discover(&mut store, subject(4), 0, 1),
             Err(Error::InvalidConfiguration)
         ));
-        assert!(ResumeTracker::discover(&store, subject(4), MAX_UNITS_PER_OBJECT, 1).is_ok());
+        assert!(ResumeTracker::discover(&mut store, subject(4), MAX_UNITS_PER_OBJECT, 1).is_ok());
         assert!(matches!(
-            ResumeTracker::discover(&store, subject(4), MAX_UNITS_PER_OBJECT + 1, 1),
+            ResumeTracker::discover(&mut store, subject(4), MAX_UNITS_PER_OBJECT + 1, 1),
             Err(Error::InvalidConfiguration)
         ));
-        let mut exact = ResumeTracker::discover(&store, subject(6), 1, 1).unwrap();
+        fs::remove_file(&bounds_path).unwrap();
+        fs::remove_file(lock_path(&bounds_path).unwrap()).unwrap();
+
+        let exact_path = temp_path("exact-bounds");
+        let mut exact_store = ResumeStore::open(&exact_path).unwrap();
+        let mut exact = ResumeTracker::discover(&mut exact_store, subject(6), 1, 1).unwrap();
         assert!(exact.begin_unit(0).unwrap());
         assert!(matches!(exact.begin_unit(1), Err(Error::InvalidUnit)));
+        fs::remove_file(&exact_path).unwrap();
+        fs::remove_file(lock_path(&exact_path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn aggregate_capacity_is_reserved_before_transfer() {
+        let path = temp_path("aggregate-capacity");
+        let mut store = ResumeStore::open(&path).unwrap();
+        let aggregate_units =
+            (MAX_STORE_PAYLOAD_BYTES - STORE_HEADER_BYTES - 2 * OBJECT_HEADER_BYTES) / UNIT_BYTES;
+        let first_units = aggregate_units / 2;
+        let second_units = aggregate_units - first_units;
+
+        assert!(ResumeTracker::discover(&mut store, subject(11), first_units, 1).is_ok());
+        assert!(ResumeTracker::discover(&mut store, subject(12), second_units, 1).is_ok());
+        assert!(matches!(
+            ResumeTracker::discover(&mut store, subject(13), 1, 1),
+            Err(Error::InvalidConfiguration)
+        ));
+
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert!(reopened.checkpointed(subject(11)).is_some());
+        assert!(reopened.checkpointed(subject(12)).is_some());
+        assert!(reopened.checkpointed(subject(13)).is_none());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]
@@ -885,9 +978,9 @@ mod tests {
     fn temporary_store_collision_preserves_the_real_error_kind() {
         let path = temp_path("temporary-collision");
         let temporary = temporary_path(&path).unwrap();
-        fs::create_dir(&temporary).unwrap();
         let mut store = ResumeStore::open(&path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(5), 1, 1).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(5), 1, 1).unwrap();
+        fs::create_dir(&temporary).unwrap();
         tracker.begin_unit(0).unwrap();
         tracker.complete_unit(0).unwrap();
         let error = tracker.checkpoint(&mut store).unwrap_err();
@@ -896,6 +989,8 @@ mod tests {
         };
         assert_ne!(error.kind(), io::ErrorKind::AlreadyExists);
         fs::remove_dir(temporary).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
     #[test]

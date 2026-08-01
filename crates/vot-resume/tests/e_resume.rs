@@ -25,7 +25,7 @@ fn random_process_kills_at_every_percent_keep_waste_bounded() {
     for kill_percent in 1_u64..=99 {
         let store_path = path(u8::try_from(kill_percent).unwrap());
         let mut store = ResumeStore::open(&store_path).unwrap();
-        let mut tracker = ResumeTracker::discover(&store, subject(), 100, 8).unwrap();
+        let mut tracker = ResumeTracker::discover(&mut store, subject(), 100, 8).unwrap();
         for unit in 0..kill_percent {
             tracker.begin_unit(unit).unwrap();
             if tracker.complete_unit(unit).unwrap() {
@@ -36,9 +36,8 @@ fn random_process_kills_at_every_percent_keep_waste_bounded() {
             tracker.begin_unit(kill_percent).unwrap();
         }
         assert!(tracker.retransmission_units_after_crash() <= tracker.retransmission_bound());
-        let restarted =
-            ResumeTracker::discover(&ResumeStore::open(&store_path).unwrap(), subject(), 100, 8)
-                .unwrap();
+        let mut reopened = ResumeStore::open(&store_path).unwrap();
+        let restarted = ResumeTracker::discover(&mut reopened, subject(), 100, 8).unwrap();
         assert_eq!(
             restarted.missing_units().count(),
             100 - usize::try_from(kill_percent / 8 * 8).unwrap()
@@ -54,7 +53,7 @@ fn vm_stale_snapshot_resends_but_never_invents_verified_units() {
     let current_path = path(100);
     let snapshot_path = path(101);
     let mut store = ResumeStore::open(&current_path).unwrap();
-    let mut tracker = ResumeTracker::discover(&store, subject(), 100, 4).unwrap();
+    let mut tracker = ResumeTracker::discover(&mut store, subject(), 100, 4).unwrap();
     for unit in 0..4 {
         tracker.begin_unit(unit).unwrap();
         tracker.complete_unit(unit).unwrap();
@@ -67,13 +66,8 @@ fn vm_stale_snapshot_resends_but_never_invents_verified_units() {
     }
     tracker.checkpoint(&mut store).unwrap();
 
-    let stale = ResumeTracker::discover(
-        &ResumeStore::open(&snapshot_path).unwrap(),
-        subject(),
-        100,
-        4,
-    )
-    .unwrap();
+    let mut snapshot_store = ResumeStore::open(&snapshot_path).unwrap();
+    let stale = ResumeTracker::discover(&mut snapshot_store, subject(), 100, 4).unwrap();
     assert!(stale.is_checkpointed(3));
     assert!(!stale.is_checkpointed(4));
     assert_eq!(stale.missing_units().count(), 96);
@@ -173,16 +167,15 @@ fn udp_blackhole_switches_to_tcp_without_redownloading_verified_units() {
 fn source_loss_allows_alternate_source_for_same_identity() {
     let store_path = path(102);
     let mut store = ResumeStore::open(&store_path).unwrap();
-    let mut original = ResumeTracker::discover(&store, subject(), 100, 4).unwrap();
+    let mut original = ResumeTracker::discover(&mut store, subject(), 100, 4).unwrap();
     for unit in 0..4 {
         original.begin_unit(unit).unwrap();
         original.complete_unit(unit).unwrap();
     }
     original.checkpoint(&mut store).unwrap();
 
-    let alternate =
-        ResumeTracker::discover(&ResumeStore::open(&store_path).unwrap(), subject(), 100, 4)
-            .unwrap();
+    let mut alternate_store = ResumeStore::open(&store_path).unwrap();
+    let alternate = ResumeTracker::discover(&mut alternate_store, subject(), 100, 4).unwrap();
     assert!(alternate.is_checkpointed(0));
     assert_eq!(alternate.missing_units().count(), 96);
     fs::remove_file(store_path).unwrap();

@@ -1539,14 +1539,8 @@ pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
         fs::read(spec)?
     };
     if let Ok(text) = std::str::from_utf8(&bytes) {
-        let text = text.trim();
-        if !text.is_empty()
-            && text.len() % 2 == 0
-            && text.as_bytes().iter().all(|byte| hex(*byte).is_some())
-        {
-            if let Ok(key) = decode_key(text) {
-                return Ok(key);
-            }
+        if let Ok(key) = decode_key(text.trim()) {
+            return Ok(key);
         }
     }
     if bytes.len() < 32 {
@@ -2338,6 +2332,68 @@ mod tests {
     }
 
     #[test]
+    fn suite_parser_accepts_every_public_alias() {
+        assert_eq!(parse_suite("blake3").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("blake3-bao64").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("1").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("sha256").unwrap(), Suite::Sha256Bep52);
+        assert_eq!(parse_suite("sha256-bep52").unwrap(), Suite::Sha256Bep52);
+        assert_eq!(parse_suite("2").unwrap(), Suite::Sha256Bep52);
+        assert!(matches!(
+            parse_suite("unknown"),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn copy_and_verify_rejects_length_or_root_mismatch() {
+        let source = temporary("copy-source");
+        let data = b"copy-and-verify";
+        fs::write(&source, data).unwrap();
+        let root = vot_verifier::root(Suite::Sha256Bep52, data).unwrap();
+
+        let valid_destination = temporary("copy-valid");
+        copy_and_verify(
+            &source,
+            &valid_destination,
+            data.len() as u64,
+            root,
+            Suite::Sha256Bep52,
+        )
+        .unwrap();
+        fs::remove_file(valid_destination).unwrap();
+
+        let length_destination = temporary("copy-length-mismatch");
+        assert!(matches!(
+            copy_and_verify(
+                &source,
+                &length_destination,
+                data.len() as u64 + 1,
+                root,
+                Suite::Sha256Bep52,
+            ),
+            Err(Error::SourceMutation)
+        ));
+        fs::remove_file(length_destination).unwrap();
+
+        let root_destination = temporary("copy-root-mismatch");
+        let mut wrong_root = root;
+        wrong_root[0] ^= 1;
+        assert!(matches!(
+            copy_and_verify(
+                &source,
+                &root_destination,
+                data.len() as u64,
+                wrong_root,
+                Suite::Sha256Bep52,
+            ),
+            Err(Error::SourceMutation)
+        ));
+        fs::remove_file(root_destination).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn key_decoder_is_strict_and_bounded() {
         assert_eq!(decode_key(&"00".repeat(32)).unwrap(), vec![0; 32]);
         assert!(matches!(decode_key("0"), Err(Error::InvalidArguments)));
@@ -2361,6 +2417,33 @@ mod tests {
             decode_key(&"ABCDEF".repeat(11)).unwrap()[..3],
             [0xab, 0xcd, 0xef]
         );
+    }
+
+    #[test]
+    fn key_spec_loader_decodes_hex_and_preserves_raw_keys() {
+        let hex_path = temporary("hex-key");
+        fs::write(&hex_path, format!("  {}\n", "ab".repeat(32))).unwrap();
+        assert_eq!(
+            load_key_spec(hex_path.to_str().unwrap()).unwrap(),
+            vec![0xab; 32]
+        );
+        fs::remove_file(&hex_path).unwrap();
+
+        let raw_path = temporary("raw-key");
+        fs::write(&raw_path, [7; 32]).unwrap();
+        assert_eq!(
+            load_key_spec(raw_path.to_str().unwrap()).unwrap(),
+            vec![7; 32]
+        );
+        fs::remove_file(&raw_path).unwrap();
+
+        let short_path = temporary("short-key");
+        fs::write(&short_path, [7; 31]).unwrap();
+        assert!(matches!(
+            load_key_spec(short_path.to_str().unwrap()),
+            Err(Error::InvalidArguments)
+        ));
+        fs::remove_file(short_path).unwrap();
     }
 
     #[test]

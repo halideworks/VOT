@@ -15,5 +15,5 @@ Observed failure:
 expected CheckpointRequired, received Ok(true)
 ```
 
-The required `vot-resume` mutation run reports 144 total, 137 caught, 7
+The required `vot-resume` mutation run reports 153 total, 146 caught, 7
 unviable, and 0 missed.

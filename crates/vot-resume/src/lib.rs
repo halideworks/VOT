@@ -331,6 +331,7 @@ pub struct Observation {
 struct SavedPath {
     observation: Observation,
     owner: Option<u64>,
+    discard_on_release: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -394,6 +395,7 @@ impl CarefulResumeCache {
             SavedPath {
                 observation,
                 owner: None,
+                discard_on_release: false,
             },
         );
         Ok(())
@@ -405,12 +407,15 @@ impl CarefulResumeCache {
         current_endpoint: RemoteEndpoint,
         input: Reconnaissance,
     ) -> Result<ResumePermit, PathReject> {
-        if self
-            .saved
-            .get(&saved_endpoint)
-            .is_some_and(|saved| saved.owner.is_some())
-        {
-            return Err(PathReject::AlreadyInUse);
+        if let Some(saved) = self.saved.get_mut(&saved_endpoint) {
+            if saved.owner.is_some() {
+                saved.discard_on_release |= saved_endpoint != current_endpoint
+                    || input.local_path_changed
+                    || input.congestion_detected
+                    || input.now >= saved.observation.expires_at
+                    || input.configuration_epoch != saved.observation.configuration_epoch;
+                return Err(PathReject::AlreadyInUse);
+            }
         }
         if saved_endpoint != current_endpoint || input.local_path_changed {
             self.saved.remove(&saved_endpoint);
@@ -466,7 +471,11 @@ impl CarefulResumeCache {
         if self.saved.get(&endpoint).and_then(|saved| saved.owner) != Some(permit.owner) {
             return false;
         }
-        if congestion_detected {
+        let discard_on_release = self
+            .saved
+            .get(&endpoint)
+            .is_some_and(|saved| saved.discard_on_release);
+        if congestion_detected || discard_on_release {
             self.saved.remove(&endpoint);
         } else if let Some(saved) = self.saved.get_mut(&endpoint) {
             saved.owner = None;
@@ -1163,69 +1172,67 @@ mod tests {
             configuration_epoch: 4,
             max_jump: 900,
         };
-        let mut cache = CarefulResumeCache::default();
-        cache.observe(endpoint, observation).unwrap();
-        let permit = cache.reconnoitre(endpoint, endpoint, input).unwrap();
-        assert_eq!(
-            cache.observe(
-                endpoint,
-                Observation {
-                    saved_cwnd: 2_000,
-                    ..observation
-                }
-            ),
-            Err(PathReject::AlreadyInUse)
-        );
-        assert_eq!(
-            cache.reconnoitre(endpoint, endpoint, input),
-            Err(PathReject::AlreadyInUse)
-        );
-        assert_eq!(
-            cache.reconnoitre(
-                endpoint,
+        let invalidations = [
+            (
                 RemoteEndpoint {
                     interface: 2,
                     ..endpoint
                 },
-                input
+                input,
             ),
-            Err(PathReject::AlreadyInUse)
-        );
-        for invalidation in [
-            Reconnaissance {
-                local_path_changed: true,
-                ..input
-            },
-            Reconnaissance {
-                congestion_detected: true,
-                ..input
-            },
-            Reconnaissance {
-                now: observation.expires_at,
-                ..input
-            },
-            Reconnaissance {
-                configuration_epoch: observation.configuration_epoch + 1,
-                ..input
-            },
-        ] {
-            assert_eq!(
-                cache.reconnoitre(endpoint, endpoint, invalidation),
-                Err(PathReject::AlreadyInUse)
-            );
-        }
-        assert!(cache.release(endpoint, &permit, false));
-        assert_eq!(
-            cache.reconnoitre(
-                endpoint,
+            (
                 endpoint,
                 Reconnaissance {
                     local_path_changed: true,
                     ..input
-                }
+                },
             ),
-            Err(PathReject::PathChanged)
-        );
+            (
+                endpoint,
+                Reconnaissance {
+                    congestion_detected: true,
+                    ..input
+                },
+            ),
+            (
+                endpoint,
+                Reconnaissance {
+                    now: observation.expires_at,
+                    ..input
+                },
+            ),
+            (
+                endpoint,
+                Reconnaissance {
+                    configuration_epoch: observation.configuration_epoch + 1,
+                    ..input
+                },
+            ),
+        ];
+        for (current_endpoint, invalidation) in invalidations {
+            let mut cache = CarefulResumeCache::default();
+            cache.observe(endpoint, observation).unwrap();
+            let permit = cache.reconnoitre(endpoint, endpoint, input).unwrap();
+            assert_eq!(
+                cache.observe(
+                    endpoint,
+                    Observation {
+                        saved_cwnd: 2_000,
+                        ..observation
+                    }
+                ),
+                Err(PathReject::AlreadyInUse)
+            );
+            assert_eq!(
+                cache.reconnoitre(endpoint, current_endpoint, invalidation),
+                Err(PathReject::AlreadyInUse)
+            );
+            assert!(cache.release(endpoint, &permit, false));
+            assert_eq!(
+                cache.reconnoitre(endpoint, endpoint, input),
+                Err(PathReject::Unknown)
+            );
+        }
     }
 
     #[test]

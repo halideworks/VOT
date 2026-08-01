@@ -182,6 +182,8 @@ def main() -> int:
         command.pop(0)
     if not command:
         parser.error("--command requires an executable")
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
 
     workload = load(args.workload)
     impairment = load(args.impairment)

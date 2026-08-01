@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +42,24 @@ def main() -> None:
     assert runner.is_file() and runner.read_text(encoding="utf-8").startswith(
         "#!/usr/bin/env python3"
     )
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--backend",
+            "simulator",
+            "--seed",
+            "-1",
+            "--command",
+            "true",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 2
+    assert "--seed must be non-negative" in rejected.stderr
     print("benchmark contract: ok")
 
 

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -148,6 +149,27 @@ impl ReliableReceiver {
         data: &[u8],
         proof: &[u8],
     ) -> Result<(), Error> {
+        self.receive_verified_range_impl(subject, covered_offset, Cow::Borrowed(data), proof, false)
+    }
+
+    fn receive_verified_range_owned(
+        &mut self,
+        subject: SubjectId,
+        covered_offset: u64,
+        data: Vec<u8>,
+        proof: &[u8],
+    ) -> Result<(), Error> {
+        self.receive_verified_range_impl(subject, covered_offset, Cow::Owned(data), proof, true)
+    }
+
+    fn receive_verified_range_impl(
+        &mut self,
+        subject: SubjectId,
+        covered_offset: u64,
+        data: Cow<'_, [u8]>,
+        proof: &[u8],
+        staging_reserved: bool,
+    ) -> Result<(), Error> {
         if !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
         }
@@ -167,7 +189,7 @@ impl ReliableReceiver {
                     &subject.root,
                     subject.length,
                     covered_offset,
-                    data,
+                    data.as_ref(),
                     proof,
                 )
                 .map_err(|_| Error::ProofInvalid)?;
@@ -177,20 +199,22 @@ impl ReliableReceiver {
                     &subject.root,
                     subject.length,
                     covered_offset,
-                    data,
+                    data.as_ref(),
                     proof,
                 )
                 .map_err(|_| Error::ProofInvalid)?;
             }
         }
-        let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
         let next_bytes = {
             let active = self
                 .range_active
                 .get(&subject)
                 .ok_or(Error::UnknownObject)?;
             if let Some(existing) = active.segments.get(&covered_offset) {
-                if existing.as_slice() == data {
+                if existing.as_slice() == data.as_ref() {
+                    if staging_reserved {
+                        self.staging.release(bytes);
+                    }
                     return Ok(());
                 }
                 return Err(Error::ProofInvalid);
@@ -206,16 +230,23 @@ impl ReliableReceiver {
                 .checked_add(bytes)
                 .ok_or(Error::LengthExceeded)?
         };
-        self.staging.reserve(bytes)?;
-        self.peak_staging = self.peak_staging.max(self.staging.used());
+        let reserved_here = if staging_reserved {
+            false
+        } else {
+            self.staging.reserve(bytes)?;
+            self.peak_staging = self.peak_staging.max(self.staging.used());
+            true
+        };
         let first = covered_offset / RANGE_UNIT_BYTES;
         let last = covered_end.div_ceil(RANGE_UNIT_BYTES);
-        let active = self
-            .range_active
-            .get_mut(&subject)
-            .ok_or(Error::UnknownObject)?;
+        let Some(active) = self.range_active.get_mut(&subject) else {
+            if reserved_here {
+                self.staging.release(bytes);
+            }
+            return Err(Error::UnknownObject);
+        };
         active.bytes = next_bytes;
-        active.segments.insert(covered_offset, data.to_vec());
+        active.segments.insert(covered_offset, data.into_owned());
         active.covered_units.extend(first..last);
         Ok(())
     }
@@ -256,26 +287,32 @@ impl ReliableReceiver {
                 return Err(Error::LengthMismatch);
             }
         }
-        let mut data = Vec::with_capacity(
-            usize::try_from(bundle.covered_length).map_err(|_| Error::LengthExceeded)?,
-        );
-        for index in 0..bundle.data_record_count {
-            let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
-            let expected_offset = bundle
-                .covered_offset
-                .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
-                .ok_or(Error::LengthExceeded)?;
-            if record.plaintext_offset != expected_offset
-                || record.plaintext_length != record.encoded.len() as u64
-            {
+        let covered_bytes = bundle.covered_length;
+        let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
+        self.staging.reserve(covered_bytes)?;
+        self.peak_staging = self.peak_staging.max(self.staging.used());
+        let result = (|| {
+            let mut data = Vec::with_capacity(capacity);
+            for index in 0..bundle.data_record_count {
+                let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
+                let expected_offset = bundle
+                    .covered_offset
+                    .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
+                    .ok_or(Error::LengthExceeded)?;
+                if record.plaintext_offset != expected_offset {
+                    return Err(Error::LengthMismatch);
+                }
+                data.extend_from_slice(&record.encoded);
+            }
+            if data.len() as u64 != covered_bytes {
                 return Err(Error::LengthMismatch);
             }
-            data.extend_from_slice(&record.encoded);
+            self.receive_verified_range_owned(subject, bundle.covered_offset, data, &bundle.proof)
+        })();
+        if result.is_err() {
+            self.staging.release(covered_bytes);
         }
-        if data.len() as u64 != bundle.covered_length {
-            return Err(Error::LengthMismatch);
-        }
-        self.receive_verified_range(subject, bundle.covered_offset, &data, &bundle.proof)
+        result
     }
     /// Completes a range transfer only after every 64 KiB unit is root verified.
     ///
@@ -476,6 +513,22 @@ mod tests {
         }
     }
 
+    fn assert_typed_bundle_error(
+        subject: SubjectId,
+        bundle: &vot_codec::frames::ProofBundle,
+        records: &[vot_codec::frames::DataRecord],
+        expected: Error,
+    ) {
+        let staging_limit = VERIFIER_RESERVATION + bundle.covered_length;
+        let mut receiver =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        receiver.begin_ranges(subject).unwrap();
+        assert_eq!(
+            receiver.receive_typed_bundle(subject, bundle, records),
+            Err(expected)
+        );
+    }
+
     #[test]
     fn reliable_transfer_uses_transport_adapter_contract() {
         let bytes = vec![0x5a; 700_000];
@@ -626,6 +679,124 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn range_validation_and_ownership_boundaries_are_explicit() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x5a; unit * 3];
+        let range_subject = subject(&bytes);
+        let make_receiver = || {
+            ReliableReceiver::new(
+                8 * VERIFIER_RESERVATION,
+                8 * VERIFIER_RESERVATION,
+                8 * VERIFIER_RESERVATION,
+            )
+            .unwrap()
+        };
+
+        let mut receiver = make_receiver();
+        receiver.begin_ranges(range_subject).unwrap();
+        assert_eq!(
+            receiver.receive_range(range_subject, 0, &[], &[]),
+            Err(Error::RecordTooLarge)
+        );
+        let too_large = vec![0; usize::try_from(MAX_PROOF_RANGE_BYTES + 1).unwrap()];
+        assert_eq!(
+            receiver.receive_range(range_subject, 0, &too_large, &[]),
+            Err(Error::RecordTooLarge)
+        );
+
+        let large_range_subject = SubjectId {
+            suite: 1,
+            root: [0; 32],
+            length: MAX_PROOF_RANGE_BYTES,
+        };
+        let exact_max = vec![0; usize::try_from(MAX_PROOF_RANGE_BYTES).unwrap()];
+        let mut exact_receiver = make_receiver();
+        exact_receiver.begin_ranges(large_range_subject).unwrap();
+        assert_eq!(
+            exact_receiver.receive_range(large_range_subject, 0, &exact_max, &[]),
+            Err(Error::ProofInvalid)
+        );
+
+        let one = &bytes[..unit];
+        let first_proof = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
+        let mut misaligned = make_receiver();
+        misaligned.begin_ranges(range_subject).unwrap();
+        assert_eq!(
+            misaligned.receive_range(range_subject, 1, one, &[]),
+            Err(Error::LengthExceeded)
+        );
+
+        let exact_range_subject = subject(one);
+        let exact_proof = vot_proof_blake3::prove(one, 0, RANGE_UNIT_BYTES).unwrap();
+        let mut exact_end = make_receiver();
+        exact_end.begin_ranges(exact_range_subject).unwrap();
+        exact_end
+            .receive_range(exact_range_subject, 0, one, &exact_proof.proof)
+            .unwrap();
+
+        let mut duplicate = make_receiver();
+        duplicate.begin_ranges(range_subject).unwrap();
+        duplicate
+            .receive_range(range_subject, 0, one, &first_proof.proof)
+            .unwrap();
+        duplicate
+            .receive_range(range_subject, 0, one, &first_proof.proof)
+            .unwrap();
+
+        let first_two = &bytes[..unit * 2];
+        let overlap_data = &bytes[unit..unit * 2];
+        let first_two_proof = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES * 2).unwrap();
+        let overlap_proof =
+            vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let mut overlap = make_receiver();
+        overlap.begin_ranges(range_subject).unwrap();
+        overlap
+            .receive_range(range_subject, 0, first_two, &first_two_proof.proof)
+            .unwrap();
+        assert_eq!(
+            overlap.receive_range(
+                range_subject,
+                RANGE_UNIT_BYTES,
+                overlap_data,
+                &overlap_proof.proof
+            ),
+            Err(Error::LengthMismatch)
+        );
+
+        let second_proof =
+            vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let mut adjacent = make_receiver();
+        adjacent.begin_ranges(range_subject).unwrap();
+        adjacent
+            .receive_range(range_subject, 0, one, &first_proof.proof)
+            .unwrap();
+        adjacent
+            .receive_range(
+                range_subject,
+                RANGE_UNIT_BYTES,
+                &bytes[unit..unit * 2],
+                &second_proof.proof,
+            )
+            .unwrap();
+
+        let mut middle = make_receiver();
+        middle.begin_ranges(range_subject).unwrap();
+        middle
+            .receive_range(
+                range_subject,
+                RANGE_UNIT_BYTES,
+                &bytes[unit..unit * 2],
+                &second_proof.proof,
+            )
+            .unwrap();
+        assert_eq!(
+            middle.range_active[&range_subject].covered_units,
+            BTreeSet::from([1])
+        );
+    }
+
+    #[test]
     fn proof_bearing_ranges_accept_out_of_order_for_both_suites() {
         let bytes = vec![0x5a; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
 
@@ -699,6 +870,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn typed_wire_bundle_reassembles_records_before_root_verification() {
         let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
         let subject = SubjectId {
@@ -771,13 +943,51 @@ mod tests {
             decoded_records.push(record);
         }
 
-        let mut receiver = ReliableReceiver::new(512 * 1024, 256 * 1024, 512 * 1024).unwrap();
+        let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
+        let mut receiver =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
         receiver.begin_ranges(subject).unwrap();
+        assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
         receiver
             .receive_typed_bundle(subject, &bundle, &decoded_records)
             .unwrap();
+        assert_eq!(receiver.advertised_credit(), 0);
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
+        assert_eq!(receiver.advertised_credit(), staging_limit);
+
+        let mut bad_bundle = bundle.clone();
+        bad_bundle.object.suite = 2;
+        assert_typed_bundle_error(subject, &bad_bundle, &records, Error::LengthMismatch);
+        bad_bundle = bundle.clone();
+        bad_bundle.object.root[0] ^= 1;
+        assert_typed_bundle_error(subject, &bad_bundle, &records, Error::LengthMismatch);
+        bad_bundle = bundle.clone();
+        bad_bundle.object.length += 1;
+        assert_typed_bundle_error(subject, &bad_bundle, &records, Error::LengthMismatch);
+        bad_bundle = bundle.clone();
+        bad_bundle.data_record_count -= 1;
+        assert_typed_bundle_error(subject, &bad_bundle, &records[..1], Error::LengthMismatch);
+
+        let mut bad_records = records.to_vec();
+        bad_records[1].plaintext_offset = RANGE_UNIT_BYTES;
+        assert_typed_bundle_error(subject, &bundle, &bad_records, Error::LengthMismatch);
+
+        let duplicate_limit = VERIFIER_RESERVATION + 2 * bundle.covered_length;
+        let mut duplicate_receiver =
+            ReliableReceiver::new(duplicate_limit, duplicate_limit, duplicate_limit).unwrap();
+        duplicate_receiver.begin_ranges(subject).unwrap();
+        duplicate_receiver
+            .receive_typed_bundle(subject, &bundle, &decoded_records)
+            .unwrap();
+        let credit_before_duplicate = duplicate_receiver.advertised_credit();
+        duplicate_receiver
+            .receive_typed_bundle(subject, &bundle, &decoded_records)
+            .unwrap();
+        assert_eq!(
+            duplicate_receiver.advertised_credit(),
+            credit_before_duplicate
+        );
     }
 
     #[test]

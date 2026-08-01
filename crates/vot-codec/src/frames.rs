@@ -763,6 +763,9 @@ fn validate_manifest_page(bytes: &[u8]) -> Result<(), Error> {
 }
 
 fn validate_seal(bytes: &[u8]) -> Result<(), Error> {
+    if crate::registered_payload_limit(frame_type::SEAL).is_some_and(|limit| bytes.len() > limit) {
+        return Err(Error::TooLarge);
+    }
     vot_manifest::decode_seal(bytes)
         .map(|_| ())
         .map_err(|_| Error::Seal)
@@ -1126,6 +1129,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, Error::InvalidValue);
+    }
+
+    #[test]
+    fn valid_manifest_seals_are_bounded_by_the_wire_limit() {
+        let pages = (0..vot_manifest::MAX_PAGE_COMMITMENTS)
+            .map(|index| vot_manifest::PageCommitment {
+                index: index as u64,
+                digest: [8; 32],
+            })
+            .collect::<Vec<_>>();
+        let seal = vot_manifest::Seal {
+            manifest_id: [4; 16],
+            final_page_count: pages.len() as u64,
+            final_page_digest: [8; 32],
+            package: vot_manifest::ObjectId {
+                suite: 1,
+                root: [9; 32],
+                length: 123,
+            },
+            pages,
+        };
+        let encoded = vot_manifest::encode_seal(&seal).unwrap();
+        assert!(encoded.len() > crate::registered_payload_limit(frame_type::SEAL).unwrap());
+        assert_eq!(
+            encode(&TypedFrame::Seal(encoded), &mut Vec::new()),
+            Err(Error::TooLarge)
+        );
     }
 
     #[test]

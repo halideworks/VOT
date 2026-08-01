@@ -13,6 +13,7 @@ use unicode_normalization::UnicodeNormalization;
 pub const MAX_PAGE_BYTES: usize = 1_048_576;
 pub const MAX_ENTRIES_PER_PAGE: usize = 8192;
 pub const MAX_PATH_COMPONENTS: usize = 256;
+pub const MAX_PAGE_COMMITMENTS: usize = MAX_PAGE_BYTES / 36;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathProfile {
@@ -326,6 +327,7 @@ pub fn canonical_path_key(path: &PackagePath, profile: PathProfile) -> Result<Ve
 }
 
 pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
+    validate_entry_count(page.entries.len())?;
     validate_entries(&page.entries, page.profile)?;
     let mut out = Vec::new();
     cbor_map(&mut out, 7);
@@ -350,10 +352,135 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
     for entry in &page.entries {
         encode_entry(&mut out, entry);
     }
-    if out.len() > MAX_PAGE_BYTES {
+    validate_page_length(out.len())?;
+    Ok(out)
+}
+
+pub fn encode_seal(seal: &Seal) -> Result<Vec<u8>, Error> {
+    validate_seal(seal)?;
+    let mut out = Vec::new();
+    cbor_map(&mut out, 6);
+    cbor_uint(&mut out, 0);
+    cbor_uint(&mut out, 0);
+    cbor_uint(&mut out, 1);
+    cbor_bytes(&mut out, &seal.manifest_id);
+    cbor_uint(&mut out, 2);
+    cbor_uint(&mut out, seal.final_page_count);
+    cbor_uint(&mut out, 3);
+    cbor_bytes(&mut out, &seal.final_page_digest);
+    cbor_uint(&mut out, 4);
+    cbor_array(&mut out, 4);
+    cbor_uint(&mut out, 1);
+    cbor_uint(&mut out, u64::from(seal.package.suite));
+    cbor_bytes(&mut out, &seal.package.root);
+    cbor_uint(&mut out, seal.package.length);
+    cbor_uint(&mut out, 5);
+    cbor_array(&mut out, seal.pages.len() as u64);
+    for commitment in &seal.pages {
+        cbor_array(&mut out, 3);
+        cbor_uint(&mut out, commitment.index);
+        cbor_bytes(&mut out, &commitment.digest);
+        cbor_array(&mut out, 0);
+    }
+    validate_page_length(out.len())?;
+    Ok(out)
+}
+
+pub fn decode_seal(input: &[u8]) -> Result<Seal, DecodeError> {
+    validate_page_length(input.len()).map_err(|_| DecodeError::PageTooLarge)?;
+    let mut decoder = Decoder::new(input);
+    if decoder.map_len()? != 6 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    decoder.exact_key(0)?;
+    if decoder.uint()? != 0 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    decoder.exact_key(1)?;
+    let manifest_id = decoder.fixed_bytes::<16>()?;
+    decoder.exact_key(2)?;
+    let final_page_count = decoder.uint()?;
+    decoder.exact_key(3)?;
+    let final_page_digest = decoder.fixed_bytes::<32>()?;
+    decoder.exact_key(4)?;
+    if decoder.array_len()? != 4 || decoder.uint()? != 1 {
+        return Err(DecodeError::InvalidStructure);
+    }
+    let package = ObjectId {
+        suite: u16::try_from(decoder.uint()?).map_err(|_| DecodeError::InvalidStructure)?,
+        root: decoder.fixed_bytes::<32>()?,
+        length: decoder.uint()?,
+    };
+    decoder.exact_key(5)?;
+    let page_count =
+        decoder.bounded_array_len(MAX_PAGE_COMMITMENTS, DecodeError::TooManyEntries)?;
+    let mut pages = Vec::with_capacity(page_count);
+    for _ in 0..page_count {
+        if decoder.array_len()? != 3 {
+            return Err(DecodeError::InvalidStructure);
+        }
+        let index = decoder.uint()?;
+        let digest = decoder.fixed_bytes::<32>()?;
+        if decoder.array_len()? != 0 {
+            return Err(DecodeError::InvalidStructure);
+        }
+        pages.push(PageCommitment { index, digest });
+    }
+    decoder.finish()?;
+    let seal = Seal {
+        manifest_id,
+        final_page_count,
+        final_page_digest,
+        package,
+        pages,
+    };
+    validate_seal(&seal).map_err(DecodeError::Semantic)?;
+    if encode_seal(&seal).map_err(DecodeError::Semantic)? != input {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(seal)
+}
+
+fn validate_seal(seal: &Seal) -> Result<(), Error> {
+    if seal.final_page_count == 0 {
+        return Err(Error::InvalidSeal);
+    }
+    if usize::try_from(seal.final_page_count).ok() != Some(seal.pages.len()) {
+        return Err(Error::InvalidSeal);
+    }
+    if seal.pages.len() > MAX_PAGE_COMMITMENTS {
+        return Err(Error::InvalidSeal);
+    }
+    if !valid_object(&seal.package) {
+        return Err(Error::InvalidSeal);
+    }
+    if seal
+        .pages
+        .iter()
+        .enumerate()
+        .any(|(index, page)| page.index != index as u64)
+    {
+        return Err(Error::InvalidSeal);
+    }
+    if seal.pages.last().map(|page| page.digest) != Some(seal.final_page_digest) {
+        return Err(Error::InvalidSeal);
+    }
+    Ok(())
+}
+
+fn validate_entry_count(entries: usize) -> Result<(), Error> {
+    if entries > MAX_ENTRIES_PER_PAGE {
         Err(Error::PageTooLarge)
     } else {
-        Ok(out)
+        Ok(())
+    }
+}
+
+fn validate_page_length(length: usize) -> Result<(), Error> {
+    if length > MAX_PAGE_BYTES {
+        Err(Error::PageTooLarge)
+    } else {
+        Ok(())
     }
 }
 
@@ -363,9 +490,7 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
 /// # Errors
 /// Returns a structural, canonical encoding, resource-bound, or semantic error.
 pub fn decode_page(input: &[u8]) -> Result<ManifestPage, DecodeError> {
-    if input.len() > MAX_PAGE_BYTES {
-        return Err(DecodeError::PageTooLarge);
-    }
+    validate_page_length(input.len()).map_err(|_| DecodeError::PageTooLarge)?;
     let mut decoder = Decoder::new(input);
     if decoder.map_len()? != 7 {
         return Err(DecodeError::InvalidStructure);
@@ -1071,6 +1196,87 @@ mod tests {
         };
         let encoded = encode_page(&rich).unwrap();
         assert_eq!(decode_page(&encoded).unwrap(), rich);
+    }
+
+    #[test]
+    fn seal_round_trips_and_rejects_inconsistent_commitments() {
+        let seal = Seal {
+            manifest_id: [4; 16],
+            final_page_count: 2,
+            final_page_digest: [8; 32],
+            package: ObjectId {
+                suite: 1,
+                root: [9; 32],
+                length: 123,
+            },
+            pages: vec![
+                PageCommitment {
+                    index: 0,
+                    digest: [7; 32],
+                },
+                PageCommitment {
+                    index: 1,
+                    digest: [8; 32],
+                },
+            ],
+        };
+        let encoded = encode_seal(&seal).unwrap();
+        assert_eq!(decode_seal(&encoded).unwrap(), seal);
+        for length in 0..encoded.len() {
+            assert!(decode_seal(&encoded[..length]).is_err());
+        }
+        let mut wrong = seal.clone();
+        wrong.pages[1].index = 2;
+        assert_eq!(encode_seal(&wrong), Err(Error::InvalidSeal));
+        wrong = seal.clone();
+        wrong.final_page_digest = [0; 32];
+        assert_eq!(encode_seal(&wrong), Err(Error::InvalidSeal));
+
+        wrong = seal.clone();
+        wrong.final_page_count = 0;
+        assert_eq!(validate_seal(&wrong), Err(Error::InvalidSeal));
+        wrong = seal.clone();
+        wrong.final_page_count = 1;
+        assert_eq!(validate_seal(&wrong), Err(Error::InvalidSeal));
+        wrong = seal.clone();
+        wrong.package.suite = 0;
+        assert_eq!(validate_seal(&wrong), Err(Error::InvalidSeal));
+        wrong = seal.clone();
+        wrong.package.length = i64::MAX as u64 + 1;
+        assert_eq!(validate_seal(&wrong), Err(Error::InvalidSeal));
+
+        let pages = (0..MAX_PAGE_COMMITMENTS)
+            .map(|index| PageCommitment {
+                index: index as u64,
+                digest: [8; 32],
+            })
+            .collect::<Vec<_>>();
+        wrong = seal.clone();
+        wrong.final_page_count = pages.len() as u64;
+        wrong.pages = pages;
+        assert_eq!(validate_seal(&wrong), Ok(()));
+
+        wrong.pages.push(PageCommitment {
+            index: MAX_PAGE_COMMITMENTS as u64,
+            digest: [8; 32],
+        });
+        wrong.final_page_count = wrong.pages.len() as u64;
+        assert_eq!(validate_seal(&wrong), Err(Error::InvalidSeal));
+    }
+
+    #[test]
+    fn manifest_collection_and_byte_bounds_are_exact() {
+        assert_eq!(MAX_PAGE_COMMITMENTS, 29_127);
+        assert!(validate_entry_count(MAX_ENTRIES_PER_PAGE).is_ok());
+        assert_eq!(
+            validate_entry_count(MAX_ENTRIES_PER_PAGE + 1),
+            Err(Error::PageTooLarge)
+        );
+        assert!(validate_page_length(MAX_PAGE_BYTES).is_ok());
+        assert_eq!(
+            validate_page_length(MAX_PAGE_BYTES + 1),
+            Err(Error::PageTooLarge)
+        );
     }
 
     #[test]

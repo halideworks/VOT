@@ -3,10 +3,14 @@
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use vot_manifest::{Component, PackagePath, PathProfile, canonical_path_key};
+use vot_manifest::{
+    Component, EntryKind, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment,
+    PathProfile, Seal, StorageRef, canonical_path_key, decode_page, decode_seal, encode_page,
+    encode_seal,
+};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 use vot_receipt::{
     AssuranceLevel, CommitProfile, Receipt, SubjectKind, authenticate_hmac_sha256,
@@ -16,12 +20,9 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
-const BUNDLE_MAGIC: [u8; 8] = *b"VOTPKG0\n";
 const PACKAGE_DOMAIN: &[u8] = b"VOT package v0\0";
-const HEADER_BYTES: u64 = 8 + 32 + 8 + 8;
-const MAX_PATH_RECORD_BYTES: usize = 1_048_576;
-const STORAGE_DIRECT: u8 = 0;
-const STORAGE_PACK: u8 = 1;
+const MANIFEST_DIRECTORY: &str = "manifest";
+const MANIFEST_SEAL: &str = "seal.cbor";
 
 #[derive(Debug)]
 pub enum Error {
@@ -106,6 +107,87 @@ struct EntryRecord {
     storage: Storage,
 }
 
+impl EntryRecord {
+    fn manifest_entry(&self) -> ManifestEntry {
+        let logical = ObjectId {
+            suite: 2,
+            root: self.logical_root,
+            length: self.logical_length,
+        };
+        let storage = match self.storage {
+            Storage::Direct => StorageRef::Direct(logical.clone()),
+            Storage::Pack {
+                root,
+                length,
+                offset,
+            } => StorageRef::Pack {
+                pack: ObjectId {
+                    suite: 2,
+                    root,
+                    length,
+                },
+                offset,
+                length: self.logical_length,
+                logical,
+            },
+        };
+        ManifestEntry {
+            path: self.path.clone(),
+            kind: EntryKind::File,
+            length: Some(self.logical_length),
+            storage: Some(storage),
+            metadata: None,
+        }
+    }
+
+    fn from_manifest(entry: ManifestEntry) -> Result<Self, Error> {
+        if entry.kind != EntryKind::File {
+            return Err(Error::InvalidBundle);
+        }
+        if entry.metadata.is_some() {
+            return Err(Error::InvalidBundle);
+        }
+        let logical_length = entry.length.ok_or(Error::InvalidBundle)?;
+        let storage = entry.storage.ok_or(Error::InvalidBundle)?;
+        let (logical_root, storage) = match storage {
+            StorageRef::Direct(object) => {
+                if object.suite != 2 || object.length != logical_length {
+                    return Err(Error::InvalidBundle);
+                }
+                (object.root, Storage::Direct)
+            }
+            StorageRef::Pack {
+                pack,
+                offset,
+                length,
+                logical,
+            } => {
+                if pack.suite != 2
+                    || logical.suite != 2
+                    || length != logical_length
+                    || logical.length != logical_length
+                {
+                    return Err(Error::InvalidBundle);
+                }
+                (
+                    logical.root,
+                    Storage::Pack {
+                        root: pack.root,
+                        length: pack.length,
+                        offset,
+                    },
+                )
+            }
+        };
+        Ok(Self {
+            path: entry.path,
+            logical_root,
+            logical_length,
+            storage,
+        })
+    }
+}
+
 struct PackageRootBuilder {
     verifier: StreamVerifier,
     last_key: Option<Vec<u8>>,
@@ -160,6 +242,278 @@ impl PackageRootBuilder {
     }
 }
 
+struct ManifestSpool {
+    directory: PathBuf,
+    entries: Vec<ManifestEntry>,
+    estimated_bytes: usize,
+    page_count: u64,
+}
+
+impl ManifestSpool {
+    fn new(bundle: &Path) -> Result<Self, Error> {
+        let directory = bundle.join(MANIFEST_DIRECTORY);
+        fs::create_dir(&directory)?;
+        Ok(Self {
+            directory,
+            entries: Vec::new(),
+            estimated_bytes: 0,
+            page_count: 0,
+        })
+    }
+
+    fn push(&mut self, entry: ManifestEntry) -> Result<(), Error> {
+        let encoded_entry = encode_page(&ManifestPage {
+            manifest_id: [0; 16],
+            index: 0,
+            total: None,
+            previous_digest: [0; 32],
+            profile: PathProfile::Portable,
+            entries: vec![entry.clone()],
+        })
+        .map_err(|_| Error::InvalidBundle)?
+        .len();
+        if page_needs_flush(self.entries.len(), self.estimated_bytes, encoded_entry)? {
+            self.flush_placeholder()?;
+        }
+        self.entries.push(entry);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .checked_add(encoded_entry)
+            .ok_or(Error::InvalidBundle)?;
+        Ok(())
+    }
+
+    fn finish(mut self, package: PackageSummary) -> Result<(), Error> {
+        self.flush_placeholder()?;
+        if self.page_count == 0 {
+            return Err(Error::InvalidBundle);
+        }
+        let mut manifest_id = [0; 16];
+        manifest_id.copy_from_slice(&package.root[..16]);
+        let mut previous_digest = [0; 32];
+        let mut pages =
+            Vec::with_capacity(usize::try_from(self.page_count).map_err(|_| Error::InvalidBundle)?);
+        for index in 0..self.page_count {
+            let spool = manifest_spool_path(&self.directory, index);
+            let encoded = read_bounded_file(&spool, vot_manifest::MAX_PAGE_BYTES)?;
+            let mut page = decode_page(&encoded).map_err(|_| Error::InvalidBundle)?;
+            page.manifest_id = manifest_id;
+            page.index = index;
+            page.total = None;
+            page.previous_digest = previous_digest;
+            let encoded = encode_page(&page).map_err(|_| Error::InvalidBundle)?;
+            let digest = *blake3::hash(&encoded).as_bytes();
+            write_new_synced(&manifest_page_path(&self.directory, index), &encoded)?;
+            fs::remove_file(spool)?;
+            pages.push(PageCommitment { index, digest });
+            previous_digest = digest;
+        }
+        let seal = Seal {
+            manifest_id,
+            final_page_count: self.page_count,
+            final_page_digest: previous_digest,
+            package: ObjectId {
+                suite: 1,
+                root: package.root,
+                length: package.logical_length,
+            },
+            pages,
+        };
+        let encoded = encode_seal(&seal).map_err(|_| Error::InvalidBundle)?;
+        write_new_synced(&self.directory.join(MANIFEST_SEAL), &encoded)?;
+        File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn flush_placeholder(&mut self) -> Result<(), Error> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        let page = self.placeholder_page();
+        let encoded = encode_page(&page).map_err(|_| Error::InvalidBundle)?;
+        write_new_synced(
+            &manifest_spool_path(&self.directory, self.page_count),
+            &encoded,
+        )?;
+        self.entries.clear();
+        self.estimated_bytes = 0;
+        self.page_count = self.page_count.checked_add(1).ok_or(Error::InvalidBundle)?;
+        Ok(())
+    }
+
+    fn placeholder_page(&self) -> ManifestPage {
+        ManifestPage {
+            manifest_id: [0; 16],
+            index: self.page_count,
+            total: None,
+            previous_digest: [0; 32],
+            profile: PathProfile::Portable,
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+fn page_needs_flush(
+    entries: usize,
+    estimated_bytes: usize,
+    next_entry_bytes: usize,
+) -> Result<bool, Error> {
+    let estimated = estimated_bytes
+        .checked_add(next_entry_bytes)
+        .ok_or(Error::InvalidBundle)?;
+    Ok(entries == vot_manifest::MAX_ENTRIES_PER_PAGE
+        || (entries != 0 && estimated > vot_manifest::MAX_PAGE_BYTES))
+}
+
+struct ManifestReader {
+    directory: PathBuf,
+    seal: Seal,
+    next_page: u64,
+    previous_digest: [u8; 32],
+    entries: std::vec::IntoIter<ManifestEntry>,
+    finished: bool,
+}
+
+impl ManifestReader {
+    fn open(bundle: &Path) -> Result<Self, Error> {
+        let directory = bundle.join(MANIFEST_DIRECTORY);
+        let encoded =
+            read_bounded_file(&directory.join(MANIFEST_SEAL), vot_manifest::MAX_PAGE_BYTES)?;
+        let seal = decode_seal(&encoded).map_err(|_| Error::InvalidBundle)?;
+        if seal.package.suite != 1 {
+            return Err(Error::InvalidBundle);
+        }
+        Ok(Self {
+            directory,
+            seal,
+            next_page: 0,
+            previous_digest: [0; 32],
+            entries: Vec::new().into_iter(),
+            finished: false,
+        })
+    }
+
+    fn next_record(&mut self) -> Result<Option<EntryRecord>, Error> {
+        loop {
+            if let Some(entry) = self.entries.next() {
+                return EntryRecord::from_manifest(entry).map(Some);
+            }
+            if self.next_page == self.seal.final_page_count {
+                if self.previous_digest != self.seal.final_page_digest {
+                    return Err(Error::InvalidBundle);
+                }
+                self.finished = true;
+                return Ok(None);
+            }
+            let encoded = read_bounded_file(
+                &manifest_page_path(&self.directory, self.next_page),
+                vot_manifest::MAX_PAGE_BYTES,
+            )?;
+            let digest = *blake3::hash(&encoded).as_bytes();
+            let page = decode_page(&encoded).map_err(|_| Error::InvalidBundle)?;
+            let commitment = self
+                .seal
+                .pages
+                .get(usize::try_from(self.next_page).map_err(|_| Error::InvalidBundle)?)
+                .ok_or(Error::InvalidBundle)?;
+            validate_page_envelope(
+                &page,
+                &self.seal,
+                commitment,
+                self.next_page,
+                self.previous_digest,
+                digest,
+            )?;
+            self.previous_digest = digest;
+            self.next_page = self.next_page.checked_add(1).ok_or(Error::InvalidBundle)?;
+            self.entries = page.entries.into_iter();
+        }
+    }
+
+    fn expected_package(&self) -> PackageSummary {
+        PackageSummary {
+            root: self.seal.package.root,
+            logical_length: self.seal.package.length,
+            entries: 0,
+        }
+    }
+}
+
+fn validate_page_envelope(
+    page: &ManifestPage,
+    seal: &Seal,
+    commitment: &PageCommitment,
+    index: u64,
+    previous_digest: [u8; 32],
+    digest: [u8; 32],
+) -> Result<(), Error> {
+    if page.manifest_id != seal.manifest_id {
+        return Err(Error::InvalidBundle);
+    }
+    if page.index != index {
+        return Err(Error::InvalidBundle);
+    }
+    if page
+        .total
+        .is_some_and(|total| total != seal.final_page_count)
+    {
+        return Err(Error::InvalidBundle);
+    }
+    if page.previous_digest != previous_digest {
+        return Err(Error::InvalidBundle);
+    }
+    if commitment.index != index {
+        return Err(Error::InvalidBundle);
+    }
+    if commitment.digest != digest {
+        return Err(Error::InvalidBundle);
+    }
+    Ok(())
+}
+
+fn scan_manifest(bundle: &Path) -> Result<PackageSummary, Error> {
+    let mut reader = ManifestReader::open(bundle)?;
+    let expected = reader.expected_package();
+    let mut package = PackageRootBuilder::new()?;
+    while let Some(record) = reader.next_record()? {
+        package.push(&record)?;
+    }
+    if !reader.finished {
+        return Err(Error::InvalidBundle);
+    }
+    let actual = package.finish()?;
+    if actual.root != expected.root {
+        return Err(Error::RootMismatch);
+    }
+    if actual.logical_length != expected.logical_length {
+        return Err(Error::RootMismatch);
+    }
+    Ok(actual)
+}
+
+fn manifest_page_path(directory: &Path, index: u64) -> PathBuf {
+    directory.join(format!("{index:016}.cbor"))
+}
+
+fn manifest_spool_path(directory: &Path, index: u64) -> PathBuf {
+    directory.join(format!(".spool-{index:016}.cbor"))
+}
+
+fn read_bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, Error> {
+    let length = fs::metadata(path)?.len();
+    if length > maximum as u64 {
+        return Err(Error::InvalidBundle);
+    }
+    fs::read(path).map_err(Error::Io)
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Error> {
     if !source.is_dir() || bundle.exists() {
         return Err(Error::InvalidArguments);
@@ -171,17 +525,7 @@ pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Erro
     fs::create_dir(bundle)?;
     let objects = bundle.join("objects");
     fs::create_dir(&objects)?;
-    let manifest_path = bundle.join("manifest.vot");
-    let mut manifest = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&manifest_path)?;
-    manifest.write_all(&BUNDLE_MAGIC)?;
-    manifest.write_all(&[0; 32])?;
-    manifest.write_all(&0_u64.to_be_bytes())?;
-    manifest.write_all(&0_u64.to_be_bytes())?;
-
+    let mut manifest = ManifestSpool::new(bundle)?;
     let mut package = PackageRootBuilder::new()?;
     let mut packer = StreamingPacker::new(PathProfile::Portable);
     for source_file in sources {
@@ -211,11 +555,7 @@ pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Erro
     }
 
     let summary = package.finish()?;
-    manifest.seek(SeekFrom::Start(8))?;
-    manifest.write_all(&summary.root)?;
-    manifest.write_all(&summary.logical_length.to_be_bytes())?;
-    manifest.write_all(&summary.entries.to_be_bytes())?;
-    manifest.sync_all()?;
+    manifest.finish(summary)?;
     File::open(&objects)?.sync_all()?;
     File::open(bundle)?.sync_all()?;
     Ok(summary)
@@ -232,7 +572,14 @@ pub fn receive_bundle(
     if receipt_path == receipt_summary_path {
         return Err(Error::InvalidArguments);
     }
+    let expected = scan_manifest(bundle)?;
     if destination.exists() {
+        if recover_prepared_receipts(receipt_path, &receipt_summary_path, &expected)? {
+            return Ok(ReceiveReport {
+                package: expected,
+                peak_staging: 0,
+            });
+        }
         return Err(Error::DestinationExists);
     }
     if receipt_path.exists() {
@@ -241,7 +588,8 @@ pub fn receive_bundle(
     if receipt_summary_path.exists() {
         return Err(Error::DestinationExists);
     }
-    let (expected, mut manifest) = read_header(&bundle.join("manifest.vot"))?;
+    clear_stale_prepared_receipts(receipt_path, &receipt_summary_path, &expected)?;
+    let mut manifest = ManifestReader::open(bundle)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
     let mut package = PackageRootBuilder::new()?;
@@ -255,8 +603,7 @@ pub fn receive_bundle(
     )?;
     let mut cached_pack: Option<([u8; 32], u64, Vec<u8>)> = None;
 
-    for _ in 0..expected.entries {
-        let record = read_record(&mut manifest)?;
+    while let Some(record) = manifest.next_record()? {
         package.push(&record)?;
         let output = output_path(&staging, &record.path)?;
         match record.storage {
@@ -299,27 +646,56 @@ pub fn receive_bundle(
             }
         }
     }
-    let mut trailing = [0; 1];
-    if manifest.read(&mut trailing)? != 0 {
-        return Err(Error::InvalidBundle);
-    }
     let actual = package.finish()?;
     if actual != expected {
         return Err(Error::RootMismatch);
     }
     let freshness = fresh_receipt_identifiers()?;
+    let receipt = publication_receipt(&actual, observed_at, freshness);
+    let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
+    let encoded = encode_authenticated(&authenticated)?;
+    let summary = receipt_summary_bytes(&actual);
+    let suffix = object_name(&actual.root);
+    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
+    let mut prepared_receipt = PreparedFile::new(receipt_path, &encoded, suffix, "receipt")?;
+    let mut prepared_summary =
+        PreparedFile::new(&receipt_summary_path, summary.as_bytes(), suffix, "summary")?;
+    if sync_directories(&staging)? == 0 {
+        return Err(Error::InvalidBundle);
+    }
+    atomic_rename_noreplace(&staging, destination)?;
+    File::open(parent_directory(destination))?.sync_all()?;
+    prepared_receipt.preserve_for_recovery();
+    prepared_summary.preserve_for_recovery();
+    finalize_prepared_receipts(
+        receipt_path,
+        &receipt_summary_path,
+        &prepared_receipt.path()?,
+        &prepared_summary.path()?,
+    )?;
+    Ok(ReceiveReport {
+        package: actual,
+        peak_staging: receiver.peak_staging(),
+    })
+}
+
+fn publication_receipt(
+    package: &PackageSummary,
+    observed_at: &str,
+    freshness: [u8; 32],
+) -> Receipt {
     let mut session_id = [0; 16];
     session_id.copy_from_slice(&freshness[..16]);
     let mut incarnation_id = [0; 16];
     incarnation_id.copy_from_slice(&freshness[16..]);
-    let receipt = Receipt {
+    Receipt {
         subject_kind: SubjectKind::Package,
         suite_id: 1,
-        subject_digest: actual.root,
-        subject_length: actual.logical_length,
+        subject_digest: package.root,
+        subject_length: package.logical_length,
         assurance: AssuranceLevel::Published,
-        profile: CommitProfile::Balanced,
-        actual_predecessor: AssuranceLevel::Durable,
+        profile: CommitProfile::Fast,
+        actual_predecessor: AssuranceLevel::TransitVerified,
         provider: 1,
         provider_version: [0, 3, 0],
         session_id,
@@ -328,27 +704,7 @@ pub fn receive_bundle(
         observed_at: observed_at.to_owned(),
         clock_source: 1,
         flags: 0,
-    };
-    let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
-    let encoded = encode_authenticated(&authenticated)?;
-    let summary = receipt_summary_bytes(&actual);
-    let suffix = object_name(&freshness);
-    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
-    let prepared_receipt = PreparedFile::new(receipt_path, &encoded, suffix, "receipt")?;
-    let prepared_summary =
-        PreparedFile::new(&receipt_summary_path, summary.as_bytes(), suffix, "summary")?;
-    if sync_directories(&staging)? == 0 {
-        return Err(Error::InvalidBundle);
     }
-    atomic_rename_noreplace(&staging, destination)?;
-    File::open(parent_directory(destination))?.sync_all()?;
-    prepared_receipt.publish()?;
-    prepared_summary.publish()?;
-    File::open(parent_directory(receipt_path))?.sync_all()?;
-    Ok(ReceiveReport {
-        package: actual,
-        peak_staging: receiver.peak_staging(),
-    })
 }
 
 fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
@@ -403,7 +759,7 @@ fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
 
 fn emit_pack(
     objects: &Path,
-    manifest: &mut File,
+    manifest: &mut ManifestSpool,
     package: &mut PackageRootBuilder,
     pack: &Pack,
 ) -> Result<(), Error> {
@@ -420,14 +776,14 @@ fn emit_pack(
             },
         };
         package.push(&record)?;
-        write_record(manifest, &record)?;
+        manifest.push(record.manifest_entry())?;
     }
     Ok(())
 }
 
 fn emit_direct(
     objects: &Path,
-    manifest: &mut File,
+    manifest: &mut ManifestSpool,
     package: &mut PackageRootBuilder,
     source: &SourceFile,
 ) -> Result<(), Error> {
@@ -456,7 +812,7 @@ fn emit_direct(
         storage: Storage::Direct,
     };
     package.push(&record)?;
-    write_record(manifest, &record)?;
+    manifest.push(record.manifest_entry())?;
     Ok(())
 }
 
@@ -493,75 +849,6 @@ fn write_object(objects: &Path, root: &[u8; 32], bytes: &[u8]) -> Result<(), Err
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-
-fn write_record(writer: &mut impl Write, record: &EntryRecord) -> Result<(), Error> {
-    let path = encode_path(&record.path)?;
-    writer.write_all(&u32_len(path.len())?.to_be_bytes())?;
-    writer.write_all(&path)?;
-    writer.write_all(&record.logical_length.to_be_bytes())?;
-    writer.write_all(&record.logical_root)?;
-    match record.storage {
-        Storage::Direct => writer.write_all(&[STORAGE_DIRECT])?,
-        Storage::Pack {
-            root,
-            length,
-            offset,
-        } => {
-            writer.write_all(&[STORAGE_PACK])?;
-            writer.write_all(&root)?;
-            writer.write_all(&length.to_be_bytes())?;
-            writer.write_all(&offset.to_be_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-fn read_header(path: &Path) -> Result<(PackageSummary, File), Error> {
-    let mut file = File::open(path)?;
-    let mut magic = [0; 8];
-    file.read_exact(&mut magic)?;
-    if magic != BUNDLE_MAGIC || file.metadata()?.len() < HEADER_BYTES {
-        return Err(Error::InvalidBundle);
-    }
-    let root = read_array(&mut file)?;
-    let logical_length = read_u64(&mut file)?;
-    let entries = read_u64(&mut file)?;
-    if entries == 0 {
-        return Err(Error::InvalidBundle);
-    }
-    Ok((
-        PackageSummary {
-            root,
-            logical_length,
-            entries,
-        },
-        file,
-    ))
-}
-
-fn read_record(reader: &mut impl Read) -> Result<EntryRecord, Error> {
-    let path_bytes = read_bounded(reader, MAX_PATH_RECORD_BYTES)?;
-    let path = decode_path(&path_bytes)?;
-    let logical_length = read_u64(reader)?;
-    let logical_root = read_array(reader)?;
-    let mut kind = [0; 1];
-    reader.read_exact(&mut kind)?;
-    let storage = match kind[0] {
-        STORAGE_DIRECT => Storage::Direct,
-        STORAGE_PACK => Storage::Pack {
-            root: read_array(reader)?,
-            length: read_u64(reader)?,
-            offset: read_u64(reader)?,
-        },
-        _ => return Err(Error::InvalidBundle),
-    };
-    Ok(EntryRecord {
-        path,
-        logical_root,
-        logical_length,
-        storage,
-    })
 }
 
 fn receive_direct(
@@ -728,54 +1015,6 @@ fn encode_path(path: &PackagePath) -> Result<Vec<u8>, Error> {
     Ok(output)
 }
 
-fn decode_path(mut input: &[u8]) -> Result<PackagePath, Error> {
-    let count = read_u16(&mut input)?;
-    let mut path = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let length = read_u16(&mut input)? as usize;
-        if input.len() < length {
-            return Err(Error::InvalidBundle);
-        }
-        let text = std::str::from_utf8(&input[..length]).map_err(|_| Error::InvalidBundle)?;
-        path.push(Component::Text(text.to_owned()));
-        input = &input[length..];
-    }
-    if !input.is_empty() {
-        return Err(Error::InvalidBundle);
-    }
-    Ok(path)
-}
-
-fn read_bounded(reader: &mut impl Read, maximum: usize) -> Result<Vec<u8>, Error> {
-    let mut length = [0; 4];
-    reader.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > maximum {
-        return Err(Error::InvalidBundle);
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn read_u16(reader: &mut impl Read) -> Result<u16, Error> {
-    let mut bytes = [0; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(u16::from_be_bytes(bytes))
-}
-
-fn read_u64(reader: &mut impl Read) -> Result<u64, Error> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn read_array(reader: &mut impl Read) -> Result<[u8; 32], Error> {
-    let mut bytes = [0; 32];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
 fn u32_len(length: usize) -> Result<u32, Error> {
     u32::try_from(length).map_err(|_| Error::InvalidBundle)
 }
@@ -807,7 +1046,7 @@ fn fresh_receipt_identifiers() -> Result<[u8; 32], Error> {
 
 struct PreparedFile {
     temporary: Option<PathBuf>,
-    destination: PathBuf,
+    cleanup: bool,
 }
 
 impl PreparedFile {
@@ -819,11 +1058,7 @@ impl PreparedFile {
         if destination.exists() {
             return Err(Error::DestinationExists);
         }
-        let name = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(Error::InvalidPath)?;
-        let temporary = destination.with_file_name(format!(".{name}.vot-{kind}-{suffix}"));
+        let temporary = prepared_output_path(destination, suffix, kind)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -832,23 +1067,154 @@ impl PreparedFile {
         file.sync_all()?;
         Ok(Self {
             temporary: Some(temporary),
-            destination: destination.to_owned(),
+            cleanup: true,
         })
     }
 
-    fn publish(mut self) -> Result<(), Error> {
-        let temporary = self.temporary.as_ref().ok_or(Error::InvalidBundle)?;
-        atomic_rename_noreplace(temporary, &self.destination)?;
-        self.temporary = None;
-        Ok(())
+    fn preserve_for_recovery(&mut self) {
+        self.cleanup = false;
+    }
+
+    fn path(&self) -> Result<PathBuf, Error> {
+        self.temporary.clone().ok_or(Error::InvalidBundle)
     }
 }
 
 impl Drop for PreparedFile {
     fn drop(&mut self) {
-        if let Some(temporary) = &self.temporary {
-            let _ = fs::remove_file(temporary);
+        if self.cleanup {
+            if let Some(temporary) = &self.temporary {
+                let _ = fs::remove_file(temporary);
+            }
         }
+    }
+}
+
+fn prepared_output_path(destination: &Path, suffix: &str, kind: &str) -> Result<PathBuf, Error> {
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Error::InvalidPath)?;
+    Ok(destination.with_file_name(format!(".{name}.vot-{kind}-{suffix}")))
+}
+
+fn clear_stale_prepared_receipts(
+    receipt: &Path,
+    summary: &Path,
+    package: &PackageSummary,
+) -> Result<(), Error> {
+    let suffix = object_name(&package.root);
+    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
+    for path in [
+        prepared_output_path(receipt, suffix, "receipt")?,
+        prepared_output_path(summary, suffix, "summary")?,
+    ] {
+        remove_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn recover_prepared_receipts(
+    receipt: &Path,
+    summary: &Path,
+    package: &PackageSummary,
+) -> Result<bool, Error> {
+    let suffix = object_name(&package.root);
+    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
+    let prepared_receipt = prepared_output_path(receipt, suffix, "receipt")?;
+    let prepared_summary = prepared_output_path(summary, suffix, "summary")?;
+    let receipt_prepared = prepared_receipt.exists();
+    let summary_prepared = prepared_summary.exists();
+    if !receipt_prepared {
+        if !summary_prepared {
+            return Ok(false);
+        }
+        return Err(Error::InvalidBundle);
+    }
+    if !summary_prepared {
+        return Err(Error::InvalidBundle);
+    }
+    if receipt.exists() && summary.exists() {
+        if !bounded_files_equal(&prepared_receipt, receipt, 65_536)? {
+            return Err(Error::DestinationExists);
+        }
+        if !bounded_files_equal(&prepared_summary, summary, 4096)? {
+            return Err(Error::DestinationExists);
+        }
+        fs::remove_file(prepared_receipt)?;
+        fs::remove_file(prepared_summary)?;
+        File::open(parent_directory(receipt))?.sync_all()?;
+        return Ok(true);
+    }
+    finalize_prepared_receipts(receipt, summary, &prepared_receipt, &prepared_summary)?;
+    Ok(true)
+}
+
+fn finalize_prepared_receipts(
+    receipt: &Path,
+    summary: &Path,
+    prepared_receipt: &Path,
+    prepared_summary: &Path,
+) -> Result<(), Error> {
+    link_or_match(prepared_receipt, receipt, 65_536)?;
+    link_or_match(prepared_summary, summary, 4096)?;
+    File::open(parent_directory(receipt))?.sync_all()?;
+    fs::remove_file(prepared_receipt)?;
+    fs::remove_file(prepared_summary)?;
+    File::open(parent_directory(receipt))?.sync_all()?;
+    Ok(())
+}
+
+fn link_or_match(prepared: &Path, destination: &Path, maximum: u64) -> Result<(), Error> {
+    match fs::hard_link(prepared, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => resolve_link_error(error, prepared, destination, maximum),
+    }
+}
+
+fn bounded_files_equal(left: &Path, right: &Path, maximum: u64) -> Result<bool, Error> {
+    let left_length = fs::metadata(left)?.len();
+    let right_length = fs::metadata(right)?.len();
+    if left_length > maximum {
+        return Ok(false);
+    }
+    if right_length > maximum {
+        return Ok(false);
+    }
+    if left_length != right_length {
+        return Ok(false);
+    }
+    Ok(fs::read(left)? == fs::read(right)?)
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) => resolve_remove_error(error),
+    }
+}
+
+fn resolve_remove_error(error: io::Error) -> Result<(), Error> {
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(Error::Io(error))
+    }
+}
+
+fn resolve_link_error(
+    error: io::Error,
+    prepared: &Path,
+    destination: &Path,
+    maximum: u64,
+) -> Result<(), Error> {
+    if error.kind() != io::ErrorKind::AlreadyExists {
+        return Err(Error::Io(error));
+    }
+    if bounded_files_equal(prepared, destination, maximum)? {
+        Ok(())
+    } else {
+        Err(Error::DestinationExists)
     }
 }
 
@@ -937,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_package_publishes_with_matching_authenticated_receipt() {
+    fn canonical_manifest_bundle_publishes_with_matching_receipt() {
         let source = temporary("source");
         let bundle = temporary("bundle");
         let destination = temporary("destination");
@@ -949,6 +1315,33 @@ mod tests {
         fs::write(source.join("large-copy.mov"), vec![0x5a; CANDIDATE_MAX + 1]).unwrap();
 
         let sent = build_bundle(&source, &bundle).unwrap();
+        let manifest_directory = bundle.join(MANIFEST_DIRECTORY);
+        let seal = decode_seal(&fs::read(manifest_directory.join(MANIFEST_SEAL)).unwrap()).unwrap();
+        assert_eq!(seal.package.root, sent.root);
+        assert_eq!(seal.package.length, sent.logical_length);
+        let mut previous = [0; 32];
+        for commitment in &seal.pages {
+            let encoded =
+                fs::read(manifest_page_path(&manifest_directory, commitment.index)).unwrap();
+            let page = decode_page(&encoded).unwrap();
+            assert_eq!(page.manifest_id, seal.manifest_id);
+            assert_eq!(page.previous_digest, previous);
+            assert_eq!(page.total, None);
+            previous = *blake3::hash(&encoded).as_bytes();
+            assert_eq!(commitment.digest, previous);
+        }
+        assert_eq!(scan_manifest(&bundle).unwrap(), sent);
+        let seal_path = manifest_directory.join(MANIFEST_SEAL);
+        let canonical_seal = encode_seal(&seal).unwrap();
+        let mut wrong_root = seal.clone();
+        wrong_root.package.root[0] ^= 1;
+        fs::write(&seal_path, encode_seal(&wrong_root).unwrap()).unwrap();
+        assert!(matches!(scan_manifest(&bundle), Err(Error::RootMismatch)));
+        let mut wrong_length = seal.clone();
+        wrong_length.package.length += 1;
+        fs::write(&seal_path, encode_seal(&wrong_length).unwrap()).unwrap();
+        assert!(matches!(scan_manifest(&bundle), Err(Error::RootMismatch)));
+        fs::write(&seal_path, canonical_seal).unwrap();
         let received = receive_bundle(
             &bundle,
             &destination,
@@ -1139,6 +1532,26 @@ mod tests {
         assert_ne!(second, [0; 32]);
         assert_ne!(first, second);
         assert_ne!(&first[..16], &first[16..]);
+        let package = PackageSummary {
+            root: [3; 32],
+            logical_length: 9,
+            entries: 1,
+        };
+        let receipt = publication_receipt(&package, "2026-07-31T23:59:59Z", first);
+        assert_eq!(receipt.session_id, first[..16]);
+        assert_eq!(receipt.incarnation_id, first[16..]);
+    }
+
+    #[test]
+    fn publication_receipt_claims_only_performed_assurance() {
+        let package = PackageSummary {
+            root: [3; 32],
+            logical_length: 9,
+            entries: 1,
+        };
+        let receipt = publication_receipt(&package, "2026-07-31T23:59:59Z", [7; 32]);
+        assert_eq!(receipt.profile, CommitProfile::Fast);
+        assert_eq!(receipt.actual_predecessor, AssuranceLevel::TransitVerified);
     }
 
     #[test]
@@ -1150,6 +1563,177 @@ mod tests {
         drop(prepared);
         assert!(!temporary.exists());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn receipt_publication_recovers_after_destination_publish() {
+        let receipt = temporary("recover-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let package = PackageSummary {
+            root: [4; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let suffix = object_name(&package.root);
+        let suffix = suffix.strip_suffix(".obj").unwrap();
+        let mut prepared_receipt =
+            PreparedFile::new(&receipt, b"authenticated", suffix, "receipt").unwrap();
+        let mut prepared_summary =
+            PreparedFile::new(&summary, b"{\"complete\":true}\\n", suffix, "summary").unwrap();
+        prepared_receipt.preserve_for_recovery();
+        prepared_summary.preserve_for_recovery();
+        let prepared_receipt_path = prepared_receipt.path().unwrap();
+        let prepared_summary_path = prepared_summary.path().unwrap();
+        drop(prepared_receipt);
+        drop(prepared_summary);
+        assert!(prepared_receipt_path.exists());
+        assert!(prepared_summary_path.exists());
+        fs::hard_link(&prepared_receipt_path, &receipt).unwrap();
+
+        assert!(recover_prepared_receipts(&receipt, &summary, &package).unwrap());
+        assert_eq!(fs::read(&receipt).unwrap(), b"authenticated");
+        assert_eq!(fs::read(&summary).unwrap(), b"{\"complete\":true}\\n");
+        assert!(!prepared_receipt_path.exists());
+        assert!(!prepared_summary_path.exists());
+        fs::remove_file(receipt).unwrap();
+        fs::remove_file(summary).unwrap();
+    }
+
+    #[test]
+    fn receipt_recovery_rejects_partial_and_conflicting_preparations() {
+        let package = PackageSummary {
+            root: [6; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let suffix = object_name(&package.root);
+        let suffix = suffix.strip_suffix(".obj").unwrap();
+
+        let receipt = temporary("only-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
+        fs::write(&prepared_receipt, b"receipt").unwrap();
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_file(prepared_receipt).unwrap();
+
+        let receipt = temporary("only-summary.cbor");
+        let summary = receipt.with_extension("json");
+        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
+        fs::write(&prepared_summary, b"summary").unwrap();
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_file(prepared_summary).unwrap();
+
+        let receipt = temporary("conflicting-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
+        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
+        fs::write(&prepared_receipt, b"expected").unwrap();
+        fs::write(&prepared_summary, b"summary").unwrap();
+        fs::write(&receipt, b"conflict").unwrap();
+        fs::write(&summary, b"summary").unwrap();
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package),
+            Err(Error::DestinationExists)
+        ));
+        fs::remove_file(prepared_receipt).unwrap();
+        fs::remove_file(prepared_summary).unwrap();
+        fs::remove_file(receipt).unwrap();
+        fs::remove_file(summary).unwrap();
+
+        let receipt = temporary("conflicting-summary.cbor");
+        let summary = receipt.with_extension("json");
+        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
+        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
+        fs::write(&prepared_receipt, b"receipt").unwrap();
+        fs::write(&prepared_summary, b"expected").unwrap();
+        fs::write(&receipt, b"receipt").unwrap();
+        fs::write(&summary, b"conflict").unwrap();
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package),
+            Err(Error::DestinationExists)
+        ));
+        fs::remove_file(prepared_receipt).unwrap();
+        fs::remove_file(prepared_summary).unwrap();
+        fs::remove_file(receipt).unwrap();
+        fs::remove_file(summary).unwrap();
+    }
+
+    #[test]
+    fn receipt_preparation_cleanup_and_file_bounds_are_exact() {
+        let package = PackageSummary {
+            root: [7; 32],
+            logical_length: 1,
+            entries: 1,
+        };
+        let receipt = temporary("stale-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let suffix = object_name(&package.root);
+        let suffix = suffix.strip_suffix(".obj").unwrap();
+        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
+        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
+        fs::write(&prepared_receipt, b"stale").unwrap();
+        fs::write(&prepared_summary, b"stale").unwrap();
+        clear_stale_prepared_receipts(&receipt, &summary, &package).unwrap();
+        assert!(!prepared_receipt.exists());
+        assert!(!prepared_summary.exists());
+        clear_stale_prepared_receipts(&receipt, &summary, &package).unwrap();
+        assert!(resolve_remove_error(io::Error::from(io::ErrorKind::NotFound)).is_ok());
+        assert!(matches!(
+            resolve_remove_error(io::Error::from(io::ErrorKind::PermissionDenied)),
+            Err(Error::Io(_))
+        ));
+
+        let left = temporary("bounded-left");
+        let right = temporary("bounded-right");
+        fs::write(&left, b"same").unwrap();
+        fs::write(&right, b"same").unwrap();
+        assert!(bounded_files_equal(&left, &right, 4).unwrap());
+        assert!(!bounded_files_equal(&left, &right, 3).unwrap());
+        fs::write(&right, b"diff").unwrap();
+        assert!(!bounded_files_equal(&left, &right, 4).unwrap());
+        fs::write(&right, b"short").unwrap();
+        assert!(!bounded_files_equal(&left, &right, 5).unwrap());
+        fs::write(&left, b"longer").unwrap();
+        assert!(!bounded_files_equal(&left, &right, 5).unwrap());
+
+        fs::write(&left, b"same").unwrap();
+        fs::write(&right, b"same").unwrap();
+        assert!(
+            resolve_link_error(
+                io::Error::from(io::ErrorKind::AlreadyExists),
+                &left,
+                &right,
+                4
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            resolve_link_error(
+                io::Error::from(io::ErrorKind::PermissionDenied),
+                &left,
+                &right,
+                4
+            ),
+            Err(Error::Io(_))
+        ));
+        fs::write(&right, b"nope").unwrap();
+        assert!(matches!(
+            resolve_link_error(
+                io::Error::from(io::ErrorKind::AlreadyExists),
+                &left,
+                &right,
+                4
+            ),
+            Err(Error::DestinationExists)
+        ));
+        fs::remove_file(left).unwrap();
+        fs::remove_file(right).unwrap();
     }
 
     #[test]
@@ -1246,7 +1830,6 @@ mod tests {
 
     #[test]
     fn package_boundaries_and_conflicts_are_exact() {
-        assert_eq!(HEADER_BYTES, 56);
         let missing = temporary("missing-source");
         let bundle = temporary("existing-bundle");
         fs::create_dir(&bundle).unwrap();
@@ -1308,33 +1891,12 @@ mod tests {
             Err(Error::RootMismatch)
         ));
 
-        let mut exact = Vec::new();
-        exact.extend_from_slice(&4_u32.to_be_bytes());
-        exact.extend_from_slice(b"four");
-        assert_eq!(read_bounded(&mut exact.as_slice(), 4).unwrap(), b"four");
-        let mut over = Vec::new();
-        over.extend_from_slice(&5_u32.to_be_bytes());
-        over.extend_from_slice(b"12345");
+        let over = directory.join("over");
+        fs::write(&over, vec![0; 5]).unwrap();
+        assert_eq!(read_bounded_file(&over, 5).unwrap(), vec![0; 5]);
         assert!(matches!(
-            read_bounded(&mut over.as_slice(), 4),
+            read_bounded_file(&over, 4),
             Err(Error::InvalidBundle)
-        ));
-
-        let header = temporary("header");
-        let mut valid = Vec::new();
-        valid.extend_from_slice(&BUNDLE_MAGIC);
-        valid.extend_from_slice(&[4; 32]);
-        valid.extend_from_slice(&0_u64.to_be_bytes());
-        valid.extend_from_slice(&1_u64.to_be_bytes());
-        fs::write(&header, &valid).unwrap();
-        assert!(read_header(&header).is_ok());
-        valid[0] ^= 1;
-        fs::write(&header, &valid).unwrap();
-        assert!(matches!(read_header(&header), Err(Error::InvalidBundle)));
-        fs::write(&header, &valid[..55]).unwrap();
-        assert!(matches!(
-            read_header(&header),
-            Err(Error::InvalidBundle | Error::Io(_))
         ));
 
         assert_eq!(parent_directory(Path::new("receipt")), Path::new("."));
@@ -1381,7 +1943,175 @@ mod tests {
         fs::create_dir(directory.join("nested")).unwrap();
         assert_eq!(sync_directories(&directory).unwrap(), 2);
 
-        fs::remove_file(header).unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn manifest_record_validation_rejects_each_wrong_field() {
+        let logical = ObjectId {
+            suite: 2,
+            root: [3; 32],
+            length: 3,
+        };
+        let direct = ManifestEntry {
+            path: vec![Component::Text("file".to_owned())],
+            kind: EntryKind::File,
+            length: Some(3),
+            storage: Some(StorageRef::Direct(logical.clone())),
+            metadata: None,
+        };
+        assert!(EntryRecord::from_manifest(direct.clone()).is_ok());
+
+        let mut wrong = direct.clone();
+        wrong.kind = EntryKind::Directory;
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+        wrong = direct.clone();
+        wrong.metadata = Some(vot_manifest::FileMetadata::default());
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+        wrong = direct.clone();
+        wrong.length = None;
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+        wrong = direct.clone();
+        wrong.storage = None;
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+        wrong = direct.clone();
+        wrong.storage = Some(StorageRef::Direct(ObjectId {
+            suite: 1,
+            ..logical.clone()
+        }));
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+        wrong = direct.clone();
+        wrong.storage = Some(StorageRef::Direct(ObjectId {
+            length: 2,
+            ..logical.clone()
+        }));
+        assert!(EntryRecord::from_manifest(wrong).is_err());
+
+        let pack = ObjectId {
+            suite: 2,
+            root: [4; 32],
+            length: 8,
+        };
+        let packed = |pack: ObjectId, length: u64, logical: ObjectId| ManifestEntry {
+            storage: Some(StorageRef::Pack {
+                pack,
+                offset: 0,
+                length,
+                logical,
+            }),
+            ..direct.clone()
+        };
+        assert!(EntryRecord::from_manifest(packed(pack.clone(), 3, logical.clone())).is_ok());
+        assert!(
+            EntryRecord::from_manifest(packed(
+                ObjectId {
+                    suite: 1,
+                    ..pack.clone()
+                },
+                3,
+                logical.clone()
+            ))
+            .is_err()
+        );
+        assert!(
+            EntryRecord::from_manifest(packed(
+                pack.clone(),
+                3,
+                ObjectId {
+                    suite: 1,
+                    ..logical.clone()
+                }
+            ))
+            .is_err()
+        );
+        assert!(EntryRecord::from_manifest(packed(pack.clone(), 2, logical.clone())).is_err());
+        assert!(
+            EntryRecord::from_manifest(packed(
+                pack,
+                3,
+                ObjectId {
+                    length: 2,
+                    ..logical
+                }
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_page_bounds_and_envelope_checks_are_exact() {
+        assert!(!page_needs_flush(0, vot_manifest::MAX_PAGE_BYTES, 1).unwrap());
+        assert!(page_needs_flush(vot_manifest::MAX_ENTRIES_PER_PAGE, 0, 1).unwrap());
+        assert!(!page_needs_flush(1, vot_manifest::MAX_PAGE_BYTES - 1, 1).unwrap());
+        assert!(page_needs_flush(1, vot_manifest::MAX_PAGE_BYTES, 1).unwrap());
+        assert!(page_needs_flush(1, usize::MAX, 1).is_err());
+
+        let mut page = ManifestPage {
+            manifest_id: [1; 16],
+            index: 0,
+            total: None,
+            previous_digest: [0; 32],
+            profile: PathProfile::Portable,
+            entries: Vec::new(),
+        };
+        let seal = Seal {
+            manifest_id: [1; 16],
+            final_page_count: 1,
+            final_page_digest: [2; 32],
+            package: ObjectId {
+                suite: 1,
+                root: [3; 32],
+                length: 0,
+            },
+            pages: vec![PageCommitment {
+                index: 0,
+                digest: [2; 32],
+            }],
+        };
+        let mut commitment = seal.pages[0].clone();
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_ok());
+        page.manifest_id = [9; 16];
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+        page.manifest_id = seal.manifest_id;
+        page.index = 1;
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+        page.index = 0;
+        page.total = Some(2);
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+        page.total = Some(1);
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_ok());
+        page.previous_digest = [8; 32];
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+        page.previous_digest = [0; 32];
+        commitment.index = 1;
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+        commitment.index = 0;
+        commitment.digest = [7; 32];
+        assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
+    }
+
+    #[test]
+    fn package_root_builder_contributes_every_record_field() {
+        let record = EntryRecord {
+            path: vec![Component::Text("a".to_owned())],
+            logical_root: [5; 32],
+            logical_length: 3,
+            storage: Storage::Direct,
+        };
+        let path = encode_path(&record.path).unwrap();
+        assert_eq!(path, [0, 1, 0, 1, b'a']);
+        let mut transcript = Vec::from(PACKAGE_DOMAIN);
+        transcript.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
+        transcript.extend_from_slice(&path);
+        transcript.extend_from_slice(&2_u16.to_be_bytes());
+        transcript.extend_from_slice(&record.logical_length.to_be_bytes());
+        transcript.extend_from_slice(&record.logical_root);
+        let expected = vot_verifier::root(Suite::Blake3Bao64, &transcript).unwrap();
+        let mut builder = PackageRootBuilder::new().unwrap();
+        builder.push(&record).unwrap();
+        let package = builder.finish().unwrap();
+        assert_eq!(package.root, expected);
+        assert_eq!(package.logical_length, 3);
+        assert_eq!(package.entries, 1);
     }
 }

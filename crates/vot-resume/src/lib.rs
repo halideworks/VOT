@@ -26,6 +26,7 @@ pub enum Error {
     InvalidUnit,
     UnitAlreadyActive,
     UnitNotActive,
+    CheckpointRequired,
     IdentityMismatch,
 }
 
@@ -170,9 +171,13 @@ impl ResumeTracker {
     /// Returns true when the checkpoint window is full and should be persisted.
     pub fn complete_unit(&mut self, unit: u64) -> Result<bool, Error> {
         self.validate_unit(unit)?;
-        if !self.active.remove(&unit) {
+        if !self.active.contains(&unit) {
             return Err(Error::UnitNotActive);
         }
+        if self.completed_since_checkpoint.len() >= self.checkpoint_window {
+            return Err(Error::CheckpointRequired);
+        }
+        self.active.remove(&unit);
         self.completed_since_checkpoint.insert(unit);
         Ok(self.completed_since_checkpoint.len() >= self.checkpoint_window)
     }
@@ -370,6 +375,7 @@ impl CarefulResumeCache {
             return Err(PathReject::InitialFlightUnacknowledged);
         }
         if input.congestion_detected {
+            self.saved.remove(&saved_endpoint);
             return Err(PathReject::Congestion);
         }
         if input.current_min_rtt.saturating_mul(2) <= saved.observation.saved_rtt {
@@ -622,6 +628,28 @@ mod tests {
     }
 
     #[test]
+    fn full_window_blocks_completion_until_checkpoint_succeeds() {
+        let path = temp_path("full-window");
+        let mut store = ResumeStore::open(&path).unwrap();
+        let mut tracker = ResumeTracker::discover(&store, subject(7), 4, 2).unwrap();
+        for unit in 0..3 {
+            tracker.begin_unit(unit).unwrap();
+        }
+        assert!(!tracker.complete_unit(0).unwrap());
+        assert!(tracker.complete_unit(1).unwrap());
+        assert!(matches!(
+            tracker.complete_unit(2),
+            Err(Error::CheckpointRequired)
+        ));
+        assert_eq!(tracker.retransmission_units_after_crash(), 3);
+        assert_eq!(tracker.retransmission_bound(), 3);
+        tracker.checkpoint(&mut store).unwrap();
+        assert!(!tracker.complete_unit(2).unwrap());
+        assert_eq!(tracker.retransmission_units_after_crash(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn store_and_unit_bounds_are_exact_and_checkpoint_failure_is_atomic() {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
         assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_832);
@@ -779,6 +807,47 @@ mod tests {
     }
 
     #[test]
+    fn reconnaissance_congestion_discards_saved_state() {
+        let endpoint = RemoteEndpoint {
+            interface: 1,
+            destination: [8; 16],
+            dscp: 1,
+        };
+        let observation = Observation {
+            saved_cwnd: 1_000,
+            saved_rtt: 100,
+            expires_at: 1_000,
+            configuration_epoch: 4,
+        };
+        let input = Reconnaissance {
+            now: 1,
+            current_min_rtt: 100,
+            initial_flight_acknowledged: true,
+            congestion_detected: true,
+            local_path_changed: false,
+            configuration_epoch: 4,
+            max_jump: 900,
+        };
+        let mut cache = CarefulResumeCache::default();
+        cache.observe(endpoint, observation).unwrap();
+        assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, input),
+            Err(PathReject::Congestion)
+        );
+        assert_eq!(
+            cache.reconnoitre(
+                endpoint,
+                endpoint,
+                Reconnaissance {
+                    congestion_detected: false,
+                    ..input
+                }
+            ),
+            Err(PathReject::Unknown)
+        );
+    }
+
+    #[test]
     fn careful_resume_rejects_each_condition_and_accepts_exact_rtt_edge() {
         let endpoint = RemoteEndpoint {
             interface: 1,
@@ -860,6 +929,7 @@ mod tests {
             ),
             Err(PathReject::Congestion)
         );
+        cache.observe(endpoint, observation).unwrap();
         assert_eq!(
             cache.reconnoitre(
                 endpoint,

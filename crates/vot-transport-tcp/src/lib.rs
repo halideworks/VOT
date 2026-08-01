@@ -190,8 +190,11 @@ impl TlsClientCarrier {
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         // A rustls client leaves the handshake only after certificate and
-        // server-name validation succeeds under its ClientConfig.
+        // server-name validation succeeds under its ClientConfig. Plaintext is
+        // VOT data only when the peer also selected the VOT application
+        // protocol.
         !self.connection.is_handshaking()
+            && self.connection.alpn_protocol() == Some(vot_transport_api::ALPN)
     }
 
     pub fn read_tls(&mut self, reader: &mut dyn Read) -> Result<usize, TlsError> {
@@ -572,6 +575,52 @@ mod tests {
         let mut reply = [0; 5];
         assert_eq!(client.read_vot_bytes(&mut reply).unwrap(), 5);
         assert_eq!(&reply, b"reply");
+    }
+
+    #[test]
+    fn completed_tls_without_vot_alpn_exposes_no_plaintext() {
+        let certificate = CertificateDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_CERT)
+                .unwrap(),
+        );
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(TEST_KEY)
+                .unwrap(),
+        ));
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![vot_transport_api::ALPN.to_vec()];
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .unwrap();
+
+        let name = ServerName::try_from("vot.test").unwrap().to_owned();
+        let mut client = TlsClientCarrier::new(Arc::new(client_config), name).unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
+        for _ in 0..8 {
+            transfer_client_to_server(&mut client, &mut server);
+            transfer_server_to_client(&mut server, &mut client);
+            if !client.connection.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.connection.is_handshaking());
+        assert_eq!(client.connection.alpn_protocol(), None);
+        assert!(!client.is_authenticated());
+        assert!(matches!(
+            client.queue_vot_bytes(b"frame"),
+            Err(TlsError::NotAuthenticated)
+        ));
+        assert!(matches!(
+            client.read_vot_bytes(&mut [0; 1]),
+            Err(TlsError::NotAuthenticated)
+        ));
     }
 
     #[test]

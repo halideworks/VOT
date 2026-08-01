@@ -37,5 +37,7 @@ These checks close correctness findings left on merged pull requests.
 | macOS linked publication retry | Retry `hard_link` after the first link succeeded but directory sync failed | `macos_namespace_failure_retains_staging` recognizes the same inode and resumes at the namespace barrier |
 | Delayed Careful Resume release | Clear `in_use` without matching the permit owner | `delayed_release_cannot_clear_a_newer_permit_owner` proves the newer connection remains exclusive |
 | Unbounded inbound transport callbacks | Queue native TCP or MsQuic events without count, byte, or record limits | Both inbound backpressure tests reject full queues and oversized peer-controlled records |
+| Symlink mistaken for linked publication | Follow a destination symlink while comparing file identity | `native_same_file_identity_is_exact` requires the destination itself to be a regular file and rejects the symlink |
+| Windows linked publication retry | Retry `hard_link` after publication succeeded but staging cleanup failed | `windows_cleanup_failure_recovers_the_existing_link` recognizes the same file identity and retries cleanup without relinking |
 
 The safe TLC capability model explores 2,389,496 distinct states without violation. `CommitUnsupportedAdvance.cfg` reaches `PUBLISHED` for an unsupported profile and TLC reports `Invariant UnsupportedNeverAdvanced is violated`.

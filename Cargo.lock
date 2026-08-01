@@ -2062,6 +2062,7 @@ dependencies = [
 name = "vot-commit-platform"
 version = "0.0.1"
 dependencies = [
+ "vot-platform-fs",
  "vot-receipt",
 ]
 

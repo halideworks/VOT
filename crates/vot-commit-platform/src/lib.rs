@@ -157,23 +157,7 @@ impl Operations for NativeOperations {
     }
 
     fn same_file(&mut self, source: &Path, destination: &Path) -> Result<bool, Error> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-
-            let source = fs::metadata(source)?;
-            let destination = match fs::metadata(destination) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => return Err(Error::Io(error)),
-            };
-            Ok(source.dev() == destination.dev() && source.ino() == destination.ino())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (source, destination);
-            Err(Error::UnsupportedPlatform)
-        }
+        vot_platform_fs::same_file_regular(source, destination).map_err(Error::Io)
     }
 
     fn link(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
@@ -215,8 +199,8 @@ fn publish_with(
     if profile == CommitProfile::Balanced {
         operations.sync_file(staging)?;
     }
-    let already_linked =
-        platform == Platform::MacOs && operations.same_file(staging, destination)?;
+    let already_linked = matches!(platform, Platform::Windows | Platform::MacOs)
+        && operations.same_file(staging, destination)?;
     if !already_linked {
         operations.link(staging, destination)?;
     }
@@ -280,10 +264,17 @@ mod tests {
         ReplaceDestination,
     }
 
+    #[derive(Clone, Copy)]
+    enum RemoveBehavior {
+        Fail,
+        Succeed,
+    }
+
     struct FaultOperations {
         trace: Vec<&'static str>,
         linked: bool,
         sync_behavior: SyncBehavior,
+        remove_behavior: RemoveBehavior,
         removed: bool,
     }
 
@@ -309,6 +300,9 @@ mod tests {
 
         fn remove(&mut self, _path: &Path) -> Result<(), Error> {
             self.trace.push("remove");
+            if matches!(self.remove_behavior, RemoveBehavior::Fail) {
+                return Err(Error::Io(io::Error::other("injected removal failure")));
+            }
             self.removed = true;
             Ok(())
         }
@@ -384,7 +378,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn native_same_file_identity_is_exact() {
         let root = directory("same-file");
@@ -398,6 +392,12 @@ mod tests {
         let mut operations = NativeOperations;
         assert!(operations.same_file(&source, &linked).unwrap());
         assert!(!operations.same_file(&source, &other).unwrap());
+        #[cfg(unix)]
+        {
+            let symlink = root.join("symlink");
+            std::os::unix::fs::symlink(&source, &symlink).unwrap();
+            assert!(!operations.same_file(&source, &symlink).unwrap());
+        }
         assert!(
             !operations
                 .same_file(&source, &root.join("missing"))
@@ -458,7 +458,7 @@ mod tests {
             &mut windows,
         )
         .unwrap();
-        assert_eq!(windows.trace, ["link", "remove"]);
+        assert_eq!(windows.trace, ["same-file", "link", "remove"]);
 
         let mut macos = RecordingOperations::default();
         publish_with(
@@ -488,6 +488,7 @@ mod tests {
             trace: Vec::new(),
             linked: false,
             sync_behavior: SyncBehavior::Fail,
+            remove_behavior: RemoveBehavior::Succeed,
             removed: false,
         };
         assert!(matches!(
@@ -534,6 +535,7 @@ mod tests {
             trace: Vec::new(),
             linked: false,
             sync_behavior: SyncBehavior::ReplaceDestination,
+            remove_behavior: RemoveBehavior::Succeed,
             removed: false,
         };
         assert!(matches!(
@@ -547,6 +549,43 @@ mod tests {
             Err(Error::InvalidLayout)
         ));
         assert!(!replaced.removed);
+    }
+
+    #[test]
+    fn windows_cleanup_failure_recovers_the_existing_link() {
+        let mut operations = FaultOperations {
+            trace: Vec::new(),
+            linked: false,
+            sync_behavior: SyncBehavior::Succeed,
+            remove_behavior: RemoveBehavior::Fail,
+            removed: false,
+        };
+        assert!(matches!(
+            publish_with(
+                Platform::Windows,
+                Path::new("root/staging"),
+                Path::new("root/destination"),
+                CommitProfile::Fast,
+                &mut operations,
+            ),
+            Err(Error::Io(_))
+        ));
+        assert!(operations.linked);
+        assert!(!operations.removed);
+        operations.remove_behavior = RemoveBehavior::Succeed;
+        publish_with(
+            Platform::Windows,
+            Path::new("root/staging"),
+            Path::new("root/destination"),
+            CommitProfile::Fast,
+            &mut operations,
+        )
+        .unwrap();
+        assert!(operations.removed);
+        assert_eq!(
+            operations.trace,
+            ["same-file", "link", "remove", "same-file", "remove"]
+        );
     }
 
     #[test]

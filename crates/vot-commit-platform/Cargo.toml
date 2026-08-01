@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+vot-platform-fs = { path = "../vot-platform-fs" }
 vot-receipt = { path = "../vot-receipt" }
 
 [lints]

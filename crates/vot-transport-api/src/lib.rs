@@ -272,6 +272,36 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct ContractAdapter {
+        controls: Vec<Vec<u8>>,
+        reliable: Vec<(StreamId, Vec<u8>)>,
+        events: VecDeque<Event>,
+        credits: Vec<u64>,
+    }
+
+    impl TransportAdapter for ContractAdapter {
+        fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
+            self.controls.push(frame.to_vec());
+            Ok(())
+        }
+
+        fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+            self.reliable.push((stream, record.to_vec()));
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Option<Event> {
+            self.events.pop_front()
+        }
+
+        fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
+            self.credits.push(bytes);
+            Ok(())
+        }
+    }
 
     #[test]
     fn flow_credit_is_derived_from_remaining_staging() {
@@ -325,5 +355,69 @@ mod tests {
         let ack = TransportAck::new(17, 42);
         assert_eq!(ack.stream(), StreamId(17));
         assert_eq!(ack.sequence(), 42);
+    }
+
+    #[test]
+    fn default_transport_methods_delegate_and_bound_batches() {
+        assert_eq!(ALPN, b"vot-draft-03");
+        assert_eq!(
+            MAX_CONTROL_FRAME_PAYLOAD,
+            vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD
+        );
+        assert_eq!(MAX_DATAGRAM_BYTES, 64 * 1024);
+
+        let payload = shared_payload(b"control");
+        assert_eq!(&*payload, b"control");
+
+        let mut adapter = ContractAdapter::default();
+        adapter.send_control_shared(payload).unwrap();
+        assert_eq!(adapter.controls, vec![b"control".to_vec()]);
+
+        let records = [shared_payload(b"one"), shared_payload(b"two")];
+        adapter
+            .send_reliable_shared(StreamId(7), records[0].clone())
+            .unwrap();
+        adapter
+            .send_reliable_batch(StreamId(7), &records[1..])
+            .unwrap();
+        assert_eq!(
+            adapter.reliable,
+            vec![
+                (StreamId(7), b"one".to_vec()),
+                (StreamId(7), b"two".to_vec()),
+            ]
+        );
+
+        assert_eq!(
+            adapter.send_datagram(9, b"unreliable"),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(adapter.flush(), Ok(()));
+        assert_eq!(adapter.path_stats(), None);
+
+        adapter.events.push_back(Event::Connected(ConnectionId(1)));
+        adapter
+            .events
+            .push_back(Event::Disconnected(ConnectionId(1)));
+        adapter
+            .events
+            .push_back(Event::Acknowledged(TransportAck::new(7, 1)));
+        let mut events = Vec::new();
+        assert_eq!(adapter.poll_batch(&mut events, 2), 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(adapter.poll_batch(&mut events, 2), 1);
+        assert_eq!(events.len(), 3);
+        assert_eq!(adapter.poll_batch(&mut events, 0), 0);
+        assert!(adapter.poll().is_none());
+    }
+
+    #[test]
+    fn bdp_target_updates_are_observable_through_credit() {
+        let mut staging = StagingCapacity::new(1024, 1, 900).unwrap();
+        assert_eq!(staging.advertised_credit(), 1);
+        staging.set_bdp_target(800);
+        assert_eq!(staging.advertised_credit(), 800);
+        staging.reserve(300).unwrap();
+        assert_eq!(staging.advertised_credit(), 724);
     }
 }

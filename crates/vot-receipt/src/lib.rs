@@ -365,6 +365,7 @@ mod tests {
             "2026-07-31T20:00:00+00:00",
             "2026-07-31t20:00:00z",
             "2026-07-31t20:00:00Z",
+            "2026-07-31T20:00:00z",
         ] {
             receipt.observed_at = valid.to_owned();
             assert_eq!(receipt.validate(), Ok(()), "{valid}");

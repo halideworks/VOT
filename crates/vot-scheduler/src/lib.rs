@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use vot_transport_api::{ConnectionId, StagingCapacity, SubjectId, TransportAck};
-use vot_verifier::{StreamVerifier, Suite};
+use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
+
+const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -77,10 +79,13 @@ impl ReliableReceiver {
         if self.active.contains_key(&subject) {
             return Err(Error::AlreadyReceiving);
         }
+        let verifier = StreamVerifier::new(suite(subject.suite)?);
+        self.staging.reserve(VERIFIER_RESERVATION)?;
+        self.peak_staging = self.peak_staging.max(self.staging.used());
         self.active.insert(
             subject,
             ActiveObject {
-                verifier: StreamVerifier::new(suite(subject.suite)?),
+                verifier,
                 received: 0,
             },
         );
@@ -128,6 +133,7 @@ impl ReliableReceiver {
             return Ok(());
         }
         let active = self.active.remove(&subject).ok_or(Error::UnknownObject)?;
+        self.staging.release(VERIFIER_RESERVATION);
         if active.received != subject.length {
             return Err(Error::LengthMismatch);
         }
@@ -252,7 +258,7 @@ mod tests {
             vot_transport_sim::Outcome::Complete { published: 1 }
         ));
 
-        let mut receiver = ReliableReceiver::new(300_000, 256_000, 300_000).unwrap();
+        let mut receiver = ReliableReceiver::new(400_000, 256_000, 400_000).unwrap();
         assert_eq!(receiver.advertised_credit(), 256_000);
         receiver.connected(ConnectionId(1));
         assert_eq!(receiver.connection_count(), 1);
@@ -262,14 +268,14 @@ mod tests {
         }
         receiver.finish(subject).unwrap();
         assert!(receiver.is_verified(subject));
-        assert_eq!(receiver.peak_staging(), 256 * 1024);
+        assert_eq!(receiver.peak_staging(), 256 * 1024 + VERIFIER_RESERVATION);
     }
 
     #[test]
     fn verified_state_survives_disconnect_and_ack_has_no_assurance_effect() {
         let bytes = b"verified object";
         let subject = subject(bytes);
-        let mut receiver = ReliableReceiver::new(1024, 1024, 1024).unwrap();
+        let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
         receiver.connected(ConnectionId(1));
         assert_eq!(receiver.connection_count(), 1);
         receiver.begin(subject).unwrap();
@@ -291,7 +297,7 @@ mod tests {
         let bytes = b"expected";
         let mut wrong = subject(bytes);
         wrong.root[0] ^= 1;
-        let mut receiver = ReliableReceiver::new(1024, 1024, 1024).unwrap();
+        let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
         receiver.begin(wrong).unwrap();
         receiver.receive(wrong, bytes).unwrap();
         assert_eq!(receiver.finish(wrong), Err(Error::RootMismatch));
@@ -331,10 +337,31 @@ mod tests {
             root: vot_verifier::root(Suite::Sha256Bep52, bytes).unwrap(),
             length: bytes.len() as u64,
         };
-        let mut receiver = ReliableReceiver::new(1024, 1024, 1024).unwrap();
+        let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
         receiver.begin(subject).unwrap();
         receiver.receive(subject, bytes).unwrap();
         receiver.finish(subject).unwrap();
         assert!(receiver.is_verified(subject));
+    }
+
+    #[test]
+    fn active_verifiers_are_bounded_by_staging_capacity() {
+        let first = subject(b"first");
+        let second = subject(b"second");
+        let mut receiver = ReliableReceiver::new(
+            VERIFIER_RESERVATION,
+            VERIFIER_RESERVATION,
+            VERIFIER_RESERVATION,
+        )
+        .unwrap();
+        receiver.begin(first).unwrap();
+        assert_eq!(receiver.advertised_credit(), 0);
+        assert_eq!(
+            receiver.begin(second),
+            Err(Error::Staging(vot_transport_api::Error::StagingExhausted))
+        );
+        receiver.receive(first, b"first").unwrap_err();
+        assert_eq!(receiver.finish(first), Err(Error::LengthMismatch));
+        receiver.begin(second).unwrap();
     }
 }

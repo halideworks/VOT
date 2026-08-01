@@ -44,14 +44,46 @@ pub enum NativeDatagramSendState {
     Canceled,
 }
 
-/// Owns bounded outbound commands and events translated from `MsQuic` callbacks.
-#[derive(Default)]
+const DEFAULT_COMMAND_COUNT_LIMIT: usize = 64;
+const DEFAULT_COMMAND_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Owns a bounded outbound command queue and translates `MsQuic` callbacks.
 pub struct MsQuicAdapter {
     commands: VecDeque<Command>,
+    command_bytes: usize,
+    command_count_limit: usize,
+    command_byte_limit: usize,
     events: VecDeque<Event>,
 }
 
+impl Default for MsQuicAdapter {
+    fn default() -> Self {
+        Self {
+            commands: VecDeque::new(),
+            command_bytes: 0,
+            command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
+            command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
+            events: VecDeque::new(),
+        }
+    }
+}
+
 impl MsQuicAdapter {
+    /// Creates an adapter with explicit outbound queue limits.
+    ///
+    /// # Errors
+    /// Rejects a zero command-count or byte limit.
+    pub fn with_queue_limits(command_count: usize, command_bytes: usize) -> Result<Self, Error> {
+        if command_count == 0 || command_bytes == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            command_count_limit: command_count,
+            command_byte_limit: command_bytes,
+            ..Self::default()
+        })
+    }
+
     pub fn record_native_event(&mut self, event: NativeEvent) {
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
@@ -85,7 +117,31 @@ impl MsQuicAdapter {
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
-        self.commands.pop_front()
+        let command = self.commands.pop_front()?;
+        self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
+        Some(command)
+    }
+
+    fn enqueue(&mut self, command: Command) -> Result<(), Error> {
+        let next_bytes = self
+            .command_bytes
+            .checked_add(command.payload_len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        if self.commands.len() >= self.command_count_limit || next_bytes > self.command_byte_limit {
+            return Err(Error::OutboundQueueFull);
+        }
+        self.commands.push_back(command);
+        self.command_bytes = next_bytes;
+        Ok(())
+    }
+}
+
+impl Command {
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Control(bytes) | Self::Reliable { bytes, .. } => bytes.len(),
+            Self::ReceiveCredit(_) => 0,
+        }
     }
 }
 
@@ -94,17 +150,15 @@ impl TransportAdapter for MsQuicAdapter {
         if frame.len() > vot_codec_limit() {
             return Err(Error::RecordTooLarge);
         }
-        self.commands.push_back(Command::Control(frame.to_vec()));
-        Ok(())
+        self.enqueue(Command::Control(frame.to_vec()))
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
         vot_transport_api::validate_data_record(record)?;
-        self.commands.push_back(Command::Reliable {
+        self.enqueue(Command::Reliable {
             stream,
             bytes: record.to_vec(),
-        });
-        Ok(())
+        })
     }
 
     fn poll(&mut self) -> Option<Event> {
@@ -112,8 +166,7 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
-        self.commands.push_back(Command::ReceiveCredit(bytes));
-        Ok(())
+        self.enqueue(Command::ReceiveCredit(bytes))
     }
 }
 
@@ -164,14 +217,17 @@ pub mod live {
         flags: SendFlags,
     ) -> Result<(), msquic::Status> {
         let context = Box::new(SendBuffer::new(bytes));
-        let pointer = context.as_ref() as *const SendBuffer;
-        // SAFETY: storage owns the allocation referenced by buffers. The whole
-        // context is detached only after Stream::send succeeds and is reclaimed
-        // exactly once by complete_send from the SendComplete callback.
+        let pointer = Box::into_raw(context);
+        // SAFETY: pointer owns storage referenced by buffers before MsQuic can
+        // invoke SendComplete. A successful call transfers sole ownership to
+        // complete_send. An immediate failure cannot produce SendComplete, so
+        // this function reconstructs and drops the allocation below.
         let result =
-            unsafe { stream.send(context.buffers.as_ref(), flags, pointer.cast::<c_void>()) };
-        if result.is_ok() {
-            let _ = Box::into_raw(context);
+            unsafe { stream.send((*pointer).buffers.as_ref(), flags, pointer.cast::<c_void>()) };
+        if result.is_err() {
+            // SAFETY: MsQuic rejected the send synchronously and therefore did
+            // not accept the context or schedule a SendComplete callback.
+            drop(unsafe { Box::from_raw(pointer) });
         }
         result
     }
@@ -497,6 +553,28 @@ mod tests {
             adapter.send_control(&vec![0; vot_codec_limit() + 1]),
             Err(Error::RecordTooLarge)
         );
+    }
+
+    #[test]
+    fn outbound_queue_applies_count_and_byte_backpressure() {
+        assert_eq!(
+            MsQuicAdapter::with_queue_limits(0, 1).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        let mut adapter = MsQuicAdapter::with_queue_limits(2, 5).unwrap();
+        adapter.send_control(b"123").unwrap();
+        adapter.send_reliable(StreamId(1), b"45").unwrap();
+        assert_eq!(adapter.set_receive_credit(1), Err(Error::OutboundQueueFull));
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Control(b"123".to_vec()))
+        );
+        assert_eq!(adapter.send_control(b"6789"), Err(Error::OutboundQueueFull));
+        assert!(matches!(
+            adapter.next_command(),
+            Some(Command::Reliable { .. })
+        ));
+        adapter.send_control(b"6789").unwrap();
     }
 
     #[cfg(feature = "live")]

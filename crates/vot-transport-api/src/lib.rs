@@ -82,6 +82,7 @@ pub enum Event {
 pub enum Error {
     InvalidConfiguration,
     RecordTooLarge,
+    OutboundQueueFull,
     StagingExhausted,
     ArithmeticOverflow,
     Backend,

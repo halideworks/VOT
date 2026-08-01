@@ -494,6 +494,64 @@ fn scan_manifest(bundle: &Path) -> Result<PackageSummary, Error> {
     Ok(actual)
 }
 
+fn validate_published_destination(
+    bundle: &Path,
+    destination: &Path,
+    expected: &PackageSummary,
+) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(destination)?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::InvalidBundle);
+    }
+    let mut file_count = 0_u64;
+    count_published_files(destination, 0, &mut file_count)?;
+    if file_count != expected.entries {
+        return Err(Error::InvalidBundle);
+    }
+
+    let mut reader = ManifestReader::open(bundle)?;
+    let mut package = PackageRootBuilder::new()?;
+    while let Some(record) = reader.next_record()? {
+        package.push(&record)?;
+        let output = output_path(destination, &record.path)?;
+        let metadata = fs::symlink_metadata(&output)?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::InvalidBundle);
+        }
+        let root = match stream_root(&output, record.logical_length) {
+            Ok(root) => root,
+            Err(Error::SourceMutation) => return Err(Error::RootMismatch),
+            Err(error) => return Err(error),
+        };
+        if root != record.logical_root {
+            return Err(Error::RootMismatch);
+        }
+    }
+    let actual = package.finish()?;
+    if actual != *expected {
+        return Err(Error::RootMismatch);
+    }
+    Ok(())
+}
+
+fn count_published_files(directory: &Path, depth: usize, count: &mut u64) -> Result<(), Error> {
+    if depth > vot_manifest::MAX_PATH_COMPONENTS {
+        return Err(Error::InvalidBundle);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            *count = count.checked_add(1).ok_or(Error::InvalidBundle)?;
+        } else if file_type.is_dir() {
+            count_published_files(&entry.path(), depth + 1, count)?;
+        } else {
+            return Err(Error::InvalidBundle);
+        }
+    }
+    Ok(())
+}
+
 fn manifest_page_path(directory: &Path, index: u64) -> PathBuf {
     directory.join(format!("{index:016}.cbor"))
 }
@@ -582,6 +640,16 @@ pub fn receive_bundle(
     }
     let expected = scan_manifest(bundle)?;
     if destination.exists() {
+        let (prepared_receipt, prepared_summary) =
+            prepared_receipt_paths(receipt_path, &receipt_summary_path, &expected)?;
+        if !receipt_path.exists()
+            && !receipt_summary_path.exists()
+            && !prepared_receipt.exists()
+            && !prepared_summary.exists()
+        {
+            return Err(Error::DestinationExists);
+        }
+        validate_published_destination(bundle, destination, &expected)?;
         if recover_prepared_receipts(receipt_path, &receipt_summary_path, &expected, key)? {
             return Ok(ReceiveReport {
                 package: expected,
@@ -1168,37 +1236,44 @@ fn recover_prepared_receipts(
     let (prepared_receipt, prepared_summary) = prepared_receipt_paths(receipt, summary, package)?;
     let receipt_prepared = prepared_receipt.exists();
     let summary_prepared = prepared_summary.exists();
-    if !receipt_prepared {
-        if !summary_prepared {
-            return match (receipt.exists(), summary.exists()) {
-                (false, false) => Ok(false),
-                (true, true) => {
-                    validate_receipt_files(receipt, summary, package, key)?;
-                    Ok(true)
-                }
-                _ => Err(Error::InvalidBundle),
-            };
-        }
-        return Err(Error::InvalidBundle);
-    }
-    if !summary_prepared {
-        return Err(Error::InvalidBundle);
-    }
-    validate_receipt_files(&prepared_receipt, &prepared_summary, package, key)?;
     if receipt.exists() && summary.exists() {
-        if !bounded_files_equal(&prepared_receipt, receipt, 65_536)? {
+        if receipt_prepared && !bounded_files_equal(&prepared_receipt, receipt, 65_536)? {
             return Err(Error::DestinationExists);
         }
-        if !bounded_files_equal(&prepared_summary, summary, 4096)? {
+        if summary_prepared && !bounded_files_equal(&prepared_summary, summary, 4096)? {
             return Err(Error::DestinationExists);
         }
-        fs::remove_file(prepared_receipt)?;
-        fs::remove_file(prepared_summary)?;
+        validate_receipt_files(receipt, summary, package, key)?;
+        if receipt_prepared {
+            remove_preparation(&prepared_receipt)?;
+        }
+        if summary_prepared {
+            remove_preparation(&prepared_summary)?;
+        }
         File::open(parent_directory(receipt))?.sync_all()?;
         return Ok(true);
     }
+    match (
+        receipt_prepared,
+        summary_prepared,
+        receipt.exists(),
+        summary.exists(),
+    ) {
+        (false, false, false, false) => return Ok(false),
+        (true, true, _, _) => {}
+        _ => return Err(Error::InvalidBundle),
+    }
+    validate_receipt_files(&prepared_receipt, &prepared_summary, package, key)?;
     finalize_prepared_receipts(receipt, summary, &prepared_receipt, &prepared_summary)?;
     Ok(true)
+}
+
+fn remove_preparation(prepared: &Path) -> Result<(), Error> {
+    match fs::remove_file(prepared) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 fn validate_receipt_files(
@@ -1691,6 +1766,54 @@ mod tests {
     }
 
     #[test]
+    fn receipt_recovery_reports_absent_evidence() {
+        let receipt = temporary("absent-recovery-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let package = PackageSummary {
+            root: [4; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        assert!(!recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]).unwrap());
+    }
+
+    #[test]
+    fn receipt_recovery_completes_after_one_preparation_was_cleaned() {
+        let package = PackageSummary {
+            root: [5; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let key = [9; 32];
+        for remove_receipt_preparation in [false, true] {
+            let receipt = temporary(&format!(
+                "partial-cleanup-{remove_receipt_preparation}.cbor"
+            ));
+            let summary = receipt.with_extension("json");
+            let (mut prepared_receipt, mut prepared_summary) =
+                prepared_evidence(&receipt, &summary, &package, &key);
+            prepared_receipt.preserve_for_recovery();
+            prepared_summary.preserve_for_recovery();
+            let prepared_receipt = prepared_receipt.path().unwrap();
+            let prepared_summary = prepared_summary.path().unwrap();
+            fs::hard_link(&prepared_receipt, &receipt).unwrap();
+            fs::hard_link(&prepared_summary, &summary).unwrap();
+            if remove_receipt_preparation {
+                fs::remove_file(&prepared_receipt).unwrap();
+            } else {
+                fs::remove_file(&prepared_summary).unwrap();
+            }
+
+            assert!(recover_prepared_receipts(&receipt, &summary, &package, &key).unwrap());
+            assert!(!prepared_receipt.exists());
+            assert!(!prepared_summary.exists());
+            validate_receipt_files(&receipt, &summary, &package, &key).unwrap();
+            fs::remove_file(receipt).unwrap();
+            fs::remove_file(summary).unwrap();
+        }
+    }
+
+    #[test]
     fn receipt_recovery_rejects_partial_and_conflicting_preparations() {
         let package = PackageSummary {
             root: [6; 32],
@@ -1955,6 +2078,18 @@ mod tests {
     }
 
     #[test]
+    fn prepared_cleanup_is_idempotent_but_preserves_real_errors() {
+        let path = temporary("remove-preparation");
+        remove_preparation(&path).unwrap();
+        fs::write(&path, b"prepared").unwrap();
+        remove_preparation(&path).unwrap();
+        assert!(!path.exists());
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(remove_preparation(&path), Err(Error::Io(_))));
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
     fn verified_pack_can_be_reloaded_after_cache_eviction() {
         let source = temporary("repeated-pack-source");
         let bundle = temporary("repeated-pack-bundle");
@@ -2095,6 +2230,131 @@ mod tests {
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(new_bundle).unwrap();
         fs::remove_file(receipt).unwrap();
+    }
+
+    #[test]
+    fn existing_destination_must_match_before_receipt_recovery() {
+        let source = temporary("recovery-validation-source");
+        let bundle = temporary("recovery-validation-bundle");
+        let destination = temporary("recovery-validation-destination");
+        let receipt = temporary("recovery-validation-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let key = [9; 32];
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("expected"), b"verified contents").unwrap();
+        let package = build_bundle(&source, &bundle).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("unrelated"), b"wrong contents").unwrap();
+        let (mut prepared_receipt, mut prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &key);
+        prepared_receipt.preserve_for_recovery();
+        prepared_summary.preserve_for_recovery();
+        let prepared_receipt = prepared_receipt.path().unwrap();
+        let prepared_summary = prepared_summary.path().unwrap();
+
+        assert!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &key,
+                "2026-07-31T23:59:59Z",
+            )
+            .is_err()
+        );
+        assert!(!receipt.exists());
+        assert!(!summary.exists());
+        assert!(prepared_receipt.exists());
+        assert!(prepared_summary.exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_file(prepared_receipt).unwrap();
+        fs::remove_file(prepared_summary).unwrap();
+    }
+
+    #[test]
+    fn published_destination_validation_checks_every_boundary() {
+        let source = temporary("published-validation-source");
+        let bundle = temporary("published-validation-bundle");
+        let destination = temporary("published-validation-destination");
+        let receipt = temporary("published-validation-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let key = [7; 32];
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("expected"), b"verified contents").unwrap();
+        let package = build_bundle(&source, &bundle).unwrap();
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &key,
+            "2026-07-31T23:59:59Z",
+        )
+        .unwrap();
+
+        validate_published_destination(&bundle, &destination, &package).unwrap();
+        fs::write(destination.join("expected"), b"corruptd contents").unwrap();
+        assert!(matches!(
+            validate_published_destination(&bundle, &destination, &package),
+            Err(Error::RootMismatch)
+        ));
+        fs::write(destination.join("expected"), b"verified contents").unwrap();
+        fs::write(destination.join("extra"), b"extra").unwrap();
+        assert!(matches!(
+            validate_published_destination(&bundle, &destination, &package),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_file(destination.join("extra")).unwrap();
+
+        fs::remove_file(&receipt).unwrap();
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &key,
+                "2026-07-31T23:59:59Z",
+            ),
+            Err(Error::InvalidBundle)
+        ));
+
+        let not_directory = temporary("published-validation-file");
+        fs::write(&not_directory, b"file").unwrap();
+        assert!(matches!(
+            validate_published_destination(&bundle, &not_directory, &package),
+            Err(Error::InvalidBundle)
+        ));
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(bundle).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_file(summary).unwrap();
+        fs::remove_file(not_directory).unwrap();
+    }
+
+    #[test]
+    fn published_destination_walk_has_exact_depth_and_count_bounds() {
+        let single = temporary("published-count-single");
+        fs::create_dir(&single).unwrap();
+        fs::write(single.join("file"), b"file").unwrap();
+        let mut count = 0;
+        count_published_files(&single, vot_manifest::MAX_PATH_COMPONENTS, &mut count).unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            count_published_files(&single, vot_manifest::MAX_PATH_COMPONENTS + 1, &mut count,),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_dir_all(single).unwrap();
+
+        let deep = temporary("published-count-deep");
+        fs::create_dir_all(deep.join("d")).unwrap();
+        assert!(matches!(
+            count_published_files(&deep, vot_manifest::MAX_PATH_COMPONENTS, &mut 0),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_dir_all(deep).unwrap();
     }
 
     #[test]

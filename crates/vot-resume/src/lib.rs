@@ -368,6 +368,7 @@ impl CarefulResumeCache {
         input: Reconnaissance,
     ) -> Result<ResumePermit, PathReject> {
         if saved_endpoint != current_endpoint || input.local_path_changed {
+            self.saved.remove(&saved_endpoint);
             return Err(PathReject::PathChanged);
         }
         let Some(saved) = self.saved.get_mut(&saved_endpoint) else {
@@ -382,6 +383,7 @@ impl CarefulResumeCache {
             return Err(PathReject::Expired);
         }
         if input.configuration_epoch != saved.observation.configuration_epoch {
+            self.saved.remove(&saved_endpoint);
             return Err(PathReject::ConfigurationChanged);
         }
         if saved.in_use {
@@ -926,15 +928,25 @@ mod tests {
             Err(PathReject::PathChanged)
         );
         assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, Reconnaissance { ..input }),
+            Err(PathReject::Unknown)
+        );
+
+        cache.observe(endpoint, observation).unwrap();
+        assert_eq!(
             cache.reconnoitre(
                 endpoint,
                 endpoint,
                 Reconnaissance {
-                    now: 1_000,
+                    local_path_changed: true,
                     ..input
                 }
             ),
-            Err(PathReject::Expired)
+            Err(PathReject::PathChanged)
+        );
+        assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, input),
+            Err(PathReject::Unknown)
         );
     }
 
@@ -1117,6 +1129,10 @@ mod tests {
                 }
             ),
             Err(PathReject::ConfigurationChanged)
+        );
+        assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, base),
+            Err(PathReject::Unknown)
         );
     }
 }

@@ -13,13 +13,13 @@ aggregate:           222 total, 198 caught, 24 unviable, 0 missed
 The review-critical publication and recovery dependencies are also required:
 
 ```text
-vot-cli:         204 total, 184 caught, 20 unviable, 0 missed
+vot-cli:         226 total, 206 caught, 20 unviable, 0 missed
 vot-receipt:     219 total, 215 caught,  4 unviable, 0 missed
 vot-platform-fs:   1 total,   1 caught,  0 unviable, 0 missed
-aggregate:       424 total, 400 caught, 24 unviable, 0 missed
+aggregate:       446 total, 422 caught, 24 unviable, 0 missed
 ```
 
-Across the Wave 5 crates and those dependencies, 646 mutants were tested: 598
+Across the Wave 5 crates and those dependencies, 668 mutants were tested: 620
 were caught, 48 were unviable, and none were missed.
 
 The only platform exclusions are the thin native `sync_file` and `sync_parent`

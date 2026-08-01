@@ -195,10 +195,10 @@ fn publish_with(
         operations.sync_file(staging)?;
     }
     operations.link(staging, destination)?;
-    operations.remove(staging)?;
     if platform == Platform::MacOs {
         operations.sync_parent(destination)?;
     }
+    operations.remove(staging)?;
     Ok(claim)
 }
 
@@ -353,7 +353,49 @@ mod tests {
             &mut macos,
         )
         .unwrap();
-        assert_eq!(macos.trace, ["sync-file", "link", "remove", "sync-parent"]);
+        assert_eq!(macos.trace, ["sync-file", "link", "sync-parent", "remove"]);
+    }
+
+    #[test]
+    fn macos_namespace_failure_retains_staging() {
+        struct FailedNamespace {
+            trace: Vec<&'static str>,
+        }
+
+        impl Operations for FailedNamespace {
+            fn sync_file(&mut self, _path: &Path) -> Result<(), Error> {
+                self.trace.push("sync-file");
+                Ok(())
+            }
+
+            fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
+                self.trace.push("link");
+                Ok(())
+            }
+
+            fn remove(&mut self, _path: &Path) -> Result<(), Error> {
+                self.trace.push("remove");
+                Ok(())
+            }
+
+            fn sync_parent(&mut self, _path: &Path) -> Result<(), Error> {
+                self.trace.push("sync-parent");
+                Err(Error::Io(io::Error::other("injected namespace failure")))
+            }
+        }
+
+        let mut operations = FailedNamespace { trace: Vec::new() };
+        assert!(matches!(
+            publish_with(
+                Platform::MacOs,
+                Path::new("root/staging"),
+                Path::new("root/destination"),
+                CommitProfile::Balanced,
+                &mut operations,
+            ),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(operations.trace, ["sync-file", "link", "sync-parent"]);
     }
 
     #[test]

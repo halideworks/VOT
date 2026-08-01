@@ -117,6 +117,11 @@ fn nat_rebind_interface_change_and_stale_cc_state_are_rejected() {
         Err(PathReject::PathChanged)
     );
     assert_eq!(
+        cache.reconnoitre(endpoint, endpoint, input),
+        Err(PathReject::Unknown)
+    );
+    cache.observe(endpoint, observation).unwrap();
+    assert_eq!(
         cache.reconnoitre(
             endpoint,
             endpoint,
@@ -127,6 +132,7 @@ fn nat_rebind_interface_change_and_stale_cc_state_are_rejected() {
         ),
         Err(PathReject::RttTooSmall)
     );
+    cache.observe(endpoint, observation).unwrap();
     assert_eq!(
         cache.reconnoitre(
             endpoint,
@@ -137,6 +143,10 @@ fn nat_rebind_interface_change_and_stale_cc_state_are_rejected() {
             }
         ),
         Err(PathReject::PathChanged)
+    );
+    assert_eq!(
+        cache.reconnoitre(endpoint, endpoint, input),
+        Err(PathReject::Unknown)
     );
 }
 

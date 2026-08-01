@@ -15,5 +15,5 @@ Observed failure:
 test tests::empty_canonical_manifest_cannot_publish ... FAILED
 ```
 
-The required `vot-cli` mutation run reports 204 total, 184 caught, 20
+The required `vot-cli` mutation run reports 226 total, 206 caught, 20
 unviable, and 0 missed.

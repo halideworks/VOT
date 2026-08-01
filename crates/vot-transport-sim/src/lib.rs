@@ -1264,6 +1264,36 @@ mod tests {
     }
 
     #[test]
+    fn adapter_bounds_control_datagram_and_credit_state() {
+        let mut adapter = SimulatorAdapter::default();
+        assert_eq!(adapter.pending_submissions(), 0);
+        assert_eq!(adapter.receive_credit(), 0);
+
+        adapter
+            .send_control(&vec![0; vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD])
+            .unwrap();
+        adapter
+            .send_datagram(7, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES])
+            .unwrap();
+        assert_eq!(adapter.pending_submissions(), 2);
+        assert_eq!(
+            adapter.send_control(&vec![0; vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + 1]),
+            Err(TransportError::RecordTooLarge)
+        );
+        assert_eq!(
+            adapter.send_datagram(8, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES + 1]),
+            Err(TransportError::RecordTooLarge)
+        );
+        assert_eq!(adapter.pending_submissions(), 2);
+
+        adapter.set_receive_credit(123).unwrap();
+        assert_eq!(adapter.pending_submissions(), 3);
+        adapter.flush().unwrap();
+        assert_eq!(adapter.pending_submissions(), 0);
+        assert_eq!(adapter.receive_credit(), 123);
+    }
+
+    #[test]
     fn same_seed_replays_byte_for_byte() {
         let scenario = Scenario::parse(FALLBACK).unwrap();
         let first = Simulator::run(&scenario);

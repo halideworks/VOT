@@ -23,8 +23,13 @@ BACKENDS = {"msquic", "quiche", "tcp", "simulator"}
 SUITE_NAMES = {"blake3-bao64", "sha256-bep52"}
 
 
-def load(relative: str) -> dict[str, Any]:
-    with (ROOT / relative).open(encoding="utf-8") as handle:
+def resolve_input_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
+
+def load(relative: str | Path) -> dict[str, Any]:
+    with resolve_input_path(relative).open(encoding="utf-8") as handle:
         value = json.load(handle)
     if not isinstance(value, dict):
         raise ValueError(f"{relative} must contain an object")
@@ -145,6 +150,7 @@ def command_environment(
     workers: int,
     seed: int,
     object_bytes: int,
+    impairment_path: Path,
 ) -> dict[str, str]:
     env = os.environ.copy()
     values = {
@@ -155,6 +161,13 @@ def command_environment(
         "VOT_BENCH_OBJECT_BYTES": str(object_bytes),
         "VOT_BENCH_RECORD_BYTES": str(workload["record_bytes"]),
         "VOT_BENCH_IMPAIRMENT": str(impairment["id"]),
+        "VOT_BENCH_IMPAIRMENT_PATH": str(impairment_path),
+        "VOT_BENCH_IMPAIRMENT_MTU_BYTES": str(impairment["mtu_bytes"]),
+        "VOT_BENCH_IMPAIRMENT_RTT_US": str(impairment["rtt_us"]),
+        "VOT_BENCH_IMPAIRMENT_LOSS_PPM": str(impairment["loss_ppm"]),
+        "VOT_BENCH_IMPAIRMENT_REORDER_WINDOW": str(impairment["reorder_window"]),
+        "VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS": str(impairment["bandwidth_bps"]),
+        "VOT_BENCH_IMPAIRMENT_QUEUE_BYTES": str(impairment["queue_bytes"]),
     }
     env.update(values)
     return env
@@ -186,7 +199,8 @@ def main() -> int:
         parser.error("--seed must be non-negative")
 
     workload = load(args.workload)
-    impairment = load(args.impairment)
+    impairment_path = resolve_input_path(args.impairment).resolve()
+    impairment = load(impairment_path)
     if workload.get("seed_required") is not True or impairment.get("seed_required") is not True:
         raise ValueError("both workload and impairment must require a seed")
     suites = [args.suite] if args.suite else workload.get("suites", [])
@@ -232,6 +246,7 @@ def main() -> int:
                     workers=workers_count,
                     seed=run_seed,
                     object_bytes=object_bytes,
+                    impairment_path=impairment_path,
                 )
                 for _ in range(warmups):
                     subprocess.run(

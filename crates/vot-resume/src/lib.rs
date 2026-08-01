@@ -58,12 +58,14 @@ pub struct ResumeStore {
 impl ResumeStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let path = path.into();
+        let lock = lock_store(&path)?;
         let objects = if path.exists() {
             decode_store(&path)?
         } else {
             BTreeMap::new()
         };
         let signature = file_signature(&path)?;
+        drop(lock);
         Ok(Self {
             path,
             objects,
@@ -137,15 +139,15 @@ impl ResumeStore {
                 checkpointed: BTreeSet::new(),
             };
             let current_length = file_len(&self.path)?;
+            let mut candidate = self.objects.clone();
+            candidate.insert(subject, object.clone());
+            validate_reserved_capacity(&candidate)?;
             if reserve_requires_compaction(self.path.exists(), current_length) {
-                let mut candidate = self.objects.clone();
-                candidate.insert(subject, object.clone());
                 Self::compact(&self.path, &candidate)?;
-                self.objects = candidate;
             } else {
                 append_record(&self.path, &encode_reserve(subject, total_units)?)?;
-                self.objects.insert(subject, object);
             }
+            self.objects = candidate;
             BTreeSet::new()
         };
         self.signature = file_signature(&self.path)?;
@@ -631,11 +633,50 @@ fn validate_reserved_capacity(objects: &BTreeMap<SubjectId, StoredObject>) -> Re
     let payload = encode_snapshot(objects)?;
     let record = encode_record(&payload)?;
     let record_length = u64::try_from(record.len()).map_err(|_| Error::TooLarge)?;
-    if compact_fits(record_length) {
+    if !compact_fits(record_length) {
+        return Err(Error::TooLarge);
+    }
+    let worst_payload_length = worst_case_snapshot_payload_length(objects)?;
+    let worst_record_length = worst_payload_length
+        .checked_add(RECORD_HEADER_BYTES)
+        .and_then(|length| length.checked_add(RECORD_CHECKSUM_BYTES))
+        .ok_or(Error::TooLarge)?;
+    if compact_fits(worst_record_length) {
         Ok(())
     } else {
         Err(Error::TooLarge)
     }
+}
+
+fn worst_case_snapshot_payload_length(
+    objects: &BTreeMap<SubjectId, StoredObject>,
+) -> Result<u64, Error> {
+    let mut length = 1_u64
+        .checked_add(uvarint_length(
+            u64::try_from(objects.len()).map_err(|_| Error::TooLarge)?,
+        ))
+        .ok_or(Error::TooLarge)?;
+    for object in objects.values() {
+        validate_total_units(object.total_units)?;
+        length = length
+            .checked_add(42)
+            .and_then(|length| length.checked_add(uvarint_length(object.total_units)))
+            .and_then(|length| length.checked_add(worst_case_ranges_length(object.total_units)))
+            .ok_or(Error::TooLarge)?;
+    }
+    Ok(length)
+}
+
+fn worst_case_ranges_length(total_units: u64) -> u64 {
+    let range_count = total_units.div_ceil(2);
+    uvarint_length(range_count).saturating_add(range_count.saturating_mul(
+        uvarint_length(total_units.saturating_sub(1)).saturating_add(uvarint_length(total_units)),
+    ))
+}
+
+fn uvarint_length(value: u64) -> u64 {
+    let significant_bits = (u64::BITS - value.leading_zeros()).max(1);
+    u64::from(significant_bits.div_ceil(7))
 }
 
 fn store_size_fits(length: u64) -> bool {
@@ -1302,6 +1343,39 @@ mod tests {
     }
 
     #[test]
+    fn open_waits_for_the_store_transaction_lock() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let path = temp_path("open-lock");
+        let mut store = ResumeStore::open(&path).unwrap();
+        store.reserve_many([(subject(10), 1)]).unwrap();
+        let held = lock_store(&path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let open_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(ResumeStore::open(open_path)).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        let reopened = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(reopened.checkpointed(subject(10)).is_some());
+        reader.join().unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
     fn store_and_unit_bounds_are_exact_and_checkpoint_failure_is_atomic() {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
         assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_844);
@@ -1370,6 +1444,46 @@ mod tests {
         assert!(matches!(exact.begin_unit(1), Err(Error::InvalidUnit)));
         fs::remove_file(&exact_path).unwrap();
         fs::remove_file(lock_path(&exact_path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn reservation_capacity_includes_worst_case_checkpoint_ranges() {
+        let mut one = BTreeMap::new();
+        one.insert(
+            subject(17),
+            StoredObject {
+                total_units: MAX_UNITS_PER_OBJECT,
+                checkpointed: BTreeSet::new(),
+            },
+        );
+        assert!(validate_reserved_capacity(&one).is_ok());
+        assert_eq!(worst_case_ranges_length(1), 3);
+        assert_eq!(
+            [
+                uvarint_length(0),
+                uvarint_length(127),
+                uvarint_length(128),
+                uvarint_length(16_383),
+                uvarint_length(16_384),
+                uvarint_length(u64::MAX),
+            ],
+            [1, 1, 2, 2, 3, 10]
+        );
+
+        let mut four = one.clone();
+        for byte in 18..21 {
+            four.insert(
+                subject(byte),
+                StoredObject {
+                    total_units: MAX_UNITS_PER_OBJECT,
+                    checkpointed: BTreeSet::new(),
+                },
+            );
+        }
+        assert!(matches!(
+            validate_reserved_capacity(&four),
+            Err(Error::TooLarge)
+        ));
     }
 
     #[test]

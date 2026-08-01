@@ -655,6 +655,10 @@ fn decode_have(input: &[u8]) -> Result<Have, Error> {
 
 fn validate_have(value: &Have) -> Result<(), Error> {
     value.object.validate()?;
+    let payload_limit = crate::registered_payload_limit(frame_type::HAVE);
+    if payload_limit.is_some_and(|limit| have_payload_len(value) > limit) {
+        return Err(Error::TooLarge);
+    }
     let group_count = value.object.length.div_ceil(GROUP_BYTES);
     let mut previous_end = 0_u64;
     for (index, run) in value.runs.iter().enumerate() {
@@ -671,6 +675,28 @@ fn validate_have(value: &Have) -> Result<(), Error> {
         previous_end = run.start_group + run.group_count;
     }
     Ok(())
+}
+
+fn have_payload_len(value: &Have) -> usize {
+    let object_length = cbor_head_len(4)
+        .saturating_add(cbor_head_len(1))
+        .saturating_add(cbor_head_len(u64::from(value.object.suite)))
+        .saturating_add(cbor_byte_string_len(32))
+        .saturating_add(cbor_head_len(value.object.length));
+    let mut length = cbor_head_len(3)
+        .saturating_add(cbor_head_len(0))
+        .saturating_add(object_length)
+        .saturating_add(cbor_head_len(1))
+        .saturating_add(cbor_head_len(value.map_sequence))
+        .saturating_add(cbor_head_len(2))
+        .saturating_add(cbor_head_len(value.runs.len() as u64));
+    for run in &value.runs {
+        length = length
+            .saturating_add(cbor_head_len(2))
+            .saturating_add(cbor_head_len(run.start_group))
+            .saturating_add(cbor_head_len(run.group_count));
+    }
+    length
 }
 
 fn encode_capacity(value: &Capacity, output: &mut Vec<u8>) {
@@ -1129,6 +1155,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, Error::InvalidValue);
+    }
+
+    #[test]
+    fn have_limit_includes_typed_run_overhead() {
+        let run_count = 900_000_u64;
+        let value = Have {
+            object: ObjectId {
+                suite: 1,
+                root: [7; 32],
+                length: GROUP_BYTES * (run_count * 2 + 1),
+            },
+            map_sequence: 1,
+            runs: (0..run_count)
+                .map(|index| HaveRun {
+                    start_group: index * 2,
+                    group_count: 1,
+                })
+                .collect(),
+        };
+        assert!(
+            have_payload_len(&value) > crate::registered_payload_limit(frame_type::HAVE).unwrap()
+        );
+        assert_eq!(validate_have(&value), Err(Error::TooLarge));
+        assert_eq!(
+            encode(&TypedFrame::Have(value), &mut Vec::new()),
+            Err(Error::TooLarge)
+        );
     }
 
     #[test]

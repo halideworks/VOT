@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -30,6 +31,30 @@ def main() -> None:
     assert impairment["id"] == "clean-path-v1"
     assert impairment["seed_required"] is True
     assert impairment["loss_ppm"] == 0
+    runner_module_spec = importlib.util.spec_from_file_location(
+        "vot_run_benchmark", ROOT / "tools/run_benchmark.py"
+    )
+    assert runner_module_spec is not None and runner_module_spec.loader is not None
+    runner_module = importlib.util.module_from_spec(runner_module_spec)
+    runner_module_spec.loader.exec_module(runner_module)
+    environment = runner_module.command_environment(
+        workload=workload,
+        impairment=impairment,
+        backend="simulator",
+        suite="blake3-bao64",
+        workers=1,
+        seed=7,
+        object_bytes=1,
+        impairment_path=ROOT / "bench/impairments/clean-path.json",
+    )
+    assert environment["VOT_BENCH_IMPAIRMENT_PATH"].endswith(
+        "bench/impairments/clean-path.json"
+    )
+    assert environment["VOT_BENCH_IMPAIRMENT_MTU_BYTES"] == "1500"
+    assert environment["VOT_BENCH_IMPAIRMENT_RTT_US"] == "1000"
+    assert environment["VOT_BENCH_IMPAIRMENT_LOSS_PPM"] == "0"
+    assert environment["VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS"] == "10000000000"
+    assert environment["VOT_BENCH_IMPAIRMENT_QUEUE_BYTES"] == "33554432"
     assert schema["properties"]["machine"]["required"] == [
         "os", "kernel", "arch", "cpu_model", "logical_cpus", "memory_bytes"
     ]

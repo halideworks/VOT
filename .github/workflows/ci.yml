@@ -127,7 +127,7 @@ jobs:
         run: rustup toolchain install 1.85.0 --profile minimal
 
       - name: Test native commit provider
-        run: cargo +1.85.0 test -p vot-commit-platform --locked
+        run: cargo +1.85.0 test -p vot-commit-platform -p vot-platform-fs -p vot-resume --locked
 
   s3-live:
     runs-on: ubuntu-24.04
@@ -257,7 +257,8 @@ jobs:
           - { package: vot-pack, required: true }
           - { package: vot-object-store, required: false }
           - { package: vot-commit-object, required: false }
-          - { package: vot-receipt, required: false }
+          - { package: vot-receipt, required: true }
+          - { package: vot-platform-fs, required: true }
           - { package: vot-transport-api, required: true }
           - { package: vot-transport-sim, required: true }
           - { package: vot-transport-msquic, required: true }

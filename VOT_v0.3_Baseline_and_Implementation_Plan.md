@@ -452,7 +452,9 @@ All externally parsed structures have a borrowed decode path and an owned valida
   vot-pack
   vot-object-store
   vot-journal
+  vot-platform-fs
   vot-commit-posix
+  vot-commit-platform
   vot-commit-object
   vot-transport-api
   vot-transport-sim

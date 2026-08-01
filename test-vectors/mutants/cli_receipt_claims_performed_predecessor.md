@@ -21,5 +21,5 @@ Observed failure:
 assertion failed: receipt.profile == CommitProfile::Fast
 ```
 
-The required `vot-cli` mutation run reports 186 total, 166 caught, 20
+The required `vot-cli` mutation run reports 203 total, 183 caught, 20
 unviable, and 0 missed.

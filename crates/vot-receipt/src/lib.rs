@@ -70,6 +70,9 @@ pub enum Error {
     InvalidSubjectLength,
     InvalidSequence,
     Authentication,
+    InvalidEncoding,
+    TooLarge,
+    NonCanonical,
 }
 
 impl Receipt {
@@ -184,14 +187,15 @@ fn valid_rfc3339(value: &str) -> bool {
 
     let mut offset = 19;
     if bytes.get(offset) == Some(&b'.') {
-        offset += 1;
-        let fraction_start = offset;
-        while bytes.get(offset).is_some_and(u8::is_ascii_digit) {
-            offset += 1;
-        }
-        if offset == fraction_start {
+        let fraction_start = offset + 1;
+        let digits = bytes[fraction_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
             return false;
         }
+        offset = fraction_start + digits;
     }
     match bytes.get(offset) {
         Some(b'Z' | b'z') => offset + 1 == bytes.len(),
@@ -223,24 +227,28 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
 
 fn encode_head(major: u8, value: u64, output: &mut Vec<u8>) {
     match value {
-        0..=23 => output.push((major << 5) | u8::try_from(value).unwrap()),
+        0..=23 => output.push(head_byte(major, u8::try_from(value).unwrap())),
         24..=0xff => {
-            output.push((major << 5) | 24);
+            output.push(head_byte(major, 24));
             output.push(u8::try_from(value).unwrap());
         }
         0x100..=0xffff => {
-            output.push((major << 5) | 25);
+            output.push(head_byte(major, 25));
             output.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
         }
         0x1_0000..=0xffff_ffff => {
-            output.push((major << 5) | 26);
+            output.push(head_byte(major, 26));
             output.extend_from_slice(&u32::try_from(value).unwrap().to_be_bytes());
         }
         _ => {
-            output.push((major << 5) | 27);
+            output.push(head_byte(major, 27));
             output.extend_from_slice(&value.to_be_bytes());
         }
     }
+}
+
+const fn head_byte(major: u8, additional: u8) -> u8 {
+    major * 32 + additional
 }
 
 fn encode_uint(value: u64, output: &mut Vec<u8>) {
@@ -316,6 +324,246 @@ pub fn encode_authenticated(receipt: &AuthenticatedReceipt) -> Result<Vec<u8>, E
     encode_uint(3, &mut output);
     encode_bytes(&receipt.authentication, &mut output);
     Ok(output)
+}
+
+/// Decodes one bounded, deterministic authenticated receipt envelope.
+pub fn decode_authenticated(input: &[u8]) -> Result<AuthenticatedReceipt, Error> {
+    if input.len() > 65_536 {
+        return Err(Error::TooLarge);
+    }
+    let mut decoder = Decoder::new(input);
+    decoder.exact_map(4)?;
+    decoder.exact_key(0)?;
+    let receipt = decode_receipt(&mut decoder)?;
+    decoder.exact_key(1)?;
+    if decoder.uint()? != 2 {
+        return Err(Error::InvalidEncoding);
+    }
+    decoder.exact_key(2)?;
+    let key_id = decoder.bytes(64)?;
+    if key_id.is_empty() {
+        return Err(Error::InvalidKeyId);
+    }
+    decoder.exact_key(3)?;
+    let authentication = decoder.fixed_bytes()?;
+    decoder.finish()?;
+    let authenticated = AuthenticatedReceipt {
+        receipt,
+        key_id,
+        authentication,
+    };
+    if encode_authenticated(&authenticated)? != input {
+        return Err(Error::NonCanonical);
+    }
+    Ok(authenticated)
+}
+
+fn decode_receipt(decoder: &mut Decoder<'_>) -> Result<Receipt, Error> {
+    decoder.exact_map(14)?;
+    decoder.exact_key(0)?;
+    if decoder.uint()? != 0 {
+        return Err(Error::InvalidEncoding);
+    }
+    decoder.exact_key(1)?;
+    decoder.exact_array(4)?;
+    let subject_kind = match decoder.uint()? {
+        0 => SubjectKind::Object,
+        1 => SubjectKind::Package,
+        _ => return Err(Error::InvalidEncoding),
+    };
+    let suite_id = decoder.u16()?;
+    let subject_digest = decoder.fixed_bytes()?;
+    let subject_length = decoder.uint()?;
+    decoder.exact_key(2)?;
+    let assurance = decode_assurance(decoder.uint()?)?;
+    decoder.exact_key(3)?;
+    let profile = match decoder.uint()? {
+        1 => CommitProfile::Fast,
+        2 => CommitProfile::Balanced,
+        3 => CommitProfile::Strict,
+        _ => return Err(Error::InvalidEncoding),
+    };
+    decoder.exact_key(4)?;
+    let actual_predecessor = decode_assurance(decoder.uint()?)?;
+    decoder.exact_key(5)?;
+    let provider = decoder.u16()?;
+    decoder.exact_key(6)?;
+    decoder.exact_array(3)?;
+    let provider_version = [decoder.u16()?, decoder.u16()?, decoder.u16()?];
+    decoder.exact_key(7)?;
+    let session_id = decoder.fixed_bytes()?;
+    decoder.exact_key(8)?;
+    let incarnation_id = decoder.fixed_bytes()?;
+    decoder.exact_key(9)?;
+    let sequence = decoder.uint()?;
+    decoder.exact_key(10)?;
+    let observed_at = decoder.text(35)?;
+    decoder.exact_key(11)?;
+    let clock_source = decoder.u8()?;
+    decoder.exact_key(12)?;
+    if decoder.u16()? != suite_id {
+        return Err(Error::InvalidEncoding);
+    }
+    decoder.exact_key(13)?;
+    let flags = decoder.u8()?;
+    let receipt = Receipt {
+        subject_kind,
+        suite_id,
+        subject_digest,
+        subject_length,
+        assurance,
+        profile,
+        actual_predecessor,
+        provider,
+        provider_version,
+        session_id,
+        incarnation_id,
+        sequence,
+        observed_at,
+        clock_source,
+        flags,
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn decode_assurance(value: u64) -> Result<AssuranceLevel, Error> {
+    match value {
+        1 => Ok(AssuranceLevel::Admitted),
+        2 => Ok(AssuranceLevel::TransitVerified),
+        3 => Ok(AssuranceLevel::Durable),
+        4 => Ok(AssuranceLevel::AtRestVerified),
+        5 => Ok(AssuranceLevel::Published),
+        _ => Err(Error::InvalidEncoding),
+    }
+}
+
+struct Decoder<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> Decoder<'a> {
+    const fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        if self.remaining.len() < length {
+            return Err(Error::InvalidEncoding);
+        }
+        let (value, remaining) = self.remaining.split_at(length);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn head(&mut self, expected_major: u8) -> Result<u64, Error> {
+        let first = *self.take(1)?.first().ok_or(Error::InvalidEncoding)?;
+        if first >> 5 != expected_major {
+            return Err(Error::InvalidEncoding);
+        }
+        match first & 0x1f {
+            value @ 0..=23 => Ok(u64::from(value)),
+            24 => {
+                let value = u64::from(self.take(1)?[0]);
+                (value >= 24).then_some(value).ok_or(Error::NonCanonical)
+            }
+            25 => {
+                let value = u64::from(u16::from_be_bytes(
+                    self.take(2)?
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                ));
+                (value > 0xff).then_some(value).ok_or(Error::NonCanonical)
+            }
+            26 => {
+                let value = u64::from(u32::from_be_bytes(
+                    self.take(4)?
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                ));
+                (value > 0xffff).then_some(value).ok_or(Error::NonCanonical)
+            }
+            27 => {
+                let value = u64::from_be_bytes(
+                    self.take(8)?
+                        .try_into()
+                        .map_err(|_| Error::InvalidEncoding)?,
+                );
+                (value > 0xffff_ffff)
+                    .then_some(value)
+                    .ok_or(Error::NonCanonical)
+            }
+            _ => Err(Error::InvalidEncoding),
+        }
+    }
+
+    fn uint(&mut self) -> Result<u64, Error> {
+        self.head(0)
+    }
+
+    fn u16(&mut self) -> Result<u16, Error> {
+        u16::try_from(self.uint()?).map_err(|_| Error::InvalidEncoding)
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        u8::try_from(self.uint()?).map_err(|_| Error::InvalidEncoding)
+    }
+
+    fn exact_key(&mut self, expected: u64) -> Result<(), Error> {
+        if self.uint()? == expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidEncoding)
+        }
+    }
+
+    fn exact_map(&mut self, expected: u64) -> Result<(), Error> {
+        if self.head(5)? == expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidEncoding)
+        }
+    }
+
+    fn exact_array(&mut self, expected: u64) -> Result<(), Error> {
+        if self.head(4)? == expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidEncoding)
+        }
+    }
+
+    fn bytes(&mut self, maximum: usize) -> Result<Vec<u8>, Error> {
+        let length = usize::try_from(self.head(2)?).map_err(|_| Error::TooLarge)?;
+        if length > maximum {
+            return Err(Error::TooLarge);
+        }
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        self.bytes(N)?
+            .try_into()
+            .map_err(|_| Error::InvalidEncoding)
+    }
+
+    fn text(&mut self, maximum: usize) -> Result<String, Error> {
+        let length = usize::try_from(self.head(3)?).map_err(|_| Error::TooLarge)?;
+        if length > maximum {
+            return Err(Error::TooLarge);
+        }
+        std::str::from_utf8(self.take(length)?)
+            .map(str::to_owned)
+            .map_err(|_| Error::InvalidEncoding)
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        if self.remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::InvalidEncoding)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +685,7 @@ mod tests {
         let first = encode_authenticated(&authenticated).unwrap();
         let second = encode_authenticated(&authenticated).unwrap();
         assert_eq!(first, second);
+        assert_eq!(decode_authenticated(&first).unwrap(), authenticated);
         assert_eq!(first[0], 0xa4);
         let canonical = authenticated.receipt.canonical_bytes().unwrap();
         assert_eq!(canonical[0], 0xae);
@@ -448,6 +697,145 @@ mod tests {
         assert_eq!(
             actual,
             "ae000001840001582007070707070707070707070707070707070707070707070707070707070707071910000205030304040501068300030007500202020202020202020202020202020208500303030303030303030303030303030309050a74323032362d30372d33315431363a30303a30305a0b010c010d00"
+        );
+    }
+
+    #[test]
+    fn authenticated_round_trip_covers_every_receipt_enum_value() {
+        for subject_kind in [SubjectKind::Object, SubjectKind::Package] {
+            for assurance in [
+                AssuranceLevel::Admitted,
+                AssuranceLevel::TransitVerified,
+                AssuranceLevel::Durable,
+                AssuranceLevel::AtRestVerified,
+                AssuranceLevel::Published,
+            ] {
+                for profile in [
+                    CommitProfile::Fast,
+                    CommitProfile::Balanced,
+                    CommitProfile::Strict,
+                ] {
+                    let mut value = receipt();
+                    value.subject_kind = subject_kind;
+                    value.assurance = assurance;
+                    value.actual_predecessor = assurance;
+                    value.profile = profile;
+                    let authenticated =
+                        authenticate_hmac_sha256(value, b"receiver-1", &[9; 32]).unwrap();
+                    let encoded = encode_authenticated(&authenticated).unwrap();
+                    assert_eq!(decode_authenticated(&encoded).unwrap(), authenticated);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_cbor_integer_widths_and_decoder_edges_are_exact() {
+        for major in 0..=5 {
+            for additional in [0, 23, 24, 25, 26, 27] {
+                assert_eq!(head_byte(major, additional), major * 32 + additional);
+            }
+        }
+        for value in [
+            23,
+            24,
+            0xff,
+            0x100,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
+            let mut receipt = receipt();
+            receipt.subject_length = value;
+            let authenticated = authenticate_hmac_sha256(receipt, b"receiver-1", &[9; 32]).unwrap();
+            let encoded = encode_authenticated(&authenticated).unwrap();
+            assert_eq!(decode_authenticated(&encoded).unwrap(), authenticated);
+        }
+
+        for (input, expected) in [
+            (&[0x18, 0x17][..], Err(Error::NonCanonical)),
+            (&[0x18, 0x18][..], Ok(24)),
+            (&[0x19, 0x00, 0xff][..], Err(Error::NonCanonical)),
+            (&[0x19, 0x01, 0x00][..], Ok(0x100)),
+            (
+                &[0x1a, 0x00, 0x00, 0xff, 0xff][..],
+                Err(Error::NonCanonical),
+            ),
+            (&[0x1a, 0x00, 0x01, 0x00, 0x00][..], Ok(0x1_0000)),
+            (
+                &[0x1b, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff][..],
+                Err(Error::NonCanonical),
+            ),
+            (
+                &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00][..],
+                Ok(0x1_0000_0000),
+            ),
+        ] {
+            assert_eq!(Decoder::new(input).uint(), expected);
+        }
+    }
+
+    #[test]
+    fn authentication_and_envelope_bounds_are_exact() {
+        let mut key_id_64 = AuthenticatedReceipt {
+            receipt: receipt(),
+            key_id: vec![1; 64],
+            authentication: [2; 32],
+        };
+        assert!(encode_authenticated(&key_id_64).is_ok());
+        key_id_64.key_id.push(1);
+        assert_eq!(encode_authenticated(&key_id_64), Err(Error::InvalidKeyId));
+        key_id_64.key_id.clear();
+        assert_eq!(encode_authenticated(&key_id_64), Err(Error::InvalidKeyId));
+
+        assert!(authenticate_hmac_sha256(receipt(), &[1; 64], &[9; 32]).is_ok());
+        assert_eq!(
+            authenticate_hmac_sha256(receipt(), &[1; 65], &[9; 32]),
+            Err(Error::InvalidKeyId)
+        );
+        let authenticated = authenticate_hmac_sha256(receipt(), b"receiver-1", &[9; 32]).unwrap();
+        assert_eq!(
+            verify_hmac_sha256(&authenticated, &[9; 31]),
+            Err(Error::InvalidKey)
+        );
+
+        assert_eq!(
+            decode_authenticated(&vec![0; 65_536]),
+            Err(Error::InvalidEncoding)
+        );
+        let mut max_timestamp = receipt();
+        max_timestamp.observed_at = "2026-07-31T16:00:00.123456789+23:59".to_owned();
+        assert_eq!(max_timestamp.observed_at.len(), 35);
+        let authenticated =
+            authenticate_hmac_sha256(max_timestamp, b"receiver-1", &[9; 32]).unwrap();
+        let encoded = encode_authenticated(&authenticated).unwrap();
+        assert_eq!(decode_authenticated(&encoded).unwrap(), authenticated);
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(decode_authenticated(&trailing), Err(Error::InvalidEncoding));
+    }
+
+    #[test]
+    fn authenticated_decoder_rejects_truncation_noncanonical_and_bounds() {
+        let authenticated = authenticate_hmac_sha256(receipt(), b"receiver-1", &[9; 32]).unwrap();
+        let encoded = encode_authenticated(&authenticated).unwrap();
+        for length in 0..encoded.len() {
+            assert!(decode_authenticated(&encoded[..length]).is_err());
+        }
+        let mut noncanonical = vec![0xb8, 0x04];
+        noncanonical.extend_from_slice(&encoded[1..]);
+        assert_eq!(
+            decode_authenticated(&noncanonical),
+            Err(Error::NonCanonical)
+        );
+        assert_eq!(decode_authenticated(&vec![0; 65_537]), Err(Error::TooLarge));
+        let mut changed = encoded;
+        *changed.last_mut().unwrap() ^= 1;
+        let decoded = decode_authenticated(&changed).unwrap();
+        assert_eq!(
+            verify_hmac_sha256(&decoded, &[9; 32]),
+            Err(Error::Authentication)
         );
     }
 }

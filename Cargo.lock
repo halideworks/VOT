@@ -2107,6 +2107,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-platform-fs"
+version = "0.0.1"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "vot-proof-blake3"
 version = "0.0.1"
 dependencies = [
@@ -2135,6 +2142,7 @@ name = "vot-resume"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "vot-platform-fs",
  "vot-transport-api",
  "vot-transport-tcp",
 ]

@@ -114,7 +114,7 @@ impl ResumeStore {
             .open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        vot_platform_fs::atomic_replace(&temporary, path)?;
         #[cfg(unix)]
         File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
         Ok(())
@@ -338,6 +338,9 @@ impl CarefulResumeCache {
         if observation.saved_cwnd == 0 || observation.saved_rtt == 0 || observation.expires_at == 0
         {
             return Err(PathReject::InvalidObservation);
+        }
+        if self.saved.get(&endpoint).is_some_and(|saved| saved.in_use) {
+            return Err(PathReject::AlreadyInUse);
         }
         self.saved.insert(
             endpoint,
@@ -650,6 +653,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_checkpoints_replace_the_previous_snapshot() {
+        let path = temp_path("repeated-checkpoint");
+        let mut store = ResumeStore::open(&path).unwrap();
+        let mut tracker = ResumeTracker::discover(&store, subject(8), 3, 1).unwrap();
+        tracker.begin_unit(0).unwrap();
+        assert!(tracker.complete_unit(0).unwrap());
+        tracker.checkpoint(&mut store).unwrap();
+        tracker.begin_unit(1).unwrap();
+        assert!(tracker.complete_unit(1).unwrap());
+        tracker.checkpoint(&mut store).unwrap();
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.checkpointed(subject(8)).unwrap(),
+            &BTreeSet::from([0, 1])
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn store_and_unit_bounds_are_exact_and_checkpoint_failure_is_atomic() {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
         assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_832);
@@ -844,6 +866,47 @@ mod tests {
                 }
             ),
             Err(PathReject::Unknown)
+        );
+    }
+
+    #[test]
+    fn active_careful_resume_observation_cannot_be_replaced() {
+        let endpoint = RemoteEndpoint {
+            interface: 1,
+            destination: [9; 16],
+            dscp: 1,
+        };
+        let observation = Observation {
+            saved_cwnd: 1_000,
+            saved_rtt: 100,
+            expires_at: 1_000,
+            configuration_epoch: 4,
+        };
+        let input = Reconnaissance {
+            now: 1,
+            current_min_rtt: 100,
+            initial_flight_acknowledged: true,
+            congestion_detected: false,
+            local_path_changed: false,
+            configuration_epoch: 4,
+            max_jump: 900,
+        };
+        let mut cache = CarefulResumeCache::default();
+        cache.observe(endpoint, observation).unwrap();
+        cache.reconnoitre(endpoint, endpoint, input).unwrap();
+        assert_eq!(
+            cache.observe(
+                endpoint,
+                Observation {
+                    saved_cwnd: 2_000,
+                    ..observation
+                }
+            ),
+            Err(PathReject::AlreadyInUse)
+        );
+        assert_eq!(
+            cache.reconnoitre(endpoint, endpoint, input),
+            Err(PathReject::AlreadyInUse)
         );
     }
 

@@ -14,7 +14,7 @@ use vot_manifest::{
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 use vot_receipt::{
     AssuranceLevel, CommitProfile, Receipt, SubjectKind, authenticate_hmac_sha256,
-    encode_authenticated,
+    decode_authenticated, encode_authenticated, verify_hmac_sha256,
 };
 use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
@@ -500,11 +500,16 @@ fn manifest_spool_path(directory: &Path, index: u64) -> PathBuf {
 }
 
 fn read_bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, Error> {
-    let length = fs::metadata(path)?.len();
-    if length > maximum as u64 {
+    let limit = u64::try_from(maximum)
+        .map_err(|_| Error::InvalidBundle)?
+        .saturating_add(1);
+    let mut input = File::open(path)?.take(limit);
+    let mut output = Vec::with_capacity(maximum.min(4096));
+    input.read_to_end(&mut output)?;
+    if output.len() > maximum {
         return Err(Error::InvalidBundle);
     }
-    fs::read(path).map_err(Error::Io)
+    Ok(output)
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -574,7 +579,7 @@ pub fn receive_bundle(
     }
     let expected = scan_manifest(bundle)?;
     if destination.exists() {
-        if recover_prepared_receipts(receipt_path, &receipt_summary_path, &expected)? {
+        if recover_prepared_receipts(receipt_path, &receipt_summary_path, &expected, key)? {
             return Ok(ReceiveReport {
                 package: expected,
                 peak_staging: 0,
@@ -588,7 +593,8 @@ pub fn receive_bundle(
     if receipt_summary_path.exists() {
         return Err(Error::DestinationExists);
     }
-    clear_stale_prepared_receipts(receipt_path, &receipt_summary_path, &expected)?;
+    let existing_preparation =
+        existing_prepared_receipts(receipt_path, &receipt_summary_path, &expected, key)?;
     let mut manifest = ManifestReader::open(bundle)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
@@ -650,28 +656,42 @@ pub fn receive_bundle(
     if actual != expected {
         return Err(Error::RootMismatch);
     }
-    let freshness = fresh_receipt_identifiers()?;
-    let receipt = publication_receipt(&actual, observed_at, freshness);
-    let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
-    let encoded = encode_authenticated(&authenticated)?;
-    let summary = receipt_summary_bytes(&actual);
-    let suffix = object_name(&actual.root);
-    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
-    let mut prepared_receipt = PreparedFile::new(receipt_path, &encoded, suffix, "receipt")?;
-    let mut prepared_summary =
-        PreparedFile::new(&receipt_summary_path, summary.as_bytes(), suffix, "summary")?;
+    let mut owned_receipt = None;
+    let mut owned_summary = None;
+    let (prepared_receipt_path, prepared_summary_path) = if let Some(paths) = existing_preparation {
+        paths
+    } else {
+        let freshness = fresh_receipt_identifiers()?;
+        let receipt = publication_receipt(&actual, observed_at, freshness);
+        let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
+        let encoded = encode_authenticated(&authenticated)?;
+        let summary = receipt_summary_bytes(&actual);
+        let suffix = object_name(&actual.root);
+        let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
+        let receipt = PreparedFile::new(receipt_path, &encoded, suffix, "receipt")?;
+        let summary =
+            PreparedFile::new(&receipt_summary_path, summary.as_bytes(), suffix, "summary")?;
+        let paths = (receipt.path()?, summary.path()?);
+        owned_receipt = Some(receipt);
+        owned_summary = Some(summary);
+        paths
+    };
     if sync_directories(&staging)? == 0 {
         return Err(Error::InvalidBundle);
     }
     atomic_rename_noreplace(&staging, destination)?;
     File::open(parent_directory(destination))?.sync_all()?;
-    prepared_receipt.preserve_for_recovery();
-    prepared_summary.preserve_for_recovery();
+    if let Some(prepared) = &mut owned_receipt {
+        prepared.preserve_for_recovery();
+    }
+    if let Some(prepared) = &mut owned_summary {
+        prepared.preserve_for_recovery();
+    }
     finalize_prepared_receipts(
         receipt_path,
         &receipt_summary_path,
-        &prepared_receipt.path()?,
-        &prepared_summary.path()?,
+        &prepared_receipt_path,
+        &prepared_summary_path,
     )?;
     Ok(ReceiveReport {
         package: actual,
@@ -840,7 +860,7 @@ fn stream_root(path: &Path, expected_length: u64) -> Result<[u8; 32], Error> {
 fn write_object(objects: &Path, root: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {
     let path = objects.join(object_name(root));
     if path.exists() {
-        if fs::read(&path)? == bytes {
+        if file_matches_bytes(&path, bytes)? {
             return Ok(());
         }
         return Err(Error::RootMismatch);
@@ -849,6 +869,14 @@ fn write_object(objects: &Path, root: &[u8; 32], bytes: &[u8]) -> Result<(), Err
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn file_matches_bytes(path: &Path, expected: &[u8]) -> Result<bool, Error> {
+    match read_bounded_file(path, expected.len()) {
+        Ok(actual) => Ok(actual == expected),
+        Err(Error::InvalidBundle) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn receive_direct(
@@ -1098,42 +1126,62 @@ fn prepared_output_path(destination: &Path, suffix: &str, kind: &str) -> Result<
     Ok(destination.with_file_name(format!(".{name}.vot-{kind}-{suffix}")))
 }
 
-fn clear_stale_prepared_receipts(
+fn prepared_receipt_paths(
     receipt: &Path,
     summary: &Path,
     package: &PackageSummary,
-) -> Result<(), Error> {
+) -> Result<(PathBuf, PathBuf), Error> {
     let suffix = object_name(&package.root);
     let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
-    for path in [
+    Ok((
         prepared_output_path(receipt, suffix, "receipt")?,
         prepared_output_path(summary, suffix, "summary")?,
-    ] {
-        remove_if_exists(&path)?;
+    ))
+}
+
+fn existing_prepared_receipts(
+    receipt: &Path,
+    summary: &Path,
+    package: &PackageSummary,
+    key: &[u8],
+) -> Result<Option<(PathBuf, PathBuf)>, Error> {
+    let (prepared_receipt, prepared_summary) = prepared_receipt_paths(receipt, summary, package)?;
+    match (prepared_receipt.exists(), prepared_summary.exists()) {
+        (false, false) => Ok(None),
+        (true, true) => {
+            validate_receipt_files(&prepared_receipt, &prepared_summary, package, key)?;
+            Ok(Some((prepared_receipt, prepared_summary)))
+        }
+        _ => Err(Error::InvalidBundle),
     }
-    Ok(())
 }
 
 fn recover_prepared_receipts(
     receipt: &Path,
     summary: &Path,
     package: &PackageSummary,
+    key: &[u8],
 ) -> Result<bool, Error> {
-    let suffix = object_name(&package.root);
-    let suffix = suffix.strip_suffix(".obj").ok_or(Error::InvalidBundle)?;
-    let prepared_receipt = prepared_output_path(receipt, suffix, "receipt")?;
-    let prepared_summary = prepared_output_path(summary, suffix, "summary")?;
+    let (prepared_receipt, prepared_summary) = prepared_receipt_paths(receipt, summary, package)?;
     let receipt_prepared = prepared_receipt.exists();
     let summary_prepared = prepared_summary.exists();
     if !receipt_prepared {
         if !summary_prepared {
-            return Ok(false);
+            return match (receipt.exists(), summary.exists()) {
+                (false, false) => Ok(false),
+                (true, true) => {
+                    validate_receipt_files(receipt, summary, package, key)?;
+                    Ok(true)
+                }
+                _ => Err(Error::InvalidBundle),
+            };
         }
         return Err(Error::InvalidBundle);
     }
     if !summary_prepared {
         return Err(Error::InvalidBundle);
     }
+    validate_receipt_files(&prepared_receipt, &prepared_summary, package, key)?;
     if receipt.exists() && summary.exists() {
         if !bounded_files_equal(&prepared_receipt, receipt, 65_536)? {
             return Err(Error::DestinationExists);
@@ -1148,6 +1196,35 @@ fn recover_prepared_receipts(
     }
     finalize_prepared_receipts(receipt, summary, &prepared_receipt, &prepared_summary)?;
     Ok(true)
+}
+
+fn validate_receipt_files(
+    receipt_path: &Path,
+    summary_path: &Path,
+    package: &PackageSummary,
+    key: &[u8],
+) -> Result<(), Error> {
+    let encoded = read_bounded_file(receipt_path, 65_536)?;
+    let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
+    verify_hmac_sha256(&authenticated, key).map_err(|_| Error::InvalidBundle)?;
+    let receipt = &authenticated.receipt;
+    if authenticated.key_id != b"vot-cli"
+        || receipt.subject_kind != SubjectKind::Package
+        || receipt.suite_id != 1
+        || receipt.subject_digest != package.root
+        || receipt.subject_length != package.logical_length
+        || receipt.assurance != AssuranceLevel::Published
+        || receipt.profile != CommitProfile::Fast
+        || receipt.actual_predecessor != AssuranceLevel::TransitVerified
+        || receipt.provider != 1
+    {
+        return Err(Error::InvalidBundle);
+    }
+    let summary = read_bounded_file(summary_path, 4096)?;
+    if summary != receipt_summary_bytes(package).as_bytes() {
+        return Err(Error::InvalidBundle);
+    }
+    Ok(())
 }
 
 fn finalize_prepared_receipts(
@@ -1165,48 +1242,32 @@ fn finalize_prepared_receipts(
     Ok(())
 }
 
-fn link_or_match(prepared: &Path, destination: &Path, maximum: u64) -> Result<(), Error> {
+fn link_or_match(prepared: &Path, destination: &Path, maximum: usize) -> Result<(), Error> {
     match fs::hard_link(prepared, destination) {
         Ok(()) => Ok(()),
         Err(error) => resolve_link_error(error, prepared, destination, maximum),
     }
 }
 
-fn bounded_files_equal(left: &Path, right: &Path, maximum: u64) -> Result<bool, Error> {
-    let left_length = fs::metadata(left)?.len();
-    let right_length = fs::metadata(right)?.len();
-    if left_length > maximum {
-        return Ok(false);
-    }
-    if right_length > maximum {
-        return Ok(false);
-    }
-    if left_length != right_length {
-        return Ok(false);
-    }
-    Ok(fs::read(left)? == fs::read(right)?)
-}
-
-fn remove_if_exists(path: &Path) -> Result<(), Error> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) => resolve_remove_error(error),
-    }
-}
-
-fn resolve_remove_error(error: io::Error) -> Result<(), Error> {
-    if error.kind() == io::ErrorKind::NotFound {
-        Ok(())
-    } else {
-        Err(Error::Io(error))
-    }
+fn bounded_files_equal(left: &Path, right: &Path, maximum: usize) -> Result<bool, Error> {
+    let left = match read_bounded_file(left, maximum) {
+        Ok(bytes) => bytes,
+        Err(Error::InvalidBundle) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let right = match read_bounded_file(right, maximum) {
+        Ok(bytes) => bytes,
+        Err(Error::InvalidBundle) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(left == right)
 }
 
 fn resolve_link_error(
     error: io::Error,
     prepared: &Path,
     destination: &Path,
-    maximum: u64,
+    maximum: usize,
 ) -> Result<(), Error> {
     if error.kind() != io::ErrorKind::AlreadyExists {
         return Err(Error::Io(error));
@@ -1565,6 +1626,33 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    fn prepared_evidence(
+        receipt: &Path,
+        summary: &Path,
+        package: &PackageSummary,
+        key: &[u8],
+    ) -> (PreparedFile, PreparedFile) {
+        let authenticated = authenticate_hmac_sha256(
+            publication_receipt(package, "2026-07-31T23:59:59Z", [5; 32]),
+            b"vot-cli",
+            key,
+        )
+        .unwrap();
+        let encoded = encode_authenticated(&authenticated).unwrap();
+        let suffix = object_name(&package.root);
+        let suffix = suffix.strip_suffix(".obj").unwrap();
+        (
+            PreparedFile::new(receipt, &encoded, suffix, "receipt").unwrap(),
+            PreparedFile::new(
+                summary,
+                receipt_summary_bytes(package).as_bytes(),
+                suffix,
+                "summary",
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn receipt_publication_recovers_after_destination_publish() {
         let receipt = temporary("recover-receipt.cbor");
@@ -1574,27 +1662,27 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        let suffix = object_name(&package.root);
-        let suffix = suffix.strip_suffix(".obj").unwrap();
-        let mut prepared_receipt =
-            PreparedFile::new(&receipt, b"authenticated", suffix, "receipt").unwrap();
-        let mut prepared_summary =
-            PreparedFile::new(&summary, b"{\"complete\":true}\\n", suffix, "summary").unwrap();
+        let key = [9; 32];
+        let (mut prepared_receipt, mut prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &key);
         prepared_receipt.preserve_for_recovery();
         prepared_summary.preserve_for_recovery();
         let prepared_receipt_path = prepared_receipt.path().unwrap();
         let prepared_summary_path = prepared_summary.path().unwrap();
+        let expected_receipt = fs::read(&prepared_receipt_path).unwrap();
+        let expected_summary = fs::read(&prepared_summary_path).unwrap();
         drop(prepared_receipt);
         drop(prepared_summary);
         assert!(prepared_receipt_path.exists());
         assert!(prepared_summary_path.exists());
         fs::hard_link(&prepared_receipt_path, &receipt).unwrap();
 
-        assert!(recover_prepared_receipts(&receipt, &summary, &package).unwrap());
-        assert_eq!(fs::read(&receipt).unwrap(), b"authenticated");
-        assert_eq!(fs::read(&summary).unwrap(), b"{\"complete\":true}\\n");
+        assert!(recover_prepared_receipts(&receipt, &summary, &package, &key).unwrap());
+        assert_eq!(fs::read(&receipt).unwrap(), expected_receipt);
+        assert_eq!(fs::read(&summary).unwrap(), expected_summary);
         assert!(!prepared_receipt_path.exists());
         assert!(!prepared_summary_path.exists());
+        assert!(recover_prepared_receipts(&receipt, &summary, &package, &key).unwrap());
         fs::remove_file(receipt).unwrap();
         fs::remove_file(summary).unwrap();
     }
@@ -1608,13 +1696,14 @@ mod tests {
         };
         let suffix = object_name(&package.root);
         let suffix = suffix.strip_suffix(".obj").unwrap();
+        let key = [9; 32];
 
         let receipt = temporary("only-receipt.cbor");
         let summary = receipt.with_extension("json");
         let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
         fs::write(&prepared_receipt, b"receipt").unwrap();
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package),
+            recover_prepared_receipts(&receipt, &summary, &package, &key),
             Err(Error::InvalidBundle)
         ));
         fs::remove_file(prepared_receipt).unwrap();
@@ -1624,21 +1713,26 @@ mod tests {
         let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
         fs::write(&prepared_summary, b"summary").unwrap();
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package),
+            recover_prepared_receipts(&receipt, &summary, &package, &key),
             Err(Error::InvalidBundle)
         ));
         fs::remove_file(prepared_summary).unwrap();
 
         let receipt = temporary("conflicting-receipt.cbor");
         let summary = receipt.with_extension("json");
+        let (mut prepared_receipt, mut prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &key);
+        prepared_receipt.preserve_for_recovery();
+        prepared_summary.preserve_for_recovery();
+        let prepared_receipt = prepared_receipt.path().unwrap();
+        let prepared_summary = prepared_summary.path().unwrap();
+        drop((prepared_receipt, prepared_summary));
         let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
         let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
-        fs::write(&prepared_receipt, b"expected").unwrap();
-        fs::write(&prepared_summary, b"summary").unwrap();
         fs::write(&receipt, b"conflict").unwrap();
-        fs::write(&summary, b"summary").unwrap();
+        fs::write(&summary, receipt_summary_bytes(&package)).unwrap();
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package),
+            recover_prepared_receipts(&receipt, &summary, &package, &key),
             Err(Error::DestinationExists)
         ));
         fs::remove_file(prepared_receipt).unwrap();
@@ -1648,14 +1742,17 @@ mod tests {
 
         let receipt = temporary("conflicting-summary.cbor");
         let summary = receipt.with_extension("json");
-        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
-        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
-        fs::write(&prepared_receipt, b"receipt").unwrap();
-        fs::write(&prepared_summary, b"expected").unwrap();
-        fs::write(&receipt, b"receipt").unwrap();
+        let (mut prepared_receipt_owner, mut prepared_summary_owner) =
+            prepared_evidence(&receipt, &summary, &package, &key);
+        prepared_receipt_owner.preserve_for_recovery();
+        prepared_summary_owner.preserve_for_recovery();
+        let prepared_receipt = prepared_receipt_owner.path().unwrap();
+        let prepared_summary = prepared_summary_owner.path().unwrap();
+        drop((prepared_receipt_owner, prepared_summary_owner));
+        fs::copy(&prepared_receipt, &receipt).unwrap();
         fs::write(&summary, b"conflict").unwrap();
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package),
+            recover_prepared_receipts(&receipt, &summary, &package, &key),
             Err(Error::DestinationExists)
         ));
         fs::remove_file(prepared_receipt).unwrap();
@@ -1665,30 +1762,148 @@ mod tests {
     }
 
     #[test]
-    fn receipt_preparation_cleanup_and_file_bounds_are_exact() {
+    fn receipt_recovery_authenticates_prepared_evidence() {
+        let package = PackageSummary {
+            root: [8; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let receipt = temporary("wrong-key-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let (mut prepared_receipt, mut prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &[8; 32]);
+        prepared_receipt.preserve_for_recovery();
+        prepared_summary.preserve_for_recovery();
+        let prepared_receipt_path = prepared_receipt.path().unwrap();
+        let prepared_summary_path = prepared_summary.path().unwrap();
+        drop((prepared_receipt, prepared_summary));
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]),
+            Err(Error::InvalidBundle)
+        ));
+        assert!(!receipt.exists());
+        assert!(!summary.exists());
+        assert!(prepared_receipt_path.exists());
+        assert!(prepared_summary_path.exists());
+
+        fs::remove_file(&prepared_receipt_path).unwrap();
+        fs::remove_file(&prepared_summary_path).unwrap();
+        let (mut prepared_receipt, mut prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &[9; 32]);
+        prepared_receipt.preserve_for_recovery();
+        prepared_summary.preserve_for_recovery();
+        let prepared_receipt_path = prepared_receipt.path().unwrap();
+        let prepared_summary_path = prepared_summary.path().unwrap();
+        drop((prepared_receipt, prepared_summary));
+        fs::write(&prepared_summary_path, b"{\"root\":\"wrong\"}\n").unwrap();
+        assert!(matches!(
+            recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]),
+            Err(Error::InvalidBundle)
+        ));
+        assert!(!receipt.exists());
+        assert!(!summary.exists());
+        fs::remove_file(prepared_receipt_path).unwrap();
+        fs::remove_file(prepared_summary_path).unwrap();
+    }
+
+    #[test]
+    fn recovered_receipt_requires_every_publication_field() {
+        let package = PackageSummary {
+            root: [10; 32],
+            logical_length: 7,
+            entries: 1,
+        };
+        let key = [9; 32];
+        let base = publication_receipt(&package, "2026-07-31T23:59:59Z", [5; 32]);
+        let mut cases = Vec::new();
+
+        let mut wrong = base.clone();
+        wrong.subject_kind = SubjectKind::Object;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.suite_id = 2;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.subject_digest[0] ^= 1;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.subject_length += 1;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.assurance = AssuranceLevel::Durable;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.profile = CommitProfile::Balanced;
+        cases.push(wrong);
+        let mut wrong = base.clone();
+        wrong.actual_predecessor = AssuranceLevel::Durable;
+        cases.push(wrong);
+        let mut wrong = base;
+        wrong.provider = 2;
+        cases.push(wrong);
+
+        for (index, wrong) in cases.into_iter().enumerate() {
+            let receipt = temporary(&format!("wrong-field-{index}.cbor"));
+            let summary = receipt.with_extension("json");
+            let authenticated = authenticate_hmac_sha256(wrong, b"vot-cli", &key).unwrap();
+            fs::write(&receipt, encode_authenticated(&authenticated).unwrap()).unwrap();
+            fs::write(&summary, receipt_summary_bytes(&package)).unwrap();
+            assert!(matches!(
+                validate_receipt_files(&receipt, &summary, &package, &key),
+                Err(Error::InvalidBundle)
+            ));
+            fs::remove_file(receipt).unwrap();
+            fs::remove_file(summary).unwrap();
+        }
+
+        let receipt = temporary("wrong-key-id.cbor");
+        let summary = receipt.with_extension("json");
+        let authenticated = authenticate_hmac_sha256(
+            publication_receipt(&package, "2026-07-31T23:59:59Z", [5; 32]),
+            b"another-key",
+            &key,
+        )
+        .unwrap();
+        fs::write(&receipt, encode_authenticated(&authenticated).unwrap()).unwrap();
+        fs::write(&summary, receipt_summary_bytes(&package)).unwrap();
+        assert!(matches!(
+            validate_receipt_files(&receipt, &summary, &package, &key),
+            Err(Error::InvalidBundle)
+        ));
+        fs::remove_file(receipt).unwrap();
+        fs::remove_file(summary).unwrap();
+    }
+
+    #[test]
+    fn live_receipt_preparation_is_not_removed_by_a_contender() {
         let package = PackageSummary {
             root: [7; 32],
             logical_length: 1,
             entries: 1,
         };
-        let receipt = temporary("stale-receipt.cbor");
+        let receipt = temporary("live-receipt.cbor");
         let summary = receipt.with_extension("json");
-        let suffix = object_name(&package.root);
-        let suffix = suffix.strip_suffix(".obj").unwrap();
-        let prepared_receipt = prepared_output_path(&receipt, suffix, "receipt").unwrap();
-        let prepared_summary = prepared_output_path(&summary, suffix, "summary").unwrap();
-        fs::write(&prepared_receipt, b"stale").unwrap();
-        fs::write(&prepared_summary, b"stale").unwrap();
-        clear_stale_prepared_receipts(&receipt, &summary, &package).unwrap();
-        assert!(!prepared_receipt.exists());
-        assert!(!prepared_summary.exists());
-        clear_stale_prepared_receipts(&receipt, &summary, &package).unwrap();
-        assert!(resolve_remove_error(io::Error::from(io::ErrorKind::NotFound)).is_ok());
+        let key = [9; 32];
+        let (prepared_receipt, prepared_summary) =
+            prepared_evidence(&receipt, &summary, &package, &key);
+        let paths = existing_prepared_receipts(&receipt, &summary, &package, &key)
+            .unwrap()
+            .unwrap();
+        assert!(paths.0.exists());
+        assert!(paths.1.exists());
         assert!(matches!(
-            resolve_remove_error(io::Error::from(io::ErrorKind::PermissionDenied)),
-            Err(Error::Io(_))
+            existing_prepared_receipts(&receipt, &summary, &package, &[8; 32]),
+            Err(Error::InvalidBundle)
         ));
+        assert!(paths.0.exists());
+        assert!(paths.1.exists());
+        drop((prepared_receipt, prepared_summary));
+        assert!(!paths.0.exists());
+        assert!(!paths.1.exists());
+    }
 
+    #[test]
+    fn receipt_file_bounds_are_exact() {
         let left = temporary("bounded-left");
         let right = temporary("bounded-right");
         fs::write(&left, b"same").unwrap();

@@ -24,6 +24,7 @@ cargo test --workspace --locked
 cargo test -p vot-resume --test e_resume --locked
 cargo test -p vot-transport-tcp --locked
 cargo test -p vot-commit-platform --locked
+cargo test -p vot-platform-fs --locked
 cargo run -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot
 cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 cargo build --manifest-path fuzz/manifest/Cargo.toml --locked

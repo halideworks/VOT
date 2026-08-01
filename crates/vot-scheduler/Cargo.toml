@@ -1,0 +1,16 @@
+[package]
+name = "vot-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vot-transport-api = { path = "../vot-transport-api" }
+vot-verifier = { path = "../vot-verifier" }
+
+[dev-dependencies]
+vot-transport-sim = { path = "../vot-transport-sim" }

@@ -187,7 +187,9 @@ jobs:
           - { package: vot-object-store, required: false }
           - { package: vot-commit-object, required: false }
           - { package: vot-receipt, required: false }
+          - { package: vot-transport-api, required: true }
           - { package: vot-transport-sim, required: true }
+          - { package: vot-scheduler, required: true }
     steps:
       - uses: actions/checkout@v4.3.1
         with:

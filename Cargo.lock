@@ -2055,6 +2055,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-scheduler"
+version = "0.0.1"
+dependencies = [
+ "vot-transport-api",
+ "vot-transport-sim",
+ "vot-verifier",
+]
+
+[[package]]
+name = "vot-transport-api"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+]
+
+[[package]]
 name = "vot-transport-sim"
 version = "0.0.1"
 dependencies = [

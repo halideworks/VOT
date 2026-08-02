@@ -103,10 +103,15 @@ pub enum ErrorKind {
     PendingRecordsExhausted { bytes: usize, count: usize },
     /// Negotiation frames have not all reached the backend yet.
     HandshakeUnsent { remaining: usize },
-    /// A record larger than the peer said it would accept.
-    RecordExceedsPeerLimit { bytes: u64, limit: u64 },
-    /// A record larger than this endpoint said it would accept.
-    RecordExceedsLocalLimit { bytes: u64, limit: u64 },
+    /// A frame whose payload is past the negotiated limit for its type.
+    FrameExceedsLimit {
+        frame_type: u64,
+        bytes: u64,
+        limit: u64,
+        side: Side,
+    },
+    /// More outbound lanes than the peer said it would carry.
+    LaneLimitExceeded { limit: u64 },
     /// The backend refused something the session needed.
     Transport(TransportError),
     /// The backend would reassemble control frames larger than this endpoint
@@ -124,9 +129,9 @@ impl ErrorKind {
             | Self::Decode(_)
             | Self::OutOfSequence { .. }
             | Self::NotNegotiated { .. }
-            | Self::PendingRecordsExhausted { .. }
-            // The peer sent past the limit it was given.
-            | Self::RecordExceedsLocalLimit { .. } => true,
+            | Self::PendingRecordsExhausted { .. } => true,
+            // Only when the peer is the one that went past its limit.
+            Self::FrameExceedsLimit { side, .. } => matches!(side, Side::Local),
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
@@ -134,7 +139,7 @@ impl ErrorKind {
             | Self::Interrupted { .. }
             | Self::ReceiveLimitMismatch { .. }
             | Self::HandshakeUnsent { .. }
-            | Self::RecordExceedsPeerLimit { .. } => false,
+            | Self::LaneLimitExceeded { .. } => false,
         }
     }
 }
@@ -439,6 +444,9 @@ pub struct Session<A> {
     /// rather than in the adapter, whose single queue would block the control
     /// frames readiness is waiting for.
     pending: VecDeque<Event>,
+    /// Lanes this endpoint has sent on, bounded by the peer's advertised
+    /// `RELIABLE_LANE_LIMIT`.
+    lanes: BTreeSet<StreamId>,
     pending_bytes: usize,
     pending_byte_limit: usize,
     pending_count_limit: usize,
@@ -463,6 +471,7 @@ impl<A: TransportAdapter> Session<A> {
             negotiation,
             outbound: VecDeque::new(),
             pending: VecDeque::new(),
+            lanes: BTreeSet::new(),
             pending_bytes: 0,
             pending_byte_limit: DEFAULT_PENDING_RECORD_BYTES,
             pending_count_limit: DEFAULT_PENDING_RECORD_COUNT,
@@ -610,6 +619,7 @@ impl<A: TransportAdapter> Session<A> {
         while let Some(event) = self.adapter.poll() {
             match event {
                 Event::Control(bytes) => {
+                    self.check_inbound(&bytes)?;
                     if let Some(event) = self.accept_control(&bytes)? {
                         return Ok(Some(event));
                     }
@@ -619,7 +629,9 @@ impl<A: TransportAdapter> Session<A> {
                     return Ok(Some(Event::Disconnected(connection)));
                 }
                 record @ Event::Reliable { .. } => {
-                    self.admit_record(&record)?;
+                    if let Event::Reliable { bytes, .. } = &record {
+                        self.check_inbound(bytes)?;
+                    }
                     if self.negotiation.is_ready() {
                         return Ok(Some(record));
                     }
@@ -642,6 +654,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.require_sendable()?;
+        self.check_outbound(frame)?;
         self.adapter.send_control(frame).map_err(transport_error)
     }
 
@@ -651,7 +664,8 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
         self.require_sendable()?;
-        self.require_within_peer_record_limit(record)?;
+        self.check_outbound(record)?;
+        self.require_lane_allowed(stream)?;
         self.adapter
             .send_reliable(stream, record)
             .map_err(transport_error)
@@ -663,7 +677,8 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
         self.require_sendable()?;
-        self.require_within_peer_record_limit(&record)?;
+        self.check_outbound(&record)?;
+        self.require_lane_allowed(stream)?;
         self.adapter
             .send_reliable_shared(stream, record)
             .map_err(transport_error)
@@ -820,67 +835,106 @@ impl<A: TransportAdapter> Session<A> {
         Ok(())
     }
 
-    /// Refuses a record whose payload is larger than the peer said it accepts.
-    ///
-    /// The declared payload, not the wire length: a conforming record carries
-    /// the type and length varints on top of the negotiated maximum.
-    fn require_within_peer_record_limit(&self, record: &[u8]) -> Result<(), Error> {
+    /// Checks a frame this endpoint is about to send against the peer's limits.
+    /// Nothing to check before the peer has advertised any.
+    fn check_outbound(&self, frame: &[u8]) -> Result<(), Error> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        let payload = declared_payload(record, peer.max_data_record_payload)?;
-        if payload <= peer.max_data_record_payload {
-            return Ok(());
-        }
-        Err(Error::new(
-            ErrorKind::RecordExceedsPeerLimit {
-                bytes: payload,
-                limit: peer.max_data_record_payload,
-            },
-            error_code::FRAME_TOO_LARGE,
-        ))
+        check_frame(frame, &peer, Side::Peer)
     }
 
-    /// Refuses a record whose payload is larger than this endpoint advertised.
+    /// Checks a frame the peer sent against the limits this endpoint
+    /// advertised, which the adapters bound only by the protocol ceiling.
+    fn check_inbound(&self, frame: &[u8]) -> Result<(), Error> {
+        check_frame(frame, &self.negotiation.local_settings(), Side::Local)
+    }
+
+    /// Refuses a lane past the number the peer said it would carry.
     ///
-    /// The adapters bound records by the protocol ceiling, which is what a
-    /// session advertising less than that would otherwise hand the application
-    /// instead of refusing.
-    fn admit_record(&self, event: &Event) -> Result<(), Error> {
-        let Event::Reliable { bytes, .. } = event else {
+    /// Counted over every lane this endpoint has used, because nothing here
+    /// closes one and the backends open a stream per distinct identifier.
+    fn require_lane_allowed(&mut self, stream: StreamId) -> Result<(), Error> {
+        let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        let limit = self.negotiation.local_settings().max_data_record_payload;
-        let payload = declared_payload(bytes, limit)?;
-        if payload <= limit {
+        if self.lanes.contains(&stream) {
+            return Ok(());
+        }
+        if u64::try_from(self.lanes.len()).is_ok_and(|used| used < peer.reliable_lane_limit) {
+            self.lanes.insert(stream);
             return Ok(());
         }
         Err(Error::new(
-            ErrorKind::RecordExceedsLocalLimit {
-                bytes: payload,
-                limit,
+            ErrorKind::LaneLimitExceeded {
+                limit: peer.reliable_lane_limit,
             },
-            error_code::FRAME_TOO_LARGE,
+            error_code::RESOURCE_LIMIT,
         ))
     }
 }
 
-/// The payload length a record declares, from its envelope.
+/// The payload limit `settings` puts on `frame_type`.
 ///
-/// `limit` bounds the decode so an unknown type cannot claim more than this
-/// endpoint would accept anyway.
-fn declared_payload(record: &[u8], limit: u64) -> Result<u64, Error> {
+/// `spec/registries.md` gives every frame a fixed maximum and negotiation can
+/// only lower it, so a setting below a registry limit takes effect here and
+/// nowhere else. A frame the settings do not name is bounded by the control
+/// ceiling alone.
+///
+/// One table rather than a check per setting: every frame, in either
+/// direction, is measured the same way, and a setting the registry adds later
+/// is a row here rather than another branch somewhere.
+fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
+    let ceiling = settings.max_control_frame_payload;
+    match frame_type {
+        frame_type::DATA_RECORD => settings.max_data_record_payload,
+        frame_type::MANIFEST_PAGE | frame_type::PROGRESSIVE_PAGE => {
+            settings.max_manifest_page_payload.min(ceiling)
+        }
+        _ => ceiling,
+    }
+}
+
+/// Whose limits a frame is measured against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Side {
+    /// What this endpoint advertised, so exceeding it is the peer's doing.
+    Local,
+    /// What the peer advertised, so exceeding it would be this endpoint's.
+    Peer,
+}
+
+/// Checks one encoded frame against the limits `settings` gives its type.
+///
+/// The one place a negotiated payload limit is applied. Records and control
+/// frames pass through it in both directions, so the payload length is read
+/// from the envelope once and a wire length is never mistaken for it.
+fn check_frame(frame: &[u8], settings: &Settings, side: Side) -> Result<(), Error> {
     let limits = vot_codec::DecodeLimits {
-        max_unknown_payload: usize::try_from(limit).unwrap_or(usize::MAX),
+        max_unknown_payload: usize::try_from(settings.max_control_frame_payload)
+            .unwrap_or(usize::MAX),
         max_frames: 1,
     };
-    let envelope = vot_codec::peek_envelope(record, limits).map_err(decode_error)?;
-    u64::try_from(envelope.payload_length).map_err(|_| {
+    let envelope = vot_codec::peek_envelope(frame, limits).map_err(decode_error)?;
+    let payload = u64::try_from(envelope.payload_length).map_err(|_| {
         Error::new(
             ErrorKind::Decode(DecodeError::LengthOverflow(u64::MAX)),
             error_code::FRAME_TOO_LARGE,
         )
-    })
+    })?;
+    let limit = negotiated_payload_limit(envelope.frame_type, settings);
+    if payload <= limit {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::FrameExceedsLimit {
+            frame_type: envelope.frame_type,
+            bytes: payload,
+            limit,
+            side,
+        },
+        error_code::FRAME_TOO_LARGE,
+    ))
 }
 
 fn transport_error(error: TransportError) -> Error {
@@ -992,6 +1046,27 @@ mod tests {
             sequence: lane,
             bytes: vot_transport_api::shared_payload(&data_record(payload)),
         }
+    }
+
+    /// Runs the exchange to completion with the given local settings.
+    fn negotiated_with(
+        client_settings: Settings,
+        server_settings: Settings,
+    ) -> (Session<Loopback>, Session<Loopback>) {
+        let mut client = Session::client(Loopback::default(), client_settings, BTreeSet::new());
+        let mut server = Session::server(Loopback::default(), server_settings, BTreeSet::new());
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        client.poll().unwrap();
+        assert!(client.is_ready() && server.is_ready());
+        (client, server)
     }
 
     /// Runs the exchange to completion, returning both endpoints.
@@ -1946,9 +2021,11 @@ mod tests {
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert_eq!(
             error.kind(),
-            &ErrorKind::RecordExceedsPeerLimit {
+            &ErrorKind::FrameExceedsLimit {
+                frame_type: frame_type::DATA_RECORD,
                 bytes: 64 * 1024 + 1,
                 limit: 64 * 1024,
+                side: Side::Peer,
             }
         );
         // The wire length of a conforming record is larger than the negotiated
@@ -1992,13 +2069,129 @@ mod tests {
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert_eq!(
             error.kind(),
-            &ErrorKind::RecordExceedsLocalLimit {
+            &ErrorKind::FrameExceedsLimit {
+                frame_type: frame_type::DATA_RECORD,
                 bytes: 64 * 1024 + 1,
                 limit: 64 * 1024,
+                side: Side::Local,
             }
         );
         // The peer sent past what it was given, so the carrier is closed.
         assert_eq!(server.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
+    }
+
+    /// One encoded frame of `frame_type` carrying `payload` bytes.
+    fn frame_of(frame_type: u64, payload: usize) -> Vec<u8> {
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type, &vec![0; payload], &mut frame).unwrap();
+        frame
+    }
+
+    #[test]
+    fn every_negotiated_payload_limit_is_applied_in_both_directions() {
+        // One table drives this, so a limit the registry adds later is a row
+        // rather than another check. The cases below are the three the settings
+        // name, plus a frame they do not, which falls back to the ceiling.
+        let settings = Settings {
+            max_control_frame_payload: 128 * 1024,
+            max_data_record_payload: 64 * 1024,
+            max_manifest_page_payload: 96 * 1024,
+            ..Settings::default()
+        };
+        let cases = [
+            (frame_type::DATA_RECORD, 64 * 1024),
+            (frame_type::MANIFEST_PAGE, 96 * 1024),
+            (frame_type::PROGRESSIVE_PAGE, 96 * 1024),
+            (frame_type::SEAL, 128 * 1024),
+        ];
+        for (frame_type, limit) in cases {
+            assert_eq!(
+                negotiated_payload_limit(frame_type, &settings),
+                limit as u64,
+                "{frame_type:#x}"
+            );
+            for side in [Side::Local, Side::Peer] {
+                check_frame(&frame_of(frame_type, limit), &settings, side).unwrap();
+                let error =
+                    check_frame(&frame_of(frame_type, limit + 1), &settings, side).unwrap_err();
+                assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
+                assert_eq!(
+                    error.kind(),
+                    &ErrorKind::FrameExceedsLimit {
+                        frame_type,
+                        bytes: limit as u64 + 1,
+                        limit: limit as u64,
+                        side,
+                    }
+                );
+                // Only the peer exceeding what it was given is the peer's
+                // fault.
+                assert_eq!(error.kind().is_peer_fault(), side == Side::Local);
+            }
+        }
+
+        // A manifest page is bounded by whichever of the two settings is lower,
+        // so a generous page limit does not widen the control ceiling.
+        let narrow_control = Settings {
+            max_control_frame_payload: 64 * 1024,
+            max_manifest_page_payload: 1024 * 1024,
+            ..Settings::default()
+        };
+        assert_eq!(
+            negotiated_payload_limit(frame_type::MANIFEST_PAGE, &narrow_control),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn a_frame_past_a_negotiated_limit_is_refused_on_the_way_out_and_in() {
+        let peer = Settings {
+            max_manifest_page_payload: 64 * 1024,
+            ..Settings::default()
+        };
+        let (mut client, mut server) = negotiated_with(Settings::default(), peer);
+
+        // Outbound: the peer said 64 KiB, so a larger page never leaves.
+        client
+            .send_control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024))
+            .unwrap();
+        let error = client
+            .send_control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024 + 1))
+            .unwrap_err();
+        assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
+        assert!(!error.kind().is_peer_fault());
+        assert!(client.adapter().closed.is_empty());
+
+        // Inbound: the server advertised 64 KiB, so a larger page closes the
+        // session rather than being delivered. A known frame type is covered,
+        // which the codec's own per-type limit would have let through.
+        server
+            .adapter
+            .events
+            .push_back(control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024 + 1)));
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
+        assert!(error.kind().is_peer_fault());
+        assert_eq!(server.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
+    }
+
+    #[test]
+    fn more_lanes_than_the_peer_carries_are_refused() {
+        let peer = Settings {
+            reliable_lane_limit: 1,
+            ..Settings::default()
+        };
+        let (mut client, _server) = negotiated_with(Settings::default(), peer);
+        let record = data_record(b"record");
+
+        client.send_reliable(StreamId(1), &record).unwrap();
+        // The same lane again is free; a second lane is not.
+        client.send_reliable(StreamId(1), &record).unwrap();
+        let error = client.send_reliable(StreamId(2), &record).unwrap_err();
+        assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
+        assert_eq!(error.kind(), &ErrorKind::LaneLimitExceeded { limit: 1 });
+        assert!(!error.kind().is_peer_fault());
+        assert_eq!(client.adapter().records.len(), 2);
     }
 
     #[test]

@@ -30,9 +30,19 @@ On a server, `HelloSent` means the peer's `HELLO` arrived.
 `Ready` means version and limits are agreed. It does not mean authenticated.
 
 `spec/wire.md` also defines `AUTH_CONTEXT`, `SESSION_OPEN`, and
-`SESSION_ACCEPT`, and marks most application frames as requiring an
-authenticated session. None of those are implemented, so every frame the
-registry marks `auth: yes` is not yet conforming.
+`SESSION_ACCEPT`, and section 1 makes a frame the registry marks `auth: yes`
+invalid until the authentication policy succeeds and `SESSION_ACCEPT` is sent.
+None of those are implemented, so no session can reach that state.
+
+Refusing every `auth: yes` frame would leave no data plane at all, since
+`DATA_RECORD` is one of them. So a session is constructed with an explicit
+`Authentication` instead, whose only variant is `Unimplemented`. A caller that
+wants to move records has to name the state it is accepting, and cannot reach it
+by default. The variant that means authenticated appears when there is an
+implementation behind it.
+
+This is the largest gap in the vertical path and it cannot be closed without
+implementing the authentication frames.
 
 ## The gate is asymmetric
 

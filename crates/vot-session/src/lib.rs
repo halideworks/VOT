@@ -494,6 +494,8 @@ fn decode_error(error: DecodeError) -> Error {
 pub struct Session<A> {
     adapter: A,
     negotiation: Negotiation,
+    /// Named by the caller, because no policy exists to establish it.
+    authentication: Authentication,
     /// Negotiation frames the backend has not accepted yet, at most two.
     ///
     /// The exchange advances in pairs, and the state machine will not produce
@@ -516,19 +518,51 @@ pub struct Session<A> {
 
 impl<A: TransportAdapter> Session<A> {
     /// A connecting session, which opens the negotiation stream.
-    pub fn client(adapter: A, local: Settings, extensions: BTreeSet<u64>) -> Self {
-        Self::new(adapter, Negotiation::client(local, extensions))
+    ///
+    /// `authentication` has to be named because there is no implementation
+    /// behind it: see [`Authentication`].
+    pub fn client(
+        adapter: A,
+        local: Settings,
+        extensions: BTreeSet<u64>,
+        authentication: Authentication,
+    ) -> Self {
+        Self::new(
+            adapter,
+            Negotiation::client(local, extensions),
+            authentication,
+        )
     }
 
     /// An accepting session, which answers on the stream the client opened.
-    pub fn server(adapter: A, local: Settings, extensions: BTreeSet<u64>) -> Self {
-        Self::new(adapter, Negotiation::server(local, extensions))
+    ///
+    /// `authentication` has to be named because there is no implementation
+    /// behind it: see [`Authentication`].
+    pub fn server(
+        adapter: A,
+        local: Settings,
+        extensions: BTreeSet<u64>,
+        authentication: Authentication,
+    ) -> Self {
+        Self::new(
+            adapter,
+            Negotiation::server(local, extensions),
+            authentication,
+        )
     }
 
-    fn new(adapter: A, negotiation: Negotiation) -> Self {
+    /// What this session can say about authentication, which is that there is
+    /// none.
+    #[must_use]
+    pub const fn authentication(&self) -> Authentication {
+        self.authentication
+    }
+
+    fn new(adapter: A, negotiation: Negotiation, authentication: Authentication) -> Self {
         Self {
             adapter,
             negotiation,
+            authentication,
             outbound: VecDeque::new(),
             pending: VecDeque::new(),
             lanes: BTreeSet::new(),
@@ -1002,6 +1036,26 @@ fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
     }
 }
 
+/// Whether a session has completed an authentication policy.
+///
+/// `spec/wire.md` section 1 makes a frame the registry marks `auth: yes`
+/// invalid until the authentication policy succeeds and `SESSION_ACCEPT` is
+/// sent. `AUTH_CONTEXT`, `SESSION_OPEN`, and `SESSION_ACCEPT` are not
+/// implemented, so no session can reach that state.
+///
+/// The enum has one variant on purpose. Refusing every `auth: yes` frame would
+/// leave no data plane at all, since `DATA_RECORD` is one of them, so a caller
+/// that wants to move records has to name the state it is accepting. It cannot
+/// be reached by default, and the variant that means authenticated appears when
+/// there is an implementation behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Authentication {
+    /// No authentication policy has run, and none can. Frames the registry
+    /// marks `auth: yes` are carried anyway, which `spec/wire.md` does not
+    /// permit.
+    Unimplemented,
+}
+
 /// Which stream a frame is on.
 ///
 /// `spec/wire.md` section 7 gives negotiation its own stream and application
@@ -1236,8 +1290,18 @@ mod tests {
         client_settings: Settings,
         server_settings: Settings,
     ) -> (Session<Loopback>, Session<Loopback>) {
-        let mut client = Session::client(Loopback::default(), client_settings, BTreeSet::new());
-        let mut server = Session::server(Loopback::default(), server_settings, BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            client_settings,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            server_settings,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
         for frame in std::mem::take(&mut client.adapter.sent) {
@@ -1254,8 +1318,18 @@ mod tests {
 
     /// Runs the exchange to completion, returning both endpoints.
     fn negotiated() -> (Session<Loopback>, Session<Loopback>) {
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
 
@@ -1279,6 +1353,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::from([1, 2]),
+            Authentication::Unimplemented,
         );
         assert_eq!(client.state(), State::Connecting);
         client.begin().unwrap();
@@ -1293,7 +1368,12 @@ mod tests {
         assert_eq!(first.frame_type(), frame_type::HELLO);
         assert_eq!(second.frame_type(), frame_type::SETTINGS);
 
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         // The server answers rather than speaking first, so nothing goes out
         // until the client's frames arrive.
@@ -1332,7 +1412,12 @@ mod tests {
 
     #[test]
     fn the_data_plane_is_refused_until_the_exchange_finishes() {
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         for state in [State::Connecting, State::HelloSent] {
             assert_eq!(
                 client
@@ -1368,8 +1453,18 @@ mod tests {
         // lane, so a conforming peer can have records in flight already.
         // Closing the session over them would punish it for the protocol's own
         // shape.
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
 
@@ -1395,7 +1490,12 @@ mod tests {
 
     #[test]
     fn held_records_are_bounded() {
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         server
             .set_pending_limits(vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES, 2)
@@ -1419,7 +1519,12 @@ mod tests {
 
     #[test]
     fn a_peer_on_another_draft_is_rejected_before_anything_else() {
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let older = Hello {
             draft_revision: vot_codec::DRAFT_REVISION - 1,
@@ -1445,7 +1550,12 @@ mod tests {
     fn the_wrong_role_and_the_wrong_order_are_both_refused() {
         // A HELLO claiming the server role on a client-initiated stream
         // contradicts the stream initiator.
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let wrong_role = Hello {
             draft_revision: vot_codec::DRAFT_REVISION,
@@ -1465,7 +1575,12 @@ mod tests {
         ));
 
         // A client never receives HELLO, because it is the one that sends it.
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         client.adapter.events.push_back(control(&frame));
         assert!(matches!(
@@ -1475,7 +1590,12 @@ mod tests {
 
         // SETTINGS before HELLO leaves the server with limits from a peer it
         // has not identified.
-        let mut early = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut early = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         early.begin().unwrap();
         let mut payload = Vec::new();
         vot_codec::encode_settings(&Settings::default(), &mut payload).unwrap();
@@ -1493,7 +1613,12 @@ mod tests {
 
     #[test]
     fn an_application_control_frame_before_readiness_ends_the_session() {
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type::SEAL, b"payload", &mut frame).unwrap();
@@ -1518,7 +1643,12 @@ mod tests {
     fn an_unknown_optional_frame_does_not_end_the_exchange() {
         // spec/wire.md requires grease to be exercised, and a handshake is
         // where a peer is most likely to send it.
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let mut grease = Vec::new();
         vot_codec::encode_frame(0x1f00, b"unspecified", &mut grease).unwrap();
@@ -1539,7 +1669,12 @@ mod tests {
 
     #[test]
     fn a_carrier_that_ends_mid_exchange_is_not_a_clean_close() {
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         client
             .adapter
@@ -1573,8 +1708,18 @@ mod tests {
             ..Settings::default()
         };
 
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
-        let mut server = Session::server(Loopback::default(), peer, BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            peer,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
         for frame in std::mem::take(&mut client.adapter.sent) {
@@ -1599,8 +1744,14 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
-        let mut answering = Session::server(Loopback::default(), peer, BTreeSet::new());
+        let mut answering = Session::server(
+            Loopback::default(),
+            peer,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         refusing.begin().unwrap();
         answering.begin().unwrap();
         for frame in std::mem::take(&mut refusing.adapter.sent) {
@@ -1674,6 +1825,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         refusing.negotiation.state = State::Ready;
         let error = refusing
@@ -1701,6 +1853,7 @@ mod tests {
                 },
                 Settings::default(),
                 BTreeSet::new(),
+                Authentication::Unimplemented,
             );
             session.negotiation.state = State::Ready;
             assert_eq!(
@@ -1719,7 +1872,12 @@ mod tests {
         // byte bound limits memory. One record short of the bound is held; the
         // byte that crosses it is not.
         let payload = vec![0_u8; 1024];
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         server
             .set_pending_limits(vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES, 8)
@@ -1730,7 +1888,12 @@ mod tests {
         assert_eq!(server.poll().unwrap(), None);
         assert_eq!(server.pending_bytes, 4 * record_wire_len(1024));
 
-        let mut exact = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut exact = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         exact.begin().unwrap();
         exact.pending_byte_limit = 2 * record_wire_len(1024);
         for lane in 0..2 {
@@ -1763,7 +1926,12 @@ mod tests {
     fn a_repeated_negotiation_frame_is_refused_at_every_point() {
         // A second HELLO would replace the extensions and revision the rest of
         // the exchange was decided under.
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let hello = Hello {
             draft_revision: vot_codec::DRAFT_REVISION,
@@ -1789,7 +1957,12 @@ mod tests {
 
         // And an acknowledgement before the settings it claims to acknowledge
         // would make the client ready without ever reading the peer's limits.
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         let mut ack = Vec::new();
         vot_codec::encode_frame(frame_type::SETTINGS_ACK, &[], &mut ack).unwrap();
@@ -1811,7 +1984,12 @@ mod tests {
         // and a local caller that asked too early. Closing on the second would
         // tear down a healthy connection over an API misuse and would tell the
         // peer it did something wrong when it did not.
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type::SEAL, b"payload", &mut frame).unwrap();
@@ -1824,7 +2002,12 @@ mod tests {
         assert_eq!(server.state(), State::Closed, "the session is over");
 
         // A local caller asking too early leaves the carrier alone.
-        let mut early = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut early = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         early.begin().unwrap();
         assert!(early.send_reliable(StreamId(1), b"record").is_err());
         assert!(early.send_control(&frame_of(frame_type::PING, 0)).is_err());
@@ -1842,6 +2025,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         refusing.negotiation.state = State::Ready;
         assert!(
@@ -1852,7 +2036,12 @@ mod tests {
         assert!(refusing.adapter().closed.is_empty());
 
         // Nor does a carrier that has already gone; there is nothing to close.
-        let mut gone = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut gone = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         gone.begin().unwrap();
         gone.adapter
             .events
@@ -1872,8 +2061,12 @@ mod tests {
             ),
             (0x0f, Vec::new(), error_code::UNKNOWN_CRITICAL_FRAME),
         ] {
-            let mut session =
-                Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+            let mut session = Session::server(
+                Loopback::default(),
+                Settings::default(),
+                BTreeSet::new(),
+                Authentication::Unimplemented,
+            );
             session.begin().unwrap();
             let mut frame = Vec::new();
             vot_codec::encode_frame(frame_type, &payload, &mut frame).unwrap();
@@ -1904,6 +2097,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         let error = mismatched.begin().unwrap_err();
         assert_eq!(error.close_code(), error_code::INVALID_SETTING);
@@ -1949,12 +2143,18 @@ mod tests {
                 ..Settings::default()
             },
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         agreed.begin().unwrap();
         assert_eq!(agreed.adapter().sent.len(), 2);
 
         // A backend that reassembles nothing has nothing to disagree with.
-        let mut silent = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut silent = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         silent.begin().unwrap();
         assert_eq!(silent.adapter().sent.len(), 2);
     }
@@ -1964,7 +2164,12 @@ mod tests {
         // Polling a failed session again used to report whatever the next frame
         // looked like against a closed state, which named the second thing that
         // went wrong rather than the first.
-        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         let mut older = Vec::new();
         vot_codec::encode_hello(
@@ -2023,6 +2228,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         client.begin().unwrap();
         assert_eq!(client.adapter().sent.len(), 1, "only HELLO fitted");
@@ -2056,6 +2262,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         polling.begin().unwrap();
         assert_eq!(polling.unsent_negotiation_frames(), 2);
@@ -2072,6 +2279,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         server.begin().unwrap();
         for frame in polling.adapter().sent.clone() {
@@ -2101,6 +2309,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         assert!(broken.begin().is_err());
         assert_eq!(broken.unsent_negotiation_frames(), 2);
@@ -2119,6 +2328,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         client.begin().unwrap();
         assert_eq!(client.unsent_negotiation_frames(), 2);
@@ -2160,7 +2370,12 @@ mod tests {
         // A server is ready when it produces SETTINGS_ACK, not when the backend
         // takes it. An application frame sent in between would reach a peer
         // still in SettingsExchanged, which closes for NotNegotiated.
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         let mut server = Session::server(
             Loopback {
                 control_capacity: Some(1),
@@ -2168,6 +2383,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
+            Authentication::Unimplemented,
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -2210,8 +2426,18 @@ mod tests {
             max_data_record_payload: 64 * 1024,
             ..Settings::default()
         };
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
-        let mut server = Session::server(Loopback::default(), peer, BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            peer,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
         for frame in std::mem::take(&mut client.adapter.sent) {
@@ -2265,7 +2491,12 @@ mod tests {
             max_data_record_payload: 64 * 1024,
             ..Settings::default()
         };
-        let mut server = Session::server(Loopback::default(), local, BTreeSet::new());
+        let mut server = Session::server(
+            Loopback::default(),
+            local,
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         server.begin().unwrap();
         server
             .adapter
@@ -2526,8 +2757,18 @@ mod tests {
         // The registry requires both endpoints to negotiate an extension, so
         // the side that cannot know has to refuse.
         let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
-        let mut client = Session::client(Loopback::default(), Settings::default(), fec.clone());
-        let mut server = Session::server(Loopback::default(), Settings::default(), fec);
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            fec.clone(),
+            Authentication::Unimplemented,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            fec,
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         server.begin().unwrap();
         for frame in std::mem::take(&mut client.adapter.sent) {
@@ -2632,7 +2873,12 @@ mod tests {
         // A TcpAdapter moves bytes through methods the contract has no place
         // for, so without this a session over one would queue a handshake that
         // nothing could ever send.
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         assert_eq!(client.adapter().sent.len(), 2);
 
@@ -2651,7 +2897,12 @@ mod tests {
 
     #[test]
     fn beginning_twice_is_refused() {
-        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
         client.begin().unwrap();
         assert!(matches!(
             client.begin().unwrap_err().kind(),

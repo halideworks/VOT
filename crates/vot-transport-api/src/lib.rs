@@ -286,11 +286,18 @@ impl ReceiveLimits {
         let control_payload = usize::try_from(settings.max_control_frame_payload)
             .map_err(|_| Error::InvalidConfiguration)?;
         validate_control_payload_limit(control_payload)?;
-        let wire = control_payload
-            .checked_add(MAX_FRAME_ENVELOPE_BYTES)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if wire > inbound_byte_capacity {
-            return Err(Error::InvalidConfiguration);
+        // Every frame the queue has to hold, not only the control one. A
+        // conforming record past the capacity is refused with an empty queue,
+        // and the driver holds it back as backpressure that never clears.
+        let record_payload = usize::try_from(settings.max_data_record_payload)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        for payload in [control_payload, record_payload] {
+            let wire = payload
+                .checked_add(MAX_FRAME_ENVELOPE_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if wire > inbound_byte_capacity {
+                return Err(Error::InvalidConfiguration);
+            }
         }
         let lanes = usize::try_from(settings.reliable_lane_limit)
             .map_err(|_| Error::InvalidConfiguration)?;
@@ -571,6 +578,32 @@ mod tests {
         assert!(limits.match_settings(&settings(largest as u64, 16)));
         assert!(!limits.match_settings(&settings(largest as u64, 15)));
         assert!(!limits.match_settings(&settings(largest as u64 - 1, 16)));
+
+        // A record has to fit too. The minimum control frame is 1 KiB and the
+        // minimum record is 64 KiB, so a queue sized for the first alone
+        // refuses a conforming record with the queue empty.
+        assert_eq!(
+            ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: MIN_CONTROL_FRAME_PAYLOAD as u64,
+                    max_data_record_payload: 64 * 1024,
+                    ..vot_codec::Settings::default()
+                },
+                64 * 1024,
+            ),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(
+            ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: MIN_CONTROL_FRAME_PAYLOAD as u64,
+                    max_data_record_payload: 64 * 1024,
+                    ..vot_codec::Settings::default()
+                },
+                64 * 1024 + MAX_FRAME_ENVELOPE_BYTES,
+            )
+            .is_ok()
+        );
 
         // One past what the queue holds is never deliverable, so it cannot be
         // advertised.

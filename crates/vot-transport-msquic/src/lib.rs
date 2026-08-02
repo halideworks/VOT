@@ -3389,6 +3389,7 @@ pub mod live {
         }
 
         #[test]
+        #[allow(clippy::too_many_lines)]
         fn two_endpoints_negotiate_over_the_real_carrier_before_any_data_moves() {
             // Everything below runs production code: the assembled client, the
             // assembled server, the session layer over both, and MsQuic in
@@ -3431,6 +3432,7 @@ pub mod live {
                 transport,
                 vot_codec::Settings::default(),
                 BTreeSet::from([1]),
+                vot_session::Authentication::Unimplemented,
             );
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -3458,7 +3460,12 @@ pub mod live {
                 }
                 std::thread::yield_now();
             };
-            let mut server = Session::server(accepted, peer_settings, BTreeSet::new());
+            let mut server = Session::server(
+                accepted,
+                peer_settings,
+                BTreeSet::new(),
+                vot_session::Authentication::Unimplemented,
+            );
             server.begin().unwrap();
 
             let mut records = Vec::new();
@@ -3581,6 +3588,7 @@ pub mod live {
                     ..vot_codec::Settings::default()
                 },
                 BTreeSet::new(),
+                vot_session::Authentication::Unimplemented,
             );
             (listener, peer, server, deadline)
         }

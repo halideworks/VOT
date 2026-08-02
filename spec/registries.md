@@ -231,3 +231,20 @@ bytes it is a label that any holder of the receipt can rewrite, so a receipt the
 same issuer produced for another purpose could be relabelled without disturbing
 its signature. A witness signature already covers its own key identifier, as a
 field of the statement it signs.
+
+## 11. Capability formats
+
+| Value | Name | Status |
+|---:|---|---|
+| `0x0001` | `ed25519-cbor-v1` | reserved for stage two |
+
+`0x0000` is reserved and MUST NOT be advertised or sent.
+
+A capability format names the encoding and verification rules for the opaque
+capability bytes in `SESSION_OPEN`. The format identifier travels outside those
+bytes so a server can reject a format it does not implement without parsing
+anything an unauthenticated peer chose the shape of.
+
+`ed25519-cbor-v1` is registered here so the identifier is stable, and is defined
+by ADR-0022 stage two. A server advertising no format requires no
+authentication, which `spec/wire.md` section 1.1 describes.

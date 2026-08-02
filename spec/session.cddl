@@ -1,0 +1,42 @@
+; VOT v0.3 session authentication schemas.
+; RFC 8949 core deterministic encoding is mandatory in addition to CDDL.
+
+auth-context = {
+  0: 0,                         ; auth context format version
+  1: bstr .size (16..64),       ; nonce, fresh per session
+  2: binding,
+  3: [* capability-format],     ; at most 16, ascending, no duplicates
+}
+
+session-open = {
+  0: 0,                         ; session open format version
+  1: id128,                     ; session_id
+  2: capability-format,
+  3: bstr .size (0..49152),     ; capability, opaque at this layer
+  4: bstr .size (0..4096),      ; requested_scope, empty asks for all of it
+  5: bstr .size (0..4096),      ; binding_proof, empty when binding is 0
+}
+
+session-accept = {
+  0: 0,                         ; session accept format version
+  1: id128,                     ; session_id, equal to the request
+  2: bstr .size (0..4096),      ; granted_scope
+}
+
+session-reject = {
+  0: 0,                         ; session reject format version
+  1: id128,                     ; session_id, equal to the request
+  2: reject-reason,
+  3: tstr .size (0..1024),      ; detail, may be empty
+}
+
+; 0 none, 1 proof of possession
+binding = 0 / 1
+
+; 0 is reserved and never advertised; see spec/registries.md section 11.
+capability-format = uint .le 65535
+
+; AUTHENTICATION_FAILED, AUTHORIZATION_FAILED, REPLAY_REJECTED
+reject-reason = 513 / 514 / 515
+
+id128 = bstr .size 16

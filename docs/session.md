@@ -155,6 +155,20 @@ identifier would make interleaving between independent streams look like
 reordering within one, and on an accepting endpoint every application lane is
 peer-initiated, so there would be nothing left to tell them apart by.
 
+## Driving a session
+
+`Session` owns its backend so an application cannot reach past the readiness
+gate to the raw adapter. Some backends need more than the adapter contract
+covers, though: a `TcpAdapter` moves bytes through `drain_commands` and
+`record_native_event`, neither of which the contract has a place for.
+
+`Session::driver` exists for that code. It is the same borrow the gate is meant
+to prevent an application taking, so it is named for the role that needs it. An
+application sending through it is doing what `send_reliable` exists to refuse.
+
+Known gap: TCP has no assembled transport, so a session over it needs an
+external driver. MsQuic does, and its `flush` and `poll` do that work.
+
 ## Client and server transports
 
 `vot-transport-msquic` provides both directions:

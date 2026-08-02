@@ -411,7 +411,13 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
 /// for ever and a caller reads that as backpressure that never clears.
 #[must_use]
 pub fn effective_send_limit(peer_limit: usize, outbound_byte_capacity: usize) -> usize {
-    peer_limit.min(outbound_byte_capacity.saturating_sub(MAX_FRAME_ENVELOPE_BYTES))
+    // Never below the protocol minimum. A queue too small for one conforming
+    // frame reports backpressure; a limit under the minimum would instead make
+    // validate_control_frame reject every frame, including an empty PING, as a
+    // configuration error.
+    peer_limit
+        .min(outbound_byte_capacity.saturating_sub(MAX_FRAME_ENVELOPE_BYTES))
+        .max(MIN_CONTROL_FRAME_PAYLOAD)
 }
 
 /// Validates a negotiated control-frame payload limit.
@@ -617,7 +623,20 @@ mod tests {
             effective_send_limit(capacity - MAX_FRAME_ENVELOPE_BYTES, capacity),
             capacity - MAX_FRAME_ENVELOPE_BYTES
         );
-        assert_eq!(effective_send_limit(1024, 0), 0, "a queue with no room");
+        // Never below the protocol minimum, so the clamp always yields a
+        // limit the protocol allows.
+        assert_eq!(effective_send_limit(1024, 0), MIN_CONTROL_FRAME_PAYLOAD);
+        assert_eq!(
+            effective_send_limit(
+                MIN_CONTROL_FRAME_PAYLOAD,
+                MIN_CONTROL_FRAME_PAYLOAD + MAX_FRAME_ENVELOPE_BYTES - 1
+            ),
+            MIN_CONTROL_FRAME_PAYLOAD
+        );
+        assert_eq!(
+            validate_control_payload_limit(effective_send_limit(1024, 0)),
+            Ok(())
+        );
     }
 
     #[test]

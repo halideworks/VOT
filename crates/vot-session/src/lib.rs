@@ -568,6 +568,20 @@ impl<A: TransportAdapter> Session<A> {
         &self.adapter
     }
 
+    /// Borrows the backend mutably, for the code that drives the carrier.
+    ///
+    /// Some backends do their work through methods the adapter contract does
+    /// not cover: a `TcpAdapter` moves bytes through `drain_commands` and
+    /// `record_native_event`, both of which need this, and without it a session
+    /// over one could queue a handshake nothing would ever send.
+    ///
+    /// This is for a driver, not an application. Reaching the adapter reaches
+    /// past the readiness gate, and an application that sends through here is
+    /// doing what [`send_reliable`](Self::send_reliable) exists to refuse.
+    pub const fn driver(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
     /// Returns the backend, ending the session's ownership of it.
     pub fn into_adapter(self) -> A {
         self.adapter
@@ -2578,6 +2592,28 @@ mod tests {
                 lane: Lane::Control,
                 side: Side::Peer,
             }
+        );
+    }
+
+    #[test]
+    fn a_driver_can_reach_a_backend_the_adapter_contract_does_not_cover() {
+        // A TcpAdapter moves bytes through methods the contract has no place
+        // for, so without this a session over one would queue a handshake that
+        // nothing could ever send.
+        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        client.begin().unwrap();
+        assert_eq!(client.adapter().sent.len(), 2);
+
+        // The same adapter, reachable for the work the session cannot do.
+        client.driver().sent.clear();
+        assert!(client.adapter().sent.is_empty());
+        client
+            .driver()
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(1)));
+        assert_eq!(
+            client.poll().unwrap(),
+            Some(Event::Connected(vot_transport_api::ConnectionId(1)))
         );
     }
 

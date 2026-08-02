@@ -17,11 +17,15 @@ pub const PEER_STREAM_ID: u64 = u64::MAX;
 /// than one of the application's reliable lanes.
 pub const CONTROL_LANE: u64 = u64::MAX - 1;
 
-/// Largest number of native events the callback queue will hold.
+/// Largest number of peer-driven events the callback queue will hold.
 ///
 /// Callbacks run on backend worker threads and cannot wait for the driver, so
 /// without a bound a peer that sends faster than the driver polls would drive
 /// allocation until the process died.
+///
+/// This bounds records and control frames, which is where a peer sets the pace.
+/// Connection lifecycle events are admitted past it, because losing one is not
+/// survivable and there are at most two of them per connection.
 pub const MAX_CALLBACK_EVENTS: usize = 1024;
 
 /// Largest partial frame held on a reliable lane while waiting for the rest.
@@ -623,43 +627,84 @@ pub mod live {
             self.adapter.pending_commands()
         }
 
-        /// Moves native events into the adapter, stopping at the first the
-        /// bounded queue will not take.
+        /// Moves native events into the adapter and ends the connection if one
+        /// of them can never be admitted.
         fn pump(&mut self) {
-            if let Some(held) = self.stalled.take()
-                && !self.offer(held)
+            if let Pumped::Inadmissible(close) =
+                pump_events(&mut self.adapter, &mut self.stalled, &self.inbound)
+                && let Some(connection) = self.connection.as_ref()
             {
-                return;
-            }
-            while let Some(event) = pop(&self.inbound) {
-                if !self.offer(event) {
-                    return;
-                }
+                // A registered close code rather than a clean shutdown, so the
+                // peer learns it violated the contract instead of seeing the
+                // transfer end for no stated reason.
+                connection.shutdown(msquic::ConnectionShutdownFlags::NONE, close);
             }
         }
+    }
 
-        /// Offers one event to the adapter. Returns false when pumping stops.
-        ///
-        /// A full queue is the only refusal worth waiting on, because it is the
-        /// only one that clears. Every other refusal means the event can never
-        /// be admitted, and holding it would wedge the head of the queue for
-        /// ever, so the connection ends rather than stalling in silence.
-        fn offer(&mut self, event: NativeEvent) -> bool {
-            match self.adapter.try_record_native_event(event) {
-                Ok(()) => true,
-                Err((event, Error::InboundQueueFull)) => {
-                    // Held rather than dropped, so backpressure never costs a
-                    // record and never reorders one.
-                    self.stalled = Some(event);
-                    false
-                }
-                Err(_) => {
-                    if let Some(connection) = self.connection.as_ref() {
-                        connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
-                    }
-                    false
-                }
+    /// How a pump run ended.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Pumped {
+        /// The callback queue is empty.
+        Drained,
+        /// An event is held back until the adapter has room.
+        Stalled,
+        /// An event could never be admitted, carrying the close code for it.
+        Inadmissible(u64),
+    }
+
+    /// Moves native events from a callback queue into the adapter.
+    ///
+    /// A full adapter is the only refusal worth waiting on, because it is the
+    /// only one that clears. Every other refusal means the event can never be
+    /// admitted, and holding it would wedge the head of the queue for ever, so
+    /// the caller ends the connection rather than stalling in silence.
+    ///
+    /// Split from the connection so the queue behaviour can be exercised
+    /// without one.
+    fn pump_events(
+        adapter: &mut MsQuicAdapter,
+        stalled: &mut Option<NativeEvent>,
+        inbound: &Arc<Mutex<VecDeque<NativeEvent>>>,
+    ) -> Pumped {
+        if let Some(held) = stalled.take() {
+            match offer(adapter, stalled, held) {
+                Pumped::Drained => {}
+                outcome => return outcome,
             }
+        }
+        while let Some(event) = pop(inbound) {
+            match offer(adapter, stalled, event) {
+                Pumped::Drained => {}
+                outcome => return outcome,
+            }
+        }
+        Pumped::Drained
+    }
+
+    /// Offers one event to the adapter.
+    fn offer(
+        adapter: &mut MsQuicAdapter,
+        stalled: &mut Option<NativeEvent>,
+        event: NativeEvent,
+    ) -> Pumped {
+        match adapter.try_record_native_event(event) {
+            Ok(()) => Pumped::Drained,
+            Err((event, Error::InboundQueueFull)) => {
+                // Held rather than dropped, so backpressure never costs a
+                // record and never reorders one.
+                *stalled = Some(event);
+                Pumped::Stalled
+            }
+            Err((_, error)) => Pumped::Inadmissible(close_code(error)),
+        }
+    }
+
+    /// Maps an inadmissible event onto the wire error registry.
+    const fn close_code(error: Error) -> u64 {
+        match error {
+            Error::RecordTooLarge => vot_codec::error_code::FRAME_TOO_LARGE as u64,
+            _ => vot_codec::error_code::RESOURCE_LIMIT as u64,
         }
     }
 
@@ -884,11 +929,15 @@ pub mod live {
 
     /// Queues a connection lifecycle event past the data bound.
     ///
-    /// `Connected` and `Disconnected` carry no payload and arrive at most once
-    /// each per connection, so admitting them past the bound adds two entries
-    /// rather than unbounded growth. The bound exists to stop a fast peer
-    /// outrunning the driver, and neither of these comes from the peer's data.
-    /// Dropping one is not survivable, so it is not treated as backpressure.
+    /// The bound exists to stop a fast peer outrunning the driver, and neither
+    /// of these comes from the peer's data. Dropping one is not survivable, so
+    /// it is not treated as backpressure.
+    ///
+    /// The extra growth is two entries, and that is a bound rather than a hope:
+    /// `MsQuicTransport` owns one connection for its whole life and this queue
+    /// belongs to that transport, `Connected` is delivered once per successful
+    /// handshake, and `ShutdownComplete` is the last event `MsQuic` delivers
+    /// for a connection. Both carry no payload.
     fn push_lifecycle(queue: &Arc<Mutex<VecDeque<NativeEvent>>>, event: NativeEvent) {
         if let Ok(mut queue) = queue.lock() {
             queue.push_back(event);
@@ -1126,12 +1175,12 @@ pub mod live {
             // waiting on a connection that is gone, holding path statistics for
             // a path that no longer exists.
             let queue = Arc::new(Mutex::new(VecDeque::new()));
-            for _ in 0..MAX_CALLBACK_EVENTS {
+            for sequence in 1..=MAX_CALLBACK_EVENTS as u64 {
                 assert!(super::push(
                     &queue,
                     NativeEvent::Reliable {
                         stream: 1,
-                        sequence: 1,
+                        sequence,
                         bytes: b"record".to_vec(),
                     }
                 ));
@@ -1141,18 +1190,82 @@ pub mod live {
                     &queue,
                     NativeEvent::Reliable {
                         stream: 1,
-                        sequence: 2,
+                        sequence: 0,
                         bytes: b"record".to_vec(),
                     }
                 ),
                 "records are refused once the bound is reached"
             );
-
             super::push_lifecycle(&queue, NativeEvent::Disconnected(11));
+
+            // Drive the driver's own path. The adapter holds far fewer events
+            // than the callback queue, so the disconnect only arrives after
+            // repeated polling, which is the case that was broken.
+            let mut adapter = MsQuicAdapter::default();
+            adapter.record_path_stats(ConnectionId(11), vot_transport_api::PathStats::default());
+            let mut stalled = None;
+            let mut records = 0;
+            let mut disconnected = false;
+            for _ in 0..MAX_CALLBACK_EVENTS * 2 {
+                super::pump_events(&mut adapter, &mut stalled, &queue);
+                while let Some(event) = adapter.poll() {
+                    match event {
+                        Event::Reliable { .. } => records += 1,
+                        Event::Disconnected(ConnectionId(11)) => disconnected = true,
+                        other => panic!("unexpected event {other:?}"),
+                    }
+                }
+                if disconnected {
+                    break;
+                }
+            }
             assert_eq!(
-                queue.lock().unwrap().back(),
-                Some(&NativeEvent::Disconnected(11))
+                records, MAX_CALLBACK_EVENTS,
+                "no record was lost on the way"
             );
+            assert!(
+                disconnected,
+                "the driver never learned the connection closed"
+            );
+            assert_eq!(
+                adapter.path_stats(),
+                None,
+                "path statistics outlived the path"
+            );
+        }
+
+        #[test]
+        fn an_event_that_can_never_be_admitted_ends_the_connection() {
+            // Holding it would wedge the head of the queue for ever. The close
+            // code comes from the wire registry so the peer is told what it did.
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            super::push_lifecycle(
+                &queue,
+                NativeEvent::Reliable {
+                    stream: 1,
+                    sequence: 1,
+                    bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1],
+                },
+            );
+            let mut adapter = MsQuicAdapter::default();
+            let mut stalled = None;
+            assert_eq!(
+                super::pump_events(&mut adapter, &mut stalled, &queue),
+                super::Pumped::Inadmissible(u64::from(vot_codec::error_code::FRAME_TOO_LARGE))
+            );
+            assert!(stalled.is_none(), "an inadmissible event is not retried");
+
+            // A full adapter is the one refusal that is waited on rather than
+            // treated as fatal.
+            let mut adapter = MsQuicAdapter::with_queue_limits(1, 4096).unwrap();
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            assert!(super::push(&queue, NativeEvent::Connected(11)));
+            assert!(super::push(&queue, NativeEvent::Disconnected(11)));
+            assert_eq!(
+                super::pump_events(&mut adapter, &mut stalled, &queue),
+                super::Pumped::Stalled
+            );
+            assert_eq!(stalled, Some(NativeEvent::Disconnected(11)));
         }
 
         #[test]
@@ -1856,7 +1969,9 @@ mod tests {
         // Zero stays an ordinary application lane.
         assert_ne!(CONTROL_LANE, 0);
         assert_ne!(PEER_STREAM_ID, 0);
-        // The bounds are the ones the callback path relies on.
+        // The bounds are the ones the callback path relies on. The event bound
+        // covers peer-driven records and control frames; lifecycle events are
+        // admitted past it.
         assert_eq!(MAX_CALLBACK_EVENTS, 1024);
         assert_eq!(
             MAX_PARTIAL_FRAME,

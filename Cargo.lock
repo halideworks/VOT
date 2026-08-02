@@ -1995,6 +1995,15 @@ name = "vot-journal"
 version = "0.0.1"
 
 [[package]]
+name = "vot-log"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
 name = "vot-manifest"
 version = "0.0.1"
 dependencies = [

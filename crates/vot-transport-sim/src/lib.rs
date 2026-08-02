@@ -53,12 +53,92 @@ enum Submission {
     ReceiveCredit(u64),
 }
 
+/// Largest reorder window the adapter will hold, bounding delivery memory.
+pub const MAX_REORDER_DEPTH: usize = 64;
+
+/// Deterministic delivery impairment applied by [`SimulatorAdapter`].
+///
+/// The reliable carrier never drops records. A QUIC reliable stream
+/// retransmits, so packet loss is visible to an application only as reordering
+/// and delay; modelling it as a dropped record would test a failure the
+/// transport does not produce. Duplication and datagram loss are real
+/// application-visible outcomes and are injected directly.
+///
+/// Every knob is a fixed period rather than a probability, so a scenario
+/// replays identically without carrying a random-number generator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Impairment {
+    /// Number of later events delivered ahead of earlier ones. Zero keeps
+    /// submission order.
+    pub reorder_depth: usize,
+    /// Deliver every Nth reliable event a second time. Zero disables
+    /// duplication.
+    pub duplicate_every: u64,
+    /// Report every Nth datagram as suspected lost rather than sent. Zero
+    /// disables datagram loss.
+    pub drop_datagram_every: u64,
+}
+
+/// The ordering guarantee an event belongs to.
+///
+/// A reliable stream delivers its own bytes in order, and one datagram's
+/// lifecycle events are sequential. Only events in different lanes can race.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Lane {
+    Control,
+    Stream(StreamId),
+    Datagram(u64),
+    Connection,
+}
+
+impl Lane {
+    fn of(event: &TransportEvent) -> Self {
+        match event {
+            TransportEvent::Control(_) => Self::Control,
+            TransportEvent::Reliable { stream, .. } => Self::Stream(*stream),
+            TransportEvent::Acknowledged(ack) => Self::Stream(ack.stream()),
+            TransportEvent::DatagramState { context, .. } => Self::Datagram(*context),
+            TransportEvent::Connected(_) | TransportEvent::Disconnected(_) => Self::Connection,
+        }
+    }
+}
+
+/// Delivers events out of order without breaking any single lane's ordering.
+///
+/// Reversing fixed-size windows decides which lane occupies which position.
+/// Each lane's own events are then placed back into the positions its lane
+/// still holds, in submission order. The result reorders independent streams
+/// against each other, which a real path does, without reordering one stream
+/// against itself or delivering a datagram's completion before it was queued,
+/// which no carrier does.
+fn reorder_across_lanes(delivered: &mut Vec<TransportEvent>, depth: usize) {
+    let mut lanes: Vec<Lane> = delivered.iter().map(Lane::of).collect();
+    for window in lanes.chunks_mut(depth + 1) {
+        window.reverse();
+    }
+    let mut by_lane: BTreeMap<Lane, VecDeque<TransportEvent>> = BTreeMap::new();
+    for event in delivered.drain(..) {
+        by_lane
+            .entry(Lane::of(&event))
+            .or_default()
+            .push_back(event);
+    }
+    for lane in lanes {
+        if let Some(event) = by_lane.get_mut(&lane).and_then(VecDeque::pop_front) {
+            delivered.push(event);
+        }
+    }
+}
+
 pub struct SimulatorAdapter {
     submissions: VecDeque<Submission>,
     events: VecDeque<TransportEvent>,
     next_sequence: u64,
     receive_credit: u64,
     control_payload_limit: usize,
+    impairment: Impairment,
+    reliable_delivered: u64,
+    datagrams_sent: u64,
 }
 
 impl Default for SimulatorAdapter {
@@ -69,11 +149,33 @@ impl Default for SimulatorAdapter {
             next_sequence: 0,
             receive_credit: 0,
             control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            impairment: Impairment::default(),
+            reliable_delivered: 0,
+            datagrams_sent: 0,
         }
     }
 }
 
 impl SimulatorAdapter {
+    /// Creates an adapter that impairs delivery deterministically.
+    ///
+    /// # Errors
+    /// Rejects a reorder depth beyond the bounded delivery window.
+    pub fn with_impairment(impairment: Impairment) -> Result<Self, TransportError> {
+        if impairment.reorder_depth > MAX_REORDER_DEPTH {
+            return Err(TransportError::InvalidConfiguration);
+        }
+        Ok(Self {
+            impairment,
+            ..Self::default()
+        })
+    }
+
+    #[must_use]
+    pub const fn impairment(&self) -> Impairment {
+        self.impairment
+    }
+
     #[must_use]
     pub fn pending_submissions(&self) -> usize {
         self.submissions.len()
@@ -82,6 +184,33 @@ impl SimulatorAdapter {
     #[must_use]
     pub const fn receive_credit(&self) -> u64 {
         self.receive_credit
+    }
+
+    /// Reorders and duplicates one flush worth of events in place.
+    fn impair(&mut self, delivered: &mut Vec<TransportEvent>) -> Result<(), TransportError> {
+        if self.impairment.reorder_depth != 0 {
+            reorder_across_lanes(delivered, self.impairment.reorder_depth);
+        }
+        if self.impairment.duplicate_every == 0 {
+            return Ok(());
+        }
+        let mut duplicated = Vec::with_capacity(delivered.len());
+        for event in delivered.drain(..) {
+            let mut repeat = false;
+            if matches!(event, TransportEvent::Reliable { .. }) {
+                self.reliable_delivered = self
+                    .reliable_delivered
+                    .checked_add(1)
+                    .ok_or(TransportError::ArithmeticOverflow)?;
+                repeat = self.reliable_delivered % self.impairment.duplicate_every == 0;
+            }
+            if repeat {
+                duplicated.push(event.clone());
+            }
+            duplicated.push(event);
+        }
+        *delivered = duplicated;
+        Ok(())
     }
 
     /// Applies the peer-negotiated control-frame payload ceiling.
@@ -146,35 +275,48 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
+        let mut delivered = Vec::with_capacity(self.submissions.len());
         while let Some(submission) = self.submissions.pop_front() {
             match submission {
-                Submission::Control(bytes) => self.events.push_back(TransportEvent::Control(bytes)),
+                Submission::Control(bytes) => delivered.push(TransportEvent::Control(bytes)),
                 Submission::Reliable { stream, bytes } => {
                     let sequence = self
                         .next_sequence
                         .checked_add(1)
                         .ok_or(TransportError::ArithmeticOverflow)?;
                     self.next_sequence = sequence;
-                    self.events.push_back(TransportEvent::Reliable {
+                    delivered.push(TransportEvent::Reliable {
                         stream,
                         sequence,
                         bytes,
                     });
                 }
                 Submission::Datagram { context, bytes } => {
-                    self.events.push_back(TransportEvent::DatagramState {
+                    self.datagrams_sent = self
+                        .datagrams_sent
+                        .checked_add(1)
+                        .ok_or(TransportError::ArithmeticOverflow)?;
+                    delivered.push(TransportEvent::DatagramState {
                         context,
                         state: vot_transport_api::DatagramSendState::Queued,
                     });
-                    self.events.push_back(TransportEvent::DatagramState {
+                    let lost = self.impairment.drop_datagram_every != 0
+                        && self.datagrams_sent % self.impairment.drop_datagram_every == 0;
+                    delivered.push(TransportEvent::DatagramState {
                         context,
-                        state: vot_transport_api::DatagramSendState::Sent,
+                        state: if lost {
+                            vot_transport_api::DatagramSendState::SuspectedLost
+                        } else {
+                            vot_transport_api::DatagramSendState::Sent
+                        },
                     });
                     let _ = bytes;
                 }
                 Submission::ReceiveCredit(bytes) => self.receive_credit = bytes,
             }
         }
+        self.impair(&mut delivered)?;
+        self.events.extend(delivered);
         Ok(())
     }
 
@@ -1346,6 +1488,179 @@ mod tests {
         adapter.flush().unwrap();
         assert_eq!(adapter.pending_submissions(), 0);
         assert_eq!(adapter.receive_credit(), 123);
+    }
+
+    fn reliable_sequences(adapter: &mut SimulatorAdapter) -> Vec<u64> {
+        let mut sequences = Vec::new();
+        while let Some(event) = adapter.poll() {
+            if let TransportEvent::Reliable { sequence, .. } = event {
+                sequences.push(sequence);
+            }
+        }
+        sequences
+    }
+
+    fn reliable_stream_sequences(adapter: &mut SimulatorAdapter) -> Vec<(u64, u64)> {
+        let mut delivered = Vec::new();
+        while let Some(event) = adapter.poll() {
+            if let TransportEvent::Reliable {
+                stream, sequence, ..
+            } = event
+            {
+                delivered.push((stream.0, sequence));
+            }
+        }
+        delivered
+    }
+
+    #[test]
+    fn impairment_configuration_is_bounded_and_observable() {
+        assert_eq!(
+            SimulatorAdapter::default().impairment(),
+            Impairment::default()
+        );
+        let impairment = Impairment {
+            reorder_depth: MAX_REORDER_DEPTH,
+            duplicate_every: 3,
+            drop_datagram_every: 2,
+        };
+        assert_eq!(
+            SimulatorAdapter::with_impairment(impairment)
+                .unwrap()
+                .impairment(),
+            impairment
+        );
+        assert_eq!(
+            SimulatorAdapter::with_impairment(Impairment {
+                reorder_depth: MAX_REORDER_DEPTH + 1,
+                ..Impairment::default()
+            })
+            .err(),
+            Some(TransportError::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn reordering_races_streams_but_never_a_stream_against_itself() {
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            reorder_depth: 2,
+            ..Impairment::default()
+        })
+        .unwrap();
+        // Three streams, two records each, submitted round robin.
+        for index in 0..2_u8 {
+            for stream in 1..=3_u64 {
+                adapter.send_reliable(StreamId(stream), &[index]).unwrap();
+            }
+        }
+        adapter.flush().unwrap();
+        let delivered = reliable_stream_sequences(&mut adapter);
+        // Windows of reorder_depth + 1 decide which lane holds which position.
+        assert_eq!(
+            delivered,
+            vec![(3, 3), (2, 2), (1, 1), (3, 6), (2, 5), (1, 4)]
+        );
+        for stream in 1..=3_u64 {
+            let sequences: Vec<_> = delivered
+                .iter()
+                .filter(|(delivered_stream, _)| *delivered_stream == stream)
+                .map(|(_, sequence)| *sequence)
+                .collect();
+            assert_eq!(sequences.len(), 2);
+            assert!(
+                sequences[0] < sequences[1],
+                "stream {stream} was reordered against itself: {sequences:?}"
+            );
+        }
+
+        // A single stream cannot be reordered at all, whatever the depth.
+        let mut single = SimulatorAdapter::with_impairment(Impairment {
+            reorder_depth: MAX_REORDER_DEPTH,
+            ..Impairment::default()
+        })
+        .unwrap();
+        for index in 0..5_u8 {
+            single.send_reliable(StreamId(1), &[index]).unwrap();
+        }
+        single.flush().unwrap();
+        assert_eq!(reliable_sequences(&mut single), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn reordering_keeps_a_datagram_lifecycle_in_order() {
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            reorder_depth: 3,
+            drop_datagram_every: 2,
+            ..Impairment::default()
+        })
+        .unwrap();
+        adapter.send_datagram(1, b"first").unwrap();
+        adapter.send_datagram(2, b"second").unwrap();
+        adapter.flush().unwrap();
+        let mut states = Vec::new();
+        while let Some(event) = adapter.poll() {
+            if let TransportEvent::DatagramState { context, state } = event {
+                states.push((context, state));
+            }
+        }
+        assert_eq!(states.len(), 4);
+        for context in [1, 2] {
+            let lifecycle: Vec<_> = states
+                .iter()
+                .filter(|(delivered, _)| *delivered == context)
+                .map(|(_, state)| *state)
+                .collect();
+            assert_eq!(lifecycle[0], vot_transport_api::DatagramSendState::Queued);
+        }
+    }
+
+    #[test]
+    fn duplication_repeats_reliable_records_across_flushes() {
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            duplicate_every: 2,
+            ..Impairment::default()
+        })
+        .unwrap();
+        adapter.send_control(b"control").unwrap();
+        adapter.send_reliable(StreamId(1), b"one").unwrap();
+        adapter.send_reliable(StreamId(1), b"two").unwrap();
+        adapter.flush().unwrap();
+        // The control frame is left alone; the second reliable record repeats.
+        assert!(matches!(adapter.poll(), Some(TransportEvent::Control(_))));
+        assert_eq!(reliable_sequences(&mut adapter), vec![1, 2, 2]);
+
+        // The period continues across flush boundaries rather than restarting.
+        adapter.send_reliable(StreamId(1), b"three").unwrap();
+        adapter.send_reliable(StreamId(1), b"four").unwrap();
+        adapter.flush().unwrap();
+        assert_eq!(reliable_sequences(&mut adapter), vec![3, 4, 4]);
+    }
+
+    #[test]
+    fn datagram_loss_is_reported_as_suspected_lost() {
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            drop_datagram_every: 2,
+            ..Impairment::default()
+        })
+        .unwrap();
+        adapter.send_datagram(1, b"first").unwrap();
+        adapter.send_datagram(2, b"second").unwrap();
+        adapter.flush().unwrap();
+        let mut states = Vec::new();
+        while let Some(event) = adapter.poll() {
+            if let TransportEvent::DatagramState { context, state } = event {
+                states.push((context, state));
+            }
+        }
+        assert_eq!(
+            states,
+            vec![
+                (1, vot_transport_api::DatagramSendState::Queued),
+                (1, vot_transport_api::DatagramSendState::Sent),
+                (2, vot_transport_api::DatagramSendState::Queued),
+                (2, vot_transport_api::DatagramSendState::SuspectedLost),
+            ]
+        );
     }
 
     #[test]

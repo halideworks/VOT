@@ -83,6 +83,11 @@ This is the only check that covers the FFI ownership in
 `vot-transport-msquic`: adopted connection and stream handles, send-buffer
 lifetime, and teardown order. It needs the pinned nightly toolchain.
 
+Pass the options exactly. LeakSanitizer matches suppressions against symbolised
+frames, so dropping `symbolize=1` or `allow_addr2line=1` stops
+`tools/lsan-msquic.supp` matching and the openssl allocations it covers are
+reported as leaks.
+
 Run the whole suite, not one test. Restricting it to one test left the
 peer-created stream path, the accepted-connection path, and the handshake
 unsanitised, and a send-buffer leak in a test listener survived for exactly that

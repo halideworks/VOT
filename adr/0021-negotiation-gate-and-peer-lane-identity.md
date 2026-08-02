@@ -42,10 +42,9 @@ sends `HELLO` and never advertises `EndpointRole::Server`.
 
 `Ready` means negotiated, not authenticated. `AUTH_CONTEXT`, `SESSION_OPEN`, and
 `SESSION_ACCEPT` are unimplemented, so every frame the registry marks
-`auth: yes` is not yet conforming. That is recorded as a gap rather than
-smoothed over.
+`auth: yes` is not yet conforming.
 
-### The gate is asymmetric on purpose
+### The gate is asymmetric
 
 Application sends are refused before local readiness. Application records that
 arrive before local readiness are held, not refused.
@@ -68,7 +67,7 @@ backend through `TransportAdapter::set_control_payload_limit`. Without that the
 exchange would be a state enum: the peer's maximum is the bound on what this
 endpoint may send, and ignoring it means sending frames the peer is entitled to
 close the session over. A backend with no such bound returns `Unsupported` and
-the session reports the limit as not applied, rather than pretending.
+the session reports the limit as not applied.
 
 ### A failure closes the carrier only when the peer caused it
 

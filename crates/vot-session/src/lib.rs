@@ -19,8 +19,7 @@
 //! application frames as requiring an authenticated session. None of those are
 //! implemented here, so a session that reaches `Ready` has completed the
 //! version and limit exchange and nothing else. Every frame the registry marks
-//! `auth: yes` is therefore not yet conforming, and that is a gap rather than a
-//! decision.
+//! `auth: yes` is therefore not yet conforming.
 
 #![forbid(unsafe_code)]
 
@@ -480,6 +479,17 @@ fn decode_error(error: DecodeError) -> Error {
 pub struct Session<A> {
     adapter: A,
     negotiation: Negotiation,
+    /// Negotiation frames the backend has not accepted yet.
+    ///
+    /// The exchange advances in pairs: a client sends `HELLO` and `SETTINGS`
+    /// together, a server answers with `SETTINGS` and `SETTINGS_ACK`. A backend
+    /// with room for the first and not the second would leave the peer waiting
+    /// for a frame nothing would ever send again, because the state machine has
+    /// already moved past producing it. Holding the remainder here makes a full
+    /// outbound queue backpressure rather than a lost handshake.
+    ///
+    /// At most two frames, since that is the largest step the exchange takes.
+    outbound: VecDeque<Vec<u8>>,
     /// Records the peer sent before this endpoint reached `Ready`.
     ///
     /// Held here rather than left in the adapter: an adapter queue is one
@@ -508,6 +518,7 @@ impl<A: TransportAdapter> Session<A> {
         Self {
             adapter,
             negotiation,
+            outbound: VecDeque::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
             pending_byte_limit: DEFAULT_PENDING_RECORD_BYTES,
@@ -643,6 +654,11 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     fn poll_inner(&mut self) -> Result<Option<Event>, Error> {
+        if !self.outbound.is_empty() && self.negotiation.state() != State::Closed {
+            // A driver that polls in a loop retries the handshake without
+            // having to know it stalled.
+            self.drain_outbound()?;
+        }
         if self.negotiation.state() == State::Closed {
             // The session is over. Frames still arriving on a closing carrier
             // are not worth interpreting, and interpreting them would report
@@ -723,7 +739,7 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Propagates a backend failure.
     pub fn flush(&mut self) -> Result<(), Error> {
-        self.adapter.flush().map_err(transport_error)
+        self.drain_outbound()
     }
 
     fn accept_control(&mut self, bytes: &[u8]) -> Result<Option<Event>, Error> {
@@ -757,11 +773,42 @@ impl<A: TransportAdapter> Session<A> {
         self.control_limit_applied = self.adapter.set_control_payload_limit(limit).is_ok();
     }
 
+    /// Queues negotiation frames and pushes as many as the backend will take.
+    ///
+    /// # Errors
+    /// Reports a backend refusal that is not capacity. A full queue is not an
+    /// error: the frames stay queued and the next `flush` or `poll` retries
+    /// them.
     fn submit(&mut self, frames: Vec<Vec<u8>>) -> Result<(), Error> {
-        for frame in frames {
-            self.adapter.send_control(&frame).map_err(transport_error)?;
+        self.outbound.extend(frames);
+        self.drain_outbound()
+    }
+
+    /// Hands queued negotiation frames to the backend in order.
+    ///
+    /// # Errors
+    /// Reports the first refusal that is not capacity, keeping that frame and
+    /// everything after it queued either way.
+    fn drain_outbound(&mut self) -> Result<(), Error> {
+        while let Some(frame) = self.outbound.front() {
+            match self.adapter.send_control(frame) {
+                Ok(()) => {
+                    self.outbound.pop_front();
+                }
+                // Backpressure. The frame stays at the head and the exchange
+                // resumes when the backend has room, rather than the peer
+                // waiting for something nothing will send again.
+                Err(TransportError::OutboundQueueFull) => break,
+                Err(error) => return Err(transport_error(error)),
+            }
         }
         self.adapter.flush().map_err(transport_error)
+    }
+
+    /// Negotiation frames still waiting for the backend.
+    #[must_use]
+    pub fn unsent_negotiation_frames(&self) -> usize {
+        self.outbound.len()
     }
 
     fn hold(&mut self, record: Event) -> Result<(), Error> {
@@ -852,12 +899,24 @@ mod tests {
         refuse_control_limit: bool,
         flushes: usize,
         refuse_sends: Option<TransportError>,
+        /// Control frames the backend will take before reporting a full queue.
+        control_capacity: Option<usize>,
+        refuse_control: Option<TransportError>,
         closed: Vec<u16>,
         receive_limit: Option<usize>,
     }
 
     impl TransportAdapter for Loopback {
         fn send_control(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+            if let Some(error) = self.refuse_control {
+                return Err(error);
+            }
+            if self
+                .control_capacity
+                .is_some_and(|room| self.sent.len() >= room)
+            {
+                return Err(TransportError::OutboundQueueFull);
+            }
             self.sent.push(frame.to_vec());
             Ok(())
         }
@@ -1250,7 +1309,7 @@ mod tests {
         assert_eq!(client.adapter().control_limit, Some(64 * 1024));
 
         // A backend with no such bound says so, and the session reports that
-        // rather than pretending the limit was applied.
+        // and the session reports the limit as not applied.
         let mut refusing = Session::client(
             Loopback {
                 refuse_control_limit: true,
@@ -1632,6 +1691,102 @@ mod tests {
             vec![error_code::UNSUPPORTED_VERSION],
             "and the carrier is not closed a second time"
         );
+    }
+
+    #[test]
+    fn a_full_outbound_queue_stalls_the_handshake_rather_than_losing_it() {
+        // The exchange advances in pairs. A backend with room for HELLO and not
+        // for SETTINGS used to leave the peer waiting for a frame nothing would
+        // send again, because the state machine had already moved past
+        // producing it and `begin` refuses a second call.
+        let mut client = Session::client(
+            Loopback {
+                control_capacity: Some(1),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        client.begin().unwrap();
+        assert_eq!(client.adapter().sent.len(), 1, "only HELLO fitted");
+        assert_eq!(client.unsent_negotiation_frames(), 1);
+        assert!(
+            client.begin().is_err(),
+            "the exchange has moved on, so it cannot be restarted"
+        );
+
+        // Room appears, and the frame that did not fit goes out on its own.
+        client.adapter.control_capacity = Some(2);
+        client.flush().unwrap();
+        assert_eq!(client.unsent_negotiation_frames(), 0);
+        let limits = vot_codec::DecodeLimits::default();
+        let sent = client.adapter().sent.clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            vot_codec::decode_one(&sent[1], limits)
+                .unwrap()
+                .0
+                .frame_type(),
+            frame_type::SETTINGS,
+            "and in the order the specification gives it"
+        );
+
+        // A driver that only polls gets there too, without knowing it stalled.
+        let mut polling = Session::client(
+            Loopback {
+                control_capacity: Some(0),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        polling.begin().unwrap();
+        assert_eq!(polling.unsent_negotiation_frames(), 2);
+        polling.adapter.control_capacity = None;
+        assert_eq!(polling.poll().unwrap(), None);
+        assert_eq!(polling.unsent_negotiation_frames(), 0);
+        assert_eq!(polling.adapter().sent.len(), 2);
+
+        // The server's answer is a pair too, and stalls the same way.
+        let mut server = Session::server(
+            Loopback {
+                control_capacity: Some(1),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        server.begin().unwrap();
+        for frame in polling.adapter().sent.clone() {
+            server.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(server.poll().unwrap(), None);
+        assert!(server.is_ready());
+        assert_eq!(server.adapter().sent.len(), 1, "only SETTINGS fitted");
+        assert_eq!(server.unsent_negotiation_frames(), 1);
+        server.adapter.control_capacity = None;
+        server.flush().unwrap();
+        assert_eq!(server.adapter().sent.len(), 2);
+        assert_eq!(
+            vot_codec::decode_one(&server.adapter().sent[1], limits)
+                .unwrap()
+                .0
+                .frame_type(),
+            frame_type::SETTINGS_ACK
+        );
+
+        // A refusal that is not capacity is still a failure, and keeps the
+        // frame rather than dropping it.
+        let mut broken = Session::client(
+            Loopback {
+                refuse_control: Some(TransportError::Backend),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        assert!(broken.begin().is_err());
+        assert_eq!(broken.unsent_negotiation_frames(), 2);
     }
 
     #[test]

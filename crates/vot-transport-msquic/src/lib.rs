@@ -3166,7 +3166,8 @@ pub mod live {
         }
 
         /// What the accepting side advertises and reassembles in the
-        /// negotiation tests, deliberately below the connecting side's default.
+        /// negotiation tests. Below the connecting side's default, so applying
+        /// it is observable.
         const SERVER_CONTROL_LIMIT: usize = 64 * 1024;
 
         #[test]
@@ -3296,7 +3297,7 @@ pub mod live {
 
         /// Brings up a raw connecting transport against a listening server.
         ///
-        /// The connecting side is deliberately not a `Session`: these tests
+        /// The connecting side is not a `Session`: these tests
         /// need a peer that does things a conforming session would refuse to
         /// do, which is exactly what an independent implementation might send.
         ///

@@ -31,9 +31,8 @@ On a server, `HelloSent` means the peer's `HELLO` arrived.
 
 `spec/wire.md` also defines `AUTH_CONTEXT`, `SESSION_OPEN`, and
 `SESSION_ACCEPT`, and marks most application frames as requiring an
-authenticated session. None of those are implemented. Every frame the registry
-marks `auth: yes` is therefore not yet conforming. This is a gap in the
-implementation, not a reinterpretation of the specification.
+authenticated session. None of those are implemented, so every frame the
+registry marks `auth: yes` is not yet conforming.
 
 ## The gate is asymmetric
 

@@ -286,10 +286,14 @@ impl StagingCapacity {
     }
 }
 
-/// Validates the wire length of a reliable DATA_RECORD submission.
+/// Validates the wire length of a reliable `DATA_RECORD` submission.
 ///
 /// The protocol limit applies to the encoded frame payload. The bounded
 /// envelope is allowed in addition to that payload limit.
+///
+/// # Errors
+/// Returns [`Error::RecordTooLarge`] when the encoded record exceeds the
+/// payload limit plus the bounded envelope.
 pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
     if record.len() > MAX_DATA_RECORD_WIRE_BYTES {
         Err(Error::RecordTooLarge)
@@ -299,6 +303,10 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
 }
 
 /// Validates a negotiated control-frame payload limit.
+///
+/// # Errors
+/// Returns [`Error::InvalidConfiguration`] when the limit is zero or exceeds
+/// the codec hard maximum.
 pub fn validate_control_payload_limit(limit: usize) -> Result<(), Error> {
     if limit == 0 || limit > vot_codec::HARD_MAX_FRAME_PAYLOAD {
         Err(Error::InvalidConfiguration)
@@ -308,6 +316,11 @@ pub fn validate_control_payload_limit(limit: usize) -> Result<(), Error> {
 }
 
 /// Validates the wire length of a control-frame submission.
+///
+/// # Errors
+/// Returns [`Error::InvalidConfiguration`] for an invalid negotiated limit,
+/// [`Error::ArithmeticOverflow`] for an unrepresentable wire bound, or
+/// [`Error::RecordTooLarge`] when the frame is too large.
 pub fn validate_control_frame(frame: &[u8], payload_limit: usize) -> Result<(), Error> {
     validate_control_payload_limit(payload_limit)?;
     let wire_limit = payload_limit

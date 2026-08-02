@@ -120,15 +120,26 @@ jobs:
         run: |
           cargo +1.88.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
           cargo +1.88.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
+      - name: Test fuzz mutation engine
+        run: |
+          cargo +1.88.0 test --manifest-path fuzz/mutator/Cargo.toml --locked
+          cargo +1.88.0 test --manifest-path fuzz/frame_codec/Cargo.toml --locked
+          cargo +1.88.0 test --manifest-path fuzz/manifest/Cargo.toml --locked
       - name: Run bounded fuzz smoke tests
         run: |
           set -euo pipefail
           for seed in fuzz/frame_codec/corpus/* test-vectors/wire/frame-envelope.json; do
-            fuzz/frame_codec/target/debug/vot-frame-fuzz-driver --iterations 256 < "$seed"
+            fuzz/frame_codec/target/debug/vot-frame-fuzz-driver \
+              --iterations 256 --corpus fuzz/frame_codec/corpus < "$seed"
           done
           for seed in fuzz/manifest/corpus/* test-vectors/manifest/page.json; do
-            fuzz/manifest/target/debug/vot-manifest-fuzz-driver --iterations 256 < "$seed"
+            fuzz/manifest/target/debug/vot-manifest-fuzz-driver \
+              --iterations 256 --corpus fuzz/manifest/corpus < "$seed"
           done
+      - name: Build libFuzzer targets
+        # Stable cannot instrument for coverage, so this only proves the
+        # coverage-guided targets still compile. fuzz-nightly runs them.
+        run: cargo +1.88.0 build --manifest-path fuzz/cargo-fuzz/Cargo.toml --locked
 
 
   platform-native:
@@ -272,8 +283,11 @@ jobs:
           - { package: vot-journal, required: true }
           - { package: vot-proof-blake3, required: true }
           - { package: vot-proof-sha256, required: true }
+          # vot-codec is advisory pending survivor cleanup: 159 of 493 mutants
+          # currently survive, almost all in the frame parser. Promote it once
+          # those are killed.
           - { package: vot-codec, required: false }
-          - { package: vot-verifier, required: false }
+          - { package: vot-verifier, required: true }
           - { package: vot-manifest, required: false }
           - { package: vot-pack, required: true }
           - { package: vot-object-store, required: false }

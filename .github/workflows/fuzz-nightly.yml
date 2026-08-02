@@ -29,8 +29,48 @@ jobs:
         run: |
           set -euo pipefail
           for seed in fuzz/frame_codec/corpus/* test-vectors/wire/frame-envelope.json; do
-            fuzz/frame_codec/target/debug/vot-frame-fuzz-driver --iterations 10000 < "$seed"
+            fuzz/frame_codec/target/debug/vot-frame-fuzz-driver \
+              --iterations 10000 --corpus fuzz/frame_codec/corpus < "$seed"
           done
           for seed in fuzz/manifest/corpus/* test-vectors/manifest/page.json; do
-            fuzz/manifest/target/debug/vot-manifest-fuzz-driver --iterations 10000 < "$seed"
+            fuzz/manifest/target/debug/vot-manifest-fuzz-driver \
+              --iterations 10000 --corpus fuzz/manifest/corpus < "$seed"
           done
+
+  coverage-guided-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: frame_codec, corpus: fuzz/frame_codec/corpus }
+          - { target: manifest, corpus: fuzz/manifest/corpus }
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install nightly toolchain
+        # Sanitizer coverage instrumentation is nightly-only, so the
+        # coverage-guided gate cannot use the pinned stable toolchain.
+        run: rustup toolchain install nightly-2026-07-15 --profile minimal
+
+      - name: Install pinned cargo-fuzz
+        run: cargo +nightly-2026-07-15 install --locked cargo-fuzz --version 0.13.2
+
+      - name: Run coverage-guided fuzzing
+        env:
+          TARGET: ${{ matrix.target }}
+          CORPUS: ${{ matrix.corpus }}
+        run: >-
+          cargo +nightly-2026-07-15 fuzz run --fuzz-dir fuzz/cargo-fuzz "$TARGET" "$CORPUS"
+          -- -max_total_time=1200 -rss_limit_mb=512 -timeout=25
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/cargo-fuzz/artifacts
+          if-no-files-found: ignore

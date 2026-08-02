@@ -108,6 +108,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-fuzz-mutator"
+version = "0.0.0"
+
+[[package]]
 name = "vot-manifest"
 version = "0.0.1"
 dependencies = [
@@ -120,5 +124,6 @@ name = "vot-manifest-fuzz-driver"
 version = "0.0.0"
 dependencies = [
  "cap",
+ "vot-fuzz-mutator",
  "vot-manifest",
 ]

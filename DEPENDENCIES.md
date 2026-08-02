@@ -60,6 +60,18 @@ CI actions, all pinned to a released tag: `actions/checkout` 4.3.1,
 carries the pinned tool binaries and the build directory, both keyed so a
 version or lockfile change misses rather than reuses.
 
+Wave 6 runtime dependencies:
+
+- `ed25519-dalek` 2.2.0 provides RFC 8032 signing and strict verification for
+  receipts that cross a trust boundary, with `curve25519-dalek` 4.1.3,
+  `ed25519` 2.2.3, and `signature` 2.2.0. Licences are BSD-3-Clause and
+  Apache-2.0 or MIT, all in the `deny.toml` allow list. Default features are
+  off; only `std` and `zeroize` are enabled. `curve25519-dalek` contains
+  `unsafe` in its backends. That does not relax the workspace lint, which
+  governs VOT's own crates, but it is an addition to the audited surface and
+  was accepted deliberately: a receipt that cannot be checked without the power
+  to forge it is not evidence. See ADR-0017.
+
 Test-only dependencies:
 
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz

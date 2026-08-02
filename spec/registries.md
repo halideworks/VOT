@@ -205,9 +205,19 @@ all ordinary telemetry levels.
 
 | Value | Name | Authenticator length | Status |
 |---:|---|---:|---|
-| `0x0001` | `ED25519` | 64 bytes | draft |
-| `0x0002` | `HMAC_SHA256` | 32 bytes | draft |
+| `0x0001` | `ED25519` | 64 bytes | required v1 |
+| `0x0002` | `HMAC_SHA256` | 32 bytes | optional |
 
 Ed25519 follows RFC 8032. HMAC-SHA-256 follows RFC 2104 with SHA-256. Deployment
 policy selects acceptable schemes and key provenance. Object verification suite
 selection never implies a receipt authentication scheme.
+
+A receipt that crosses a trust boundary uses `ED25519`. A symmetric MAC cannot
+serve that case: any party able to verify it is equally able to forge it, so the
+auditor a receipt exists for either cannot check it or becomes able to
+manufacture it. `HMAC_SHA256` remains registered for receipts that never leave
+one trust domain, where the shared key is already common to both sides.
+
+The authenticator covers a domain separator, the two-byte scheme value, and the
+canonical receipt bytes, in that order. Binding the scheme means an
+authenticator produced under one scheme is not valid input for another.

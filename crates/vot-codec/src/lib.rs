@@ -744,9 +744,23 @@ mod tests {
             peek_envelope(&huge, limits),
             Err(DecodeError::FrameTooLarge { .. })
         ));
+
+        // The limit is inclusive. A record of exactly the registered size is
+        // legal, and rejecting it would refuse the largest frame the protocol
+        // defines while every smaller one still worked.
+        let mut exact = Vec::new();
+        encode_varint(frame_type::DATA_RECORD, &mut exact).unwrap();
+        encode_varint(MAX_DATA_RECORD_PAYLOAD_FOR_TEST, &mut exact).unwrap();
+        let envelope = peek_envelope(&exact, limits).unwrap();
+        assert_eq!(
+            envelope.payload_length,
+            registered_payload_limit(frame_type::DATA_RECORD).unwrap()
+        );
+        assert!(!envelope.skipped);
     }
 
-    const MAX_DATA_RECORD_PAYLOAD_FOR_TEST: u64 = 256 * 1024;
+    const MAX_DATA_RECORD_PAYLOAD_FOR_TEST: u64 =
+        registered_payload_limit(frame_type::DATA_RECORD).unwrap() as u64;
     use super::*;
 
     #[test]

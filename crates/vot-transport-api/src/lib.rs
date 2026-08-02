@@ -107,6 +107,8 @@ pub enum Error {
     ArithmeticOverflow,
     Unsupported,
     Backend,
+    /// A peer used more lanes than this endpoint advertised it would carry.
+    LaneLimitExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

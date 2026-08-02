@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -82,6 +82,12 @@ pub struct TcpAdapter {
     control_receive_limit: usize,
     /// What this endpoint advertised, once it has been configured.
     receive_limits: Option<vot_transport_api::ReceiveLimits>,
+    /// Lanes the peer has sent on.
+    ///
+    /// This carrier is one byte stream, so a lane is a logical identifier with
+    /// no open or close of its own. Distinct identifiers seen is therefore the
+    /// only lane count there is, and it only grows.
+    inbound_lanes: BTreeSet<u64>,
     events: VecDeque<Event>,
     event_bytes: usize,
     event_count_limit: usize,
@@ -98,6 +104,7 @@ impl Default for TcpAdapter {
             control_payload_limit: CONTROL_LIMIT,
             control_receive_limit: CONTROL_LIMIT,
             receive_limits: None,
+            inbound_lanes: BTreeSet::new(),
             events: VecDeque::new(),
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
@@ -120,6 +127,25 @@ impl TcpAdapter {
         })
     }
 
+    /// Counts one peer lane against the advertised limit.
+    ///
+    /// # Errors
+    /// Reports a peer using more lanes than it was told this endpoint carries.
+    fn admit_lane(&mut self, stream: u64) -> Result<(), Error> {
+        let Some(limits) = self.receive_limits else {
+            // Nothing advertised, so nothing to hold the peer to.
+            return Ok(());
+        };
+        if self.inbound_lanes.contains(&stream) {
+            return Ok(());
+        }
+        if self.inbound_lanes.len() >= limits.lanes() {
+            return Err(Error::LaneLimitExceeded);
+        }
+        self.inbound_lanes.insert(stream);
+        Ok(())
+    }
+
     /// Applies what this endpoint advertises.
     ///
     /// The bound has to be in force before the peer's first frame: accepting
@@ -140,8 +166,9 @@ impl TcpAdapter {
                 vot_transport_api::validate_control_frame(bytes, self.control_receive_limit)?;
                 bytes.len()
             }
-            NativeEvent::Reliable { bytes, .. } => {
+            NativeEvent::Reliable { stream, bytes, .. } => {
                 vot_transport_api::validate_data_record(bytes)?;
+                self.admit_lane(*stream)?;
                 bytes.len()
             }
             NativeEvent::Connected(_)
@@ -755,6 +782,48 @@ mod tests {
     fn path_stats_are_unavailable_without_a_native_path() {
         let adapter = TcpAdapter::default();
         assert_eq!(adapter.path_stats(), None);
+    }
+
+    #[test]
+    fn a_peer_using_more_lanes_than_advertised_is_refused() {
+        // Reporting the limit as enforced while accepting any number of lanes
+        // is worse than not reporting it: a session checks the carrier agrees
+        // with what it advertises and then nothing holds the peer to it.
+        //
+        // One byte stream carries every lane here, so a lane has no open or
+        // close of its own and distinct identifiers seen is the whole count.
+        let mut adapter = TcpAdapter::default();
+        let record = |lane: u64| NativeEvent::Reliable {
+            stream: lane,
+            sequence: lane,
+            bytes: vec![0; 8],
+        };
+        // Nothing advertised yet, so nothing to hold the peer to.
+        assert_eq!(adapter.receive_limits(), None);
+        for lane in 0..4 {
+            adapter.record_native_event(record(lane)).unwrap();
+        }
+
+        let mut bounded = TcpAdapter::default();
+        bounded.set_receive_limits(
+            vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    reliable_lane_limit: 2,
+                    ..vot_codec::Settings::default()
+                },
+                INBOUND_BYTE_CAPACITY,
+            )
+            .unwrap(),
+        );
+        bounded.record_native_event(record(1)).unwrap();
+        bounded.record_native_event(record(2)).unwrap();
+        // A lane already seen is free.
+        bounded.record_native_event(record(1)).unwrap();
+        assert_eq!(
+            bounded.record_native_event(record(3)),
+            Err(Error::LaneLimitExceeded),
+            "one lane past what was advertised"
+        );
     }
 
     #[test]

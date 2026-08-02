@@ -118,7 +118,13 @@ negotiated.
 The lane limit is split by what each layer can see. A session opens lanes, so it
 counts its own. Only the transport sees a peer stream open and close, so it
 counts those: a session would count lanes ever used and refuse a peer that
-closed one and opened another. A limit below a codec per-type maximum
+closed one and opened another.
+
+The two carriers count differently because their lanes differ. MsQuic opens a
+stream per lane, so it counts streams open at once and releases one at shutdown.
+TCP carries every lane on one byte stream, where a lane is a logical identifier
+with no open or close of its own, so distinct identifiers seen is the whole
+count and it only grows. A limit below a codec per-type maximum
 takes effect only here, because the codec's limits are fixed.
 
 The first two unenforced settings are timers. A session that agreed an idle

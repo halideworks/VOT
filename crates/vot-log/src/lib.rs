@@ -562,7 +562,10 @@ pub fn verify_checkpoint(
     required: usize,
 ) -> Result<Vec<String>, Error> {
     let body = signed.checkpoint.body()?;
-    let mut accepted: Vec<String> = Vec::new();
+    // Keyed by public key, not by name. A policy that lists one key under two
+    // names would otherwise let a single key pair satisfy a threshold of two,
+    // which is not two independent witnesses.
+    let mut accepted: Vec<(String, [u8; 32])> = Vec::new();
     for signature in &signed.signatures {
         let bytes: [u8; 64] = match signature.signature.as_slice().try_into() {
             Ok(bytes) => bytes,
@@ -577,20 +580,21 @@ pub fn verify_checkpoint(
             if note_key_hash(&witness.name, &witness.key.to_bytes()) != signature.key_hash {
                 continue;
             }
+            let public = witness.key.to_bytes();
             if witness
                 .key
                 .verify_strict(body.as_bytes(), &Signature::from_bytes(&bytes))
                 .is_ok()
-                && !accepted.contains(&witness.name)
+                && !accepted.iter().any(|(_, seen)| *seen == public)
             {
-                accepted.push(witness.name.clone());
+                accepted.push((witness.name.clone(), public));
             }
         }
     }
     if accepted.len() < required {
         return Err(Error::Unwitnessed);
     }
-    Ok(accepted)
+    Ok(accepted.into_iter().map(|(name, _)| name).collect())
 }
 
 #[cfg(test)]
@@ -966,6 +970,27 @@ mod tests {
         sign_checkpoint(&mut signed, "alpha", &alpha).unwrap();
         assert_eq!(
             verify_checkpoint(&signed, &witnesses, 3),
+            Err(Error::Unwitnessed)
+        );
+
+        // And one key listed under two names is still one witness, or a policy
+        // that aliases a key would silently halve the threshold it asked for.
+        let aliased = vec![
+            WitnessKey {
+                name: "alpha".to_owned(),
+                key: alpha.verifying_key(),
+            },
+            WitnessKey {
+                name: "alpha-backup".to_owned(),
+                key: alpha.verifying_key(),
+            },
+        ];
+        let mut doubled = checkpoint_of(&log_of(9));
+        sign_checkpoint(&mut doubled, "alpha", &alpha).unwrap();
+        sign_checkpoint(&mut doubled, "alpha-backup", &alpha).unwrap();
+        assert_eq!(verify_checkpoint(&doubled, &aliased, 1).unwrap().len(), 1);
+        assert_eq!(
+            verify_checkpoint(&doubled, &aliased, 2),
             Err(Error::Unwitnessed)
         );
     }

@@ -24,8 +24,26 @@ pub const CONTROL_LANE: u64 = u64::MAX - 1;
 /// allocation until the process died.
 pub const MAX_CALLBACK_EVENTS: usize = 1024;
 
-/// Largest partial frame held while waiting for the rest of it.
+/// Largest partial frame held on a reliable lane while waiting for the rest.
 pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
+
+/// Largest partial frame held on the control lane.
+///
+/// Control frames are four times the size of a data record, so reusing the
+/// record bound here would refuse a large `PACKAGE_DESCRIPTOR` the same
+/// transport is willing to send. This matches the adapter's default control
+/// payload limit, which is what the assembled transport sends under, because a
+/// receive bound below the send bound is the asymmetry this exists to avoid.
+/// `set_control_payload_limit` can raise the sending side; the assembled
+/// transport does not expose it, and whatever does must plumb the negotiated
+/// value through to framing rather than leave this constant behind.
+pub const MAX_PARTIAL_CONTROL_FRAME: usize = vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES;
+
+/// Returns whether `lane` is one this crate reserves for its own reporting.
+#[must_use]
+pub const fn is_reserved_lane(lane: u64) -> bool {
+    lane == PEER_STREAM_ID || lane == CONTROL_LANE
+}
 
 use vot_transport_api::{
     ConnectionId, DatagramSendState, Error, Event, PathStats, Payload, StreamId, TransportAck,
@@ -324,11 +342,10 @@ impl TransportAdapter for MsQuicAdapter {
         self.send_reliable_shared(stream, shared_payload(record))
     }
 
-    fn preflight_reliable_batch(
-        &self,
-        _stream: StreamId,
-        records: &[Payload],
-    ) -> Result<(), Error> {
+    fn preflight_reliable_batch(&self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
+        if is_reserved_lane(stream.0) {
+            return Err(Error::InvalidConfiguration);
+        }
         let next_bytes = records
             .iter()
             .try_fold(self.command_bytes, |bytes, record| {
@@ -350,6 +367,12 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
+        // Reserved lanes name the control stream and peer-initiated records.
+        // Accepting one here would open an application stream whose replies
+        // were reported as the wrong kind.
+        if is_reserved_lane(stream.0) {
+            return Err(Error::InvalidConfiguration);
+        }
         vot_transport_api::validate_data_record(&record)?;
         self.enqueue(Command::Reliable {
             stream,
@@ -421,8 +444,8 @@ pub mod live {
     use vot_transport_api::{ConnectionId, Error, Event, Payload, StreamId, TransportAdapter};
 
     use super::{
-        CONTROL_LANE, Command, MAX_CALLBACK_EVENTS, MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent,
-        PEER_STREAM_ID,
+        Command, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter,
+        NativeEvent, PEER_STREAM_ID,
     };
     use vot_transport_api::PathStats;
 
@@ -516,12 +539,8 @@ pub mod live {
             let (closed_tx, closed) = mpsc::channel();
             let sequence = Arc::new(AtomicU64::new(0));
             let callback_inbound = Arc::clone(&inbound);
-            let peer_handler = stream_handler(
-                Arc::clone(&inbound),
-                Arc::clone(&sequence),
-                PEER_STREAM_ID,
-                true,
-            );
+            let peer_inbound = Arc::clone(&inbound);
+            let peer_sequence = Arc::clone(&sequence);
             let connection = Connection::open(
                 &registration,
                 move |_: ConnectionRef, event: ConnectionEvent| {
@@ -531,8 +550,18 @@ pub mod live {
                         }
                         ConnectionEvent::PeerStreamStarted { stream, .. } => {
                             // Without adopting these there is no receive path
-                            // for anything the peer initiates.
-                            stream.set_callback_handler(peer_handler.clone());
+                            // for anything the peer initiates. Each gets its
+                            // own handler, because two peer streams share no
+                            // byte ordering and one reassembly buffer between
+                            // them would splice their frames together.
+                            stream.set_callback_handler(stream_handler(
+                                Arc::clone(&peer_inbound),
+                                Arc::clone(&peer_sequence),
+                                StreamKind::Reliable {
+                                    lane: PEER_STREAM_ID,
+                                },
+                                true,
+                            ));
                         }
                         ConnectionEvent::ShutdownComplete { .. } => {
                             let _ =
@@ -606,31 +635,68 @@ pub mod live {
         }
     }
 
+    /// What a stream carries, which decides both the frame bound applied to it
+    /// and the kind of event its bytes become.
+    ///
+    /// Carried explicitly rather than inferred from the lane number, so an
+    /// application stream can never be mistaken for the control stream.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum StreamKind {
+        /// The negotiation stream `spec/wire.md` reserves.
+        Control,
+        /// An application lane, reported under `lane`.
+        Reliable { lane: u64 },
+    }
+
+    impl StreamKind {
+        /// Largest partial frame this kind of stream may hold.
+        const fn partial_frame_limit(self) -> usize {
+            match self {
+                Self::Control => MAX_PARTIAL_CONTROL_FRAME,
+                Self::Reliable { .. } => MAX_PARTIAL_FRAME,
+            }
+        }
+
+        /// Largest payload a frame on this kind of stream may declare.
+        const fn payload_limit(self) -> usize {
+            match self {
+                Self::Control => vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                Self::Reliable { .. } => vot_transport_api::MAX_DATA_RECORD_BYTES,
+            }
+        }
+    }
+
     /// Per-stream reassembly state.
     ///
     /// QUIC preserves a byte stream, not message boundaries, and `spec/wire.md`
     /// permits a frame to be split across callbacks or several to arrive in
     /// one. Treating a callback buffer as a record would deliver truncated or
-    /// combined ones.
-    #[derive(Default)]
+    /// combined ones. Each stream owns its own state, because bytes from two
+    /// streams share no ordering and combining them would build frames that
+    /// were never sent.
     struct Framing {
         pending: Vec<u8>,
+        kind: StreamKind,
     }
 
     impl Framing {
+        const fn new(kind: StreamKind) -> Self {
+            Self {
+                pending: Vec::new(),
+                kind,
+            }
+        }
+
         /// Adds received bytes and returns every complete frame now available.
         ///
         /// # Errors
         /// Reports a frame that can never complete, either because it is
-        /// malformed or because it exceeds the largest record the protocol
-        /// allows, which would otherwise stall the stream for ever.
+        /// malformed or because it exceeds the largest frame this lane allows,
+        /// which would otherwise stall the stream for ever.
         fn accept(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-            if self.pending.len().saturating_add(bytes.len()) > MAX_PARTIAL_FRAME {
-                return Err(Error::RecordTooLarge);
-            }
             self.pending.extend_from_slice(bytes);
             let limits = vot_codec::DecodeLimits {
-                max_unknown_payload: vot_transport_api::MAX_DATA_RECORD_BYTES,
+                max_unknown_payload: self.kind.payload_limit(),
                 max_frames: 1,
             };
             let mut frames = Vec::new();
@@ -647,44 +713,48 @@ pub mod live {
                 }
             }
             self.pending.drain(..offset);
+            // The bound belongs to the frame still being assembled, not to the
+            // read that delivered it. A read that coalesces the tail of one
+            // frame with the head of the next is legal, and checking before
+            // draining would refuse it.
+            if self.pending.len() > self.kind.partial_frame_limit() {
+                return Err(Error::RecordTooLarge);
+            }
             Ok(frames)
         }
     }
 
-    /// Builds the callback installed on every stream.
+    /// Builds the callback installed on one stream.
     ///
     /// Received bytes become native events rather than being handled inline,
     /// because a callback runs on an `MsQuic` worker thread and the adapter
     /// belongs to the driver thread.
+    ///
+    /// The result is deliberately not `Clone`: every stream needs reassembly
+    /// state of its own, so a handler is built per stream rather than shared.
     fn stream_handler(
         inbound: Arc<Mutex<VecDeque<NativeEvent>>>,
         sequence: Arc<AtomicU64>,
-        stream_id: u64,
+        kind: StreamKind,
         peer_owned: bool,
-    ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + Clone + 'static {
-        let framing = Arc::new(Mutex::new(Framing::default()));
+    ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
+        let mut framing = Framing::new(kind);
         move |stream: StreamRef, event: StreamEvent| {
             match event {
                 StreamEvent::Receive { buffers, .. } => {
-                    let Ok(mut framing) = framing.lock() else {
-                        return Err(msquic::Status::from(
-                            msquic::StatusCode::QUIC_STATUS_ABORTED,
-                        ));
-                    };
                     for buffer in buffers {
                         let frames = framing.accept(buffer.as_bytes()).map_err(|_| {
                             msquic::Status::from(msquic::StatusCode::QUIC_STATUS_ABORTED)
                         })?;
                         for frame in frames {
                             let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                            let event = if stream_id == CONTROL_LANE {
-                                NativeEvent::Control(frame)
-                            } else {
-                                NativeEvent::Reliable {
-                                    stream: stream_id,
+                            let event = match kind {
+                                StreamKind::Control => NativeEvent::Control(frame),
+                                StreamKind::Reliable { lane } => NativeEvent::Reliable {
+                                    stream: lane,
                                     sequence: next,
                                     bytes: frame,
-                                }
+                                },
                             };
                             if !push(&inbound, event) {
                                 // The queue is full and a callback cannot wait,
@@ -725,7 +795,7 @@ pub mod live {
         connection: Option<&Connection>,
         inbound: &Arc<Mutex<VecDeque<NativeEvent>>>,
         sequence: &Arc<AtomicU64>,
-        lane: u64,
+        kind: StreamKind,
     ) -> Result<Stream, Error> {
         let connection = connection.ok_or(Error::Backend)?;
         // The caller owns the handle and closes it at teardown, so there is
@@ -733,7 +803,7 @@ pub mod live {
         let stream = Stream::open(
             connection,
             StreamOpenFlags::NONE,
-            stream_handler(Arc::clone(inbound), Arc::clone(sequence), lane, false),
+            stream_handler(Arc::clone(inbound), Arc::clone(sequence), kind, false),
         )
         .map_err(|_| Error::Backend)?;
         stream
@@ -753,7 +823,12 @@ pub mod live {
         match streams.entry(id) {
             Entry::Occupied(slot) => Ok(&*slot.into_mut()),
             Entry::Vacant(slot) => {
-                let stream = open_stream(connection, inbound, sequence, id)?;
+                let stream = open_stream(
+                    connection,
+                    inbound,
+                    sequence,
+                    StreamKind::Reliable { lane: id },
+                )?;
                 Ok(&*slot.insert(stream))
             }
         }
@@ -841,7 +916,12 @@ pub mod live {
                     // from the reliable pool, so StreamId(0) remains an
                     // ordinary application lane rather than aliasing control.
                     if control.is_none() {
-                        *control = Some(open_stream(connection, inbound, sequence, CONTROL_LANE)?);
+                        *control = Some(open_stream(
+                            connection,
+                            inbound,
+                            sequence,
+                            StreamKind::Control,
+                        )?);
                     }
                     let handle = control.as_ref().ok_or(Error::Backend)?;
                     send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
@@ -971,11 +1051,92 @@ pub mod live {
             Settings, Status, Stream, StreamEvent, StreamOpenFlags, StreamRef, StreamStartFlags,
         };
 
-        use super::MsQuicTransport;
+        use super::{Framing, MsQuicTransport, StreamKind};
 
-        use super::super::{Command as AdapterCommand, MsQuicAdapter, NativeEvent};
+        use super::super::{
+            Command as AdapterCommand, MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter,
+            NativeEvent,
+        };
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
-        use vot_transport_api::{ConnectionId, Error, Event, StreamId, TransportAdapter};
+        use vot_transport_api::{
+            ConnectionId, Error, Event, MAX_DATA_RECORD_BYTES, StreamId, TransportAdapter,
+        };
+
+        fn framed(frame_type: u64, payload: &[u8]) -> Vec<u8> {
+            let mut frame = Vec::new();
+            vot_codec::encode_frame(frame_type, payload, &mut frame).unwrap();
+            frame
+        }
+
+        #[test]
+        fn a_read_that_coalesces_two_frames_is_not_refused_for_its_size() {
+            // A near-maximum record whose tail arrives together with the head of
+            // the next frame pushes the buffer past the bound for an instant.
+            // Checking before the completed frame is drained refuses a read the
+            // peer was entitled to send.
+            let big = framed(
+                vot_codec::frame_type::DATA_RECORD,
+                &vec![0x5a; MAX_DATA_RECORD_BYTES],
+            );
+            let next = framed(vot_codec::frame_type::DATA_RECORD, &[0x21; 64]);
+            assert!(big.len() + next.len() > MAX_PARTIAL_FRAME);
+
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let split = big.len() - 8;
+            assert!(framing.accept(&big[..split]).unwrap().is_empty());
+            let mut rest = big[split..].to_vec();
+            rest.extend_from_slice(&next);
+            let frames = framing.accept(&rest).unwrap();
+            assert_eq!(frames, vec![big, next]);
+        }
+
+        #[test]
+        fn a_frame_that_can_never_complete_is_refused_rather_than_held() {
+            // Without this the stream stalls for ever on bytes that will never
+            // form a frame, and the buffer grows for as long as they arrive.
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let head = framed(
+                vot_codec::frame_type::PACKAGE_DESCRIPTOR,
+                &vec![0x11; MAX_DATA_RECORD_BYTES * 2],
+            );
+            assert!(matches!(
+                framing.accept(&head[..=MAX_PARTIAL_FRAME]),
+                Err(Error::RecordTooLarge)
+            ));
+        }
+
+        #[test]
+        fn the_control_lane_reassembles_up_to_the_control_bound() {
+            // Control frames are larger than data records, so applying the
+            // record bound to the control stream rejects a large
+            // PACKAGE_DESCRIPTOR the same transport is willing to send.
+            let frame = framed(
+                vot_codec::frame_type::PACKAGE_DESCRIPTOR,
+                &vec![0x11; MAX_DATA_RECORD_BYTES * 2],
+            );
+            assert!(frame.len() > MAX_PARTIAL_FRAME);
+            assert!(frame.len() <= MAX_PARTIAL_CONTROL_FRAME);
+
+            let mut control = Framing::new(StreamKind::Control);
+            let head = frame.len() - 1;
+            assert!(control.accept(&frame[..head]).unwrap().is_empty());
+            assert_eq!(control.accept(&frame[head..]).unwrap(), vec![frame]);
+        }
+
+        #[test]
+        fn two_streams_never_share_reassembly_state() {
+            // Interleaving halves of two frames through one buffer would splice
+            // them into records neither peer sent.
+            let first = framed(vot_codec::frame_type::DATA_RECORD, b"first-record");
+            let second = framed(vot_codec::frame_type::DATA_RECORD, b"second");
+            let mut left = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut right = Framing::new(StreamKind::Reliable { lane: 2 });
+
+            assert!(left.accept(&first[..4]).unwrap().is_empty());
+            assert!(right.accept(&second[..4]).unwrap().is_empty());
+            assert_eq!(right.accept(&second[4..]).unwrap(), vec![second]);
+            assert_eq!(left.accept(&first[4..]).unwrap(), vec![first]);
+        }
 
         fn test_credential() -> Credential {
             let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
@@ -1590,6 +1751,47 @@ mod tests {
             MAX_PARTIAL_FRAME,
             vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES
         );
+        // The control lane reassembles up to what the adapter is willing to
+        // send on it. A receive bound below the send bound would refuse a frame
+        // this transport produces.
+        assert_eq!(
+            MAX_PARTIAL_CONTROL_FRAME,
+            vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES
+        );
+        assert_eq!(
+            MsQuicAdapter::default().control_payload_limit,
+            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
+        );
+    }
+
+    #[test]
+    fn a_reserved_lane_is_refused_at_submission() {
+        // Both are lanes the receive path reports on. Opening an application
+        // stream numbered the same way would have its replies classified as
+        // control frames or as peer-initiated records.
+        let mut adapter = MsQuicAdapter::default();
+        for lane in [CONTROL_LANE, PEER_STREAM_ID] {
+            assert!(is_reserved_lane(lane));
+            assert!(matches!(
+                adapter.send_reliable(StreamId(lane), b"record"),
+                Err(Error::InvalidConfiguration)
+            ));
+            assert!(matches!(
+                adapter.send_reliable_shared(StreamId(lane), shared_payload(b"record")),
+                Err(Error::InvalidConfiguration)
+            ));
+            assert!(matches!(
+                adapter.preflight_reliable_batch(StreamId(lane), &[shared_payload(b"record")]),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        assert_eq!(adapter.pending_commands(), 0);
+        // The lane one below the reserved pair is ordinary.
+        assert!(!is_reserved_lane(CONTROL_LANE - 1));
+        adapter
+            .send_reliable(StreamId(CONTROL_LANE - 1), b"record")
+            .unwrap();
+        assert_eq!(adapter.pending_commands(), 1);
     }
 
     #[test]

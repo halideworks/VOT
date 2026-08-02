@@ -122,8 +122,10 @@ limits on the way out and against this endpoint's on the way in.
 
 The four payload limits go through one table, so a frame type the registry adds
 later is a row rather than another check. The same check requires exactly one
-whole frame and refuses an experimental frame whose extension was not
-negotiated.
+whole frame, refuses an experimental frame whose extension was not negotiated,
+and refuses a frame on a stream that does not carry its type. A lane carries a
+proof-bearing range, meaning a `PROOF_BUNDLE` and the `DATA_RECORD` frames it
+covers; the negotiation stream carries everything else.
 
 The lane limit is split by what each layer can see. A session opens lanes, so it
 counts its own. Only the transport sees a peer stream open and close, so it

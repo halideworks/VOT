@@ -7,14 +7,17 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
 use vot_transport_api::{ConnectionId, PathStats, StagingCapacity, SubjectId, TransportAck};
+
+pub mod session;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
-const RANGE_UNIT_BYTES: u64 = 65_536;
+/// Range granularity a proof covers, from spec/proofs.md.
+pub const RANGE_UNIT_BYTES: u64 = 65_536;
 const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     UnknownObject,
     AlreadyReceiving,
@@ -26,6 +29,10 @@ pub enum Error {
     Verification(vot_verifier::VerifyError),
     ProofInvalid,
     UnsupportedCompression,
+    /// The session failed before a frame could be interpreted.
+    Session(vot_session::Error),
+    /// More incomplete bundle state than this receiver will hold.
+    PendingBundlesExhausted,
 }
 
 impl From<vot_transport_api::Error> for Error {

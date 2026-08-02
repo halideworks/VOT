@@ -3839,6 +3839,163 @@ pub mod live {
         }
 
         #[test]
+        #[allow(clippy::too_many_lines)]
+        fn a_proof_bearing_range_becomes_verified_state_over_the_carrier() {
+            // The whole point of the carrier. Until this existed a live session
+            // moved opaque records and verified nothing, and the receiver that
+            // turns a proof-bearing range into verified state was driven only
+            // by hand-fed frames.
+            let unit = usize::try_from(vot_scheduler::RANGE_UNIT_BYTES).unwrap();
+            let bytes = vec![0x5a_u8; unit * 2];
+            let subject = vot_transport_api::SubjectId {
+                suite: 1,
+                root: vot_verifier::root(vot_verifier::Suite::Blake3Bao64, &bytes).unwrap(),
+                length: bytes.len() as u64,
+            };
+            let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
+            let bundle = vot_codec::frames::ProofBundle {
+                request_id: [1; 16],
+                bundle_id: [2; 16],
+                object: vot_codec::frames::ObjectId {
+                    suite: subject.suite,
+                    root: subject.root,
+                    length: subject.length,
+                },
+                requested_offset: 0,
+                requested_length: subject.length,
+                covered_offset: proof.covered_offset,
+                covered_length: proof.data.len() as u64,
+                data_record_count: 2,
+                total_plaintext_length: proof.data.len() as u64,
+                proof: proof.proof,
+            };
+            let records: Vec<_> = (0..2)
+                .map(|index| vot_codec::frames::DataRecord {
+                    bundle_id: [2; 16],
+                    record_index: index,
+                    plaintext_offset: index * vot_scheduler::RANGE_UNIT_BYTES,
+                    plaintext_length: vot_scheduler::RANGE_UNIT_BYTES,
+                    compression: 0,
+                    encoded: bytes[usize::try_from(index).unwrap() * unit..][..unit].to_vec(),
+                })
+                .collect();
+
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut listener = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                server_limits(),
+            )
+            .unwrap();
+            let port = listener.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let transport = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                101,
+                test_limits(),
+            )
+            .unwrap();
+            let mut client = Session::client(
+                transport,
+                vot_codec::Settings::default(),
+                BTreeSet::new(),
+                vot_session::Authentication::Unimplemented,
+            );
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut connected = false;
+            while Instant::now() < deadline && !connected {
+                while let Some(event) = client.poll().unwrap() {
+                    connected |= matches!(event, Event::Connected(_));
+                }
+                std::thread::yield_now();
+            }
+            assert!(connected);
+            client.begin().unwrap();
+
+            let accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = listener.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+            let server = Session::server(
+                accepted,
+                vot_codec::Settings {
+                    max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                    ..vot_codec::Settings::default()
+                },
+                BTreeSet::new(),
+                vot_session::Authentication::Unimplemented,
+            );
+            let mut receiver = vot_scheduler::session::SessionReceiver::new(
+                server,
+                vot_scheduler::ReliableReceiver::new(1 << 22, 1 << 16, 1 << 16).unwrap(),
+            );
+            receiver.session_mut().begin().unwrap();
+
+            while Instant::now() < deadline && !(client.is_ready() && receiver.session().is_ready())
+            {
+                receiver.poll().unwrap();
+                let _ = client.poll().unwrap();
+                std::thread::yield_now();
+            }
+            assert!(client.is_ready() && receiver.session().is_ready());
+
+            // Authorisation is the caller's, since the authentication frames
+            // are unimplemented.
+            receiver.admit(subject).unwrap();
+            assert!(!receiver.is_verified(subject));
+
+            let mut frames = vec![{
+                let mut out = Vec::new();
+                vot_codec::frames::encode(
+                    &vot_codec::frames::TypedFrame::ProofBundle(bundle),
+                    &mut out,
+                )
+                .unwrap();
+                out
+            }];
+            for record in records {
+                let mut out = Vec::new();
+                vot_codec::frames::encode(
+                    &vot_codec::frames::TypedFrame::DataRecord(record),
+                    &mut out,
+                )
+                .unwrap();
+                frames.push(out);
+            }
+            for frame in frames {
+                client.send_reliable(StreamId(1), &frame).unwrap();
+            }
+            client.flush().unwrap();
+
+            while Instant::now() < deadline && !receiver.is_verified(subject) {
+                receiver.poll().unwrap();
+                let _ = client.poll().unwrap();
+                std::thread::yield_now();
+            }
+            assert!(
+                receiver.is_verified(subject),
+                "the range never became verified state"
+            );
+            assert_eq!(receiver.pending_bundles(), 0);
+
+            drop(client);
+            drop(receiver);
+            drop(listener);
+        }
+
+        #[test]
         fn a_malformed_peer_frame_ends_the_session_not_the_process() {
             // MsQuic treats a failure status from a receive callback as an
             // application bug: a debug build asserts and aborts, a release

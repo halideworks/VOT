@@ -1072,10 +1072,19 @@ pub enum Lane {
 
 impl Lane {
     /// Whether a frame of this type belongs on the lane.
+    ///
+    /// `spec/wire.md` section 7 gives a lane the payload and the control stream
+    /// everything else. It does not enumerate either side, so this is the
+    /// narrow reading: a lane carries a proof-bearing range, which is a
+    /// `PROOF_BUNDLE` and the `DATA_RECORD` frames it covers, and nothing else.
     const fn carries(self, frame_type: u64) -> bool {
+        let payload = matches!(
+            frame_type,
+            vot_codec::frame_type::PROOF_BUNDLE | vot_codec::frame_type::DATA_RECORD
+        );
         match self {
-            Self::Control => frame_type != vot_codec::frame_type::DATA_RECORD,
-            Self::Reliable => frame_type == vot_codec::frame_type::DATA_RECORD,
+            Self::Control => !payload,
+            Self::Reliable => payload,
         }
     }
 }
@@ -2802,6 +2811,27 @@ mod tests {
             server.adapter().closed.is_empty(),
             "a local refusal does not close the carrier"
         );
+    }
+
+    #[test]
+    fn a_lane_carries_a_proof_bearing_range() {
+        // A lane carries a PROOF_BUNDLE and the records it covers. Allowing
+        // only DATA_RECORD made proof-bearing transfer impossible, which
+        // nothing noticed until a receiver was wired to a session.
+        for frame_type in [frame_type::PROOF_BUNDLE, frame_type::DATA_RECORD] {
+            assert!(Lane::Reliable.carries(frame_type), "{frame_type:#x}");
+            assert!(!Lane::Control.carries(frame_type), "{frame_type:#x}");
+        }
+        for frame_type in [
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::MANIFEST_PAGE,
+            frame_type::PUBLISH_RECEIPT,
+            frame_type::PING,
+        ] {
+            assert!(Lane::Control.carries(frame_type), "{frame_type:#x}");
+            assert!(!Lane::Reliable.carries(frame_type), "{frame_type:#x}");
+        }
     }
 
     #[test]

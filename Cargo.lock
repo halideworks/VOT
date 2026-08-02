@@ -2081,6 +2081,7 @@ dependencies = [
  "vot-codec",
  "vot-proof-blake3",
  "vot-proof-sha256",
+ "vot-session",
  "vot-transport-api",
  "vot-transport-sim",
  "vot-verifier",
@@ -2108,8 +2109,11 @@ version = "0.0.1"
 dependencies = [
  "msquic",
  "vot-codec",
+ "vot-proof-blake3",
+ "vot-scheduler",
  "vot-session",
  "vot-transport-api",
+ "vot-verifier",
 ]
 
 [[package]]

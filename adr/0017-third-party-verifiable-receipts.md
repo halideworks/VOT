@@ -26,11 +26,18 @@ HMAC-SHA-256 stays registered for receipts that never leave one trust domain.
 The envelope carries its scheme, and the authenticator is variable length,
 checked against the length the registry fixes for that scheme.
 
-The authenticator covers a domain separator, the scheme as two bytes, then the
-canonical receipt. Binding the scheme into the signed input means an
-authenticator produced under one scheme is not valid input for another, so a
-verifier cannot be walked from the strong scheme to the weak one by an attacker
-who can choose the envelope.
+The authenticator covers a domain separator, the scheme as two bytes, the key
+identifier with a one-byte length prefix, then the canonical receipt. Binding
+the scheme into the signed input means an authenticator produced under one
+scheme is not valid input for another, so a verifier cannot be walked from the
+strong scheme to the weak one by an attacker who can choose the envelope.
+
+Binding the key identifier means a verifier can use it to separate contexts. It
+names which key the issuer claimed to be using, and callers do read it that way:
+the CLI requires `vot-cli` on a publication receipt. Left outside the signed
+bytes it is a label anyone can rewrite, so a receipt the same issuer signed for
+another purpose could be relabelled and still verify. The length prefix keeps an
+identifier from being read as the start of the canonical receipt.
 
 Verification uses `verify_strict`, which rejects signatures under low-order or
 torsion public keys. Without it one signature can verify under more than one
@@ -50,8 +57,8 @@ crates, but it is a real addition to the audited surface and is recorded in
 DEPENDENCIES.md.
 
 Existing HMAC receipts do not verify against this implementation, because the
-signed input now includes the scheme. Both schemes were draft and no wire
-vectors were published, so nothing deployed is invalidated.
+signed input now includes the scheme and the key identifier. Both schemes were
+draft and no wire vectors were published, so nothing deployed is invalidated.
 
 This ADR covers authentication only. A single signed receipt is still a claim
 about history rather than the history itself: an issuer holding its own key can

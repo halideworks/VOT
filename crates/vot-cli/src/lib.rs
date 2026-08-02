@@ -1391,6 +1391,10 @@ fn remove_preparation(prepared: &Path) -> Result<(), Error> {
 /// disagree about what counts as a publication.
 fn validate_publication_shape(authenticated: &AuthenticatedReceipt) -> Result<(), Error> {
     let receipt = &authenticated.receipt;
+    // The key identifier separates contexts here, so it has to be authentic.
+    // vot-receipt binds it into the signed input for that reason; if it ever
+    // stopped, a receipt this issuer signed for something else could be
+    // relabelled and would pass this check.
     if authenticated.key_id != KEY_ID
         || receipt.subject_kind != SubjectKind::Package
         || receipt.suite_id != 1

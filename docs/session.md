@@ -93,6 +93,31 @@ own reassembly bound has to be in force before the peer's first byte, so
 Advertising one bound and accepting frames up to another is silent otherwise:
 the peer sends what it was told it could, and this endpoint takes more.
 
+## Which settings are enforced
+
+`spec/registries.md` defines eight settings. Four bound framing and are applied
+by `vot-session`, in both directions: a frame is measured against the peer's
+limits on the way out and against this endpoint's on the way in.
+
+| Setting | Enforced | Where |
+| --- | --- | --- |
+| `MAX_CONTROL_FRAME_PAYLOAD` | yes | payload limit table |
+| `MAX_DATA_RECORD_PAYLOAD` | yes | payload limit table |
+| `MAX_MANIFEST_PAGE_PAYLOAD` | yes | payload limit table, and `PROGRESSIVE_PAGE` |
+| `RELIABLE_LANE_LIMIT` | yes | distinct lane count |
+| `IDLE_TIMEOUT_MS` | no | nothing here keeps time |
+| `ACTIVE_KEEPALIVE_MS` | no | nothing here keeps time |
+| `COMPRESSION_MIN_GAIN_BPS` | no | nothing compresses yet |
+| `TELEMETRY_LEVEL` | no | advisory, read elsewhere |
+
+The four payload limits go through one table, so a frame type the registry adds
+later is a row rather than another check. A limit below a codec per-type maximum
+takes effect only here, because the codec's limits are fixed.
+
+The first two unenforced settings are timers. A session that agreed an idle
+timeout and never applied it will not close an idle carrier, and neither
+endpoint sends keepalives.
+
 ## Lane identity
 
 Records carry a `StreamId`. Two rules keep those identifiers meaningful.

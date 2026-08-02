@@ -110,8 +110,8 @@ pub enum ErrorKind {
         limit: u64,
         side: Side,
     },
-    /// More outbound lanes than the peer said it would carry.
-    LaneLimitExceeded { limit: u64 },
+    /// More lanes than the advertised `RELIABLE_LANE_LIMIT` allows.
+    LaneLimitExceeded { limit: u64, side: Side },
     /// The backend refused something the session needed.
     Transport(TransportError),
     /// The backend would reassemble control frames larger than this endpoint
@@ -131,15 +131,16 @@ impl ErrorKind {
             | Self::NotNegotiated { .. }
             | Self::PendingRecordsExhausted { .. } => true,
             // Only when the peer is the one that went past its limit.
-            Self::FrameExceedsLimit { side, .. } => matches!(side, Side::Local),
+            Self::FrameExceedsLimit { side, .. } | Self::LaneLimitExceeded { side, .. } => {
+                matches!(side, Side::Local)
+            }
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
             | Self::Transport(_)
             | Self::Interrupted { .. }
             | Self::ReceiveLimitMismatch { .. }
-            | Self::HandshakeUnsent { .. }
-            | Self::LaneLimitExceeded { .. } => false,
+            | Self::HandshakeUnsent { .. } => false,
         }
     }
 }
@@ -447,6 +448,9 @@ pub struct Session<A> {
     /// Lanes this endpoint has sent on, bounded by the peer's advertised
     /// `RELIABLE_LANE_LIMIT`.
     lanes: BTreeSet<StreamId>,
+    /// Lanes the peer has sent on, bounded by the limit this endpoint
+    /// advertised.
+    peer_lanes: BTreeSet<StreamId>,
     pending_bytes: usize,
     pending_byte_limit: usize,
     pending_count_limit: usize,
@@ -472,6 +476,7 @@ impl<A: TransportAdapter> Session<A> {
             outbound: VecDeque::new(),
             pending: VecDeque::new(),
             lanes: BTreeSet::new(),
+            peer_lanes: BTreeSet::new(),
             pending_bytes: 0,
             pending_byte_limit: DEFAULT_PENDING_RECORD_BYTES,
             pending_count_limit: DEFAULT_PENDING_RECORD_COUNT,
@@ -629,8 +634,10 @@ impl<A: TransportAdapter> Session<A> {
                     return Ok(Some(Event::Disconnected(connection)));
                 }
                 record @ Event::Reliable { .. } => {
-                    if let Event::Reliable { bytes, .. } = &record {
+                    if let Event::Reliable { stream, bytes, .. } = &record {
+                        let stream = *stream;
                         self.check_inbound(bytes)?;
+                        self.admit_peer_lane(stream)?;
                     }
                     if self.negotiation.is_ready() {
                         return Ok(Some(record));
@@ -858,20 +865,46 @@ impl<A: TransportAdapter> Session<A> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        if self.lanes.contains(&stream) {
-            return Ok(());
-        }
-        if u64::try_from(self.lanes.len()).is_ok_and(|used| used < peer.reliable_lane_limit) {
-            self.lanes.insert(stream);
-            return Ok(());
-        }
-        Err(Error::new(
-            ErrorKind::LaneLimitExceeded {
-                limit: peer.reliable_lane_limit,
-            },
-            error_code::RESOURCE_LIMIT,
-        ))
+        admit_lane(
+            &mut self.lanes,
+            stream,
+            peer.reliable_lane_limit,
+            Side::Peer,
+        )
     }
+
+    /// Refuses a peer lane past the number this endpoint said it would carry.
+    ///
+    /// The backends bound peer streams by their own carrier settings, not by
+    /// what was advertised, so this is the only place the negotiated count
+    /// applies inbound.
+    fn admit_peer_lane(&mut self, stream: StreamId) -> Result<(), Error> {
+        let limit = self.negotiation.local_settings().reliable_lane_limit;
+        admit_lane(&mut self.peer_lanes, stream, limit, Side::Local)
+    }
+}
+
+/// Counts one lane against a negotiated limit.
+///
+/// A lane already in use is free: the limit is on how many exist, and nothing
+/// here closes one.
+fn admit_lane(
+    lanes: &mut BTreeSet<StreamId>,
+    stream: StreamId,
+    limit: u64,
+    side: Side,
+) -> Result<(), Error> {
+    if lanes.contains(&stream) {
+        return Ok(());
+    }
+    if u64::try_from(lanes.len()).is_ok_and(|used| used < limit) {
+        lanes.insert(stream);
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::LaneLimitExceeded { limit, side },
+        error_code::RESOURCE_LIMIT,
+    ))
 }
 
 /// The payload limit `settings` puts on `frame_type`.
@@ -2189,9 +2222,55 @@ mod tests {
         client.send_reliable(StreamId(1), &record).unwrap();
         let error = client.send_reliable(StreamId(2), &record).unwrap_err();
         assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
-        assert_eq!(error.kind(), &ErrorKind::LaneLimitExceeded { limit: 1 });
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::LaneLimitExceeded {
+                limit: 1,
+                side: Side::Peer,
+            }
+        );
         assert!(!error.kind().is_peer_fault());
         assert_eq!(client.adapter().records.len(), 2);
+    }
+
+    #[test]
+    fn more_peer_lanes_than_this_endpoint_carries_are_refused() {
+        // The backends bound peer streams by their carrier settings, not by
+        // what was advertised, so the negotiated count applies only here.
+        let local = Settings {
+            reliable_lane_limit: 2,
+            ..Settings::default()
+        };
+        let (_client, mut server) = negotiated_with(Settings::default(), local);
+        for lane in 0..2 {
+            server.adapter.events.push_back(record(lane, b"record"));
+            assert!(matches!(
+                server.poll().unwrap(),
+                Some(Event::Reliable { .. })
+            ));
+        }
+        // A lane already seen is free.
+        server.adapter.events.push_back(record(0, b"again"));
+        assert!(matches!(
+            server.poll().unwrap(),
+            Some(Event::Reliable { .. })
+        ));
+
+        server
+            .adapter
+            .events
+            .push_back(record(2, b"one lane too many"));
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::LaneLimitExceeded {
+                limit: 2,
+                side: Side::Local,
+            }
+        );
+        assert!(error.kind().is_peer_fault());
+        assert_eq!(server.adapter().closed, vec![error_code::RESOURCE_LIMIT]);
     }
 
     #[test]

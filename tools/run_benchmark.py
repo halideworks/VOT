@@ -102,6 +102,18 @@ def validate_assurance(value: Any) -> str:
     return value
 
 
+def validate_identifier(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def validate_iteration_count(value: Any, name: str, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"workload {name} must be an integer >= {minimum}")
+    return value
+
+
 def build_result(
     measured: dict[str, Any],
     *,
@@ -118,6 +130,8 @@ def build_result(
     assurance: str,
     iteration: int,
 ) -> dict[str, Any]:
+    workload_id = validate_identifier(workload_id, "workload_id")
+    impairment_id = validate_identifier(impairment_id, "impairment_id")
     bytes_sent = measured_int(measured.get("bytes_sent"), "bytes_sent")
     verified_bytes = measured_int(measured.get("verified_bytes"), "verified_bytes")
     elapsed_ns = measured_int(measured.get("elapsed_ns"), "elapsed_ns", 1)
@@ -166,6 +180,7 @@ def command_environment(
     seed: int,
     object_bytes: int,
     impairment_path: Path,
+    impairment_id: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
     values = {
@@ -175,7 +190,7 @@ def command_environment(
         "VOT_BENCH_SEED": str(seed),
         "VOT_BENCH_OBJECT_BYTES": str(object_bytes),
         "VOT_BENCH_RECORD_BYTES": str(workload["record_bytes"]),
-        "VOT_BENCH_IMPAIRMENT": str(impairment["id"]),
+        "VOT_BENCH_IMPAIRMENT": impairment_id,
         "VOT_BENCH_IMPAIRMENT_PATH": str(impairment_path),
         "VOT_BENCH_IMPAIRMENT_MTU_BYTES": str(impairment["mtu_bytes"]),
         "VOT_BENCH_IMPAIRMENT_RTT_US": str(impairment["rtt_us"]),
@@ -216,6 +231,8 @@ def main() -> int:
     workload = load(args.workload)
     impairment_path = resolve_input_path(args.impairment).resolve()
     impairment = load(impairment_path)
+    workload_id = validate_identifier(workload.get("id"), "workload id")
+    impairment_id = validate_identifier(impairment.get("id"), "impairment id")
     if workload.get("seed_required") is not True or impairment.get("seed_required") is not True:
         raise ValueError("both workload and impairment must require a seed")
     assurance = validate_assurance(workload.get("assurance"))
@@ -242,10 +259,12 @@ def main() -> int:
         ).strip()
     )
     machine_info = machine()
-    warmups = int(workload.get("warmup_iterations", 0))
-    iterations = int(workload.get("measurement_iterations", 1))
-    if warmups < 0 or iterations < 1:
-        raise ValueError("workload iteration counts are invalid")
+    warmups = validate_iteration_count(
+        workload.get("warmup_iterations", 0), "warmup_iterations", 0
+    )
+    iterations = validate_iteration_count(
+        workload.get("measurement_iterations", 1), "measurement_iterations", 1
+    )
     results: list[dict[str, Any]] = []
     combination = 0
     for object_bytes in object_sizes:
@@ -262,6 +281,7 @@ def main() -> int:
                     seed=run_seed,
                     object_bytes=object_bytes,
                     impairment_path=impairment_path,
+                    impairment_id=impairment_id,
                 )
                 for _ in range(warmups):
                     subprocess.run(
@@ -289,8 +309,8 @@ def main() -> int:
                     results.append(
                         build_result(
                             measured,
-                            workload_id=str(workload["id"]),
-                            impairment_id=str(impairment["id"]),
+                            workload_id=workload_id,
+                            impairment_id=impairment_id,
                             backend=args.backend,
                             source_commit=source_commit,
                             dirty=dirty,

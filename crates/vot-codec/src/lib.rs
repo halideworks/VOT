@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 pub mod frames;
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
+pub const MIN_CONTROL_FRAME_PAYLOAD: usize = 1024;
 pub const HARD_MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_UNKNOWN_PAYLOAD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FRAMES_PER_BATCH: usize = 4096;
@@ -324,7 +325,10 @@ fn apply_setting(
     use setting_id as id;
 
     let target = match identifier {
-        id::MAX_CONTROL_FRAME_PAYLOAD if (1024..=16 * 1024 * 1024).contains(&value) => {
+        id::MAX_CONTROL_FRAME_PAYLOAD
+            if (MIN_CONTROL_FRAME_PAYLOAD as u64..=HARD_MAX_FRAME_PAYLOAD as u64)
+                .contains(&value) =>
+        {
             &mut settings.max_control_frame_payload
         }
         id::MAX_DATA_RECORD_PAYLOAD if (64 * 1024..=256 * 1024).contains(&value) => {
@@ -863,6 +867,7 @@ mod tests {
 
     #[test]
     fn settings_payload_limits_are_explicit() {
+        assert_eq!(MIN_CONTROL_FRAME_PAYLOAD, 1024);
         let one_setting = |identifier: u64, value: u64| {
             let mut payload = Vec::new();
             encode_varint(identifier, &mut payload).unwrap();

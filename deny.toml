@@ -17,8 +17,10 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-# Path dependencies have no wildcard version; external wildcard versions are denied.
+# Workspace crates are unpublished; internal path/git dependencies are intentional.
+# External wildcard versions remain denied.
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

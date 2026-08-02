@@ -46,6 +46,7 @@ def main() -> None:
         seed=7,
         object_bytes=1,
         impairment_path=ROOT / "bench/impairments/clean-path.json",
+        impairment_id=impairment["id"],
     )
     assert environment["VOT_BENCH_IMPAIRMENT_PATH"].endswith(
         "bench/impairments/clean-path.json"
@@ -56,6 +57,23 @@ def main() -> None:
     assert environment["VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS"] == "10000000000"
     assert environment["VOT_BENCH_IMPAIRMENT_QUEUE_BYTES"] == "33554432"
     assert runner_module.validate_assurance("root-verified") == "root-verified"
+    assert runner_module.validate_identifier("workload-v1", "workload id") == "workload-v1"
+    for invalid_identifier in ("", 1, True):
+        try:
+            runner_module.validate_identifier(invalid_identifier, "workload id")
+        except ValueError as error:
+            assert "non-empty string" in str(error)
+        else:
+            raise AssertionError("invalid benchmark identifiers must be rejected")
+    assert runner_module.validate_iteration_count(0, "warmup_iterations", 0) == 0
+    assert runner_module.validate_iteration_count(1, "measurement_iterations", 1) == 1
+    for invalid_count in (True, 1.9, "1", -1):
+        try:
+            runner_module.validate_iteration_count(invalid_count, "measurement_iterations", 1)
+        except ValueError as error:
+            assert "integer" in str(error)
+        else:
+            raise AssertionError("invalid iteration counts must be rejected")
     try:
         runner_module.validate_assurance("not-an-assurance")
     except ValueError as error:

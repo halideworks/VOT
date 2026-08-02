@@ -1535,16 +1535,14 @@ const fn hex(value: u8) -> Option<u8> {
 /// Both raw keys and hexadecimal text files are accepted. Raw input is
 /// preserved byte-for-byte; hexadecimal text must use the explicit hex:
 /// prefix, and textual raw keys may use raw:. Keys must contain 32..=64
-/// bytes. Source reads are bounded to MAX_KEY_SOURCE_BYTES bytes.
+/// bytes. Source reads are bounded to `MAX_KEY_SOURCE_BYTES` bytes.
 pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
     let bytes = if let Some(name) = spec.strip_prefix("env:") {
         if name.is_empty() {
             return Err(Error::InvalidArguments);
         }
         let value = std::env::var(name).map_err(|_| Error::InvalidArguments)?;
-        if value.len() > MAX_KEY_SOURCE_BYTES {
-            return Err(Error::InvalidArguments);
-        }
+        validate_key_source_length(value.len())?;
         value.into_bytes()
     } else if spec == "-" {
         read_key_source(io::stdin().lock())?
@@ -1554,14 +1552,20 @@ pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
     parse_loaded_key(bytes)
 }
 
+fn validate_key_source_length(length: usize) -> Result<(), Error> {
+    if length > MAX_KEY_SOURCE_BYTES {
+        Err(Error::InvalidArguments)
+    } else {
+        Ok(())
+    }
+}
+
 fn read_key_source(reader: impl Read) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     reader
         .take((MAX_KEY_SOURCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_KEY_SOURCE_BYTES {
-        return Err(Error::InvalidArguments);
-    }
+    validate_key_source_length(bytes.len())?;
     Ok(bytes)
 }
 
@@ -2430,6 +2434,17 @@ mod tests {
 
     #[test]
     fn key_decoder_is_strict_and_bounded() {
+        assert_eq!(MAX_KEY_SOURCE_BYTES, 133);
+        assert!(decode_key(&"ab".repeat(34)).is_ok());
+        assert_eq!(decode_key(&"ab".repeat(64)).unwrap(), vec![0xab; 64]);
+        assert!(matches!(
+            decode_key(&"ab".repeat(65)),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            decode_key(&"a".repeat(65)),
+            Err(Error::InvalidArguments)
+        ));
         assert_eq!(decode_key(&"00".repeat(32)).unwrap(), vec![0; 32]);
         assert!(matches!(decode_key("0"), Err(Error::InvalidArguments)));
         assert!(matches!(
@@ -2495,6 +2510,22 @@ mod tests {
             Err(Error::InvalidArguments)
         ));
         fs::remove_file(oversized_path).unwrap();
+    }
+
+    #[test]
+    fn key_source_limit_is_exact_and_reads_are_bounded() {
+        assert!(validate_key_source_length(MAX_KEY_SOURCE_BYTES).is_ok());
+        assert!(matches!(
+            validate_key_source_length(MAX_KEY_SOURCE_BYTES + 1),
+            Err(Error::InvalidArguments)
+        ));
+
+        let exact = read_key_source(io::Cursor::new(vec![7; MAX_KEY_SOURCE_BYTES])).unwrap();
+        assert_eq!(exact.len(), MAX_KEY_SOURCE_BYTES);
+        assert!(matches!(
+            read_key_source(io::Cursor::new(vec![7; MAX_KEY_SOURCE_BYTES + 1])),
+            Err(Error::InvalidArguments)
+        ));
     }
 
     #[test]

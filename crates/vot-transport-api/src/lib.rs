@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 pub const ALPN: &[u8] = b"vot-draft-03";
+pub const MIN_CONTROL_FRAME_PAYLOAD: usize = vot_codec::MIN_CONTROL_FRAME_PAYLOAD;
 pub const MAX_CONTROL_FRAME_PAYLOAD: usize = vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD;
 pub const MAX_DATA_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
@@ -305,13 +306,13 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
 /// Validates a negotiated control-frame payload limit.
 ///
 /// # Errors
-/// Returns [`Error::InvalidConfiguration`] when the limit is zero or exceeds
-/// the codec hard maximum.
+/// Returns [`Error::InvalidConfiguration`] when the limit is below the
+/// protocol minimum or exceeds the codec hard maximum.
 pub fn validate_control_payload_limit(limit: usize) -> Result<(), Error> {
-    if limit == 0 || limit > vot_codec::HARD_MAX_FRAME_PAYLOAD {
-        Err(Error::InvalidConfiguration)
-    } else {
+    if (MIN_CONTROL_FRAME_PAYLOAD..=vot_codec::HARD_MAX_FRAME_PAYLOAD).contains(&limit) {
         Ok(())
+    } else {
+        Err(Error::InvalidConfiguration)
     }
 }
 
@@ -391,6 +392,7 @@ mod tests {
 
     #[test]
     fn records_are_bounded_before_a_backend_sees_them() {
+        assert_eq!(MIN_CONTROL_FRAME_PAYLOAD, 1024);
         assert_eq!(MAX_DATA_RECORD_BYTES, 262_144);
         assert_eq!(MAX_FRAME_ENVELOPE_BYTES, 16);
         assert_eq!(MAX_DATA_RECORD_WIRE_BYTES, 262_160);
@@ -415,6 +417,18 @@ mod tests {
                 MAX_CONTROL_FRAME_PAYLOAD
             ),
             Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            validate_control_payload_limit(MIN_CONTROL_FRAME_PAYLOAD),
+            Ok(())
+        );
+        assert_eq!(
+            validate_control_payload_limit(MIN_CONTROL_FRAME_PAYLOAD - 1),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            validate_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD),
+            Ok(())
         );
         assert_eq!(
             validate_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD + 1),

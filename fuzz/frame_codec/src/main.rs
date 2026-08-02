@@ -13,6 +13,33 @@ use vot_codec::{
 const MAX_INPUT: u64 = (HARD_MAX_FRAME_PAYLOAD as u64) + 64 * 1024;
 const ALLOCATION_LIMIT: usize = 256 * 1024 * 1024;
 
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hex_seed(input: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(input).ok()?.trim();
+    if text.is_empty() || text.len() % 2 != 0 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push(high * 16 + low);
+    }
+    Some(decoded)
+}
+
+fn normalize_seed(input: Vec<u8>) -> Vec<u8> {
+    decode_hex_seed(&input).unwrap_or(input)
+}
+
 #[global_allocator]
 static ALLOCATOR: Cap<System> = Cap::new(System, ALLOCATION_LIMIT);
 
@@ -79,6 +106,7 @@ fn iterations() -> usize {
 fn main() -> io::Result<()> {
     let mut input = Vec::new();
     io::stdin().take(MAX_INPUT).read_to_end(&mut input)?;
+    let input = normalize_seed(input);
     let mut state = 0x9e37_79b9_u64;
     for iteration in 0..iterations() {
         let mut candidate = input.clone();
@@ -91,4 +119,19 @@ fn main() -> io::Result<()> {
         exercise(&candidate);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_seed;
+
+    #[test]
+    fn hex_seed_is_decoded_before_fuzzing() {
+        assert_eq!(normalize_seed(b"0100\n".to_vec()), [1, 0]);
+    }
+
+    #[test]
+    fn binary_seed_is_preserved() {
+        assert_eq!(normalize_seed(vec![0x31, 0x04, 0xde, 0xad]), [0x31, 0x04, 0xde, 0xad]);
+    }
 }

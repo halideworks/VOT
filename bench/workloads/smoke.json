@@ -1,0 +1,1 @@
+{"id":"ram-to-ram-smoke-v1","version":1,"source":"ram","destination":"ram","object_bytes":[1048576],"record_bytes":65536,"worker_counts":[1],"suites":["blake3-bao64","sha256-bep52"],"assurance":"root-verified","seed_required":true,"warmup_iterations":0,"measurement_iterations":1}

@@ -121,6 +121,19 @@ jobs:
           cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-shrink -- sim/scenarios/storage-fault.vot > /tmp/storage-minimized.vot
           cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-replay -- /tmp/storage-minimized.vot > /tmp/storage-minimized.trace
 
+      - name: Smoke the benchmark contract end to end
+        # Proves the runner, the backend driver, and the published result schema
+        # still agree. It is a contract check, not a performance measurement, so
+        # it uses a small object and an unoptimised build.
+        run: |
+          cargo +1.88.0 build -p vot-bench-driver --locked
+          python3 tools/run_benchmark.py \
+            --workload bench/workloads/smoke.json \
+            --backend simulator --seed 1 \
+            --output /tmp/bench-smoke.jsonl \
+            --command target/debug/vot-bench-driver
+          python3 tools/validate_benchmark_results.py /tmp/bench-smoke.jsonl
+
       - name: Build standalone fuzz drivers
         run: |
           cargo +1.88.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
@@ -307,6 +320,7 @@ jobs:
           - { package: vot-transport-tcp, required: true }
           - { package: vot-resume, required: true }
           - { package: vot-commit-platform, required: true }
+          - { package: vot-bench-driver, required: true }
     steps:
       - uses: actions/checkout@v4.3.1
         with:

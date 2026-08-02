@@ -799,75 +799,126 @@ pub mod live {
             }
         }
 
-        /// Adds received bytes and returns every complete frame now available.
+        /// Feeds received bytes to `emit`, one complete frame at a time.
+        ///
+        /// Frames are handed over as they are parsed rather than collected,
+        /// and only a trailing incomplete frame is ever copied into the buffer.
+        /// A coalesced read can carry many valid frames at once, so returning
+        /// them together would let one callback hold the whole read plus a copy
+        /// of every frame in it before the bounded queue saw any of them.
         ///
         /// # Errors
         /// Reports a frame this lane cannot carry, either because it is
         /// malformed, because it is larger than the lane allows, or because it
         /// can never complete, all of which would otherwise stall the stream.
-        fn accept(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, FrameFault> {
-            // Whatever belongs to a frame already being skipped never reaches
-            // the buffer at all.
-            let skipped = self.discarding.min(bytes.len());
-            self.discarding -= skipped;
-            self.pending.extend_from_slice(&bytes[skipped..]);
-
+        /// Propagates whatever `emit` reports.
+        fn accept(
+            &mut self,
+            bytes: &[u8],
+            mut emit: impl FnMut(&[u8]) -> Result<(), FrameFault>,
+        ) -> Result<(), FrameFault> {
             let limits = vot_codec::DecodeLimits {
                 max_unknown_payload: self.kind.payload_limit(),
                 max_frames: 1,
             };
-            let mut frames = Vec::new();
-            let mut offset = 0;
+            let mut input = bytes;
             loop {
-                let envelope = match vot_codec::peek_envelope(&self.pending[offset..], limits) {
-                    Ok(envelope) => envelope,
-                    // The type and length have not both arrived yet.
-                    Err(vot_codec::DecodeError::Incomplete { .. }) => break,
-                    // The decoder already knows which registered error this is,
-                    // and spec/wire.md requires the session to close under that
-                    // code rather than under a generic transport abort.
-                    Err(error) => return Err(FrameFault::from_decode(&error)),
-                };
-                // The codec bounds a known frame by its registered limit, which
-                // for PROOF_BUNDLE and HAVE is larger than this lane carries.
-                // Without this the frame decodes, reaches the adapter, is
-                // refused there as oversized, and is retried for ever at the
-                // head of the queue.
-                if envelope.total_length > self.kind.partial_frame_limit() {
-                    return Err(FrameFault::too_large());
+                // Bytes belonging to a frame being skipped never reach the
+                // buffer at all.
+                if self.discarding != 0 {
+                    let dropped = self.discarding.min(input.len());
+                    self.discarding -= dropped;
+                    input = &input[dropped..];
+                    if self.discarding != 0 {
+                        return Ok(());
+                    }
                 }
-                let available = self.pending.len() - offset;
-                if envelope.skipped {
-                    // spec/wire.md step 6: stream-discard exactly the declared
-                    // length and never size a buffer from it. Buffering until
-                    // the frame completed would hold a payload that is thrown
-                    // away, once per stream.
-                    if available >= envelope.total_length {
-                        offset += envelope.total_length;
+                if input.is_empty() {
+                    return Ok(());
+                }
+
+                // A frame already part-way through is completed from the buffer,
+                // which is the only place bytes accumulate.
+                if !self.pending.is_empty() {
+                    let Some(envelope) = self.envelope(limits, None)? else {
+                        // Not even the header is complete. It is at most a
+                        // couple of varints, so take one byte and look again.
+                        self.pending.push(input[0]);
+                        input = &input[1..];
+                        continue;
+                    };
+                    let needed = envelope.total_length - self.pending.len();
+                    let taken = needed.min(input.len());
+                    if envelope.skipped {
+                        // The header is buffered but the payload is not, so
+                        // only the remainder has to be counted down.
+                        self.discarding = needed - taken;
+                        self.pending.clear();
+                        input = &input[taken..];
                         continue;
                     }
-                    self.discarding = envelope.total_length - available;
-                    offset = self.pending.len();
-                    break;
+                    self.pending.extend_from_slice(&input[..taken]);
+                    input = &input[taken..];
+                    if self.pending.len() < envelope.total_length {
+                        return Ok(());
+                    }
+                    emit(&self.pending)?;
+                    self.pending.clear();
+                    continue;
                 }
-                if available < envelope.total_length {
-                    // A known frame is parsed whole, so its bytes are held
-                    // until the rest arrives. The lane bound above is what
-                    // keeps that finite.
-                    break;
+
+                // Nothing buffered, so parse straight out of the read.
+                let Some(envelope) = self.envelope(limits, Some(input))? else {
+                    // Only a partial header is left. That is bounded by the
+                    // envelope size, not by the payload it describes.
+                    self.pending.extend_from_slice(input);
+                    return Ok(());
+                };
+                if input.len() < envelope.total_length {
+                    if envelope.skipped {
+                        // spec/wire.md step 6: stream-discard exactly the
+                        // declared length and never size a buffer from it.
+                        self.discarding = envelope.total_length - input.len();
+                        return Ok(());
+                    }
+                    self.pending.extend_from_slice(input);
+                    return Ok(());
                 }
-                frames.push(self.pending[offset..offset + envelope.total_length].to_vec());
-                offset += envelope.total_length;
+                if !envelope.skipped {
+                    emit(&input[..envelope.total_length])?;
+                }
+                input = &input[envelope.total_length..];
             }
-            self.pending.drain(..offset);
-            // The bound belongs to the frame still being assembled, not to the
-            // read that delivered it. A read that coalesces the tail of one
-            // frame with the head of the next is legal, and checking before
-            // draining would refuse it.
-            if self.pending.len() > self.kind.partial_frame_limit() {
-                return Err(FrameFault::too_large());
+        }
+
+        /// Reads the next envelope from `input`, or from the buffer when
+        /// `input` is `None`, applying this lane's bound to it.
+        ///
+        /// Returns `None` while the header is still arriving.
+        fn envelope(
+            &self,
+            limits: vot_codec::DecodeLimits,
+            input: Option<&[u8]>,
+        ) -> Result<Option<vot_codec::FrameEnvelope>, FrameFault> {
+            match vot_codec::peek_envelope(input.unwrap_or(&self.pending), limits) {
+                Ok(envelope) => {
+                    // The codec bounds a known frame by its registered limit,
+                    // which for PROOF_BUNDLE and HAVE is larger than this lane
+                    // carries. Without this the frame decodes, reaches the
+                    // adapter, is refused there as oversized, and is retried for
+                    // ever at the head of the queue.
+                    if envelope.total_length > self.kind.partial_frame_limit() {
+                        return Err(FrameFault::too_large());
+                    }
+                    Ok(Some(envelope))
+                }
+                // The type and length have not both arrived yet.
+                Err(vot_codec::DecodeError::Incomplete { .. }) => Ok(None),
+                // The decoder already knows which registered error this is, and
+                // spec/wire.md requires the session to close under that code
+                // rather than under a generic transport abort.
+                Err(error) => Err(FrameFault::from_decode(&error)),
             }
-            Ok(frames)
         }
 
         /// Bytes currently held for a frame still being assembled.
@@ -936,33 +987,37 @@ pub mod live {
             match event {
                 StreamEvent::Receive { buffers, .. } => {
                     for buffer in buffers {
-                        let frames = framing.accept(buffer.as_bytes()).map_err(|fault| {
-                            request_close(&close_request, fault.close);
-                            msquic::Status::from(msquic::StatusCode::QUIC_STATUS_ABORTED)
-                        })?;
-                        for frame in frames {
-                            let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                            let event = match kind {
-                                StreamKind::Control => NativeEvent::Control(frame),
-                                StreamKind::Reliable { lane } => NativeEvent::Reliable {
-                                    stream: lane,
-                                    sequence: next,
-                                    bytes: frame,
-                                },
-                            };
-                            if !push(&inbound, event) {
-                                // The queue is full and a callback cannot wait,
-                                // so the connection fails loudly instead of
-                                // growing without limit.
-                                request_close(
-                                    &close_request,
-                                    vot_codec::error_code::RESOURCE_LIMIT,
-                                );
-                                return Err(msquic::Status::from(
-                                    msquic::StatusCode::QUIC_STATUS_ABORTED,
-                                ));
-                            }
-                        }
+                        // Each frame is offered to the bounded queue as it is
+                        // parsed. Collecting them first would let one coalesced
+                        // read hold the whole read plus a copy of every frame in
+                        // it before the queue's bound applied to any of them.
+                        framing
+                            .accept(buffer.as_bytes(), |frame| {
+                                let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                                let event = match kind {
+                                    StreamKind::Control => NativeEvent::Control(frame.to_vec()),
+                                    StreamKind::Reliable { lane } => NativeEvent::Reliable {
+                                        stream: lane,
+                                        sequence: next,
+                                        bytes: frame.to_vec(),
+                                    },
+                                };
+                                if push(&inbound, event) {
+                                    Ok(())
+                                } else {
+                                    // The queue is full and a callback cannot
+                                    // wait, so the connection fails loudly
+                                    // instead of growing without limit.
+                                    Err(FrameFault {
+                                        error: Error::InboundQueueFull,
+                                        close: vot_codec::error_code::RESOURCE_LIMIT,
+                                    })
+                                }
+                            })
+                            .map_err(|fault| {
+                                request_close(&close_request, fault.close);
+                                msquic::Status::from(msquic::StatusCode::QUIC_STATUS_ABORTED)
+                            })?;
                     }
                 }
                 StreamEvent::SendComplete { client_context, .. } => {
@@ -1376,6 +1431,17 @@ pub mod live {
             ConnectionId, Error, Event, MAX_DATA_RECORD_BYTES, StreamId, TransportAdapter,
         };
 
+        /// Drives `accept` and collects what it emitted, which is what the
+        /// tests assert on. The transport itself never collects.
+        fn collect(framing: &mut Framing, bytes: &[u8]) -> Result<Vec<Vec<u8>>, super::FrameFault> {
+            let mut frames = Vec::new();
+            framing.accept(bytes, |frame| {
+                frames.push(frame.to_vec());
+                Ok(())
+            })?;
+            Ok(frames)
+        }
+
         fn framed(frame_type: u64, payload: &[u8]) -> Vec<u8> {
             let mut frame = Vec::new();
             vot_codec::encode_frame(frame_type, payload, &mut frame).unwrap();
@@ -1506,7 +1572,7 @@ pub mod live {
             stream.extend_from_slice(&grease);
             stream.extend_from_slice(&real);
             assert_eq!(
-                framing.accept(&stream).unwrap(),
+                collect(&mut framing, &stream).unwrap(),
                 vec![real.clone()],
                 "only the known frame reaches the application"
             );
@@ -1514,6 +1580,48 @@ pub mod live {
                 !framing.is_assembling(),
                 "the skipped frames were consumed, not left behind"
             );
+        }
+
+        #[test]
+        fn a_coalesced_read_is_handed_over_frame_by_frame() {
+            // MsQuic can deliver one buffer holding many complete frames.
+            // Collecting them before offering any to the bounded queue would
+            // hold the whole read plus a copy of every frame in it, which is
+            // memory the queue's bound never sees.
+            let record = framed(vot_codec::frame_type::DATA_RECORD, &vec![0x6b; 32 * 1024]);
+            let mut read = Vec::new();
+            for _ in 0..64 {
+                read.extend_from_slice(&record);
+            }
+            assert!(read.len() > MAX_CALLBACK_BYTES / 8, "a read worth bounding");
+
+            // accept hands each frame over as it is parsed and cannot return a
+            // collection, so it has no way to accumulate them. What is
+            // observable from outside is what it retains.
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut delivered = 0;
+            framing
+                .accept(&read, |frame| {
+                    assert_eq!(frame, record.as_slice());
+                    delivered += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(delivered, 64, "every frame reached the queue");
+            assert_eq!(
+                framing.buffered(),
+                0,
+                "a read that ends on a frame boundary leaves nothing behind"
+            );
+
+            // A trailing partial frame is the only thing ever retained, and it
+            // is the partial frame alone rather than the read that carried it.
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut ragged = read.clone();
+            ragged.truncate(read.len() - 16);
+            let delivered = collect(&mut framing, &ragged).unwrap();
+            assert_eq!(delivered.len(), 63);
+            assert_eq!(framing.buffered(), record.len() - 16);
         }
 
         #[test]
@@ -1527,7 +1635,7 @@ pub mod live {
             let real = framed(vot_codec::frame_type::DATA_RECORD, b"after");
 
             let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
-            assert!(framing.accept(&optional[..8]).unwrap().is_empty());
+            assert!(collect(&mut framing, &optional[..8]).unwrap().is_empty());
             assert!(framing.is_assembling(), "the frame is still arriving");
             assert!(
                 framing.buffered() < 64,
@@ -1537,11 +1645,11 @@ pub mod live {
 
             // Deliver the rest in pieces, then a real frame right behind it.
             for chunk in optional[8..].chunks(4096) {
-                assert!(framing.accept(chunk).unwrap().is_empty());
+                assert!(collect(&mut framing, chunk).unwrap().is_empty());
                 assert!(framing.buffered() < 64, "still nothing worth holding");
             }
             assert!(!framing.is_assembling(), "the skip finished exactly");
-            assert_eq!(framing.accept(&real).unwrap(), vec![real]);
+            assert_eq!(collect(&mut framing, &real).unwrap(), vec![real]);
         }
 
         #[test]
@@ -1593,10 +1701,10 @@ pub mod live {
 
             let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
             let split = big.len() - 8;
-            assert!(framing.accept(&big[..split]).unwrap().is_empty());
+            assert!(collect(&mut framing, &big[..split]).unwrap().is_empty());
             let mut rest = big[split..].to_vec();
             rest.extend_from_slice(&next);
-            let frames = framing.accept(&rest).unwrap();
+            let frames = collect(&mut framing, &rest).unwrap();
             assert_eq!(frames, vec![big, next]);
         }
 
@@ -1610,7 +1718,7 @@ pub mod live {
                 &vec![0x11; MAX_DATA_RECORD_BYTES * 2],
             );
             assert_eq!(
-                framing.accept(&head[..=MAX_PARTIAL_FRAME]),
+                collect(&mut framing, &head[..=MAX_PARTIAL_FRAME]),
                 Err(super::FrameFault::too_large())
             );
         }
@@ -1629,8 +1737,8 @@ pub mod live {
 
             let mut control = Framing::new(StreamKind::Control);
             let head = frame.len() - 1;
-            assert!(control.accept(&frame[..head]).unwrap().is_empty());
-            assert_eq!(control.accept(&frame[head..]).unwrap(), vec![frame]);
+            assert!(collect(&mut control, &frame[..head]).unwrap().is_empty());
+            assert_eq!(collect(&mut control, &frame[head..]).unwrap(), vec![frame]);
         }
 
         #[test]
@@ -1653,11 +1761,14 @@ pub mod live {
             assert_eq!(fault.error, Error::RecordTooLarge);
             assert_eq!(fault.close, vot_codec::error_code::FRAME_TOO_LARGE);
             assert_eq!(
-                Framing::new(StreamKind::Control).accept(&oversized),
+                collect(&mut Framing::new(StreamKind::Control), &oversized),
                 Err(fault)
             );
             assert_eq!(
-                Framing::new(StreamKind::Reliable { lane: 1 }).accept(&oversized),
+                collect(
+                    &mut Framing::new(StreamKind::Reliable { lane: 1 }),
+                    &oversized
+                ),
                 Err(fault)
             );
         }
@@ -1670,7 +1781,7 @@ pub mod live {
             // transfer waiting on a record the peer stopped sending.
             let frame = framed(vot_codec::frame_type::DATA_RECORD, b"half-sent");
             let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
-            assert!(framing.accept(&frame[..3]).unwrap().is_empty());
+            assert!(collect(&mut framing, &frame[..3]).unwrap().is_empty());
             assert!(framing.is_assembling());
             assert_eq!(
                 super::FrameFault::truncated().close,
@@ -1680,7 +1791,7 @@ pub mod live {
             // A frame that landed whole leaves nothing behind, so a FIN there
             // is an ordinary end of stream.
             let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
-            assert_eq!(framing.accept(&frame).unwrap().len(), 1);
+            assert_eq!(collect(&mut framing, &frame).unwrap().len(), 1);
             assert!(!framing.is_assembling());
         }
 
@@ -1691,9 +1802,11 @@ pub mod live {
             // UNKNOWN_CRITICAL_FRAME.
             let mut unknown_critical = Vec::new();
             vot_codec::encode_frame(0x7fff_ffff, b"payload", &mut unknown_critical).unwrap();
-            let fault = Framing::new(StreamKind::Reliable { lane: 1 })
-                .accept(&unknown_critical)
-                .unwrap_err();
+            let fault = collect(
+                &mut Framing::new(StreamKind::Reliable { lane: 1 }),
+                &unknown_critical,
+            )
+            .unwrap_err();
             assert_eq!(fault.close, vot_codec::error_code::UNKNOWN_CRITICAL_FRAME);
         }
 
@@ -1731,10 +1844,10 @@ pub mod live {
             let mut left = Framing::new(StreamKind::Reliable { lane: 1 });
             let mut right = Framing::new(StreamKind::Reliable { lane: 2 });
 
-            assert!(left.accept(&first[..4]).unwrap().is_empty());
-            assert!(right.accept(&second[..4]).unwrap().is_empty());
-            assert_eq!(right.accept(&second[4..]).unwrap(), vec![second]);
-            assert_eq!(left.accept(&first[4..]).unwrap(), vec![first]);
+            assert!(collect(&mut left, &first[..4]).unwrap().is_empty());
+            assert!(collect(&mut right, &second[..4]).unwrap().is_empty());
+            assert_eq!(collect(&mut right, &second[4..]).unwrap(), vec![second]);
+            assert_eq!(collect(&mut left, &first[4..]).unwrap(), vec![first]);
         }
 
         /// Generates the test certificate exactly once per process.

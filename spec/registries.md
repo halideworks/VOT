@@ -218,6 +218,16 @@ auditor a receipt exists for either cannot check it or becomes able to
 manufacture it. `HMAC_SHA256` remains registered for receipts that never leave
 one trust domain, where the shared key is already common to both sides.
 
-The authenticator covers a domain separator, the two-byte scheme value, and the
-canonical receipt bytes, in that order. Binding the scheme means an
-authenticator produced under one scheme is not valid input for another.
+The authenticator covers a domain separator, the two-byte scheme value, the key
+identifier prefixed by its length in a single byte, and the canonical receipt
+bytes, in that order. The identifier is 1 to 64 bytes, as `receipt.cddl`
+requires, so the prefix always fits.
+
+Binding the scheme means an authenticator produced under one scheme is not valid
+input for another. Binding the key identifier means a verifier may use it to
+tell one issuing context from another. It names the key the issuer claimed to be
+using, and `commit.md` has the verifier check it; left outside the authenticated
+bytes it is a label that any holder of the receipt can rewrite, so a receipt the
+same issuer produced for another purpose could be relabelled without disturbing
+its signature. A witness signature already covers its own key identifier, as a
+field of the statement it signs.

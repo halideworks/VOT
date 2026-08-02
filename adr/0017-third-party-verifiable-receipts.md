@@ -59,6 +59,9 @@ DEPENDENCIES.md.
 Existing HMAC receipts do not verify against this implementation, because the
 signed input now includes the scheme and the key identifier. Both schemes were
 draft and no wire vectors were published, so nothing deployed is invalidated.
+`spec/registries.md` carries the normative definition and was updated with it;
+an implementation that follows the registry and not this crate is the case that
+matters, and it can only interoperate if the two agree.
 
 This ADR covers authentication only. A single signed receipt is still a claim
 about history rather than the history itself: an issuer holding its own key can

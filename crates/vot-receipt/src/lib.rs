@@ -911,6 +911,45 @@ mod tests {
     }
 
     #[test]
+    fn the_authenticated_bytes_match_the_registry() {
+        // spec/registries.md defines this input normatively: domain separator,
+        // two-byte scheme, key identifier behind a one-byte length, canonical
+        // receipt. An independent implementation follows that text, not this
+        // crate, so the two agreeing is the whole of interoperability. Pinned
+        // as bytes rather than described, because a test that rebuilt the input
+        // the same way the code does would agree with any format at all.
+        let input = signing_input(AuthScheme::Ed25519, b"receiver-1", &receipt()).unwrap();
+        let canonical = receipt().canonical_bytes().unwrap();
+
+        assert_eq!(&input[..DOMAIN.len()], b"VOT receipt v0\0");
+        let rest = &input[DOMAIN.len()..];
+        assert_eq!(&rest[..2], &[0x00, 0x01], "ED25519 is scheme 0x0001");
+        assert_eq!(rest[2], 10, "the key identifier is length prefixed");
+        assert_eq!(&rest[3..13], b"receiver-1");
+        assert_eq!(&rest[13..], canonical.as_slice());
+        assert_eq!(input.len(), DOMAIN.len() + 3 + 10 + canonical.len());
+
+        // The MAC scheme differs only in the two scheme bytes.
+        let maced = signing_input(AuthScheme::HmacSha256, b"receiver-1", &receipt()).unwrap();
+        assert_eq!(&maced[DOMAIN.len()..DOMAIN.len() + 2], &[0x00, 0x02]);
+        assert_eq!(&maced[DOMAIN.len() + 2..], &input[DOMAIN.len() + 2..]);
+
+        // A one-byte prefix covers the identifier bounds receipt.cddl sets.
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, &[b'k'; 64], &receipt()).unwrap()[DOMAIN.len() + 2],
+            64
+        );
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, &[b'k'; 65], &receipt()),
+            Err(Error::InvalidKeyId)
+        );
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, b"", &receipt()),
+            Err(Error::InvalidKeyId)
+        );
+    }
+
+    #[test]
     fn authentication_binds_every_receipt_field() {
         let key = [9; 32];
         let authenticated = authenticate_hmac_sha256(receipt(), b"receiver-1", &key).unwrap();

@@ -20,9 +20,15 @@ use crate::{Error, ReliableReceiver};
 /// Bundles held while their records arrive.
 pub const DEFAULT_PENDING_BUNDLES: usize = 8;
 
-/// Record bytes held for bundles that are not complete.
-pub const DEFAULT_PENDING_BUNDLE_BYTES: usize =
-    DEFAULT_PENDING_BUNDLES * vot_transport_api::MAX_DATA_RECORD_BYTES;
+/// The most one incomplete bundle can hold: its own proof, which travels as a
+/// control frame, plus one record.
+///
+/// A byte bound below this would refuse a peer that sent nothing oversized.
+pub const MIN_PENDING_BUNDLE_BYTES: usize =
+    vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + vot_transport_api::MAX_DATA_RECORD_BYTES;
+
+/// Bytes held for bundles that are not complete.
+pub const DEFAULT_PENDING_BUNDLE_BYTES: usize = DEFAULT_PENDING_BUNDLES * MIN_PENDING_BUNDLE_BYTES;
 
 /// A bundle and the records that belong to it, in whichever order they came.
 #[derive(Default)]
@@ -32,12 +38,18 @@ struct Pending {
 }
 
 impl Pending {
-    /// The record bytes this bundle is holding.
+    /// The bytes this bundle is holding, proof and records alike.
     ///
-    /// Summed on demand rather than kept alongside `records`, so the total and
-    /// the records it describes cannot disagree.
+    /// Summed on demand rather than kept alongside the frames, so the total and
+    /// what it describes cannot disagree.
     fn bytes(&self) -> usize {
-        self.records.iter().map(|held| held.encoded.len()).sum()
+        let proof = self.bundle.as_ref().map_or(0, |bundle| bundle.proof.len());
+        proof
+            + self
+                .records
+                .iter()
+                .map(|held| held.encoded.len())
+                .sum::<usize>()
     }
 
     /// Whether every record the bundle declares has arrived.
@@ -82,10 +94,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// Sets how much incomplete bundle state this will hold.
     ///
     /// # Errors
-    /// Rejects a bound that cannot hold one maximum record, which would refuse
-    /// a conforming peer rather than bound it.
+    /// Rejects a bound that cannot hold one whole bundle, which would refuse a
+    /// conforming peer rather than bound it.
     pub fn set_pending_limits(&mut self, bundles: usize, bytes: usize) -> Result<(), Error> {
-        if bundles == 0 || bytes < vot_transport_api::MAX_DATA_RECORD_BYTES {
+        if bundles == 0 || bytes < MIN_PENDING_BUNDLE_BYTES {
             return Err(Error::Staging(
                 vot_transport_api::Error::InvalidConfiguration,
             ));
@@ -203,7 +215,11 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             return Err(Error::UnknownObject);
         }
         let id = bundle.bundle_id;
-        self.reserve(&id, 0)?;
+        // The proof travels as a control frame, so it is bounded per frame by
+        // the negotiated ceiling but nothing bounds the total until it is
+        // charged here alongside the records.
+        let bytes = bundle.proof.len();
+        self.reserve(&id, bytes)?;
         let pending = self.pending.entry(id).or_default();
         if pending.bundle.is_some() {
             // spec/wire.md section 5: request and range identity deduplicate,
@@ -211,6 +227,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             return Err(Error::ProofInvalid);
         }
         pending.bundle = Some(bundle);
+        self.pending_bytes += bytes;
         self.deliver(id)
     }
 
@@ -507,7 +524,9 @@ mod tests {
         let (subject, _bundle, records) = object();
         let mut driver = ready();
         driver.admit(subject).unwrap();
-        driver.set_pending_limits(1, 1 << 20).unwrap();
+        driver
+            .set_pending_limits(1, MIN_PENDING_BUNDLE_BYTES)
+            .unwrap();
 
         driver
             .session_mut()
@@ -534,16 +553,84 @@ mod tests {
     }
 
     #[test]
+    fn a_held_bundle_is_charged_for_its_proof() {
+        // The proof is bounded per frame by the negotiated control ceiling, so
+        // without this the aggregate is that ceiling times the bundle count and
+        // the byte bound reports none of it.
+        let (subject, bundle, records) = object();
+        let proof = bundle.proof.len();
+        assert!(proof > 0);
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bytes(), proof);
+
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::DataRecord(records[0].clone()))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bytes(), proof + records[0].encoded.len());
+    }
+
+    #[test]
+    fn a_delivered_bundle_releases_only_its_own_bytes() {
+        // Release subtracts from a total shared with every other held bundle,
+        // so an over-subtraction here is invisible unless something else is
+        // still holding.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+
+        let mut stray = records[0].clone();
+        stray.bundle_id = [9; 16];
+        let stray_bytes = stray.encoded.len();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::DataRecord(stray))));
+        assert_eq!(driver.poll().unwrap(), None);
+
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+        for record in &records {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        assert_eq!(driver.pending_bundles(), 1, "the stray is still held");
+        assert_eq!(driver.pending_bytes(), stray_bytes);
+    }
+
+    #[test]
     fn the_held_byte_bound_is_exact() {
         // The byte bound is what limits memory. A count alone would let a peer
         // hold a bundle's worth of records under one identifier.
         assert_eq!(
+            MIN_PENDING_BUNDLE_BYTES,
+            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + vot_transport_api::MAX_DATA_RECORD_BYTES
+        );
+        assert_eq!(
             DEFAULT_PENDING_BUNDLE_BYTES,
-            DEFAULT_PENDING_BUNDLES * vot_transport_api::MAX_DATA_RECORD_BYTES
+            DEFAULT_PENDING_BUNDLES * MIN_PENDING_BUNDLE_BYTES
         );
         let (subject, _bundle, records) = object();
         let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
-        let limit = vot_transport_api::MAX_DATA_RECORD_BYTES;
+        let limit = MIN_PENDING_BUNDLE_BYTES;
         let fits = limit / unit;
 
         let mut driver = ready();
@@ -572,7 +659,7 @@ mod tests {
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
         assert_eq!(driver.pending_bytes(), limit, "a refusal holds nothing");
 
-        // The smallest usable bound is one maximum record. One below it would
+        // The smallest usable bound is one whole bundle. One below it would
         // refuse a peer that did nothing wrong.
         let mut limits = ready();
         assert!(limits.set_pending_limits(1, limit).is_ok());

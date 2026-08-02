@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
@@ -47,7 +47,7 @@ jobs:
           - { target: frame_codec, corpus: fuzz/frame_codec/corpus }
           - { target: manifest, corpus: fuzz/manifest/corpus }
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 

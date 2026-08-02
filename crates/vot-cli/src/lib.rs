@@ -854,6 +854,7 @@ fn publication_receipt(
         observed_at: observed_at.to_owned(),
         clock_source: 1,
         flags: 0,
+        previous: None,
     }
 }
 

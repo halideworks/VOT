@@ -50,6 +50,12 @@ pub struct Receipt {
     pub observed_at: String,
     pub clock_source: u8,
     pub flags: u8,
+    /// Envelope digest of the previous observation for this subject.
+    ///
+    /// `None` only for the first observation in a chain. Every later one links
+    /// to its predecessor, so the record cannot be rewritten one entry at a
+    /// time: changing any observation changes every digest after it.
+    pub previous: Option<[u8; 32]>,
 }
 
 /// Registered receipt authentication schemes.
@@ -125,6 +131,14 @@ pub enum Error {
     Authentication,
     /// The envelope names a scheme other than the one the verifier requires.
     UnexpectedScheme,
+    /// A witness signed a different head than the one presented.
+    WitnessHeadMismatch,
+    /// An entry does not link to its predecessor, or the first one links.
+    ChainBroken,
+    /// An entry in the chain is about a different subject.
+    ChainSubjectMismatch,
+    /// A chain with no observations proves nothing.
+    EmptyChain,
     InvalidEncoding,
     TooLarge,
     NonCanonical,
@@ -160,7 +174,9 @@ impl Receipt {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
         self.validate()?;
         let mut output = Vec::with_capacity(160);
-        encode_map(14, &mut output);
+        // Key 17 is optional, so the map length depends on whether this
+        // observation links to a predecessor.
+        encode_map(if self.previous.is_some() { 15 } else { 14 }, &mut output);
         encode_uint(0, &mut output);
         encode_uint(0, &mut output);
         encode_uint(1, &mut output);
@@ -196,6 +212,10 @@ impl Receipt {
         encode_uint(u64::from(self.suite_id), &mut output);
         encode_uint(13, &mut output);
         encode_uint(u64::from(self.flags), &mut output);
+        if let Some(previous) = &self.previous {
+            encode_uint(17, &mut output);
+            encode_bytes(previous, &mut output);
+        }
         Ok(output)
     }
 }
@@ -326,6 +346,151 @@ fn encode_array(length: u64, output: &mut Vec<u8>) {
 
 fn encode_map(length: u64, output: &mut Vec<u8>) {
     encode_head(5, length, output);
+}
+
+/// A witness statement: an independent party recording that it saw a chain head
+/// at its own clock time.
+///
+/// This is what anchors a chain. An issuer signing its own observations can
+/// rewrite and re-sign all of them, and `observed_at` is whatever the issuer
+/// says. A witness signature over the head, timestamped by the witness, means a
+/// later rewrite has to also produce witness signatures the issuer cannot make.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessStatement {
+    /// Envelope digest of the observation being witnessed.
+    pub head: [u8; 32],
+    /// The witness's own observation time, not the issuer's.
+    pub observed_at: String,
+    pub key_id: Vec<u8>,
+}
+
+/// A witness statement with its signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessSignature {
+    pub statement: WitnessStatement,
+    pub scheme: AuthScheme,
+    pub authentication: Vec<u8>,
+}
+
+const WITNESS_DOMAIN: &[u8] = b"VOT witness v0\0";
+
+impl WitnessStatement {
+    /// # Errors
+    /// Rejects an invalid timestamp or key identifier.
+    pub fn validate(&self) -> Result<(), Error> {
+        validate_key_id(&self.key_id)?;
+        if !valid_rfc3339(&self.observed_at) {
+            return Err(Error::InvalidTimestamp);
+        }
+        Ok(())
+    }
+
+    /// Deterministic bytes a witness signature covers.
+    ///
+    /// # Errors
+    /// Propagates validation failures.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.validate()?;
+        let mut output = Vec::with_capacity(WITNESS_DOMAIN.len() + 96);
+        output.extend_from_slice(WITNESS_DOMAIN);
+        encode_map(3, &mut output);
+        encode_uint(0, &mut output);
+        encode_bytes(&self.head, &mut output);
+        encode_uint(1, &mut output);
+        encode_text(&self.observed_at, &mut output);
+        encode_uint(2, &mut output);
+        encode_bytes(&self.key_id, &mut output);
+        Ok(output)
+    }
+}
+
+/// Signs a witness statement.
+///
+/// # Errors
+/// Rejects an invalid statement.
+pub fn witness_ed25519(
+    statement: WitnessStatement,
+    key: &SigningKey,
+) -> Result<WitnessSignature, Error> {
+    let bytes = statement.canonical_bytes()?;
+    let authentication = key.sign(&bytes).to_bytes().to_vec();
+    Ok(WitnessSignature {
+        statement,
+        scheme: AuthScheme::Ed25519,
+        authentication,
+    })
+}
+
+/// Verifies one witness signature over the head it claims.
+///
+/// # Errors
+/// Rejects a statement about a different head, a non-Ed25519 witness, or a
+/// signature that does not verify.
+pub fn verify_witness(
+    signature: &WitnessSignature,
+    head: &[u8; 32],
+    key: &VerifyingKey,
+) -> Result<(), Error> {
+    if signature.statement.head != *head {
+        return Err(Error::WitnessHeadMismatch);
+    }
+    if signature.scheme != AuthScheme::Ed25519 {
+        // A witness a relying party cannot check without also being able to
+        // forge is not a witness.
+        return Err(Error::UnexpectedScheme);
+    }
+    let bytes: [u8; 64] = signature
+        .authentication
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Authentication)?;
+    key.verify_strict(
+        &signature.statement.canonical_bytes()?,
+        &Signature::from_bytes(&bytes),
+    )
+    .map_err(|_| Error::Authentication)
+}
+
+/// Checks that a sequence of observations forms one unbroken chain.
+///
+/// Each entry must link to its predecessor's envelope digest, carry the same
+/// subject, and advance the issuer sequence. The first entry must not link.
+///
+/// # Errors
+/// Reports the first structural break.
+pub fn verify_chain(chain: &[AuthenticatedReceipt]) -> Result<(), Error> {
+    let Some(first) = chain.first() else {
+        return Err(Error::EmptyChain);
+    };
+    if first.receipt.previous.is_some() {
+        return Err(Error::ChainBroken);
+    }
+    let subject = (
+        first.receipt.subject_kind,
+        first.receipt.subject_digest,
+        first.receipt.subject_length,
+    );
+    let mut previous_digest = first.digest()?;
+    let mut previous_sequence = first.receipt.sequence;
+    for entry in chain.iter().skip(1) {
+        if entry.receipt.previous != Some(previous_digest) {
+            return Err(Error::ChainBroken);
+        }
+        if (
+            entry.receipt.subject_kind,
+            entry.receipt.subject_digest,
+            entry.receipt.subject_length,
+        ) != subject
+        {
+            return Err(Error::ChainSubjectMismatch);
+        }
+        if entry.receipt.sequence <= previous_sequence {
+            return Err(Error::InvalidSequence);
+        }
+        previous_digest = entry.digest()?;
+        previous_sequence = entry.receipt.sequence;
+    }
+    Ok(())
 }
 
 /// Bytes an authenticator covers: domain, scheme, then the canonical receipt.
@@ -489,7 +654,11 @@ pub fn decode_authenticated(input: &[u8]) -> Result<AuthenticatedReceipt, Error>
 }
 
 fn decode_receipt(decoder: &mut Decoder<'_>) -> Result<Receipt, Error> {
-    decoder.exact_map(14)?;
+    // Fourteen keys, or fifteen when the observation links to a predecessor.
+    let entries = decoder.head(5)?;
+    if entries != 14 && entries != 15 {
+        return Err(Error::InvalidEncoding);
+    }
     decoder.exact_key(0)?;
     if decoder.uint()? != 0 {
         return Err(Error::InvalidEncoding);
@@ -536,6 +705,12 @@ fn decode_receipt(decoder: &mut Decoder<'_>) -> Result<Receipt, Error> {
     }
     decoder.exact_key(13)?;
     let flags = decoder.u8()?;
+    let previous = if entries == 15 {
+        decoder.exact_key(17)?;
+        Some(decoder.fixed_bytes::<32>()?)
+    } else {
+        None
+    };
     let receipt = Receipt {
         subject_kind,
         suite_id,
@@ -552,6 +727,7 @@ fn decode_receipt(decoder: &mut Decoder<'_>) -> Result<Receipt, Error> {
         observed_at,
         clock_source,
         flags,
+        previous,
     };
     receipt.validate()?;
     Ok(receipt)
@@ -717,6 +893,7 @@ mod tests {
             observed_at: "2026-07-31T16:00:00Z".to_owned(),
             clock_source: 1,
             flags: 0,
+            previous: None,
         }
     }
 
@@ -906,8 +1083,231 @@ mod tests {
         }
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+    }
+
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])
+    }
+
+    /// Builds a signed chain: each observation links to the previous envelope.
+    fn chain(key: &SigningKey, levels: &[AssuranceLevel]) -> Vec<AuthenticatedReceipt> {
+        let mut chain: Vec<AuthenticatedReceipt> = Vec::new();
+        for (index, level) in levels.iter().enumerate() {
+            let mut entry = receipt();
+            entry.assurance = *level;
+            entry.sequence = index as u64 + 1;
+            entry.previous = chain.last().map(|last| last.digest().unwrap());
+            chain.push(sign_ed25519(entry, b"issuer-1", key).unwrap());
+        }
+        chain
+    }
+
+    #[test]
+    fn a_chain_links_every_observation_to_its_predecessor() {
+        let key = signing_key();
+        let signed = chain(
+            &key,
+            &[
+                AssuranceLevel::Admitted,
+                AssuranceLevel::TransitVerified,
+                AssuranceLevel::Durable,
+                AssuranceLevel::AtRestVerified,
+                AssuranceLevel::Published,
+            ],
+        );
+        verify_chain(&signed).unwrap();
+        for entry in &signed {
+            verify_ed25519(entry, &key.verifying_key()).unwrap();
+        }
+        assert!(signed[0].receipt.previous.is_none());
+        assert_eq!(
+            signed[4].receipt.previous,
+            Some(signed[3].digest().unwrap())
+        );
+    }
+
+    #[test]
+    fn rewriting_one_observation_breaks_every_link_after_it() {
+        // This is what the chain buys: a middle entry cannot be replaced
+        // without also reissuing everything downstream.
+        let key = signing_key();
+        let mut signed = chain(
+            &key,
+            &[
+                AssuranceLevel::Admitted,
+                AssuranceLevel::TransitVerified,
+                AssuranceLevel::Durable,
+            ],
+        );
+        let mut rewritten = signed[1].receipt.clone();
+        rewritten.observed_at = "2031-01-01T00:00:00Z".to_owned();
+        signed[1] = sign_ed25519(rewritten, b"issuer-1", &key).unwrap();
+        // Re-signed and individually valid, but the chain no longer joins.
+        verify_ed25519(&signed[1], &key.verifying_key()).unwrap();
+        assert_eq!(verify_chain(&signed), Err(Error::ChainBroken));
+    }
+
+    #[test]
+    fn a_chain_rejects_every_structural_break() {
+        let key = signing_key();
+        assert_eq!(verify_chain(&[]), Err(Error::EmptyChain));
+
+        // A first entry that claims a predecessor.
+        let mut genesis = receipt();
+        genesis.previous = Some([9; 32]);
+        let orphan = sign_ed25519(genesis, b"issuer-1", &key).unwrap();
+        assert_eq!(verify_chain(&[orphan]), Err(Error::ChainBroken));
+
+        let signed = chain(&key, &[AssuranceLevel::Admitted, AssuranceLevel::Durable]);
+        verify_chain(&signed).unwrap();
+
+        // An entry about a different subject.
+        let mut foreign = signed[1].receipt.clone();
+        foreign.subject_digest = [0xfe; 32];
+        let foreign = sign_ed25519(foreign, b"issuer-1", &key).unwrap();
+        assert_eq!(
+            verify_chain(&[signed[0].clone(), foreign]),
+            Err(Error::ChainSubjectMismatch)
+        );
+
+        // A sequence that does not advance.
+        let mut stalled = signed[1].receipt.clone();
+        stalled.sequence = signed[0].receipt.sequence;
+        let stalled = sign_ed25519(stalled, b"issuer-1", &key).unwrap();
+        assert_eq!(
+            verify_chain(&[signed[0].clone(), stalled]),
+            Err(Error::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn witness_bytes_are_pinned_and_cover_every_field() {
+        // Signing and verifying with the same function proves nothing about
+        // what is signed, so the encoding is pinned directly.
+        let statement = WitnessStatement {
+            head: [0xab; 32],
+            observed_at: "2026-08-02T04:00:00Z".to_owned(),
+            key_id: b"witness-a".to_vec(),
+        };
+        let bytes = statement.canonical_bytes().unwrap();
+        assert_eq!(
+            hex(&bytes),
+            "564f54207769746e65737320763000a3005820abababababababababababababababababababababababababababababababab0174323032362d30382d30325430343a30303a30305a02497769746e6573732d61"
+        );
+
+        // Every field is inside those bytes.
+        for changed in [
+            WitnessStatement {
+                head: [0xac; 32],
+                ..statement.clone()
+            },
+            WitnessStatement {
+                observed_at: "2026-08-02T04:00:01Z".to_owned(),
+                ..statement.clone()
+            },
+            WitnessStatement {
+                key_id: b"witness-b".to_vec(),
+                ..statement.clone()
+            },
+        ] {
+            assert_ne!(changed.canonical_bytes().unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn a_witness_anchors_the_head_at_its_own_time() {
+        let issuer = signing_key();
+        let witness = SigningKey::from_bytes(&[11; 32]);
+        let signed = chain(
+            &issuer,
+            &[AssuranceLevel::Admitted, AssuranceLevel::Durable],
+        );
+        let head = signed.last().unwrap().digest().unwrap();
+
+        let statement = WitnessStatement {
+            head,
+            observed_at: "2026-08-02T04:00:00Z".to_owned(),
+            key_id: b"witness-a".to_vec(),
+        };
+        let attested = witness_ed25519(statement, &witness).unwrap();
+        verify_witness(&attested, &head, &witness.verifying_key()).unwrap();
+
+        // A witness signature does not carry over to another head.
+        let other = signed[0].digest().unwrap();
+        assert_eq!(
+            verify_witness(&attested, &other, &witness.verifying_key()),
+            Err(Error::WitnessHeadMismatch)
+        );
+
+        // Nor to another witness key.
+        let impostor = SigningKey::from_bytes(&[12; 32]);
+        assert_eq!(
+            verify_witness(&attested, &head, &impostor.verifying_key()),
+            Err(Error::Authentication)
+        );
+    }
+
+    #[test]
+    fn a_witness_statement_is_rejected_when_malformed_or_symmetric() {
+        let witness = SigningKey::from_bytes(&[11; 32]);
+        let head = [3; 32];
+        let good = WitnessStatement {
+            head,
+            observed_at: "2026-08-02T04:00:00Z".to_owned(),
+            key_id: b"witness-a".to_vec(),
+        };
+        assert!(good.canonical_bytes().is_ok());
+
+        for broken in [
+            WitnessStatement {
+                key_id: Vec::new(),
+                ..good.clone()
+            },
+            WitnessStatement {
+                key_id: vec![1; 65],
+                ..good.clone()
+            },
+            WitnessStatement {
+                observed_at: "not a time".to_owned(),
+                ..good.clone()
+            },
+        ] {
+            assert!(broken.validate().is_err());
+        }
+
+        // A symmetric witness would be checkable only by someone able to forge
+        // it, which defeats the point of a witness.
+        let mut symmetric = witness_ed25519(good, &witness).unwrap();
+        symmetric.scheme = AuthScheme::HmacSha256;
+        assert_eq!(
+            verify_witness(&symmetric, &head, &witness.verifying_key()),
+            Err(Error::UnexpectedScheme)
+        );
+    }
+
+    #[test]
+    fn the_chain_link_survives_the_envelope_round_trip() {
+        let key = signing_key();
+        let signed = chain(&key, &[AssuranceLevel::Admitted, AssuranceLevel::Durable]);
+        for entry in &signed {
+            let decoded = decode_authenticated(&encode_authenticated(entry).unwrap()).unwrap();
+            assert_eq!(&decoded, entry);
+        }
+        // The linked form encodes one more map entry than the genesis form.
+        let genesis = encode_authenticated(&signed[0]).unwrap();
+        let linked = encode_authenticated(&signed[1]).unwrap();
+        assert!(linked.len() > genesis.len());
+        verify_chain(&[
+            decode_authenticated(&genesis).unwrap(),
+            decode_authenticated(&linked).unwrap(),
+        ])
+        .unwrap();
     }
 
     #[test]

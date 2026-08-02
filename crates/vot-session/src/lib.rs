@@ -643,6 +643,14 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     fn poll_inner(&mut self) -> Result<Option<Event>, Error> {
+        if self.negotiation.state() == State::Closed {
+            // The session is over. Frames still arriving on a closing carrier
+            // are not worth interpreting, and interpreting them would report
+            // the second thing that went wrong rather than the first: a peer
+            // whose HELLO was refused would show up as an application frame
+            // before negotiation on the next call.
+            return Ok(self.drain_lifecycle());
+        }
         if self.negotiation.is_ready()
             && let Some(event) = self.take_pending()
         {
@@ -771,6 +779,20 @@ impl<A: TransportAdapter> Session<A> {
         self.pending_bytes = next;
         self.pending.push_back(record);
         Ok(())
+    }
+
+    /// Returns the next carrier event a closed session still owes its caller.
+    ///
+    /// Lifecycle only: the caller has to learn the carrier ended, and nothing
+    /// else on a closed session means anything.
+    fn drain_lifecycle(&mut self) -> Option<Event> {
+        while let Some(event) = self.adapter.poll() {
+            match event {
+                Event::Control(_) | Event::Reliable { .. } => {}
+                lifecycle => return Some(lifecycle),
+            }
+        }
+        None
     }
 
     fn take_pending(&mut self) -> Option<Event> {
@@ -1559,6 +1581,57 @@ mod tests {
         let mut silent = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
         silent.begin().unwrap();
         assert_eq!(silent.adapter().sent.len(), 2);
+    }
+
+    #[test]
+    fn a_closed_session_stops_interpreting_and_still_reports_the_carrier() {
+        // Polling a failed session again used to report whatever the next frame
+        // looked like against a closed state, which named the second thing that
+        // went wrong rather than the first.
+        let mut server = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
+        server.begin().unwrap();
+        let mut older = Vec::new();
+        vot_codec::encode_hello(
+            &Hello {
+                draft_revision: vot_codec::DRAFT_REVISION - 1,
+                endpoint_role: EndpointRole::Client,
+                extensions: BTreeSet::new(),
+            },
+            &mut older,
+        )
+        .unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::HELLO, &older, &mut frame).unwrap();
+        server.adapter.events.push_back(control(&frame));
+        assert_eq!(
+            server.poll().unwrap_err().close_code(),
+            error_code::UNSUPPORTED_VERSION
+        );
+        assert_eq!(server.state(), State::Closed);
+        assert_eq!(
+            server.adapter().closed,
+            vec![error_code::UNSUPPORTED_VERSION],
+            "closed once, under the first cause"
+        );
+
+        // Anything still on the carrier is dropped rather than reinterpreted.
+        server.adapter.events.push_back(control(&frame));
+        server.adapter.events.push_back(record(1, b"late"));
+        server
+            .adapter
+            .events
+            .push_back(Event::Disconnected(vot_transport_api::ConnectionId(1)));
+        assert_eq!(
+            server.poll().unwrap(),
+            Some(Event::Disconnected(vot_transport_api::ConnectionId(1))),
+            "the caller still has to learn the carrier ended"
+        );
+        assert_eq!(server.poll().unwrap(), None);
+        assert_eq!(
+            server.adapter().closed,
+            vec![error_code::UNSUPPORTED_VERSION],
+            "and the carrier is not closed a second time"
+        );
     }
 
     #[test]

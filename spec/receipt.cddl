@@ -26,6 +26,22 @@ receipt = {
   ? 14: uint,                   ; delegated mechanism registry value
   ? 15: uint,                   ; unsupported feature registry value
   ? 16: uint,                   ; experimental extension identifier
+  ? 17: bstr .size 32,          ; envelope digest of the previous observation
+}
+
+; A witness records that it saw a chain head at its own clock time. An issuer
+; signing its own observations can rewrite and re-sign all of them, so a chain
+; is anchored only by signatures the issuer cannot produce.
+witness-statement = {
+  0: bstr .size 32,             ; witnessed envelope digest
+  1: tstr .size (20..35),       ; witness observation time, not the issuer's
+  2: bstr .size (1..64),        ; witness key identifier
+}
+
+witness-signature = {
+  0: witness-statement,
+  1: 1,                         ; ED25519 only; a symmetric witness is not one
+  2: bstr .size 64,
 }
 
 subject-id = [

@@ -72,6 +72,10 @@ Wave 6 runtime dependencies:
   was accepted deliberately: a receipt that cannot be checked without the power
   to forge it is not evidence. See ADR-0017.
 
+`base64` 0.22.1 becomes a default dependency rather than an S3-only one, for
+the signed note format in `vot-log`. It is already pinned exactly and its
+licence is accepted.
+
 Test-only dependencies:
 
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz

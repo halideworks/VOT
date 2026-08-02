@@ -56,8 +56,19 @@ jobs:
         # coverage-guided gate cannot use the pinned stable toolchain.
         run: rustup toolchain install nightly-2026-07-15 --profile minimal
 
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-nightly-2026-07-15-cargo-fuzz-0.13.2
+
       - name: Install pinned cargo-fuzz
-        run: cargo +nightly-2026-07-15 install --locked cargo-fuzz --version 0.13.2
+        run: >-
+          cargo +nightly-2026-07-15 install --locked cargo-fuzz --version 0.13.2
+          || cargo +nightly-2026-07-15 install --locked --force cargo-fuzz --version 0.13.2
 
       - name: Run coverage-guided fuzzing
         env:

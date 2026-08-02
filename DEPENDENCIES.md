@@ -54,6 +54,12 @@ Wave 5 runtime dependencies:
   feature, uses `rustix` instead of direct libc calls on Unix, and is licensed
   under Apache-2.0 or MIT.
 
+CI actions, all pinned to a released tag: `actions/checkout` 4.3.1,
+`actions/setup-python` 6.2.0, `actions/upload-artifact` 4.6.2, and
+`actions/cache` 6.1.0. The cache action holds no VOT source or result; it
+carries the pinned tool binaries and the build directory, both keyed so a
+version or lockfile change misses rather than reuses.
+
 Test-only dependencies:
 
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz

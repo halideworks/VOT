@@ -24,10 +24,37 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
 
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-deny-0.20.2-cargo-audit-0.22.1
+
+      # This job builds, lints, tests, and runs the workspace, so the registry
+      # and the build directory are worth keeping between runs. The key follows
+      # the lockfile; a dependency change misses and rebuilds.
+      - name: Restore cargo registry and build directory
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: validate-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: validate-1.88.0-
+
       - name: Check dependency policy and advisories
         run: |
-          cargo +1.88.0 install --locked cargo-deny --version 0.20.2
-          cargo +1.88.0 install --locked cargo-audit --version 0.22.1
+          # Fall back to a rebuild if a restored binary lost its metadata.
+          cargo +1.88.0 install --locked cargo-deny --version 0.20.2 \
+            || cargo +1.88.0 install --locked --force cargo-deny --version 0.20.2
+          cargo +1.88.0 install --locked cargo-audit --version 0.22.1 \
+            || cargo +1.88.0 install --locked --force cargo-audit --version 0.22.1
           # The policy tools read the committed lockfile; neither subcommand needs a global --locked flag.
           cargo deny check
           # cargo-audit reads the committed lockfile and has no --locked flag.
@@ -315,8 +342,25 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
+      # Every package in the matrix was building cargo-mutants from source, so
+      # one CI run compiled the same tool twenty-three times. The key holds the
+      # pinned version, so a version bump misses and rebuilds once.
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-mutants-26.0.0
+
       - name: Install pinned cargo-mutants
-        run: cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+        # A restored binary whose metadata did not come with it makes a plain
+        # install fail rather than skip, so fall back to rebuilding instead of
+        # wedging on a bad cache entry.
+        run: >-
+          cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+          || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
       - name: Test mutants
         continue-on-error: ${{ !matrix.required }}

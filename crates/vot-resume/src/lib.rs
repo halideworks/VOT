@@ -9,6 +9,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use vot_transport_api::{PathStats, SubjectId};
+
+pub mod units;
+pub use units::UnitRanges;
 use vot_transport_tcp::Carrier;
 
 const MAGIC: &[u8; 8] = b"VOTRES02";
@@ -54,7 +57,7 @@ impl From<io::Error> for Error {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StoredObject {
     total_units: u64,
-    checkpointed: BTreeSet<u64>,
+    checkpointed: UnitRanges,
 }
 
 /// Checksummed append-only state keyed by immutable object identity, never connection ID.
@@ -83,7 +86,7 @@ impl ResumeStore {
     }
 
     #[must_use]
-    pub fn checkpointed(&self, subject: SubjectId) -> Option<&BTreeSet<u64>> {
+    pub fn checkpointed(&self, subject: SubjectId) -> Option<&UnitRanges> {
         self.objects
             .get(&subject)
             .map(|object| &object.checkpointed)
@@ -113,7 +116,7 @@ impl ResumeStore {
                     subject,
                     StoredObject {
                         total_units,
-                        checkpointed: BTreeSet::new(),
+                        checkpointed: UnitRanges::new(),
                     },
                 );
                 changed = true;
@@ -133,7 +136,7 @@ impl ResumeStore {
         &mut self,
         subject: SubjectId,
         total_units: u64,
-    ) -> Result<BTreeSet<u64>, Error> {
+    ) -> Result<UnitRanges, Error> {
         validate_total_units(total_units)?;
         let lock = lock_store(&self.path)?;
         self.refresh_locked()?;
@@ -145,7 +148,7 @@ impl ResumeStore {
         } else {
             let object = StoredObject {
                 total_units,
-                checkpointed: BTreeSet::new(),
+                checkpointed: UnitRanges::new(),
             };
             let current_length = file_len(&self.path)?;
             let mut candidate = self.objects.clone();
@@ -157,7 +160,7 @@ impl ResumeStore {
                 append_record(&self.path, &encode_reserve(subject, total_units)?)?;
             }
             self.objects = candidate;
-            BTreeSet::new()
+            UnitRanges::new()
         };
         self.signature = file_signature(&self.path)?;
         drop(lock);
@@ -168,10 +171,13 @@ impl ResumeStore {
         &mut self,
         subject: SubjectId,
         total_units: u64,
-        checkpointed: BTreeSet<u64>,
-    ) -> Result<BTreeSet<u64>, Error> {
+        checkpointed: &UnitRanges,
+    ) -> Result<UnitRanges, Error> {
         validate_total_units(total_units)?;
-        if checkpointed.iter().any(|unit| *unit >= total_units) {
+        if checkpointed
+            .max()
+            .is_some_and(|highest| highest >= total_units)
+        {
             return Err(Error::InvalidUnit);
         }
         let lock = lock_store(&self.path)?;
@@ -183,7 +189,7 @@ impl ResumeStore {
         }
         let previous = existing.checkpointed.clone();
         let mut merged = previous.clone();
-        merged.extend(checkpointed);
+        merged.union(checkpointed);
         candidate.insert(
             subject,
             StoredObject {
@@ -253,7 +259,7 @@ pub struct ResumeTracker {
     subject: SubjectId,
     total_units: u64,
     checkpoint_window: usize,
-    checkpointed: BTreeSet<u64>,
+    checkpointed: UnitRanges,
     completed_since_checkpoint: BTreeSet<u64>,
     active: BTreeSet<u64>,
 }
@@ -280,7 +286,7 @@ impl ResumeTracker {
 
     pub fn begin_unit(&mut self, unit: u64) -> Result<bool, Error> {
         self.validate_unit(unit)?;
-        if self.checkpointed.contains(&unit) || self.completed_since_checkpoint.contains(&unit) {
+        if self.checkpointed.contains(unit) || self.completed_since_checkpoint.contains(&unit) {
             return Ok(false);
         }
         if !self.active.insert(unit) {
@@ -304,9 +310,14 @@ impl ResumeTracker {
     }
 
     pub fn checkpoint(&mut self, store: &mut ResumeStore) -> Result<(), Error> {
+        // Build the pending units as their own runs first, then merge the two
+        // lists in one pass. Inserting them one at a time into a set that
+        // already holds millions of runs would shift the vector per unit.
+        let mut pending = UnitRanges::new();
+        pending.extend_units(self.completed_since_checkpoint.iter().copied());
         let mut checkpointed = self.checkpointed.clone();
-        checkpointed.extend(&self.completed_since_checkpoint);
-        let checkpointed = store.save_object(self.subject, self.total_units, checkpointed)?;
+        checkpointed.union(&pending);
+        let checkpointed = store.save_object(self.subject, self.total_units, &checkpointed)?;
         self.checkpointed = checkpointed;
         self.completed_since_checkpoint.clear();
         Ok(())
@@ -324,15 +335,11 @@ impl ResumeTracker {
 
     #[must_use]
     pub fn is_checkpointed(&self, unit: u64) -> bool {
-        self.checkpointed.contains(&unit)
+        self.checkpointed.contains(unit)
     }
 
     pub fn missing_units(&self) -> impl Iterator<Item = u64> + '_ {
-        MissingUnits {
-            total_units: self.total_units,
-            next: 0,
-            checkpointed: self.checkpointed.iter().peekable(),
-        }
+        self.checkpointed.missing(self.total_units)
     }
 
     fn validate_unit(&self, unit: u64) -> Result<(), Error> {
@@ -340,35 +347,6 @@ impl ResumeTracker {
             Err(Error::InvalidUnit)
         } else {
             Ok(())
-        }
-    }
-}
-struct MissingUnits<'a> {
-    total_units: u64,
-    next: u64,
-    checkpointed: std::iter::Peekable<std::collections::btree_set::Iter<'a, u64>>,
-}
-
-impl Iterator for MissingUnits<'_> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.next >= self.total_units {
-                return None;
-            }
-            if self
-                .checkpointed
-                .peek()
-                .is_some_and(|unit| **unit == self.next)
-            {
-                self.checkpointed.next();
-                self.next = self.next.saturating_add(1);
-                continue;
-            }
-            let missing = self.next;
-            self.next = self.next.saturating_add(1);
-            return Some(missing);
         }
     }
 }
@@ -734,12 +712,15 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
     if decoder.take(MAGIC.len())? != MAGIC {
         return Err(Error::Corrupt);
     }
-    let mut objects = BTreeMap::new();
+    // Replay accumulates raw runs and normalises once at the end. Merging into
+    // a UnitRanges per record would copy every run replayed so far, and a valid
+    // log can hold hundreds of thousands of checkpoint records.
+    let mut objects: BTreeMap<SubjectId, ReplayObject> = BTreeMap::new();
     while !decoder.is_empty() {
         let record_start = bytes.len().saturating_sub(decoder.remaining.len());
         if decoder.remaining.len() < RECORD_HEADER_BYTES as usize {
             truncate_torn_tail(path, record_start)?;
-            return Ok(objects);
+            return settle(objects);
         }
         let record_length = usize::try_from(decoder.u32()?).map_err(|_| Error::Corrupt)?;
         if !record_length_valid(record_length) {
@@ -750,7 +731,7 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
             .ok_or(Error::Corrupt)?;
         if decoder.remaining.len() < required {
             truncate_torn_tail(path, record_start)?;
-            return Ok(objects);
+            return settle(objects);
         }
         let record = decoder.take(record_length)?;
         let checksum = decoder.take(RECORD_CHECKSUM_BYTES as usize)?;
@@ -760,7 +741,32 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
         }
         apply_record(record, &mut objects)?;
     }
-    Ok(objects)
+    settle(objects)
+}
+
+/// Runs for one object as replay found them: unordered, possibly overlapping.
+struct ReplayObject {
+    total_units: u64,
+    runs: Vec<(u64, u64)>,
+}
+
+/// Normalises every replayed object once the log has been read.
+fn settle(
+    objects: BTreeMap<SubjectId, ReplayObject>,
+) -> Result<BTreeMap<SubjectId, StoredObject>, Error> {
+    objects
+        .into_iter()
+        .map(|(subject, object)| {
+            let checkpointed = UnitRanges::from_runs(object.runs).map_err(|_| Error::Corrupt)?;
+            Ok((
+                subject,
+                StoredObject {
+                    total_units: object.total_units,
+                    checkpointed,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn truncate_torn_tail(path: &Path, valid_length: usize) -> Result<(), Error> {
@@ -788,7 +794,7 @@ fn encode_reserve(subject: SubjectId, total_units: u64) -> Result<Vec<u8>, Error
 fn encode_checkpoint(
     subject: SubjectId,
     total_units: u64,
-    units: &BTreeSet<u64>,
+    units: &UnitRanges,
 ) -> Result<Vec<u8>, Error> {
     validate_total_units(total_units)?;
     let mut output = Vec::new();
@@ -805,37 +811,18 @@ fn encode_subject(subject: &SubjectId, output: &mut Vec<u8>) {
     output.extend_from_slice(&subject.length.to_be_bytes());
 }
 
-fn encode_ranges(units: &BTreeSet<u64>, output: &mut Vec<u8>) {
-    let mut range_count = 0_u64;
-    let mut previous: Option<u64> = None;
-    for unit in units {
-        if previous.is_none_or(|last| *unit != last.saturating_add(1)) {
-            range_count = range_count.saturating_add(1);
-        }
-        previous = Some(*unit);
+fn encode_ranges(units: &UnitRanges, output: &mut Vec<u8>) {
+    // The set is already run-length in memory, so encoding is a copy rather
+    // than a scan that rediscovers the runs.
+    encode_uvarint(u64::try_from(units.run_count()).unwrap_or(u64::MAX), output);
+    for (start, length) in units.runs() {
+        encode_uvarint(start, output);
+        encode_uvarint(length, output);
     }
-    encode_uvarint(range_count, output);
-    let Some(first) = units.first().copied() else {
-        return;
-    };
-    let mut start = first;
-    let mut last = first;
-    for unit in units.iter().copied().skip(1) {
-        if unit == last.saturating_add(1) {
-            last = unit;
-        } else {
-            encode_uvarint(start, output);
-            encode_uvarint(last - start + 1, output);
-            start = unit;
-            last = unit;
-        }
-    }
-    encode_uvarint(start, output);
-    encode_uvarint(last - start + 1, output);
 }
 
-fn difference(merged: &BTreeSet<u64>, previous: &BTreeSet<u64>) -> BTreeSet<u64> {
-    merged.difference(previous).copied().collect()
+fn difference(merged: &UnitRanges, previous: &UnitRanges) -> UnitRanges {
+    merged.difference(previous)
 }
 
 fn encode_uvarint(mut value: u64, output: &mut Vec<u8>) {
@@ -911,7 +898,7 @@ fn append_fits(current_length: u64, header_length: u64, record_length: u64) -> b
 
 fn apply_record(
     record: &[u8],
-    objects: &mut BTreeMap<SubjectId, StoredObject>,
+    objects: &mut BTreeMap<SubjectId, ReplayObject>,
 ) -> Result<(), Error> {
     let mut decoder = Decoder::new(record);
     let kind = decoder.take(1)?.first().copied().ok_or(Error::Corrupt)?;
@@ -930,9 +917,9 @@ fn apply_record(
             } else {
                 objects.insert(
                     subject,
-                    StoredObject {
+                    ReplayObject {
                         total_units,
-                        checkpointed: BTreeSet::new(),
+                        runs: Vec::new(),
                     },
                 );
             }
@@ -941,8 +928,7 @@ fn apply_record(
             let subject = decode_subject(&mut decoder)?;
             let total_units = decoder.uvar()?;
             validate_total_units(total_units)?;
-            let mut delta = BTreeSet::new();
-            decode_ranges(&mut decoder, total_units, &mut delta)?;
+            let delta = decode_run_list(&mut decoder, total_units)?;
             if !decoder.is_empty() {
                 return Err(Error::Corrupt);
             }
@@ -952,7 +938,8 @@ fn apply_record(
             if object.total_units != total_units {
                 return Err(Error::Corrupt);
             }
-            object.checkpointed.extend(delta);
+            // Append only. The whole log is normalised once at the end.
+            object.runs.extend(delta);
         }
         SNAPSHOT_RECORD => {
             let count = decoder.uvar()?;
@@ -961,16 +948,9 @@ fn apply_record(
                 let subject = decode_subject(&mut decoder)?;
                 let total_units = decoder.uvar()?;
                 validate_total_units(total_units)?;
-                let mut checkpointed = BTreeSet::new();
-                decode_ranges(&mut decoder, total_units, &mut checkpointed)?;
+                let runs = decode_run_list(&mut decoder, total_units)?;
                 if snapshot
-                    .insert(
-                        subject,
-                        StoredObject {
-                            total_units,
-                            checkpointed,
-                        },
-                    )
+                    .insert(subject, ReplayObject { total_units, runs })
                     .is_some()
                 {
                     return Err(Error::Corrupt);
@@ -994,12 +974,21 @@ fn decode_subject(decoder: &mut Decoder<'_>) -> Result<SubjectId, Error> {
     })
 }
 
-fn decode_ranges(
-    decoder: &mut Decoder<'_>,
-    total_units: u64,
-    output: &mut BTreeSet<u64>,
-) -> Result<(), Error> {
+#[cfg(test)]
+fn decode_ranges(decoder: &mut Decoder<'_>, total_units: u64) -> Result<UnitRanges, Error> {
+    UnitRanges::from_runs(decode_run_list(decoder, total_units)?).map_err(|_| Error::Corrupt)
+}
+
+fn decode_run_list(decoder: &mut Decoder<'_>, total_units: u64) -> Result<Vec<(u64, u64)>, Error> {
     let count = decoder.uvar()?;
+    // Runs are separated by at least one absent unit, so an object of n units
+    // holds at most ceil(n / 2) of them. Checking that before allocating means
+    // a corrupt record cannot ask for a reservation the object could never
+    // justify.
+    if count > total_units.div_ceil(2) {
+        return Err(Error::Corrupt);
+    }
+    let mut runs = Vec::with_capacity(usize::try_from(count).map_err(|_| Error::Corrupt)?);
     let mut previous_end = 0_u64;
     for _ in 0..count {
         let start = decoder.uvar()?;
@@ -1011,12 +1000,12 @@ fn decode_ranges(
         if end > total_units {
             return Err(Error::Corrupt);
         }
-        for unit in start..end {
-            output.insert(unit);
-        }
+        // Runs stay run-length all the way in. Expanding them here was one
+        // entry per 64 KiB of every object in the store.
+        runs.push((start, length));
         previous_end = end;
     }
-    Ok(())
+    Ok(runs)
 }
 
 fn read_bounded_store(path: &Path, maximum: u64) -> Result<Vec<u8>, Error> {
@@ -1165,6 +1154,13 @@ mod tests {
         }
     }
 
+    /// Builds a checkpoint set from individual units, as the tests think of them.
+    fn units(units: impl IntoIterator<Item = u64>) -> UnitRanges {
+        let mut set = UnitRanges::new();
+        set.extend_units(units);
+        set
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "vot-resume-{name}-{}-{}",
@@ -1188,7 +1184,7 @@ mod tests {
         tracker.complete_unit(0).unwrap();
         tracker.checkpoint(&mut store).unwrap();
         let mut reopened = ResumeStore::open(&path).unwrap();
-        assert!(reopened.checkpointed(subject(1)).unwrap().contains(&0));
+        assert!(reopened.checkpointed(subject(1)).unwrap().contains(0));
         assert!(reopened.checkpointed(subject(9)).is_none());
         assert!(matches!(
             ResumeTracker::discover(&mut reopened, subject(1), 11, 3),
@@ -1326,10 +1322,7 @@ mod tests {
         assert!(tracker.complete_unit(1).unwrap());
         tracker.checkpoint(&mut store).unwrap();
         let reopened = ResumeStore::open(&path).unwrap();
-        assert_eq!(
-            reopened.checkpointed(subject(8)).unwrap(),
-            &BTreeSet::from([0, 1])
-        );
+        assert_eq!(reopened.checkpointed(subject(8)).unwrap(), &units([0, 1]));
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
@@ -1350,10 +1343,7 @@ mod tests {
         second.checkpoint(&mut second_store).unwrap();
 
         let reopened = ResumeStore::open(&path).unwrap();
-        assert_eq!(
-            reopened.checkpointed(subject(9)).unwrap(),
-            &BTreeSet::from([0, 1])
-        );
+        assert_eq!(reopened.checkpointed(subject(9)).unwrap(), &units([0, 1]));
         assert!(second.is_checkpointed(0));
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
@@ -1503,7 +1493,7 @@ mod tests {
             subject(17),
             StoredObject {
                 total_units: MAX_UNITS_PER_OBJECT,
-                checkpointed: BTreeSet::new(),
+                checkpointed: UnitRanges::new(),
             },
         );
         assert!(validate_reserved_capacity(&one).is_ok());
@@ -1525,7 +1515,7 @@ mod tests {
             subject(18),
             StoredObject {
                 total_units: MAX_UNITS_PER_OBJECT,
-                checkpointed: BTreeSet::new(),
+                checkpointed: UnitRanges::new(),
             },
         );
         assert!(matches!(
@@ -1597,7 +1587,7 @@ mod tests {
             subject(15),
             StoredObject {
                 total_units: 0,
-                checkpointed: BTreeSet::new(),
+                checkpointed: UnitRanges::new(),
             },
         );
         assert!(matches!(
@@ -1608,14 +1598,16 @@ mod tests {
 
     #[test]
     fn resume_codecs_round_trip() {
-        let units = BTreeSet::from([1, 2, 4, 7, 8]);
+        let checkpointed = units([1, 2, 4, 7, 8]);
         let mut encoded_ranges = Vec::new();
-        encode_ranges(&units, &mut encoded_ranges);
-        let mut decoded_ranges = BTreeSet::new();
+        encode_ranges(&checkpointed, &mut encoded_ranges);
         let mut range_decoder = Decoder::new(&encoded_ranges);
-        decode_ranges(&mut range_decoder, 9, &mut decoded_ranges).unwrap();
+        let decoded_ranges = decode_ranges(&mut range_decoder, 9).unwrap();
         assert!(range_decoder.is_empty());
-        assert_eq!(decoded_ranges, units);
+        assert_eq!(decoded_ranges, checkpointed);
+        // Three runs, and the encoding says so rather than listing five units.
+        assert_eq!(checkpointed.run_count(), 3);
+        assert_eq!(encoded_ranges.first().copied(), Some(3));
 
         let mut encoded_varint = Vec::new();
         encode_uvarint(128, &mut encoded_varint);
@@ -1638,14 +1630,14 @@ mod tests {
             subject(11),
             StoredObject {
                 total_units: 9,
-                checkpointed: units.clone(),
+                checkpointed: checkpointed.clone(),
             },
         );
         let snapshot = encode_snapshot(&snapshot_objects).unwrap();
         assert_eq!(snapshot.first().copied(), Some(SNAPSHOT_RECORD));
         let mut replayed_snapshot = BTreeMap::new();
         apply_record(&snapshot, &mut replayed_snapshot).unwrap();
-        assert_eq!(replayed_snapshot, snapshot_objects);
+        assert_eq!(settle(replayed_snapshot).unwrap(), snapshot_objects);
 
         let reserve = encode_reserve(subject(12), 42).unwrap();
         assert_eq!(reserve.first().copied(), Some(RESERVE_RECORD));
@@ -1667,7 +1659,7 @@ mod tests {
             subject(14),
             StoredObject {
                 total_units: 2,
-                checkpointed: BTreeSet::from([0]),
+                checkpointed: units([0]),
             },
         );
         ResumeStore::compact(&compact_path, &compact_objects).unwrap();
@@ -1677,27 +1669,49 @@ mod tests {
                 .unwrap()
                 .checkpointed(subject(14))
                 .unwrap(),
-            &BTreeSet::from([0])
+            &units([0])
         );
         fs::remove_file(&compact_path).unwrap();
 
         let path = temp_path("append-codecs");
         let reserve = encode_reserve(subject(12), 42).unwrap();
         append_record(&path, &reserve).unwrap();
-        let checkpoint = encode_checkpoint(subject(12), 42, &BTreeSet::from([3])).unwrap();
+        let checkpoint = encode_checkpoint(subject(12), 42, &units([3])).unwrap();
         append_record(&path, &checkpoint).unwrap();
         let decoded_store = decode_store(&path).unwrap();
-        assert_eq!(
-            decoded_store[&subject(12)].checkpointed,
-            BTreeSet::from([3])
-        );
+        assert_eq!(decoded_store[&subject(12)].checkpointed, units([3]));
         fs::remove_file(&path).unwrap();
+
+        // The most fragmented an object can be is every other unit, and that
+        // exact shape has to decode.
+        let alternating = units([0, 2, 4, 6, 8]);
+        assert_eq!(alternating.run_count(), 5);
+        let mut encoded_alternating = Vec::new();
+        encode_ranges(&alternating, &mut encoded_alternating);
+        assert_eq!(
+            decode_ranges(&mut Decoder::new(&encoded_alternating), 9).unwrap(),
+            alternating
+        );
+
+        // One more run than the object can hold, and a count no object could
+        // ever justify, are both refused before anything is sized from them.
+        let mut over_count = Vec::new();
+        encode_uvarint(6, &mut over_count);
+        assert!(matches!(
+            decode_ranges(&mut Decoder::new(&over_count), 9),
+            Err(Error::Corrupt)
+        ));
+        let mut absurd_count = Vec::new();
+        encode_uvarint(u64::MAX, &mut absurd_count);
+        assert!(matches!(
+            decode_ranges(&mut Decoder::new(&absurd_count), 4),
+            Err(Error::Corrupt)
+        ));
 
         for malformed in [&[1, 0, 0][..], &[2, 0, 2, 1, 1][..]] {
             let mut malformed_decoder = Decoder::new(malformed);
-            let mut output = BTreeSet::new();
             assert!(matches!(
-                decode_ranges(&mut malformed_decoder, 4, &mut output),
+                decode_ranges(&mut malformed_decoder, 4),
                 Err(Error::Corrupt)
             ));
         }
@@ -1738,6 +1752,68 @@ mod tests {
     // instead.
     #[test]
     #[ignore = "scale test, run with --ignored"]
+    fn replaying_many_checkpoint_records_stays_linear() {
+        // Every record adds one isolated run near the front, which is the shape
+        // that made replay copy all prior runs per record. Twenty thousand of
+        // them has to reopen promptly.
+        let path = temp_path("replay-many-checkpoints");
+        let object = subject(21);
+        let total_units = 100_000;
+        append_record(&path, &encode_reserve(object, total_units).unwrap()).unwrap();
+        for index in (0..20_000).rev() {
+            let record = encode_checkpoint(object, total_units, &units([index * 2])).unwrap();
+            append_record(&path, &record).unwrap();
+        }
+
+        let reopened = ResumeStore::open(&path).unwrap();
+        let held = reopened.checkpointed(object).unwrap();
+        assert_eq!(held.count(), 20_000);
+        assert_eq!(held.run_count(), 20_000);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_large_contiguous_object_costs_one_run_in_memory() {
+        // The point of holding checkpoint state as runs. At the maximum object
+        // size a per-unit set would be sixteen million entries; a transfer that
+        // has not lost anything is one run, and one gap makes it two.
+        let path = temp_path("run-length-memory");
+        let subject = SubjectId {
+            suite: 1,
+            root: [0x5c; 32],
+            length: MAX_UNITS_PER_OBJECT * 65_536,
+        };
+        let mut store = ResumeStore::open(&path).unwrap();
+        store
+            .reserve_many([(subject, MAX_UNITS_PER_OBJECT)])
+            .unwrap();
+        store
+            .save_object(subject, MAX_UNITS_PER_OBJECT, &units(0..250_000))
+            .unwrap();
+        let held = store.checkpointed(subject).unwrap();
+        assert_eq!(held.count(), 250_000);
+        assert_eq!(held.run_count(), 1);
+
+        let mut fragmented = units(0..250_000);
+        fragmented.extend_units([250_001]);
+        store
+            .save_object(subject, MAX_UNITS_PER_OBJECT, &fragmented)
+            .unwrap();
+        let held = store.checkpointed(subject).unwrap();
+        assert_eq!(held.count(), 250_001);
+        assert_eq!(held.run_count(), 2);
+
+        // And it survives a reload, still as runs.
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(reopened.checkpointed(subject).unwrap().run_count(), 2);
+        assert_eq!(reopened.checkpointed(subject).unwrap(), &fragmented);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "scale test, run with --ignored"]
     fn resume_store_handles_million_small_file_workload() {
         let path = temp_path("million-small-files");
         let subject_for = |index: u32| {
@@ -1775,7 +1851,7 @@ mod tests {
         assert!(reopened.checkpointed(subject_for(999_999)).is_some());
         assert_eq!(
             reopened.checkpointed(large_subject).unwrap(),
-            &BTreeSet::from([0, 1, 2])
+            &units([0, 1, 2])
         );
         assert!(file_len(&path).unwrap() < MAX_STORE_BYTES);
         fs::remove_file(&path).unwrap();
@@ -1810,7 +1886,7 @@ mod tests {
                 subject_for(index),
                 StoredObject {
                     total_units: 1,
-                    checkpointed: BTreeSet::from([0]),
+                    checkpointed: units([0]),
                 },
             );
         }
@@ -1818,7 +1894,7 @@ mod tests {
             large_subject,
             StoredObject {
                 total_units: 100,
-                checkpointed: (0..100).collect(),
+                checkpointed: units(0..100),
             },
         );
 
@@ -1826,17 +1902,14 @@ mod tests {
         ResumeStore::compact(&path, &objects).unwrap();
 
         let reopened = ResumeStore::open(&path).unwrap();
-        assert_eq!(
-            reopened.checkpointed(subject_for(0)).unwrap(),
-            &BTreeSet::from([0])
-        );
+        assert_eq!(reopened.checkpointed(subject_for(0)).unwrap(), &units([0]));
         assert_eq!(
             reopened.checkpointed(subject_for(999_999)).unwrap(),
-            &BTreeSet::from([0])
+            &units([0])
         );
         assert_eq!(
             reopened.checkpointed(large_subject).unwrap(),
-            &(0..100).collect::<BTreeSet<_>>()
+            &units(0..100)
         );
 
         let length = file_len(&path).unwrap();
@@ -1858,7 +1931,7 @@ mod tests {
         write_raw(&path, &trailing);
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
 
-        let malformed_range = encode_checkpoint(subject(1), 1, &BTreeSet::from([1])).unwrap();
+        let malformed_range = encode_checkpoint(subject(1), 1, &units([1])).unwrap();
         write_raw(&path, &malformed_range);
         assert!(matches!(ResumeStore::open(&path), Err(Error::Corrupt)));
 

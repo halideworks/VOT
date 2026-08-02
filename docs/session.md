@@ -164,6 +164,24 @@ identifier would make interleaving between independent streams look like
 reordering within one, and on an accepting endpoint every application lane is
 peer-initiated, so there would be nothing left to tell them apart by.
 
+## The carrier and the advertised limits
+
+The two have to come from one place. A QUIC configuration allowing fewer peer
+bidirectional streams than the advertised lane count blocks a lane the session
+said it would carry, and the session cannot see it: the software bound passes
+and the carrier refuses the stream anyway.
+
+`peer_stream_settings` builds the MsQuic settings from the same `ReceiveLimits`
+an endpoint advertises. One more stream than the lane count, because negotiation
+takes the first client-initiated bidirectional stream and that is not a lane.
+
+## Early data
+
+`spec/wire.md` section 4 makes no v0.3 application frame valid in 0-RTT. The
+MsQuic receive path checks the flag before framing anything and closes under
+`REPLAY_REJECTED`. Framing it first would hand the session replayable early data
+that becomes an ordinary record once negotiation finishes.
+
 ## Driving a session
 
 `Session` owns its backend so an application cannot reach past the readiness

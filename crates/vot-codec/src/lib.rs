@@ -40,6 +40,7 @@ pub mod error_code {
     pub const UNSUPPORTED_VERSION: u16 = 0x0104;
     pub const RESOURCE_LIMIT: u16 = 0x0502;
     pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
+    pub const REPLAY_REJECTED: u16 = 0x0203;
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
 }
 
@@ -1520,6 +1521,7 @@ mod tests {
             assert_eq!(required_extension(frame_type), None, "{frame_type:#x}");
         }
         assert_eq!(error_code::EXPERIMENT_NOT_NEGOTIATED, 0x0701);
+        assert_eq!(error_code::REPLAY_REJECTED, 0x0203);
         assert_eq!(extension_id::DATAGRAM_FEC, 0x01);
         assert_eq!(extension_id::MULTIPATH_QUIC, 0x06);
     }

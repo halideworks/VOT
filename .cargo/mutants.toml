@@ -1,5 +1,10 @@
 gitignore = true
-minimum_test_timeout = 20.0
+# Raised from 20s after `mutation (vot-resume)` timed out in CI on a mutant the
+# same run catches locally: `replace <= with > in UnitRanges::insert` makes an
+# insertion do more work, and 20s is tight on a loaded runner. The timeout only
+# costs anything for a mutant that genuinely hangs, and one had never done so
+# before this, so the headroom is close to free.
+minimum_test_timeout = 60.0
 timeout_multiplier = 4.0
 # The msquic live module only compiles under the `live` feature, which the
 # mutation job does not enable, so every mutant in it would be unviable here.

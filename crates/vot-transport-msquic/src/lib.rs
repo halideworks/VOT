@@ -481,7 +481,7 @@ pub mod live {
 
     use msquic::{
         Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Listener,
-        ListenerEvent, Registration, RegistrationConfig, SendFlags, Stream, StreamEvent,
+        ListenerEvent, Registration, RegistrationConfig, SendFlags, Settings, Stream, StreamEvent,
         StreamOpenFlags, StreamRef, StreamStartFlags,
     };
 
@@ -1326,7 +1326,17 @@ pub mod live {
         let mut faulted = false;
         move |stream: StreamRef, event: StreamEvent| {
             match event {
-                StreamEvent::Receive { buffers, .. } => {
+                StreamEvent::Receive { buffers, flags, .. } => {
+                    // spec/wire.md section 4: no v0.3 application frame is
+                    // valid in 0-RTT, and a receiver must reject one. Framing
+                    // it first would hand the session replayable early data
+                    // that looks like an ordinary record once negotiation
+                    // finishes.
+                    if flags.contains(msquic::ReceiveFlags::ZERO_RTT) {
+                        faulted = true;
+                        request_close(&close_request, vot_codec::error_code::REPLAY_REJECTED);
+                        return Ok(());
+                    }
                     for buffer in buffers {
                         if faulted {
                             break;
@@ -2111,6 +2121,29 @@ pub mod live {
         })
     }
 
+    /// Builds the `MsQuic` settings an endpoint advertising `limits` needs.
+    ///
+    /// The carrier and the advertised limit have to come from one place. A
+    /// configuration allowing fewer peer bidirectional streams than the lane
+    /// count blocks a lane the session said it would carry, and the session
+    /// cannot see that: it checks the software bound and the carrier refuses
+    /// the stream anyway.
+    ///
+    /// One more stream than the lane count, because `spec/wire.md` gives
+    /// negotiation the first client-initiated bidirectional stream and that is
+    /// not an application lane.
+    ///
+    /// # Errors
+    /// Reports a lane count the carrier cannot express.
+    pub fn peer_stream_settings(limits: ReceiveLimits) -> Result<Settings, Error> {
+        let streams = limits
+            .lanes()
+            .checked_add(1)
+            .and_then(|count| u16::try_from(count).ok())
+            .ok_or(Error::InvalidConfiguration)?;
+        Ok(Settings::new().set_PeerBidiStreamCount(streams))
+    }
+
     /// Opens an actual `MsQuic` registration and validates the linked API table.
     ///
     /// # Errors
@@ -2742,6 +2775,33 @@ pub mod live {
         }
 
         #[test]
+        fn the_carrier_is_configured_from_the_limits_that_are_advertised() {
+            // A configuration allowing fewer peer streams than the lane count
+            // blocks a lane the session said it would carry, and the session
+            // cannot see that: it checks the software bound and the carrier
+            // refuses the stream anyway. The live tests configured eight peer
+            // streams against a sixteen-lane default until this existed.
+            let limits = |lanes: u64| {
+                vot_transport_api::ReceiveLimits::advertised(
+                    &vot_codec::Settings {
+                        reliable_lane_limit: lanes,
+                        ..vot_codec::Settings::default()
+                    },
+                    super::super::INBOUND_BYTE_CAPACITY,
+                )
+                .unwrap()
+            };
+            for lanes in [1_u64, 16, 256] {
+                let settings = super::peer_stream_settings(limits(lanes)).unwrap();
+                assert_eq!(
+                    settings.as_ffi_ref().PeerBidiStreamCount,
+                    u16::try_from(lanes).unwrap() + 1,
+                    "one more than the lanes, for the negotiation stream"
+                );
+            }
+        }
+
+        #[test]
         fn peer_streams_are_bounded_by_what_this_endpoint_advertised() {
             // The count is on streams open at once, so a peer that closes one
             // may open another, and one past the advertised number is refused.
@@ -2934,7 +2994,7 @@ pub mod live {
         /// Builds a client configuration that trusts the test certificate.
         fn client_configuration(registration: &Registration) -> Arc<Configuration> {
             let alpn = [BufferRef::from(vot_transport_api::ALPN)];
-            let settings = Settings::new().set_PeerBidiStreamCount(4);
+            let settings = super::peer_stream_settings(test_limits()).unwrap();
             let configuration = Configuration::open(registration, &alpn, Some(&settings)).unwrap();
             configuration
                 .load_credential(
@@ -3146,7 +3206,9 @@ pub mod live {
         /// Builds a listening configuration that presents the test certificate.
         fn server_configuration(registration: &Registration) -> Arc<Configuration> {
             let alpn = [BufferRef::from(vot_transport_api::ALPN)];
-            let settings = Settings::new().set_PeerBidiStreamCount(8);
+            // From the same limits the server advertises, so the carrier can
+            // open every lane the session says it will carry.
+            let settings = super::peer_stream_settings(server_limits()).unwrap();
             let configuration = Configuration::open(registration, &alpn, Some(&settings)).unwrap();
             configuration
                 .load_credential(

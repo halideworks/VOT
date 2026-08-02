@@ -888,9 +888,7 @@ pub mod live {
             let mut adapter = MsQuicAdapter::default();
             adapter
                 .set_control_receive_limit(control_receive_limit)
-                .map_err(|_| {
-                    msquic::Status::from(msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER)
-                })?;
+                .map_err(|_| invalid_parameter())?;
             Ok(Self {
                 carrier: Carrier {
                     adapter,
@@ -1871,6 +1869,8 @@ pub mod live {
         // callbacks, which is what makes the channel send infallible.
         listener: Listener,
         accepted: Receiver<AcceptedTransport>,
+        /// Connections handed to the channel and not yet accepted.
+        queued: Arc<AtomicUsize>,
         _configuration: Arc<Configuration>,
         registration: Arc<Registration>,
     }
@@ -1887,24 +1887,45 @@ pub mod live {
             address: &Addr,
             control_receive_limit: usize,
         ) -> Result<Self, msquic::Status> {
+            // Up front, so a limit out of range fails here rather than on every
+            // connection that then never reaches accept.
+            vot_transport_api::validate_control_payload_limit(control_receive_limit)
+                .map_err(|_| invalid_parameter())?;
             let (accepted_tx, accepted) = mpsc::channel();
+            let queued = Arc::new(AtomicUsize::new(0));
+            let callback_queued = Arc::clone(&queued);
             let next_connection_id = Arc::new(AtomicU64::new(1));
             let listener_configuration = Arc::clone(&configuration);
             let listener_registration = Arc::clone(&registration);
             let listener = Listener::open(&registration, move |_, event: ListenerEvent| {
                 if let ListenerEvent::NewConnection { connection, .. } = event {
+                    // Claimed before anything is adopted. A per-connection bound
+                    // is not a server bound: a peer that opens connections
+                    // faster than they are accepted would otherwise hold a live
+                    // connection, its callback queues, and its stream state for
+                    // each one. Refused here, so MsQuic closes the connection
+                    // and nothing is torn down on a worker thread.
+                    if claim_accept_slot(&callback_queued).is_err() {
+                        return Err(invalid_parameter());
+                    }
                     let transport = accept_connection(
                         &connection,
                         &listener_configuration,
                         &listener_registration,
                         next_connection_id.fetch_add(1, Ordering::Relaxed),
                         control_receive_limit,
-                    )?;
+                    )
+                    .inspect_err(|_| {
+                        // The slot is claimed before anything is adopted, so a
+                        // connection that never became a transport has to give
+                        // it back or the queue shrinks for the listener's life.
+                        callback_queued.fetch_sub(1, Ordering::Relaxed);
+                    })?;
                     // Not inside the assert: dropping the transport here
                     // would run teardown on a worker thread and wait there for
                     // a shutdown the same pool has to deliver.
-                    let queued = accepted_tx.send(transport);
-                    debug_assert!(queued.is_ok(), "the listener closes before its receiver");
+                    let sent = accepted_tx.send(transport);
+                    debug_assert!(sent.is_ok(), "the listener closes before its receiver");
                 }
                 Ok(())
             })?;
@@ -1912,6 +1933,7 @@ pub mod live {
             Ok(Self {
                 listener,
                 accepted,
+                queued,
                 _configuration: configuration,
                 registration,
             })
@@ -1928,7 +1950,15 @@ pub mod live {
 
         /// Takes the next accepted connection without blocking.
         pub fn accept(&mut self) -> Option<AcceptedTransport> {
-            self.accepted.try_recv().ok()
+            let transport = self.accepted.try_recv().ok()?;
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            Some(transport)
+        }
+
+        /// Connections waiting to be accepted.
+        #[must_use]
+        pub fn queued_connections(&self) -> usize {
+            self.queued.load(Ordering::Relaxed)
         }
 
         /// A share of the registration these connections belong to.
@@ -1944,6 +1974,26 @@ pub mod live {
             // into a channel that is about to go away.
             self.listener.stop();
         }
+    }
+
+    /// Largest number of connections held between arriving and being accepted.
+    ///
+    /// Each holds a live connection, its callback queues, and its stream state,
+    /// so without this the per-connection bounds do not add up to a server one.
+    pub const MAX_QUEUED_CONNECTIONS: usize = 64;
+
+    /// Takes one of the queued-connection slots, or reports the queue full.
+    fn claim_accept_slot(queued: &AtomicUsize) -> Result<(), ()> {
+        queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_QUEUED_CONNECTIONS).then(|| count + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    fn invalid_parameter() -> msquic::Status {
+        msquic::Status::from(msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER)
     }
 
     /// Assembles one accepted connection. Runs on a worker thread, so it
@@ -2004,7 +2054,7 @@ pub mod live {
         let mut adapter = MsQuicAdapter::default();
         adapter
             .set_control_receive_limit(control_receive_limit)
-            .map_err(|_| msquic::Status::from(msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER))?;
+            .map_err(|_| invalid_parameter())?;
         Ok(AcceptedTransport {
             carrier: Carrier {
                 adapter,
@@ -3417,6 +3467,105 @@ pub mod live {
             drop(peer);
             drop(server);
             drop(listener);
+        }
+
+        #[test]
+        fn a_listener_bounds_what_it_holds_and_checks_its_own_configuration() {
+            // A per-connection byte bound is not a server bound. Each queued
+            // connection holds a live handle, its callback queues, and its
+            // stream state, so a peer that connects faster than the application
+            // accepts would otherwise have no limit at all.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+
+            // An unusable limit fails here rather than on every connection that
+            // then never reaches accept.
+            for limit in [0, vot_codec::HARD_MAX_FRAME_PAYLOAD + 1] {
+                assert!(
+                    MsQuicServer::listen(
+                        Arc::clone(&configuration),
+                        Arc::clone(&registration),
+                        &alpn,
+                        &address,
+                        limit,
+                    )
+                    .is_err(),
+                    "a limit of {limit} cannot serve anything"
+                );
+            }
+
+            let mut server = MsQuicServer::listen(
+                configuration,
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                SERVER_CONTROL_LIMIT,
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+            assert_eq!(server.queued_connections(), 0);
+
+            // More connections than the queue holds. The excess is refused by
+            // the listener, so nothing is torn down on a worker thread.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut clients = Vec::new();
+            for id in 0..super::MAX_QUEUED_CONNECTIONS as u64 + 4 {
+                let client_registration = super::registration().unwrap();
+                clients.push(
+                    MsQuicTransport::connect(
+                        client_configuration(&client_registration),
+                        client_registration,
+                        "127.0.0.1",
+                        port,
+                        id,
+                        vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                    )
+                    .unwrap(),
+                );
+            }
+            while Instant::now() < deadline
+                && server.queued_connections() < super::MAX_QUEUED_CONNECTIONS
+            {
+                for client in &mut clients {
+                    while client.poll().is_some() {}
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                server.queued_connections(),
+                super::MAX_QUEUED_CONNECTIONS,
+                "the queue filled"
+            );
+
+            // It never goes past the bound, however long the clients try.
+            let settle = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < settle {
+                for client in &mut clients {
+                    while client.poll().is_some() {}
+                }
+                assert!(server.queued_connections() <= super::MAX_QUEUED_CONNECTIONS);
+                std::thread::yield_now();
+            }
+
+            // Accepting frees slots again.
+            let accepted = server.accept().expect("a queued connection");
+            assert_eq!(
+                server.queued_connections(),
+                super::MAX_QUEUED_CONNECTIONS - 1
+            );
+            drop(accepted);
+
+            let mut drained = Vec::new();
+            while let Some(transport) = server.accept() {
+                drained.push(transport);
+            }
+            assert_eq!(server.queued_connections(), 0);
+
+            drop(drained);
+            drop(clients);
+            drop(server);
         }
 
         #[test]

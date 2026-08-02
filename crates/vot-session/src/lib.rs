@@ -104,7 +104,9 @@ pub enum ErrorKind {
     /// Negotiation frames have not all reached the backend yet.
     HandshakeUnsent { remaining: usize },
     /// A record larger than the peer said it would accept.
-    RecordExceedsPeerLimit { bytes: usize, limit: u64 },
+    RecordExceedsPeerLimit { bytes: u64, limit: u64 },
+    /// A record larger than this endpoint said it would accept.
+    RecordExceedsLocalLimit { bytes: u64, limit: u64 },
     /// The backend refused something the session needed.
     Transport(TransportError),
     /// The backend would reassemble control frames larger than this endpoint
@@ -122,7 +124,9 @@ impl ErrorKind {
             | Self::Decode(_)
             | Self::OutOfSequence { .. }
             | Self::NotNegotiated { .. }
-            | Self::PendingRecordsExhausted { .. } => true,
+            | Self::PendingRecordsExhausted { .. }
+            // The peer sent past the limit it was given.
+            | Self::RecordExceedsLocalLimit { .. } => true,
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
@@ -615,6 +619,7 @@ impl<A: TransportAdapter> Session<A> {
                     return Ok(Some(Event::Disconnected(connection)));
                 }
                 record @ Event::Reliable { .. } => {
+                    self.admit_record(&record)?;
                     if self.negotiation.is_ready() {
                         return Ok(Some(record));
                     }
@@ -646,7 +651,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
         self.require_sendable()?;
-        self.require_within_peer_record_limit(record.len())?;
+        self.require_within_peer_record_limit(record)?;
         self.adapter
             .send_reliable(stream, record)
             .map_err(transport_error)
@@ -658,7 +663,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
         self.require_sendable()?;
-        self.require_within_peer_record_limit(record.len())?;
+        self.require_within_peer_record_limit(&record)?;
         self.adapter
             .send_reliable_shared(stream, record)
             .map_err(transport_error)
@@ -815,25 +820,67 @@ impl<A: TransportAdapter> Session<A> {
         Ok(())
     }
 
-    /// Refuses a record larger than the peer said it would accept.
+    /// Refuses a record whose payload is larger than the peer said it accepts.
     ///
-    /// The adapter only knows the protocol ceiling. Sending past what the peer
-    /// advertised is a session the peer is entitled to end.
-    fn require_within_peer_record_limit(&self, bytes: usize) -> Result<(), Error> {
+    /// The declared payload, not the wire length: a conforming record carries
+    /// the type and length varints on top of the negotiated maximum.
+    fn require_within_peer_record_limit(&self, record: &[u8]) -> Result<(), Error> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        if u64::try_from(bytes).is_ok_and(|bytes| bytes <= peer.max_data_record_payload) {
+        let payload = declared_payload(record, peer.max_data_record_payload)?;
+        if payload <= peer.max_data_record_payload {
             return Ok(());
         }
         Err(Error::new(
             ErrorKind::RecordExceedsPeerLimit {
-                bytes,
+                bytes: payload,
                 limit: peer.max_data_record_payload,
             },
             error_code::FRAME_TOO_LARGE,
         ))
     }
+
+    /// Refuses a record whose payload is larger than this endpoint advertised.
+    ///
+    /// The adapters bound records by the protocol ceiling, which is what a
+    /// session advertising less than that would otherwise hand the application
+    /// instead of refusing.
+    fn admit_record(&self, event: &Event) -> Result<(), Error> {
+        let Event::Reliable { bytes, .. } = event else {
+            return Ok(());
+        };
+        let limit = self.negotiation.local_settings().max_data_record_payload;
+        let payload = declared_payload(bytes, limit)?;
+        if payload <= limit {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::RecordExceedsLocalLimit {
+                bytes: payload,
+                limit,
+            },
+            error_code::FRAME_TOO_LARGE,
+        ))
+    }
+}
+
+/// The payload length a record declares, from its envelope.
+///
+/// `limit` bounds the decode so an unknown type cannot claim more than this
+/// endpoint would accept anyway.
+fn declared_payload(record: &[u8], limit: u64) -> Result<u64, Error> {
+    let limits = vot_codec::DecodeLimits {
+        max_unknown_payload: usize::try_from(limit).unwrap_or(usize::MAX),
+        max_frames: 1,
+    };
+    let envelope = vot_codec::peek_envelope(record, limits).map_err(decode_error)?;
+    u64::try_from(envelope.payload_length).map_err(|_| {
+        Error::new(
+            ErrorKind::Decode(DecodeError::LengthOverflow(u64::MAX)),
+            error_code::FRAME_TOO_LARGE,
+        )
+    })
 }
 
 fn transport_error(error: TransportError) -> Error {
@@ -927,11 +974,23 @@ mod tests {
         Event::Control(vot_transport_api::shared_payload(bytes))
     }
 
+    /// One encoded `DATA_RECORD` frame, which is what a lane actually carries.
+    fn data_record(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::DATA_RECORD, payload, &mut frame).unwrap();
+        frame
+    }
+
+    /// The wire length of a `DATA_RECORD` carrying `payload` bytes.
+    fn record_wire_len(payload: usize) -> usize {
+        data_record(&vec![0; payload]).len()
+    }
+
     fn record(lane: u64, payload: &[u8]) -> Event {
         Event::Reliable {
             stream: StreamId(lane),
             sequence: lane,
-            bytes: vot_transport_api::shared_payload(payload),
+            bytes: vot_transport_api::shared_payload(&data_record(payload)),
         }
     }
 
@@ -1038,7 +1097,9 @@ mod tests {
         );
 
         let (mut client, _server) = negotiated();
-        client.send_reliable(StreamId(1), b"record").unwrap();
+        client
+            .send_reliable(StreamId(1), &data_record(b"record"))
+            .unwrap();
         assert_eq!(client.adapter.records.len(), 1);
     }
 
@@ -1354,7 +1415,9 @@ mod tests {
             BTreeSet::new(),
         );
         refusing.negotiation.state = State::Ready;
-        let error = refusing.send_reliable(StreamId(1), b"record").unwrap_err();
+        let error = refusing
+            .send_reliable(StreamId(1), &data_record(b"record"))
+            .unwrap_err();
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert_eq!(
             error.kind(),
@@ -1381,7 +1444,7 @@ mod tests {
             session.negotiation.state = State::Ready;
             assert_eq!(
                 session
-                    .send_reliable(StreamId(1), b"record")
+                    .send_reliable(StreamId(1), &data_record(b"record"))
                     .unwrap_err()
                     .close_code(),
                 expected
@@ -1404,16 +1467,16 @@ mod tests {
             server.adapter.events.push_back(record(lane, &payload));
         }
         assert_eq!(server.poll().unwrap(), None);
-        assert_eq!(server.pending_bytes, 4 * 1024);
+        assert_eq!(server.pending_bytes, 4 * record_wire_len(1024));
 
         let mut exact = Session::server(Loopback::default(), Settings::default(), BTreeSet::new());
         exact.begin().unwrap();
-        exact.pending_byte_limit = 2 * 1024;
+        exact.pending_byte_limit = 2 * record_wire_len(1024);
         for lane in 0..2 {
             exact.adapter.events.push_back(record(lane, &payload));
         }
         assert_eq!(exact.poll().unwrap(), None, "the bound itself is allowed");
-        assert_eq!(exact.pending_bytes, 2 * 1024);
+        assert_eq!(exact.pending_bytes, 2 * record_wire_len(1024));
 
         exact.adapter.events.push_back(record(2, b"x"));
         let error = exact.poll().unwrap_err();
@@ -1421,7 +1484,7 @@ mod tests {
         assert_eq!(
             error.kind(),
             &ErrorKind::PendingRecordsExhausted {
-                bytes: 2 * 1024,
+                bytes: 2 * record_wire_len(1024),
                 count: 2,
             }
         );
@@ -1520,7 +1583,11 @@ mod tests {
             BTreeSet::new(),
         );
         refusing.negotiation.state = State::Ready;
-        assert!(refusing.send_reliable(StreamId(1), b"record").is_err());
+        assert!(
+            refusing
+                .send_reliable(StreamId(1), &data_record(b"record"))
+                .is_err()
+        );
         assert!(refusing.adapter().closed.is_empty());
 
         // Nor does a carrier that has already gone; there is nothing to close.
@@ -1826,7 +1893,7 @@ mod tests {
 
         for send in [
             server.send_control(b"application"),
-            server.send_reliable(StreamId(1), b"record"),
+            server.send_reliable(StreamId(1), &data_record(b"record")),
         ] {
             assert_eq!(
                 send.unwrap_err().kind(),
@@ -1871,10 +1938,10 @@ mod tests {
         assert!(client.is_ready());
 
         client
-            .send_reliable(StreamId(1), &vec![0; 64 * 1024])
+            .send_reliable(StreamId(1), &data_record(&vec![0; 64 * 1024]))
             .unwrap();
         let error = client
-            .send_reliable(StreamId(1), &vec![0; 64 * 1024 + 1])
+            .send_reliable(StreamId(1), &data_record(&vec![0; 64 * 1024 + 1]))
             .unwrap_err();
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert_eq!(
@@ -1884,17 +1951,54 @@ mod tests {
                 limit: 64 * 1024,
             }
         );
+        // The wire length of a conforming record is larger than the negotiated
+        // payload maximum, so comparing it would refuse a legal frame.
+        assert!(data_record(&vec![0; 64 * 1024]).len() > 64 * 1024);
         assert_eq!(
             client
                 .send_reliable_shared(
                     StreamId(1),
-                    vot_transport_api::shared_payload(&vec![0; 64 * 1024 + 1])
+                    vot_transport_api::shared_payload(&data_record(&vec![0; 64 * 1024 + 1]))
                 )
                 .unwrap_err()
                 .kind(),
             error.kind()
         );
         assert_eq!(client.adapter().records.len(), 1, "only the one that fits");
+    }
+
+    #[test]
+    fn a_record_past_the_limit_this_endpoint_advertised_is_refused() {
+        // The adapters bound records by the protocol ceiling, so a session
+        // advertising less than that would hand the application a record the
+        // peer was told not to send.
+        let local = Settings {
+            max_data_record_payload: 64 * 1024,
+            ..Settings::default()
+        };
+        let mut server = Session::server(Loopback::default(), local, BTreeSet::new());
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(record(1, &vec![0; 64 * 1024]));
+        assert_eq!(server.poll().unwrap(), None, "the bound itself is accepted");
+
+        server
+            .adapter
+            .events
+            .push_back(record(2, &vec![0; 64 * 1024 + 1]));
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::RecordExceedsLocalLimit {
+                bytes: 64 * 1024 + 1,
+                limit: 64 * 1024,
+            }
+        );
+        // The peer sent past what it was given, so the carrier is closed.
+        assert_eq!(server.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
     }
 
     #[test]

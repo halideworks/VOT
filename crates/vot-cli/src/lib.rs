@@ -1372,6 +1372,26 @@ fn remove_preparation(prepared: &Path) -> Result<(), Error> {
     }
 }
 
+/// Every field a CLI publication receipt must carry, whichever package it is
+/// about.
+///
+/// Shared by the bundle check and the auditor's command so the two cannot
+/// disagree about what counts as a publication.
+fn validate_publication_shape(authenticated: &AuthenticatedReceipt) -> Result<(), Error> {
+    let receipt = &authenticated.receipt;
+    if authenticated.key_id != KEY_ID
+        || receipt.subject_kind != SubjectKind::Package
+        || receipt.suite_id != 1
+        || receipt.assurance != AssuranceLevel::Published
+        || receipt.profile != CommitProfile::Fast
+        || receipt.actual_predecessor != AssuranceLevel::TransitVerified
+        || receipt.provider != 1
+    {
+        return Err(Error::InvalidBundle);
+    }
+    Ok(())
+}
+
 /// Checks a receipt with nothing but the issuer's public key.
 ///
 /// This is the auditor's position, and the reason receipts moved to Ed25519: a
@@ -1389,9 +1409,10 @@ pub fn verify_receipt_file(
     let encoded = read_bounded_file(receipt_path, 65_536)?;
     let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
     key.verify(&authenticated)?;
-    if authenticated.key_id != KEY_ID {
-        return Err(Error::InvalidBundle);
-    }
+    // A valid signature says who wrote the receipt, not what it claims. Without
+    // the shape check an issuer's signature over any lower observation, or over
+    // an object rather than a package, would print as a published package.
+    validate_publication_shape(&authenticated)?;
     Ok(VerifiedReceipt {
         root: authenticated.receipt.subject_digest,
         logical_length: authenticated.receipt.subject_length,
@@ -1420,17 +1441,9 @@ fn validate_receipt_files(
     let encoded = read_bounded_file(receipt_path, 65_536)?;
     let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
     key.verify(&authenticated)?;
+    validate_publication_shape(&authenticated)?;
     let receipt = &authenticated.receipt;
-    if authenticated.key_id != b"vot-cli"
-        || receipt.subject_kind != SubjectKind::Package
-        || receipt.suite_id != 1
-        || receipt.subject_digest != package.root
-        || receipt.subject_length != package.logical_length
-        || receipt.assurance != AssuranceLevel::Published
-        || receipt.profile != CommitProfile::Fast
-        || receipt.actual_predecessor != AssuranceLevel::TransitVerified
-        || receipt.provider != 1
-    {
+    if receipt.subject_digest != package.root || receipt.subject_length != package.logical_length {
         return Err(Error::InvalidBundle);
     }
     let summary = read_bounded_file(summary_path, 4096)?;
@@ -2600,6 +2613,48 @@ mod tests {
         assert_eq!(verified.logical_length, package.logical_length);
         assert_eq!(verified.assurance, AssuranceLevel::Published);
         assert!(verified.third_party_verifiable);
+
+        // A signature only says who wrote the receipt. An observation that is
+        // not a package publication must not print as one, however valid the
+        // signature over it is.
+        for wrong in [
+            Receipt {
+                subject_kind: SubjectKind::Object,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                assurance: AssuranceLevel::TransitVerified,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                actual_predecessor: AssuranceLevel::Admitted,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                profile: CommitProfile::Strict,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                suite_id: 2,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                provider: 2,
+                ..authenticated.receipt.clone()
+            },
+        ] {
+            let path = temporary("wrong-observation.cbor");
+            let signed = signing.sign(wrong).unwrap();
+            fs::write(&path, encode_authenticated(&signed).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    verify_receipt_file(&path, &auditing),
+                    Err(Error::InvalidBundle)
+                ),
+                "a non-publication observation was accepted"
+            );
+            fs::remove_file(&path).unwrap();
+        }
 
         // The auditor cannot produce one, which is the point.
         assert!(matches!(

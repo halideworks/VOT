@@ -96,7 +96,12 @@ jobs:
       - name: Test
         run: |
           cargo +1.88.0 test --workspace --locked
+          # Scale tests are ignored by default so the mutation jobs, which rerun
+          # the suite once per mutant, do not pay for them hundreds of times.
+          # They run here instead, once each. The only other ignored test in the
+          # workspace needs the privileged loop device and runs in strict-device.
           cargo +1.88.0 test -p vot-pack --test million_package --locked -- --ignored
+          cargo +1.88.0 test -p vot-resume --lib --locked -- --ignored
 
       - name: Validate deterministic simulation
         run: |

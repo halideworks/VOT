@@ -1732,7 +1732,12 @@ mod tests {
         fs::remove_file(lock_path(&no_op_path).unwrap()).unwrap();
     }
 
+    // The two million-object tests are the whole runtime of this suite: 6.3s of
+    // 6.7s. Mutation testing reruns the suite once per mutant, so leaving them
+    // in the default set charges that 272 times. They run in their own CI step
+    // instead.
     #[test]
+    #[ignore = "scale test, run with --ignored"]
     fn resume_store_handles_million_small_file_workload() {
         let path = temp_path("million-small-files");
         let subject_for = |index: u32| {
@@ -1778,6 +1783,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "scale test, run with --ignored"]
     fn fully_checkpointed_million_object_snapshot_fits_the_store() {
         // The reserved-only workload above proves the reservation path. This
         // proves the durable path it grows into: every object checkpointed, so

@@ -73,6 +73,7 @@ jobs:
           python3 tools/verify_wave4_package.py
           python3 tools/validate_commit_fixtures.py
           python3 tools/validate_commit_model_sync.py
+          VOT_CARGO="cargo +1.88.0" python3 tools/validate_negotiation_vectors.py
           VOT_CARGO="cargo +1.88.0" python3 tools/differential_fuzz_codec.py
 
       - name: Model-check commit invariants
@@ -310,10 +311,18 @@ jobs:
           RUSTFLAGS: -Zsanitizer=address
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:symbolize=1:allow_addr2line=1
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/tools/lsan-msquic.supp:print_suppressions=1
+        # The whole live suite rather than one test. The single-test form left
+        # every peer-created stream, the accepted-connection path, and the
+        # negotiation handshake unsanitised, and a leak in the listener used by
+        # those tests survived because of it. The full run takes well under a
+        # minute against a thirty-minute budget.
+        #
+        # Serial, because a sanitiser report from parallel tests interleaves and
+        # cannot be attributed to the test that produced it.
         run: >-
           cargo +nightly-2026-07-15 test -p vot-transport-msquic
           --features live --target x86_64-unknown-linux-gnu --locked
-          localhost_reliable_stream_round_trip
+          -- --test-threads=1
 
   mutation:
     name: mutation (${{ matrix.package }})
@@ -343,6 +352,7 @@ jobs:
           - { package: vot-transport-api, required: true }
           - { package: vot-transport-sim, required: true }
           - { package: vot-transport-msquic, required: true }
+          - { package: vot-session, required: true }
           - { package: vot-scheduler, required: true }
           - { package: vot-cli, required: true }
           - { package: vot-transport-tcp, required: true }

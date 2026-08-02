@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -17,6 +17,13 @@ use vot_transport_api::{
 const DEFAULT_COMMAND_COUNT_LIMIT: usize = 64;
 const DEFAULT_COMMAND_BYTE_LIMIT: usize = 4 * 1024 * 1024;
 const CONTROL_LIMIT: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
+
+/// Most this adapter's inbound queue holds for one event.
+///
+/// `ReceiveLimits` is built against it, so an endpoint cannot advertise a
+/// control frame this backend could never enqueue: retrying would not make it
+/// fit and the queue is empty either way.
+pub const INBOUND_BYTE_CAPACITY: usize = DEFAULT_COMMAND_BYTE_LIMIT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
@@ -70,6 +77,17 @@ pub struct TcpAdapter {
     command_count_limit: usize,
     command_byte_limit: usize,
     control_payload_limit: usize,
+    /// Largest control-frame payload this endpoint will accept, which is what
+    /// it advertises. Separate from the send bound, which is the peer's.
+    control_receive_limit: usize,
+    /// What this endpoint advertised, once it has been configured.
+    receive_limits: Option<vot_transport_api::ReceiveLimits>,
+    /// Lanes the peer has sent on.
+    ///
+    /// This carrier is one byte stream, so a lane is a logical identifier with
+    /// no open or close of its own. Distinct identifiers seen is therefore the
+    /// only lane count there is, and it only grows.
+    inbound_lanes: BTreeSet<u64>,
     events: VecDeque<Event>,
     event_bytes: usize,
     event_count_limit: usize,
@@ -84,6 +102,9 @@ impl Default for TcpAdapter {
             command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
             control_payload_limit: CONTROL_LIMIT,
+            control_receive_limit: CONTROL_LIMIT,
+            receive_limits: None,
+            inbound_lanes: BTreeSet::new(),
             events: VecDeque::new(),
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
@@ -106,14 +127,33 @@ impl TcpAdapter {
         })
     }
 
-    /// Applies the peer-negotiated control-frame payload ceiling.
+    /// Counts one peer lane against the advertised limit.
     ///
     /// # Errors
-    /// Rejects zero or out-of-range negotiated payload limits.
-    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit = limit;
+    /// Reports a peer using more lanes than it was told this endpoint carries.
+    fn admit_lane(&mut self, stream: u64) -> Result<(), Error> {
+        let Some(limits) = self.receive_limits else {
+            // Nothing advertised, so nothing to hold the peer to.
+            return Ok(());
+        };
+        if self.inbound_lanes.contains(&stream) {
+            return Ok(());
+        }
+        if self.inbound_lanes.len() >= limits.lanes() {
+            return Err(Error::LaneLimitExceeded);
+        }
+        self.inbound_lanes.insert(stream);
         Ok(())
+    }
+
+    /// Applies what this endpoint advertises.
+    ///
+    /// The bound has to be in force before the peer's first frame: accepting
+    /// more than was advertised is silent otherwise, since the peer sends what
+    /// it was told it could and this endpoint takes more.
+    pub const fn set_receive_limits(&mut self, limits: vot_transport_api::ReceiveLimits) {
+        self.control_receive_limit = limits.control_payload();
+        self.receive_limits = Some(limits);
     }
 
     /// Queues a native callback after enforcing protocol and memory bounds.
@@ -123,11 +163,12 @@ impl TcpAdapter {
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let payload_len = match &event {
             NativeEvent::Control(bytes) => {
-                vot_transport_api::validate_control_frame(bytes, self.control_payload_limit)?;
+                vot_transport_api::validate_control_frame(bytes, self.control_receive_limit)?;
                 bytes.len()
             }
-            NativeEvent::Reliable { bytes, .. } => {
+            NativeEvent::Reliable { stream, bytes, .. } => {
                 vot_transport_api::validate_data_record(bytes)?;
+                self.admit_lane(*stream)?;
                 bytes.len()
             }
             NativeEvent::Connected(_)
@@ -204,6 +245,26 @@ impl TcpAdapter {
 }
 
 impl TransportAdapter for TcpAdapter {
+    fn receive_limits(&self) -> Option<vot_transport_api::ReceiveLimits> {
+        // This adapter does bound the control frames it accepts, in
+        // `record_native_event`, so a session can check that what it is about
+        // to advertise is what will be enforced.
+        self.receive_limits
+    }
+
+    fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+        // The send bound only. What this endpoint accepts is what it
+        // advertised, and a peer's limit must not widen or narrow that.
+        //
+        // Clamped to what the outbound queue can hold: a peer allowing more
+        // than this endpoint can enqueue does not oblige it to send that much,
+        // and a bound above the queue refuses the frame at submission for ever.
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit =
+            vot_transport_api::effective_send_limit(limit, self.command_byte_limit);
+        Ok(())
+    }
+
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.send_control_shared(shared_payload(frame))
     }
@@ -724,35 +785,156 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_control_payload_limit_updates_both_directions() {
+    fn a_peer_using_more_lanes_than_advertised_is_refused() {
+        // Reporting the limit as enforced while accepting any number of lanes
+        // is worse than not reporting it: a session checks the carrier agrees
+        // with what it advertises and then nothing holds the peer to it.
+        //
+        // One byte stream carries every lane here, so a lane has no open or
+        // close of its own and distinct identifiers seen is the whole count.
+        let mut adapter = TcpAdapter::default();
+        let record = |lane: u64| NativeEvent::Reliable {
+            stream: lane,
+            sequence: lane,
+            bytes: vec![0; 8],
+        };
+        // Nothing advertised yet, so nothing to hold the peer to.
+        assert_eq!(adapter.receive_limits(), None);
+        for lane in 0..4 {
+            adapter.record_native_event(record(lane)).unwrap();
+        }
+
+        let mut bounded = TcpAdapter::default();
+        bounded.set_receive_limits(
+            vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    reliable_lane_limit: 2,
+                    ..vot_codec::Settings::default()
+                },
+                INBOUND_BYTE_CAPACITY,
+            )
+            .unwrap(),
+        );
+        bounded.record_native_event(record(1)).unwrap();
+        bounded.record_native_event(record(2)).unwrap();
+        // A lane already seen is free.
+        bounded.record_native_event(record(1)).unwrap();
+        assert_eq!(
+            bounded.record_native_event(record(3)),
+            Err(Error::LaneLimitExceeded),
+            "one lane past what was advertised"
+        );
+    }
+
+    #[test]
+    fn the_two_control_bounds_move_independently() {
+        // A limit the inbound queue could never hold is refused before it can
+        // be advertised, whatever the protocol range allows.
+        assert_eq!(INBOUND_BYTE_CAPACITY, DEFAULT_COMMAND_BYTE_LIMIT);
+        let too_large = vot_transport_api::ReceiveLimits::advertised(
+            &vot_codec::Settings {
+                max_control_frame_payload: (INBOUND_BYTE_CAPACITY
+                    - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1) as u64,
+                ..vot_codec::Settings::default()
+            },
+            INBOUND_BYTE_CAPACITY,
+        );
+        assert_eq!(too_large, Err(Error::InvalidConfiguration));
+
+        // What this endpoint sends is bounded by what the peer advertised. What
+        // it accepts is bounded by what it advertised itself. One setter for
+        // both would either send frames the peer will refuse or accept frames
+        // this endpoint said it would not.
+        let envelope = vot_transport_api::MAX_FRAME_ENVELOPE_BYTES;
         let mut adapter = TcpAdapter::default();
         assert_eq!(
             adapter.set_control_payload_limit(0),
             Err(Error::InvalidConfiguration)
         );
+        assert_eq!(
+            adapter.receive_limits(),
+            None,
+            "nothing is advertised until it is configured"
+        );
+
+        // The peer allows more than the default, so more may be sent. The
+        // receive bound does not move with it.
         adapter.set_control_payload_limit(2 * 1024 * 1024).unwrap();
+        assert_eq!(
+            adapter.receive_limits(),
+            None,
+            "a peer's limit is not this endpoint's"
+        );
         adapter
-            .send_control(&vec![
-                0;
-                2 * 1024 * 1024
-                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
-            ])
+            .send_control(&vec![0; 2 * 1024 * 1024 + envelope])
             .unwrap();
         assert_eq!(
-            adapter.send_control(&vec![
-                0;
-                2 * 1024 * 1024
-                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
-                    + 1
-            ]),
+            adapter.send_control(&vec![0; 2 * 1024 * 1024 + envelope + 1]),
             Err(Error::RecordTooLarge)
         );
         assert_eq!(
-            adapter.record_native_event(NativeEvent::Control(vec![
-                0;
-                2 * 1024 * 1024 + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
-            ])),
+            adapter
+                .record_native_event(NativeEvent::Control(vec![0; CONTROL_LIMIT + envelope + 1])),
+            Err(Error::RecordTooLarge),
+            "still only what this endpoint advertised"
+        );
+
+        // Advertising more raises the receive bound, and only that.
+        let wide = vot_transport_api::ReceiveLimits::advertised(
+            &vot_codec::Settings {
+                max_control_frame_payload: 2 * 1024 * 1024,
+                ..vot_codec::Settings::default()
+            },
+            INBOUND_BYTE_CAPACITY,
+        )
+        .unwrap();
+        adapter.set_receive_limits(wide);
+        assert_eq!(adapter.receive_limits(), Some(wide));
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::Control(vec![0; 2 * 1024 * 1024 + envelope])),
             Ok(())
+        );
+
+        // A peer allowing more than the queue holds does not let this endpoint
+        // send more: the bound is clamped, so an oversized frame is refused at
+        // submission rather than queued for ever.
+        let mut generous = TcpAdapter::default();
+        generous
+            .set_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD)
+            .unwrap();
+        let largest = INBOUND_BYTE_CAPACITY - envelope;
+        generous.send_control(&vec![0; largest + envelope]).unwrap();
+        assert_eq!(
+            generous.send_control(&vec![0; largest + envelope + 1]),
+            Err(Error::RecordTooLarge),
+            "refused at submission, not queued for ever"
+        );
+
+        // And advertising less is enforced, which is the direction that was
+        // silent before: the peer sends what it was told it could and this
+        // endpoint takes exactly that.
+        let mut narrow = TcpAdapter::default();
+        let narrow_limits = vot_transport_api::ReceiveLimits::advertised(
+            &vot_codec::Settings {
+                max_control_frame_payload: 64 * 1024,
+                ..vot_codec::Settings::default()
+            },
+            INBOUND_BYTE_CAPACITY,
+        )
+        .unwrap();
+        narrow.set_receive_limits(narrow_limits);
+        assert_eq!(
+            narrow.receive_limits().unwrap().control_payload(),
+            64 * 1024
+        );
+        assert_eq!(
+            narrow.record_native_event(NativeEvent::Control(vec![0; 64 * 1024 + envelope])),
+            Ok(())
+        );
+        assert_eq!(
+            narrow.record_native_event(NativeEvent::Control(vec![0; 64 * 1024 + envelope + 1])),
+            Err(Error::RecordTooLarge)
         );
     }
 

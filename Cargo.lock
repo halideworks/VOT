@@ -2087,6 +2087,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-session"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+ "vot-transport-api",
+]
+
+[[package]]
 name = "vot-transport-api"
 version = "0.0.1"
 dependencies = [
@@ -2100,6 +2108,7 @@ version = "0.0.1"
 dependencies = [
  "msquic",
  "vot-codec",
+ "vot-session",
  "vot-transport-api",
 ]
 
@@ -2119,6 +2128,7 @@ name = "vot-transport-tcp"
 version = "0.0.1"
 dependencies = [
  "rustls",
+ "vot-codec",
  "vot-transport-api",
 ]
 

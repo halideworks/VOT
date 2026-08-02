@@ -39,6 +39,39 @@ pub mod error_code {
     pub const DUPLICATE_SETTING: u16 = 0x0106;
     pub const UNSUPPORTED_VERSION: u16 = 0x0104;
     pub const RESOURCE_LIMIT: u16 = 0x0502;
+    pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
+    pub const REPLAY_REJECTED: u16 = 0x0203;
+    pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
+}
+
+/// Extension identifiers from `spec/registries.md` section 4.
+pub mod extension_id {
+    pub const CORE_RELIABLE: u64 = 0x00;
+    pub const DATAGRAM_FEC: u64 = 0x01;
+    pub const ZSTD_RECORDS: u64 = 0x02;
+    pub const VCRC: u64 = 0x03;
+    pub const PUBLIC_MULTI_RAIL: u64 = 0x04;
+    pub const CUSTOM_CONGESTION_CONTROL: u64 = 0x05;
+    pub const MULTIPATH_QUIC: u64 = 0x06;
+}
+
+/// The extension a known frame needs before it may be used.
+///
+/// `spec/wire.md` section 5: an experimental frame is invalid unless its
+/// extension is negotiated, and using one anyway is
+/// `EXPERIMENT_NOT_NEGOTIATED`. A frame with no entry needs nothing.
+#[must_use]
+pub const fn required_extension(frame_type: u64) -> Option<u64> {
+    use crate::frame_type as ty;
+
+    match frame_type {
+        ty::DATAGRAM_CREDIT
+        | ty::CODING_EPOCH_OPEN
+        | ty::GEN_STATE
+        | ty::GEN_DONE
+        | ty::CODING_EPOCH_CLOSE => Some(extension_id::DATAGRAM_FEC),
+        _ => None,
+    }
 }
 
 pub mod frame_type {
@@ -157,6 +190,32 @@ impl Default for Settings {
             compression_min_gain_bps: 500,
             telemetry_level: 1,
         }
+    }
+}
+
+impl Settings {
+    /// Every registered setting and the value advertised for it, in identifier
+    /// order. Encoding walks this, so there is no lookup that cannot fail.
+    #[must_use]
+    pub const fn advertised(&self) -> [(u64, u64); 8] {
+        use setting_id as id;
+
+        [
+            (
+                id::MAX_CONTROL_FRAME_PAYLOAD,
+                self.max_control_frame_payload,
+            ),
+            (id::MAX_DATA_RECORD_PAYLOAD, self.max_data_record_payload),
+            (
+                id::MAX_MANIFEST_PAGE_PAYLOAD,
+                self.max_manifest_page_payload,
+            ),
+            (id::RELIABLE_LANE_LIMIT, self.reliable_lane_limit),
+            (id::IDLE_TIMEOUT_MS, self.idle_timeout_ms),
+            (id::ACTIVE_KEEPALIVE_MS, self.active_keepalive_ms),
+            (id::COMPRESSION_MIN_GAIN_BPS, self.compression_min_gain_bps),
+            (id::TELEMETRY_LEVEL, self.telemetry_level),
+        ]
     }
 }
 
@@ -317,50 +376,135 @@ pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
     Ok(settings)
 }
 
+/// Every setting `spec/registries.md` defines, in identifier order.
+pub const REGISTERED_SETTINGS: [u64; 8] = [
+    setting_id::MAX_CONTROL_FRAME_PAYLOAD,
+    setting_id::MAX_DATA_RECORD_PAYLOAD,
+    setting_id::MAX_MANIFEST_PAGE_PAYLOAD,
+    setting_id::RELIABLE_LANE_LIMIT,
+    setting_id::IDLE_TIMEOUT_MS,
+    setting_id::ACTIVE_KEEPALIVE_MS,
+    setting_id::COMPRESSION_MIN_GAIN_BPS,
+    setting_id::TELEMETRY_LEVEL,
+];
+
+/// The inclusive value range `spec/registries.md` gives a setting. One source
+/// for both directions.
+#[must_use]
+pub const fn setting_range(identifier: u64) -> Option<(u64, u64)> {
+    use setting_id as id;
+
+    match identifier {
+        id::MAX_CONTROL_FRAME_PAYLOAD => Some((
+            MIN_CONTROL_FRAME_PAYLOAD as u64,
+            HARD_MAX_FRAME_PAYLOAD as u64,
+        )),
+        id::MAX_DATA_RECORD_PAYLOAD => Some((64 * 1024, 256 * 1024)),
+        id::MAX_MANIFEST_PAGE_PAYLOAD => Some((64 * 1024, 1024 * 1024)),
+        id::RELIABLE_LANE_LIMIT => Some((1, 256)),
+        id::IDLE_TIMEOUT_MS => Some((1000, 600_000)),
+        id::ACTIVE_KEEPALIVE_MS => Some((10_000, 30_000)),
+        id::COMPRESSION_MIN_GAIN_BPS => Some((0, 10_000)),
+        id::TELEMETRY_LEVEL => Some((0, 2)),
+        _ => None,
+    }
+}
+
+/// The field a registered setting is carried in.
+fn setting_field(settings: &mut Settings, identifier: u64) -> Option<&mut u64> {
+    use setting_id as id;
+
+    match identifier {
+        id::MAX_CONTROL_FRAME_PAYLOAD => Some(&mut settings.max_control_frame_payload),
+        id::MAX_DATA_RECORD_PAYLOAD => Some(&mut settings.max_data_record_payload),
+        id::MAX_MANIFEST_PAGE_PAYLOAD => Some(&mut settings.max_manifest_page_payload),
+        id::RELIABLE_LANE_LIMIT => Some(&mut settings.reliable_lane_limit),
+        id::IDLE_TIMEOUT_MS => Some(&mut settings.idle_timeout_ms),
+        id::ACTIVE_KEEPALIVE_MS => Some(&mut settings.active_keepalive_ms),
+        id::COMPRESSION_MIN_GAIN_BPS => Some(&mut settings.compression_min_gain_bps),
+        id::TELEMETRY_LEVEL => Some(&mut settings.telemetry_level),
+        _ => None,
+    }
+}
+
+/// Whether `value` is inside the range `spec/registries.md` gives `identifier`.
+///
+/// An unregistered identifier has no range, so nothing may be advertised under
+/// it.
+#[must_use]
+pub fn setting_in_range(identifier: u64, value: u64) -> bool {
+    setting_range(identifier).is_some_and(|(low, high)| (low..=high).contains(&value))
+}
+
 fn apply_setting(
     settings: &mut Settings,
     identifier: u64,
     value: u64,
 ) -> Result<(), SettingsError> {
-    use setting_id as id;
+    if !setting_in_range(identifier, value) {
+        return if setting_range(identifier).is_some() {
+            Err(SettingsError::InvalidValue {
+                setting: identifier,
+                value,
+            })
+        } else if is_critical(identifier) {
+            Err(SettingsError::UnknownCritical(identifier))
+        } else {
+            // An unknown optional setting is ignored, which is what lets a
+            // later revision add one without breaking this one.
+            Ok(())
+        };
+    }
+    // Registered and in range, so the field is there.
+    if let Some(target) = setting_field(settings, identifier) {
+        *target = value;
+    }
+    Ok(())
+}
 
-    let target = match identifier {
-        id::MAX_CONTROL_FRAME_PAYLOAD
-            if (MIN_CONTROL_FRAME_PAYLOAD as u64..=HARD_MAX_FRAME_PAYLOAD as u64)
-                .contains(&value) =>
-        {
-            &mut settings.max_control_frame_payload
-        }
-        id::MAX_DATA_RECORD_PAYLOAD if (64 * 1024..=256 * 1024).contains(&value) => {
-            &mut settings.max_data_record_payload
-        }
-        id::MAX_MANIFEST_PAGE_PAYLOAD if (64 * 1024..=1024 * 1024).contains(&value) => {
-            &mut settings.max_manifest_page_payload
-        }
-        id::RELIABLE_LANE_LIMIT if (1..=256).contains(&value) => &mut settings.reliable_lane_limit,
-        id::IDLE_TIMEOUT_MS if (1000..=600_000).contains(&value) => &mut settings.idle_timeout_ms,
-        id::ACTIVE_KEEPALIVE_MS if (10_000..=30_000).contains(&value) => {
-            &mut settings.active_keepalive_ms
-        }
-        id::COMPRESSION_MIN_GAIN_BPS if value <= 10_000 => &mut settings.compression_min_gain_bps,
-        id::TELEMETRY_LEVEL if value <= 2 => &mut settings.telemetry_level,
-        id::MAX_CONTROL_FRAME_PAYLOAD
-        | id::MAX_DATA_RECORD_PAYLOAD
-        | id::MAX_MANIFEST_PAGE_PAYLOAD
-        | id::RELIABLE_LANE_LIMIT
-        | id::IDLE_TIMEOUT_MS
-        | id::ACTIVE_KEEPALIVE_MS
-        | id::COMPRESSION_MIN_GAIN_BPS
-        | id::TELEMETRY_LEVEL => {
+/// Encodes a `SETTINGS` payload as `spec/wire.md` section 1 defines it.
+///
+/// Every registered setting is advertised: the peer's defaults are its own.
+///
+/// # Errors
+/// Returns [`SettingsError::InvalidValue`] for a value outside the registered
+/// range, so a frame the peer would reject is never put on the wire.
+pub fn encode_settings(settings: &Settings, output: &mut Vec<u8>) -> Result<(), SettingsError> {
+    for (identifier, value) in settings.advertised() {
+        if !setting_in_range(identifier, value) {
             return Err(SettingsError::InvalidValue {
                 setting: identifier,
                 value,
             });
         }
-        _ if is_critical(identifier) => return Err(SettingsError::UnknownCritical(identifier)),
-        _ => return Ok(()),
+        encode_varint(identifier, output).map_err(SettingsError::Malformed)?;
+        encode_varint(value, output).map_err(SettingsError::Malformed)?;
+    }
+    Ok(())
+}
+
+/// Encodes a `HELLO` payload as `spec/wire.md` section 1 defines it.
+///
+/// The revision is written as given, so a test can produce the frame a peer on
+/// another draft would send.
+///
+/// # Errors
+/// Returns [`HelloError::TooManyExtensions`] above the registered bound.
+pub fn encode_hello(hello: &Hello, output: &mut Vec<u8>) -> Result<(), HelloError> {
+    let count = hello.extensions.len();
+    if count > MAX_EXTENSIONS_PER_HELLO {
+        return Err(HelloError::TooManyExtensions(count as u64));
+    }
+    let write = |value: u64, output: &mut Vec<u8>| {
+        encode_varint(value, output).map_err(HelloError::Malformed)
     };
-    *target = value;
+    write(hello.draft_revision, output)?;
+    write(hello.endpoint_role as u64, output)?;
+    write(count as u64, output)?;
+    // Ordered, so one HELLO has one encoding.
+    for extension in &hello.extensions {
+        write(*extension, output)?;
+    }
     Ok(())
 }
 
@@ -1205,6 +1349,181 @@ mod tests {
                 .len(),
             MAX_EXTENSIONS_PER_HELLO
         );
+    }
+
+    #[test]
+    fn encoded_negotiation_payloads_decode_back_to_what_was_sent() {
+        // Until these existed no endpoint could send HELLO or SETTINGS, so the
+        // decoders had nothing to read but hand-built bytes.
+        let hello = Hello {
+            draft_revision: DRAFT_REVISION,
+            endpoint_role: EndpointRole::Client,
+            extensions: BTreeSet::from([6, 2, 0]),
+        };
+        let mut payload = Vec::new();
+        encode_hello(&hello, &mut payload).unwrap();
+        // spec/wire.md section 1: revision, role, count, then the extensions in
+        // ascending order because the set is ordered.
+        assert_eq!(
+            payload,
+            vec![u8::try_from(DRAFT_REVISION).unwrap(), 0, 3, 0, 2, 6]
+        );
+        assert_eq!(decode_hello(&payload, EndpointRole::Client).unwrap(), hello);
+
+        let settings = Settings::default();
+        let mut payload = Vec::new();
+        encode_settings(&settings, &mut payload).unwrap();
+        assert_eq!(decode_settings(&payload).unwrap(), settings);
+        // Every registered setting is advertised, not only those that differ
+        // from a default the peer does not share.
+        let mut identifiers = Vec::new();
+        let mut offset = 0;
+        while offset < payload.len() {
+            let (identifier, width) = decode_varint(&payload[offset..]).unwrap();
+            offset += width;
+            let (_, width) = decode_varint(&payload[offset..]).unwrap();
+            offset += width;
+            identifiers.push(identifier);
+        }
+        assert_eq!(identifiers, REGISTERED_SETTINGS.to_vec());
+        assert!(payload.len() <= registered_payload_limit(frame_type::SETTINGS).unwrap());
+    }
+
+    #[test]
+    fn a_payload_the_peer_would_reject_is_never_encoded() {
+        use setting_id as id;
+
+        // The encoder and the decoder read one range table, so a value this
+        // side would refuse is refused before it reaches the wire rather than
+        // costing a round trip and a closed session.
+        let out_of_range = Settings {
+            telemetry_level: 3,
+            ..Settings::default()
+        };
+        assert_eq!(
+            encode_settings(&out_of_range, &mut Vec::new()),
+            Err(SettingsError::InvalidValue {
+                setting: setting_id::TELEMETRY_LEVEL,
+                value: 3,
+            })
+        );
+        // Every range pinned to the value spec/registries.md gives it, rather
+        // than only checked for internal consistency. A range that quietly
+        // widened would let this endpoint advertise a limit the registry does
+        // not allow, and a peer would be right to refuse the session.
+        assert_eq!(
+            setting_range(id::MAX_CONTROL_FRAME_PAYLOAD),
+            Some((1024, 16 * 1024 * 1024))
+        );
+        assert_eq!(
+            setting_range(id::MAX_DATA_RECORD_PAYLOAD),
+            Some((64 * 1024, 256 * 1024))
+        );
+        assert_eq!(
+            setting_range(id::MAX_MANIFEST_PAGE_PAYLOAD),
+            Some((64 * 1024, 1024 * 1024))
+        );
+        assert_eq!(setting_range(id::RELIABLE_LANE_LIMIT), Some((1, 256)));
+        assert_eq!(setting_range(id::IDLE_TIMEOUT_MS), Some((1000, 600_000)));
+        assert_eq!(
+            setting_range(id::ACTIVE_KEEPALIVE_MS),
+            Some((10_000, 30_000))
+        );
+        assert_eq!(
+            setting_range(id::COMPRESSION_MIN_GAIN_BPS),
+            Some((0, 10_000))
+        );
+        assert_eq!(setting_range(id::TELEMETRY_LEVEL), Some((0, 2)));
+        assert_eq!(setting_range(0x02), None);
+
+        for identifier in REGISTERED_SETTINGS {
+            let (low, high) = setting_range(identifier).expect("a registered setting has a range");
+            assert!(low <= high);
+            // The bound itself is inside the range, and one past it is not.
+            assert!(setting_in_range(identifier, low));
+            assert!(setting_in_range(identifier, high));
+            assert!(!setting_in_range(identifier, high + 1));
+            let mut settings = Settings::default();
+            *setting_field(&mut settings, identifier).expect("a registered setting has a field") =
+                high;
+            let mut payload = Vec::new();
+            encode_settings(&settings, &mut payload).unwrap();
+            assert_eq!(decode_settings(&payload).unwrap(), settings);
+        }
+
+        // The bound itself encodes, and one past it does not. Without the
+        // first half a bound off by one would go unnoticed and this endpoint
+        // would refuse a HELLO the registry allows.
+        let at_bound = Hello {
+            draft_revision: DRAFT_REVISION,
+            endpoint_role: EndpointRole::Client,
+            extensions: (0..MAX_EXTENSIONS_PER_HELLO as u64).collect(),
+        };
+        let mut payload = Vec::new();
+        encode_hello(&at_bound, &mut payload).unwrap();
+        assert_eq!(
+            decode_hello(&payload, EndpointRole::Client).unwrap(),
+            at_bound
+        );
+
+        let too_many = Hello {
+            draft_revision: DRAFT_REVISION,
+            endpoint_role: EndpointRole::Client,
+            extensions: (0..=MAX_EXTENSIONS_PER_HELLO as u64).collect(),
+        };
+        assert_eq!(
+            encode_hello(&too_many, &mut Vec::new()),
+            Err(HelloError::TooManyExtensions(
+                MAX_EXTENSIONS_PER_HELLO as u64 + 1
+            ))
+        );
+
+        // The revision is written as given, so the frame a peer on an older
+        // draft would send can be produced and shown to be rejected.
+        let older = Hello {
+            draft_revision: DRAFT_REVISION - 1,
+            endpoint_role: EndpointRole::Client,
+            extensions: BTreeSet::new(),
+        };
+        let mut payload = Vec::new();
+        encode_hello(&older, &mut payload).unwrap();
+        assert_eq!(
+            decode_hello(&payload, EndpointRole::Client),
+            Err(HelloError::UnsupportedRevision(DRAFT_REVISION - 1))
+        );
+    }
+
+    #[test]
+    fn experimental_frames_name_the_extension_they_need() {
+        // spec/wire.md section 5: an experimental frame is invalid unless its
+        // extension is negotiated. Without this table nothing can tell one
+        // from an ordinary frame.
+        for frame_type in [
+            frame_type::DATAGRAM_CREDIT,
+            frame_type::CODING_EPOCH_OPEN,
+            frame_type::GEN_STATE,
+            frame_type::GEN_DONE,
+            frame_type::CODING_EPOCH_CLOSE,
+        ] {
+            assert_eq!(
+                required_extension(frame_type),
+                Some(extension_id::DATAGRAM_FEC),
+                "{frame_type:#x}"
+            );
+        }
+        for frame_type in [
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::DATA_RECORD,
+            frame_type::MANIFEST_PAGE,
+            frame_type::PING,
+        ] {
+            assert_eq!(required_extension(frame_type), None, "{frame_type:#x}");
+        }
+        assert_eq!(error_code::EXPERIMENT_NOT_NEGOTIATED, 0x0701);
+        assert_eq!(error_code::REPLAY_REJECTED, 0x0203);
+        assert_eq!(extension_id::DATAGRAM_FEC, 0x01);
+        assert_eq!(extension_id::MULTIPATH_QUIC, 0x06);
     }
 
     #[test]

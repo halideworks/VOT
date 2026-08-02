@@ -1,8 +1,19 @@
 gitignore = true
-minimum_test_timeout = 20.0
+# Raised from 20s after `mutation (vot-resume)` timed out in CI on a mutant the
+# same run catches locally: `replace <= with > in UnitRanges::insert` makes an
+# insertion do more work, and 20s is tight on a loaded runner. The timeout only
+# costs anything for a mutant that genuinely hangs, and one had never done so
+# before this, so the headroom is close to free.
+minimum_test_timeout = 60.0
 timeout_multiplier = 4.0
 # The msquic live module only compiles under the `live` feature, which the
-# mutation job does not enable, so every mutant in it is unkillable by
-# construction. It is covered by the msquic-live and msquic-sanitizer jobs.
+# mutation job does not enable, so every mutant in it would be unviable here.
+# It is covered by the msquic-live and msquic-sanitizer jobs.
+#
+# This is a job configuration, not a tool limitation. Measured 2026-08-02 with
+# the exclusion removed and `--features live --timeout 120`: 277 mutants, 205
+# caught, 33 missed, 9 timeouts, 12 minutes. Promoting it needs those 33
+# classified and the timeouts understood first, and the job would have to build
+# MsQuic from source as the msquic-live job does.
 exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
 exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]

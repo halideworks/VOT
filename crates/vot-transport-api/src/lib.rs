@@ -107,6 +107,8 @@ pub enum Error {
     ArithmeticOverflow,
     Unsupported,
     Backend,
+    /// A peer used more lanes than this endpoint advertised it would carry.
+    LaneLimitExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -220,6 +222,113 @@ pub trait TransportAdapter {
     /// # Errors
     /// Reports a backend failure. Credit is absolute, not additive.
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error>;
+
+    /// Ends the session under a registered `spec/registries.md` close code,
+    /// for a peer that broke the protocol.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when the backend cannot signal a code.
+    fn close(&mut self, _code: u16) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    /// The limits this endpoint will hold a peer to, so a caller can check that
+    /// what it advertises is what the carrier enforces.
+    fn receive_limits(&self) -> Option<ReceiveLimits> {
+        None
+    }
+
+    /// Applies the peer's advertised control-frame limit to what is sent.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when the backend enforces no such bound,
+    /// and [`Error::InvalidConfiguration`] for a limit outside the protocol
+    /// range.
+    fn set_control_payload_limit(&mut self, _limit: usize) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+}
+
+/// What an endpoint advertises in `SETTINGS` and will be held to.
+///
+/// Built against the inbound queue that has to hold a frame, so an endpoint
+/// cannot advertise a limit its own backend would refuse. A frame inside the
+/// advertised bound but larger than the queue can hold is never deliverable:
+/// retrying cannot make it fit, and a driver treating a full queue as
+/// backpressure waits for ever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveLimits {
+    control_payload: usize,
+    lanes: usize,
+}
+
+impl ReceiveLimits {
+    /// Derives the limits from what a session will advertise.
+    ///
+    /// `inbound_byte_capacity` is the most the backend's inbound queue holds
+    /// for one event.
+    ///
+    /// # Errors
+    /// Rejects a control-frame limit outside the protocol range or larger than
+    /// the queue can hold with its envelope, and a lane limit that does not
+    /// fit.
+    pub fn advertised(
+        settings: &vot_codec::Settings,
+        inbound_byte_capacity: usize,
+    ) -> Result<Self, Error> {
+        // Against the registry rather than by hand, so a range copied here
+        // could not drift from the one the codec encodes and decodes under.
+        for (setting, value) in settings.advertised() {
+            if !vot_codec::setting_in_range(setting, value) {
+                return Err(Error::InvalidConfiguration);
+            }
+        }
+        let control_payload = usize::try_from(settings.max_control_frame_payload)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        validate_control_payload_limit(control_payload)?;
+        // Every frame the queue has to hold, not only the control one. A
+        // conforming record past the capacity is refused with an empty queue,
+        // and the driver holds it back as backpressure that never clears.
+        let record_payload = usize::try_from(settings.max_data_record_payload)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        for payload in [control_payload, record_payload] {
+            let wire = payload
+                .checked_add(MAX_FRAME_ENVELOPE_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if wire > inbound_byte_capacity {
+                return Err(Error::InvalidConfiguration);
+            }
+        }
+        let lanes = usize::try_from(settings.reliable_lane_limit)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        Ok(Self {
+            control_payload,
+            lanes,
+        })
+    }
+
+    /// The control-frame payload this endpoint will reassemble.
+    #[must_use]
+    pub const fn control_payload(self) -> usize {
+        self.control_payload
+    }
+
+    /// Peer lanes this endpoint will carry at once.
+    #[must_use]
+    pub const fn lanes(self) -> usize {
+        self.lanes
+    }
+
+    /// Whether these are the limits `settings` advertises.
+    ///
+    /// Advertising one thing while the carrier enforces another either refuses
+    /// conforming frames or accepts more than was promised, and neither shows
+    /// up without comparing every limit.
+    #[must_use]
+    pub fn match_settings(self, settings: &vot_codec::Settings) -> bool {
+        u64::try_from(self.control_payload) == Ok(settings.max_control_frame_payload)
+            && u64::try_from(self.lanes) == Ok(settings.reliable_lane_limit)
+    }
 }
 
 /// Sole source of truth for receiver staging usage and advertised credit.
@@ -301,6 +410,23 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+/// The most a backend may send under a peer's advertised limit.
+///
+/// The smaller of what the peer allows and what this endpoint can enqueue.
+/// Sending less than the peer permits is always allowed; a bound above the
+/// outbound queue is not, because a frame that large is refused at submission
+/// for ever and a caller reads that as backpressure that never clears.
+#[must_use]
+pub fn effective_send_limit(peer_limit: usize, outbound_byte_capacity: usize) -> usize {
+    // Never below the protocol minimum. A queue too small for one conforming
+    // frame reports backpressure; a limit under the minimum would instead make
+    // validate_control_frame reject every frame, including an empty PING, as a
+    // configuration error.
+    peer_limit
+        .min(outbound_byte_capacity.saturating_sub(MAX_FRAME_ENVELOPE_BYTES))
+        .max(MIN_CONTROL_FRAME_PAYLOAD)
 }
 
 /// Validates a negotiated control-frame payload limit.
@@ -437,6 +563,118 @@ mod tests {
     }
 
     #[test]
+    fn advertised_limits_have_to_fit_the_queue_that_holds_them() {
+        let settings = |control: u64, lanes: u64| vot_codec::Settings {
+            max_control_frame_payload: control,
+            reliable_lane_limit: lanes,
+            ..vot_codec::Settings::default()
+        };
+        let capacity = 4 * 1024 * 1024;
+        let largest = capacity - MAX_FRAME_ENVELOPE_BYTES;
+
+        let limits = ReceiveLimits::advertised(&settings(largest as u64, 16), capacity).unwrap();
+        assert_eq!(limits.control_payload(), largest);
+        assert_eq!(limits.lanes(), 16);
+        assert!(limits.match_settings(&settings(largest as u64, 16)));
+        assert!(!limits.match_settings(&settings(largest as u64, 15)));
+        assert!(!limits.match_settings(&settings(largest as u64 - 1, 16)));
+
+        // A record has to fit too. The minimum control frame is 1 KiB and the
+        // minimum record is 64 KiB, so a queue sized for the first alone
+        // refuses a conforming record with the queue empty.
+        assert_eq!(
+            ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: MIN_CONTROL_FRAME_PAYLOAD as u64,
+                    max_data_record_payload: 64 * 1024,
+                    ..vot_codec::Settings::default()
+                },
+                64 * 1024,
+            ),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(
+            ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: MIN_CONTROL_FRAME_PAYLOAD as u64,
+                    max_data_record_payload: 64 * 1024,
+                    ..vot_codec::Settings::default()
+                },
+                64 * 1024 + MAX_FRAME_ENVELOPE_BYTES,
+            )
+            .is_ok()
+        );
+
+        // One past what the queue holds is never deliverable, so it cannot be
+        // advertised.
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(largest as u64 + 1, 16), capacity),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            ReceiveLimits::advertised(
+                &settings(MIN_CONTROL_FRAME_PAYLOAD as u64 - 1, 16),
+                capacity
+            ),
+            Err(Error::InvalidConfiguration)
+        );
+        // Every registered range applies, from the codec's table rather than one
+        // copied here. Zero lanes leaves a peer unable to send anything, and
+        // one past the registry maximum is not a count the peer could encode.
+        for lanes in [0, 257] {
+            assert_eq!(
+                ReceiveLimits::advertised(&settings(largest as u64, lanes), capacity),
+                Err(Error::InvalidConfiguration),
+                "{lanes} lanes"
+            );
+        }
+        for lanes in [1_u64, 256] {
+            assert_eq!(
+                ReceiveLimits::advertised(&settings(largest as u64, lanes), capacity)
+                    .unwrap()
+                    .lanes(),
+                usize::try_from(lanes).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_send_bound_never_exceeds_what_the_backend_can_queue() {
+        // A peer allowing more than this endpoint can enqueue does not oblige
+        // it to send that much. A bound above the queue would refuse the frame
+        // at submission for ever, which a caller reads as backpressure.
+        let capacity = 4 * 1024 * 1024;
+        assert_eq!(
+            effective_send_limit(64 * 1024, capacity),
+            64 * 1024,
+            "a peer under the capacity is taken as it stands"
+        );
+        assert_eq!(
+            effective_send_limit(16 * 1024 * 1024, capacity),
+            capacity - MAX_FRAME_ENVELOPE_BYTES,
+            "and one over it is clamped to what fits"
+        );
+        assert_eq!(
+            effective_send_limit(capacity - MAX_FRAME_ENVELOPE_BYTES, capacity),
+            capacity - MAX_FRAME_ENVELOPE_BYTES
+        );
+        // Never below the protocol minimum, so the clamp always yields a
+        // limit the protocol allows.
+        assert_eq!(effective_send_limit(1024, 0), MIN_CONTROL_FRAME_PAYLOAD);
+        assert_eq!(
+            effective_send_limit(
+                MIN_CONTROL_FRAME_PAYLOAD,
+                MIN_CONTROL_FRAME_PAYLOAD + MAX_FRAME_ENVELOPE_BYTES - 1
+            ),
+            MIN_CONTROL_FRAME_PAYLOAD
+        );
+        assert_eq!(
+            validate_control_payload_limit(effective_send_limit(1024, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn invalid_capacity_configuration_is_rejected() {
         assert_eq!(
             StagingCapacity::new(0, 1, 1),
@@ -503,6 +741,19 @@ mod tests {
         );
         assert_eq!(adapter.flush(), Ok(()));
         assert_eq!(adapter.path_stats(), None);
+
+        // Defaulting these to success would let a caller believe a limit was
+        // applied, or a peer told why the session ended, when neither
+        // happened.
+        assert_eq!(
+            adapter.close(vot_codec::error_code::MALFORMED_FRAME),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(adapter.receive_limits(), None);
+        assert_eq!(
+            adapter.set_control_payload_limit(MAX_CONTROL_FRAME_PAYLOAD),
+            Err(Error::Unsupported)
+        );
 
         adapter.events.push_back(Event::Connected(ConnectionId(1)));
         adapter

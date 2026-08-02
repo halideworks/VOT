@@ -674,14 +674,6 @@ pub fn receive_bundle(
     key: &KeyMaterial,
     observed_at: &str,
 ) -> Result<ReceiveReport, Error> {
-    // Receiving ends in publication, which needs a private key. Checking here
-    // rather than at signing time matters: by then the whole bundle has been
-    // copied into staging, and nothing removes that tree on the way out, so a
-    // misconfigured key would leave a full hidden copy of the package behind
-    // and another one for every retry.
-    if matches!(key, KeyMaterial::Verifying(_)) {
-        return Err(Error::InvalidArguments);
-    }
     let receipt_summary_path = receipt_path.with_extension("json");
     if receipt_path == receipt_summary_path {
         return Err(Error::InvalidArguments);
@@ -705,6 +697,17 @@ pub fn receive_bundle(
             });
         }
         return Err(Error::DestinationExists);
+    }
+    // Everything from here signs a new receipt, which needs a private key.
+    // Checking here rather than at signing time matters: by then the whole
+    // bundle has been copied into staging, and nothing removes that tree on the
+    // way out, so a misconfigured key would leave a full hidden copy of the
+    // package behind and another one for every retry. It cannot move any
+    // earlier: recovering an interrupted publication only verifies a receipt
+    // that is already signed, so an operator holding just the public key has to
+    // be able to finish one.
+    if matches!(key, KeyMaterial::Verifying(_)) {
+        return Err(Error::InvalidArguments);
     }
     if receipt_path.exists() {
         return Err(Error::DestinationExists);
@@ -2768,6 +2771,60 @@ mod tests {
         fs::remove_dir_all(&bundle).unwrap();
         fs::remove_file(&receipt).unwrap();
         fs::remove_file(receipt.with_extension("json")).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_can_finish_an_interrupted_publication() {
+        // Recovery only checks a receipt that is already signed, so refusing
+        // the public key here would strand an operator who holds nothing else
+        // with a published destination and no way to finalise its receipt.
+        let source = temporary("verify-only-recover-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![3; 4096]).unwrap();
+        let bundle = temporary("verify-only-recover.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-recover-dest");
+        let receipt = temporary("verify-only-recover-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &KeyMaterial::Signing(Box::new(signing.clone())),
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+
+        // Put the run back into the state a crash between the rename and the
+        // receipt finalisation leaves behind.
+        let package = scan_manifest(&bundle).unwrap();
+        let (prepared_receipt, prepared_summary) =
+            prepared_receipt_paths(&receipt, &summary, &package).unwrap();
+        fs::rename(&receipt, &prepared_receipt).unwrap();
+        fs::rename(&summary, &prepared_summary).unwrap();
+
+        let auditing = KeyMaterial::Verifying(Box::new(signing.verifying_key()));
+        let report = receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &auditing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(report.peak_staging, 0);
+        assert!(receipt.exists());
+        assert!(summary.exists());
+        assert!(!prepared_receipt.exists());
+        assert!(!prepared_summary.exists());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(&summary).unwrap();
     }
 
     #[test]

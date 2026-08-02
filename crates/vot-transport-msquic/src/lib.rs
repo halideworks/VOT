@@ -546,7 +546,10 @@ pub mod live {
                 move |_: ConnectionRef, event: ConnectionEvent| {
                     match event {
                         ConnectionEvent::Connected { .. } => {
-                            let _ = push(&callback_inbound, NativeEvent::Connected(connection_id));
+                            push_lifecycle(
+                                &callback_inbound,
+                                NativeEvent::Connected(connection_id),
+                            );
                         }
                         ConnectionEvent::PeerStreamStarted { stream, .. } => {
                             // Without adopting these there is no receive path
@@ -564,8 +567,16 @@ pub mod live {
                             ));
                         }
                         ConnectionEvent::ShutdownComplete { .. } => {
-                            let _ =
-                                push(&callback_inbound, NativeEvent::Disconnected(connection_id));
+                            // Admitted past the data bound. A saturated queue is
+                            // exactly when the connection is most likely to be
+                            // torn down, and a driver that never learns it
+                            // closed waits on a connection that is gone while
+                            // the adapter keeps path statistics for a path that
+                            // no longer exists.
+                            push_lifecycle(
+                                &callback_inbound,
+                                NativeEvent::Disconnected(connection_id),
+                            );
                             // Teardown waits on this before releasing the
                             // handle, so a send buffer cannot outlive it.
                             let _ = closed_tx.send(());
@@ -615,21 +626,38 @@ pub mod live {
         /// Moves native events into the adapter, stopping at the first the
         /// bounded queue will not take.
         fn pump(&mut self) {
-            if let Some(held) = self.stalled.take() {
-                if let Err((held, _)) = self.adapter.try_record_native_event(held) {
-                    self.stalled = Some(held);
+            if let Some(held) = self.stalled.take()
+                && !self.offer(held)
+            {
+                return;
+            }
+            while let Some(event) = pop(&self.inbound) {
+                if !self.offer(event) {
                     return;
                 }
             }
-            loop {
-                let Some(event) = pop(&self.inbound) else {
-                    return;
-                };
-                if let Err((event, _)) = self.adapter.try_record_native_event(event) {
+        }
+
+        /// Offers one event to the adapter. Returns false when pumping stops.
+        ///
+        /// A full queue is the only refusal worth waiting on, because it is the
+        /// only one that clears. Every other refusal means the event can never
+        /// be admitted, and holding it would wedge the head of the queue for
+        /// ever, so the connection ends rather than stalling in silence.
+        fn offer(&mut self, event: NativeEvent) -> bool {
+            match self.adapter.try_record_native_event(event) {
+                Ok(()) => true,
+                Err((event, Error::InboundQueueFull)) => {
                     // Held rather than dropped, so backpressure never costs a
                     // record and never reorders one.
                     self.stalled = Some(event);
-                    return;
+                    false
+                }
+                Err(_) => {
+                    if let Some(connection) = self.connection.as_ref() {
+                        connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
+                    }
+                    false
                 }
             }
         }
@@ -690,9 +718,9 @@ pub mod live {
         /// Adds received bytes and returns every complete frame now available.
         ///
         /// # Errors
-        /// Reports a frame that can never complete, either because it is
-        /// malformed or because it exceeds the largest frame this lane allows,
-        /// which would otherwise stall the stream for ever.
+        /// Reports a frame this lane cannot carry, either because it is
+        /// malformed, because it is larger than the lane allows, or because it
+        /// can never complete, all of which would otherwise stall the stream.
         fn accept(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
             self.pending.extend_from_slice(bytes);
             let limits = vot_codec::DecodeLimits {
@@ -704,6 +732,14 @@ pub mod live {
             loop {
                 match vot_codec::decode_one(&self.pending[offset..], limits) {
                     Ok((_, consumed)) => {
+                        // The codec bounds a known frame by its registered
+                        // limit, which for PROOF_BUNDLE and HAVE is larger than
+                        // this lane carries. Without this the frame decodes,
+                        // reaches the adapter, is refused there as oversized,
+                        // and is retried for ever at the head of the queue.
+                        if consumed > self.kind.partial_frame_limit() {
+                            return Err(Error::RecordTooLarge);
+                        }
                         frames.push(self.pending[offset..offset + consumed].to_vec());
                         offset += consumed;
                     }
@@ -844,6 +880,19 @@ pub mod live {
         }
         queue.push_back(event);
         true
+    }
+
+    /// Queues a connection lifecycle event past the data bound.
+    ///
+    /// `Connected` and `Disconnected` carry no payload and arrive at most once
+    /// each per connection, so admitting them past the bound adds two entries
+    /// rather than unbounded growth. The bound exists to stop a fast peer
+    /// outrunning the driver, and neither of these comes from the peer's data.
+    /// Dropping one is not survivable, so it is not treated as backpressure.
+    fn push_lifecycle(queue: &Arc<Mutex<VecDeque<NativeEvent>>>, event: NativeEvent) {
+        if let Ok(mut queue) = queue.lock() {
+            queue.push_back(event);
+        }
     }
 
     fn pop(queue: &Arc<Mutex<VecDeque<NativeEvent>>>) -> Option<NativeEvent> {
@@ -1053,9 +1102,11 @@ pub mod live {
 
         use super::{Framing, MsQuicTransport, StreamKind};
 
+        use std::collections::VecDeque;
+
         use super::super::{
-            Command as AdapterCommand, MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter,
-            NativeEvent,
+            Command as AdapterCommand, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME,
+            MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent,
         };
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
         use vot_transport_api::{
@@ -1066,6 +1117,42 @@ pub mod live {
             let mut frame = Vec::new();
             vot_codec::encode_frame(frame_type, payload, &mut frame).unwrap();
             frame
+        }
+
+        #[test]
+        fn a_saturated_callback_queue_still_reports_the_disconnect() {
+            // A queue is most likely to be full exactly when the connection is
+            // being torn down. Dropping the disconnect there leaves the driver
+            // waiting on a connection that is gone, holding path statistics for
+            // a path that no longer exists.
+            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            for _ in 0..MAX_CALLBACK_EVENTS {
+                assert!(super::push(
+                    &queue,
+                    NativeEvent::Reliable {
+                        stream: 1,
+                        sequence: 1,
+                        bytes: b"record".to_vec(),
+                    }
+                ));
+            }
+            assert!(
+                !super::push(
+                    &queue,
+                    NativeEvent::Reliable {
+                        stream: 1,
+                        sequence: 2,
+                        bytes: b"record".to_vec(),
+                    }
+                ),
+                "records are refused once the bound is reached"
+            );
+
+            super::push_lifecycle(&queue, NativeEvent::Disconnected(11));
+            assert_eq!(
+                queue.lock().unwrap().back(),
+                Some(&NativeEvent::Disconnected(11))
+            );
         }
 
         #[test]
@@ -1121,6 +1208,30 @@ pub mod live {
             let head = frame.len() - 1;
             assert!(control.accept(&frame[..head]).unwrap().is_empty());
             assert_eq!(control.accept(&frame[head..]).unwrap(), vec![frame]);
+        }
+
+        #[test]
+        fn a_frame_larger_than_its_lane_is_refused_even_when_the_codec_allows_it() {
+            // decode_one bounds a known frame by its registered limit, and
+            // PROOF_BUNDLE and HAVE are registered far above what either lane
+            // carries. Letting one through would decode cleanly, be refused by
+            // the adapter as oversized, and then be retried for ever.
+            let oversized = framed(
+                vot_codec::frame_type::HAVE,
+                &vec![0x33; MAX_PARTIAL_CONTROL_FRAME],
+            );
+            assert!(
+                vot_codec::decode_one(&oversized, vot_codec::DecodeLimits::default()).is_ok(),
+                "the codec accepts this frame, which is what makes the lane check necessary"
+            );
+            assert!(matches!(
+                Framing::new(StreamKind::Control).accept(&oversized),
+                Err(Error::RecordTooLarge)
+            ));
+            assert!(matches!(
+                Framing::new(StreamKind::Reliable { lane: 1 }).accept(&oversized),
+                Err(Error::RecordTooLarge)
+            ));
         }
 
         #[test]

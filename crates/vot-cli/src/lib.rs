@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use vot_manifest::{
     Component, EntryKind, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment,
     PathProfile, Seal, StorageRef, canonical_path_key, decode_page, decode_seal, encode_page,
@@ -13,8 +14,9 @@ use vot_manifest::{
 };
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 use vot_receipt::{
-    AssuranceLevel, CommitProfile, Receipt, SubjectKind, authenticate_hmac_sha256,
-    decode_authenticated, encode_authenticated, verify_hmac_sha256,
+    AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
+    authenticate_hmac_sha256, decode_authenticated, encode_authenticated, sign_ed25519,
+    verify_ed25519, verify_hmac_sha256,
 };
 use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
@@ -669,7 +671,7 @@ pub fn receive_bundle(
     bundle: &Path,
     destination: &Path,
     receipt_path: &Path,
-    key: &[u8],
+    key: &KeyMaterial,
     observed_at: &str,
 ) -> Result<ReceiveReport, Error> {
     let receipt_summary_path = receipt_path.with_extension("json");
@@ -704,6 +706,18 @@ pub fn receive_bundle(
     }
     let existing_preparation =
         existing_prepared_receipts(receipt_path, &receipt_summary_path, &expected, key)?;
+    // A receipt is signed below only when an interrupted run did not already
+    // leave one, so that is exactly when a private key is required. Checking
+    // here rather than at signing time matters: by then the whole bundle has
+    // been copied into staging, and nothing removes that tree on the way out,
+    // so a misconfigured key would leave a full hidden copy of the package
+    // behind and another one for every retry. It cannot move any earlier
+    // either, because reusing or recovering a prepared receipt only verifies
+    // one that is already signed, and an operator holding just the public key
+    // has to be able to finish those.
+    if existing_preparation.is_none() && matches!(key, KeyMaterial::Verifying(_)) {
+        return Err(Error::InvalidArguments);
+    }
     let mut manifest = ManifestReader::open(bundle)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
@@ -774,7 +788,7 @@ pub fn receive_bundle(
     } else {
         let freshness = fresh_receipt_identifiers()?;
         let receipt = publication_receipt(&actual, observed_at, freshness);
-        let authenticated = authenticate_hmac_sha256(receipt, b"vot-cli", key)?;
+        let authenticated = key.sign(receipt)?;
         let encoded = encode_authenticated(&authenticated)?;
         let summary = receipt_summary_bytes(&actual);
         let suffix = object_name(&actual.root);
@@ -1308,7 +1322,7 @@ fn existing_prepared_receipts(
     receipt: &Path,
     summary: &Path,
     package: &PackageSummary,
-    key: &[u8],
+    key: &KeyMaterial,
 ) -> Result<Option<(PathBuf, PathBuf)>, Error> {
     let (prepared_receipt, prepared_summary) = prepared_receipt_paths(receipt, summary, package)?;
     match (prepared_receipt.exists(), prepared_summary.exists()) {
@@ -1325,7 +1339,7 @@ fn recover_prepared_receipts(
     receipt: &Path,
     summary: &Path,
     package: &PackageSummary,
-    key: &[u8],
+    key: &KeyMaterial,
 ) -> Result<bool, Error> {
     let (prepared_receipt, prepared_summary) = prepared_receipt_paths(receipt, summary, package)?;
     let receipt_prepared = prepared_receipt.exists();
@@ -1370,26 +1384,82 @@ fn remove_preparation(prepared: &Path) -> Result<(), Error> {
     }
 }
 
-fn validate_receipt_files(
-    receipt_path: &Path,
-    summary_path: &Path,
-    package: &PackageSummary,
-    key: &[u8],
-) -> Result<(), Error> {
-    let encoded = read_bounded_file(receipt_path, 65_536)?;
-    let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
-    verify_hmac_sha256(&authenticated, key).map_err(|_| Error::InvalidBundle)?;
+/// Every field a CLI publication receipt must carry, whichever package it is
+/// about.
+///
+/// Shared by the bundle check and the auditor's command so the two cannot
+/// disagree about what counts as a publication.
+fn validate_publication_shape(authenticated: &AuthenticatedReceipt) -> Result<(), Error> {
     let receipt = &authenticated.receipt;
-    if authenticated.key_id != b"vot-cli"
+    // The key identifier separates contexts here, so it has to be authentic.
+    // vot-receipt binds it into the signed input for that reason; if it ever
+    // stopped, a receipt this issuer signed for something else could be
+    // relabelled and would pass this check.
+    if authenticated.key_id != KEY_ID
         || receipt.subject_kind != SubjectKind::Package
         || receipt.suite_id != 1
-        || receipt.subject_digest != package.root
-        || receipt.subject_length != package.logical_length
         || receipt.assurance != AssuranceLevel::Published
         || receipt.profile != CommitProfile::Fast
         || receipt.actual_predecessor != AssuranceLevel::TransitVerified
         || receipt.provider != 1
     {
+        return Err(Error::InvalidBundle);
+    }
+    Ok(())
+}
+
+/// Checks a receipt with nothing but the issuer's public key.
+///
+/// This is the auditor's position, and the reason receipts moved to Ed25519: a
+/// party holding only the public half can confirm what was published without
+/// being able to produce a receipt of its own. Handing a shared secret to an
+/// auditor would have made them capable of both.
+///
+/// # Errors
+/// Rejects an unreadable or malformed receipt, one that does not verify, or a
+/// key that cannot check the scheme the receipt was made with.
+pub fn verify_receipt_file(
+    receipt_path: &Path,
+    key: &KeyMaterial,
+) -> Result<VerifiedReceipt, Error> {
+    let encoded = read_bounded_file(receipt_path, 65_536)?;
+    let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
+    key.verify(&authenticated)?;
+    // A valid signature says who wrote the receipt, not what it claims. Without
+    // the shape check an issuer's signature over any lower observation, or over
+    // an object rather than a package, would print as a published package.
+    validate_publication_shape(&authenticated)?;
+    Ok(VerifiedReceipt {
+        root: authenticated.receipt.subject_digest,
+        logical_length: authenticated.receipt.subject_length,
+        assurance: authenticated.receipt.assurance,
+        third_party_verifiable: key.is_third_party_verifiable(),
+    })
+}
+
+/// What a checked receipt says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedReceipt {
+    pub root: [u8; 32],
+    pub logical_length: u64,
+    pub assurance: AssuranceLevel,
+    /// False when the check used a shared secret, so the caller can say whether
+    /// the result means anything to a third party.
+    pub third_party_verifiable: bool,
+}
+
+fn validate_receipt_files(
+    receipt_path: &Path,
+    summary_path: &Path,
+    package: &PackageSummary,
+    key: &KeyMaterial,
+) -> Result<(), Error> {
+    let encoded = read_bounded_file(receipt_path, 65_536)?;
+    let authenticated = decode_authenticated(&encoded).map_err(|_| Error::InvalidBundle)?;
+    key.verify(&authenticated)?;
+    validate_publication_shape(&authenticated)?;
+    let receipt = &authenticated.receipt;
+    if receipt.subject_digest != package.root || receipt.subject_length != package.logical_length {
         return Err(Error::InvalidBundle);
     }
     let summary = read_bounded_file(summary_path, 4096)?;
@@ -1494,11 +1564,56 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// What a loaded key can do.
+///
+/// A shared secret can sign and verify, but only inside one trust domain: a
+/// holder can forge as well as check. A signing key produces receipts anyone
+/// with the public half can check. A verifying key can only check, which is
+/// exactly the auditor's position and the case the product exists for.
+#[derive(Clone, Debug)]
+pub enum KeyMaterial {
+    Signing(Box<SigningKey>),
+    Verifying(Box<VerifyingKey>),
+    Shared(Vec<u8>),
+}
+
+impl KeyMaterial {
+    /// Whether a receipt made with this key can be checked by a party that
+    /// cannot also produce one.
+    #[must_use]
+    pub const fn is_third_party_verifiable(&self) -> bool {
+        matches!(self, Self::Signing(_) | Self::Verifying(_))
+    }
+
+    fn sign(&self, receipt: vot_receipt::Receipt) -> Result<AuthenticatedReceipt, Error> {
+        match self {
+            Self::Signing(key) => Ok(sign_ed25519(receipt, KEY_ID, key)?),
+            Self::Shared(secret) => Ok(authenticate_hmac_sha256(receipt, KEY_ID, secret)?),
+            // Publishing needs a private key. Failing here beats writing a
+            // receipt nobody can check.
+            Self::Verifying(_) => Err(Error::InvalidArguments),
+        }
+    }
+
+    fn verify(&self, authenticated: &AuthenticatedReceipt) -> Result<(), Error> {
+        match self {
+            Self::Signing(key) => verify_ed25519(authenticated, &key.verifying_key()),
+            Self::Verifying(key) => verify_ed25519(authenticated, key),
+            Self::Shared(secret) => verify_hmac_sha256(authenticated, secret),
+        }
+        .map_err(|_| Error::InvalidBundle)
+    }
+}
+
+const KEY_ID: &[u8] = b"vot-cli";
+const ED25519_KEY_BYTES: usize = 32;
+const SECRET_KEY_PREFIX: &str = "ed25519-secret:";
+const PUBLIC_KEY_PREFIX: &str = "ed25519-public:";
 const MIN_HMAC_KEY_BYTES: usize = 32;
 const MAX_HMAC_KEY_BYTES: usize = 64;
 const HEX_KEY_PREFIX: &str = "hex:";
 const RAW_KEY_PREFIX: &str = "raw:";
-const MAX_KEY_SOURCE_BYTES: usize = HEX_KEY_PREFIX.len() + 2 * MAX_HMAC_KEY_BYTES + 1;
+const MAX_KEY_SOURCE_BYTES: usize = SECRET_KEY_PREFIX.len() + 2 * MAX_HMAC_KEY_BYTES + 1;
 
 pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
     if value.len() % 2 != 0 || value.len() > 2 * MAX_HMAC_KEY_BYTES {
@@ -1537,7 +1652,7 @@ const fn hex(value: u8) -> Option<u8> {
 /// preserved byte-for-byte; hexadecimal text must use the explicit hex:
 /// prefix, and textual raw keys may use raw:. Keys must contain 32..=64
 /// bytes. Source reads are bounded to `MAX_KEY_SOURCE_BYTES` bytes.
-pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
+pub fn load_key_spec(spec: &str) -> Result<KeyMaterial, Error> {
     let bytes = if let Some(name) = spec.strip_prefix("env:") {
         if name.is_empty() {
             return Err(Error::InvalidArguments);
@@ -1570,16 +1685,46 @@ fn read_key_source(reader: impl Read) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
-fn parse_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
+fn parse_loaded_key(bytes: Vec<u8>) -> Result<KeyMaterial, Error> {
     if let Ok(text) = std::str::from_utf8(&bytes) {
+        // An Ed25519 key is labelled, because 32 bytes of secret and 32 bytes
+        // of public key are indistinguishable and using one as the other would
+        // either leak a secret or produce receipts nobody can check.
+        if let Some(encoded) = text.strip_prefix(SECRET_KEY_PREFIX) {
+            let seed = decode_fixed_key(encoded.trim())?;
+            return Ok(KeyMaterial::Signing(Box::new(SigningKey::from_bytes(
+                &seed,
+            ))));
+        }
+        if let Some(encoded) = text.strip_prefix(PUBLIC_KEY_PREFIX) {
+            let public = decode_fixed_key(encoded.trim())?;
+            let key = VerifyingKey::from_bytes(&public).map_err(|_| Error::InvalidArguments)?;
+            return Ok(KeyMaterial::Verifying(Box::new(key)));
+        }
         if let Some(encoded) = text.strip_prefix(HEX_KEY_PREFIX) {
-            return decode_key(encoded.trim());
+            return Ok(KeyMaterial::Shared(decode_key(encoded.trim())?));
         }
         if let Some(raw) = text.strip_prefix(RAW_KEY_PREFIX) {
-            return validate_loaded_key(raw.as_bytes().to_vec());
+            return Ok(KeyMaterial::Shared(validate_loaded_key(
+                raw.as_bytes().to_vec(),
+            )?));
         }
     }
-    validate_loaded_key(bytes)
+    Ok(KeyMaterial::Shared(validate_loaded_key(bytes)?))
+}
+
+/// Decodes exactly one Ed25519 key's worth of hex.
+fn decode_fixed_key(value: &str) -> Result<[u8; ED25519_KEY_BYTES], Error> {
+    if value.len() != 2 * ED25519_KEY_BYTES {
+        return Err(Error::InvalidArguments);
+    }
+    let mut output = [0_u8; ED25519_KEY_BYTES];
+    for (slot, pair) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = hex(pair[0]).ok_or(Error::InvalidArguments)?;
+        let low = hex(pair[1]).ok_or(Error::InvalidArguments)?;
+        *slot = high * 16 + low;
+    }
+    Ok(output)
 }
 
 fn validate_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
@@ -1591,6 +1736,20 @@ fn validate_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// Wraps a raw secret as shared key material, which is what these tests
+    /// used before receipts gained a scheme.
+    fn shared(bytes: &[u8]) -> KeyMaterial {
+        KeyMaterial::Shared(bytes.to_vec())
+    }
+
+    /// The secret inside shared key material, for the loader tests.
+    fn loaded_secret(key: &KeyMaterial) -> Vec<u8> {
+        match key {
+            KeyMaterial::Shared(bytes) => bytes.clone(),
+            other => panic!("expected a shared secret, got {other:?}"),
+        }
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1648,7 +1807,7 @@ mod tests {
             &bundle,
             &destination,
             &receipt,
-            &[7; 32],
+            &shared(&[7; 32]),
             "2026-07-31T23:59:59Z",
         )
         .unwrap();
@@ -1705,7 +1864,7 @@ mod tests {
                 &bundle,
                 &destination,
                 &receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             )
             .is_err()
@@ -1731,7 +1890,13 @@ mod tests {
         fs::write(source.join("file"), b"contents").unwrap();
         build_bundle(&source, &bundle).unwrap();
         assert!(matches!(
-            receive_bundle(&bundle, &destination, &receipt, &[7; 32], "not-rfc3339"),
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &shared(&[7; 32]),
+                "not-rfc3339"
+            ),
             Err(Error::Receipt(vot_receipt::Error::InvalidTimestamp))
         ));
         assert!(!destination.exists());
@@ -1760,7 +1925,7 @@ mod tests {
                 &bundle,
                 &destination,
                 &receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::Io(_))
@@ -1779,7 +1944,7 @@ mod tests {
                 &bundle,
                 &collision_destination,
                 &collision_receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::InvalidArguments)
@@ -1796,7 +1961,7 @@ mod tests {
                 &bundle,
                 &existing_summary_destination,
                 &existing_summary_receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::DestinationExists)
@@ -1871,14 +2036,15 @@ mod tests {
         receipt: &Path,
         summary: &Path,
         package: &PackageSummary,
-        key: &[u8],
+        key: &KeyMaterial,
     ) -> (PreparedFile, PreparedFile) {
-        let authenticated = authenticate_hmac_sha256(
-            publication_receipt(package, "2026-07-31T23:59:59Z", [5; 32]),
-            b"vot-cli",
-            key,
-        )
-        .unwrap();
+        let authenticated = key
+            .sign(publication_receipt(
+                package,
+                "2026-07-31T23:59:59Z",
+                [5; 32],
+            ))
+            .unwrap();
         let encoded = encode_authenticated(&authenticated).unwrap();
         let suffix = object_name(&package.root);
         let suffix = suffix.strip_suffix(".obj").unwrap();
@@ -1903,7 +2069,7 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         let (mut prepared_receipt, mut prepared_summary) =
             prepared_evidence(&receipt, &summary, &package, &key);
         prepared_receipt.preserve_for_recovery();
@@ -1939,7 +2105,7 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("file"), b"published").unwrap();
         let (prepared_receipt, prepared_summary) =
@@ -1981,7 +2147,9 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        assert!(!recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]).unwrap());
+        assert!(
+            !recover_prepared_receipts(&receipt, &summary, &package, &shared(&[9; 32])).unwrap()
+        );
     }
 
     #[test]
@@ -1991,7 +2159,7 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         for remove_receipt_preparation in [false, true] {
             let receipt = temporary(&format!(
                 "partial-cleanup-{remove_receipt_preparation}.cbor"
@@ -2029,7 +2197,7 @@ mod tests {
         };
         let suffix = object_name(&package.root);
         let suffix = suffix.strip_suffix(".obj").unwrap();
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
 
         let receipt = temporary("only-receipt.cbor");
         let summary = receipt.with_extension("json");
@@ -2104,14 +2272,14 @@ mod tests {
         let receipt = temporary("wrong-key-receipt.cbor");
         let summary = receipt.with_extension("json");
         let (mut prepared_receipt, mut prepared_summary) =
-            prepared_evidence(&receipt, &summary, &package, &[8; 32]);
+            prepared_evidence(&receipt, &summary, &package, &shared(&[8; 32]));
         prepared_receipt.preserve_for_recovery();
         prepared_summary.preserve_for_recovery();
         let prepared_receipt_path = prepared_receipt.path().unwrap();
         let prepared_summary_path = prepared_summary.path().unwrap();
         drop((prepared_receipt, prepared_summary));
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]),
+            recover_prepared_receipts(&receipt, &summary, &package, &shared(&[9; 32])),
             Err(Error::InvalidBundle)
         ));
         assert!(!receipt.exists());
@@ -2122,7 +2290,7 @@ mod tests {
         fs::remove_file(&prepared_receipt_path).unwrap();
         fs::remove_file(&prepared_summary_path).unwrap();
         let (mut prepared_receipt, mut prepared_summary) =
-            prepared_evidence(&receipt, &summary, &package, &[9; 32]);
+            prepared_evidence(&receipt, &summary, &package, &shared(&[9; 32]));
         prepared_receipt.preserve_for_recovery();
         prepared_summary.preserve_for_recovery();
         let prepared_receipt_path = prepared_receipt.path().unwrap();
@@ -2130,7 +2298,7 @@ mod tests {
         drop((prepared_receipt, prepared_summary));
         fs::write(&prepared_summary_path, b"{\"root\":\"wrong\"}\n").unwrap();
         assert!(matches!(
-            recover_prepared_receipts(&receipt, &summary, &package, &[9; 32]),
+            recover_prepared_receipts(&receipt, &summary, &package, &shared(&[9; 32])),
             Err(Error::InvalidBundle)
         ));
         assert!(!receipt.exists());
@@ -2146,7 +2314,7 @@ mod tests {
             logical_length: 7,
             entries: 1,
         };
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         let base = publication_receipt(&package, "2026-07-31T23:59:59Z", [5; 32]);
         let mut cases = Vec::new();
 
@@ -2178,7 +2346,7 @@ mod tests {
         for (index, wrong) in cases.into_iter().enumerate() {
             let receipt = temporary(&format!("wrong-field-{index}.cbor"));
             let summary = receipt.with_extension("json");
-            let authenticated = authenticate_hmac_sha256(wrong, b"vot-cli", &key).unwrap();
+            let authenticated = authenticate_hmac_sha256(wrong, b"vot-cli", &[9; 32]).unwrap();
             fs::write(&receipt, encode_authenticated(&authenticated).unwrap()).unwrap();
             fs::write(&summary, receipt_summary_bytes(&package)).unwrap();
             assert!(matches!(
@@ -2194,7 +2362,7 @@ mod tests {
         let authenticated = authenticate_hmac_sha256(
             publication_receipt(&package, "2026-07-31T23:59:59Z", [5; 32]),
             b"another-key",
-            &key,
+            &[9; 32],
         )
         .unwrap();
         fs::write(&receipt, encode_authenticated(&authenticated).unwrap()).unwrap();
@@ -2216,7 +2384,7 @@ mod tests {
         };
         let receipt = temporary("live-receipt.cbor");
         let summary = receipt.with_extension("json");
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         let (prepared_receipt, prepared_summary) =
             prepared_evidence(&receipt, &summary, &package, &key);
         let paths = existing_prepared_receipts(&receipt, &summary, &package, &key)
@@ -2225,7 +2393,7 @@ mod tests {
         assert!(paths.0.exists());
         assert!(paths.1.exists());
         assert!(matches!(
-            existing_prepared_receipts(&receipt, &summary, &package, &[8; 32]),
+            existing_prepared_receipts(&receipt, &summary, &package, &shared(&[8; 32])),
             Err(Error::InvalidBundle)
         ));
         assert!(paths.0.exists());
@@ -2313,7 +2481,7 @@ mod tests {
             &bundle,
             &destination,
             &receipt,
-            &[7; 32],
+            &shared(&[7; 32]),
             "2026-07-31T23:59:59Z",
         )
         .unwrap();
@@ -2434,8 +2602,370 @@ mod tests {
     }
 
     #[test]
+    fn an_auditor_with_only_the_public_key_can_check_a_receipt() {
+        // The whole reason receipts moved to Ed25519. The issuer publishes with
+        // a private key; the auditor holds only the public half.
+        let issuer = SigningKey::from_bytes(&[42; 32]);
+        let signing = KeyMaterial::Signing(Box::new(issuer.clone()));
+        let auditing = KeyMaterial::Verifying(Box::new(issuer.verifying_key()));
+
+        let package = PackageSummary {
+            root: [0x33; 32],
+            logical_length: 4096,
+            entries: 1,
+        };
+        let receipt_path = temporary("auditor-receipt.cbor");
+        let authenticated = signing
+            .sign(publication_receipt(
+                &package,
+                "2026-08-02T00:00:00Z",
+                [5; 32],
+            ))
+            .unwrap();
+        fs::write(&receipt_path, encode_authenticated(&authenticated).unwrap()).unwrap();
+
+        let verified = verify_receipt_file(&receipt_path, &auditing).unwrap();
+        assert_eq!(verified.root, package.root);
+        assert_eq!(verified.logical_length, package.logical_length);
+        assert_eq!(verified.assurance, AssuranceLevel::Published);
+        assert!(verified.third_party_verifiable);
+
+        // A signature only says who wrote the receipt. An observation that is
+        // not a package publication must not print as one, however valid the
+        // signature over it is.
+        for wrong in [
+            Receipt {
+                subject_kind: SubjectKind::Object,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                assurance: AssuranceLevel::TransitVerified,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                actual_predecessor: AssuranceLevel::Admitted,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                profile: CommitProfile::Strict,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                suite_id: 2,
+                ..authenticated.receipt.clone()
+            },
+            Receipt {
+                provider: 2,
+                ..authenticated.receipt.clone()
+            },
+        ] {
+            let path = temporary("wrong-observation.cbor");
+            let signed = signing.sign(wrong).unwrap();
+            fs::write(&path, encode_authenticated(&signed).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    verify_receipt_file(&path, &auditing),
+                    Err(Error::InvalidBundle)
+                ),
+                "a non-publication observation was accepted"
+            );
+            fs::remove_file(&path).unwrap();
+        }
+
+        // The auditor cannot produce one, which is the point.
+        assert!(matches!(
+            auditing.sign(publication_receipt(
+                &package,
+                "2026-08-02T00:00:00Z",
+                [5; 32]
+            )),
+            Err(Error::InvalidArguments)
+        ));
+
+        // Another issuer's public key does not verify it.
+        let stranger = SigningKey::from_bytes(&[43; 32]);
+        let wrong = KeyMaterial::Verifying(Box::new(stranger.verifying_key()));
+        assert!(matches!(
+            verify_receipt_file(&receipt_path, &wrong),
+            Err(Error::InvalidBundle)
+        ));
+
+        // A shared secret checks, but says so, because that result means
+        // nothing to a third party.
+        let secret = shared(&[9; 32]);
+        let maced = temporary("auditor-hmac.cbor");
+        fs::write(
+            &maced,
+            encode_authenticated(
+                &secret
+                    .sign(publication_receipt(
+                        &package,
+                        "2026-08-02T00:00:00Z",
+                        [5; 32],
+                    ))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !verify_receipt_file(&maced, &secret)
+                .unwrap()
+                .third_party_verifiable
+        );
+        // And the two schemes do not check each other.
+        assert!(matches!(
+            verify_receipt_file(&maced, &auditing),
+            Err(Error::InvalidBundle)
+        ));
+        assert!(matches!(
+            verify_receipt_file(&receipt_path, &secret),
+            Err(Error::InvalidBundle)
+        ));
+
+        fs::remove_file(&receipt_path).unwrap();
+        fs::remove_file(&maced).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_is_refused_before_anything_is_staged() {
+        // Failing at signing time would already have copied the whole bundle
+        // into staging, and nothing removes that tree, so every retry would
+        // leave another hidden copy of the package on disk.
+        let source = temporary("verify-only-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![7; 4096]).unwrap();
+        let bundle = temporary("verify-only.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-dest");
+        let receipt = temporary("verify-only-receipt.cbor");
+        let auditing =
+            KeyMaterial::Verifying(Box::new(SigningKey::from_bytes(&[42; 32]).verifying_key()));
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &auditing,
+                "2026-08-02T00:00:00Z"
+            ),
+            Err(Error::InvalidArguments)
+        ));
+
+        // No staging tree, no destination, no receipt.
+        assert!(!staging_path(&destination).unwrap().exists());
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+
+        // The same call with a signing key does publish, so the refusal is
+        // about the key material and not about the bundle.
+        let signing = KeyMaterial::Signing(Box::new(SigningKey::from_bytes(&[42; 32])));
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &signing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert!(receipt.exists());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(receipt.with_extension("json")).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_can_finish_an_interrupted_publication() {
+        // Recovery only checks a receipt that is already signed, so refusing
+        // the public key here would strand an operator who holds nothing else
+        // with a published destination and no way to finalise its receipt.
+        let source = temporary("verify-only-recover-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![3; 4096]).unwrap();
+        let bundle = temporary("verify-only-recover.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-recover-dest");
+        let receipt = temporary("verify-only-recover-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &KeyMaterial::Signing(Box::new(signing.clone())),
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+
+        // Put the run back into the state a crash between the rename and the
+        // receipt finalisation leaves behind.
+        let package = scan_manifest(&bundle).unwrap();
+        let (prepared_receipt, prepared_summary) =
+            prepared_receipt_paths(&receipt, &summary, &package).unwrap();
+        fs::rename(&receipt, &prepared_receipt).unwrap();
+        fs::rename(&summary, &prepared_summary).unwrap();
+
+        let auditing = KeyMaterial::Verifying(Box::new(signing.verifying_key()));
+        let report = receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &auditing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(report.peak_staging, 0);
+        assert!(receipt.exists());
+        assert!(summary.exists());
+        assert!(!prepared_receipt.exists());
+        assert!(!prepared_summary.exists());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(&summary).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_reuses_a_prepared_receipt_when_publication_never_happened() {
+        // Crashing after the receipt was prepared but before the staging rename
+        // leaves a signed receipt and no destination. The rerun copies the
+        // bundle again but signs nothing, so the public key is enough.
+        let source = temporary("verify-only-reuse-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![5; 4096]).unwrap();
+        let bundle = temporary("verify-only-reuse.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-reuse-dest");
+        let receipt = temporary("verify-only-reuse-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &KeyMaterial::Signing(Box::new(signing.clone())),
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+
+        let package = scan_manifest(&bundle).unwrap();
+        let (prepared_receipt, prepared_summary) =
+            prepared_receipt_paths(&receipt, &summary, &package).unwrap();
+        fs::rename(&receipt, &prepared_receipt).unwrap();
+        fs::rename(&summary, &prepared_summary).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+
+        let auditing = KeyMaterial::Verifying(Box::new(signing.verifying_key()));
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &auditing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert!(destination.exists());
+        assert!(receipt.exists());
+        assert!(!prepared_receipt.exists());
+        assert!(!prepared_summary.exists());
+        // The reused receipt is the one that was signed, not a new one.
+        validate_receipt_files(&receipt, &summary, &package, &auditing).unwrap();
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(&summary).unwrap();
+    }
+
+    #[test]
+    fn ed25519_key_specs_are_labelled_and_exact() {
+        let seed = "ab".repeat(32);
+        let secret_path = temporary("ed-secret");
+        fs::write(&secret_path, format!("{SECRET_KEY_PREFIX}{seed}\n")).unwrap();
+        let loaded = load_key_spec(secret_path.to_str().unwrap()).unwrap();
+        assert!(matches!(loaded, KeyMaterial::Signing(_)));
+        assert!(loaded.is_third_party_verifiable());
+        fs::remove_file(&secret_path).unwrap();
+
+        let public = SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes();
+        let public_hex = public.iter().fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+        let public_path = temporary("ed-public");
+        fs::write(&public_path, format!("{PUBLIC_KEY_PREFIX}{public_hex}\n")).unwrap();
+        let loaded = load_key_spec(public_path.to_str().unwrap()).unwrap();
+        assert!(matches!(loaded, KeyMaterial::Verifying(_)));
+        fs::remove_file(&public_path).unwrap();
+
+        // Wrong length, bad hex, and a public key that is not on the curve.
+        // One hex digit either side of exactly 32 bytes, so the length check
+        // is observed at its edge rather than only far from it.
+        for bad in [
+            // Empty is the dangerous one: without a length check it would zip
+            // over nothing and hand back an all-zero key.
+            SECRET_KEY_PREFIX.to_owned(),
+            PUBLIC_KEY_PREFIX.to_owned(),
+            format!("{SECRET_KEY_PREFIX}{}", "ab".repeat(17)),
+            format!("{SECRET_KEY_PREFIX}{}", "a".repeat(63)),
+            format!("{SECRET_KEY_PREFIX}{}", "a".repeat(65)),
+            format!("{SECRET_KEY_PREFIX}{}", "ab".repeat(31)),
+            format!("{SECRET_KEY_PREFIX}{}", "ab".repeat(33)),
+            format!("{SECRET_KEY_PREFIX}{}", "zz".repeat(32)),
+        ] {
+            let path = temporary("ed-bad");
+            fs::write(&path, &bad).unwrap();
+            assert!(
+                load_key_spec(path.to_str().unwrap()).is_err(),
+                "accepted {bad}"
+            );
+            fs::remove_file(&path).unwrap();
+        }
+
+        // A shared secret is still shared, and is not third-party verifiable.
+        assert!(!shared(&[9; 32]).is_third_party_verifiable());
+
+        // Pin the decoding itself. Loading a key that succeeds proves nothing
+        // about which key was loaded, and a wrong key would sign receipts
+        // nobody can check against the public half that was published.
+        let expected: [u8; ED25519_KEY_BYTES] =
+            std::array::from_fn(|index| u8::try_from(index).unwrap_or(0));
+        let encoded = expected.iter().fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+        assert_eq!(decode_fixed_key(&encoded).unwrap(), expected);
+        assert_eq!(decode_fixed_key(&"ff".repeat(32)).unwrap(), [0xff; 32]);
+        assert_eq!(decode_fixed_key(&"0f".repeat(32)).unwrap(), [0x0f; 32]);
+        assert_eq!(decode_fixed_key(&"f0".repeat(32)).unwrap(), [0xf0; 32]);
+    }
+
+    #[test]
     fn key_decoder_is_strict_and_bounded() {
-        assert_eq!(MAX_KEY_SOURCE_BYTES, 133);
+        // The longest legal source is the longest prefix, a maximum length
+        // shared secret in hex, and a trailing newline.
+        assert_eq!(MAX_KEY_SOURCE_BYTES, SECRET_KEY_PREFIX.len() + 128 + 1);
+        assert_eq!(MAX_KEY_SOURCE_BYTES, 144);
+        // Every key spec has to fit inside it.
+        for spec in [
+            format!("{SECRET_KEY_PREFIX}{}", "ab".repeat(32)),
+            format!("{PUBLIC_KEY_PREFIX}{}", "ab".repeat(32)),
+            format!("{HEX_KEY_PREFIX}{}", "ab".repeat(64)),
+            format!("{RAW_KEY_PREFIX}{}", "a".repeat(64)),
+        ] {
+            assert!(spec.len() < MAX_KEY_SOURCE_BYTES, "{spec} does not fit");
+        }
         assert!(decode_key(&"ab".repeat(34)).is_ok());
         assert_eq!(decode_key(&"ab".repeat(64)).unwrap(), vec![0xab; 64]);
         assert!(matches!(
@@ -2475,7 +3005,7 @@ mod tests {
         let hex_path = temporary("hex-key");
         fs::write(&hex_path, format!("hex:{}\n", "ab".repeat(32))).unwrap();
         assert_eq!(
-            load_key_spec(hex_path.to_str().unwrap()).unwrap(),
+            loaded_secret(&load_key_spec(hex_path.to_str().unwrap()).unwrap()),
             vec![0xab; 32]
         );
         fs::remove_file(&hex_path).unwrap();
@@ -2483,7 +3013,7 @@ mod tests {
         let raw_path = temporary("raw-key");
         fs::write(&raw_path, [7; 32]).unwrap();
         assert_eq!(
-            load_key_spec(raw_path.to_str().unwrap()).unwrap(),
+            loaded_secret(&load_key_spec(raw_path.to_str().unwrap()).unwrap()),
             vec![7; 32]
         );
         fs::remove_file(&raw_path).unwrap();
@@ -2491,7 +3021,7 @@ mod tests {
         let ambiguous_path = temporary("ambiguous-raw-key");
         fs::write(&ambiguous_path, [b'a'; 64]).unwrap();
         assert_eq!(
-            load_key_spec(ambiguous_path.to_str().unwrap()).unwrap(),
+            loaded_secret(&load_key_spec(ambiguous_path.to_str().unwrap()).unwrap()),
             vec![b'a'; 64]
         );
         fs::remove_file(&ambiguous_path).unwrap();
@@ -2556,7 +3086,7 @@ mod tests {
                 &new_bundle,
                 &destination,
                 &receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::DestinationExists)
@@ -2568,7 +3098,7 @@ mod tests {
                 &new_bundle,
                 &destination,
                 &receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::DestinationExists)
@@ -2587,7 +3117,7 @@ mod tests {
         let destination = temporary("recovery-validation-destination");
         let receipt = temporary("recovery-validation-receipt.cbor");
         let summary = receipt.with_extension("json");
-        let key = [9; 32];
+        let key = shared(&[9; 32]);
         fs::create_dir(&source).unwrap();
         fs::write(source.join("expected"), b"verified contents").unwrap();
         let package = build_bundle(&source, &bundle).unwrap();
@@ -2629,7 +3159,7 @@ mod tests {
         let destination = temporary("published-validation-destination");
         let receipt = temporary("published-validation-receipt.cbor");
         let summary = receipt.with_extension("json");
-        let key = [7; 32];
+        let key = shared(&[7; 32]);
         fs::create_dir(&source).unwrap();
         fs::write(source.join("expected"), b"verified contents").unwrap();
         let package = build_bundle(&source, &bundle).unwrap();
@@ -2750,7 +3280,7 @@ mod tests {
                 &bundle,
                 &destination,
                 &receipt,
-                &[7; 32],
+                &shared(&[7; 32]),
                 "2026-07-31T23:59:59Z"
             ),
             Err(Error::InvalidBundle)

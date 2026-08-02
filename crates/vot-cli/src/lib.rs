@@ -698,17 +698,6 @@ pub fn receive_bundle(
         }
         return Err(Error::DestinationExists);
     }
-    // Everything from here signs a new receipt, which needs a private key.
-    // Checking here rather than at signing time matters: by then the whole
-    // bundle has been copied into staging, and nothing removes that tree on the
-    // way out, so a misconfigured key would leave a full hidden copy of the
-    // package behind and another one for every retry. It cannot move any
-    // earlier: recovering an interrupted publication only verifies a receipt
-    // that is already signed, so an operator holding just the public key has to
-    // be able to finish one.
-    if matches!(key, KeyMaterial::Verifying(_)) {
-        return Err(Error::InvalidArguments);
-    }
     if receipt_path.exists() {
         return Err(Error::DestinationExists);
     }
@@ -717,6 +706,18 @@ pub fn receive_bundle(
     }
     let existing_preparation =
         existing_prepared_receipts(receipt_path, &receipt_summary_path, &expected, key)?;
+    // A receipt is signed below only when an interrupted run did not already
+    // leave one, so that is exactly when a private key is required. Checking
+    // here rather than at signing time matters: by then the whole bundle has
+    // been copied into staging, and nothing removes that tree on the way out,
+    // so a misconfigured key would leave a full hidden copy of the package
+    // behind and another one for every retry. It cannot move any earlier
+    // either, because reusing or recovering a prepared receipt only verifies
+    // one that is already signed, and an operator holding just the public key
+    // has to be able to finish those.
+    if existing_preparation.is_none() && matches!(key, KeyMaterial::Verifying(_)) {
+        return Err(Error::InvalidArguments);
+    }
     let mut manifest = ManifestReader::open(bundle)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
@@ -2819,6 +2820,60 @@ mod tests {
         assert!(summary.exists());
         assert!(!prepared_receipt.exists());
         assert!(!prepared_summary.exists());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(&summary).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_reuses_a_prepared_receipt_when_publication_never_happened() {
+        // Crashing after the receipt was prepared but before the staging rename
+        // leaves a signed receipt and no destination. The rerun copies the
+        // bundle again but signs nothing, so the public key is enough.
+        let source = temporary("verify-only-reuse-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![5; 4096]).unwrap();
+        let bundle = temporary("verify-only-reuse.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-reuse-dest");
+        let receipt = temporary("verify-only-reuse-receipt.cbor");
+        let summary = receipt.with_extension("json");
+        let signing = SigningKey::from_bytes(&[42; 32]);
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &KeyMaterial::Signing(Box::new(signing.clone())),
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+
+        let package = scan_manifest(&bundle).unwrap();
+        let (prepared_receipt, prepared_summary) =
+            prepared_receipt_paths(&receipt, &summary, &package).unwrap();
+        fs::rename(&receipt, &prepared_receipt).unwrap();
+        fs::rename(&summary, &prepared_summary).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+
+        let auditing = KeyMaterial::Verifying(Box::new(signing.verifying_key()));
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &auditing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert!(destination.exists());
+        assert!(receipt.exists());
+        assert!(!prepared_receipt.exists());
+        assert!(!prepared_summary.exists());
+        // The reused receipt is the one that was signed, not a new one.
+        validate_receipt_files(&receipt, &summary, &package, &auditing).unwrap();
 
         fs::remove_dir_all(&source).unwrap();
         fs::remove_dir_all(&destination).unwrap();

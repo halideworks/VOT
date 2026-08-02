@@ -653,8 +653,17 @@ impl<A: TransportAdapter> Session<A> {
         error
     }
 
+    /// Whether queued negotiation frames should still be pushed.
+    ///
+    /// A closed session has nothing left to negotiate, and a stale `HELLO`
+    /// arriving on a dying connection is noise the peer has to parse before it
+    /// can work out the session is over.
+    const fn may_negotiate(&self) -> bool {
+        !matches!(self.negotiation.state(), State::Closed)
+    }
+
     fn poll_inner(&mut self) -> Result<Option<Event>, Error> {
-        if !self.outbound.is_empty() && self.negotiation.state() != State::Closed {
+        if self.may_negotiate() && !self.outbound.is_empty() {
             // A driver that polls in a loop retries the handshake without
             // having to know it stalled.
             self.drain_outbound()?;
@@ -739,7 +748,12 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Propagates a backend failure.
     pub fn flush(&mut self) -> Result<(), Error> {
-        self.drain_outbound()
+        if self.may_negotiate() {
+            return self.drain_outbound();
+        }
+        // Closed. Whatever the backend already holds may still go out, but no
+        // more negotiation frames are handed to it.
+        self.adapter.flush().map_err(transport_error)
     }
 
     fn accept_control(&mut self, bytes: &[u8]) -> Result<Option<Event>, Error> {
@@ -1787,6 +1801,55 @@ mod tests {
         );
         assert!(broken.begin().is_err());
         assert_eq!(broken.unsent_negotiation_frames(), 2);
+    }
+
+    #[test]
+    fn a_closed_session_stops_pushing_the_handshake() {
+        // The retry queue and the closed state have to agree. A session that
+        // kept draining after it failed would put a stale HELLO on a dying
+        // connection, which the peer has to parse before it can tell the
+        // session is over.
+        let mut client = Session::client(
+            Loopback {
+                control_capacity: Some(0),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        client.begin().unwrap();
+        assert_eq!(client.unsent_negotiation_frames(), 2);
+        assert!(client.adapter().sent.is_empty());
+
+        // A client never receives HELLO, so this ends the session while both
+        // frames are still queued.
+        let mut hello = Vec::new();
+        vot_codec::encode_hello(
+            &Hello {
+                draft_revision: vot_codec::DRAFT_REVISION,
+                endpoint_role: EndpointRole::Client,
+                extensions: BTreeSet::new(),
+            },
+            &mut hello,
+        )
+        .unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::HELLO, &hello, &mut frame).unwrap();
+        client.adapter.events.push_back(control(&frame));
+        assert!(client.poll().is_err());
+        assert_eq!(client.state(), State::Closed);
+
+        // Room appears, and neither path takes it.
+        client.adapter.control_capacity = None;
+        assert_eq!(client.poll().unwrap(), None);
+        client.flush().unwrap();
+        assert_eq!(client.unsent_negotiation_frames(), 2, "still queued");
+        assert!(
+            client.adapter().sent.is_empty(),
+            "a closed session sends no more of the handshake"
+        );
+        // The backend is still flushed, so anything it already holds can leave.
+        assert!(client.adapter().flushes > 0);
     }
 
     #[test]

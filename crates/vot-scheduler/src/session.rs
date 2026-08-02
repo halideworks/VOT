@@ -17,18 +17,29 @@ use vot_transport_api::{Event, SubjectId, TransportAdapter};
 
 use crate::{Error, ReliableReceiver};
 
-/// Bundles held while their records arrive.
-pub const DEFAULT_PENDING_BUNDLES: usize = 8;
-
-/// The most one incomplete bundle can hold: its own proof, which travels as a
-/// control frame, plus one record.
+/// The most one admitted bundle can hold: its proof, bounded per frame by the
+/// negotiated control ceiling, plus every record it can declare.
 ///
-/// A byte bound below this would refuse a peer that sent nothing oversized.
-pub const MIN_PENDING_BUNDLE_BYTES: usize =
-    vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + vot_transport_api::MAX_DATA_RECORD_BYTES;
+/// A byte bound below this refuses a conforming transfer partway through, so it
+/// is the floor for the admitted budget rather than a target.
+pub const MAX_PENDING_BUNDLE_BYTES: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
+    + vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE * vot_transport_api::MAX_DATA_RECORD_BYTES;
 
-/// Bytes held for bundles that are not complete.
-pub const DEFAULT_PENDING_BUNDLE_BYTES: usize = DEFAULT_PENDING_BUNDLES * MIN_PENDING_BUNDLE_BYTES;
+/// The most one bundle can hold before its proof has arrived.
+pub const MAX_ORPHAN_BUNDLE_BYTES: usize =
+    vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE * vot_transport_api::MAX_DATA_RECORD_BYTES;
+
+/// Admitted bundles held while the rest of their records arrive.
+pub const DEFAULT_PENDING_BUNDLES: usize = 4;
+
+/// Bytes held for admitted bundles that are not complete.
+pub const DEFAULT_PENDING_BUNDLE_BYTES: usize = DEFAULT_PENDING_BUNDLES * MAX_PENDING_BUNDLE_BYTES;
+
+/// Bundles held for records that arrived before their proof.
+pub const DEFAULT_ORPHAN_BUNDLES: usize = 2;
+
+/// Bytes held for records that arrived before their proof.
+pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUNDLE_BYTES;
 
 /// A bundle and the records that belong to it, in whichever order they came.
 #[derive(Default)]
@@ -65,9 +76,10 @@ pub struct SessionReceiver<A> {
     session: Session<A>,
     receiver: ReliableReceiver,
     pending: BTreeMap<[u8; 16], Pending>,
-    pending_bytes: usize,
     pending_bundle_limit: usize,
     pending_byte_limit: usize,
+    orphan_bundle_limit: usize,
+    orphan_byte_limit: usize,
     /// Subjects the caller has authorised. Nothing here decides that: the
     /// authentication and authorization frames are unimplemented, so a subject
     /// is admitted by an explicit call rather than by a peer asking.
@@ -83,27 +95,44 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             session,
             receiver,
             pending: BTreeMap::new(),
-            pending_bytes: 0,
             pending_bundle_limit: DEFAULT_PENDING_BUNDLES,
             pending_byte_limit: DEFAULT_PENDING_BUNDLE_BYTES,
+            orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
+            orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
             admitted: BTreeSet::new(),
             credit_applied: false,
         }
     }
 
-    /// Sets how much incomplete bundle state this will hold.
+    /// Sets how much state this will hold for admitted bundles.
     ///
     /// # Errors
     /// Rejects a bound that cannot hold one whole bundle, which would refuse a
-    /// conforming peer rather than bound it.
+    /// conforming transfer partway through rather than bound it.
     pub fn set_pending_limits(&mut self, bundles: usize, bytes: usize) -> Result<(), Error> {
-        if bundles == 0 || bytes < MIN_PENDING_BUNDLE_BYTES {
+        if bundles == 0 || bytes < MAX_PENDING_BUNDLE_BYTES {
             return Err(Error::Staging(
                 vot_transport_api::Error::InvalidConfiguration,
             ));
         }
         self.pending_bundle_limit = bundles;
         self.pending_byte_limit = bytes;
+        Ok(())
+    }
+
+    /// Sets how much state this will hold for records that arrived before
+    /// their proof.
+    ///
+    /// # Errors
+    /// Rejects a bound that cannot hold one whole bundle's records.
+    pub fn set_orphan_limits(&mut self, bundles: usize, bytes: usize) -> Result<(), Error> {
+        if bundles == 0 || bytes < MAX_ORPHAN_BUNDLE_BYTES {
+            return Err(Error::Staging(
+                vot_transport_api::Error::InvalidConfiguration,
+            ));
+        }
+        self.orphan_bundle_limit = bundles;
+        self.orphan_byte_limit = bytes;
         Ok(())
     }
 
@@ -148,10 +177,16 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.pending.len()
     }
 
-    /// Record bytes held for bundles that are not complete.
+    /// Bundles holding records whose proof has not arrived.
     #[must_use]
-    pub const fn pending_bytes(&self) -> usize {
-        self.pending_bytes
+    pub fn orphan_bundles(&self) -> usize {
+        self.held(true).0
+    }
+
+    /// Bytes held for bundles that are not complete.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.values().map(Pending::bytes).sum()
     }
 
     /// Returns the next event the application should see.
@@ -215,49 +250,107 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             return Err(Error::UnknownObject);
         }
         let id = bundle.bundle_id;
-        // The proof travels as a control frame, so it is bounded per frame by
-        // the negotiated ceiling but nothing bounds the total until it is
-        // charged here alongside the records.
-        let bytes = bundle.proof.len();
-        self.reserve(&id, bytes)?;
-        let pending = self.pending.entry(id).or_default();
-        if pending.bundle.is_some() {
+        if let Some(held) = self
+            .pending
+            .get(&id)
+            .and_then(|pending| pending.bundle.as_ref())
+        {
             // spec/wire.md section 5: request and range identity deduplicate,
-            // and a conflicting duplicate is rejected.
+            // and only a conflicting duplicate is rejected.
+            return if *held == bundle {
+                Ok(())
+            } else {
+                Err(Error::ProofInvalid)
+            };
+        }
+        if self
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.records.len() as u64 > bundle.data_record_count)
+        {
+            // More records than the proof covers. Without this the entry can
+            // never reach its declared count and never leaves.
             return Err(Error::ProofInvalid);
         }
-        pending.bundle = Some(bundle);
-        self.pending_bytes += bytes;
+        // The records already held move to the admitted budget along with the
+        // proof, so the reservation covers the whole entry rather than the
+        // frame that happens to complete it.
+        let carried = self.pending.get(&id).map_or(0, Pending::bytes);
+        let bytes = bundle
+            .proof
+            .len()
+            .checked_add(carried)
+            .ok_or(Error::LengthExceeded)?;
+        self.reserve(&id, bytes, false)?;
+        self.pending.entry(id).or_default().bundle = Some(bundle);
         self.deliver(id)
     }
 
     fn hold_record(&mut self, record: DataRecord) -> Result<(), Error> {
         let id = record.bundle_id;
-        let bytes = record.encoded.len();
-        self.reserve(&id, bytes)?;
-        let pending = self.pending.entry(id).or_default();
-        if pending
-            .records
-            .iter()
-            .any(|held| held.record_index == record.record_index)
-        {
-            return Err(Error::ProofInvalid);
+        let orphan = self
+            .pending
+            .get(&id)
+            .is_none_or(|pending| pending.bundle.is_none());
+        if let Some(pending) = self.pending.get(&id) {
+            if let Some(held) = pending
+                .records
+                .iter()
+                .find(|held| held.record_index == record.record_index)
+            {
+                return if *held == record {
+                    Ok(())
+                } else {
+                    Err(Error::ProofInvalid)
+                };
+            }
+            let declared = pending.bundle.as_ref().map_or(
+                vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE,
+                |bundle| {
+                    usize::try_from(bundle.data_record_count)
+                        .unwrap_or(vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE)
+                },
+            );
+            if pending.records.len() >= declared {
+                return Err(Error::ProofInvalid);
+            }
         }
-        pending.records.push(record);
-        self.pending_bytes += bytes;
+        self.reserve(&id, record.encoded.len(), orphan)?;
+        self.pending.entry(id).or_default().records.push(record);
         self.deliver(id)
     }
 
+    /// Counts the entries in one budget and the bytes they hold.
+    fn held(&self, orphan: bool) -> (usize, usize) {
+        self.pending
+            .values()
+            .filter(|pending| pending.bundle.is_none() == orphan)
+            .fold((0, 0), |(count, bytes), pending| {
+                (count + 1, bytes + pending.bytes())
+            })
+    }
+
     /// Reserves room for a frame belonging to `id`.
-    fn reserve(&mut self, id: &[u8; 16], bytes: usize) -> Result<(), Error> {
-        if !self.pending.contains_key(id) && self.pending.len() >= self.pending_bundle_limit {
+    ///
+    /// Records that arrive before their proof name no subject, so nothing can
+    /// authorise them. They hold their own budget, and a peer filling it with
+    /// records for bundles it never sends cannot crowd out an admitted one.
+    fn reserve(&mut self, id: &[u8; 16], bytes: usize, orphan: bool) -> Result<(), Error> {
+        let (count_limit, byte_limit) = if orphan {
+            (self.orphan_bundle_limit, self.orphan_byte_limit)
+        } else {
+            (self.pending_bundle_limit, self.pending_byte_limit)
+        };
+        let (count, held) = self.held(orphan);
+        let known = self
+            .pending
+            .get(id)
+            .is_some_and(|pending| pending.bundle.is_none() == orphan);
+        if !known && count >= count_limit {
             return Err(Error::PendingBundlesExhausted);
         }
-        let next = self
-            .pending_bytes
-            .checked_add(bytes)
-            .ok_or(Error::LengthExceeded)?;
-        if next > self.pending_byte_limit {
+        let next = held.checked_add(bytes).ok_or(Error::LengthExceeded)?;
+        if next > byte_limit {
             return Err(Error::PendingBundlesExhausted);
         }
         Ok(())
@@ -274,7 +367,6 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let Some(pending) = self.pending.remove(&id) else {
             return Ok(());
         };
-        self.pending_bytes = self.pending_bytes.saturating_sub(pending.bytes());
         let Some(bundle) = pending.bundle else {
             return Ok(());
         };
@@ -525,7 +617,7 @@ mod tests {
         let mut driver = ready();
         driver.admit(subject).unwrap();
         driver
-            .set_pending_limits(1, MIN_PENDING_BUNDLE_BYTES)
+            .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES)
             .unwrap();
 
         driver
@@ -546,10 +638,33 @@ mod tests {
             .push_back(lane(&wire(&TypedFrame::DataRecord(other))));
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
 
-        // A bound that cannot hold one maximum record would refuse a peer that
-        // did nothing wrong.
-        assert!(driver.set_pending_limits(0, 1 << 20).is_err());
-        assert!(driver.set_pending_limits(1, 1).is_err());
+        // The bound itself is allowed, and one below it would refuse a
+        // conforming transfer partway through rather than bound it.
+        assert!(
+            driver
+                .set_pending_limits(1, MAX_PENDING_BUNDLE_BYTES)
+                .is_ok()
+        );
+        assert!(
+            driver
+                .set_pending_limits(0, MAX_PENDING_BUNDLE_BYTES)
+                .is_err()
+        );
+        assert!(
+            driver
+                .set_pending_limits(1, MAX_PENDING_BUNDLE_BYTES - 1)
+                .is_err()
+        );
+        assert!(
+            driver
+                .set_orphan_limits(0, MAX_ORPHAN_BUNDLE_BYTES)
+                .is_err()
+        );
+        assert!(
+            driver
+                .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES - 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -620,23 +735,33 @@ mod tests {
     fn the_held_byte_bound_is_exact() {
         // The byte bound is what limits memory. A count alone would let a peer
         // hold a bundle's worth of records under one identifier.
+        let records_per_bundle = vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE;
         assert_eq!(
-            MIN_PENDING_BUNDLE_BYTES,
-            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + vot_transport_api::MAX_DATA_RECORD_BYTES
+            MAX_ORPHAN_BUNDLE_BYTES,
+            records_per_bundle * vot_transport_api::MAX_DATA_RECORD_BYTES
+        );
+        assert_eq!(
+            MAX_PENDING_BUNDLE_BYTES,
+            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + MAX_ORPHAN_BUNDLE_BYTES
         );
         assert_eq!(
             DEFAULT_PENDING_BUNDLE_BYTES,
-            DEFAULT_PENDING_BUNDLES * MIN_PENDING_BUNDLE_BYTES
+            DEFAULT_PENDING_BUNDLES * MAX_PENDING_BUNDLE_BYTES
         );
+        assert_eq!(
+            DEFAULT_ORPHAN_BYTES,
+            DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUNDLE_BYTES
+        );
+
         let (subject, _bundle, records) = object();
         let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
-        let limit = MIN_PENDING_BUNDLE_BYTES;
+        let limit = MAX_ORPHAN_BUNDLE_BYTES;
         let fits = limit / unit;
 
         let mut driver = ready();
         driver.admit(subject).unwrap();
         // A generous bundle count, so only the byte bound can refuse anything.
-        driver.set_pending_limits(fits + 4, limit).unwrap();
+        driver.set_orphan_limits(fits + 4, limit).unwrap();
         for index in 0..fits {
             let mut record = records[0].clone();
             record.bundle_id = [u8::try_from(index).unwrap(); 16];
@@ -658,13 +783,126 @@ mod tests {
             .push_back(lane(&wire(&TypedFrame::DataRecord(extra))));
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
         assert_eq!(driver.pending_bytes(), limit, "a refusal holds nothing");
+    }
 
-        // The smallest usable bound is one whole bundle. One below it would
-        // refuse a peer that did nothing wrong.
-        let mut limits = ready();
-        assert!(limits.set_pending_limits(1, limit).is_ok());
-        assert!(limits.set_pending_limits(1, limit - 1).is_err());
-        assert!(limits.set_pending_limits(0, limit).is_err());
+    #[test]
+    fn records_without_a_proof_cannot_crowd_out_an_admitted_bundle() {
+        // A DATA_RECORD names a bundle and no subject, so nothing can
+        // authorise one that arrives first. They hold their own budget.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        driver
+            .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES)
+            .unwrap();
+        assert_eq!(driver.orphan_bundles(), 0, "nothing is held yet");
+
+        let mut stray = records[0].clone();
+        stray.bundle_id = [9; 16];
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::DataRecord(stray))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.orphan_bundles(), 1, "the orphan budget is full");
+        assert_eq!(driver.pending_bundles(), 1);
+
+        // A second record for the same bundle is not a second bundle, so a
+        // full count does not refuse it.
+        let mut second = records[1].clone();
+        second.bundle_id = [9; 16];
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::DataRecord(second))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.orphan_bundles(), 1);
+
+        // The admitted budget is untouched, so the real transfer still runs.
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+        for record in &records {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        assert_eq!(driver.orphan_bundles(), 1, "only the stray is left");
+    }
+
+    #[test]
+    fn an_exact_duplicate_is_ignored_and_a_conflicting_one_is_refused() {
+        // spec/wire.md section 5: exact duplicates deduplicate, and only a
+        // conflicting duplicate is an error. A retry is not an attack.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        for frame in [
+            TypedFrame::ProofBundle(bundle.clone()),
+            TypedFrame::ProofBundle(bundle.clone()),
+            TypedFrame::DataRecord(records[0].clone()),
+            TypedFrame::DataRecord(records[0].clone()),
+        ] {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(lane(&wire(&frame)));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bundles(), 1);
+        assert_eq!(
+            driver.pending_bytes(),
+            bundle.proof.len() + records[0].encoded.len(),
+            "a duplicate is held once"
+        );
+
+        let mut conflicting = records[0].clone();
+        conflicting.encoded[0] ^= 0xff;
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::DataRecord(conflicting))));
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+    }
+
+    #[test]
+    fn more_records_than_the_proof_covers_are_refused() {
+        // complete() tests equality, so an entry holding more records than its
+        // bundle declares would never complete and never leave.
+        let (subject, bundle, records) = object();
+        let declared = usize::try_from(bundle.data_record_count).unwrap();
+        assert_eq!(declared, records.len());
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+
+        // One record past the declared count, before the proof arrives, so the
+        // count is not known when it is held.
+        for index in 0..=declared {
+            let mut record = records[0].clone();
+            record.record_index = index as u64;
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(lane(&wire(&TypedFrame::DataRecord(record))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }
 
     #[test]
@@ -696,28 +934,22 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_record_or_bundle_is_refused() {
-        let (subject, bundle, records) = object();
+    fn a_bundle_that_conflicts_with_a_held_one_is_refused() {
+        let (subject, bundle, _records) = object();
         let mut driver = ready();
         driver.admit(subject).unwrap();
-        for _ in 0..2 {
+        let mut conflicting = bundle.clone();
+        conflicting.proof[0] ^= 0xff;
+        for frame in [
+            TypedFrame::ProofBundle(bundle),
+            TypedFrame::ProofBundle(conflicting),
+        ] {
             driver
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(records[0].clone()))));
+                .push_back(lane(&wire(&frame)));
         }
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
-
-        let mut fresh = ready();
-        fresh.admit(subject).unwrap();
-        for _ in 0..2 {
-            fresh
-                .session_mut()
-                .driver()
-                .events
-                .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
-        }
-        assert_eq!(fresh.poll().unwrap_err(), Error::ProofInvalid);
     }
 }

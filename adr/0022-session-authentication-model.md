@@ -50,7 +50,12 @@ identifier, and the capability as an opaque versioned blob. The server answers
 `SESSION_ACCEPT` or `SESSION_REJECT`.
 
 `Session` gains an authenticated state, and every frame the registry marks
-`auth: yes` is refused until it is reached. `Authentication` gains the variant
+`auth: yes` is refused until it is reached. The frame behavior registry marked
+`SESSION_OPEN`, `SESSION_ACCEPT`, and `SESSION_REJECT` `auth: yes` while they
+are the frames that authenticate, so the gate would have refused the exchange
+that opens it. They are now marked `no`, alongside `AUTH_CONTEXT`, which was
+already `no`. Correcting the table keeps the rule in one place rather than
+adding an exception list beside it. `Authentication` gains the variant
 that means authenticated, so `Unimplemented` stops being the only one.
 
 The capability is verified through a `CapabilityPolicy` boundary rather than by
@@ -80,13 +85,8 @@ the carrier switch the specification requires, and it needs nothing the MsQuic
 wrapper does not expose. A deployment wanting certificate binding can implement
 it in the policy boundary.
 
-Two specification questions remain open and are recorded here rather than
+One specification question remains open and is recorded here rather than
 answered.
-
-`SESSION_OPEN` is marked `auth: yes` in the frame behaviour registry while being
-the frame that opens a session. Either the column means the authentication
-policy has succeeded and the session frames are the mechanism, or the table is
-wrong. Stage one assumes the first reading.
 
 Nothing says who issues capabilities. Section 5 names issuer and audience but no
 trust anchor distribution. Stage two cannot ship without an answer.

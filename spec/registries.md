@@ -1,6 +1,6 @@
 # VOT v0.3 Registries
 
-Status: frozen for `vot-draft-03`
+Status: frozen for `vot-draft-04`
 
 All integer registry values are unsigned QUIC variable-length integers unless a
 table says otherwise. Values not listed here are unassigned. Implementations

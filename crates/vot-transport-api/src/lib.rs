@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-pub const ALPN: &[u8] = b"vot-draft-03";
+pub const ALPN: &[u8] = b"vot-draft-04";
 pub const MIN_CONTROL_FRAME_PAYLOAD: usize = vot_codec::MIN_CONTROL_FRAME_PAYLOAD;
 pub const MAX_CONTROL_FRAME_PAYLOAD: usize = vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD;
 pub const MAX_DATA_RECORD_BYTES: usize = 256 * 1024;
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn default_transport_methods_delegate_and_bound_batches() {
-        assert_eq!(ALPN, b"vot-draft-03");
+        assert_eq!(ALPN, b"vot-draft-04");
         assert_eq!(
             MAX_CONTROL_FRAME_PAYLOAD,
             vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD

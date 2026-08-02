@@ -1,0 +1,54 @@
+{
+  "format": "vot-receipt-signing-transcript-v1",
+  "alpn": "vot-draft-04",
+  "description": "Bytes a receipt authenticator covers, as spec/registries.md defines them: domain separator, two-byte scheme, key identifier behind a one-byte length, canonical receipt. An implementation that reproduces the authenticators below from the parts agrees with this one on the exact domain, byte order, length prefix, and canonical-receipt boundary.",
+  "domain_separator_hex": "564f54207265636569707420763000",
+  "domain_separator_ascii": "VOT receipt v0\u0000",
+  "key_id_hex": "766f742d636f6e666f726d616e6365",
+  "key_id_ascii": "vot-conformance",
+  "key_id_length_prefix_hex": "0f",
+  "key_id_bounds_bytes": [1, 64],
+  "canonical_receipt_hex": "ae000001840101582011111111111111111111111111111111111111111111111111111111111111111a001000000205030104040501068300040007502222222222222222222222222222222208503333333333333333333333333333333309070a74323032362d30382d30325430303a30303a30305a0b010c010d00",
+  "receipt_fields": {
+    "subject_kind": "Package",
+    "suite_id": 1,
+    "subject_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "subject_length": 1048576,
+    "assurance": "Published",
+    "profile": "Fast",
+    "actual_predecessor": "AtRestVerified",
+    "provider": 1,
+    "provider_version": [0, 4, 0],
+    "session_id": "22222222222222222222222222222222",
+    "incarnation_id": "33333333333333333333333333333333",
+    "sequence": 7,
+    "observed_at": "2026-08-02T00:00:00Z",
+    "clock_source": 1,
+    "flags": 0,
+    "previous": null
+  },
+  "schemes": [
+    {
+      "name": "ED25519",
+      "value": 1,
+      "scheme_hex": "0001",
+      "authenticator_bytes": 64,
+      "third_party_verifiable": true,
+      "secret_key_seed_hex": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+      "public_key_hex": "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
+      "authenticator_hex": "9cd793b6ba9d3b84079328fd69823004653bab15c499283fba99e3759b4378d62e5cbe89736ef41b4e8083b90b76f4511d0c00b856bc040f8c5081a75cb27f0d",
+      "note": "RFC 8032, verified with verify_strict so one signature cannot verify under two public keys."
+    },
+    {
+      "name": "HMAC_SHA256",
+      "value": 2,
+      "scheme_hex": "0002",
+      "authenticator_bytes": 32,
+      "third_party_verifiable": false,
+      "secret_key_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "authenticator_hex": "c394fbecece437abac2fb05e1fca9f4f54ed745b70902bc0a10b0ee85a70c13e",
+      "note": "RFC 2104 with SHA-256. Registered only for receipts that stay inside one trust domain, since a party able to check it can forge it."
+    }
+  ],
+  "authenticated_envelope_ed25519_hex": "a400ae000001840101582011111111111111111111111111111111111111111111111111111111111111111a001000000205030104040501068300040007502222222222222222222222222222222208503333333333333333333333333333333309070a74323032362d30382d30325430303a30303a30305a0b010c010d000101024f766f742d636f6e666f726d616e63650358409cd793b6ba9d3b84079328fd69823004653bab15c499283fba99e3759b4378d62e5cbe89736ef41b4e8083b90b76f4511d0c00b856bc040f8c5081a75cb27f0d"
+}

@@ -1,6 +1,6 @@
 {
   "format": "vot-wire-envelope-v1",
-  "alpn": "vot-draft-03",
+  "alpn": "vot-draft-04",
   "criticality": "least-significant-bit: even optional, odd critical",
   "hard_max_frame_payload": 16777216,
   "default_max_unknown_payload": 1048576,

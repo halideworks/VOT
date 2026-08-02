@@ -212,7 +212,7 @@ A dual-hash equivalence record is accepted only after one trusted verifier reads
 
 ### 2.7 Wire-version and extension mechanism
 
-Prototype ALPN: `vot-draft-03`.
+Prototype ALPN: `vot-draft-04`.
 
 The production ALPN will be registered before a stable v1 release. The prototype must not claim that `vot/1` is already registered.
 
@@ -371,7 +371,7 @@ These values are defaults, not promises that every workload is optimal at them. 
 | Manifest page maximum | 1 MiB canonical bytes |
 | Session/incarnation identifier | 128 random bits |
 | Default reliable lane count | 16, locally tunable |
-| Prototype ALPN | `vot-draft-03` |
+| Prototype ALPN | `vot-draft-04` |
 | Default idle timeout | 90 s |
 | Active keepalive | 20 s |
 | Online VCRC objective | CVaR95 |

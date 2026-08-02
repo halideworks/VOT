@@ -23,6 +23,30 @@ use vot_verifier::{StreamVerifier, Suite};
 const PACKAGE_DOMAIN: &[u8] = b"VOT package v0\0";
 const MANIFEST_DIRECTORY: &str = "manifest";
 const MANIFEST_SEAL: &str = "seal.cbor";
+const DEFAULT_LOGICAL_SUITE: Suite = Suite::Sha256Bep52;
+
+const fn suite_id(suite: Suite) -> u16 {
+    match suite {
+        Suite::Blake3Bao64 => 1,
+        Suite::Sha256Bep52 => 2,
+    }
+}
+
+fn suite_from_id(id: u16) -> Result<Suite, Error> {
+    match id {
+        1 => Ok(Suite::Blake3Bao64),
+        2 => Ok(Suite::Sha256Bep52),
+        _ => Err(Error::InvalidBundle),
+    }
+}
+
+pub fn parse_suite(value: &str) -> Result<Suite, Error> {
+    match value {
+        "blake3" | "blake3-bao64" | "1" => Ok(Suite::Blake3Bao64),
+        "sha256" | "sha256-bep52" | "2" => Ok(Suite::Sha256Bep52),
+        _ => Err(Error::InvalidArguments),
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -102,6 +126,7 @@ enum Storage {
 
 struct EntryRecord {
     path: PackagePath,
+    suite: Suite,
     logical_root: [u8; 32],
     logical_length: u64,
     storage: Storage,
@@ -110,7 +135,7 @@ struct EntryRecord {
 impl EntryRecord {
     fn manifest_entry(&self) -> ManifestEntry {
         let logical = ObjectId {
-            suite: 2,
+            suite: suite_id(self.suite),
             root: self.logical_root,
             length: self.logical_length,
         };
@@ -122,7 +147,7 @@ impl EntryRecord {
                 offset,
             } => StorageRef::Pack {
                 pack: ObjectId {
-                    suite: 2,
+                    suite: suite_id(self.suite),
                     root,
                     length,
                 },
@@ -149,12 +174,13 @@ impl EntryRecord {
         }
         let logical_length = entry.length.ok_or(Error::InvalidBundle)?;
         let storage = entry.storage.ok_or(Error::InvalidBundle)?;
-        let (logical_root, storage) = match storage {
+        let (logical_root, suite, storage) = match storage {
             StorageRef::Direct(object) => {
-                if object.suite != 2 || object.length != logical_length {
+                let suite = suite_from_id(object.suite)?;
+                if object.length != logical_length {
                     return Err(Error::InvalidBundle);
                 }
-                (object.root, Storage::Direct)
+                (object.root, suite, Storage::Direct)
             }
             StorageRef::Pack {
                 pack,
@@ -162,8 +188,9 @@ impl EntryRecord {
                 length,
                 logical,
             } => {
-                if pack.suite != 2
-                    || logical.suite != 2
+                let pack_suite = suite_from_id(pack.suite)?;
+                let logical_suite = suite_from_id(logical.suite)?;
+                if pack_suite != logical_suite
                     || length != logical_length
                     || logical.length != logical_length
                 {
@@ -171,6 +198,7 @@ impl EntryRecord {
                 }
                 (
                     logical.root,
+                    logical_suite,
                     Storage::Pack {
                         root: pack.root,
                         length: pack.length,
@@ -181,6 +209,7 @@ impl EntryRecord {
         };
         Ok(Self {
             path: entry.path,
+            suite,
             logical_root,
             logical_length,
             storage,
@@ -222,7 +251,8 @@ impl PackageRootBuilder {
         self.verifier
             .update(&u32_len(encoded_path.len())?.to_be_bytes())?;
         self.verifier.update(&encoded_path)?;
-        self.verifier.update(&2_u16.to_be_bytes())?;
+        self.verifier
+            .update(&suite_id(record.suite).to_be_bytes())?;
         self.verifier.update(&record.logical_length.to_be_bytes())?;
         self.verifier.update(&record.logical_root)?;
         self.logical_length = self
@@ -518,7 +548,7 @@ fn validate_published_destination(
         if !metadata.file_type().is_file() {
             return Err(Error::InvalidBundle);
         }
-        let root = match stream_root(&output, record.logical_length) {
+        let root = match stream_root(&output, record.logical_length, record.suite) {
             Ok(root) => root,
             Err(Error::SourceMutation) => return Err(Error::RootMismatch),
             Err(error) => return Err(error),
@@ -581,6 +611,14 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 }
 
 pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Error> {
+    build_bundle_with_suite(source, bundle, DEFAULT_LOGICAL_SUITE)
+}
+
+pub fn build_bundle_with_suite(
+    source: &Path,
+    bundle: &Path,
+    suite: Suite,
+) -> Result<PackageSummary, Error> {
     if !source.is_dir() || bundle.exists() {
         return Err(Error::InvalidArguments);
     }
@@ -593,7 +631,7 @@ pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Erro
     fs::create_dir(&objects)?;
     let mut manifest = ManifestSpool::new(bundle)?;
     let mut package = PackageRootBuilder::new()?;
-    let mut packer = StreamingPacker::new(PathProfile::Portable);
+    let mut packer = StreamingPacker::new_with_suite(PathProfile::Portable, suite);
     for source_file in sources {
         if source_file.length <= CANDIDATE_MAX as u64 {
             let mut bytes = Vec::with_capacity(
@@ -613,7 +651,7 @@ pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Erro
             if let Some(pack) = packer.flush() {
                 emit_pack(&objects, &mut manifest, &mut package, &pack)?;
             }
-            emit_direct(&objects, &mut manifest, &mut package, &source_file)?;
+            emit_direct(&objects, &mut manifest, &mut package, &source_file, suite)?;
         }
     }
     if let Some(pack) = packer.finish() {
@@ -678,7 +716,7 @@ pub fn receive_bundle(
         MAX_DATA_RECORD_BYTES as u64,
         MAX_DATA_RECORD_BYTES as u64,
     )?;
-    let mut cached_pack: Option<([u8; 32], u64, Vec<u8>)> = None;
+    let mut cached_pack: Option<(Suite, [u8; 32], u64, Vec<u8>)> = None;
 
     while let Some(record) = manifest.next_record()? {
         package.push(&record)?;
@@ -692,6 +730,7 @@ pub fn receive_bundle(
                     &output,
                     record.logical_root,
                     record.logical_length,
+                    record.suite,
                     &mut receiver,
                 )?;
             }
@@ -700,23 +739,24 @@ pub fn receive_bundle(
                 length,
                 offset,
             } => {
-                let needs_load = pack_needs_load(cached_pack.as_ref(), root, length);
+                let needs_load = pack_needs_load(cached_pack.as_ref(), record.suite, root, length);
                 if needs_load {
                     let bytes = receive_object(
                         &bundle.join("objects").join(object_name(&root)),
                         root,
                         length,
+                        record.suite,
                         &mut receiver,
                     )?;
-                    cached_pack = Some((root, length, bytes));
+                    cached_pack = Some((record.suite, root, length, bytes));
                 }
-                let (_, _, bytes) = cached_pack.as_ref().ok_or(Error::InvalidBundle)?;
+                let (_, _, _, bytes) = cached_pack.as_ref().ok_or(Error::InvalidBundle)?;
                 let start = usize::try_from(offset).map_err(|_| Error::InvalidBundle)?;
                 let logical =
                     usize::try_from(record.logical_length).map_err(|_| Error::InvalidBundle)?;
                 let end = start.checked_add(logical).ok_or(Error::InvalidBundle)?;
                 let extracted = bytes.get(start..end).ok_or(Error::InvalidBundle)?;
-                if vot_verifier::root(Suite::Sha256Bep52, extracted)? != record.logical_root {
+                if vot_verifier::root(record.suite, extracted)? != record.logical_root {
                     return Err(Error::RootMismatch);
                 }
                 write_published_file(&output, extracted)?;
@@ -877,6 +917,7 @@ fn emit_pack(
     for entry in &pack.entries {
         let record = EntryRecord {
             path: entry.path.clone(),
+            suite: pack.suite,
             logical_root: entry.logical_root,
             logical_length: entry.length,
             storage: Storage::Pack {
@@ -896,27 +937,20 @@ fn emit_direct(
     manifest: &mut ManifestSpool,
     package: &mut PackageRootBuilder,
     source: &SourceFile,
+    suite: Suite,
 ) -> Result<(), Error> {
-    let root = stream_root(&source.source, source.length)?;
+    let root = stream_root(&source.source, source.length, suite)?;
     let object = objects.join(object_name(&root));
     if object.exists() {
-        if stream_root(&object, source.length)? != root {
+        if stream_root(&object, source.length, suite)? != root {
             return Err(Error::RootMismatch);
         }
     } else {
-        let mut input = File::open(&source.source)?;
-        let mut output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&object)?;
-        io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        if stream_root(&object, source.length)? != root {
-            return Err(Error::SourceMutation);
-        }
+        copy_and_verify(&source.source, &object, source.length, root, suite)?;
     }
     let record = EntryRecord {
         path: source.path.clone(),
+        suite,
         logical_root: root,
         logical_length: source.length,
         storage: Storage::Direct,
@@ -926,9 +960,42 @@ fn emit_direct(
     Ok(())
 }
 
-fn stream_root(path: &Path, expected_length: u64) -> Result<[u8; 32], Error> {
+fn copy_and_verify(
+    source: &Path,
+    destination: &Path,
+    expected_length: u64,
+    expected_root: [u8; 32],
+    suite: Suite,
+) -> Result<(), Error> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    let mut verifier = StreamVerifier::new(suite);
+    let mut length = 0_u64;
+    let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        verifier.update(&buffer[..read])?;
+        length = length
+            .checked_add(read as u64)
+            .ok_or(Error::InvalidBundle)?;
+    }
+    output.sync_all()?;
+    if length != expected_length || verifier.finish()? != expected_root {
+        return Err(Error::SourceMutation);
+    }
+    Ok(())
+}
+
+fn stream_root(path: &Path, expected_length: u64, suite: Suite) -> Result<[u8; 32], Error> {
     let mut input = File::open(path)?;
-    let mut verifier = StreamVerifier::new(Suite::Sha256Bep52);
+    let mut verifier = StreamVerifier::new(suite);
     let mut length = 0_u64;
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
@@ -974,6 +1041,7 @@ fn receive_direct(
     output: &Path,
     root: [u8; 32],
     length: u64,
+    suite: Suite,
     receiver: &mut ReliableReceiver,
 ) -> Result<(), Error> {
     create_parent(output)?;
@@ -982,7 +1050,7 @@ fn receive_direct(
         return Err(Error::InvalidBundle);
     }
     let subject = SubjectId {
-        suite: 2,
+        suite: suite_id(suite),
         root,
         length,
     };
@@ -994,7 +1062,7 @@ fn receive_direct(
     if !already_verified {
         receiver.begin(subject)?;
     }
-    let mut verifier = already_verified.then(|| StreamVerifier::new(Suite::Sha256Bep52));
+    let mut verifier = already_verified.then(|| StreamVerifier::new(suite));
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
         let read = source.read(&mut buffer)?;
@@ -1023,6 +1091,7 @@ fn receive_object(
     object: &Path,
     root: [u8; 32],
     length: u64,
+    suite: Suite,
     receiver: &mut ReliableReceiver,
 ) -> Result<Vec<u8>, Error> {
     let capacity = usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
@@ -1034,7 +1103,7 @@ fn receive_object(
         return Err(Error::InvalidBundle);
     }
     let subject = SubjectId {
-        suite: 2,
+        suite: suite_id(suite),
         root,
         length,
     };
@@ -1042,7 +1111,7 @@ fn receive_object(
     if !already_verified {
         receiver.begin(subject)?;
     }
-    let mut verifier = already_verified.then(|| StreamVerifier::new(Suite::Sha256Bep52));
+    let mut verifier = already_verified.then(|| StreamVerifier::new(suite));
     let mut bytes = Vec::with_capacity(capacity);
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
@@ -1100,9 +1169,14 @@ fn sync_directories(root: &Path) -> Result<usize, Error> {
     Ok(count)
 }
 
-fn pack_needs_load(cached: Option<&([u8; 32], u64, Vec<u8>)>, root: [u8; 32], length: u64) -> bool {
-    cached.is_none_or(|(cached_root, cached_length, _)| {
-        *cached_root != root || *cached_length != length
+fn pack_needs_load(
+    cached: Option<&(Suite, [u8; 32], u64, Vec<u8>)>,
+    suite: Suite,
+    root: [u8; 32],
+    length: u64,
+) -> bool {
+    cached.is_none_or(|(cached_suite, cached_root, cached_length, _)| {
+        *cached_suite != suite || *cached_root != root || *cached_length != length
     })
 }
 
@@ -1419,8 +1493,14 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+const MIN_HMAC_KEY_BYTES: usize = 32;
+const MAX_HMAC_KEY_BYTES: usize = 64;
+const HEX_KEY_PREFIX: &str = "hex:";
+const RAW_KEY_PREFIX: &str = "raw:";
+const MAX_KEY_SOURCE_BYTES: usize = HEX_KEY_PREFIX.len() + 2 * MAX_HMAC_KEY_BYTES + 1;
+
 pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
-    if value.len() % 2 != 0 {
+    if value.len() % 2 != 0 || value.len() > 2 * MAX_HMAC_KEY_BYTES {
         return Err(Error::InvalidArguments);
     }
     let bytes = value.as_bytes();
@@ -1430,7 +1510,7 @@ pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
         let low = hex(pair[1]).ok_or(Error::InvalidArguments)?;
         output.push(high * 16 + low);
     }
-    if output.len() < 32 {
+    if !(MIN_HMAC_KEY_BYTES..=MAX_HMAC_KEY_BYTES).contains(&output.len()) {
         return Err(Error::InvalidArguments);
     }
     Ok(output)
@@ -1443,6 +1523,69 @@ const fn hex(value: u8) -> Option<u8> {
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
     }
+}
+
+/// Loads an HMAC key without putting the key bytes in the process argument list.
+///
+/// The source is one of:
+/// - `env:NAME` for an environment variable;
+/// - `-` for stdin; or
+/// - a filesystem path.
+///
+/// Both raw keys and hexadecimal text files are accepted. Raw input is
+/// preserved byte-for-byte; hexadecimal text must use the explicit hex:
+/// prefix, and textual raw keys may use raw:. Keys must contain 32..=64
+/// bytes. Source reads are bounded to `MAX_KEY_SOURCE_BYTES` bytes.
+pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
+    let bytes = if let Some(name) = spec.strip_prefix("env:") {
+        if name.is_empty() {
+            return Err(Error::InvalidArguments);
+        }
+        let value = std::env::var(name).map_err(|_| Error::InvalidArguments)?;
+        validate_key_source_length(value.len())?;
+        value.into_bytes()
+    } else if spec == "-" {
+        read_key_source(io::stdin().lock())?
+    } else {
+        read_key_source(File::open(spec)?)?
+    };
+    parse_loaded_key(bytes)
+}
+
+fn validate_key_source_length(length: usize) -> Result<(), Error> {
+    if length > MAX_KEY_SOURCE_BYTES {
+        Err(Error::InvalidArguments)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_key_source(reader: impl Read) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_KEY_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    validate_key_source_length(bytes.len())?;
+    Ok(bytes)
+}
+
+fn parse_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if let Some(encoded) = text.strip_prefix(HEX_KEY_PREFIX) {
+            return decode_key(encoded.trim());
+        }
+        if let Some(raw) = text.strip_prefix(RAW_KEY_PREFIX) {
+            return validate_loaded_key(raw.as_bytes().to_vec());
+        }
+    }
+    validate_loaded_key(bytes)
+}
+
+fn validate_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
+    if !(MIN_HMAC_KEY_BYTES..=MAX_HMAC_KEY_BYTES).contains(&bytes.len()) {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2199,7 +2342,15 @@ mod tests {
             MAX_DATA_RECORD_BYTES as u64,
         )
         .unwrap();
-        receive_direct(&object, &first, root, bytes.len() as u64, &mut receiver).unwrap();
+        receive_direct(
+            &object,
+            &first,
+            root,
+            bytes.len() as u64,
+            Suite::Sha256Bep52,
+            &mut receiver,
+        )
+        .unwrap();
         let mut corrupted = bytes;
         corrupted[0] ^= 1;
         fs::write(&object, corrupted).unwrap();
@@ -2209,6 +2360,7 @@ mod tests {
                 &second,
                 root,
                 fs::metadata(&object).unwrap().len(),
+                Suite::Sha256Bep52,
                 &mut receiver
             ),
             Err(Error::RootMismatch)
@@ -2219,7 +2371,80 @@ mod tests {
     }
 
     #[test]
+    fn suite_parser_accepts_every_public_alias() {
+        assert_eq!(parse_suite("blake3").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("blake3-bao64").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("1").unwrap(), Suite::Blake3Bao64);
+        assert_eq!(parse_suite("sha256").unwrap(), Suite::Sha256Bep52);
+        assert_eq!(parse_suite("sha256-bep52").unwrap(), Suite::Sha256Bep52);
+        assert_eq!(parse_suite("2").unwrap(), Suite::Sha256Bep52);
+        assert!(matches!(
+            parse_suite("unknown"),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn copy_and_verify_rejects_length_or_root_mismatch() {
+        let source = temporary("copy-source");
+        let data = b"copy-and-verify";
+        fs::write(&source, data).unwrap();
+        let root = vot_verifier::root(Suite::Sha256Bep52, data).unwrap();
+
+        let valid_destination = temporary("copy-valid");
+        copy_and_verify(
+            &source,
+            &valid_destination,
+            data.len() as u64,
+            root,
+            Suite::Sha256Bep52,
+        )
+        .unwrap();
+        fs::remove_file(valid_destination).unwrap();
+
+        let length_destination = temporary("copy-length-mismatch");
+        assert!(matches!(
+            copy_and_verify(
+                &source,
+                &length_destination,
+                data.len() as u64 + 1,
+                root,
+                Suite::Sha256Bep52,
+            ),
+            Err(Error::SourceMutation)
+        ));
+        fs::remove_file(length_destination).unwrap();
+
+        let root_destination = temporary("copy-root-mismatch");
+        let mut wrong_root = root;
+        wrong_root[0] ^= 1;
+        assert!(matches!(
+            copy_and_verify(
+                &source,
+                &root_destination,
+                data.len() as u64,
+                wrong_root,
+                Suite::Sha256Bep52,
+            ),
+            Err(Error::SourceMutation)
+        ));
+        fs::remove_file(root_destination).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
     fn key_decoder_is_strict_and_bounded() {
+        assert_eq!(MAX_KEY_SOURCE_BYTES, 133);
+        assert!(decode_key(&"ab".repeat(34)).is_ok());
+        assert_eq!(decode_key(&"ab".repeat(64)).unwrap(), vec![0xab; 64]);
+        assert!(matches!(
+            decode_key(&"ab".repeat(65)),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            decode_key(&"a".repeat(65)),
+            Err(Error::InvalidArguments)
+        ));
         assert_eq!(decode_key(&"00".repeat(32)).unwrap(), vec![0; 32]);
         assert!(matches!(decode_key("0"), Err(Error::InvalidArguments)));
         assert!(matches!(
@@ -2239,9 +2464,68 @@ mod tests {
             ]
         );
         assert_eq!(
-            decode_key(&"ABCDEF".repeat(11)).unwrap()[..3],
+            decode_key(&format!("{}0000", "ABCDEF".repeat(10))).unwrap()[..3],
             [0xab, 0xcd, 0xef]
         );
+    }
+
+    #[test]
+    fn key_spec_loader_decodes_hex_and_preserves_raw_keys() {
+        let hex_path = temporary("hex-key");
+        fs::write(&hex_path, format!("hex:{}\n", "ab".repeat(32))).unwrap();
+        assert_eq!(
+            load_key_spec(hex_path.to_str().unwrap()).unwrap(),
+            vec![0xab; 32]
+        );
+        fs::remove_file(&hex_path).unwrap();
+
+        let raw_path = temporary("raw-key");
+        fs::write(&raw_path, [7; 32]).unwrap();
+        assert_eq!(
+            load_key_spec(raw_path.to_str().unwrap()).unwrap(),
+            vec![7; 32]
+        );
+        fs::remove_file(&raw_path).unwrap();
+
+        let ambiguous_path = temporary("ambiguous-raw-key");
+        fs::write(&ambiguous_path, [b'a'; 64]).unwrap();
+        assert_eq!(
+            load_key_spec(ambiguous_path.to_str().unwrap()).unwrap(),
+            vec![b'a'; 64]
+        );
+        fs::remove_file(&ambiguous_path).unwrap();
+
+        let short_path = temporary("short-key");
+        fs::write(&short_path, [7; 31]).unwrap();
+        assert!(matches!(
+            load_key_spec(short_path.to_str().unwrap()),
+            Err(Error::InvalidArguments)
+        ));
+        fs::remove_file(&short_path).unwrap();
+
+        let oversized_path = temporary("oversized-key");
+        fs::write(&oversized_path, [7; 65]).unwrap();
+        assert!(matches!(
+            load_key_spec(oversized_path.to_str().unwrap()),
+            Err(Error::InvalidArguments)
+        ));
+        fs::remove_file(oversized_path).unwrap();
+    }
+
+    #[test]
+    fn key_source_limit_is_exact_and_reads_are_bounded() {
+        assert!(validate_key_source_length(MAX_KEY_SOURCE_BYTES).is_ok());
+        assert!(matches!(
+            validate_key_source_length(MAX_KEY_SOURCE_BYTES + 1),
+            Err(Error::InvalidArguments)
+        ));
+
+        let exact = read_key_source(io::Cursor::new(vec![7; MAX_KEY_SOURCE_BYTES])).unwrap();
+        assert_eq!(exact.len(), MAX_KEY_SOURCE_BYTES);
+        assert!(matches!(
+            read_key_source(io::Cursor::new(vec![7; MAX_KEY_SOURCE_BYTES + 1])),
+            Err(Error::InvalidArguments)
+        ));
     }
 
     #[test]
@@ -2500,11 +2784,32 @@ mod tests {
             parent_directory(Path::new("nested/receipt")),
             Path::new("nested")
         );
-        let cached = ([5; 32], 9, Vec::new());
-        assert!(!pack_needs_load(Some(&cached), [5; 32], 9));
-        assert!(pack_needs_load(Some(&cached), [6; 32], 9));
-        assert!(pack_needs_load(Some(&cached), [5; 32], 10));
-        assert!(pack_needs_load(None, [5; 32], 9));
+        let cached = (Suite::Sha256Bep52, [5; 32], 9, Vec::new());
+        assert!(!pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [5; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Blake3Bao64,
+            [5; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [6; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [5; 32],
+            10
+        ));
+        assert!(pack_needs_load(None, Suite::Sha256Bep52, [5; 32], 9));
 
         let mut receiver = ReliableReceiver::new(
             (MAX_DATA_RECORD_BYTES + vot_verifier::GROUP_SIZE) as u64,
@@ -2517,6 +2822,7 @@ mod tests {
                 Path::new("does-not-exist"),
                 [0; 32],
                 vot_pack::HARD_MAX as u64 + 1,
+                Suite::Sha256Bep52,
                 &mut receiver
             ),
             Err(Error::InvalidBundle)
@@ -2526,6 +2832,7 @@ mod tests {
                 Path::new("does-not-exist"),
                 [0; 32],
                 vot_pack::HARD_MAX as u64,
+                Suite::Sha256Bep52,
                 &mut receiver
             ),
             Err(Error::Io(_))
@@ -2533,7 +2840,7 @@ mod tests {
         let short = directory.join("short");
         fs::write(&short, b"x").unwrap();
         assert!(matches!(
-            receive_object(&short, [0; 32], 2, &mut receiver),
+            receive_object(&short, [0; 32], 2, Suite::Sha256Bep52, &mut receiver),
             Err(Error::InvalidBundle)
         ));
         fs::create_dir(directory.join("nested")).unwrap();
@@ -2573,6 +2880,12 @@ mod tests {
         wrong = direct.clone();
         wrong.storage = Some(StorageRef::Direct(ObjectId {
             suite: 1,
+            ..logical.clone()
+        }));
+        assert!(EntryRecord::from_manifest(wrong).is_ok());
+        wrong = direct.clone();
+        wrong.storage = Some(StorageRef::Direct(ObjectId {
+            suite: 99,
             ..logical.clone()
         }));
         assert!(EntryRecord::from_manifest(wrong).is_err());
@@ -2690,6 +3003,7 @@ mod tests {
     fn package_root_builder_contributes_every_record_field() {
         let record = EntryRecord {
             path: vec![Component::Text("a".to_owned())],
+            suite: DEFAULT_LOGICAL_SUITE,
             logical_root: [5; 32],
             logical_length: 3,
             storage: Storage::Direct,

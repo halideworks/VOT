@@ -3,6 +3,7 @@
 //! Deterministic VOT small-file pack construction and checked extraction.
 
 use vot_manifest::{PackagePath, PathProfile, canonical_path_key};
+use vot_verifier::Suite;
 
 pub const CANDIDATE_MAX: usize = 262_144;
 pub const TARGET_SIZE: usize = 67_108_864;
@@ -28,6 +29,7 @@ pub struct Pack {
     pub bytes: Vec<u8>,
     pub entries: Vec<PackedEntry>,
     pub root: [u8; 32],
+    pub suite: Suite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,12 +44,21 @@ pub enum Error {
 }
 
 pub fn build(files: Vec<LogicalFile>, profile: PathProfile) -> Result<Vec<Pack>, Error> {
-    build_with_target(files, profile, TARGET_SIZE)
+    build_with_suite(files, profile, Suite::Sha256Bep52)
+}
+
+pub fn build_with_suite(
+    files: Vec<LogicalFile>,
+    profile: PathProfile,
+    suite: Suite,
+) -> Result<Vec<Pack>, Error> {
+    build_with_target_and_suite(files, profile, TARGET_SIZE, suite)
 }
 
 /// Bounded pack construction for a canonical-path-ordered input stream.
 pub struct StreamingPacker {
     profile: PathProfile,
+    suite: Suite,
     target_size: usize,
     last_key: Option<Vec<u8>>,
     bytes: Vec<u8>,
@@ -57,8 +68,14 @@ pub struct StreamingPacker {
 impl StreamingPacker {
     #[must_use]
     pub fn new(profile: PathProfile) -> Self {
+        Self::new_with_suite(profile, Suite::Sha256Bep52)
+    }
+
+    #[must_use]
+    pub fn new_with_suite(profile: PathProfile, suite: Suite) -> Self {
         Self {
             profile,
+            suite,
             target_size: TARGET_SIZE,
             last_key: None,
             bytes: Vec::new(),
@@ -66,12 +83,22 @@ impl StreamingPacker {
         }
     }
 
+    #[cfg(test)]
     fn with_target(profile: PathProfile, target_size: usize) -> Result<Self, Error> {
+        Self::with_target_and_suite(profile, target_size, Suite::Sha256Bep52)
+    }
+
+    fn with_target_and_suite(
+        profile: PathProfile,
+        target_size: usize,
+        suite: Suite,
+    ) -> Result<Self, Error> {
         if target_size == 0 || target_size > HARD_MAX {
             return Err(Error::PackTooLarge);
         }
         Ok(Self {
             profile,
+            suite,
             target_size,
             last_key: None,
             bytes: Vec::new(),
@@ -105,6 +132,7 @@ impl StreamingPacker {
             finish_pack(
                 std::mem::take(&mut self.bytes),
                 std::mem::take(&mut self.entries),
+                self.suite,
             )
         });
 
@@ -116,7 +144,7 @@ impl StreamingPacker {
             path: file.path,
             offset: offset as u64,
             length: file.bytes.len() as u64,
-            logical_root: vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &file.bytes)
+            logical_root: vot_verifier::root(self.suite, &file.bytes)
                 .map_err(|_| Error::PackTooLarge)?,
         });
         Ok(completed)
@@ -128,6 +156,7 @@ impl StreamingPacker {
             finish_pack(
                 std::mem::take(&mut self.bytes),
                 std::mem::take(&mut self.entries),
+                self.suite,
             )
         })
     }
@@ -138,10 +167,20 @@ impl StreamingPacker {
     }
 }
 
+#[cfg(test)]
 fn build_with_target(
+    files: Vec<LogicalFile>,
+    profile: PathProfile,
+    target_size: usize,
+) -> Result<Vec<Pack>, Error> {
+    build_with_target_and_suite(files, profile, target_size, Suite::Sha256Bep52)
+}
+
+fn build_with_target_and_suite(
     mut files: Vec<LogicalFile>,
     profile: PathProfile,
     target_size: usize,
+    suite: Suite,
 ) -> Result<Vec<Pack>, Error> {
     let mut keyed = Vec::with_capacity(files.len());
     for file in files.drain(..) {
@@ -156,7 +195,7 @@ fn build_with_target(
         return Err(Error::DuplicatePath);
     }
 
-    let mut packer = StreamingPacker::with_target(profile, target_size)?;
+    let mut packer = StreamingPacker::with_target_and_suite(profile, target_size, suite)?;
     let mut packs = Vec::new();
     for (_, file) in keyed {
         if let Some(pack) = packer.push(file)? {
@@ -169,13 +208,14 @@ fn build_with_target(
     Ok(packs)
 }
 
-fn finish_pack(bytes: Vec<u8>, entries: Vec<PackedEntry>) -> Pack {
-    let root = vot_verifier::root(vot_verifier::Suite::Sha256Bep52, &bytes)
-        .expect("a bounded pack is a valid verifier stream");
+fn finish_pack(bytes: Vec<u8>, entries: Vec<PackedEntry>, suite: Suite) -> Pack {
+    let root =
+        vot_verifier::root(suite, &bytes).expect("a bounded pack is a valid verifier stream");
     Pack {
         bytes,
         entries,
         root,
+        suite,
     }
 }
 
@@ -184,9 +224,7 @@ pub fn extract<'a>(pack: &'a Pack, entry: &PackedEntry) -> Result<&'a [u8], Erro
     let length = usize::try_from(entry.length).map_err(|_| Error::Bounds)?;
     let end = start.checked_add(length).ok_or(Error::Bounds)?;
     let bytes = pack.bytes.get(start..end).ok_or(Error::Bounds)?;
-    if vot_verifier::root(vot_verifier::Suite::Sha256Bep52, bytes).map_err(|_| Error::Bounds)?
-        == entry.logical_root
-    {
+    if vot_verifier::root(pack.suite, bytes).map_err(|_| Error::Bounds)? == entry.logical_root {
         Ok(bytes)
     } else {
         Err(Error::HashMismatch)

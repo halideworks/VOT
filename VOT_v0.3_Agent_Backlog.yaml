@@ -68,9 +68,18 @@ gates:
       - checkpoint_bounded_retransmission
       - quic_to_tcp_preserves_verified_state
       - platform_receipts_state_actual_assurance
+  W5.5:
+    name: system-integration-and-data-plane-contract
+    requires:
+      - transport_contract_exercised_by_simulator_and_backend
+      - proof_bearing_out_of_order_receive
+      - resume_store_scales_to_wave6_workload
+      - reproducible_benchmark_contract_checked
   W6:
     name: fast-path
     requires:
+      - system_integration_complete
+      - benchmark_workload_and_result_schema_ready
       - production_quic_backend_selected_by_data
       - primary_10Gbps_target_attains_95_percent_of_attainable_rate
       - cycles_per_verified_GiB_published
@@ -295,7 +304,7 @@ work_items:
       - crates/vot-transport-api
       - crates/vot-scheduler
     acceptance:
-      - complete_transfer_over_simulator
+      - reliable_transfer_uses_transport_adapter_contract
       - flow_control_tracks_staging_capacity
       - transport_ack_never_maps_to_durability
 
@@ -308,7 +317,7 @@ work_items:
       - crates/vot-transport-msquic
       - live_interop_tests
     acceptance:
-      - simulator_and_live_semantics_match
+      - localhost_reliable_stream_round_trip
       - no_FFI_leaks_or_use_after_free
       - datagram_send_state_exposed_for_later_use
 
@@ -348,11 +357,30 @@ work_items:
       - retransmission_bounded_by_checkpoint_plus_active_units
       - stale_path_state_not_reused_unsafely
 
+  - id: INT-001
+    agent: A09
+    wave: 5.5
+    title: System integration and data-plane contract
+    depends_on: [MOB-002, XFER-002, XFER-003, OBJ-001, OBJ-002]
+    deliverables:
+      - shared_transport_submission_and_polling_contract
+      - simulator_transfer_through_transport_adapter
+      - proof_bearing_out_of_order_receiver
+      - range_encoded_append_only_resume_state
+      - bench/workloads
+      - bench/impairments
+      - bench/public_result_schema.json
+    acceptance:
+      - reliable_transfer_uses_transport_adapter_contract
+      - proof_bearing_ranges_accept_out_of_order_for_both_suites
+      - resume_store_handles_million_small_file_workload
+      - benchmark_contract_validator_passes
+
   - id: PERF-001
     agent: A12
     wave: 6
     title: QUIC engine ceiling bakeoff
-    depends_on: [XFER-003]
+    depends_on: [INT-001]
     deliverables:
       - MsQuic_vs_quiche_report
       - selected_default_backend_ADR
@@ -472,7 +500,7 @@ work_items:
     agent: A17
     wave: 11
     title: Reproducible benchmark and interoperability bundle
-    depends_on: [XFER-003, MOB-002, PERF-002]
+    depends_on: [INT-001, PERF-002]
     deliverables:
       - bench/workloads
       - bench/impairments

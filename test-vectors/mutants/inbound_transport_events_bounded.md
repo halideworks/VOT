@@ -23,5 +23,5 @@ oversized inbound Reliable event was queued
 
 The required `vot-transport-tcp` run reports 90 total, 81 caught, 9 unviable,
 and 0 missed. The required `vot-transport-msquic` run reports 45 total, 43
-caught, 2 unviable, and 0 missed. The shared `vot-transport-api` run reports 22
-total, 21 caught, 1 unviable, and 0 missed.
+caught, 2 unviable, and 0 missed. The required `vot-transport-api` run reports 36
+total, 35 caught, 1 unviable, and 0 missed.

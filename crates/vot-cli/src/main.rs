@@ -15,8 +15,15 @@ fn run() -> Result<(), vot_cli::Error> {
             println!("{} {}", root_hex(&summary.root), summary.logical_length);
             Ok(())
         }
+        [_, command, suite, source, bundle] if command == "send" => {
+            let suite = vot_cli::parse_suite(suite)?;
+            let summary =
+                vot_cli::build_bundle_with_suite(Path::new(source), Path::new(bundle), suite)?;
+            println!("{} {}", root_hex(&summary.root), summary.logical_length);
+            Ok(())
+        }
         [_, command, bundle, destination, receipt, key, observed_at] if command == "receive" => {
-            let key = vot_cli::decode_key(key)?;
+            let key = vot_cli::load_key_spec(key)?;
             let report = vot_cli::receive_bundle(
                 Path::new(bundle),
                 Path::new(destination),

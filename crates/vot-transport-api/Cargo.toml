@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 vot-codec = { path = "../vot-codec" }
+
+[dev-dependencies]
+vot-journal = { path = "../vot-journal" }

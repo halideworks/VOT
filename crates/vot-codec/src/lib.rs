@@ -1,15 +1,18 @@
-//! Bounded codec primitives for the `vot-draft-03` frame envelope.
+//! Typed payload schemas and bounded framing for the VOT v0.3 wire protocol.
 //!
-//! Payload schemas live in their owning protocol modules. This crate validates
-//! the common envelope, criticality convention, grease handling, and registered
-//! per-frame limits before a payload parser can allocate or mutate state.
+//! This crate validates the common envelope, criticality convention, grease
+//! handling, registered per-frame limits, and typed application payloads before
+//! a parser can allocate or mutate state.
 
 #![forbid(unsafe_code)]
 
 use core::cmp::min;
 use std::collections::BTreeSet;
 
+pub mod frames;
+
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
+pub const MIN_CONTROL_FRAME_PAYLOAD: usize = 1024;
 pub const HARD_MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_UNKNOWN_PAYLOAD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FRAMES_PER_BATCH: usize = 4096;
@@ -322,7 +325,10 @@ fn apply_setting(
     use setting_id as id;
 
     let target = match identifier {
-        id::MAX_CONTROL_FRAME_PAYLOAD if (1024..=16 * 1024 * 1024).contains(&value) => {
+        id::MAX_CONTROL_FRAME_PAYLOAD
+            if (MIN_CONTROL_FRAME_PAYLOAD as u64..=HARD_MAX_FRAME_PAYLOAD as u64)
+                .contains(&value) =>
+        {
             &mut settings.max_control_frame_payload
         }
         id::MAX_DATA_RECORD_PAYLOAD if (64 * 1024..=256 * 1024).contains(&value) => {
@@ -639,6 +645,115 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn protocol_limits_and_error_codes_are_explicit() {
+        assert_eq!(HARD_MAX_FRAME_PAYLOAD, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_UNKNOWN_PAYLOAD, 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_FRAMES_PER_BATCH, 4096);
+
+        assert_eq!(
+            DecodeError::Incomplete {
+                needed: 2,
+                available: 1
+            }
+            .protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            DecodeError::ValueOutOfRange(1).protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            DecodeError::InvalidLimits.protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            DecodeError::LengthOverflow(1).protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            DecodeError::FrameTooLarge {
+                frame_type: 1,
+                length: 2,
+                limit: 1
+            }
+            .protocol_code(),
+            error_code::FRAME_TOO_LARGE
+        );
+        assert_eq!(
+            DecodeError::UnknownCritical(1).protocol_code(),
+            error_code::UNKNOWN_CRITICAL_FRAME
+        );
+        assert_eq!(
+            DecodeError::TooManyFrames { limit: 1 }.protocol_code(),
+            error_code::RESOURCE_LIMIT
+        );
+
+        assert_eq!(
+            HelloError::UnsupportedRevision(4).protocol_code(),
+            error_code::UNSUPPORTED_VERSION
+        );
+        assert_eq!(
+            HelloError::TooManyExtensions(1).protocol_code(),
+            error_code::RESOURCE_LIMIT
+        );
+        assert_eq!(
+            HelloError::Malformed(DecodeError::Incomplete {
+                needed: 2,
+                available: 1
+            })
+            .protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            HelloError::RoleMismatch {
+                expected: EndpointRole::Client,
+                actual: EndpointRole::Server
+            }
+            .protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            HelloError::DuplicateExtension(1).protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
+            HelloError::TrailingBytes.protocol_code(),
+            error_code::MALFORMED_FRAME
+        );
+
+        assert_eq!(
+            SettingsError::Duplicate(1).protocol_code(),
+            error_code::DUPLICATE_SETTING
+        );
+        assert_eq!(
+            SettingsError::InvalidValue {
+                setting: 1,
+                value: 0
+            }
+            .protocol_code(),
+            error_code::INVALID_SETTING
+        );
+        assert_eq!(
+            SettingsError::UnknownCritical(1).protocol_code(),
+            error_code::INVALID_SETTING
+        );
+        assert_eq!(
+            SettingsError::TooMany { limit: 1 }.protocol_code(),
+            error_code::RESOURCE_LIMIT
+        );
+        assert_eq!(
+            SettingsError::Malformed(DecodeError::FrameTooLarge {
+                frame_type: 1,
+                length: 2,
+                limit: 1
+            })
+            .protocol_code(),
+            error_code::FRAME_TOO_LARGE
+        );
+    }
+
+    #[test]
     fn optional_unknown_is_skipped() {
         let bytes = [0x1e, 0x03, 0xaa, 0xbb, 0xcc];
         let (frame, consumed) = decode_one(&bytes, DecodeLimits::default()).unwrap();
@@ -751,6 +866,86 @@ mod tests {
     }
 
     #[test]
+    fn settings_payload_limits_are_explicit() {
+        assert_eq!(MIN_CONTROL_FRAME_PAYLOAD, 1024);
+        let one_setting = |identifier: u64, value: u64| {
+            let mut payload = Vec::new();
+            encode_varint(identifier, &mut payload).unwrap();
+            encode_varint(value, &mut payload).unwrap();
+            payload
+        };
+
+        assert_eq!(
+            decode_settings(&one_setting(setting_id::MAX_CONTROL_FRAME_PAYLOAD, 1024))
+                .unwrap()
+                .max_control_frame_payload,
+            1024
+        );
+        assert_eq!(
+            decode_settings(&one_setting(
+                setting_id::MAX_CONTROL_FRAME_PAYLOAD,
+                16 * 1024 * 1024
+            ))
+            .unwrap()
+            .max_control_frame_payload,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            decode_settings(&one_setting(setting_id::MAX_CONTROL_FRAME_PAYLOAD, 1023)),
+            Err(SettingsError::InvalidValue {
+                setting: setting_id::MAX_CONTROL_FRAME_PAYLOAD,
+                value: 1023
+            })
+        );
+        assert_eq!(
+            decode_settings(&one_setting(
+                setting_id::MAX_CONTROL_FRAME_PAYLOAD,
+                16 * 1024 * 1024 + 1
+            )),
+            Err(SettingsError::InvalidValue {
+                setting: setting_id::MAX_CONTROL_FRAME_PAYLOAD,
+                value: 16 * 1024 * 1024 + 1
+            })
+        );
+
+        assert_eq!(
+            decode_settings(&one_setting(setting_id::MAX_DATA_RECORD_PAYLOAD, 64 * 1024))
+                .unwrap()
+                .max_data_record_payload,
+            64 * 1024
+        );
+        assert_eq!(
+            decode_settings(&one_setting(
+                setting_id::MAX_DATA_RECORD_PAYLOAD,
+                256 * 1024
+            ))
+            .unwrap()
+            .max_data_record_payload,
+            256 * 1024
+        );
+        assert_eq!(
+            decode_settings(&one_setting(
+                setting_id::MAX_DATA_RECORD_PAYLOAD,
+                64 * 1024 - 1
+            )),
+            Err(SettingsError::InvalidValue {
+                setting: setting_id::MAX_DATA_RECORD_PAYLOAD,
+                value: 64 * 1024 - 1
+            })
+        );
+        assert_eq!(
+            decode_settings(&one_setting(
+                setting_id::MAX_DATA_RECORD_PAYLOAD,
+                256 * 1024 + 1
+            )),
+            Err(SettingsError::InvalidValue {
+                setting: setting_id::MAX_DATA_RECORD_PAYLOAD,
+                value: 256 * 1024 + 1
+            })
+        );
+    }
+
+    #[test]
     fn settings_negotiation_rejects_critical_duplicate_and_invalid() {
         let mut unknown = Vec::new();
         encode_varint(0x25, &mut unknown).unwrap();
@@ -813,6 +1008,14 @@ mod tests {
             Err(HelloError::RoleMismatch { .. })
         ));
 
+        let server = [3, 1, 0];
+        assert_eq!(
+            decode_hello(&server, EndpointRole::Server)
+                .unwrap()
+                .endpoint_role,
+            EndpointRole::Server
+        );
+
         let mut duplicate = Vec::new();
         for value in [DRAFT_REVISION, 0, 2, 3, 3] {
             encode_varint(value, &mut duplicate).unwrap();
@@ -835,6 +1038,25 @@ mod tests {
             Err(HelloError::TooManyExtensions(
                 MAX_EXTENSIONS_PER_HELLO as u64 + 1
             ))
+        );
+
+        let mut maximum = Vec::new();
+        for value in [
+            DRAFT_REVISION,
+            EndpointRole::Client as u64,
+            MAX_EXTENSIONS_PER_HELLO as u64,
+        ] {
+            encode_varint(value, &mut maximum).unwrap();
+        }
+        for extension in 0..MAX_EXTENSIONS_PER_HELLO as u64 {
+            encode_varint(extension, &mut maximum).unwrap();
+        }
+        assert_eq!(
+            decode_hello(&maximum, EndpointRole::Client)
+                .unwrap()
+                .extensions
+                .len(),
+            MAX_EXTENSIONS_PER_HELLO
         );
     }
 

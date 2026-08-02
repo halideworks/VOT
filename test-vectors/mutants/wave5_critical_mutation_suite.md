@@ -1,6 +1,6 @@
 # Wave 5 critical mutation suite
 
-Wave 5 mutation tests use cargo-mutants 26.0.0 and Rust 1.85.0. Every Wave 5
+Wave 5 mutation tests use cargo-mutants 26.0.0 and Rust 1.88.0. Every Wave 5
 crate is required in CI.
 
 ```text
@@ -23,12 +23,12 @@ The shared carrier dependencies changed during the final review also remain
 required:
 
 ```text
-vot-transport-api:     22 total, 21 caught, 1 unviable, 0 missed
+vot-transport-api:     36 total, 35 caught, 1 unviable, 0 missed
 vot-transport-msquic:  45 total, 43 caught, 2 unviable, 0 missed
-aggregate:             67 total, 64 caught, 3 unviable, 0 missed
+aggregate:             81 total, 78 caught, 3 unviable, 0 missed
 ```
 
-Across the Wave 5 crates and those dependencies, 788 mutants were tested: 738
+Across the Wave 5 crates and those dependencies, 802 mutants were tested: 752
 were caught, 50 were unviable, and none were missed.
 
 The only platform exclusions are the thin native `sync_file` and `sync_parent`

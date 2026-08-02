@@ -22,10 +22,20 @@ jobs:
           python-version: "3.13"
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check dependency policy and advisories
+        run: |
+          cargo +1.88.0 install --locked cargo-deny --version 0.20.2
+          cargo +1.88.0 install --locked cargo-audit --version 0.22.1
+          # The policy tools read the committed lockfile; neither subcommand needs a global --locked flag.
+          cargo deny check
+          # cargo-audit reads the committed lockfile and has no --locked flag.
+          cargo audit
 
       - name: Validate specifications and vectors
         run: |
+          python3 tools/validate_benchmark_contract.py
           python3 tools/validate_registries.py
           python3 tools/validate_wire_vectors.py
           python3 tools/validate_security_matrix.py
@@ -35,7 +45,7 @@ jobs:
           python3 tools/verify_wave4_package.py
           python3 tools/validate_commit_fixtures.py
           python3 tools/validate_commit_model_sync.py
-          VOT_CARGO="cargo +1.85.0" python3 tools/differential_fuzz_codec.py
+          VOT_CARGO="cargo +1.88.0" python3 tools/differential_fuzz_codec.py
 
       - name: Model-check commit invariants
         run: |
@@ -75,18 +85,18 @@ jobs:
           grep -q "Invariant UnsupportedNeverAdvanced is violated" /tmp/tlc-unsupported.log
 
       - name: Check formatting
-        run: cargo +1.85.0 fmt --all --check
+        run: cargo +1.88.0 fmt --all --check
 
       - name: Lint
         run: |
-          cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
+          cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
           CLIPPY_CONF_DIR=crates/vot-transport-sim \
-            cargo +1.85.0 clippy -p vot-transport-sim --all-targets --locked -- -D warnings
+            cargo +1.88.0 clippy -p vot-transport-sim --all-targets --locked -- -D warnings
 
       - name: Test
         run: |
-          cargo +1.85.0 test --workspace --locked
-          cargo +1.85.0 test -p vot-pack --test million_package --locked -- --ignored
+          cargo +1.88.0 test --workspace --locked
+          cargo +1.88.0 test -p vot-pack --test million_package --locked -- --ignored
 
       - name: Validate deterministic simulation
         run: |
@@ -97,18 +107,29 @@ jobs:
           seed_a="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
           seed_b="$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')"
           test "$seed_a" != "$seed_b"
-          RUST_SEED="$seed_a" cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-a.trace 2> /tmp/rebind-a.digest
-          RUST_SEED="$seed_b" cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-b.trace 2> /tmp/rebind-b.digest
+
+          RUST_SEED="$seed_a" cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-a.trace 2> /tmp/rebind-a.digest
+          RUST_SEED="$seed_b" cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot > /tmp/rebind-b.trace 2> /tmp/rebind-b.digest
           cmp /tmp/rebind-a.trace /tmp/rebind-b.trace
           cmp /tmp/rebind-a.digest /tmp/rebind-b.digest
-          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/storage-fault.vot > /tmp/storage.trace
-          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-shrink -- sim/scenarios/storage-fault.vot > /tmp/storage-minimized.vot
-          cargo +1.85.0 run -q -p vot-transport-sim --bin vot-trace-replay -- /tmp/storage-minimized.vot > /tmp/storage-minimized.trace
+          cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/storage-fault.vot > /tmp/storage.trace
+          cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-shrink -- sim/scenarios/storage-fault.vot > /tmp/storage-minimized.vot
+          cargo +1.88.0 run -q -p vot-transport-sim --bin vot-trace-replay -- /tmp/storage-minimized.vot > /tmp/storage-minimized.trace
 
       - name: Build standalone fuzz drivers
         run: |
-          cargo +1.85.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
-          cargo +1.85.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
+          cargo +1.88.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
+          cargo +1.88.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
+      - name: Run bounded fuzz smoke tests
+        run: |
+          set -euo pipefail
+          for seed in fuzz/frame_codec/corpus/* test-vectors/wire/frame-envelope.json; do
+            fuzz/frame_codec/target/debug/vot-frame-fuzz-driver --iterations 256 < "$seed"
+          done
+          for seed in fuzz/manifest/corpus/* test-vectors/manifest/page.json; do
+            fuzz/manifest/target/debug/vot-manifest-fuzz-driver --iterations 256 < "$seed"
+          done
+
 
   platform-native:
     name: platform native (${{ matrix.os }})
@@ -124,10 +145,10 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Test native commit provider
-        run: cargo +1.85.0 test -p vot-commit-platform -p vot-platform-fs -p vot-resume --locked
+        run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-resume --locked
 
   s3-live:
     runs-on: ubuntu-24.04
@@ -138,7 +159,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Start pinned MinIO
         run: |
@@ -167,7 +188,7 @@ jobs:
           VOT_S3_BUCKET: vot-wave2
           VOT_S3_ACCESS_KEY: votwave2admin
           VOT_S3_SECRET_KEY: vot-wave2-secret-key-2026
-        run: cargo +1.85.0 test -p vot-commit-object --features s3-live --test s3_live --locked
+        run: cargo +1.88.0 test -p vot-commit-object --features s3-live --test s3_live --locked
 
       - name: Stop MinIO
         if: always()
@@ -185,7 +206,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Install storage harness tools
         run: sudo apt-get update && sudo apt-get install -y dmsetup e2fsprogs util-linux
@@ -202,16 +223,16 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       - name: Install native build tools
         run: sudo apt-get update && sudo apt-get install -y cmake openssl
 
       - name: Test live MsQuic interop
-        run: cargo +1.85.0 test -p vot-transport-msquic --features live --locked
+        run: cargo +1.88.0 test -p vot-transport-msquic --features live --locked
 
       - name: Lint isolated FFI crate
-        run: cargo +1.85.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
+        run: cargo +1.88.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
 
   msquic-sanitizer:
     runs-on: ubuntu-24.04
@@ -273,11 +294,11 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Install pinned cargo-mutants
-        run: cargo +1.85.0 install --locked cargo-mutants --version 26.0.0
+        run: cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
 
       - name: Test mutants
         continue-on-error: ${{ !matrix.required }}
-        run: cargo +1.85.0 mutants --package "${{ matrix.package }}" --jobs 2
+        run: cargo +1.88.0 mutants --package "${{ matrix.package }}" --jobs 2

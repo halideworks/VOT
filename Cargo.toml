@@ -6,13 +6,13 @@ resolver = "3"
 version = "0.0.1"
 edition = "2024"
 license = "AGPL-3.0-only"
-rust-version = "1.85"
+rust-version = "1.88"
 [workspace.dependencies]
 blake3 = "1.8.5"
 sha2 = "0.10.9"
 unicode-normalization = "0.1.24"
 rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-base64 = "=0.21.7"
+base64 = "=0.22.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

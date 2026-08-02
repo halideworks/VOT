@@ -10,6 +10,7 @@ Implementation order and acceptance gates are defined in
 ## Validation
 
 ```sh
+python3 tools/validate_benchmark_contract.py
 python3 tools/validate_registries.py
 python3 tools/validate_wire_vectors.py
 python3 tools/validate_security_matrix.py
@@ -38,13 +39,22 @@ Build a deterministic transfer bundle:
 cargo run -p vot-cli -- send SOURCE_DIRECTORY BUNDLE_DIRECTORY
 ```
 
+An explicit logical-object suite can be selected with:
+
+```sh
+cargo run -p vot-cli -- send SUITE SOURCE_DIRECTORY BUNDLE_DIRECTORY
+```
+
+SUITE is `blake3` or `sha256`; the default is `sha256`.
+
 Verify and publish a bundle, then write an authenticated receipt:
 
 ```sh
-cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor HMAC_KEY_HEX 2026-07-31T20:00:00Z
+cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor KEY_SOURCE 2026-07-31T20:00:00Z
 ```
 
-The HMAC key must be at least 32 bytes. The receiver refuses to replace an
+KEY_SOURCE is `env:NAME`, `-` for stdin, or a file path. Raw key bytes
+(32–64 bytes) are preserved as-is; hexadecimal text must begin with `hex:` (and textual raw keys may begin with `raw:`). The receiver refuses to replace an
 existing destination or receipt.
 
 ## License

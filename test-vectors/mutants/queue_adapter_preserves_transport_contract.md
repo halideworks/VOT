@@ -1,8 +1,8 @@
-# simulator_and_live_semantics_match
+# queue_adapter_preserves_transport_contract
 
-The MsQuic bridge consumes the same `TransportAdapter` contract as the
-deterministic simulator. A live localhost test sends one 192 KiB reliable stream
-over the pinned MsQuic v2.5.9 release and compares every received byte.
+The queue adapter preserves the transport command order and keeps VOT bytes
+unchanged. This is a unit-level contract test; the feature-gated live test is
+tracked separately as `localhost_reliable_stream_round_trip`.
 
 Mutant:
 
@@ -14,7 +14,7 @@ Mutant:
 Observed failure:
 
 ```text
-test tests::simulator_and_live_semantics_share_the_transport_contract ... FAILED
+test tests::queue_adapter_preserves_transport_contract ... FAILED
 assertion `left == right` failed
 left: Some(ReceiveCredit(4096))
 right: Some(Reliable { stream: StreamId(2), bytes: [...] })

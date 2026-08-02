@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 blake3.workspace = true
+vot-transport-api = { path = "../vot-transport-api" }
 
 [dev-dependencies]
 vot-commit-model = { path = "../vot-commit-model" }

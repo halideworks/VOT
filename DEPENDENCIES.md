@@ -16,8 +16,9 @@ VOT keeps the correctness core small and auditable.
 - Automated updates run tests and vector comparisons; they never auto-merge an
   identity-, wire-, storage-, or cryptography-visible change.
 
-Current minimum Rust version is 1.85 for Rust 2024 edition support. Raising it
-requires an ADR or release-policy update and CI coverage.
+Current minimum Rust version is 1.88. The optional AWS S3 backend requires the
+patched SDK release below, whose dependency graph requires Rust 1.88. Raising the
+minimum further requires an ADR or release-policy update and CI coverage.
 
 Wave 1 runtime dependencies:
 
@@ -33,11 +34,12 @@ Wave 2 runtime dependencies:
 - `rustix` 1.1.4 provides the safe Linux `O_DIRECT` descriptor API.
 - `hmac` 0.12.1 provides RustCrypto HMAC-SHA-256 receipt authentication.
 
-The optional `s3-live` feature uses `aws-sdk-s3` 1.96.0, `base64` 0.22.1,
-and `tokio`. Version 1.96.0 is the newest AWS S3 SDK release compatible with
-the project Rust 1.85 minimum. The larger SDK dependency graph is isolated
-behind the feature and exercised against MinIO in CI. The MinIO server and
-client images are pinned by digest.
+The optional `s3-live` feature uses `aws-sdk-s3` 1.120.0, `base64` 0.22.1,
+and `tokio`. Version 1.120.0 is the first SDK release in this line that pulls
+the patched `lru` release and current TLS/runtime dependencies; it requires the
+project Rust 1.88 minimum. The larger SDK dependency graph is isolated behind
+the feature and exercised against MinIO in CI. The MinIO server and client
+images are pinned by digest.
 
 Wave 3 adds no new third-party runtime packages. The deterministic simulator
 reuses the workspace `blake3` package for canonical trace digests. The frame and

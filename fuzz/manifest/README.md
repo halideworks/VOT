@@ -13,3 +13,6 @@ cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 
 Seed from `test-vectors/manifest/page.json`. Minimized failures may be committed
 only when they contain no customer data, paths, tokens, or payloads.
+
+CI runs --iterations 256 against the committed corpus and the canonical page
+seed. A scheduled workflow runs the same bounded driver for 10,000 iterations.

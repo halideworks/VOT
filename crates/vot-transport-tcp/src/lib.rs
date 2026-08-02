@@ -9,23 +9,29 @@ use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
-use vot_transport_api::{ConnectionId, Error, Event, StreamId, TransportAck, TransportAdapter};
+use vot_transport_api::{
+    ConnectionId, Error, Event, PathStats, Payload, StreamId, TransportAck, TransportAdapter,
+    shared_payload,
+};
 
 const DEFAULT_COMMAND_COUNT_LIMIT: usize = 64;
 const DEFAULT_COMMAND_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-const CONTROL_LIMIT: usize = 1024 * 1024;
+const CONTROL_LIMIT: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
-    Control(Vec<u8>),
-    Reliable { stream: StreamId, bytes: Vec<u8> },
+    Control(Payload),
+    Reliable { stream: StreamId, bytes: Payload },
+    Datagram { context: u64, bytes: Payload },
     ReceiveCredit(u64),
 }
 
 impl Command {
     fn payload_len(&self) -> usize {
         match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } => bytes.len(),
+            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
+                bytes.len()
+            }
             Self::ReceiveCredit(_) => 0,
         }
     }
@@ -33,7 +39,9 @@ impl Command {
     #[must_use]
     pub fn vot_bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } => Some(bytes),
+            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
+                Some(bytes)
+            }
             Self::ReceiveCredit(_) => None,
         }
     }
@@ -61,6 +69,7 @@ pub struct TcpAdapter {
     command_bytes: usize,
     command_count_limit: usize,
     command_byte_limit: usize,
+    control_payload_limit: usize,
     events: VecDeque<Event>,
     event_bytes: usize,
     event_count_limit: usize,
@@ -74,6 +83,7 @@ impl Default for TcpAdapter {
             command_bytes: 0,
             command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
+            control_payload_limit: CONTROL_LIMIT,
             events: VecDeque::new(),
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
@@ -96,6 +106,16 @@ impl TcpAdapter {
         })
     }
 
+    /// Applies the peer-negotiated control-frame payload ceiling.
+    ///
+    /// # Errors
+    /// Rejects zero or out-of-range negotiated payload limits.
+    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit = limit;
+        Ok(())
+    }
+
     /// Queues a native callback after enforcing protocol and memory bounds.
     ///
     /// # Errors
@@ -103,9 +123,7 @@ impl TcpAdapter {
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let payload_len = match &event {
             NativeEvent::Control(bytes) => {
-                if bytes.len() > CONTROL_LIMIT {
-                    return Err(Error::RecordTooLarge);
-                }
+                vot_transport_api::validate_control_frame(bytes, self.control_payload_limit)?;
                 bytes.len()
             }
             NativeEvent::Reliable { bytes, .. } => {
@@ -126,7 +144,7 @@ impl TcpAdapter {
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
             NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
-            NativeEvent::Control(bytes) => Event::Control(bytes),
+            NativeEvent::Control(bytes) => Event::Control(bytes.into()),
             NativeEvent::Reliable {
                 stream,
                 sequence,
@@ -134,7 +152,7 @@ impl TcpAdapter {
             } => Event::Reliable {
                 stream: StreamId(stream),
                 sequence,
-                bytes,
+                bytes: bytes.into(),
             },
             NativeEvent::Acknowledged { stream, sequence } => {
                 Event::Acknowledged(TransportAck::new(stream, sequence))
@@ -148,6 +166,27 @@ impl TcpAdapter {
         let command = self.commands.pop_front()?;
         self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
         Some(command)
+    }
+
+    /// Gives a carrier driver one queued command at a time.
+    ///
+    /// A failed submission remains at the head of the queue so a caller can
+    /// retry or close the carrier without silently dropping data.
+    ///
+    /// # Errors
+    /// Returns the first carrier error reported by `submit`.
+    pub fn drain_commands<F, E>(&mut self, mut submit: F) -> Result<(), E>
+    where
+        F: FnMut(Command) -> Result<(), E>,
+    {
+        while let Some(command) = self.commands.front().cloned() {
+            submit(command)?;
+            let Some(command) = self.commands.pop_front() else {
+                break;
+            };
+            self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
+        }
+        Ok(())
     }
 
     fn enqueue(&mut self, command: Command) -> Result<(), Error> {
@@ -166,17 +205,49 @@ impl TcpAdapter {
 
 impl TransportAdapter for TcpAdapter {
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
-        if frame.len() > CONTROL_LIMIT {
-            return Err(Error::RecordTooLarge);
-        }
-        self.enqueue(Command::Control(frame.to_vec()))
+        self.send_control_shared(shared_payload(frame))
+    }
+
+    fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
+        vot_transport_api::validate_control_frame(&frame, self.control_payload_limit)?;
+        self.enqueue(Command::Control(frame))
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
         vot_transport_api::validate_data_record(record)?;
+        self.send_reliable_shared(stream, shared_payload(record))
+    }
+
+    fn preflight_reliable_batch(
+        &self,
+        _stream: StreamId,
+        records: &[Payload],
+    ) -> Result<(), Error> {
+        let next_bytes = records
+            .iter()
+            .try_fold(self.command_bytes, |bytes, record| {
+                vot_transport_api::validate_data_record(record)?;
+                bytes
+                    .checked_add(record.len())
+                    .ok_or(Error::ArithmeticOverflow)
+            })?;
+        let next_count = self
+            .commands
+            .len()
+            .checked_add(records.len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        if next_count > self.command_count_limit || next_bytes > self.command_byte_limit {
+            Err(Error::OutboundQueueFull)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
+        vot_transport_api::validate_data_record(&record)?;
         self.enqueue(Command::Reliable {
             stream,
-            bytes: record.to_vec(),
+            bytes: record,
         })
     }
 
@@ -188,6 +259,10 @@ impl TransportAdapter for TcpAdapter {
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
         self.enqueue(Command::ReceiveCredit(bytes))
+    }
+
+    fn path_stats(&self) -> Option<PathStats> {
+        None
     }
 }
 
@@ -389,12 +464,76 @@ impl CarrierRace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
+    use std::process::{Command as ProcessCommand, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::{RootCertStore, ServerConfig, ServerConnection};
 
-    const TEST_CERT: &str = "MIIDQDCCAiigAwIBAgIUH2kAu8b2ouPR9XDkVFin4mBS82MwDQYJKoZIhvcNAQELBQAwEzERMA8GA1UEAwwIdm90LnRlc3QwHhcNMjYwODAxMDU1MjEyWhcNMzYwNzI5MDU1MjEyWjATMREwDwYDVQQDDAh2b3QudGVzdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMG3NR4mquNRAy3vWYufkClhwqU6fL+esfVrBuMXUXLv4uomQR0ddtqN/6ciwTGLattqm6V0LfmLfPPFxB/cbgGCPJyyDe5TT81r+Af/eRQiWZohJZdkncCDZ2jhn8qAX81S1lilsBvHbgS+3ZSXkq3zP+HXA5A1QCXXbRpPG4dBO0TySb+dZusgIwUtJ+TciuNTFt3ndA5qkKspIMeHnmgx1p+fmgnZft8ZHRHBRqZ4wVxBJa3ZY9Rjkids1mku/bP2NDOmH0oSJQSXionkBXrBK9Fyr2/T9DitwOr+2t02JlNT1oLQ21r9OikCWXu/9o8VhEkYwAo2c5uwQhj5B+ECAwEAAaOBizCBiDAdBgNVHQ4EFgQUajW5JZNFtIhizFsXII9bCXfIvIIwHwYDVR0jBBgwFoAUajW5JZNFtIhizFsXII9bCXfIvIIwEwYDVR0RBAwwCoIIdm90LnRlc3QwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAIRUsJDe9Pa8wIa/DShr9Wz4/HRrJFll37xVsdNi7IdwchWPQifN0vL3UowvcGGTr1RpL2UKyyQ+KMgouq3glV4nL65tXx5LSxklIsMiHQ2fJGJTk/JUFOouiVn7s764ICwRFSTPTxzrtqrv6+4DAUnA4zYxvs+dtc4CO7eQCeX2Zd4RT1j9mjH2Hi3oZ6h/fHZjLfoegTI5PeHjT24LVX0l9dW3q9fsf39zGVC8l2jyM+vYyYNGix15fAxgKHnW1AugjgaV9oeF66F5FQLWcO3BZFOWwOv3rOVst1lFvBkHJCHMnngl3XEZe3G2dWKUcwsNA45O4PwIa7M38PggUJ4=";
-    const TEST_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDBtzUeJqrjUQMt71mLn5ApYcKlOny/nrH1awbjF1Fy7+LqJkEdHXbajf+nIsExi2rbapuldC35i3zzxcQf3G4Bgjycsg3uU0/Na/gH/3kUIlmaISWXZJ3Ag2do4Z/KgF/NUtZYpbAbx24Evt2Ul5Kt8z/h1wOQNUAl120aTxuHQTtE8km/nWbrICMFLSfk3IrjUxbd53QOapCrKSDHh55oMdafn5oJ2X7fGR0RwUameMFcQSWt2WPUY5InbNZpLv2z9jQzph9KEiUEl4qJ5AV6wSvRcq9v0/Q4rcDq/trdNiZTU9aC0Nta/TopAll7v/aPFYRJGMAKNnObsEIY+QfhAgMBAAECggEAHUaja/WbEPSu3tPT/CJ2xpJEOPVgYhNJQNZWeZ6ODClN6WYzpANOcZRRRUCe4u53jUaM1FH9GsAmd671R31oUKkOoP3V1iVYI6sEFq1Y7p6MXRtSU5F8t9oEGFk07YU+NUkmJMqRlXkr2uK/mRPZMpnXFzoIC1TI548pqXa4KdYCGTIiAg4c/lL0/KSRgPxiy54rXp8LqoapsO5Dsit3dMIs+0/O0N7BtWgcZ+wGbPRJoaRgJq7HaMglnbL+F1Q+8uXrahvNEzXV1r12mB1eed+KIdqsZ5n6CrRJI/gXPt3mWGEKX2ac3os0rvlXzRV4vUBv7+0Rk3R6794dcQxiowKBgQDlC5F9iKiJPjuRPhYJC/IhMhu/aTXyjnpHQIyvdzInuTxCSkjntcRVkaHdW+BbQXwtJiabyM4+97q3desvw9TIvJnB3z0Ss+g5PC1m0WdSE+Bf5layCq7KdxfGnZkrkNuwfVKokOYnX4ZLejqRumnoeY36GIu+wYscd/dxI4+mXwKBgQDYg0SrzEHz7l06NL585w6Gy7J57ZF8tAzeJk/eO+xuhd9RsAcZE/RsndC8R0ghPzS6nx6C8L20WV5+3RGIZZRa59s+PBU5HtF8HBKw6DA7BuHvBWncEkiEk8oqoRvwLMcWzYeg0qEsvBLBzte7zY39/RmBQ1quYShgk9tqy3d5vwKBgDDa7daj/qb/kj8hyht149i20npam7o4L9bg6uFGgHk+pp7RL4nVGKLT5H3N6iYs6qrKt3OFOpDt0HLvgRH4KHwE1psm3eUOYNtMfbavteUo/jQWcqmZY70l9/lShmhnhqS3ppj0B1OgqYmR8cpBw/NlciZFdBFlQSH6aNpGJo7rAoGBAIfql9BVUE3GJAYnGDGmhsr90pOSHFOxX6aRXHABJCIZriBEpaALk9QfmeqnwNMGL567xtaiNCSkOZrgQmJiiigrBsnhw9zwyMblhKJDkAtt/aUju9moLJf1guMR8kzqfyyEZ5EAyKchhZDevTUrC+kW2sz3sFRpr4Q5LXO0ONNXAoGAbqfqMdmCSv566ZePQmTq4T9JkZE3XHX+oP79A0bq8PcJebGbHcWqdPjgQNvG0xBLLk3zqPF2sYRlBuwoA59ARBKvLhsDG7nNoXQefnfl8IzkQLz2AfVAvDj5Bo8bHjepTs4wZZGwhTjdWQSu9oPMTuxFzu5GnGsrWcgCXXp+Gxk=";
+    static IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_identity() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let sequence = IDENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vot-tcp-identity-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let key_pem = directory.join("key.pem");
+        let key_der = directory.join("key.der");
+        let certificate_der = directory.join("cert.der");
+        let status = ProcessCommand::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key_pem.to_str().unwrap(),
+                "-out",
+                certificate_der.to_str().unwrap(),
+                "-outform",
+                "DER",
+                "-sha256",
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=vot.test",
+                "-addext",
+                "subjectAltName=DNS:vot.test",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-addext",
+                "keyUsage=critical,digitalSignature,keyEncipherment",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = ProcessCommand::new("openssl")
+            .args([
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-in",
+                key_pem.to_str().unwrap(),
+                "-out",
+                key_der.to_str().unwrap(),
+                "-outform",
+                "DER",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let certificate = CertificateDer::from(std::fs::read(&certificate_der).unwrap());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&key_der).unwrap()));
+        let _ = std::fs::remove_dir_all(directory);
+        (certificate, key)
+    }
 
     fn transfer_client_to_server(client: &mut TlsClientCarrier, server: &mut ServerConnection) {
         let mut wire = Vec::new();
@@ -469,6 +608,32 @@ mod tests {
     }
 
     #[test]
+    fn command_drain_preserves_order_and_removes_submitted_commands() {
+        let mut adapter = TcpAdapter::default();
+        adapter.send_control(b"control").unwrap();
+        adapter.send_reliable(StreamId(4), b"payload").unwrap();
+
+        let mut seen = Vec::new();
+        adapter
+            .drain_commands(|command| {
+                seen.push(command);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                Command::Control(shared_payload(b"control")),
+                Command::Reliable {
+                    stream: StreamId(4),
+                    bytes: shared_payload(b"payload"),
+                },
+            ]
+        );
+        assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
     fn adapter_preserves_identical_vot_bytes_and_bounds_queues() {
         let mut adapter = TcpAdapter::with_queue_limits(2, 8).unwrap();
         adapter.send_control(b"abc").unwrap();
@@ -485,10 +650,111 @@ mod tests {
         assert_eq!(
             adapter.send_reliable(
                 StreamId(1),
-                &vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1]
+                &vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1]
             ),
             Err(Error::RecordTooLarge)
         );
+    }
+
+    #[test]
+    fn reliable_batch_preflight_keeps_queue_unchanged_on_count_failure() {
+        let mut adapter = TcpAdapter::with_queue_limits(2, 100).unwrap();
+        adapter.send_reliable(StreamId(1), b"first").unwrap();
+        let records = [shared_payload(b"second"), shared_payload(b"third")];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(Error::OutboundQueueFull)
+        );
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Reliable {
+                stream: StreamId(1),
+                bytes: shared_payload(b"first"),
+            })
+        );
+        assert_eq!(adapter.next_command(), None);
+
+        let mut exact_count = TcpAdapter::with_queue_limits(2, 100).unwrap();
+        exact_count.send_reliable(StreamId(1), b"first").unwrap();
+        assert_eq!(
+            exact_count.send_reliable_batch(StreamId(1), &[shared_payload(b"second")]),
+            Ok(())
+        );
+
+        let mut exact_bytes = TcpAdapter::with_queue_limits(3, 8).unwrap();
+        exact_bytes.send_reliable(StreamId(1), b"one").unwrap();
+        assert_eq!(
+            exact_bytes.send_reliable_batch(StreamId(1), &[shared_payload(b"12345")]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reliable_batch_preflight_keeps_queue_unchanged_on_byte_failure() {
+        let mut adapter = TcpAdapter::with_queue_limits(3, 8).unwrap();
+        adapter.send_reliable(StreamId(1), b"one").unwrap();
+        let records = [shared_payload(b"two"), shared_payload(b"three")];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(Error::OutboundQueueFull)
+        );
+        assert_eq!(
+            adapter.next_command(),
+            Some(Command::Reliable {
+                stream: StreamId(1),
+                bytes: shared_payload(b"one"),
+            })
+        );
+        assert_eq!(adapter.next_command(), None);
+    }
+
+    #[test]
+    fn path_stats_are_unavailable_without_a_native_path() {
+        let adapter = TcpAdapter::default();
+        assert_eq!(adapter.path_stats(), None);
+    }
+
+    #[test]
+    fn negotiated_control_payload_limit_updates_both_directions() {
+        let mut adapter = TcpAdapter::default();
+        assert_eq!(
+            adapter.set_control_payload_limit(0),
+            Err(Error::InvalidConfiguration)
+        );
+        adapter.set_control_payload_limit(2 * 1024 * 1024).unwrap();
+        adapter
+            .send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
+            .unwrap();
+        assert_eq!(
+            adapter.send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::Control(vec![
+                0;
+                2 * 1024 * 1024 + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tcp_datagrams_are_explicitly_unsupported() {
+        let mut adapter = TcpAdapter::default();
+        assert_eq!(
+            adapter.send_datagram(7, b"datagram"),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(adapter.next_command(), None);
     }
 
     #[test]
@@ -522,9 +788,20 @@ mod tests {
         );
 
         let mut control = TcpAdapter::default();
-        control.send_control(&vec![0; CONTROL_LIMIT]).unwrap();
+        control
+            .send_control(&vec![
+                0;
+                CONTROL_LIMIT
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
+            .unwrap();
         assert_eq!(
-            control.send_control(&vec![0; CONTROL_LIMIT + 1]),
+            control.send_control(&vec![
+                0;
+                CONTROL_LIMIT
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
             Err(Error::RecordTooLarge)
         );
 
@@ -546,7 +823,10 @@ mod tests {
             control.record_native_event(event).unwrap();
         }
         assert_eq!(control.poll(), Some(Event::Connected(ConnectionId(1))));
-        assert_eq!(control.poll(), Some(Event::Control(b"control".to_vec())));
+        assert_eq!(
+            control.poll(),
+            Some(Event::Control(b"control".to_vec().into()))
+        );
         assert!(matches!(control.poll(), Some(Event::Reliable { .. })));
         assert!(matches!(control.poll(), Some(Event::Acknowledged(_))));
         assert_eq!(control.poll(), Some(Event::Disconnected(ConnectionId(1))));
@@ -592,18 +872,25 @@ mod tests {
 
         let mut oversized = TcpAdapter::default();
         oversized
-            .record_native_event(NativeEvent::Control(vec![0; CONTROL_LIMIT]))
+            .record_native_event(NativeEvent::Control(vec![
+                0;
+                CONTROL_LIMIT + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ]))
             .unwrap();
         assert!(matches!(oversized.poll(), Some(Event::Control(_))));
         assert_eq!(
-            oversized.record_native_event(NativeEvent::Control(vec![0; CONTROL_LIMIT + 1])),
+            oversized.record_native_event(NativeEvent::Control(vec![
+                0;
+                CONTROL_LIMIT + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ])),
             Err(Error::RecordTooLarge)
         );
         assert_eq!(
             oversized.record_native_event(NativeEvent::Reliable {
                 stream: 1,
                 sequence: 1,
-                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1],
+                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1],
             }),
             Err(Error::RecordTooLarge)
         );
@@ -633,16 +920,7 @@ mod tests {
 
     #[test]
     fn authenticated_tls_carries_identical_vot_bytes() {
-        let certificate = CertificateDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_CERT)
-                .unwrap(),
-        );
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_KEY)
-                .unwrap(),
-        ));
+        let (certificate, key) = test_identity();
         let mut roots = RootCertStore::empty();
         roots.add(certificate.clone()).unwrap();
         let mut client_config = ClientConfig::builder()
@@ -684,16 +962,7 @@ mod tests {
 
     #[test]
     fn completed_tls_without_vot_alpn_exposes_no_plaintext() {
-        let certificate = CertificateDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_CERT)
-                .unwrap(),
-        );
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(TEST_KEY)
-                .unwrap(),
-        ));
+        let (certificate, key) = test_identity();
         let mut roots = RootCertStore::empty();
         roots.add(certificate.clone()).unwrap();
         let mut client_config = ClientConfig::builder()

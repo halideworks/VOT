@@ -104,19 +104,42 @@ limits on the way out and against this endpoint's on the way in.
 | `MAX_CONTROL_FRAME_PAYLOAD` | yes | payload limit table |
 | `MAX_DATA_RECORD_PAYLOAD` | yes | payload limit table |
 | `MAX_MANIFEST_PAGE_PAYLOAD` | yes | payload limit table, and `PROGRESSIVE_PAGE` |
-| `RELIABLE_LANE_LIMIT` | yes | distinct lane count |
+| `RELIABLE_LANE_LIMIT` | yes | outbound in the session, inbound in the transport |
 | `IDLE_TIMEOUT_MS` | no | nothing here keeps time |
 | `ACTIVE_KEEPALIVE_MS` | no | nothing here keeps time |
 | `COMPRESSION_MIN_GAIN_BPS` | no | nothing compresses yet |
 | `TELEMETRY_LEVEL` | no | advisory, read elsewhere |
 
 The four payload limits go through one table, so a frame type the registry adds
-later is a row rather than another check. A limit below a codec per-type maximum
+later is a row rather than another check. The same check requires exactly one
+whole frame and refuses an experimental frame whose extension was not
+negotiated.
+
+The lane limit is split by what each layer can see. A session opens lanes, so it
+counts its own. Only the transport sees a peer stream open and close, so it
+counts those: a session would count lanes ever used and refuse a peer that
+closed one and opened another. A limit below a codec per-type maximum
 takes effect only here, because the codec's limits are fixed.
 
 The first two unenforced settings are timers. A session that agreed an idle
 timeout and never applied it will not close an idle carrier, and neither
 endpoint sends keepalives.
+
+## Extensions
+
+`HELLO` carries the extensions the client offers, and `spec/registries.md` says
+both endpoints must negotiate one before it is used. Only the client sends
+`HELLO`, so the server learns the client's set and the client learns nothing
+about the server's.
+
+A session therefore treats the intersection as negotiated, which on a client is
+always empty. An experimental frame is refused in both directions as a result:
+`DATAGRAM_CREDIT` and the coding-epoch frames close the session with
+`EXPERIMENT_NOT_NEGOTIATED` whatever either side advertised.
+
+That is the safe reading while every experimental feature is disabled by
+default and none are implemented. Making one usable needs the specification to
+say how a server reports which extensions it accepted.
 
 ## Lane identity
 

@@ -40,6 +40,37 @@ pub mod error_code {
     pub const UNSUPPORTED_VERSION: u16 = 0x0104;
     pub const RESOURCE_LIMIT: u16 = 0x0502;
     pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
+    pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
+}
+
+/// Extension identifiers from `spec/registries.md` section 4.
+pub mod extension_id {
+    pub const CORE_RELIABLE: u64 = 0x00;
+    pub const DATAGRAM_FEC: u64 = 0x01;
+    pub const ZSTD_RECORDS: u64 = 0x02;
+    pub const VCRC: u64 = 0x03;
+    pub const PUBLIC_MULTI_RAIL: u64 = 0x04;
+    pub const CUSTOM_CONGESTION_CONTROL: u64 = 0x05;
+    pub const MULTIPATH_QUIC: u64 = 0x06;
+}
+
+/// The extension a known frame needs before it may be used.
+///
+/// `spec/wire.md` section 5: an experimental frame is invalid unless its
+/// extension is negotiated, and using one anyway is
+/// `EXPERIMENT_NOT_NEGOTIATED`. A frame with no entry needs nothing.
+#[must_use]
+pub const fn required_extension(frame_type: u64) -> Option<u64> {
+    use crate::frame_type as ty;
+
+    match frame_type {
+        ty::DATAGRAM_CREDIT
+        | ty::CODING_EPOCH_OPEN
+        | ty::GEN_STATE
+        | ty::GEN_DONE
+        | ty::CODING_EPOCH_CLOSE => Some(extension_id::DATAGRAM_FEC),
+        _ => None,
+    }
 }
 
 pub mod frame_type {
@@ -1459,6 +1490,38 @@ mod tests {
             decode_hello(&payload, EndpointRole::Client),
             Err(HelloError::UnsupportedRevision(DRAFT_REVISION - 1))
         );
+    }
+
+    #[test]
+    fn experimental_frames_name_the_extension_they_need() {
+        // spec/wire.md section 5: an experimental frame is invalid unless its
+        // extension is negotiated. Without this table nothing can tell one
+        // from an ordinary frame.
+        for frame_type in [
+            frame_type::DATAGRAM_CREDIT,
+            frame_type::CODING_EPOCH_OPEN,
+            frame_type::GEN_STATE,
+            frame_type::GEN_DONE,
+            frame_type::CODING_EPOCH_CLOSE,
+        ] {
+            assert_eq!(
+                required_extension(frame_type),
+                Some(extension_id::DATAGRAM_FEC),
+                "{frame_type:#x}"
+            );
+        }
+        for frame_type in [
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::DATA_RECORD,
+            frame_type::MANIFEST_PAGE,
+            frame_type::PING,
+        ] {
+            assert_eq!(required_extension(frame_type), None, "{frame_type:#x}");
+        }
+        assert_eq!(error_code::EXPERIMENT_NOT_NEGOTIATED, 0x0701);
+        assert_eq!(extension_id::DATAGRAM_FEC, 0x01);
+        assert_eq!(extension_id::MULTIPATH_QUIC, 0x06);
     }
 
     #[test]

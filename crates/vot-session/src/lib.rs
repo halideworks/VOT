@@ -112,6 +112,19 @@ pub enum ErrorKind {
     },
     /// More lanes than the advertised `RELIABLE_LANE_LIMIT` allows.
     LaneLimitExceeded { limit: u64, side: Side },
+    /// A submission that is not exactly one whole frame.
+    NotExactlyOneFrame {
+        frame_type: u64,
+        declared: usize,
+        found: usize,
+        side: Side,
+    },
+    /// A frame whose extension was not negotiated.
+    ExperimentNotNegotiated {
+        frame_type: u64,
+        extension: u64,
+        side: Side,
+    },
     /// The backend refused something the session needed.
     Transport(TransportError),
     /// The backend would reassemble control frames larger than this endpoint
@@ -131,9 +144,10 @@ impl ErrorKind {
             | Self::NotNegotiated { .. }
             | Self::PendingRecordsExhausted { .. } => true,
             // Only when the peer is the one that went past its limit.
-            Self::FrameExceedsLimit { side, .. } | Self::LaneLimitExceeded { side, .. } => {
-                matches!(side, Side::Local)
-            }
+            Self::FrameExceedsLimit { side, .. }
+            | Self::LaneLimitExceeded { side, .. }
+            | Self::NotExactlyOneFrame { side, .. }
+            | Self::ExperimentNotNegotiated { side, .. } => matches!(side, Side::Local),
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
@@ -215,6 +229,22 @@ impl Negotiation {
     #[must_use]
     pub const fn peer_settings(&self) -> Option<Settings> {
         self.peer_settings
+    }
+
+    /// The extensions both endpoints advertised.
+    ///
+    /// Advertising one does not authorise it, so this is the intersection.
+    /// Empty until the peer's `HELLO` arrives, which is what keeps an
+    /// experimental frame out of an unnegotiated session.
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> BTreeSet<u64> {
+        let Some(hello) = &self.peer_hello else {
+            return BTreeSet::new();
+        };
+        self.extensions
+            .intersection(&hello.extensions)
+            .copied()
+            .collect()
     }
 
     /// What the peer said about itself.
@@ -448,9 +478,6 @@ pub struct Session<A> {
     /// Lanes this endpoint has sent on, bounded by the peer's advertised
     /// `RELIABLE_LANE_LIMIT`.
     lanes: BTreeSet<StreamId>,
-    /// Lanes the peer has sent on, bounded by the limit this endpoint
-    /// advertised.
-    peer_lanes: BTreeSet<StreamId>,
     pending_bytes: usize,
     pending_byte_limit: usize,
     pending_count_limit: usize,
@@ -476,7 +503,6 @@ impl<A: TransportAdapter> Session<A> {
             outbound: VecDeque::new(),
             pending: VecDeque::new(),
             lanes: BTreeSet::new(),
-            peer_lanes: BTreeSet::new(),
             pending_bytes: 0,
             pending_byte_limit: DEFAULT_PENDING_RECORD_BYTES,
             pending_count_limit: DEFAULT_PENDING_RECORD_COUNT,
@@ -634,10 +660,13 @@ impl<A: TransportAdapter> Session<A> {
                     return Ok(Some(Event::Disconnected(connection)));
                 }
                 record @ Event::Reliable { .. } => {
-                    if let Event::Reliable { stream, bytes, .. } = &record {
-                        let stream = *stream;
+                    // No lane count here. A session never sees a stream close,
+                    // so it could only count lanes ever used and would refuse a
+                    // peer that closed one and opened another. The transport
+                    // counts them at adoption and releases them at shutdown,
+                    // which is the only place that lifecycle is visible.
+                    if let Event::Reliable { bytes, .. } = &record {
                         self.check_inbound(bytes)?;
-                        self.admit_peer_lane(stream)?;
                     }
                     if self.negotiation.is_ready() {
                         return Ok(Some(record));
@@ -855,13 +884,23 @@ impl<A: TransportAdapter> Session<A> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        check_frame(frame, &peer, Side::Peer)
+        check_frame(
+            frame,
+            &peer,
+            &self.negotiation.negotiated_extensions(),
+            Side::Peer,
+        )
     }
 
     /// Checks a frame the peer sent against the limits this endpoint
     /// advertised, which the adapters bound only by the protocol ceiling.
     fn check_inbound(&self, frame: &[u8]) -> Result<(), Error> {
-        check_frame(frame, &self.negotiation.local_settings(), Side::Local)
+        check_frame(
+            frame,
+            &self.negotiation.local_settings(),
+            &self.negotiation.negotiated_extensions(),
+            Side::Local,
+        )
     }
 
     /// Refuses a lane past the number the peer said it would carry.
@@ -873,18 +912,6 @@ impl<A: TransportAdapter> Session<A> {
             return Ok(());
         };
         lane_allowed(&self.lanes, stream, peer.reliable_lane_limit, Side::Peer)
-    }
-
-    /// Refuses a peer lane past the number this endpoint said it would carry.
-    ///
-    /// The backends bound peer streams by their own carrier settings, not by
-    /// what was advertised, so this is the only place the negotiated count
-    /// applies inbound.
-    fn admit_peer_lane(&mut self, stream: StreamId) -> Result<(), Error> {
-        let limit = self.negotiation.local_settings().reliable_lane_limit;
-        lane_allowed(&self.peer_lanes, stream, limit, Side::Local)?;
-        self.peer_lanes.insert(stream);
-        Ok(())
     }
 }
 
@@ -943,13 +970,50 @@ pub enum Side {
 /// The one place a negotiated payload limit is applied. Records and control
 /// frames pass through it in both directions, so the payload length is read
 /// from the envelope once and a wire length is never mistaken for it.
-fn check_frame(frame: &[u8], settings: &Settings, side: Side) -> Result<(), Error> {
+fn check_frame(
+    frame: &[u8],
+    settings: &Settings,
+    extensions: &BTreeSet<u64>,
+    side: Side,
+) -> Result<(), Error> {
     let limits = vot_codec::DecodeLimits {
         max_unknown_payload: usize::try_from(settings.max_control_frame_payload)
             .unwrap_or(usize::MAX),
         max_frames: 1,
     };
     let envelope = vot_codec::peek_envelope(frame, limits).map_err(decode_error)?;
+
+    // Exactly one whole frame. peek_envelope succeeds on a header alone, so a
+    // header declaring a payload that is not there would go out as it stands
+    // and leave the peer waiting on a stream that stays open. Trailing bytes
+    // are the same disagreement from the other end.
+    if envelope.total_length != frame.len() {
+        return Err(Error::new(
+            ErrorKind::NotExactlyOneFrame {
+                frame_type: envelope.frame_type,
+                declared: envelope.total_length,
+                found: frame.len(),
+                side,
+            },
+            error_code::MALFORMED_FRAME,
+        ));
+    }
+
+    // spec/wire.md section 5: an experimental frame is invalid unless its
+    // extension was negotiated, whichever side it came from.
+    if let Some(extension) = vot_codec::required_extension(envelope.frame_type)
+        && !extensions.contains(&extension)
+    {
+        return Err(Error::new(
+            ErrorKind::ExperimentNotNegotiated {
+                frame_type: envelope.frame_type,
+                extension,
+                side,
+            },
+            error_code::EXPERIMENT_NOT_NEGOTIATED,
+        ));
+    }
+
     let payload = u64::try_from(envelope.payload_length).map_err(|_| {
         Error::new(
             ErrorKind::Decode(DecodeError::LengthOverflow(u64::MAX)),
@@ -1504,11 +1568,14 @@ mod tests {
         let (mut client, _server) = negotiated();
         let flushes = client.adapter().flushes;
         client
-            .send_reliable_shared(StreamId(3), vot_transport_api::shared_payload(b"shared"))
+            .send_reliable_shared(
+                StreamId(3),
+                vot_transport_api::shared_payload(&data_record(b"shared")),
+            )
             .unwrap();
         assert_eq!(
             client.adapter().records,
-            vec![(StreamId(3), b"shared".to_vec())]
+            vec![(StreamId(3), data_record(b"shared"))]
         );
         client.flush().unwrap();
         assert_eq!(client.adapter().flushes, flushes + 1);
@@ -1675,7 +1742,7 @@ mod tests {
         let mut early = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
         early.begin().unwrap();
         assert!(early.send_reliable(StreamId(1), b"record").is_err());
-        assert!(early.send_control(b"frame").is_err());
+        assert!(early.send_control(&frame_of(frame_type::PING, 0)).is_err());
         assert!(
             early.adapter().closed.is_empty(),
             "an API misuse is not the peer's fault"
@@ -2001,7 +2068,7 @@ mod tests {
         assert_eq!(server.unsent_negotiation_frames(), 1, "the ACK did not fit");
 
         for send in [
-            server.send_control(b"application"),
+            server.send_control(&frame_of(frame_type::PING, 0)),
             server.send_reliable(StreamId(1), &data_record(b"record")),
         ] {
             assert_eq!(
@@ -2020,7 +2087,7 @@ mod tests {
         server.adapter.control_capacity = None;
         server.flush().unwrap();
         assert_eq!(server.unsent_negotiation_frames(), 0);
-        server.send_control(b"application").unwrap();
+        server.send_control(&frame_of(frame_type::PING, 0)).unwrap();
         assert_eq!(server.adapter().sent.len(), 3);
     }
 
@@ -2145,9 +2212,20 @@ mod tests {
                 "{frame_type:#x}"
             );
             for side in [Side::Local, Side::Peer] {
-                check_frame(&frame_of(frame_type, limit), &settings, side).unwrap();
-                let error =
-                    check_frame(&frame_of(frame_type, limit + 1), &settings, side).unwrap_err();
+                check_frame(
+                    &frame_of(frame_type, limit),
+                    &settings,
+                    &BTreeSet::new(),
+                    side,
+                )
+                .unwrap();
+                let error = check_frame(
+                    &frame_of(frame_type, limit + 1),
+                    &settings,
+                    &BTreeSet::new(),
+                    side,
+                )
+                .unwrap_err();
                 assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
                 assert_eq!(
                     error.kind(),
@@ -2235,46 +2313,6 @@ mod tests {
     }
 
     #[test]
-    fn more_peer_lanes_than_this_endpoint_carries_are_refused() {
-        // The backends bound peer streams by their carrier settings, not by
-        // what was advertised, so the negotiated count applies only here.
-        let local = Settings {
-            reliable_lane_limit: 2,
-            ..Settings::default()
-        };
-        let (_client, mut server) = negotiated_with(Settings::default(), local);
-        for lane in 0..2 {
-            server.adapter.events.push_back(record(lane, b"record"));
-            assert!(matches!(
-                server.poll().unwrap(),
-                Some(Event::Reliable { .. })
-            ));
-        }
-        // A lane already seen is free.
-        server.adapter.events.push_back(record(0, b"again"));
-        assert!(matches!(
-            server.poll().unwrap(),
-            Some(Event::Reliable { .. })
-        ));
-
-        server
-            .adapter
-            .events
-            .push_back(record(2, b"one lane too many"));
-        let error = server.poll().unwrap_err();
-        assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
-        assert_eq!(
-            error.kind(),
-            &ErrorKind::LaneLimitExceeded {
-                limit: 2,
-                side: Side::Local,
-            }
-        );
-        assert!(error.kind().is_peer_fault());
-        assert_eq!(server.adapter().closed, vec![error_code::RESOURCE_LIMIT]);
-    }
-
-    #[test]
     fn a_refused_send_does_not_spend_a_lane() {
         // The send opens no carrier stream when the backend refuses it, so
         // counting the lane would spend one on nothing and, at a limit of one,
@@ -2302,6 +2340,100 @@ mod tests {
                 side: Side::Peer,
             }
         );
+    }
+
+    #[test]
+    fn a_submission_that_is_not_one_whole_frame_is_refused() {
+        // peek_envelope succeeds on a header alone, so a header declaring a
+        // payload that is not there would go out as it stands and leave the
+        // peer waiting on a stream that stays open.
+        let (mut client, mut server) = negotiated();
+        let whole = frame_of(frame_type::PING, 0);
+        client.send_control(&whole).unwrap();
+
+        let record = data_record(b"payload");
+        for truncated in [&record[..record.len() - 1], &record[..1]] {
+            let error = client.send_reliable(StreamId(1), truncated).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::NotExactlyOneFrame { .. } | ErrorKind::Decode(_)
+            ));
+        }
+
+        // Two frames in one submission is the same disagreement about where a
+        // frame ends.
+        let mut two = record.clone();
+        two.extend_from_slice(&record);
+        assert!(matches!(
+            client.send_reliable(StreamId(1), &two).unwrap_err().kind(),
+            ErrorKind::NotExactlyOneFrame {
+                found,
+                declared,
+                ..
+            } if *found == two.len() && *declared == record.len()
+        ));
+
+        // And the peer sending one closes the session rather than delivering it.
+        server.adapter.events.push_back(control(&{
+            let mut short = frame_of(frame_type::PING, 0);
+            short.extend_from_slice(&frame_of(frame_type::PING, 0));
+            short
+        }));
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::MALFORMED_FRAME);
+        assert!(error.kind().is_peer_fault());
+    }
+
+    #[test]
+    fn an_experimental_frame_needs_its_extension_negotiated() {
+        // spec/wire.md section 5: a known experimental frame is invalid unless
+        // its extension was negotiated, and the default sets are empty.
+        let credit = frame_of(frame_type::DATAGRAM_CREDIT, 8);
+        let (mut client, mut server) = negotiated();
+        let error = client.send_control(&credit).unwrap_err();
+        assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::ExperimentNotNegotiated {
+                frame_type: frame_type::DATAGRAM_CREDIT,
+                extension: vot_codec::extension_id::DATAGRAM_FEC,
+                side: Side::Peer,
+            }
+        );
+
+        server.adapter.events.push_back(control(&credit));
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
+        assert!(error.kind().is_peer_fault());
+
+        // A client cannot reach the state where one is allowed, and that is a
+        // specification gap rather than a policy choice. spec/wire.md section 1
+        // has only the client send HELLO, so the server learns which extensions
+        // the client offered and the client learns nothing about the server's.
+        // The registry requires both endpoints to negotiate an extension, so
+        // the side that cannot know has to refuse.
+        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let mut client = Session::client(Loopback::default(), Settings::default(), fec.clone());
+        let mut server = Session::server(Loopback::default(), Settings::default(), fec);
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        client.poll().unwrap();
+
+        // The server saw the offer, so it has an intersection.
+        assert_eq!(
+            server.negotiation.negotiated_extensions(),
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
+        );
+        // The client saw no HELLO, so it has none and refuses either way.
+        assert!(client.negotiation.negotiated_extensions().is_empty());
+        assert!(client.send_control(&credit).is_err());
     }
 
     #[test]

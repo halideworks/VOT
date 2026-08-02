@@ -1204,6 +1204,19 @@ mod tests {
         ResumeStore::open(&path).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), valid_length);
 
+        let exact_header_path = temp_path("torn-header-boundary");
+        let mut exact_header = MAGIC.to_vec();
+        exact_header.extend_from_slice(&vec![0; RECORD_HEADER_BYTES as usize - 1]);
+        fs::write(&exact_header_path, exact_header).unwrap();
+        let reopened = ResumeStore::open(&exact_header_path).unwrap();
+        assert!(reopened.objects.is_empty());
+        assert_eq!(
+            fs::metadata(&exact_header_path).unwrap().len(),
+            MAGIC.len() as u64
+        );
+        fs::remove_file(&exact_header_path).unwrap();
+        fs::remove_file(lock_path(&exact_header_path).unwrap()).unwrap();
+
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }

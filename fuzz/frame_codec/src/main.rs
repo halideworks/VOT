@@ -6,7 +6,7 @@ use cap::Cap;
 use std::alloc::System;
 use std::io::{self, Read};
 use vot_codec::{
-    DecodeLimits, DecodedFrame, EndpointRole, HARD_MAX_FRAME_PAYLOAD, decode_all, decode_hello,
+    DecodeLimits, DecodedFrame, EndpointRole, HARD_MAX_FRAME_PAYLOAD, decode_hello, decode_one,
     decode_settings,
 };
 
@@ -21,25 +21,49 @@ fn exercise(input: &[u8]) {
         max_unknown_payload: HARD_MAX_FRAME_PAYLOAD,
         max_frames: 4096,
     };
-    if let Ok(frames) = decode_all(input, limits) {
-        for frame in frames {
-            if let DecodedFrame::Known {
-                frame_type,
-                payload,
-            } = frame
-            {
-                match frame_type {
-                    vot_codec::frame_type::HELLO => {
-                        let _ = decode_hello(payload, EndpointRole::Client);
-                        let _ = decode_hello(payload, EndpointRole::Server);
-                    }
-                    vot_codec::frame_type::SETTINGS => {
-                        let _ = decode_settings(payload);
-                    }
-                    _ => {}
+    let mut offset = 0;
+    for _ in 0..limits.max_frames {
+        if offset == input.len() {
+            break;
+        }
+        let Ok((frame, consumed)) = decode_one(&input[offset..], limits) else {
+            break;
+        };
+        if let DecodedFrame::Known {
+            frame_type,
+            payload,
+        } = frame
+        {
+            match frame_type {
+                vot_codec::frame_type::HELLO => {
+                    let _ = decode_hello(payload, EndpointRole::Client);
+                    let _ = decode_hello(payload, EndpointRole::Server);
                 }
+                vot_codec::frame_type::SETTINGS => {
+                    let _ = decode_settings(payload);
+                }
+                vot_codec::frame_type::PACKAGE_DESCRIPTOR
+                | vot_codec::frame_type::MANIFEST_REQUEST
+                | vot_codec::frame_type::MANIFEST_PAGE
+                | vot_codec::frame_type::SEAL
+                | vot_codec::frame_type::HAVE
+                | vot_codec::frame_type::RANGE_REQUEST
+                | vot_codec::frame_type::PROOF_BUNDLE
+                | vot_codec::frame_type::DATA_RECORD
+                | vot_codec::frame_type::CAPACITY
+                | vot_codec::frame_type::TRANSIT_VERIFIED
+                | vot_codec::frame_type::CHUNK_DURABLE
+                | vot_codec::frame_type::CHUNK_AT_REST_VERIFIED
+                | vot_codec::frame_type::PUBLISH_RECEIPT => {
+                    let _ = vot_codec::frames::decode(&input[offset..], limits);
+                }
+                _ => {}
             }
         }
+        let Some(next) = offset.checked_add(consumed) else {
+            break;
+        };
+        offset = next;
     }
 }
 

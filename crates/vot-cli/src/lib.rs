@@ -716,7 +716,7 @@ pub fn receive_bundle(
         MAX_DATA_RECORD_BYTES as u64,
         MAX_DATA_RECORD_BYTES as u64,
     )?;
-    let mut cached_pack: Option<([u8; 32], u64, Vec<u8>)> = None;
+    let mut cached_pack: Option<(Suite, [u8; 32], u64, Vec<u8>)> = None;
 
     while let Some(record) = manifest.next_record()? {
         package.push(&record)?;
@@ -739,7 +739,7 @@ pub fn receive_bundle(
                 length,
                 offset,
             } => {
-                let needs_load = pack_needs_load(cached_pack.as_ref(), root, length);
+                let needs_load = pack_needs_load(cached_pack.as_ref(), record.suite, root, length);
                 if needs_load {
                     let bytes = receive_object(
                         &bundle.join("objects").join(object_name(&root)),
@@ -748,9 +748,9 @@ pub fn receive_bundle(
                         record.suite,
                         &mut receiver,
                     )?;
-                    cached_pack = Some((root, length, bytes));
+                    cached_pack = Some((record.suite, root, length, bytes));
                 }
-                let (_, _, bytes) = cached_pack.as_ref().ok_or(Error::InvalidBundle)?;
+                let (_, _, _, bytes) = cached_pack.as_ref().ok_or(Error::InvalidBundle)?;
                 let start = usize::try_from(offset).map_err(|_| Error::InvalidBundle)?;
                 let logical =
                     usize::try_from(record.logical_length).map_err(|_| Error::InvalidBundle)?;
@@ -1169,9 +1169,14 @@ fn sync_directories(root: &Path) -> Result<usize, Error> {
     Ok(count)
 }
 
-fn pack_needs_load(cached: Option<&([u8; 32], u64, Vec<u8>)>, root: [u8; 32], length: u64) -> bool {
-    cached.is_none_or(|(cached_root, cached_length, _)| {
-        *cached_root != root || *cached_length != length
+fn pack_needs_load(
+    cached: Option<&(Suite, [u8; 32], u64, Vec<u8>)>,
+    suite: Suite,
+    root: [u8; 32],
+    length: u64,
+) -> bool {
+    cached.is_none_or(|(cached_suite, cached_root, cached_length, _)| {
+        *cached_suite != suite || *cached_root != root || *cached_length != length
     })
 }
 
@@ -1488,8 +1493,14 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+const MIN_HMAC_KEY_BYTES: usize = 32;
+const MAX_HMAC_KEY_BYTES: usize = 64;
+const HEX_KEY_PREFIX: &str = "hex:";
+const RAW_KEY_PREFIX: &str = "raw:";
+const MAX_KEY_SOURCE_BYTES: usize = HEX_KEY_PREFIX.len() + 2 * MAX_HMAC_KEY_BYTES + 1;
+
 pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
-    if value.len() % 2 != 0 {
+    if value.len() % 2 != 0 || value.len() > 2 * MAX_HMAC_KEY_BYTES {
         return Err(Error::InvalidArguments);
     }
     let bytes = value.as_bytes();
@@ -1499,7 +1510,7 @@ pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
         let low = hex(pair[1]).ok_or(Error::InvalidArguments)?;
         output.push(high * 16 + low);
     }
-    if output.len() < 32 {
+    if !(MIN_HMAC_KEY_BYTES..=MAX_HMAC_KEY_BYTES).contains(&output.len()) {
         return Err(Error::InvalidArguments);
     }
     Ok(output)
@@ -1521,29 +1532,53 @@ const fn hex(value: u8) -> Option<u8> {
 /// - `-` for stdin; or
 /// - a filesystem path.
 ///
-/// Both raw keys and hexadecimal text files are accepted. In all cases the
-/// decoded key must contain at least 32 bytes.
+/// Both raw keys and hexadecimal text files are accepted. Raw input is
+/// preserved byte-for-byte; hexadecimal text must use the explicit hex:
+/// prefix, and textual raw keys may use raw:. Keys must contain 32..=64
+/// bytes. Source reads are bounded to MAX_KEY_SOURCE_BYTES bytes.
 pub fn load_key_spec(spec: &str) -> Result<Vec<u8>, Error> {
     let bytes = if let Some(name) = spec.strip_prefix("env:") {
         if name.is_empty() {
             return Err(Error::InvalidArguments);
         }
-        std::env::var(name)
-            .map_err(|_| Error::InvalidArguments)?
-            .into_bytes()
+        let value = std::env::var(name).map_err(|_| Error::InvalidArguments)?;
+        if value.len() > MAX_KEY_SOURCE_BYTES {
+            return Err(Error::InvalidArguments);
+        }
+        value.into_bytes()
     } else if spec == "-" {
-        let mut bytes = Vec::new();
-        io::stdin().read_to_end(&mut bytes)?;
-        bytes
+        read_key_source(io::stdin().lock())?
     } else {
-        fs::read(spec)?
+        read_key_source(File::open(spec)?)?
     };
+    parse_loaded_key(bytes)
+}
+
+fn read_key_source(reader: impl Read) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_KEY_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_KEY_SOURCE_BYTES {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(bytes)
+}
+
+fn parse_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
     if let Ok(text) = std::str::from_utf8(&bytes) {
-        if let Ok(key) = decode_key(text.trim()) {
-            return Ok(key);
+        if let Some(encoded) = text.strip_prefix(HEX_KEY_PREFIX) {
+            return decode_key(encoded.trim());
+        }
+        if let Some(raw) = text.strip_prefix(RAW_KEY_PREFIX) {
+            return validate_loaded_key(raw.as_bytes().to_vec());
         }
     }
-    if bytes.len() < 32 {
+    validate_loaded_key(bytes)
+}
+
+fn validate_loaded_key(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
+    if !(MIN_HMAC_KEY_BYTES..=MAX_HMAC_KEY_BYTES).contains(&bytes.len()) {
         return Err(Error::InvalidArguments);
     }
     Ok(bytes)
@@ -2414,7 +2449,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            decode_key(&"ABCDEF".repeat(11)).unwrap()[..3],
+            decode_key(&format!("{}0000", "ABCDEF".repeat(10))).unwrap()[..3],
             [0xab, 0xcd, 0xef]
         );
     }
@@ -2422,7 +2457,7 @@ mod tests {
     #[test]
     fn key_spec_loader_decodes_hex_and_preserves_raw_keys() {
         let hex_path = temporary("hex-key");
-        fs::write(&hex_path, format!("  {}\n", "ab".repeat(32))).unwrap();
+        fs::write(&hex_path, format!("hex:{}\n", "ab".repeat(32))).unwrap();
         assert_eq!(
             load_key_spec(hex_path.to_str().unwrap()).unwrap(),
             vec![0xab; 32]
@@ -2437,13 +2472,29 @@ mod tests {
         );
         fs::remove_file(&raw_path).unwrap();
 
+        let ambiguous_path = temporary("ambiguous-raw-key");
+        fs::write(&ambiguous_path, [b'a'; 64]).unwrap();
+        assert_eq!(
+            load_key_spec(ambiguous_path.to_str().unwrap()).unwrap(),
+            vec![b'a'; 64]
+        );
+        fs::remove_file(&ambiguous_path).unwrap();
+
         let short_path = temporary("short-key");
         fs::write(&short_path, [7; 31]).unwrap();
         assert!(matches!(
             load_key_spec(short_path.to_str().unwrap()),
             Err(Error::InvalidArguments)
         ));
-        fs::remove_file(short_path).unwrap();
+        fs::remove_file(&short_path).unwrap();
+
+        let oversized_path = temporary("oversized-key");
+        fs::write(&oversized_path, [7; 65]).unwrap();
+        assert!(matches!(
+            load_key_spec(oversized_path.to_str().unwrap()),
+            Err(Error::InvalidArguments)
+        ));
+        fs::remove_file(oversized_path).unwrap();
     }
 
     #[test]
@@ -2702,11 +2753,32 @@ mod tests {
             parent_directory(Path::new("nested/receipt")),
             Path::new("nested")
         );
-        let cached = ([5; 32], 9, Vec::new());
-        assert!(!pack_needs_load(Some(&cached), [5; 32], 9));
-        assert!(pack_needs_load(Some(&cached), [6; 32], 9));
-        assert!(pack_needs_load(Some(&cached), [5; 32], 10));
-        assert!(pack_needs_load(None, [5; 32], 9));
+        let cached = (Suite::Sha256Bep52, [5; 32], 9, Vec::new());
+        assert!(!pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [5; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Blake3Bao64,
+            [5; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [6; 32],
+            9
+        ));
+        assert!(pack_needs_load(
+            Some(&cached),
+            Suite::Sha256Bep52,
+            [5; 32],
+            10
+        ));
+        assert!(pack_needs_load(None, Suite::Sha256Bep52, [5; 32], 9));
 
         let mut receiver = ReliableReceiver::new(
             (MAX_DATA_RECORD_BYTES + vot_verifier::GROUP_SIZE) as u64,

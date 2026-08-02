@@ -433,9 +433,9 @@ fn decode_proof_bundle(input: &[u8]) -> Result<ProofBundle, Error> {
     reader.key(9)?;
     let total_plaintext_length = reader.uint()?;
     reader.key(10)?;
-    let proof = reader.bytes(MAX_PROOF_BYTES)?.to_vec();
+    let proof = reader.bytes(MAX_PROOF_BYTES)?;
     reader.finish()?;
-    let value = ProofBundle {
+    let mut value = ProofBundle {
         request_id,
         bundle_id,
         object,
@@ -445,13 +445,21 @@ fn decode_proof_bundle(input: &[u8]) -> Result<ProofBundle, Error> {
         covered_length,
         data_record_count,
         total_plaintext_length,
-        proof,
+        proof: Vec::new(),
     };
-    validate_proof_bundle(&value)?;
+    validate_proof_bundle_with_proof_len(&value, proof.len())?;
+    value.proof = proof.to_vec();
     Ok(value)
 }
 
 fn validate_proof_bundle(value: &ProofBundle) -> Result<(), Error> {
+    validate_proof_bundle_with_proof_len(value, value.proof.len())
+}
+
+fn validate_proof_bundle_with_proof_len(
+    value: &ProofBundle,
+    proof_len: usize,
+) -> Result<(), Error> {
     value.object.validate()?;
     if value.object.length == 0
         || value.requested_length == 0
@@ -472,9 +480,9 @@ fn validate_proof_bundle(value: &ProofBundle) -> Result<(), Error> {
         || value.data_record_count == 0
         || value.data_record_count > 17
         || value.total_plaintext_length != value.covered_length
-        || value.proof.len() > MAX_PROOF_BYTES
+        || proof_len > MAX_PROOF_BYTES
         || crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
-            .is_some_and(|limit| proof_bundle_payload_len(value) > limit)
+            .is_some_and(|limit| proof_bundle_payload_len_with(value, proof_len) > limit)
     {
         return Err(Error::InvalidValue);
     }
@@ -496,7 +504,12 @@ fn validate_proof_bundle(value: &ProofBundle) -> Result<(), Error> {
     }
 }
 
+#[cfg(test)]
 fn proof_bundle_payload_len(value: &ProofBundle) -> usize {
+    proof_bundle_payload_len_with(value, value.proof.len())
+}
+
+fn proof_bundle_payload_len_with(value: &ProofBundle, proof_len: usize) -> usize {
     let object_length = cbor_head_len(4)
         .saturating_add(cbor_head_len(1))
         .saturating_add(cbor_head_len(u64::from(value.object.suite)))
@@ -524,7 +537,7 @@ fn proof_bundle_payload_len(value: &ProofBundle) -> usize {
         .saturating_add(cbor_head_len(9))
         .saturating_add(cbor_head_len(value.total_plaintext_length))
         .saturating_add(cbor_head_len(10))
-        .saturating_add(cbor_byte_string_len(value.proof.len()))
+        .saturating_add(cbor_byte_string_len(proof_len))
 }
 
 fn encode_data_record(value: &DataRecord, output: &mut Vec<u8>) -> Result<(), Error> {
@@ -1076,6 +1089,41 @@ mod tests {
         let (decoded_data, _) = decode(&encoded[used..], DecodeLimits::default()).unwrap();
         assert_eq!(decoded_bundle, bundle);
         assert_eq!(decoded_data, data);
+    }
+
+    #[test]
+    fn proof_bundle_metadata_is_checked_before_proof_size() {
+        let proof = vec![0xaa; 1024];
+        let mut payload = Vec::new();
+        map(11, &mut payload);
+        uint(0, &mut payload);
+        uint(0, &mut payload);
+        uint(1, &mut payload);
+        bytes(&[1; 16], &mut payload);
+        uint(2, &mut payload);
+        bytes(&[2; 16], &mut payload);
+        uint(3, &mut payload);
+        encode_object(&object(), &mut payload);
+        uint(4, &mut payload);
+        uint(GROUP_BYTES, &mut payload);
+        uint(5, &mut payload);
+        uint(GROUP_BYTES, &mut payload);
+        uint(6, &mut payload);
+        uint(GROUP_BYTES, &mut payload);
+        uint(7, &mut payload);
+        uint(GROUP_BYTES, &mut payload);
+        uint(8, &mut payload);
+        uint(0, &mut payload);
+        uint(9, &mut payload);
+        uint(GROUP_BYTES, &mut payload);
+        uint(10, &mut payload);
+        bytes(&proof, &mut payload);
+        let mut encoded = Vec::new();
+        encode_frame(frame_type::PROOF_BUNDLE, &payload, &mut encoded).unwrap();
+        assert_eq!(
+            decode(&encoded, DecodeLimits::default()),
+            Err(Error::InvalidValue)
+        );
     }
 
     #[test]

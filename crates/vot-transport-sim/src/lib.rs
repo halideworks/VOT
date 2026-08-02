@@ -53,12 +53,24 @@ enum Submission {
     ReceiveCredit(u64),
 }
 
-#[derive(Default)]
 pub struct SimulatorAdapter {
     submissions: VecDeque<Submission>,
     events: VecDeque<TransportEvent>,
     next_sequence: u64,
     receive_credit: u64,
+    control_payload_limit: usize,
+}
+
+impl Default for SimulatorAdapter {
+    fn default() -> Self {
+        Self {
+            submissions: VecDeque::new(),
+            events: VecDeque::new(),
+            next_sequence: 0,
+            receive_credit: 0,
+            control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+        }
+    }
 }
 
 impl SimulatorAdapter {
@@ -71,13 +83,21 @@ impl SimulatorAdapter {
     pub const fn receive_credit(&self) -> u64 {
         self.receive_credit
     }
+
+    /// Applies the peer-negotiated control-frame payload ceiling.
+    ///
+    /// # Errors
+    /// Rejects zero or out-of-range negotiated payload limits.
+    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), TransportError> {
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit = limit;
+        Ok(())
+    }
 }
 
 impl vot_transport_api::TransportAdapter for SimulatorAdapter {
     fn send_control(&mut self, frame: &[u8]) -> Result<(), TransportError> {
-        if frame.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
-            return Err(TransportError::RecordTooLarge);
-        }
+        vot_transport_api::validate_control_frame(frame, self.control_payload_limit)?;
         self.submissions
             .push_back(Submission::Control(vot_transport_api::shared_payload(
                 frame,
@@ -1239,13 +1259,39 @@ mod tests {
     const STORAGE_FAULT: &str = include_str!("../../../sim/scenarios/storage-fault.vot");
 
     #[test]
+    fn negotiated_control_payload_limit_is_applied() {
+        let mut adapter = SimulatorAdapter::default();
+        assert_eq!(
+            adapter.set_control_payload_limit(0),
+            Err(TransportError::InvalidConfiguration)
+        );
+        adapter.set_control_payload_limit(2 * 1024 * 1024).unwrap();
+        adapter
+            .send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
+            .unwrap();
+        assert_eq!(
+            adapter.send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
+            Err(TransportError::RecordTooLarge)
+        );
+    }
+
+    #[test]
     fn adapter_submission_preflight_preserves_queue_state() {
         let mut adapter = SimulatorAdapter::default();
         adapter.send_reliable(StreamId(1), b"one").unwrap();
         assert_eq!(adapter.pending_submissions(), 1);
         let records = [
             shared_payload(b"two"),
-            shared_payload(&vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1]),
+            shared_payload(&vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1]),
         ];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
@@ -1270,14 +1316,23 @@ mod tests {
         assert_eq!(adapter.receive_credit(), 0);
 
         adapter
-            .send_control(&vec![0; vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD])
+            .send_control(&vec![
+                0;
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
             .unwrap();
         adapter
             .send_datagram(7, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES])
             .unwrap();
         assert_eq!(adapter.pending_submissions(), 2);
         assert_eq!(
-            adapter.send_control(&vec![0; vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + 1]),
+            adapter.send_control(&vec![
+                0;
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
             Err(TransportError::RecordTooLarge)
         );
         assert_eq!(

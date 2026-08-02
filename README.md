@@ -53,8 +53,8 @@ Verify and publish a bundle, then write an authenticated receipt:
 cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor KEY_SOURCE 2026-07-31T20:00:00Z
 ```
 
-KEY_SOURCE is `env:NAME`, `-` for stdin, or a file path containing a raw or
-hexadecimal key of at least 32 bytes. The receiver refuses to replace an
+KEY_SOURCE is `env:NAME`, `-` for stdin, or a file path. Raw key bytes
+(32–64 bytes) are preserved as-is; hexadecimal text must begin with `hex:` (and textual raw keys may begin with `raw:`). The receiver refuses to replace an
 existing destination or receipt.
 
 ## License

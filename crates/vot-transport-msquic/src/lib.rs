@@ -55,6 +55,7 @@ pub struct MsQuicAdapter {
     command_bytes: usize,
     command_count_limit: usize,
     command_byte_limit: usize,
+    control_payload_limit: usize,
     events: VecDeque<Event>,
     event_bytes: usize,
     event_count_limit: usize,
@@ -68,6 +69,7 @@ impl Default for MsQuicAdapter {
             command_bytes: 0,
             command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
+            control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             events: VecDeque::new(),
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
@@ -94,6 +96,16 @@ impl MsQuicAdapter {
         })
     }
 
+    /// Applies the peer-negotiated control-frame payload ceiling.
+    ///
+    /// # Errors
+    /// Rejects zero or out-of-range negotiated payload limits.
+    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit = limit;
+        Ok(())
+    }
+
     /// Queues a native callback after enforcing protocol and memory bounds.
     ///
     /// # Errors
@@ -101,9 +113,7 @@ impl MsQuicAdapter {
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let payload_len = match &event {
             NativeEvent::Control(bytes) => {
-                if bytes.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
-                    return Err(Error::RecordTooLarge);
-                }
+                vot_transport_api::validate_control_frame(bytes, self.control_payload_limit)?;
                 bytes.len()
             }
             NativeEvent::Reliable { bytes, .. } => {
@@ -213,9 +223,7 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
-        if frame.len() > vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD {
-            return Err(Error::RecordTooLarge);
-        }
+        vot_transport_api::validate_control_frame(&frame, self.control_payload_limit)?;
         self.enqueue(Command::Control(frame))
     }
 
@@ -735,7 +743,7 @@ mod tests {
         assert_eq!(
             adapter.send_reliable(
                 StreamId(1),
-                &vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1]
+                &vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1]
             ),
             Err(Error::RecordTooLarge)
         );
@@ -798,10 +806,54 @@ mod tests {
     fn control_frames_obey_the_exact_backend_limit() {
         assert_eq!(vot_codec_limit(), 1_048_576);
         let mut adapter = MsQuicAdapter::default();
-        adapter.send_control(&vec![0; vot_codec_limit()]).unwrap();
+        adapter
+            .send_control(&vec![
+                0;
+                vot_codec_limit()
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
+            .unwrap();
         assert_eq!(
-            adapter.send_control(&vec![0; vot_codec_limit() + 1]),
+            adapter.send_control(&vec![
+                0;
+                vot_codec_limit()
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
             Err(Error::RecordTooLarge)
+        );
+    }
+
+    #[test]
+    fn negotiated_control_payload_limit_updates_both_directions() {
+        let mut adapter = MsQuicAdapter::default();
+        assert_eq!(
+            adapter.set_control_payload_limit(0),
+            Err(Error::InvalidConfiguration)
+        );
+        adapter.set_control_payload_limit(2 * 1024 * 1024).unwrap();
+        adapter
+            .send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])
+            .unwrap();
+        assert_eq!(
+            adapter.send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::Control(vec![
+                0;
+                2 * 1024 * 1024 + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ])),
+            Ok(())
         );
     }
 
@@ -867,18 +919,25 @@ mod tests {
 
         let mut oversized = MsQuicAdapter::default();
         oversized
-            .record_native_event(NativeEvent::Control(vec![0; vot_codec_limit()]))
+            .record_native_event(NativeEvent::Control(vec![
+                0;
+                vot_codec_limit() + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+            ]))
             .unwrap();
         assert!(matches!(oversized.poll(), Some(Event::Control(_))));
         assert_eq!(
-            oversized.record_native_event(NativeEvent::Control(vec![0; vot_codec_limit() + 1])),
+            oversized.record_native_event(NativeEvent::Control(vec![
+                0;
+                vot_codec_limit() + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ])),
             Err(Error::RecordTooLarge)
         );
         assert_eq!(
             oversized.record_native_event(NativeEvent::Reliable {
                 stream: 1,
                 sequence: 1,
-                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_BYTES + 1],
+                bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1],
             }),
             Err(Error::RecordTooLarge)
         );

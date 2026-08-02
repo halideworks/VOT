@@ -17,8 +17,8 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-# Workspace members intentionally use path dependencies; keep external wildcard use visible without rejecting these internal edges.
-wildcards = "warn"
+# Path dependencies have no wildcard version; external wildcard versions are denied.
+wildcards = "deny"
 highlight = "all"
 
 [sources]

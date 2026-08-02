@@ -55,6 +55,13 @@ def main() -> None:
     assert environment["VOT_BENCH_IMPAIRMENT_LOSS_PPM"] == "0"
     assert environment["VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS"] == "10000000000"
     assert environment["VOT_BENCH_IMPAIRMENT_QUEUE_BYTES"] == "33554432"
+    assert runner_module.validate_assurance("root-verified") == "root-verified"
+    try:
+        runner_module.validate_assurance("not-an-assurance")
+    except ValueError as error:
+        assert "workload assurance" in str(error)
+    else:
+        raise AssertionError("invalid workload assurance must be rejected")
     try:
         runner_module.validate_positive_matrix([True])
     except ValueError as error:

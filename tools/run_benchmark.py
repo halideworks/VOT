@@ -21,6 +21,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 BACKENDS = {"msquic", "quiche", "tcp", "simulator"}
 SUITE_NAMES = {"blake3-bao64", "sha256-bep52"}
+ASSURANCE_LEVELS = {"root-verified", "durable", "published"}
 
 
 def resolve_input_path(value: str | Path) -> Path:
@@ -93,6 +94,14 @@ def validate_positive_matrix(values: list[Any]) -> None:
         raise ValueError("workload matrix values must be positive integers")
 
 
+def validate_assurance(value: Any) -> str:
+    if not isinstance(value, str) or value not in ASSURANCE_LEVELS:
+        raise ValueError(
+            "workload assurance must be one of: root-verified, durable, published"
+        )
+    return value
+
+
 def build_result(
     measured: dict[str, Any],
     *,
@@ -117,6 +126,7 @@ def build_result(
     )
     cycles_value = measured.get("cycles")
     cycles = None if cycles_value is None else measured_int(cycles_value, "cycles")
+    assurance = validate_assurance(assurance)
     if bytes_sent < verified_bytes:
         raise ValueError("backend reported verified_bytes greater than bytes_sent")
     if verified_bytes != object_bytes:
@@ -208,6 +218,7 @@ def main() -> int:
     impairment = load(impairment_path)
     if workload.get("seed_required") is not True or impairment.get("seed_required") is not True:
         raise ValueError("both workload and impairment must require a seed")
+    assurance = validate_assurance(workload.get("assurance"))
     suites = [args.suite] if args.suite else workload.get("suites", [])
     workers = (
         [args.workers] if args.workers is not None else workload.get("worker_counts", [])
@@ -288,7 +299,7 @@ def main() -> int:
                             seed=run_seed,
                             object_bytes=object_bytes,
                             machine_info=machine_info,
-                            assurance=str(workload["assurance"]),
+                            assurance=assurance,
                             iteration=iteration,
                         )
                     )

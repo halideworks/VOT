@@ -8,6 +8,11 @@ pub const ALPN: &[u8] = b"vot-draft-03";
 pub const MAX_CONTROL_FRAME_PAYLOAD: usize = vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD;
 pub const MAX_DATA_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
+/// A VOT frame has at most two eight-byte QUIC-varint envelope fields.
+pub const MAX_FRAME_ENVELOPE_BYTES: usize = 16;
+pub const MAX_CONTROL_FRAME_WIRE_BYTES: usize =
+    MAX_CONTROL_FRAME_PAYLOAD + MAX_FRAME_ENVELOPE_BYTES;
+pub const MAX_DATA_RECORD_WIRE_BYTES: usize = MAX_DATA_RECORD_BYTES + MAX_FRAME_ENVELOPE_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(pub u64);
@@ -281,10 +286,34 @@ impl StagingCapacity {
     }
 }
 
-/// # Errors
-/// Rejects data records above the frozen protocol limit.
+/// Validates the wire length of a reliable DATA_RECORD submission.
+///
+/// The protocol limit applies to the encoded frame payload. The bounded
+/// envelope is allowed in addition to that payload limit.
 pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
-    if record.len() > MAX_DATA_RECORD_BYTES {
+    if record.len() > MAX_DATA_RECORD_WIRE_BYTES {
+        Err(Error::RecordTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates a negotiated control-frame payload limit.
+pub fn validate_control_payload_limit(limit: usize) -> Result<(), Error> {
+    if limit == 0 || limit > vot_codec::HARD_MAX_FRAME_PAYLOAD {
+        Err(Error::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates the wire length of a control-frame submission.
+pub fn validate_control_frame(frame: &[u8], payload_limit: usize) -> Result<(), Error> {
+    validate_control_payload_limit(payload_limit)?;
+    let wire_limit = payload_limit
+        .checked_add(MAX_FRAME_ENVELOPE_BYTES)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if frame.len() > wire_limit {
         Err(Error::RecordTooLarge)
     } else {
         Ok(())
@@ -350,13 +379,33 @@ mod tests {
     #[test]
     fn records_are_bounded_before_a_backend_sees_them() {
         assert_eq!(MAX_DATA_RECORD_BYTES, 262_144);
+        assert_eq!(MAX_FRAME_ENVELOPE_BYTES, 16);
+        assert_eq!(MAX_DATA_RECORD_WIRE_BYTES, 262_160);
         assert_eq!(
-            validate_data_record(&vec![0; MAX_DATA_RECORD_BYTES]),
+            validate_data_record(&vec![0; MAX_DATA_RECORD_WIRE_BYTES]),
             Ok(())
         );
         assert_eq!(
-            validate_data_record(&vec![0; MAX_DATA_RECORD_BYTES + 1]),
+            validate_data_record(&vec![0; MAX_DATA_RECORD_WIRE_BYTES + 1]),
             Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            validate_control_frame(
+                &vec![0; MAX_CONTROL_FRAME_WIRE_BYTES],
+                MAX_CONTROL_FRAME_PAYLOAD
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_control_frame(
+                &vec![0; MAX_CONTROL_FRAME_WIRE_BYTES + 1],
+                MAX_CONTROL_FRAME_PAYLOAD
+            ),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            validate_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD + 1),
+            Err(Error::InvalidConfiguration)
         );
     }
 
@@ -413,7 +462,7 @@ mod tests {
         let mut preflight = ContractAdapter::default();
         let invalid_records = [
             shared_payload(b"accepted only after preflight"),
-            shared_payload(&vec![0; MAX_DATA_RECORD_BYTES + 1]),
+            shared_payload(&vec![0; MAX_DATA_RECORD_WIRE_BYTES + 1]),
         ];
         assert_eq!(
             preflight.send_reliable_batch(StreamId(8), &invalid_records),

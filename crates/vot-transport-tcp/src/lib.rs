@@ -261,6 +261,15 @@ impl TransportAdapter for TcpAdapter {
         self.enqueue(Command::ReceiveCredit(bytes))
     }
 
+    /// Always absent on this backend.
+    ///
+    /// This crate is a bounded command queue and a rustls state machine. It
+    /// owns no socket, so there is nothing here to sample; the msquic backend
+    /// reports metrics because a driver reads them off a live connection and
+    /// pushes them in. Reporting a fabricated RTT or congestion window instead
+    /// would be worse than reporting nothing, because ADR-0013 says a backend
+    /// that cannot expose enough state does not use Careful Resume, and that
+    /// decision is made from this value.
     fn path_stats(&self) -> Option<PathStats> {
         None
     }

@@ -105,7 +105,9 @@ error. Stale monotonic epochs never replace newer state.
 ## 5. Frame behavior registry
 
 The maximum below includes the frame payload only. "Auth" means a successfully
-authenticated and authorized session is required.
+authenticated and authorized session is required. The session frames carry that
+authentication, so they are marked `no`: requiring an authenticated session to
+send them would leave no way to reach one.
 
 | Frame | Maximum | Idempotence and replay | Auth | 0-RTT |
 |---|---:|---|---|---|
@@ -113,9 +115,9 @@ authenticated and authorized session is required.
 | `SETTINGS` | 16 KiB | once per direction; duplicate setting or frame is an error | no | no |
 | `SETTINGS_ACK` | 0 | duplicate acknowledgement is ignored | no | no |
 | `AUTH_CONTEXT` | 64 KiB | policy-defined nonce/channel binding; replay is rejected | no | no |
-| `SESSION_OPEN` | 64 KiB | exact duplicate session ID reuses result; conflicting duplicate rejected | yes | no |
-| `SESSION_ACCEPT` | 64 KiB | exact duplicate result is idempotent | yes | no |
-| `SESSION_REJECT` | 64 KiB | exact duplicate result is idempotent | yes | no |
+| `SESSION_OPEN` | 64 KiB | exact duplicate session ID reuses result; conflicting duplicate rejected | no | no |
+| `SESSION_ACCEPT` | 64 KiB | exact duplicate result is idempotent | no | no |
+| `SESSION_REJECT` | 64 KiB | exact duplicate result is idempotent | no | no |
 | `PACKAGE_DESCRIPTOR` | 1 MiB | keyed by package identity; conflicting duplicate rejected | yes | no |
 | `MANIFEST_REQUEST` | 64 KiB | exact request ID is idempotent | yes | no |
 | `MANIFEST_PAGE` | 1 MiB | page identity and index deduplicate; conflicting page rejected | yes | no |

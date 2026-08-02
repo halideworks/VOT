@@ -28,6 +28,17 @@ pub const CONTROL_LANE: u64 = u64::MAX - 1;
 /// survivable and there are at most two of them per connection.
 pub const MAX_CALLBACK_EVENTS: usize = 1024;
 
+/// Largest number of peer-driven payload bytes the callback queue will hold.
+///
+/// The entry count is not a memory bound on its own. A control frame is four
+/// times the size of a data record, so a thousand of them is over a gigabyte
+/// held for a peer the driver has not caught up with. This is the bound that
+/// actually limits memory; the count limits per-event overhead.
+///
+/// Sized as a burst of the largest frames either lane carries, which is enough
+/// for the driver to be briefly behind without the connection failing.
+pub const MAX_CALLBACK_BYTES: usize = 16 * MAX_PARTIAL_CONTROL_FRAME;
+
 /// Largest partial frame held on a reliable lane while waiting for the rest.
 pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
 
@@ -448,8 +459,8 @@ pub mod live {
     use vot_transport_api::{ConnectionId, Error, Event, Payload, StreamId, TransportAdapter};
 
     use super::{
-        Command, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter,
-        NativeEvent, PEER_STREAM_ID,
+        Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME,
+        MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent, PEER_STREAM_ID,
     };
     use vot_transport_api::PathStats;
 
@@ -538,7 +549,7 @@ pub mod live {
             port: u16,
             connection_id: u64,
         ) -> Result<Self, msquic::Status> {
-            let inbound: Arc<Mutex<VecDeque<NativeEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+            let inbound: Arc<Mutex<CallbackQueue>> = Arc::new(Mutex::new(CallbackQueue::default()));
             let (closed_tx, closed) = mpsc::channel();
             let sequence = Arc::new(AtomicU64::new(0));
             let close_request = Arc::new(AtomicU64::new(NO_CLOSE));
@@ -687,7 +698,7 @@ pub mod live {
     fn pump_events(
         adapter: &mut MsQuicAdapter,
         stalled: &mut Option<NativeEvent>,
-        inbound: &Arc<Mutex<VecDeque<NativeEvent>>>,
+        inbound: &Arc<Mutex<CallbackQueue>>,
     ) -> Pumped {
         if let Some(held) = stalled.take() {
             match offer(adapter, stalled, held) {
@@ -798,7 +809,7 @@ pub mod live {
             let mut offset = 0;
             loop {
                 match vot_codec::decode_one(&self.pending[offset..], limits) {
-                    Ok((_, consumed)) => {
+                    Ok((frame, consumed)) => {
                         // The codec bounds a known frame by its registered
                         // limit, which for PROOF_BUNDLE and HAVE is larger than
                         // this lane carries. Without this the frame decodes,
@@ -807,7 +818,13 @@ pub mod live {
                         if consumed > self.kind.partial_frame_limit() {
                             return Err(FrameFault::too_large());
                         }
-                        frames.push(self.pending[offset..offset + consumed].to_vec());
+                        // spec/wire.md: an unknown optional frame is skipped by
+                        // its validated length, and grease is handled the same
+                        // way. Forwarding one would hand the application bytes
+                        // it must ignore and spend queue capacity on them.
+                        if matches!(frame, vot_codec::DecodedFrame::Known { .. }) {
+                            frames.push(self.pending[offset..offset + consumed].to_vec());
+                        }
                         offset += consumed;
                     }
                     // More bytes will finish it, so keep what we have.
@@ -874,7 +891,7 @@ pub mod live {
     /// The result is deliberately not `Clone`: every stream needs reassembly
     /// state of its own, so a handler is built per stream rather than shared.
     fn stream_handler(
-        inbound: Arc<Mutex<VecDeque<NativeEvent>>>,
+        inbound: Arc<Mutex<CallbackQueue>>,
         sequence: Arc<AtomicU64>,
         close_request: Arc<AtomicU64>,
         kind: StreamKind,
@@ -954,7 +971,7 @@ pub mod live {
     /// The state every stream callback shares with the driver.
     #[derive(Clone)]
     struct Callbacks {
-        inbound: Arc<Mutex<VecDeque<NativeEvent>>>,
+        inbound: Arc<Mutex<CallbackQueue>>,
         sequence: Arc<AtomicU64>,
         close_request: Arc<AtomicU64>,
     }
@@ -1019,37 +1036,84 @@ pub mod live {
         }
     }
 
-    /// Queues an event for the driver. Returns false when the bound is reached.
-    fn push(queue: &Arc<Mutex<VecDeque<NativeEvent>>>, event: NativeEvent) -> bool {
+    /// The queue between the backend's worker threads and the driver.
+    ///
+    /// Bounded by payload bytes as well as by entry count. A count on its own is
+    /// not a memory bound: the largest control frame is four times the largest
+    /// record, so a thousand of them is over a gigabyte held on behalf of a peer
+    /// that has sent nothing the driver asked for.
+    #[derive(Default)]
+    pub struct CallbackQueue {
+        events: VecDeque<NativeEvent>,
+        bytes: usize,
+    }
+
+    impl CallbackQueue {
+        /// Queues a peer-driven event. Returns false when either bound is met.
+        fn push(&mut self, event: NativeEvent) -> bool {
+            let payload = native_payload_len(&event);
+            let Some(next) = self.bytes.checked_add(payload) else {
+                return false;
+            };
+            if self.events.len() >= MAX_CALLBACK_EVENTS || next > MAX_CALLBACK_BYTES {
+                return false;
+            }
+            self.events.push_back(event);
+            self.bytes = next;
+            true
+        }
+
+        /// Queues a connection lifecycle event past both bounds.
+        fn push_lifecycle(&mut self, event: NativeEvent) {
+            debug_assert_eq!(native_payload_len(&event), 0);
+            self.events.push_back(event);
+        }
+
+        fn pop(&mut self) -> Option<NativeEvent> {
+            let event = self.events.pop_front()?;
+            self.bytes = self.bytes.saturating_sub(native_payload_len(&event));
+            Some(event)
+        }
+    }
+
+    /// Bytes an event holds on the queue's behalf.
+    fn native_payload_len(event: &NativeEvent) -> usize {
+        match event {
+            NativeEvent::Control(bytes) | NativeEvent::Reliable { bytes, .. } => bytes.len(),
+            NativeEvent::Connected(_)
+            | NativeEvent::Disconnected(_)
+            | NativeEvent::Acknowledged { .. }
+            | NativeEvent::DatagramState { .. } => 0,
+        }
+    }
+
+    /// Queues an event for the driver. Returns false when a bound is reached.
+    fn push(queue: &Arc<Mutex<CallbackQueue>>, event: NativeEvent) -> bool {
         let Ok(mut queue) = queue.lock() else {
             return false;
         };
-        if queue.len() >= MAX_CALLBACK_EVENTS {
-            return false;
-        }
-        queue.push_back(event);
-        true
+        queue.push(event)
     }
 
-    /// Queues a connection lifecycle event past the data bound.
+    /// Queues a connection lifecycle event past the data bounds.
     ///
-    /// The bound exists to stop a fast peer outrunning the driver, and neither
+    /// Those bounds exist to stop a fast peer outrunning the driver, and neither
     /// of these comes from the peer's data. Dropping one is not survivable, so
     /// it is not treated as backpressure.
     ///
-    /// The extra growth is two entries, and that is a bound rather than a hope:
-    /// `MsQuicTransport` owns one connection for its whole life and this queue
-    /// belongs to that transport, `Connected` is delivered once per successful
-    /// handshake, and `ShutdownComplete` is the last event `MsQuic` delivers
-    /// for a connection. Both carry no payload.
-    fn push_lifecycle(queue: &Arc<Mutex<VecDeque<NativeEvent>>>, event: NativeEvent) {
+    /// The extra growth is two payload-free entries, and that is a bound rather
+    /// than a hope: `MsQuicTransport` owns one connection for its whole life and
+    /// this queue belongs to that transport, `Connected` is delivered once per
+    /// successful handshake, and `ShutdownComplete` is the last event `MsQuic`
+    /// delivers for a connection.
+    fn push_lifecycle(queue: &Arc<Mutex<CallbackQueue>>, event: NativeEvent) {
         if let Ok(mut queue) = queue.lock() {
-            queue.push_back(event);
+            queue.push_lifecycle(event);
         }
     }
 
-    fn pop(queue: &Arc<Mutex<VecDeque<NativeEvent>>>) -> Option<NativeEvent> {
-        queue.lock().ok()?.pop_front()
+    fn pop(queue: &Arc<Mutex<CallbackQueue>>) -> Option<NativeEvent> {
+        queue.lock().ok()?.pop()
     }
 
     /// No close has been requested. The wire registry starts at `0x0101`, so
@@ -1258,7 +1322,7 @@ pub mod live {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         use std::process::Command;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::{Arc, Mutex, OnceLock, mpsc};
         use std::time::{Duration, Instant};
 
         use msquic::{
@@ -1269,11 +1333,9 @@ pub mod live {
 
         use super::{Framing, MsQuicTransport, StreamKind};
 
-        use std::collections::VecDeque;
-
         use super::super::{
-            Command as AdapterCommand, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME,
-            MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent,
+            Command as AdapterCommand, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS,
+            MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent,
         };
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
         use vot_transport_api::{
@@ -1292,7 +1354,7 @@ pub mod live {
             // being torn down. Dropping the disconnect there leaves the driver
             // waiting on a connection that is gone, holding path statistics for
             // a path that no longer exists.
-            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
             for sequence in 1..=MAX_CALLBACK_EVENTS as u64 {
                 assert!(super::push(
                     &queue,
@@ -1353,18 +1415,86 @@ pub mod live {
         }
 
         #[test]
+        fn the_callback_queue_is_bounded_by_bytes_as_well_as_by_count() {
+            // Counting entries alone is not a memory bound. A thousand maximum
+            // control frames is over a gigabyte, which a peer can queue while
+            // the driver is briefly behind.
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            let frame = vec![0x44; MAX_PARTIAL_CONTROL_FRAME - 64];
+            let mut admitted = 0;
+            while super::push(&queue, NativeEvent::Control(frame.clone())) {
+                admitted += 1;
+                assert!(admitted <= MAX_CALLBACK_EVENTS, "the byte bound never bit");
+            }
+            assert!(
+                admitted < MAX_CALLBACK_EVENTS,
+                "bytes must run out first for frames this size"
+            );
+            assert!(admitted * frame.len() <= MAX_CALLBACK_BYTES);
+
+            // Draining returns the capacity, so the bound is backpressure and
+            // not a one-way ratchet.
+            assert!(super::pop(&queue).is_some());
+            assert!(super::push(&queue, NativeEvent::Control(frame)));
+
+            // Payload-free events are still bounded by the count.
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            for _ in 0..MAX_CALLBACK_EVENTS {
+                assert!(super::push(
+                    &queue,
+                    NativeEvent::Acknowledged {
+                        stream: 1,
+                        sequence: 1
+                    }
+                ));
+            }
+            assert!(!super::push(
+                &queue,
+                NativeEvent::Acknowledged {
+                    stream: 1,
+                    sequence: 2
+                }
+            ));
+        }
+
+        #[test]
+        fn an_unknown_optional_frame_is_skipped_rather_than_delivered() {
+            // spec/wire.md: an unknown optional type is skipped by its
+            // validated length. Handing it up would give the application bytes
+            // it must ignore and spend queue capacity holding them.
+            let optional = framed(0x7ffe, b"ignore me");
+            let grease = framed(0x1f00, b"grease");
+            let real = framed(vot_codec::frame_type::DATA_RECORD, b"payload");
+            assert!(vot_codec::is_grease(0x1f00));
+
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut stream = optional.clone();
+            stream.extend_from_slice(&grease);
+            stream.extend_from_slice(&real);
+            assert_eq!(
+                framing.accept(&stream).unwrap(),
+                vec![real],
+                "only the known frame reaches the application"
+            );
+            assert!(
+                !framing.is_assembling(),
+                "the skipped frames were consumed, not left behind"
+            );
+        }
+
+        #[test]
         fn an_event_that_can_never_be_admitted_ends_the_connection() {
             // Holding it would wedge the head of the queue for ever. The close
             // code comes from the wire registry so the peer is told what it did.
-            let queue = Arc::new(Mutex::new(VecDeque::new()));
-            super::push_lifecycle(
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            assert!(super::push(
                 &queue,
                 NativeEvent::Reliable {
                     stream: 1,
                     sequence: 1,
                     bytes: vec![0; vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES + 1],
-                },
-            );
+                }
+            ));
             let mut adapter = MsQuicAdapter::default();
             let mut stalled = None;
             assert_eq!(
@@ -1376,7 +1506,7 @@ pub mod live {
             // A full adapter is the one refusal that is waited on rather than
             // treated as fatal.
             let mut adapter = MsQuicAdapter::with_queue_limits(1, 4096).unwrap();
-            let queue = Arc::new(Mutex::new(VecDeque::new()));
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
             assert!(super::push(&queue, NativeEvent::Connected(11)));
             assert!(super::push(&queue, NativeEvent::Disconnected(11)));
             assert_eq!(
@@ -1545,12 +1675,20 @@ pub mod live {
             assert_eq!(left.accept(&first[4..]).unwrap(), vec![first]);
         }
 
+        /// Generates the test certificate exactly once per process.
+        ///
+        /// Several tests need it and the harness runs them concurrently. An
+        /// exists-then-create check let two of them run `openssl` over the same
+        /// two paths at once, so one could load a half-written certificate and
+        /// fail for reasons that have nothing to do with what it tests.
         fn test_credential() -> Credential {
-            let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
-            std::fs::create_dir_all(&directory).unwrap();
-            let key = directory.join("key.pem");
-            let certificate = directory.join("cert.pem");
-            if !key.exists() || !certificate.exists() {
+            static MATERIAL: OnceLock<(String, String)> = OnceLock::new();
+            let (key, certificate) = MATERIAL.get_or_init(|| {
+                let directory =
+                    std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
+                std::fs::create_dir_all(&directory).unwrap();
+                let key = directory.join("key.pem");
+                let certificate = directory.join("cert.pem");
                 let status = Command::new("openssl")
                     .args([
                         "req",
@@ -1571,10 +1709,11 @@ pub mod live {
                     .status()
                     .unwrap();
                 assert!(status.success());
-            }
+                (key.display().to_string(), certificate.display().to_string())
+            });
             Credential::CertificateFile(msquic::CertificateFile::new(
-                key.display().to_string(),
-                certificate.display().to_string(),
+                key.clone(),
+                certificate.clone(),
             ))
         }
 
@@ -1884,7 +2023,7 @@ pub mod live {
                             received.extend_from_slice(buffer.as_bytes());
                         }
                         if received.len() == expected_length {
-                            complete_tx.send(()).unwrap();
+                            let _ = complete_tx.send(());
                         }
                     }
                     StreamEvent::ShutdownComplete { .. } => {
@@ -1906,7 +2045,7 @@ pub mod live {
                         stream.set_callback_handler(server_stream.clone());
                     }
                     ConnectionEvent::ShutdownComplete { .. } => {
-                        server_closed_tx.send(()).unwrap();
+                        let _ = server_closed_tx.send(());
                         // SAFETY: MsQuic delivered ShutdownComplete for this
                         // peer-created connection and no other owner adopted it.
                         unsafe { close_peer_connection(&connection) };
@@ -1924,7 +2063,7 @@ pub mod live {
                         connection.set_configuration(&configuration)?;
                     }
                     ListenerEvent::StopComplete { .. } => {
-                        listener_stopped_tx.send(()).unwrap();
+                        let _ = listener_stopped_tx.send(());
                     }
                 }
                 Ok(())

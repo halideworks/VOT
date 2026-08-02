@@ -1,0 +1,16 @@
+[package]
+name = "vot-bench-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+vot-scheduler = { path = "../vot-scheduler" }
+vot-transport-api = { path = "../vot-transport-api" }
+vot-transport-sim = { path = "../vot-transport-sim" }
+vot-verifier = { path = "../vot-verifier" }
+
+[lints]
+workspace = true

@@ -5,4 +5,4 @@ timeout_multiplier = 4.0
 # mutation job does not enable, so every mutant in it is unkillable by
 # construction. It is covered by the msquic-live and msquic-sanitizer jobs.
 exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
-exclude_globs = ["crates/vot-cli/src/main.rs"]
+exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]

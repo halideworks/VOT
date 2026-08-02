@@ -1,5 +1,8 @@
 gitignore = true
 minimum_test_timeout = 20.0
 timeout_multiplier = 4.0
-exclude_re = ["live::registration", "live::send_owned", "(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
+# The msquic live module only compiles under the `live` feature, which the
+# mutation job does not enable, so every mutant in it is unkillable by
+# construction. It is covered by the msquic-live and msquic-sanitizer jobs.
+exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
 exclude_globs = ["crates/vot-cli/src/main.rs"]

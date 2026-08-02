@@ -1,25 +1,9 @@
-//! VOT session negotiation and the gate it puts in front of the data plane.
+//! The `spec/wire.md` section 1 exchange, and the gate it puts in front of the
+//! data plane. See `docs/session.md`.
 //!
-//! `spec/wire.md` section 1 puts negotiation on the first client-initiated
-//! bidirectional stream: the client sends `HELLO` then `SETTINGS`, the server
-//! answers with its own `SETTINGS` then `SETTINGS_ACK`. Until that exchange
-//! finishes neither side knows the other's limits, its draft revision, or the
-//! extensions it understands.
-//!
-//! The transport backends can open streams and move bytes without any of that,
-//! which is what makes this layer necessary rather than decorative: reserving
-//! the negotiation stream is not the same as negotiating on it. Nothing here
-//! adds protocol machinery. It enforces machinery `spec/wire.md` already
-//! defines.
-//!
-//! ## What `Ready` means
-//!
-//! `Ready` means negotiated, not authenticated. `spec/wire.md` also defines
-//! `AUTH_CONTEXT`, `SESSION_OPEN`, and `SESSION_ACCEPT`, and marks most
-//! application frames as requiring an authenticated session. None of those are
-//! implemented here, so a session that reaches `Ready` has completed the
-//! version and limit exchange and nothing else. Every frame the registry marks
-//! `auth: yes` is therefore not yet conforming.
+//! `Ready` means negotiated, not authenticated. `AUTH_CONTEXT`,
+//! `SESSION_OPEN`, and `SESSION_ACCEPT` are unimplemented, so every frame the
+//! registry marks `auth: yes` is not yet conforming.
 
 #![forbid(unsafe_code)]
 
@@ -31,28 +15,20 @@ use vot_codec::{
 };
 use vot_transport_api::{Error as TransportError, Event, Payload, StreamId, TransportAdapter};
 
-/// Largest number of peer records held while this endpoint finishes
-/// negotiating.
+/// Peer records held while this endpoint finishes negotiating.
 ///
 /// A conforming peer can have data in flight before it learns this side is
-/// ready: the two endpoints reach `Ready` at different moments, and QUIC orders
-/// nothing between the negotiation stream and an application lane. Refusing
-/// those records would close a session the peer did nothing wrong in, so they
-/// are held. Held, not unbounded: this is the only place peer data accumulates
-/// on behalf of a session that has not agreed to anything yet.
+/// ready, so refusing them would close a session it did nothing wrong in.
 pub const DEFAULT_PENDING_RECORD_BYTES: usize = 4 * vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
 
-/// Largest number of peer records held before readiness, by count.
-///
-/// A byte bound alone does not limit per-record overhead, and a peer that sends
-/// many tiny records would otherwise queue an unbounded number of them.
+/// The same bound by count, since bytes alone do not limit per-record
+/// overhead.
 pub const DEFAULT_PENDING_RECORD_COUNT: usize = 64;
 
 /// How far a session has got through `spec/wire.md` section 1.
 ///
-/// The names are written from the client's side of the exchange. On an
-/// accepting endpoint `HelloSent` means the peer's `HELLO` arrived, and
-/// `SettingsExchanged` means its `SETTINGS` arrived and this side's went out.
+/// Named from the client's side: on a server, `HelloSent` means the peer's
+/// `HELLO` arrived.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
     /// No carrier yet.
@@ -79,10 +55,8 @@ impl State {
 
 /// Why a session cannot continue, with the code `spec/registries.md` gives it.
 ///
-/// A failure the peer caused is applied to the carrier before the error is
-/// returned, so the peer learns which rule it broke rather than seeing the
-/// session end for no stated reason. A local failure is not: see
-/// [`ErrorKind::is_peer_fault`].
+/// A peer-caused failure closes the carrier under that code before the error
+/// is returned. A local one does not: see [`ErrorKind::is_peer_fault`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
@@ -107,11 +81,8 @@ impl Error {
     }
 }
 
-/// The distinguishable ways a session fails.
-///
-/// Kept separate from the registered close code so a caller can tell a peer
-/// that sent the wrong thing from one that sent nothing, and a local refusal
-/// from a peer-induced one, which the single wire code cannot express.
+/// The distinguishable ways a session fails, which one registered close code
+/// cannot express.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
     /// The peer's `HELLO` was not acceptable.
@@ -130,6 +101,10 @@ pub enum ErrorKind {
     NotReady { state: State },
     /// The peer sent more before readiness than this endpoint will hold.
     PendingRecordsExhausted { bytes: usize, count: usize },
+    /// Negotiation frames have not all reached the backend yet.
+    HandshakeUnsent { remaining: usize },
+    /// A record larger than the peer said it would accept.
+    RecordExceedsPeerLimit { bytes: usize, limit: u64 },
     /// The backend refused something the session needed.
     Transport(TransportError),
     /// The backend would reassemble control frames larger than this endpoint
@@ -139,11 +114,6 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Whether the peer caused this, and so whether it belongs on the wire.
-    ///
-    /// The question `spec/wire.md` cannot answer from the close code alone: one
-    /// registered code covers a peer that sent a frame out of sequence and a
-    /// local caller that asked for something too early, and only the first is
-    /// a reason to end a working connection.
     #[must_use]
     pub const fn is_peer_fault(&self) -> bool {
         match self {
@@ -153,14 +123,14 @@ impl ErrorKind {
             | Self::OutOfSequence { .. }
             | Self::NotNegotiated { .. }
             | Self::PendingRecordsExhausted { .. } => true,
-            // A local misuse of the API, a backend refusal the backend already
-            // knows about, and a carrier that has already gone. Closing over
-            // any of these would either blame the peer for something it did
-            // not do or turn backpressure into a teardown.
+            // Local. Closing over these would blame the peer for something it
+            // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
             | Self::Transport(_)
             | Self::Interrupted { .. }
-            | Self::ReceiveLimitMismatch { .. } => false,
+            | Self::ReceiveLimitMismatch { .. }
+            | Self::HandshakeUnsent { .. }
+            | Self::RecordExceedsPeerLimit { .. } => false,
         }
     }
 }
@@ -174,10 +144,8 @@ pub enum Accepted {
     Application,
 }
 
-/// The `spec/wire.md` section 1 exchange, as a state machine.
-///
-/// Carries no carrier and no buffers, so the sequence can be exercised without
-/// one. [`Session`] is what connects it to a transport.
+/// The exchange as a state machine, with no carrier and no buffers.
+/// [`Session`] connects it to a transport.
 #[derive(Clone, Debug)]
 pub struct Negotiation {
     role: EndpointRole,
@@ -232,10 +200,8 @@ impl Negotiation {
     }
 
     /// The limits the peer advertised, which bound what this endpoint sends.
-    ///
-    /// Absent until the peer's `SETTINGS` arrive, because a default guessed on
-    /// its behalf is exactly the kind of assumption negotiation exists to
-    /// remove.
+    /// Absent until its `SETTINGS` arrive; guessing a default would be the
+    /// assumption negotiation exists to remove.
     #[must_use]
     pub const fn peer_settings(&self) -> Option<Settings> {
         self.peer_settings
@@ -249,9 +215,8 @@ impl Negotiation {
 
     /// Reports the negotiation stream reserved and returns what to send.
     ///
-    /// The client sends `HELLO` then `SETTINGS`. The server sends nothing yet:
-    /// `spec/wire.md` has it answer, and answering before the question would
-    /// mean acknowledging settings it has not seen.
+    /// The client sends `HELLO` then `SETTINGS`; the server answers, so it
+    /// sends nothing yet.
     ///
     /// # Errors
     /// Rejects a second call, and a local `HELLO` or `SETTINGS` this endpoint
@@ -293,9 +258,8 @@ impl Negotiation {
         };
         let (decoded, consumed) = vot_codec::decode_one(frame, limits).map_err(decode_error)?;
         if consumed != frame.len() {
-            // The caller is expected to hand over exactly one framed frame.
-            // More bytes mean the carrier and this layer disagree about where
-            // frames end, which is not something to guess about.
+            // Trailing bytes mean the carrier and this layer disagree about
+            // where frames end.
             return Err(Error::new(
                 ErrorKind::Decode(DecodeError::LengthOverflow(consumed as u64)),
                 error_code::MALFORMED_FRAME,
@@ -306,9 +270,8 @@ impl Negotiation {
             payload,
         } = decoded
         else {
-            // An unknown optional or grease frame is skipped by its validated
-            // length at any point in the exchange, which is what lets a peer
-            // send them during a handshake without ending it.
+            // Unknown optional and grease frames are skipped at any point, so
+            // a peer can send them mid-handshake.
             return Ok(Accepted::Consumed { reply: Vec::new() });
         };
         match frame_type {
@@ -319,11 +282,9 @@ impl Negotiation {
         }
     }
 
-    /// Ends the exchange because the peer broke it.
-    ///
-    /// Separate from [`carrier_closed`](Self::carrier_closed), which reports a
-    /// carrier that went away on its own. Nothing further is accepted either
-    /// way, but only this one is the peer's doing.
+    /// Ends the exchange because the peer broke it, as opposed to
+    /// [`carrier_closed`](Self::carrier_closed), which is the carrier going
+    /// away on its own.
     pub const fn abandon(&mut self) {
         self.state = State::Closed;
     }
@@ -346,9 +307,8 @@ impl Negotiation {
     }
 
     fn accept_hello(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
-        // spec/wire.md section 5: HELLO is sent once per session, and section 1
-        // has only the client send it, on the stream it opened. A server that
-        // sent one would be claiming a role the stream initiator contradicts.
+        // spec/wire.md section 5: once per session, and only the client sends
+        // it, on the stream it opened.
         if self.role != EndpointRole::Server || self.state != State::ControlReserved {
             return Err(self.out_of_sequence(frame_type::HELLO));
         }
@@ -362,14 +322,12 @@ impl Negotiation {
     }
 
     fn accept_settings(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
-        // Once per direction. A second one would change limits the peer has
-        // already been told this endpoint is working under.
+        // Once per direction: a second would move limits the peer was already
+        // told.
         if self.peer_settings.is_some() {
             return Err(self.out_of_sequence(frame_type::SETTINGS));
         }
-        // The same state on both sides: the client has sent HELLO and SETTINGS
-        // and is waiting for the answer, and the server has seen HELLO and is
-        // waiting for the settings behind it.
+        // The same state on both sides: HELLO accounted for, SETTINGS not.
         if self.state != State::HelloSent {
             return Err(self.out_of_sequence(frame_type::SETTINGS));
         }
@@ -382,9 +340,7 @@ impl Negotiation {
         match self.role {
             EndpointRole::Client => Ok(Accepted::Consumed { reply: Vec::new() }),
             EndpointRole::Server => {
-                // The answer and the acknowledgement go out together: the
-                // acknowledgement says the settings just parsed were accepted,
-                // and this endpoint has nothing further to ask.
+                // Answer and acknowledgement together: nothing further to ask.
                 let reply = vec![self.settings_frame()?, settings_ack_frame()?];
                 self.state = State::Ready;
                 Ok(Accepted::Consumed { reply })
@@ -392,12 +348,8 @@ impl Negotiation {
         }
     }
 
-    /// Accepts `SETTINGS_ACK`.
-    ///
-    /// No payload check: `spec/wire.md` section 5 gives this frame a maximum of
-    /// zero bytes, and the codec rejects a longer one as `FRAME_TOO_LARGE`
-    /// before it reaches here. A second check would be a branch nothing could
-    /// take.
+    /// Accepts `SETTINGS_ACK`. No payload check: the registry gives it a
+    /// maximum of zero bytes, so the codec has already refused a longer one.
     fn accept_settings_ack(&mut self) -> Result<Accepted, Error> {
         // spec/wire.md section 5: a duplicate acknowledgement is ignored, so a
         // second one after readiness is not an error.
@@ -415,11 +367,9 @@ impl Negotiation {
         if self.state.is_ready() {
             return Ok(Accepted::Application);
         }
-        // spec/wire.md section 1: frames that require a session are invalid
-        // until there is one. Reported as a state violation rather than an
-        // authentication failure, because no authentication policy has run:
-        // claiming one rejected this would describe a check that does not
-        // exist yet.
+        // spec/wire.md section 1: frames needing a session are invalid until
+        // there is one. A state violation, not an authentication failure: no
+        // authentication policy has run.
         Err(Error::new(
             ErrorKind::NotNegotiated { frame_type },
             error_code::MALFORMED_FRAME,
@@ -471,30 +421,19 @@ fn decode_error(error: DecodeError) -> Error {
 }
 
 /// A negotiation running over a transport, gating the data plane behind it.
-///
-/// Owns the adapter so an application cannot reach past the gate to the raw
-/// backend. The backends stay able to open streams and move bytes on their own,
-/// which is what makes them testable; this is what stops a deployment doing it
-/// before there is anything to send it under.
+/// Owns the adapter so an application cannot reach past the gate.
 pub struct Session<A> {
     adapter: A,
     negotiation: Negotiation,
-    /// Negotiation frames the backend has not accepted yet.
+    /// Negotiation frames the backend has not accepted yet, at most two.
     ///
-    /// The exchange advances in pairs: a client sends `HELLO` and `SETTINGS`
-    /// together, a server answers with `SETTINGS` and `SETTINGS_ACK`. A backend
-    /// with room for the first and not the second would leave the peer waiting
-    /// for a frame nothing would ever send again, because the state machine has
-    /// already moved past producing it. Holding the remainder here makes a full
-    /// outbound queue backpressure rather than a lost handshake.
-    ///
-    /// At most two frames, since that is the largest step the exchange takes.
+    /// The exchange advances in pairs, and the state machine will not produce
+    /// a frame twice, so a full outbound queue has to be backpressure rather
+    /// than a lost handshake.
     outbound: VecDeque<Vec<u8>>,
-    /// Records the peer sent before this endpoint reached `Ready`.
-    ///
-    /// Held here rather than left in the adapter: an adapter queue is one
-    /// ordered stream of events, so leaving a record in it would block the
-    /// control frames behind it, and those are what readiness is waiting for.
+    /// Records the peer sent before this endpoint reached `Ready`. Held here
+    /// rather than in the adapter, whose single queue would block the control
+    /// frames readiness is waiting for.
     pending: VecDeque<Event>,
     pending_bytes: usize,
     pending_byte_limit: usize,
@@ -562,11 +501,8 @@ impl<A: TransportAdapter> Session<A> {
         self.negotiation.peer_settings()
     }
 
-    /// Whether the peer's control-frame limit was applied to the backend.
-    ///
-    /// A backend with no such bound reports [`TransportError::Unsupported`] and
-    /// this stays false, so a caller can tell an applied limit from one that
-    /// was quietly dropped.
+    /// Whether the peer's control-frame limit reached the backend. False when
+    /// the backend has no such bound.
     #[must_use]
     pub const fn control_limit_applied(&self) -> bool {
         self.control_limit_applied
@@ -595,11 +531,8 @@ impl<A: TransportAdapter> Session<A> {
 
     /// Refuses to advertise a control-frame limit the backend will not keep.
     ///
-    /// Advertising one bound and reassembling up to another is the asymmetry
-    /// negotiation exists to remove, and it is silent: the peer sends what it
-    /// was told it could, and this endpoint accepts more. Checked rather than
-    /// set, because the bound has to be in force before the first byte and a
-    /// session is constructed after the carrier is.
+    /// Checked rather than set: the bound has to be in force before the peer's
+    /// first byte, and a session is built after the carrier.
     ///
     /// # Errors
     /// Reports a backend whose reassembly bound is not the limit this endpoint
@@ -639,12 +572,8 @@ impl<A: TransportAdapter> Session<A> {
         }
     }
 
-    /// Ends the session when the peer is the one that broke it.
-    ///
-    /// Only then. A local caller using the API wrongly, or a backend refusing a
-    /// submission, is not something to tear a healthy connection down over, and
-    /// `NotReady` on the wire would tell the peer nothing it did was wrong. A
-    /// carrier that has already gone has nothing left to close.
+    /// Ends the session when the peer is the one that broke it, and only
+    /// then.
     fn fail(&mut self, error: Error) -> Error {
         if error.kind().is_peer_fault() {
             let _ = self.adapter.close(error.close_code());
@@ -653,27 +582,20 @@ impl<A: TransportAdapter> Session<A> {
         error
     }
 
-    /// Whether queued negotiation frames should still be pushed.
-    ///
-    /// A closed session has nothing left to negotiate, and a stale `HELLO`
-    /// arriving on a dying connection is noise the peer has to parse before it
-    /// can work out the session is over.
+    /// Whether queued negotiation frames should still be pushed. A closed
+    /// session has nothing left to negotiate.
     const fn may_negotiate(&self) -> bool {
         !matches!(self.negotiation.state(), State::Closed)
     }
 
     fn poll_inner(&mut self) -> Result<Option<Event>, Error> {
         if self.may_negotiate() && !self.outbound.is_empty() {
-            // A driver that polls in a loop retries the handshake without
-            // having to know it stalled.
+            // So a driver that only polls recovers from a stall.
             self.drain_outbound()?;
         }
         if self.negotiation.state() == State::Closed {
-            // The session is over. Frames still arriving on a closing carrier
-            // are not worth interpreting, and interpreting them would report
-            // the second thing that went wrong rather than the first: a peer
-            // whose HELLO was refused would show up as an application frame
-            // before negotiation on the next call.
+            // Interpreting more would report the second thing that went wrong
+            // rather than the first.
             return Ok(self.drain_lifecycle());
         }
         if self.negotiation.is_ready()
@@ -714,7 +636,7 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.require_ready()?;
+        self.require_sendable()?;
         self.adapter.send_control(frame).map_err(transport_error)
     }
 
@@ -723,7 +645,8 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
-        self.require_ready()?;
+        self.require_sendable()?;
+        self.require_within_peer_record_limit(record.len())?;
         self.adapter
             .send_reliable(stream, record)
             .map_err(transport_error)
@@ -734,7 +657,8 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
-        self.require_ready()?;
+        self.require_sendable()?;
+        self.require_within_peer_record_limit(record.len())?;
         self.adapter
             .send_reliable_shared(stream, record)
             .map_err(transport_error)
@@ -751,8 +675,7 @@ impl<A: TransportAdapter> Session<A> {
         if self.may_negotiate() {
             return self.drain_outbound();
         }
-        // Closed. Whatever the backend already holds may still go out, but no
-        // more negotiation frames are handed to it.
+        // Closed: flush what the backend holds, but add nothing to it.
         self.adapter.flush().map_err(transport_error)
     }
 
@@ -772,11 +695,8 @@ impl<A: TransportAdapter> Session<A> {
         }
     }
 
-    /// Applies what the peer advertised to the backend.
-    ///
-    /// Without this the exchange is a state enum: the peer's control-frame
-    /// maximum is the bound on what this endpoint may send, and ignoring it
-    /// means sending frames the peer is entitled to close the session over.
+    /// Applies what the peer advertised to the backend. Its control-frame
+    /// maximum is the bound on what this endpoint may send.
     fn apply_peer_limits(&mut self) {
         let Some(peer) = self.negotiation.peer_settings() else {
             return;
@@ -790,9 +710,8 @@ impl<A: TransportAdapter> Session<A> {
     /// Queues negotiation frames and pushes as many as the backend will take.
     ///
     /// # Errors
-    /// Reports a backend refusal that is not capacity. A full queue is not an
-    /// error: the frames stay queued and the next `flush` or `poll` retries
-    /// them.
+    /// Reports a refusal that is not capacity. A full queue is backpressure:
+    /// the next `flush` or `poll` retries.
     fn submit(&mut self, frames: Vec<Vec<u8>>) -> Result<(), Error> {
         self.outbound.extend(frames);
         self.drain_outbound()
@@ -801,17 +720,15 @@ impl<A: TransportAdapter> Session<A> {
     /// Hands queued negotiation frames to the backend in order.
     ///
     /// # Errors
-    /// Reports the first refusal that is not capacity, keeping that frame and
-    /// everything after it queued either way.
+    /// Reports the first refusal that is not capacity. The frame stays queued
+    /// either way.
     fn drain_outbound(&mut self) -> Result<(), Error> {
         while let Some(frame) = self.outbound.front() {
             match self.adapter.send_control(frame) {
                 Ok(()) => {
                     self.outbound.pop_front();
                 }
-                // Backpressure. The frame stays at the head and the exchange
-                // resumes when the backend has room, rather than the peer
-                // waiting for something nothing will send again.
+                // Backpressure: resume when the backend has room.
                 Err(TransportError::OutboundQueueFull) => break,
                 Err(error) => return Err(transport_error(error)),
             }
@@ -842,10 +759,8 @@ impl<A: TransportAdapter> Session<A> {
         Ok(())
     }
 
-    /// Returns the next carrier event a closed session still owes its caller.
-    ///
-    /// Lifecycle only: the caller has to learn the carrier ended, and nothing
-    /// else on a closed session means anything.
+    /// Lifecycle events only. The caller still has to learn the carrier
+    /// ended; nothing else on a closed session means anything.
     fn drain_lifecycle(&mut self) -> Option<Event> {
         while let Some(event) = self.adapter.poll() {
             match event {
@@ -874,15 +789,49 @@ impl<A: TransportAdapter> Session<A> {
         )
     }
 
-    fn require_ready(&self) -> Result<(), Error> {
-        if self.negotiation.is_ready() {
+    /// Whether the application may put a frame on the carrier.
+    ///
+    /// Readiness is not enough. A server becomes ready when it produces
+    /// `SETTINGS_ACK`, not when the backend takes it, so an application frame
+    /// sent while the acknowledgement is still queued would overtake it and
+    /// reach a peer that is still waiting to finish negotiating.
+    fn require_sendable(&self) -> Result<(), Error> {
+        if !self.negotiation.is_ready() {
+            return Err(Error::new(
+                ErrorKind::NotReady {
+                    state: self.negotiation.state(),
+                },
+                error_code::MALFORMED_FRAME,
+            ));
+        }
+        if !self.outbound.is_empty() {
+            return Err(Error::new(
+                ErrorKind::HandshakeUnsent {
+                    remaining: self.outbound.len(),
+                },
+                error_code::RESOURCE_LIMIT,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses a record larger than the peer said it would accept.
+    ///
+    /// The adapter only knows the protocol ceiling. Sending past what the peer
+    /// advertised is a session the peer is entitled to end.
+    fn require_within_peer_record_limit(&self, bytes: usize) -> Result<(), Error> {
+        let Some(peer) = self.negotiation.peer_settings() else {
+            return Ok(());
+        };
+        if u64::try_from(bytes).is_ok_and(|bytes| bytes <= peer.max_data_record_payload) {
             return Ok(());
         }
         Err(Error::new(
-            ErrorKind::NotReady {
-                state: self.negotiation.state(),
+            ErrorKind::RecordExceedsPeerLimit {
+                bytes,
+                limit: peer.max_data_record_payload,
             },
-            error_code::MALFORMED_FRAME,
+            error_code::FRAME_TOO_LARGE,
         ))
     }
 }
@@ -1850,6 +1799,102 @@ mod tests {
         );
         // The backend is still flushed, so anything it already holds can leave.
         assert!(client.adapter().flushes > 0);
+    }
+
+    #[test]
+    fn an_application_frame_cannot_overtake_a_queued_acknowledgement() {
+        // A server is ready when it produces SETTINGS_ACK, not when the backend
+        // takes it. An application frame sent in between would reach a peer
+        // still in SettingsExchanged, which closes for NotNegotiated.
+        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(
+            Loopback {
+                control_capacity: Some(1),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        assert!(server.is_ready());
+        assert_eq!(server.unsent_negotiation_frames(), 1, "the ACK did not fit");
+
+        for send in [
+            server.send_control(b"application"),
+            server.send_reliable(StreamId(1), b"record"),
+        ] {
+            assert_eq!(
+                send.unwrap_err().kind(),
+                &ErrorKind::HandshakeUnsent { remaining: 1 }
+            );
+        }
+        assert_eq!(
+            server.adapter().sent.len(),
+            1,
+            "nothing overtook the acknowledgement"
+        );
+        assert!(server.adapter().records.is_empty());
+
+        // Once it goes out, the application may send.
+        server.adapter.control_capacity = None;
+        server.flush().unwrap();
+        assert_eq!(server.unsent_negotiation_frames(), 0);
+        server.send_control(b"application").unwrap();
+        assert_eq!(server.adapter().sent.len(), 3);
+    }
+
+    #[test]
+    fn a_record_larger_than_the_peer_accepts_is_refused() {
+        // The adapter only knows the protocol ceiling. Sending past what the
+        // peer advertised is a session the peer is entitled to end.
+        let peer = Settings {
+            max_data_record_payload: 64 * 1024,
+            ..Settings::default()
+        };
+        let mut client = Session::client(Loopback::default(), Settings::default(), BTreeSet::new());
+        let mut server = Session::server(Loopback::default(), peer, BTreeSet::new());
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        client.poll().unwrap();
+        assert!(client.is_ready());
+
+        client
+            .send_reliable(StreamId(1), &vec![0; 64 * 1024])
+            .unwrap();
+        let error = client
+            .send_reliable(StreamId(1), &vec![0; 64 * 1024 + 1])
+            .unwrap_err();
+        assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::RecordExceedsPeerLimit {
+                bytes: 64 * 1024 + 1,
+                limit: 64 * 1024,
+            }
+        );
+        assert_eq!(
+            client
+                .send_reliable_shared(
+                    StreamId(1),
+                    vot_transport_api::shared_payload(&vec![0; 64 * 1024 + 1])
+                )
+                .unwrap_err()
+                .kind(),
+            error.kind()
+        );
+        assert_eq!(client.adapter().records.len(), 1, "only the one that fits");
     }
 
     #[test]

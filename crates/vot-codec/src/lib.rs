@@ -163,10 +163,7 @@ impl Default for Settings {
 
 impl Settings {
     /// Every registered setting and the value advertised for it, in identifier
-    /// order.
-    ///
-    /// Encoding walks this rather than looking each field up by identifier, so
-    /// there is no lookup that cannot fail and no branch nothing can take.
+    /// order. Encoding walks this, so there is no lookup that cannot fail.
     #[must_use]
     pub const fn advertised(&self) -> [(u64, u64); 8] {
         use setting_id as id;
@@ -348,9 +345,6 @@ pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
 }
 
 /// Every setting `spec/registries.md` defines, in identifier order.
-///
-/// Encoding walks this list, so a setting added to the registry and to
-/// [`Settings`] without being added here would never be advertised.
 pub const REGISTERED_SETTINGS: [u64; 8] = [
     setting_id::MAX_CONTROL_FRAME_PAYLOAD,
     setting_id::MAX_DATA_RECORD_PAYLOAD,
@@ -362,11 +356,8 @@ pub const REGISTERED_SETTINGS: [u64; 8] = [
     setting_id::TELEMETRY_LEVEL,
 ];
 
-/// The inclusive value range `spec/registries.md` gives a setting.
-///
-/// One source for both directions. A decoder that accepted a range an encoder
-/// would not produce, or the other way round, is a drift nothing else here
-/// would catch.
+/// The inclusive value range `spec/registries.md` gives a setting. One source
+/// for both directions.
 #[must_use]
 pub const fn setting_range(identifier: u64) -> Option<(u64, u64)> {
     use setting_id as id;
@@ -432,9 +423,7 @@ fn apply_setting(
             Ok(())
         };
     }
-    // Registered and in range, so the field is there. Written this way rather
-    // than as a second fallible lookup over the same eight identifiers, which
-    // would be a branch nothing could take.
+    // Registered and in range, so the field is there.
     if let Some(target) = setting_field(settings, identifier) {
         *target = value;
     }
@@ -443,9 +432,7 @@ fn apply_setting(
 
 /// Encodes a `SETTINGS` payload as `spec/wire.md` section 1 defines it.
 ///
-/// Every registered setting is advertised rather than only those that differ
-/// from a default, because the peer's defaults are its own and an omitted
-/// setting tells it nothing about what this endpoint will accept.
+/// Every registered setting is advertised: the peer's defaults are its own.
 ///
 /// # Errors
 /// Returns [`SettingsError::InvalidValue`] for a value outside the registered
@@ -466,8 +453,8 @@ pub fn encode_settings(settings: &Settings, output: &mut Vec<u8>) -> Result<(), 
 
 /// Encodes a `HELLO` payload as `spec/wire.md` section 1 defines it.
 ///
-/// The revision is written as given rather than forced to [`DRAFT_REVISION`],
-/// so a test can produce the frame a peer on another draft would send.
+/// The revision is written as given, so a test can produce the frame a peer on
+/// another draft would send.
 ///
 /// # Errors
 /// Returns [`HelloError::TooManyExtensions`] above the registered bound.
@@ -482,8 +469,7 @@ pub fn encode_hello(hello: &Hello, output: &mut Vec<u8>) -> Result<(), HelloErro
     write(hello.draft_revision, output)?;
     write(hello.endpoint_role as u64, output)?;
     write(count as u64, output)?;
-    // A BTreeSet, so extensions go out in identifier order and the same HELLO
-    // encodes to the same bytes every time.
+    // Ordered, so one HELLO has one encoding.
     for extension in &hello.extensions {
         write(*extension, output)?;
     }

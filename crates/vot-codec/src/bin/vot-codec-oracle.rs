@@ -9,9 +9,8 @@ use vot_codec::{
 fn main() -> io::Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
-        // A bare hex line stays the frame oracle it always was, so the
-        // differential fuzzer is unaffected. A prefixed line selects one of the
-        // negotiation payload decoders.
+        // A bare hex line is still the frame oracle; a prefix selects a
+        // negotiation payload decoder.
         if let Some(rest) = line.strip_prefix("hello ") {
             println!("{}", hello_line(rest));
             continue;
@@ -52,10 +51,7 @@ fn main() -> io::Result<()> {
 }
 
 /// Decodes one HELLO payload and reports what it holds, or why it was refused.
-///
-/// The role is not fixed here: a caller checking vectors has to be able to see
-/// a server-role payload decode rather than only the role mismatch a session
-/// would report.
+/// The role is not fixed, so a vector can check a server-role payload.
 fn hello_line(hex: &str) -> String {
     let Some(payload) = decode_hex(hex) else {
         return "err|INVALID_HEX".to_string();
@@ -75,9 +71,8 @@ fn hello_line(hex: &str) -> String {
     for extension in &hello.extensions {
         let _ = write!(output, "|{extension}");
     }
-    // Re-encoding here is what makes the canonical cases meaningful: a decoder
-    // that read the bytes correctly but an encoder that writes different ones
-    // would still fail the comparison.
+    // Re-encoded, so a vector catches an encoder that disagrees with the
+    // decoder.
     let mut encoded = Vec::new();
     match encode_hello(&hello, &mut encoded) {
         Ok(()) => format!("{output}|re={}", encode_hex(&encoded)),
@@ -125,12 +120,8 @@ fn setting_value(settings: &Settings, identifier: u64) -> u64 {
     }
 }
 
-/// Names a refusal by the `spec/registries.md` code the session closes under.
-///
-/// Negotiation refusals are reported this way rather than by the decoder's own
-/// error name, because the registry is the vocabulary a second implementation
-/// shares. A partial payload and a trailing byte are different bugs but the
-/// same registered code, and the code is what a peer sees.
+/// Names a refusal by the `spec/registries.md` code it closes under, which is
+/// the vocabulary a second implementation shares.
 const fn code_name(code: u16) -> &'static str {
     use vot_codec::error_code as registry;
 

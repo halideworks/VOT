@@ -226,6 +226,14 @@ impl MsQuicAdapter {
         }
     }
 
+    /// Commands submitted but not yet handed to the backend.
+    ///
+    /// A driver watches this to know whether a failed flush left work behind.
+    #[must_use]
+    pub fn pending_commands(&self) -> usize {
+        self.commands.len()
+    }
+
     pub fn next_command(&mut self) -> Option<Command> {
         let command = self.commands.pop_front()?;
         self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
@@ -374,7 +382,9 @@ pub mod live {
     use std::ffi::c_void;
 
     use msquic::ffi::QUIC_STATISTICS_V2;
+    use std::collections::btree_map::Entry;
     use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -446,6 +456,9 @@ pub mod live {
         /// Held back when the adapter's bounded inbound queue is full, so a
         /// record is never dropped and ordering is never broken.
         stalled: Option<NativeEvent>,
+        /// Delivery order for received records, shared with the callbacks that
+        /// assign it.
+        sequence: Arc<AtomicU64>,
         streams: BTreeMap<u64, Stream>,
         connection: Option<Connection>,
         closed: Receiver<()>,
@@ -453,6 +466,10 @@ pub mod live {
         _configuration: Arc<Configuration>,
         registration: Registration,
     }
+
+    /// The first client-initiated bidirectional stream carries control frames,
+    /// which is what `spec/wire.md` requires.
+    pub const CONTROL_STREAM_ID: u64 = 0;
 
     /// How long teardown waits for `MsQuic` to finish with a connection.
     const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -471,13 +488,25 @@ pub mod live {
         ) -> Result<Self, msquic::Status> {
             let inbound: Arc<Mutex<VecDeque<NativeEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
             let (closed_tx, closed) = mpsc::channel();
+            let sequence = Arc::new(AtomicU64::new(0));
             let callback_inbound = Arc::clone(&inbound);
+            let peer_handler = stream_handler(
+                Arc::clone(&inbound),
+                Arc::clone(&sequence),
+                PEER_STREAM_ID,
+                true,
+            );
             let connection = Connection::open(
                 &registration,
                 move |_: ConnectionRef, event: ConnectionEvent| {
                     match event {
                         ConnectionEvent::Connected { .. } => {
                             push(&callback_inbound, NativeEvent::Connected(connection_id));
+                        }
+                        ConnectionEvent::PeerStreamStarted { stream, .. } => {
+                            // Without adopting these there is no receive path
+                            // for anything the peer initiates.
+                            stream.set_callback_handler(peer_handler.clone());
                         }
                         ConnectionEvent::ShutdownComplete { .. } => {
                             push(&callback_inbound, NativeEvent::Disconnected(connection_id));
@@ -495,6 +524,7 @@ pub mod live {
                 adapter: MsQuicAdapter::default(),
                 inbound,
                 stalled: None,
+                sequence,
                 streams: BTreeMap::new(),
                 connection: Some(connection),
                 closed,
@@ -519,26 +549,10 @@ pub mod live {
             Ok(())
         }
 
-        /// Opens a stream on first use and keeps it for the transport's life.
-        fn stream(&mut self, id: u64) -> Result<&Stream, msquic::Status> {
-            if !self.streams.contains_key(&id) {
-                let connection = self.connection.as_ref().ok_or(msquic::Status::from(
-                    msquic::StatusCode::QUIC_STATUS_INVALID_STATE,
-                ))?;
-                // The pool owns the handle and closes it at teardown. It is
-                // never detached, so there is exactly one owner.
-                let stream = Stream::open(connection, StreamOpenFlags::NONE, |_, event| {
-                    if let StreamEvent::SendComplete { client_context, .. } = event {
-                        // SAFETY: send_owned produced this context exactly once
-                        // and MsQuic delivers SendComplete for it once.
-                        unsafe { complete_send(client_context) };
-                    }
-                    Ok::<(), msquic::Status>(())
-                })?;
-                stream.start(StreamStartFlags::NONE)?;
-                self.streams.insert(id, stream);
-            }
-            Ok(&self.streams[&id])
+        /// Commands still queued for the backend.
+        #[must_use]
+        pub fn pending_commands(&self) -> usize {
+            self.adapter.pending_commands()
         }
 
         /// Moves native events into the adapter, stopping at the first the
@@ -560,6 +574,92 @@ pub mod live {
                     self.stalled = Some(event);
                     return;
                 }
+            }
+        }
+    }
+
+    /// Identifier reported for records arriving on a peer-initiated stream.
+    ///
+    /// The peer's stream numbering is its own, so reusing it here would collide
+    /// with locally opened streams.
+    const PEER_STREAM_ID: u64 = u64::MAX;
+
+    /// Builds the callback installed on every stream.
+    ///
+    /// Received bytes become native events rather than being handled inline,
+    /// because a callback runs on an `MsQuic` worker thread and the adapter
+    /// belongs to the driver thread.
+    fn stream_handler(
+        inbound: Arc<Mutex<VecDeque<NativeEvent>>>,
+        sequence: Arc<AtomicU64>,
+        stream_id: u64,
+        peer_owned: bool,
+    ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + Clone + 'static {
+        move |stream: StreamRef, event: StreamEvent| {
+            match event {
+                StreamEvent::Receive { buffers, .. } => {
+                    for buffer in buffers {
+                        let bytes = buffer.as_bytes();
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                        let event = if stream_id == CONTROL_STREAM_ID {
+                            NativeEvent::Control(bytes.to_vec())
+                        } else {
+                            NativeEvent::Reliable {
+                                stream: stream_id,
+                                sequence: next,
+                                bytes: bytes.to_vec(),
+                            }
+                        };
+                        push(&inbound, event);
+                    }
+                }
+                StreamEvent::SendComplete { client_context, .. } => {
+                    // SAFETY: send_owned produced this context exactly once and
+                    // MsQuic delivers SendComplete for it exactly once.
+                    unsafe { complete_send(client_context) };
+                }
+                StreamEvent::ShutdownComplete { .. } if peer_owned => {
+                    // SAFETY: MsQuic delivered ShutdownComplete for a
+                    // peer-created stream this callback has not adopted before.
+                    // Locally opened streams are owned by the pool instead.
+                    unsafe { close_peer_stream(&stream) };
+                }
+                _ => {}
+            }
+            Ok::<(), msquic::Status>(())
+        }
+    }
+
+    /// Returns the stream for `id`, opening it on first use.
+    ///
+    /// A free function rather than a method, so `flush` can hold the stream
+    /// pool and the adapter at the same time.
+    fn stream_for<'a>(
+        streams: &'a mut BTreeMap<u64, Stream>,
+        connection: Option<&Connection>,
+        inbound: &Arc<Mutex<VecDeque<NativeEvent>>>,
+        sequence: &Arc<AtomicU64>,
+        id: u64,
+    ) -> Result<&'a Stream, Error> {
+        match streams.entry(id) {
+            Entry::Occupied(slot) => Ok(&*slot.into_mut()),
+            Entry::Vacant(slot) => {
+                let connection = connection.ok_or(Error::Backend)?;
+                // The pool owns the handle and closes it at teardown, so there
+                // is exactly one owner and it is never detached.
+                let stream = Stream::open(
+                    connection,
+                    StreamOpenFlags::NONE,
+                    stream_handler(Arc::clone(inbound), Arc::clone(sequence), id, false),
+                )
+                .map_err(|_| Error::Backend)?;
+                stream
+                    .start(StreamStartFlags::NONE)
+                    .map_err(|_| Error::Backend)?;
+                Ok(&*slot.insert(stream))
             }
         }
     }
@@ -604,29 +704,40 @@ pub mod live {
         }
 
         fn flush(&mut self) -> Result<(), Error> {
-            // Commands are drained one at a time and a failed submission stays
-            // at the head, so a backend error costs no data.
-            let mut queued: Vec<Command> = Vec::new();
-            self.adapter.drain_commands(|command| {
-                queued.push(command);
-                Ok::<(), Error>(())
-            })?;
-            for command in queued {
-                match command {
-                    Command::Reliable { stream, bytes } => {
-                        let handle = self.stream(stream.0).map_err(|_| Error::Backend)?;
-                        send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)?;
-                    }
-                    // Control frames, datagrams, and credit are not carried by
-                    // this increment. Silently dropping them would be worse
-                    // than saying so.
-                    Command::Control(_) | Command::Datagram { .. } => {
-                        return Err(Error::Unsupported);
-                    }
-                    Command::ReceiveCredit(_) => {}
+            // Submission happens inside the drain, so a command that cannot be
+            // sent stays at the head of the queue and every command after it is
+            // still there to retry. Collecting first and sending afterwards
+            // would lose them on the first failure.
+            let Self {
+                adapter,
+                inbound,
+                sequence,
+                streams,
+                connection,
+                ..
+            } = self;
+            let connection = connection.as_ref();
+            adapter.drain_commands(|command| match command {
+                Command::Reliable { stream, bytes } => {
+                    let handle = stream_for(streams, connection, inbound, sequence, stream.0)?;
+                    send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
                 }
-            }
-            Ok(())
+                Command::Control(bytes) => {
+                    // spec/wire.md puts negotiation on the first
+                    // client-initiated bidirectional stream.
+                    let handle =
+                        stream_for(streams, connection, inbound, sequence, CONTROL_STREAM_ID)?;
+                    send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+                }
+                // Neither is carried yet, and both stay queued rather than
+                // being consumed, so a caller sees the refusal and decides,
+                // rather than losing the submission. Receive credit in
+                // particular is the receiver's memory bound: discarding it
+                // would let a peer send past the advertised capacity. The
+                // wrapper exposes no runtime flow-control parameter, so the
+                // initial window comes from Settings on the Configuration.
+                Command::Datagram { .. } | Command::ReceiveCredit(_) => Err(Error::Unsupported),
+            })
         }
 
         fn poll(&mut self) -> Option<Event> {
@@ -750,7 +861,7 @@ pub mod live {
 
         use super::super::{Command as AdapterCommand, MsQuicAdapter, NativeEvent};
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
-        use vot_transport_api::{ConnectionId, Event, StreamId, TransportAdapter};
+        use vot_transport_api::{ConnectionId, Error, Event, StreamId, TransportAdapter};
 
         fn test_credential() -> Credential {
             let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
@@ -825,6 +936,9 @@ pub mod live {
                             collected.extend_from_slice(buffer.as_bytes());
                         }
                         if collected.len() >= expected {
+                            // Echo one record back, so the client's receive
+                            // path is exercised rather than assumed.
+                            let _ = super::send_owned(&stream, b"echo", SendFlags::NONE);
                             let _ = done.send(());
                         }
                     }
@@ -905,13 +1019,67 @@ pub mod live {
                 transport.send_reliable(StreamId(1), record).unwrap();
             }
             transport.flush().unwrap();
+            assert_eq!(
+                transport.pending_commands(),
+                0,
+                "a clean flush queues nothing"
+            );
             done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             assert_eq!(*received.lock().unwrap(), payload);
+
+            // The peer echoed a record back, so the receive path has to deliver
+            // it through poll rather than the transport being send only.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut echoed = Vec::new();
+            while Instant::now() < deadline && echoed.is_empty() {
+                while let Some(event) = transport.poll() {
+                    if let Event::Reliable {
+                        bytes, sequence, ..
+                    } = event
+                    {
+                        assert!(sequence >= 1, "sequence starts at one");
+                        echoed.extend_from_slice(&bytes);
+                    }
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(echoed, b"echo", "nothing arrived through the receive path");
 
             drop(transport);
             listener.stop();
             drop(listener);
             registration.shutdown();
+        }
+
+        #[test]
+        fn a_refused_command_stays_queued_for_the_next_flush() {
+            // The bounded queue is the backpressure mechanism, so a command the
+            // backend will not take has to survive the failed flush. Collecting
+            // commands before submitting would lose it and everything after it.
+            let registration = super::registration().unwrap();
+            let configuration = client_configuration(&registration);
+            let mut transport = MsQuicTransport::connect(
+                configuration,
+                super::registration().unwrap(),
+                "127.0.0.1",
+                1,
+                21,
+            )
+            .unwrap();
+
+            transport.send_datagram(1, b"not carried yet").unwrap();
+            transport
+                .send_reliable(StreamId(4), b"queued behind it")
+                .unwrap();
+            assert_eq!(transport.pending_commands(), 2);
+
+            for _ in 0..3 {
+                assert_eq!(transport.flush(), Err(Error::Unsupported));
+                // Both survive: the refused one and the one behind it.
+                assert_eq!(transport.pending_commands(), 2);
+            }
+            drop(transport);
+            drop(registration);
         }
 
         #[test]
@@ -1265,6 +1433,20 @@ mod tests {
         let stats = adapter.path_stats().unwrap();
         assert_eq!(stats.congestion_window_bytes, Some(1_048_576));
         assert_eq!(stats.smoothed_rtt_us, Some(18_500));
+    }
+
+    #[test]
+    fn queued_command_count_tracks_submission_and_drain() {
+        let mut adapter = MsQuicAdapter::default();
+        assert_eq!(adapter.pending_commands(), 0);
+        adapter.send_control(b"one").unwrap();
+        assert_eq!(adapter.pending_commands(), 1);
+        adapter.send_reliable(StreamId(2), b"two").unwrap();
+        assert_eq!(adapter.pending_commands(), 2);
+        adapter.next_command().unwrap();
+        assert_eq!(adapter.pending_commands(), 1);
+        adapter.drain_commands(|_| Ok::<(), Error>(())).unwrap();
+        assert_eq!(adapter.pending_commands(), 0);
     }
 
     #[test]

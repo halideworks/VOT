@@ -972,6 +972,16 @@ pub mod live {
         }
     }
 
+    impl Drop for Framing {
+        fn drop(&mut self) {
+            // A peer that resets a stream part-way through a frame destroys this
+            // without the frame ever completing. Without returning the
+            // reservation those bytes stay charged for ever, and enough resets
+            // refuse streams that have done nothing wrong.
+            self.release();
+        }
+    }
+
     /// A stream's bytes could not be framed, with the code the session closes
     /// under.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1752,6 +1762,34 @@ pub mod live {
             let mut recovered =
                 Framing::new(StreamKind::Reliable { lane: 999 }, Arc::clone(&budget));
             recovered.accept(&head, |_| Ok(())).unwrap();
+        }
+
+        #[test]
+        fn a_stream_reset_mid_frame_returns_its_reservation() {
+            // A peer resetting a stream part-way through a frame destroys the
+            // framing without the frame completing. Bytes left charged would
+            // accumulate across resets until streams that had done nothing
+            // wrong were refused.
+            let budget = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            let record = framed(vot_codec::frame_type::DATA_RECORD, &vec![0x3c; 100 * 1024]);
+            let head = record[..record.len() - 1].to_vec();
+
+            for reset in 0..8 {
+                let mut framing =
+                    Framing::new(StreamKind::Reliable { lane: reset }, Arc::clone(&budget));
+                framing.accept(&head, |_| Ok(())).unwrap();
+                assert_eq!(
+                    budget.lock().unwrap().charged(),
+                    head.len(),
+                    "the partial frame is charged while it is held"
+                );
+                drop(framing);
+                assert_eq!(
+                    budget.lock().unwrap().charged(),
+                    0,
+                    "reset {reset} left phantom bytes charged"
+                );
+            }
         }
 
         #[test]

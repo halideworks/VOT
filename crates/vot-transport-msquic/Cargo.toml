@@ -15,6 +15,9 @@ msquic = { git = "https://github.com/microsoft/msquic.git", rev = "87b53085d76bd
 vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }
 
+[dev-dependencies]
+vot-session = { path = "../vot-session" }
+
 [lints.rust]
 unsafe_code = "deny"
 

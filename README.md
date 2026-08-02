@@ -7,29 +7,17 @@ The project is in early development. The v0.3 specifications are in `spec/`.
 Implementation order and acceptance gates are defined in
 `VOT_v0.3_Agent_Backlog.yaml`.
 
-## Validation
+## Documentation
+
+- [Validation](docs/validation.md) lists every check and what each one covers.
+- [Sessions and negotiation](docs/session.md) describes the handshake, what
+  readiness does and does not mean, and how lanes are identified.
+- Decisions and their reasoning are in `adr/`.
+
+The quickest useful check is:
 
 ```sh
-python3 tools/validate_benchmark_contract.py
-python3 tools/validate_registries.py
-python3 tools/validate_wire_vectors.py
-python3 tools/validate_receipt_vectors.py
-python3 tools/validate_security_matrix.py
-python3 tools/validate_wave0.py
-python3 tools/verify_wave1_vectors.py
-python3 tools/verify_manifest_pack_vectors.py
-python3 tools/verify_wave4_package.py
-python3 tools/validate_commit_fixtures.py
-python3 tools/validate_commit_model_sync.py
-python3 tools/differential_fuzz_codec.py
 cargo test --workspace --locked
-cargo test -p vot-resume --test e_resume --locked
-cargo test -p vot-transport-tcp --locked
-cargo test -p vot-commit-platform --locked
-cargo test -p vot-platform-fs --locked
-cargo run -p vot-transport-sim --bin vot-trace-replay -- sim/scenarios/rebind-fallback.vot
-cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
-cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 ```
 
 ## Package transfer

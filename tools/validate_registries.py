@@ -87,6 +87,27 @@ def validate(root: Path) -> None:
         f"registry-only={setting_registry_rows.keys() - setting_rust_rows.keys()}"
     )
 
+    # Encoding walks REGISTERED_SETTINGS, so a setting that reaches the
+    # registry and the Rust constants but not that list is silently never
+    # advertised. The list is checked against the constants rather than the
+    # registry so the two mismatches are reported separately.
+    listed = re.search(
+        r"pub const REGISTERED_SETTINGS: \[u64; (?P<count>\d+)\] = \[(?P<body>[^\]]*)\];",
+        rust_text,
+    )
+    assert listed, "REGISTERED_SETTINGS not found"
+    listed_names = re.findall(r"setting_id::([A-Z0-9_]+)", listed["body"])
+    assert len(listed_names) == int(listed["count"]), (
+        f"REGISTERED_SETTINGS declares {listed['count']} entries "
+        f"but lists {len(listed_names)}"
+    )
+    assert len(listed_names) == len(set(listed_names)), "duplicate in REGISTERED_SETTINGS"
+    assert set(listed_names) == setting_rust_rows.keys(), (
+        "REGISTERED_SETTINGS/setting_id mismatch: "
+        f"listed-only={set(listed_names) - setting_rust_rows.keys()}, "
+        f"constant-only={setting_rust_rows.keys() - set(listed_names)}"
+    )
+
     grease_values = range(0x1F00, 0x1FFF, 2)
     assert all(value % 2 == 0 for value in grease_values)
     assert not set(values).intersection(grease_values)

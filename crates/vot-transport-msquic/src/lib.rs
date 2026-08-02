@@ -4,18 +4,32 @@
 
 use std::collections::VecDeque;
 
-/// Lane reported for records arriving on a peer-initiated stream.
+/// First lane reported for a peer-initiated stream.
 ///
-/// A driver reads this off `Event::Reliable` to tell a peer-initiated record
-/// from one on a lane it opened.
+/// Every peer-initiated stream is given a lane of its own from here upwards. A
+/// single shared identifier would be cheaper, but records carrying it would
+/// come from several independent QUIC streams, and a consumer reading
+/// `Event::Reliable` has no way to see that: interleaving between two peer
+/// streams would look like reordering within one. On an accepted connection
+/// every application lane is peer-initiated, so there would be nothing left to
+/// tell one lane from another.
 ///
-/// The peer numbers its own streams, so reusing that numbering here would
-/// collide with locally opened lanes.
-pub const PEER_STREAM_ID: u64 = u64::MAX;
+/// The peer numbers its own streams and an application numbers its own lanes,
+/// so these are allocated above both rather than sharing either number space.
+/// A QUIC varint stops at `2^62 - 1`, so no lane either side can name on the
+/// wire reaches this.
+pub const PEER_LANE_BASE: u64 = 1 << 62;
 
 /// Lane reported for control frames, which arrive on their own stream rather
 /// than one of the application's reliable lanes.
 pub const CONTROL_LANE: u64 = u64::MAX - 1;
+
+/// Largest lane a peer-initiated stream can be given.
+pub const PEER_LANE_LAST: u64 = CONTROL_LANE - 1;
+
+/// QUIC identifier of the first client-initiated bidirectional stream, which
+/// `spec/wire.md` reserves for negotiation.
+pub const CONTROL_STREAM_ID: u64 = 0;
 
 /// Largest number of peer-driven events the callback queue will hold.
 ///
@@ -42,22 +56,28 @@ pub const MAX_CALLBACK_BYTES: usize = 16 * MAX_PARTIAL_CONTROL_FRAME;
 /// Largest partial frame held on a reliable lane while waiting for the rest.
 pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
 
-/// Largest partial frame held on the control lane.
+/// Largest partial frame held on the control lane at the default bound.
 ///
 /// Control frames are four times the size of a data record, so reusing the
 /// record bound here would refuse a large `PACKAGE_DESCRIPTOR` the same
-/// transport is willing to send. This matches the adapter's default control
-/// payload limit, which is what the assembled transport sends under, because a
-/// receive bound below the send bound is the asymmetry this exists to avoid.
-/// `set_control_payload_limit` can raise the sending side; the assembled
-/// transport does not expose it, and whatever does must plumb the negotiated
-/// value through to framing rather than leave this constant behind.
+/// transport is willing to send.
+///
+/// This is the ceiling, not the bound in force. An assembled transport takes
+/// the control-frame payload it will reassemble at construction and holds every
+/// stream to it, because that is the limit it advertises in `SETTINGS` and
+/// accepting more than it advertised is the asymmetry negotiation exists to
+/// remove. This constant is what that bound defaults to, and what the callback
+/// byte budget is sized from.
 pub const MAX_PARTIAL_CONTROL_FRAME: usize = vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES;
 
 /// Returns whether `lane` is one this crate reserves for its own reporting.
+///
+/// Covers the control lane and every peer-initiated lane in one comparison,
+/// because an application may open neither: their framing kind and their
+/// stream handle belong to the transport.
 #[must_use]
 pub const fn is_reserved_lane(lane: u64) -> bool {
-    lane == PEER_STREAM_ID || lane == CONTROL_LANE
+    lane >= PEER_LANE_BASE
 }
 
 use vot_transport_api::{
@@ -152,16 +172,6 @@ impl MsQuicAdapter {
             event_byte_limit: command_bytes,
             ..Self::default()
         })
-    }
-
-    /// Applies the peer-negotiated control-frame payload ceiling.
-    ///
-    /// # Errors
-    /// Rejects zero or out-of-range negotiated payload limits.
-    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit = limit;
-        Ok(())
     }
 
     /// Queues a native callback after enforcing protocol and memory bounds.
@@ -415,6 +425,13 @@ impl TransportAdapter for MsQuicAdapter {
         self.enqueue(Command::ReceiveCredit(bytes))
     }
 
+    /// Applies the peer-negotiated control-frame payload ceiling.
+    fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit = limit;
+        Ok(())
+    }
+
     fn path_stats(&self) -> Option<PathStats> {
         self.path.map(|(_, stats)| stats)
     }
@@ -445,22 +462,22 @@ pub mod live {
     use msquic::ffi::QUIC_STATISTICS_V2;
     use std::collections::btree_map::Entry;
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use msquic::{
-        BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Registration,
-        RegistrationConfig, SendFlags, Stream, StreamEvent, StreamOpenFlags, StreamRef,
-        StreamStartFlags,
+        Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Listener,
+        ListenerEvent, Registration, RegistrationConfig, SendFlags, Stream, StreamEvent,
+        StreamOpenFlags, StreamRef, StreamStartFlags,
     };
 
     use vot_transport_api::{ConnectionId, Error, Event, Payload, StreamId, TransportAdapter};
 
     use super::{
-        Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_CONTROL_FRAME,
-        MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent, PEER_STREAM_ID,
+        CONTROL_STREAM_ID, Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_FRAME,
+        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST,
     };
     use vot_transport_api::PathStats;
 
@@ -506,128 +523,125 @@ pub mod live {
         Ok(path_stats_from_statistics(&connection.get_stats_v2()?))
     }
 
-    /// A connected `MsQuic` client that satisfies the backend-neutral adapter.
+    /// Where an endpoint's negotiation stream comes from.
     ///
-    /// Ownership is the whole design here. The registration, configuration,
-    /// connection, and every stream are owned by this type and released in that
-    /// order, because releasing them in any other order frees something a
-    /// callback may still be running against. Callbacks never touch the
-    /// adapter: they push native events onto a shared queue, and the driver
-    /// thread drains it, which is what ADR-0016 requires.
-    pub struct MsQuicTransport {
+    /// `spec/wire.md` puts negotiation on the first client-initiated
+    /// bidirectional stream. The connecting side therefore opens that stream
+    /// and the accepting side receives it, and that difference is the only one
+    /// between the two assembled transports. Everything else, from framing to
+    /// shutdown ownership, is shared.
+    enum Control {
+        /// Opened here, and claimed before any application lane so negotiation
+        /// keeps QUIC stream zero.
+        Opened(Option<Stream>),
+        /// Started by the peer and adopted, which is what an accepted
+        /// connection sees.
+        Adopted(ControlSlot),
+    }
+
+    impl Control {
+        /// Claims the negotiation stream if this endpoint is the one that opens
+        /// it.
+        ///
+        /// # Errors
+        /// Propagates a stream that could not be opened or started.
+        fn reserve(
+            &mut self,
+            connection: Option<&Connection>,
+            callbacks: &Callbacks,
+        ) -> Result<(), Error> {
+            match self {
+                Self::Opened(slot) => ensure_control(slot, connection, callbacks),
+                // Nothing to claim: the peer opens this one, and an application
+                // lane opened here does not take its identifier.
+                Self::Adopted(_) => Ok(()),
+            }
+        }
+
+        /// Sends a frame on the negotiation stream.
+        ///
+        /// # Errors
+        /// Reports a stream that could not be opened, has not arrived yet, or
+        /// refused the send. The caller keeps the frame queued in every case.
+        fn send(
+            &mut self,
+            connection: Option<&Connection>,
+            callbacks: &Callbacks,
+            bytes: &[u8],
+        ) -> Result<(), Error> {
+            match self {
+                Self::Opened(slot) => {
+                    ensure_control(slot, connection, callbacks)?;
+                    let handle = slot.as_ref().ok_or(Error::Backend)?;
+                    send_owned(handle, bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+                }
+                Self::Adopted(slot) => {
+                    let guard = slot.lock().map_err(|_| Error::Backend)?;
+                    // Refused rather than dropped while the peer has not opened
+                    // the stream. A refused command stays at the head of the
+                    // queue, so the frame is sent once the stream arrives.
+                    let handle = guard.as_ref().ok_or(Error::Backend)?;
+                    send_owned(handle, bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+                }
+            }
+        }
+
+        /// The slot a peer-created negotiation stream is adopted into, if this
+        /// endpoint is the one that adopts it.
+        const fn slot(&self) -> Option<&ControlSlot> {
+            match self {
+                Self::Adopted(slot) => Some(slot),
+                Self::Opened(_) => None,
+            }
+        }
+
+        /// Releases the handle this endpoint holds, if any.
+        fn release(&mut self) {
+            match self {
+                Self::Opened(slot) => *slot = None,
+                Self::Adopted(slot) => {
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One assembled `MsQuic` connection, whichever side opened it.
+    ///
+    /// Ownership is the whole design here. The connection and every stream are
+    /// owned by this type and released in a fixed order, because releasing them
+    /// in any other order frees something a callback may still be running
+    /// against. Callbacks never touch the adapter: they push native events onto
+    /// a shared queue, and the driver thread drains it, which is what ADR-0016
+    /// requires.
+    struct Carrier {
         adapter: MsQuicAdapter,
         /// Shared with every stream callback: the event queue, the delivery
-        /// order, and the close code a callback asks the driver to send.
+        /// order, the lane numbering, and the close code a callback asks the
+        /// driver to send.
         callbacks: Callbacks,
         /// Held back when the adapter's bounded inbound queue is full, so a
         /// record is never dropped and ordering is never broken.
         stalled: Option<NativeEvent>,
+        /// Application lanes opened by this endpoint.
         streams: BTreeMap<u64, Stream>,
-        /// The first client-initiated bidirectional stream, which `spec/wire.md`
-        /// reserves for negotiation. Held apart from the reliable pool so
+        /// The negotiation stream, held apart from the lane pool so
         /// `StreamId(0)` stays an ordinary application lane.
-        control: Option<Stream>,
+        control: Control,
         connection: Option<Connection>,
         closed: Receiver<()>,
         connection_id: u64,
-        _configuration: Arc<Configuration>,
-        registration: Registration,
     }
 
     /// How long teardown waits for `MsQuic` to finish with a connection.
     const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
-    impl MsQuicTransport {
-        /// Connects to `host:port` and returns a transport ready to send.
-        ///
-        /// # Errors
-        /// Propagates registration, configuration, or connection failures.
-        pub fn connect(
-            configuration: Arc<Configuration>,
-            registration: Registration,
-            host: &str,
-            port: u16,
-            connection_id: u64,
-        ) -> Result<Self, msquic::Status> {
-            let inbound: Arc<Mutex<CallbackQueue>> = Arc::new(Mutex::new(CallbackQueue::default()));
-            let (closed_tx, closed) = mpsc::channel();
-            let sequence = Arc::new(AtomicU64::new(0));
-            let close_request = Arc::new(AtomicU64::new(NO_CLOSE));
-            let callback_inbound = Arc::clone(&inbound);
-            let peer_inbound = Arc::clone(&inbound);
-            let peer_sequence = Arc::clone(&sequence);
-            let peer_close = Arc::clone(&close_request);
-            let connection = Connection::open(
-                &registration,
-                move |_: ConnectionRef, event: ConnectionEvent| {
-                    match event {
-                        ConnectionEvent::Connected { .. } => {
-                            push_lifecycle(
-                                &callback_inbound,
-                                NativeEvent::Connected(connection_id),
-                            );
-                        }
-                        ConnectionEvent::PeerStreamStarted { stream, .. } => {
-                            // Without adopting these there is no receive path
-                            // for anything the peer initiates. Each gets its
-                            // own handler, because two peer streams share no
-                            // byte ordering and one reassembly buffer between
-                            // them would splice their frames together.
-                            stream.set_callback_handler(stream_handler(
-                                Arc::clone(&peer_inbound),
-                                Arc::clone(&peer_sequence),
-                                Arc::clone(&peer_close),
-                                StreamKind::Reliable {
-                                    lane: PEER_STREAM_ID,
-                                },
-                                true,
-                            ));
-                        }
-                        ConnectionEvent::ShutdownComplete { .. } => {
-                            // Admitted past the data bound. A saturated queue is
-                            // exactly when the connection is most likely to be
-                            // torn down, and a driver that never learns it
-                            // closed waits on a connection that is gone while
-                            // the adapter keeps path statistics for a path that
-                            // no longer exists.
-                            push_lifecycle(
-                                &callback_inbound,
-                                NativeEvent::Disconnected(connection_id),
-                            );
-                            // Teardown waits on this before releasing the
-                            // handle, so a send buffer cannot outlive it.
-                            let _ = closed_tx.send(());
-                        }
-                        _ => {}
-                    }
-                    Ok(())
-                },
-            )?;
-            connection.start(&configuration, host, port)?;
-            Ok(Self {
-                adapter: MsQuicAdapter::default(),
-                callbacks: Callbacks {
-                    inbound,
-                    sequence,
-                    close_request,
-                },
-                stalled: None,
-                streams: BTreeMap::new(),
-                control: None,
-                connection: Some(connection),
-                closed,
-                connection_id,
-                _configuration: configuration,
-                registration,
-            })
-        }
-
+    impl Carrier {
         /// Samples the live connection and records the result on the driver
         /// thread, which is the only thread allowed to touch the adapter.
-        ///
-        /// # Errors
-        /// Propagates an `MsQuic` `GetParam` failure.
-        pub fn sample_path(&mut self) -> Result<(), msquic::Status> {
+        fn sample_path(&mut self) -> Result<(), msquic::Status> {
             let Some(connection) = self.connection.as_ref() else {
                 return Ok(());
             };
@@ -635,12 +649,6 @@ pub mod live {
             self.adapter
                 .record_path_stats(ConnectionId(self.connection_id), stats);
             Ok(())
-        }
-
-        /// Commands still queued for the backend.
-        #[must_use]
-        pub fn pending_commands(&self) -> usize {
-            self.adapter.pending_commands()
         }
 
         /// Moves native events into the adapter and ends the connection if one
@@ -672,6 +680,257 @@ pub mod live {
                     .close_request
                     .store(NO_CLOSE, Ordering::Relaxed);
             }
+        }
+
+        /// Submits queued commands to the backend.
+        ///
+        /// Submission happens inside the drain, so a command that cannot be
+        /// sent stays at the head of the queue and every command after it is
+        /// still there to retry. Collecting first and sending afterwards would
+        /// lose them on the first failure.
+        fn flush(&mut self) -> Result<(), Error> {
+            let Self {
+                adapter,
+                callbacks,
+                streams,
+                control,
+                connection,
+                ..
+            } = self;
+            let connection = connection.as_ref();
+            adapter.drain_commands(|command| match command {
+                Command::Reliable { stream, bytes } => {
+                    // Claimed before any application lane, so negotiation keeps
+                    // the first client-initiated bidirectional stream even when
+                    // a caller sends a record before a control frame.
+                    control.reserve(connection, callbacks)?;
+                    let handle = stream_for(streams, connection, callbacks, stream.0)?;
+                    send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+                }
+                Command::Control(bytes) => control.send(connection, callbacks, &bytes),
+                // Unreachable: both are refused at submission so neither can
+                // reach the queue, but a silent success here would hide it if
+                // that ever changed.
+                Command::Datagram { .. } | Command::ReceiveCredit(_) => Err(Error::Unsupported),
+            })
+        }
+
+        /// The registered code the peer closed under, if it named one.
+        fn peer_close_code(&self) -> Option<u16> {
+            let code = self.callbacks.peer_close.load(Ordering::Relaxed);
+            if code == NO_CLOSE {
+                return None;
+            }
+            u16::try_from(code).ok()
+        }
+
+        /// Releases everything this connection owns, in the only safe order.
+        fn teardown(&mut self) {
+            // Streams first: a stream outliving its connection is a use after
+            // free, and MsQuic delivers their completions before the
+            // connection's own shutdown completes.
+            self.streams.clear();
+            self.control.release();
+            if let Some(connection) = self.connection.take() {
+                connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
+                // Waiting for ShutdownComplete is what makes the rest safe. A
+                // bounded wait, because a hung teardown should not hang a
+                // process for ever.
+                let _ = self.closed.recv_timeout(SHUTDOWN_WAIT);
+                drop(connection);
+            }
+        }
+    }
+
+    impl TransportAdapter for Carrier {
+        fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
+            self.adapter.send_control(frame)
+        }
+
+        fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+            self.adapter.send_reliable(stream, record)
+        }
+
+        fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
+            self.adapter.send_reliable_shared(stream, record)
+        }
+
+        fn preflight_reliable_batch(
+            &self,
+            stream: StreamId,
+            records: &[Payload],
+        ) -> Result<(), Error> {
+            self.adapter.preflight_reliable_batch(stream, records)
+        }
+
+        fn send_datagram(&mut self, _context: u64, _payload: &[u8]) -> Result<(), Error> {
+            // Refused here rather than at flush. A queued datagram would sit at
+            // the head for ever, because drain_commands keeps a rejected
+            // command and nothing can remove it, blocking every control and
+            // reliable record behind it.
+            Err(Error::Unsupported)
+        }
+
+        fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), Error> {
+            // Refused at submission for the same reason as datagrams: a queued
+            // command this backend cannot carry would sit at the head for ever
+            // and block every record behind it. Credit is the receiver's memory
+            // bound, so accepting the call and failing later would be worse
+            // than saying no. The wrapper exposes no runtime flow-control
+            // parameter; the initial window comes from Settings on the
+            // Configuration.
+            Err(Error::Unsupported)
+        }
+
+        fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+            self.adapter.set_control_payload_limit(limit)
+        }
+
+        fn control_receive_limit(&self) -> Option<usize> {
+            Some(self.callbacks.control_receive_limit.load(Ordering::Relaxed))
+        }
+
+        fn close(&mut self, code: u16) -> Result<(), Error> {
+            // Through the close request rather than straight to the connection,
+            // so there is one writer for close state and the first code still
+            // wins. The pump is what turns it into a shutdown, which keeps
+            // connection calls on the driver thread.
+            request_close(&self.callbacks.close_request, code);
+            self.pump();
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            Self::flush(self)
+        }
+
+        fn poll(&mut self) -> Option<Event> {
+            self.pump();
+            self.adapter.poll()
+        }
+
+        fn path_stats(&self) -> Option<PathStats> {
+            self.adapter.path_stats()
+        }
+    }
+
+    /// A connected `MsQuic` client that satisfies the backend-neutral adapter.
+    ///
+    /// Owns its registration and configuration alongside the connection, and
+    /// releases them in that order after the connection is gone.
+    pub struct MsQuicTransport {
+        carrier: Carrier,
+        _configuration: Arc<Configuration>,
+        registration: Registration,
+    }
+
+    impl MsQuicTransport {
+        /// Connects to `host:port` and returns a transport ready to send.
+        ///
+        /// `control_receive_limit` is the largest control-frame payload this
+        /// endpoint will reassemble, and is what it must advertise in
+        /// `SETTINGS`. Taken here rather than set later because a bound that
+        /// arrives after the first byte is a bound the peer already got past.
+        ///
+        /// # Errors
+        /// Propagates registration, configuration, or connection failures.
+        pub fn connect(
+            configuration: Arc<Configuration>,
+            registration: Registration,
+            host: &str,
+            port: u16,
+            connection_id: u64,
+            control_receive_limit: usize,
+        ) -> Result<Self, msquic::Status> {
+            let callbacks = Callbacks::new();
+            callbacks
+                .control_receive_limit
+                .store(control_receive_limit, Ordering::Relaxed);
+            let (closed_tx, closed) = mpsc::channel();
+            let callback_inbound = Arc::clone(&callbacks.inbound);
+            let peer_close = Arc::clone(&callbacks.peer_close);
+            let peer_callbacks = callbacks.clone();
+            let connection = Connection::open(
+                &registration,
+                move |_: ConnectionRef, event: ConnectionEvent| {
+                    match event {
+                        ConnectionEvent::Connected { .. } => {
+                            push_lifecycle(
+                                &callback_inbound,
+                                NativeEvent::Connected(connection_id),
+                            );
+                        }
+                        ConnectionEvent::PeerStreamStarted { stream, .. } => {
+                            // Without adopting these there is no receive path
+                            // for anything the peer initiates. No control slot:
+                            // this endpoint opens the negotiation stream
+                            // itself, so the peer cannot start one.
+                            adopt_peer_stream(&peer_callbacks, &stream, None);
+                        }
+                        ConnectionEvent::ShutdownInitiatedByPeer { error_code } => {
+                            // Kept so a driver can say why the session ended
+                            // rather than only that it did.
+                            peer_close.store(error_code, Ordering::Relaxed);
+                        }
+                        ConnectionEvent::ShutdownComplete { .. } => {
+                            // Admitted past the data bound. A saturated queue is
+                            // exactly when the connection is most likely to be
+                            // torn down, and a driver that never learns it
+                            // closed waits on a connection that is gone while
+                            // the adapter keeps path statistics for a path that
+                            // no longer exists.
+                            push_lifecycle(
+                                &callback_inbound,
+                                NativeEvent::Disconnected(connection_id),
+                            );
+                            // Teardown waits on this before releasing the
+                            // handle, so a send buffer cannot outlive it.
+                            let _ = closed_tx.send(());
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )?;
+            connection.start(&configuration, host, port)?;
+            Ok(Self {
+                carrier: Carrier {
+                    adapter: MsQuicAdapter::default(),
+                    callbacks,
+                    stalled: None,
+                    streams: BTreeMap::new(),
+                    control: Control::Opened(None),
+                    connection: Some(connection),
+                    closed,
+                    connection_id,
+                },
+                _configuration: configuration,
+                registration,
+            })
+        }
+
+        /// Samples the live connection and records the result on the driver
+        /// thread, which is the only thread allowed to touch the adapter.
+        ///
+        /// # Errors
+        /// Propagates an `MsQuic` `GetParam` failure.
+        pub fn sample_path(&mut self) -> Result<(), msquic::Status> {
+            self.carrier.sample_path()
+        }
+
+        /// Commands still queued for the backend.
+        #[must_use]
+        pub fn pending_commands(&self) -> usize {
+            self.carrier.adapter.pending_commands()
+        }
+
+        /// The registered code the peer closed under, if it named one.
+        ///
+        /// Present only once the peer has closed with a code of its own; a
+        /// clean shutdown or a carrier failure leaves it absent.
+        #[must_use]
+        pub fn peer_close_code(&self) -> Option<u16> {
+            self.carrier.peer_close_code()
         }
     }
 
@@ -755,19 +1014,25 @@ pub mod live {
     }
 
     impl StreamKind {
-        /// Largest partial frame this kind of stream may hold.
-        const fn partial_frame_limit(self) -> usize {
+        /// Largest payload a frame on this kind of stream may declare.
+        ///
+        /// `control` is what this endpoint advertised, which is at most the
+        /// compiled-in ceiling and may be less.
+        const fn payload_limit(self, control: usize) -> usize {
             match self {
-                Self::Control => MAX_PARTIAL_CONTROL_FRAME,
-                Self::Reliable { .. } => MAX_PARTIAL_FRAME,
+                Self::Control => control,
+                Self::Reliable { .. } => vot_transport_api::MAX_DATA_RECORD_BYTES,
             }
         }
 
-        /// Largest payload a frame on this kind of stream may declare.
-        const fn payload_limit(self) -> usize {
+        /// Largest partial frame this kind of stream may hold, envelope
+        /// included.
+        const fn partial_frame_limit(self, control: usize) -> usize {
             match self {
-                Self::Control => vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
-                Self::Reliable { .. } => vot_transport_api::MAX_DATA_RECORD_BYTES,
+                Self::Control => {
+                    control.saturating_add(vot_transport_api::MAX_FRAME_ENVELOPE_BYTES)
+                }
+                Self::Reliable { .. } => MAX_PARTIAL_FRAME,
             }
         }
     }
@@ -782,6 +1047,12 @@ pub mod live {
     /// were never sent.
     struct Framing {
         pending: Vec<u8>,
+        /// The control bound this stream reassembles under, shared with the
+        /// driver so an advertised limit applies to frames read after it is
+        /// set. A frame already part-way through keeps the bound its envelope
+        /// was read under, because retightening mid-frame would reject bytes
+        /// this endpoint had already agreed to take.
+        control_limit: Arc<AtomicUsize>,
         /// Payload bytes of a skipped frame still to arrive. They are dropped as
         /// they land rather than buffered, which `spec/wire.md` requires and
         /// which also keeps a peer from parking a lane's worth of memory per
@@ -794,9 +1065,14 @@ pub mod live {
     }
 
     impl Framing {
-        fn new(kind: StreamKind, budget: Arc<Mutex<CallbackQueue>>) -> Self {
+        fn new(
+            kind: StreamKind,
+            budget: Arc<Mutex<CallbackQueue>>,
+            control_limit: Arc<AtomicUsize>,
+        ) -> Self {
             Self {
                 pending: Vec::new(),
+                control_limit,
                 discarding: 0,
                 reserved: 0,
                 budget,
@@ -852,8 +1128,11 @@ pub mod live {
             bytes: &[u8],
             mut emit: impl FnMut(&[u8]) -> Result<(), FrameFault>,
         ) -> Result<(), FrameFault> {
+            // Read once per call rather than per frame, so every frame in one
+            // carrier read is measured against the same bound.
+            let control = self.control_limit.load(Ordering::Relaxed);
             let limits = vot_codec::DecodeLimits {
-                max_unknown_payload: self.kind.payload_limit(),
+                max_unknown_payload: self.kind.payload_limit(control),
                 max_frames: 1,
             };
             let mut input = bytes;
@@ -875,7 +1154,7 @@ pub mod live {
                 // A frame already part-way through is completed from the buffer,
                 // which is the only place bytes accumulate.
                 if !self.pending.is_empty() {
-                    let Some(envelope) = self.envelope(limits, None)? else {
+                    let Some(envelope) = self.envelope(limits, control, None)? else {
                         // Not even the header is complete. It is at most a
                         // couple of varints, so take one byte and look again.
                         self.hold(&input[..1])?;
@@ -906,7 +1185,7 @@ pub mod live {
                 }
 
                 // Nothing buffered, so parse straight out of the read.
-                let Some(envelope) = self.envelope(limits, Some(input))? else {
+                let Some(envelope) = self.envelope(limits, control, Some(input))? else {
                     // Only a partial header is left. That is bounded by the
                     // envelope size, not by the payload it describes.
                     self.hold(input)?;
@@ -936,6 +1215,7 @@ pub mod live {
         fn envelope(
             &self,
             limits: vot_codec::DecodeLimits,
+            control: usize,
             input: Option<&[u8]>,
         ) -> Result<Option<vot_codec::FrameEnvelope>, FrameFault> {
             match vot_codec::peek_envelope(input.unwrap_or(&self.pending), limits) {
@@ -945,7 +1225,7 @@ pub mod live {
                     // carries. Without this the frame decodes, reaches the
                     // adapter, is refused there as oversized, and is retried for
                     // ever at the head of the queue.
-                    if envelope.total_length > self.kind.partial_frame_limit() {
+                    if envelope.total_length > self.kind.partial_frame_limit(control) {
                         return Err(FrameFault::too_large());
                     }
                     Ok(Some(envelope))
@@ -1031,49 +1311,61 @@ pub mod live {
     ///
     /// The result is deliberately not `Clone`: every stream needs reassembly
     /// state of its own, so a handler is built per stream rather than shared.
+    ///
+    /// `callback_owned` says whether this callback is the stream's only owner.
+    /// It is for a peer stream nothing will be sent back on, and it is not for
+    /// a stream this endpoint opened or adopted into a pool, where the pool
+    /// releases the handle instead and a graceful close here would end a lane
+    /// the driver still has replies for.
     fn stream_handler(
         inbound: Arc<Mutex<CallbackQueue>>,
         sequence: Arc<AtomicU64>,
         close_request: Arc<AtomicU64>,
+        control_limit: Arc<AtomicUsize>,
         kind: StreamKind,
-        peer_owned: bool,
+        callback_owned: bool,
     ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
-        let mut framing = Framing::new(kind, Arc::clone(&inbound));
+        let mut framing = Framing::new(kind, Arc::clone(&inbound), control_limit);
+        // Set once a fault has ended this stream, so the remaining bytes of a
+        // coalesced read are not parsed against state the fault invalidated.
+        let mut faulted = false;
         move |stream: StreamRef, event: StreamEvent| {
             match event {
                 StreamEvent::Receive { buffers, .. } => {
                     for buffer in buffers {
+                        if faulted {
+                            break;
+                        }
                         // Each frame is offered to the bounded queue as it is
                         // parsed. Collecting them first would let one coalesced
                         // read hold the whole read plus a copy of every frame in
                         // it before the queue's bound applied to any of them.
-                        framing
-                            .accept(buffer.as_bytes(), |frame| {
-                                let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                                let event = match kind {
-                                    StreamKind::Control => NativeEvent::Control(frame.to_vec()),
-                                    StreamKind::Reliable { lane } => NativeEvent::Reliable {
-                                        stream: lane,
-                                        sequence: next,
-                                        bytes: frame.to_vec(),
-                                    },
-                                };
-                                if push(&inbound, event) {
-                                    Ok(())
-                                } else {
-                                    // The queue is full and a callback cannot
-                                    // wait, so the connection fails loudly
-                                    // instead of growing without limit.
-                                    Err(FrameFault {
-                                        error: Error::InboundQueueFull,
-                                        close: vot_codec::error_code::RESOURCE_LIMIT,
-                                    })
-                                }
-                            })
-                            .map_err(|fault| {
-                                request_close(&close_request, fault.close);
-                                msquic::Status::from(msquic::StatusCode::QUIC_STATUS_ABORTED)
-                            })?;
+                        let outcome = framing.accept(buffer.as_bytes(), |frame| {
+                            let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                            let event = match kind {
+                                StreamKind::Control => NativeEvent::Control(frame.to_vec()),
+                                StreamKind::Reliable { lane } => NativeEvent::Reliable {
+                                    stream: lane,
+                                    sequence: next,
+                                    bytes: frame.to_vec(),
+                                },
+                            };
+                            if push(&inbound, event) {
+                                Ok(())
+                            } else {
+                                // The queue is full and a callback cannot
+                                // wait, so the connection fails loudly
+                                // instead of growing without limit.
+                                Err(FrameFault {
+                                    error: Error::InboundQueueFull,
+                                    close: vot_codec::error_code::RESOURCE_LIMIT,
+                                })
+                            }
+                        });
+                        if let Err(fault) = outcome {
+                            faulted = true;
+                            request_close(&close_request, fault.close);
+                        }
                     }
                 }
                 StreamEvent::SendComplete { client_context, .. } => {
@@ -1088,27 +1380,30 @@ pub mod live {
                     // partial frame instead would leave the transfer waiting on
                     // a record the peer already stopped sending.
                     if framing.is_assembling() {
+                        faulted = true;
                         request_close(&close_request, FrameFault::truncated().close);
-                        return Err(msquic::Status::from(
-                            msquic::StatusCode::QUIC_STATUS_ABORTED,
-                        ));
-                    }
-                    if peer_owned {
+                    } else if callback_owned {
                         // Without closing our side the stream never reaches
                         // ShutdownComplete, so its native resources live until
                         // the connection ends and short-lived peer lanes
                         // accumulate.
-                        stream.shutdown(msquic::StreamShutdownFlags::GRACEFUL, 0)?;
+                        let _ = stream.shutdown(msquic::StreamShutdownFlags::GRACEFUL, 0);
                     }
                 }
-                StreamEvent::ShutdownComplete { .. } if peer_owned => {
+                StreamEvent::ShutdownComplete { .. } if callback_owned => {
                     // SAFETY: MsQuic delivered ShutdownComplete for a
                     // peer-created stream this callback has not adopted before.
-                    // Locally opened streams are owned by the pool instead.
+                    // Streams held in a pool are released by that pool instead.
                     unsafe { close_peer_stream(&stream) };
                 }
                 _ => {}
             }
+            // Always success. MsQuic treats a failure status from a receive
+            // callback as an application bug: a debug build asserts and aborts
+            // the process, and a release build ignores the status. A peer that
+            // sends one malformed frame would therefore either kill the process
+            // or be silently tolerated. The close request above is what ends
+            // the session, and the driver sends it under the registered code.
             Ok::<(), msquic::Status>(())
         }
     }
@@ -1119,6 +1414,178 @@ pub mod live {
         inbound: Arc<Mutex<CallbackQueue>>,
         sequence: Arc<AtomicU64>,
         close_request: Arc<AtomicU64>,
+        /// Next lane to hand to a peer-initiated stream. Held as an atomic
+        /// because streams are adopted on a backend worker thread.
+        peer_lanes: Arc<AtomicU64>,
+        /// The registered code the peer closed under, once it has.
+        ///
+        /// Recorded rather than reported through an event, because the
+        /// backend-neutral `Disconnected` carries no room for it and widening
+        /// it would change every backend. Read by the driver for diagnostics.
+        peer_close: Arc<AtomicU64>,
+        /// Largest control-frame payload this endpoint will reassemble.
+        ///
+        /// Read per frame by every control stream's framing, so an endpoint
+        /// advertising a limit in SETTINGS is actually held to it rather than
+        /// accepting up to a compiled-in constant. Held as an atomic because
+        /// framing runs on backend worker threads.
+        control_receive_limit: Arc<AtomicUsize>,
+    }
+
+    impl Callbacks {
+        /// Fresh callback state for one connection.
+        ///
+        /// Never shared between connections: the byte budget, the delivery
+        /// sequence, and the lane numbering are all per connection, and a
+        /// second connection reusing them would let one peer spend another's
+        /// memory and would report two connections' lanes under one numbering.
+        fn new() -> Self {
+            Self {
+                inbound: Arc::new(Mutex::new(CallbackQueue::default())),
+                sequence: Arc::new(AtomicU64::new(0)),
+                close_request: Arc::new(AtomicU64::new(NO_CLOSE)),
+                peer_lanes: Arc::new(AtomicU64::new(PEER_LANE_BASE)),
+                peer_close: Arc::new(AtomicU64::new(NO_CLOSE)),
+                control_receive_limit: Arc::new(AtomicUsize::new(
+                    vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                )),
+            }
+        }
+    }
+
+    /// Takes the next lane for a peer-initiated stream.
+    ///
+    /// Returns `None` once the range is spent rather than wrapping, because a
+    /// wrapped lane would alias a live stream and splice two peers' records
+    /// together. Reaching it needs `2^62` streams on one connection, so this is
+    /// a bound rather than an expected path, but an unchecked `fetch_add` would
+    /// make it a silent one.
+    fn allocate_peer_lane(next: &AtomicU64) -> Option<u64> {
+        next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |lane| {
+            (lane <= PEER_LANE_LAST).then(|| lane + 1)
+        })
+        .ok()
+    }
+
+    /// Decides what a peer-initiated stream carries and which lane it reports.
+    ///
+    /// `spec/wire.md` reserves the first client-initiated bidirectional stream
+    /// for negotiation. On an accepted connection that stream is peer-initiated,
+    /// so it is recognised by its QUIC identifier rather than by arrival order,
+    /// which nothing here guarantees. On a connecting endpoint the local side
+    /// already owns that identifier, so the test simply never matches.
+    ///
+    /// # Errors
+    /// Reports the code to close under when the carrier cannot identify the
+    /// stream or the lane range is spent.
+    fn classify_peer_stream(stream: &StreamRef, next_lane: &AtomicU64) -> Result<StreamKind, u16> {
+        // A stream whose identifier cannot be read cannot be told apart from
+        // the negotiation stream, and guessing would either parse records as
+        // negotiation or negotiation as records.
+        let id = stream
+            .get_stream_id()
+            .map_err(|_| vot_codec::error_code::CARRIER_UNAVAILABLE)?;
+        if id == CONTROL_STREAM_ID {
+            return Ok(StreamKind::Control);
+        }
+        allocate_peer_lane(next_lane)
+            .map(|lane| StreamKind::Reliable { lane })
+            .ok_or(vot_codec::error_code::RESOURCE_LIMIT)
+    }
+
+    /// Holds the negotiation stream on an accepted connection.
+    ///
+    /// The client opens that stream, so on this side it arrives peer-created
+    /// and its handle has to be kept rather than left to its callback: every
+    /// frame the receiver sends back, from `SETTINGS` to `PUBLISH_RECEIPT`,
+    /// goes out on it. Shared because streams are adopted on a backend worker
+    /// thread and sent on by the driver.
+    ///
+    /// Only the negotiation stream is kept. Application lanes are receive-only
+    /// on an accepted connection, so leaving them to their callbacks is both
+    /// correct and what keeps a connection's stream state from growing with the
+    /// number of lanes the peer has ever opened.
+    type ControlSlot = Arc<Mutex<Option<Stream>>>;
+
+    /// Installs the receive handler on a stream the peer started.
+    ///
+    /// Shared by the connecting and accepted paths, because a peer stream is
+    /// classified, bounded, and framed the same way on either side. Each gets a
+    /// handler of its own: two peer streams share no byte ordering, and one
+    /// reassembly buffer between them would splice their frames together.
+    ///
+    /// `control` is the slot an accepted connection keeps its negotiation
+    /// stream in, and is absent on a connecting one, which opens that stream
+    /// itself.
+    fn adopt_peer_stream(callbacks: &Callbacks, stream: &StreamRef, control: Option<&ControlSlot>) {
+        let kind = match classify_peer_stream(stream, &callbacks.peer_lanes) {
+            Ok(kind) => kind,
+            Err(close) => return refuse_peer_stream(callbacks, stream, close),
+        };
+        if kind != StreamKind::Control {
+            stream.set_callback_handler(stream_handler(
+                Arc::clone(&callbacks.inbound),
+                Arc::clone(&callbacks.sequence),
+                Arc::clone(&callbacks.close_request),
+                Arc::clone(&callbacks.control_receive_limit),
+                kind,
+                true,
+            ));
+            return;
+        }
+        // Ownership is settled before a handler exists, so a slot that cannot
+        // be taken never leaves a started stream with a callback and no owner.
+        let Some(mut slot) = control.and_then(|slot| slot.lock().ok()) else {
+            // Either this endpoint opened the negotiation stream itself, in
+            // which case the peer cannot have started it, or the slot is
+            // unusable. Neither leaves anywhere to reply.
+            return refuse_peer_stream(callbacks, stream, vot_codec::error_code::MALFORMED_FRAME);
+        };
+        if slot.is_some() {
+            // spec/wire.md reserves one negotiation stream per session, and a
+            // second would divide the handshake across two of them.
+            return refuse_peer_stream(callbacks, stream, vot_codec::error_code::MALFORMED_FRAME);
+        }
+        stream.set_callback_handler(stream_handler(
+            Arc::clone(&callbacks.inbound),
+            Arc::clone(&callbacks.sequence),
+            Arc::clone(&callbacks.close_request),
+            Arc::clone(&callbacks.control_receive_limit),
+            kind,
+            false,
+        ));
+        // SAFETY: MsQuic started this stream, the slot was empty, and no other
+        // owner has adopted it. The handler above was installed without
+        // callback ownership, so this is the only owner and it releases the
+        // handle at teardown.
+        let adopted = unsafe { Stream::from_raw(stream.as_raw()) };
+        *slot = Some(adopted);
+    }
+
+    /// Aborts a peer stream that cannot be accepted and ends the session.
+    fn refuse_peer_stream(callbacks: &Callbacks, stream: &StreamRef, close: u16) {
+        // A refused stream still needs a handler. MsQuic reports its shutdown
+        // through one, and that report is the only place the handle is
+        // released.
+        stream.set_callback_handler(refused_stream_handler());
+        let _ = stream.shutdown(msquic::StreamShutdownFlags::ABORT, u64::from(close));
+        request_close(&callbacks.close_request, close);
+    }
+
+    /// Handler for a peer stream that could not be given an identity.
+    ///
+    /// It reads nothing. Its only job is to release the handle once `MsQuic`
+    /// reports the aborted stream finished, which no other owner will do.
+    fn refused_stream_handler()
+    -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
+        move |stream: StreamRef, event: StreamEvent| {
+            if matches!(event, StreamEvent::ShutdownComplete { .. }) {
+                // SAFETY: MsQuic delivered ShutdownComplete for a peer-created
+                // stream that was never adopted by any other owner.
+                unsafe { close_peer_stream(&stream) };
+            }
+            Ok(())
+        }
     }
 
     /// Opens one stream and installs the receive handler on it.
@@ -1137,6 +1604,7 @@ pub mod live {
                 Arc::clone(&callbacks.inbound),
                 Arc::clone(&callbacks.sequence),
                 Arc::clone(&callbacks.close_request),
+                Arc::clone(&callbacks.control_receive_limit),
                 kind,
                 false,
             ),
@@ -1308,110 +1776,320 @@ pub mod live {
         );
     }
 
-    impl TransportAdapter for MsQuicTransport {
-        fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
-            self.adapter.send_control(frame)
-        }
-
-        fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
-            self.adapter.send_reliable(stream, record)
-        }
-
-        fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
-            self.adapter.send_reliable_shared(stream, record)
-        }
-
-        fn preflight_reliable_batch(
-            &self,
-            stream: StreamId,
-            records: &[Payload],
-        ) -> Result<(), Error> {
-            self.adapter.preflight_reliable_batch(stream, records)
-        }
-
-        fn send_datagram(&mut self, _context: u64, _payload: &[u8]) -> Result<(), Error> {
-            // Refused here rather than at flush. A queued datagram would sit at
-            // the head for ever, because drain_commands keeps a rejected
-            // command and nothing can remove it, blocking every control and
-            // reliable record behind it.
-            Err(Error::Unsupported)
-        }
-
-        fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), Error> {
-            // Refused at submission for the same reason as datagrams: a queued
-            // command this backend cannot carry would sit at the head for ever
-            // and block every record behind it. Credit is the receiver's memory
-            // bound, so accepting the call and failing later would be worse
-            // than saying no. The wrapper exposes no runtime flow-control
-            // parameter; the initial window comes from Settings on the
-            // Configuration.
-            Err(Error::Unsupported)
-        }
-
-        fn flush(&mut self) -> Result<(), Error> {
-            // Submission happens inside the drain, so a command that cannot be
-            // sent stays at the head of the queue and every command after it is
-            // still there to retry. Collecting first and sending afterwards
-            // would lose them on the first failure.
-            let Self {
-                adapter,
-                callbacks,
-                streams,
-                control,
-                connection,
-                ..
-            } = self;
-            let connection = connection.as_ref();
-            adapter.drain_commands(|command| match command {
-                Command::Reliable { stream, bytes } => {
-                    // Claimed before any application lane, so negotiation keeps
-                    // the first client-initiated bidirectional stream even when
-                    // a caller sends a record before a control frame.
-                    ensure_control(control, connection, callbacks)?;
-                    let handle = stream_for(streams, connection, callbacks, stream.0)?;
-                    send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+    /// Forwards the backend-neutral adapter contract to the shared carrier.
+    ///
+    /// Written once rather than per transport, so a connecting and an accepted
+    /// endpoint cannot drift apart in how they bound records, refuse commands
+    /// this backend cannot carry, or preserve a queue across a failed flush.
+    macro_rules! delegate_to_carrier {
+        ($transport:ty) => {
+            impl TransportAdapter for $transport {
+                fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
+                    self.carrier.send_control(frame)
                 }
-                Command::Control(bytes) => {
-                    // Held apart from the reliable pool, so StreamId(0) remains
-                    // an ordinary application lane rather than aliasing control.
-                    ensure_control(control, connection, callbacks)?;
-                    let handle = control.as_ref().ok_or(Error::Backend)?;
-                    send_owned(handle, &bytes, SendFlags::NONE).map_err(|_| Error::Backend)
+
+                fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+                    self.carrier.send_reliable(stream, record)
                 }
-                // Unreachable: both are refused at submission so neither can
-                // reach the queue, but a silent success here would hide it if
-                // that ever changed.
-                Command::Datagram { .. } | Command::ReceiveCredit(_) => Err(Error::Unsupported),
-            })
-        }
 
-        fn poll(&mut self) -> Option<Event> {
-            self.pump();
-            self.adapter.poll()
-        }
+                fn send_reliable_shared(
+                    &mut self,
+                    stream: StreamId,
+                    record: Payload,
+                ) -> Result<(), Error> {
+                    self.carrier.send_reliable_shared(stream, record)
+                }
 
-        fn path_stats(&self) -> Option<PathStats> {
-            self.adapter.path_stats()
-        }
+                fn preflight_reliable_batch(
+                    &self,
+                    stream: StreamId,
+                    records: &[Payload],
+                ) -> Result<(), Error> {
+                    self.carrier.preflight_reliable_batch(stream, records)
+                }
+
+                fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
+                    self.carrier.send_datagram(context, payload)
+                }
+
+                fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
+                    self.carrier.set_receive_credit(bytes)
+                }
+
+                fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
+                    self.carrier.set_control_payload_limit(limit)
+                }
+
+                fn control_receive_limit(&self) -> Option<usize> {
+                    self.carrier.control_receive_limit()
+                }
+
+                fn close(&mut self, code: u16) -> Result<(), Error> {
+                    self.carrier.close(code)
+                }
+
+                fn flush(&mut self) -> Result<(), Error> {
+                    TransportAdapter::flush(&mut self.carrier)
+                }
+
+                fn poll(&mut self) -> Option<Event> {
+                    self.carrier.poll()
+                }
+
+                fn path_stats(&self) -> Option<PathStats> {
+                    self.carrier.path_stats()
+                }
+            }
+        };
     }
+
+    delegate_to_carrier!(MsQuicTransport);
+    delegate_to_carrier!(AcceptedTransport);
 
     impl Drop for MsQuicTransport {
         fn drop(&mut self) {
-            // Streams first: a stream outliving its connection is a use after
-            // free, and MsQuic delivers their completions before the
-            // connection's own shutdown completes.
-            self.streams.clear();
-            self.control = None;
-            if let Some(connection) = self.connection.take() {
-                connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
-                // Waiting for ShutdownComplete is what makes the rest safe. A
-                // bounded wait, because a hung teardown should not hang a
-                // process for ever.
-                let _ = self.closed.recv_timeout(SHUTDOWN_WAIT);
-                drop(connection);
-            }
+            self.carrier.teardown();
             self.registration.shutdown();
         }
+    }
+
+    /// A `MsQuic` connection this endpoint accepted, satisfying the same
+    /// backend-neutral adapter as the connecting side.
+    ///
+    /// The receive stack, the callback budget, the framing, the close-code
+    /// propagation, and the teardown order are the same code the connecting
+    /// side runs. What differs is the negotiation stream, which arrives from
+    /// the peer here rather than being opened, and the registration, which
+    /// belongs to the listener and is shared rather than owned.
+    ///
+    /// It holds a share of that registration so an accepted connection can
+    /// outlive the listener that produced it without the registration closing
+    /// underneath it.
+    pub struct AcceptedTransport {
+        carrier: Carrier,
+        _registration: Arc<Registration>,
+    }
+
+    impl AcceptedTransport {
+        /// Commands still queued for the backend.
+        #[must_use]
+        pub fn pending_commands(&self) -> usize {
+            self.carrier.adapter.pending_commands()
+        }
+
+        /// The registered code the peer closed under, if it named one.
+        ///
+        /// Present only once the peer has closed with a code of its own; a
+        /// clean shutdown or a carrier failure leaves it absent.
+        #[must_use]
+        pub fn peer_close_code(&self) -> Option<u16> {
+            self.carrier.peer_close_code()
+        }
+
+        /// The identifier this connection reports lifecycle events under.
+        #[must_use]
+        pub const fn connection_id(&self) -> u64 {
+            self.carrier.connection_id
+        }
+
+        /// Samples the live connection and records the result on the driver
+        /// thread, which is the only thread allowed to touch the adapter.
+        ///
+        /// # Errors
+        /// Propagates an `MsQuic` `GetParam` failure.
+        pub fn sample_path(&mut self) -> Result<(), msquic::Status> {
+            self.carrier.sample_path()
+        }
+
+        /// Whether the peer has opened the negotiation stream yet.
+        ///
+        /// Control frames submitted before it arrives stay queued rather than
+        /// being lost, so this reports readiness to send rather than gating it.
+        #[must_use]
+        pub fn control_stream_open(&self) -> bool {
+            self.carrier
+                .control
+                .slot()
+                .and_then(|slot| slot.lock().ok())
+                .is_some_and(|slot| slot.is_some())
+        }
+    }
+
+    impl Drop for AcceptedTransport {
+        fn drop(&mut self) {
+            // No registration shutdown: the listener owns it and may still be
+            // serving other connections.
+            self.carrier.teardown();
+        }
+    }
+
+    /// A listening `MsQuic` endpoint that produces assembled connections.
+    ///
+    /// Exists so both directions of a transfer run production code. Without it
+    /// a test or a benchmark has to hand-roll a receive stack in its listener,
+    /// and that second stack is the one nothing else exercises.
+    pub struct MsQuicServer {
+        // Declared first so it closes before the channel it feeds. Closing a
+        // listener waits for its callbacks, which is what makes handing an
+        // accepted connection to the channel infallible.
+        listener: Listener,
+        accepted: Receiver<AcceptedTransport>,
+        _configuration: Arc<Configuration>,
+        registration: Arc<Registration>,
+    }
+
+    impl MsQuicServer {
+        /// Starts listening on `address` for the given ALPN.
+        ///
+        /// # Errors
+        /// Propagates a listener that could not be opened or started.
+        pub fn listen(
+            configuration: Arc<Configuration>,
+            registration: Arc<Registration>,
+            alpn: &[BufferRef],
+            address: &Addr,
+            control_receive_limit: usize,
+        ) -> Result<Self, msquic::Status> {
+            let (accepted_tx, accepted) = mpsc::channel();
+            let next_connection_id = Arc::new(AtomicU64::new(1));
+            let listener_configuration = Arc::clone(&configuration);
+            let listener_registration = Arc::clone(&registration);
+            let listener = Listener::open(&registration, move |_, event: ListenerEvent| {
+                if let ListenerEvent::NewConnection { connection, .. } = event {
+                    let transport = accept_connection(
+                        &connection,
+                        &listener_configuration,
+                        &listener_registration,
+                        next_connection_id.fetch_add(1, Ordering::Relaxed),
+                        control_receive_limit,
+                    )?;
+                    // Sent unconditionally: dropping the transport here would
+                    // run teardown on a backend worker thread and wait there
+                    // for a shutdown the same worker pool has to deliver.
+                    // Failure is unreachable because closing the listener waits
+                    // for this callback, so the receiver outlives every call.
+                    let queued = accepted_tx.send(transport);
+                    debug_assert!(queued.is_ok(), "the listener closes before its receiver");
+                }
+                Ok(())
+            })?;
+            listener.start(alpn, Some(address))?;
+            Ok(Self {
+                listener,
+                accepted,
+                _configuration: configuration,
+                registration,
+            })
+        }
+
+        /// The port the listener bound, which is chosen by the system when the
+        /// requested port is zero.
+        ///
+        /// # Errors
+        /// Propagates an `MsQuic` `GetParam` failure.
+        pub fn local_port(&self) -> Result<u16, msquic::Status> {
+            Ok(self.listener.get_local_addr()?.port())
+        }
+
+        /// Takes the next accepted connection without blocking.
+        pub fn accept(&mut self) -> Option<AcceptedTransport> {
+            self.accepted.try_recv().ok()
+        }
+
+        /// A share of the registration these connections belong to.
+        #[must_use]
+        pub fn registration(&self) -> Arc<Registration> {
+            Arc::clone(&self.registration)
+        }
+    }
+
+    impl Drop for MsQuicServer {
+        fn drop(&mut self) {
+            // Stopped before it is closed, so no further connection is accepted
+            // into a channel that is about to go away.
+            self.listener.stop();
+        }
+    }
+
+    /// Assembles one accepted connection.
+    ///
+    /// Runs on a backend worker thread, so it installs callbacks and adopts the
+    /// handle but touches no connection state afterwards.
+    fn accept_connection(
+        connection: &ConnectionRef,
+        configuration: &Arc<Configuration>,
+        registration: &Arc<Registration>,
+        connection_id: u64,
+        control_receive_limit: usize,
+    ) -> Result<AcceptedTransport, msquic::Status> {
+        // Fresh for this connection: the byte budget, the delivery sequence,
+        // and the lane numbering are per connection, and sharing them would let
+        // one peer spend another's memory.
+        let callbacks = Callbacks::new();
+        // Set before any handler exists, so the bound is in force for the first
+        // frame the peer sends rather than being tightened underneath one.
+        callbacks
+            .control_receive_limit
+            .store(control_receive_limit, Ordering::Relaxed);
+        let control: ControlSlot = Arc::new(Mutex::new(None));
+        let (closed_tx, closed) = mpsc::channel();
+        let callback_inbound = Arc::clone(&callbacks.inbound);
+        let peer_close = Arc::clone(&callbacks.peer_close);
+        let peer_callbacks = callbacks.clone();
+        let peer_control = Arc::clone(&control);
+        connection.set_callback_handler(move |_: ConnectionRef, event: ConnectionEvent| {
+            match event {
+                ConnectionEvent::Connected { .. } => {
+                    push_lifecycle(&callback_inbound, NativeEvent::Connected(connection_id));
+                }
+                ConnectionEvent::PeerStreamStarted { stream, .. } => {
+                    // Every application lane arrives this way on an accepted
+                    // connection, and so does the negotiation stream.
+                    adopt_peer_stream(&peer_callbacks, &stream, Some(&peer_control));
+                }
+                ConnectionEvent::ShutdownInitiatedByPeer { error_code } => {
+                    peer_close.store(error_code, Ordering::Relaxed);
+                }
+                ConnectionEvent::ShutdownComplete { .. } => {
+                    push_lifecycle(&callback_inbound, NativeEvent::Disconnected(connection_id));
+                    // Teardown waits on this before releasing the handle, so a
+                    // send buffer cannot outlive it.
+                    let _ = closed_tx.send(());
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        // The handler is installed first because events can begin arriving as
+        // soon as the configuration is set, and one delivered before a handler
+        // exists has nowhere to go.
+        //
+        // A failure here propagates without adopting the connection, which is
+        // deliberate: MsQuic closes a connection the application refused, and
+        // closing it here as well would close the handle twice. The cost is
+        // that the callback context installed above is leaked on that path,
+        // because the wrapper only releases it through its own close. A leak on
+        // a path that means the configuration handle is unusable is the lesser
+        // of the two.
+        connection.set_configuration(configuration)?;
+        // SAFETY: MsQuic delivered this connection through NewConnection, the
+        // configuration was accepted, and no other owner has adopted it. The
+        // transport built below is its sole owner and releases it at teardown,
+        // so the callback above never closes it.
+        let owned = unsafe { Connection::from_raw(connection.as_raw()) };
+        Ok(AcceptedTransport {
+            carrier: Carrier {
+                adapter: MsQuicAdapter::default(),
+                callbacks,
+                stalled: None,
+                streams: BTreeMap::new(),
+                control: Control::Adopted(control),
+                connection: Some(owned),
+                closed,
+                connection_id,
+            },
+            _registration: Arc::clone(registration),
+        })
     }
 
     /// Opens an actual `MsQuic` registration and validates the linked API table.
@@ -1494,7 +2172,7 @@ pub mod live {
     mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         use std::process::Command;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex, OnceLock, mpsc};
         use std::time::{Duration, Instant};
 
@@ -1504,21 +2182,40 @@ pub mod live {
             Settings, Status, Stream, StreamEvent, StreamOpenFlags, StreamRef, StreamStartFlags,
         };
 
-        use super::{Framing, MsQuicTransport, StreamKind};
+        use super::{
+            AcceptedTransport, Control, Framing, MsQuicServer, MsQuicTransport, StreamKind,
+            allocate_peer_lane,
+        };
 
         use super::super::{
             Command as AdapterCommand, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS,
             MAX_PARTIAL_CONTROL_FRAME, MAX_PARTIAL_FRAME, MsQuicAdapter, NativeEvent,
+            PEER_LANE_BASE, PEER_LANE_LAST, is_reserved_lane,
         };
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
         use vot_transport_api::{
             ConnectionId, Error, Event, MAX_DATA_RECORD_BYTES, StreamId, TransportAdapter,
         };
 
+        use std::collections::BTreeSet;
+        use vot_session::Session;
+
         /// A framing with a budget of its own, for tests that only care about
         /// how one stream parses.
+        /// The default control bound, which is what the framing unit tests
+        /// measure against unless they are testing the bound itself.
+        fn control_bound() -> Arc<AtomicUsize> {
+            Arc::new(AtomicUsize::new(
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            ))
+        }
+
         fn lone(kind: StreamKind) -> Framing {
-            Framing::new(kind, Arc::new(Mutex::new(super::CallbackQueue::default())))
+            Framing::new(
+                kind,
+                Arc::new(Mutex::new(super::CallbackQueue::default())),
+                control_bound(),
+            )
         }
 
         /// Drives `accept` and collects what it emitted, which is what the
@@ -1732,7 +2429,11 @@ pub mod live {
             let mut streams = Vec::new();
             let mut refused = None;
             for lane in 0..lanes {
-                let mut framing = Framing::new(StreamKind::Reliable { lane }, Arc::clone(&budget));
+                let mut framing = Framing::new(
+                    StreamKind::Reliable { lane },
+                    Arc::clone(&budget),
+                    control_bound(),
+                );
                 match framing.accept(&head, |_| Ok(())) {
                     Ok(()) => streams.push(framing),
                     Err(fault) => {
@@ -1759,8 +2460,11 @@ pub mod live {
             let mut finished = streams.pop().unwrap();
             assert_eq!(collect(&mut finished, &tail).unwrap(), vec![record]);
             drop(finished);
-            let mut recovered =
-                Framing::new(StreamKind::Reliable { lane: 999 }, Arc::clone(&budget));
+            let mut recovered = Framing::new(
+                StreamKind::Reliable { lane: 999 },
+                Arc::clone(&budget),
+                control_bound(),
+            );
             recovered.accept(&head, |_| Ok(())).unwrap();
         }
 
@@ -1775,8 +2479,11 @@ pub mod live {
             let head = record[..record.len() - 1].to_vec();
 
             for reset in 0..8 {
-                let mut framing =
-                    Framing::new(StreamKind::Reliable { lane: reset }, Arc::clone(&budget));
+                let mut framing = Framing::new(
+                    StreamKind::Reliable { lane: reset },
+                    Arc::clone(&budget),
+                    control_bound(),
+                );
                 framing.accept(&head, |_| Ok(())).unwrap();
                 assert_eq!(
                     budget.lock().unwrap().charged(),
@@ -2015,6 +2722,39 @@ pub mod live {
             assert_eq!(collect(&mut left, &first[4..]).unwrap(), vec![first]);
         }
 
+        #[test]
+        fn every_peer_stream_gets_a_lane_of_its_own() {
+            // A shared identifier made records from independent streams look
+            // like one reordered stream, which on an accepted connection is
+            // every application lane there is.
+            let next = AtomicU64::new(PEER_LANE_BASE);
+            let lanes: Vec<u64> = (0..4).map(|_| allocate_peer_lane(&next).unwrap()).collect();
+            assert_eq!(
+                lanes,
+                vec![
+                    PEER_LANE_BASE,
+                    PEER_LANE_BASE + 1,
+                    PEER_LANE_BASE + 2,
+                    PEER_LANE_BASE + 3,
+                ]
+            );
+            for lane in lanes {
+                assert!(is_reserved_lane(lane));
+            }
+        }
+
+        #[test]
+        fn a_spent_lane_range_refuses_rather_than_wraps() {
+            // Wrapping would alias a live stream and splice two peers' records
+            // together, which is worse than refusing the connection.
+            let next = AtomicU64::new(PEER_LANE_LAST);
+            assert_eq!(allocate_peer_lane(&next), Some(PEER_LANE_LAST));
+            assert_eq!(allocate_peer_lane(&next), None);
+            // Still refused on every later attempt rather than only the first.
+            assert_eq!(allocate_peer_lane(&next), None);
+            assert_eq!(next.load(Ordering::Relaxed), PEER_LANE_LAST + 1);
+        }
+
         /// Generates the test certificate exactly once per process.
         ///
         /// Several tests need it and the harness runs them concurrently. An
@@ -2115,6 +2855,17 @@ pub mod live {
                             let _ = done.send(());
                         }
                     }
+                    StreamEvent::SendComplete { client_context, .. } => {
+                        // send_owned detaches the buffer for MsQuic to hold
+                        // until it is done with it, so this is the only place
+                        // it can be reclaimed. Without this the listener leaks
+                        // one allocation per send, which is what the leak
+                        // sanitiser reported once it was pointed at the whole
+                        // suite rather than one test.
+                        // SAFETY: send_owned produced this context exactly once
+                        // and MsQuic delivers SendComplete for it exactly once.
+                        unsafe { complete_send(client_context) };
+                    }
                     StreamEvent::ShutdownComplete { .. } => {
                         // SAFETY: MsQuic delivered ShutdownComplete for this
                         // peer-created stream and no other owner adopted it.
@@ -2163,9 +2914,15 @@ pub mod live {
 
             let client_registration = super::registration().unwrap();
             let configuration = client_configuration(&client_registration);
-            let mut transport =
-                MsQuicTransport::connect(configuration, client_registration, "127.0.0.1", port, 11)
-                    .unwrap();
+            let mut transport = MsQuicTransport::connect(
+                configuration,
+                client_registration,
+                "127.0.0.1",
+                port,
+                11,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
 
             // Wait for the connection through the adapter's own event queue,
             // which is the path a driver uses rather than a side channel.
@@ -2202,16 +2959,16 @@ pub mod live {
             // reserves the first client-initiated bidirectional stream, which is
             // QUIC stream 0, for HELLO and SETTINGS. A conforming peer would
             // parse these records as negotiation if the lane had claimed it.
-            let control = transport
-                .control
-                .as_ref()
-                .expect("negotiation stream was never claimed");
+            let Control::Opened(Some(control)) = &transport.carrier.control else {
+                panic!("negotiation stream was never claimed");
+            };
             assert_eq!(
                 control.get_stream_id().unwrap(),
                 0,
                 "negotiation must own the first client-initiated bidirectional stream"
             );
             let lane = transport
+                .carrier
                 .streams
                 .values()
                 .next()
@@ -2252,6 +3009,644 @@ pub mod live {
             registration.shutdown();
         }
 
+        /// Builds a listening configuration that presents the test certificate.
+        fn server_configuration(registration: &Registration) -> Arc<Configuration> {
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let settings = Settings::new().set_PeerBidiStreamCount(8);
+            let configuration = Configuration::open(registration, &alpn, Some(&settings)).unwrap();
+            configuration
+                .load_credential(
+                    &CredentialConfig::new()
+                        .set_credential_flags(CredentialFlags::NONE)
+                        .set_credential(test_credential()),
+                )
+                .unwrap();
+            Arc::new(configuration)
+        }
+
+        /// Polls `transport` until `collect` reports it has seen enough, or the
+        /// deadline passes.
+        fn drive(
+            transport: &mut impl TransportAdapter,
+            deadline: Instant,
+            mut collect: impl FnMut(Event) -> bool,
+        ) -> bool {
+            while Instant::now() < deadline {
+                while let Some(event) = transport.poll() {
+                    if collect(event) {
+                        return true;
+                    }
+                }
+                std::thread::yield_now();
+            }
+            false
+        }
+
+        #[test]
+        fn an_accepted_connection_drives_the_same_transport_as_the_client() {
+            // Both directions run production code here. A listener that
+            // hand-rolls its own receive stack proves nothing about the one a
+            // deployment would use, and that second stack is the one nothing
+            // else exercises.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut server = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let mut client = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                31,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(
+                drive(&mut client, deadline, |event| matches!(
+                    event,
+                    Event::Connected(ConnectionId(31))
+                )),
+                "the client never connected"
+            );
+
+            let mut accepted: AcceptedTransport = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = server.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(accepted.connection_id(), 1);
+
+            // A control frame and records on two lanes. The lanes are the point:
+            // they arrive as two independent peer-created streams, and reporting
+            // both under one identifier would make their interleaving look like
+            // reordering within one stream.
+            let hello = framed(vot_codec::frame_type::PING, b"");
+            let first_record = framed(vot_codec::frame_type::DATA_RECORD, b"first-lane");
+            let second_record = framed(vot_codec::frame_type::DATA_RECORD, b"second-lane");
+            client.send_control(&hello).unwrap();
+            client.send_reliable(StreamId(1), &first_record).unwrap();
+            client.send_reliable(StreamId(2), &second_record).unwrap();
+            client.flush().unwrap();
+
+            let mut control = Vec::new();
+            let mut lanes: Vec<(u64, Vec<u8>)> = Vec::new();
+            assert!(
+                drive(&mut accepted, deadline, |event| {
+                    match event {
+                        Event::Control(bytes) => control = bytes.to_vec(),
+                        Event::Reliable { stream, bytes, .. } => {
+                            lanes.push((stream.0, bytes.to_vec()));
+                        }
+                        _ => {}
+                    }
+                    !control.is_empty() && lanes.len() == 2
+                }),
+                "the accepted connection never received the client's frames"
+            );
+
+            assert_eq!(control, hello, "the negotiation stream carried the frame");
+            lanes.sort_by_key(|(lane, _)| *lane);
+            let [(first, first_bytes), (second, second_bytes)] = lanes.as_slice() else {
+                unreachable!("exactly two lanes were collected")
+            };
+            assert_ne!(
+                first, second,
+                "two peer streams must not share one lane identity"
+            );
+            for lane in [first, second] {
+                assert!(
+                    super::super::is_reserved_lane(*lane),
+                    "a peer lane must sit outside the range either side can name"
+                );
+            }
+            let mut records = [first_bytes.clone(), second_bytes.clone()];
+            records.sort();
+            assert_eq!(records, [first_record, second_record]);
+
+            // The reply goes back on the negotiation stream the client opened,
+            // which is the only peer stream an accepted connection holds. Every
+            // frame a receiver sends, from SETTINGS to PUBLISH_RECEIPT, takes
+            // this path.
+            assert!(accepted.control_stream_open());
+            let reply = framed(vot_codec::frame_type::SETTINGS_ACK, b"");
+            accepted.send_control(&reply).unwrap();
+            accepted.flush().unwrap();
+            assert_eq!(accepted.pending_commands(), 0);
+
+            let mut received = Vec::new();
+            assert!(
+                drive(&mut client, deadline, |event| {
+                    if let Event::Control(bytes) = event {
+                        received = bytes.to_vec();
+                    }
+                    !received.is_empty()
+                }),
+                "the client never saw the reply"
+            );
+            assert_eq!(received, reply);
+
+            drop(client);
+            drop(accepted);
+            drop(server);
+        }
+
+        /// What the accepting side advertises and reassembles in the
+        /// negotiation tests, deliberately below the connecting side's default.
+        const SERVER_CONTROL_LIMIT: usize = 64 * 1024;
+
+        #[test]
+        fn two_endpoints_negotiate_over_the_real_carrier_before_any_data_moves() {
+            // Everything below runs production code: the assembled client, the
+            // assembled server, the session layer over both, and MsQuic in
+            // between. Until this existed, negotiation had never been spoken
+            // over a carrier, only over an in-memory loopback.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut listener = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                // The accepting side advertises a smaller control-frame bound
+                // than the connecting one, so applying it is observable rather
+                // than a no-op. The listener is configured with it because the
+                // bound has to be in force before the client's first byte.
+                SERVER_CONTROL_LIMIT,
+            )
+            .unwrap();
+            let port = listener.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let transport = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                61,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+
+            let peer_settings = vot_codec::Settings {
+                max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                ..vot_codec::Settings::default()
+            };
+            let mut client = Session::client(
+                transport,
+                vot_codec::Settings::default(),
+                BTreeSet::from([1]),
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut connected = false;
+            while Instant::now() < deadline && !connected {
+                while let Some(event) = client.poll().unwrap() {
+                    connected |= matches!(event, Event::Connected(ConnectionId(61)));
+                }
+                std::thread::yield_now();
+            }
+            assert!(connected, "the client never connected");
+
+            // Nothing may move until the exchange finishes, and it has not
+            // started: the client speaks first but has not been told to.
+            assert_eq!(client.state(), vot_session::State::Connecting);
+            assert!(client.send_reliable(StreamId(1), b"too early").is_err());
+
+            client.begin().unwrap();
+            assert_eq!(client.state(), vot_session::State::HelloSent);
+
+            let accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = listener.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+            let mut server = Session::server(accepted, peer_settings, BTreeSet::new());
+            server.begin().unwrap();
+
+            let mut records = Vec::new();
+            while Instant::now() < deadline && !(client.is_ready() && server.is_ready()) {
+                while let Some(event) = server.poll().unwrap() {
+                    if let Event::Reliable { bytes, .. } = event {
+                        records.push(bytes.to_vec());
+                    }
+                }
+                while let Some(event) = client.poll().unwrap() {
+                    assert!(
+                        !matches!(event, Event::Reliable { .. }),
+                        "the client asked for nothing back"
+                    );
+                }
+                std::thread::yield_now();
+            }
+            assert!(client.is_ready(), "the client never reached readiness");
+            assert!(server.is_ready(), "the server never reached readiness");
+
+            // The exchange did something rather than only advancing an enum:
+            // the peer's advertised maximum is now the bound this side sends
+            // control frames under.
+            assert_eq!(
+                client.peer_settings().map(|s| s.max_control_frame_payload),
+                Some(SERVER_CONTROL_LIMIT as u64)
+            );
+            assert!(client.control_limit_applied());
+            assert_eq!(
+                server.peer_settings(),
+                Some(vot_codec::Settings::default()),
+                "the server read the client's advertised limits"
+            );
+
+            // And only now will the data plane carry anything.
+            let payload = framed(vot_codec::frame_type::DATA_RECORD, b"after negotiation");
+            client.send_reliable(StreamId(1), &payload).unwrap();
+            client.flush().unwrap();
+
+            while Instant::now() < deadline && records.is_empty() {
+                while let Some(event) = server.poll().unwrap() {
+                    if let Event::Reliable { bytes, .. } = event {
+                        records.push(bytes.to_vec());
+                    }
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(records, vec![payload]);
+
+            drop(client);
+            drop(server);
+            drop(listener);
+        }
+
+        /// Brings up a raw connecting transport against a listening server.
+        ///
+        /// The connecting side is deliberately not a `Session`: these tests
+        /// need a peer that does things a conforming session would refuse to
+        /// do, which is exactly what an independent implementation might send.
+        ///
+        /// The listener comes back too, because dropping it closes the
+        /// registration the accepted connection belongs to.
+        fn peer_against_server(
+            connection_id: u64,
+        ) -> (
+            MsQuicServer,
+            MsQuicTransport,
+            Session<AcceptedTransport>,
+            Instant,
+        ) {
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut listener = MsQuicServer::listen(
+                configuration,
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                SERVER_CONTROL_LIMIT,
+            )
+            .unwrap();
+            let port = listener.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let mut peer = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                connection_id,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(
+                drive(&mut peer, deadline, |event| matches!(
+                    event,
+                    Event::Connected(_)
+                )),
+                "the peer never connected"
+            );
+
+            // Nothing is sent here. A frame before the exchange starts is an
+            // application frame arriving before negotiation, which the server
+            // is right to refuse, and the connection is accepted on the
+            // handshake rather than on the first stream.
+            let accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = listener.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+            let server = Session::server(
+                accepted,
+                vot_codec::Settings {
+                    max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                    ..vot_codec::Settings::default()
+                },
+                BTreeSet::new(),
+            );
+            (listener, peer, server, deadline)
+        }
+
+        /// One encoded HELLO from a client on `revision`.
+        fn hello_frame(revision: u64) -> Vec<u8> {
+            let hello = vot_codec::Hello {
+                draft_revision: revision,
+                endpoint_role: vot_codec::EndpointRole::Client,
+                extensions: BTreeSet::new(),
+            };
+            let mut payload = Vec::new();
+            vot_codec::encode_hello(&hello, &mut payload).unwrap();
+            framed(vot_codec::frame_type::HELLO, &payload)
+        }
+
+        /// One encoded SETTINGS carrying the defaults.
+        fn settings_frame() -> Vec<u8> {
+            let mut payload = Vec::new();
+            vot_codec::encode_settings(&vot_codec::Settings::default(), &mut payload).unwrap();
+            framed(vot_codec::frame_type::SETTINGS, &payload)
+        }
+
+        /// Polls a session until it fails or the deadline passes.
+        fn drive_session<A: TransportAdapter>(
+            session: &mut Session<A>,
+            peer: &mut MsQuicTransport,
+            deadline: Instant,
+            mut done: impl FnMut(&mut Session<A>) -> bool,
+        ) -> Option<vot_session::Error> {
+            while Instant::now() < deadline {
+                match session.poll() {
+                    Ok(_) => {}
+                    Err(error) => return Some(error),
+                }
+                while peer.poll().is_some() {}
+                if done(session) {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+            None
+        }
+
+        #[test]
+        fn a_registered_close_code_reaches_the_peer() {
+            // The code was computed and asserted in unit tests long before
+            // anything sent it, so a peer on another draft saw the session end
+            // for no stated reason. This is the end-to-end version: the server
+            // refuses the revision and the peer reads the registered reason
+            // back off the carrier.
+            let (listener, mut peer, mut server, deadline) = peer_against_server(71);
+            server.begin().unwrap();
+
+            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION - 1))
+                .unwrap();
+            peer.flush().unwrap();
+
+            let refused = drive_session(&mut server, &mut peer, deadline, |_| false)
+                .expect("the server accepted a HELLO it had to refuse");
+            assert_eq!(
+                refused.close_code(),
+                vot_codec::error_code::UNSUPPORTED_VERSION
+            );
+
+            let mut observed = None;
+            while Instant::now() < deadline && observed.is_none() {
+                while peer.poll().is_some() {}
+                observed = peer.peer_close_code();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                observed,
+                Some(vot_codec::error_code::UNSUPPORTED_VERSION),
+                "the registered code never reached the wire"
+            );
+
+            drop(peer);
+            drop(server);
+            drop(listener);
+        }
+
+        #[test]
+        fn records_sent_before_readiness_are_held_over_the_real_carrier() {
+            // The in-memory version proves the buffer works. Only the carrier
+            // proves the race it exists for is real: the negotiation stream and
+            // an application lane are different QUIC streams, so nothing orders
+            // a record against the frames that make the sender ready.
+            let (listener, mut peer, mut server, deadline) = peer_against_server(81);
+            server.begin().unwrap();
+
+            let record = framed(vot_codec::frame_type::DATA_RECORD, b"in flight");
+            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION))
+                .unwrap();
+            // Between the two negotiation frames, which is the worst ordering
+            // the carrier can produce and the one a conforming peer can create.
+            peer.send_reliable(StreamId(1), &record).unwrap();
+            peer.send_control(&settings_frame()).unwrap();
+            peer.flush().unwrap();
+
+            // Collected as the session runs, because the held record is
+            // released the moment readiness is reached and a second pass would
+            // arrive after it.
+            let mut held = Vec::new();
+            while Instant::now() < deadline && held.is_empty() {
+                while let Some(event) = server.poll().unwrap() {
+                    if let Event::Reliable { bytes, .. } = event {
+                        assert!(
+                            server.is_ready(),
+                            "a record surfaced before the exchange finished"
+                        );
+                        held.push(bytes.to_vec());
+                    }
+                }
+                while peer.poll().is_some() {}
+                std::thread::yield_now();
+            }
+            assert!(
+                server.is_ready(),
+                "a record in flight blocked the exchange behind it"
+            );
+            assert_eq!(held, vec![record], "a record in flight was lost");
+
+            drop(peer);
+            drop(server);
+            drop(listener);
+        }
+
+        #[test]
+        fn a_malformed_peer_frame_ends_the_session_not_the_process() {
+            // MsQuic treats a failure status from a receive callback as an
+            // application bug: a debug build asserts and aborts, a release
+            // build ignores it. Returning one on a decoder fault therefore let
+            // any peer end the process with three bytes. The fault has to
+            // travel through the close request instead, which is what the
+            // driver turns into a registered connection close.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut server = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let mut client = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                51,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut client, deadline, |event| matches!(
+                event,
+                Event::Connected(ConnectionId(51))
+            )));
+
+            let mut accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = server.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+
+            // Frame type fifteen is odd, so it is critical, and unregistered,
+            // so it is unknown. spec/wire.md closes the session under
+            // UNKNOWN_CRITICAL_FRAME rather than skipping it.
+            let unknown_critical = [0x0f_u8, 0x01, 0x41];
+            assert!(vot_codec::is_critical(0x0f));
+            assert!(!vot_codec::is_known(0x0f));
+            client
+                .send_reliable(StreamId(1), &unknown_critical)
+                .unwrap();
+            client.flush().unwrap();
+
+            assert!(
+                drive(&mut accepted, deadline, |event| matches!(
+                    event,
+                    Event::Disconnected(_)
+                )),
+                "the session survived a frame it had to reject"
+            );
+            // The process is still here, which is the whole point.
+            assert_eq!(accepted.connection_id(), 1);
+
+            drop(client);
+            drop(accepted);
+            drop(server);
+        }
+
+        #[test]
+        fn a_control_frame_stays_queued_until_the_peer_opens_the_stream() {
+            // An accepted connection does not open the negotiation stream; the
+            // client does. A frame submitted first has to wait for it rather
+            // than be lost, because nothing will submit it again.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut server = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let mut client = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                41,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut client, deadline, |event| matches!(
+                event,
+                Event::Connected(ConnectionId(41))
+            )));
+
+            let mut accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = server.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+
+            // Nothing has opened the negotiation stream yet, so the frame has
+            // nowhere to go and must survive the failed flush.
+            assert!(!accepted.control_stream_open());
+            let reply = framed(vot_codec::frame_type::SETTINGS_ACK, b"");
+            accepted.send_control(&reply).unwrap();
+            assert!(accepted.flush().is_err(), "there is no stream to send on");
+            assert_eq!(accepted.pending_commands(), 1, "the frame was not lost");
+
+            // The client opens it, and the same queued frame now goes out.
+            client
+                .send_control(&framed(vot_codec::frame_type::PING, b""))
+                .unwrap();
+            client.flush().unwrap();
+            let mut seen = false;
+            assert!(
+                drive(&mut accepted, deadline, |event| {
+                    seen = matches!(event, Event::Control(_));
+                    seen
+                }),
+                "the negotiation stream never arrived"
+            );
+            assert!(accepted.control_stream_open());
+            accepted.flush().unwrap();
+            assert_eq!(accepted.pending_commands(), 0);
+
+            let mut received = Vec::new();
+            assert!(
+                drive(&mut client, deadline, |event| {
+                    if let Event::Control(bytes) = event {
+                        received = bytes.to_vec();
+                    }
+                    !received.is_empty()
+                }),
+                "the frame queued before the stream existed never arrived"
+            );
+            assert_eq!(received, reply);
+
+            drop(client);
+            drop(accepted);
+            drop(server);
+        }
+
         #[test]
         fn a_command_the_backend_refuses_stays_queued() {
             // Backpressure only works if a failed flush loses nothing.
@@ -2265,6 +3660,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 21,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             )
             .unwrap();
             // Nothing is listening, so the send cannot reach a peer.
@@ -2307,6 +3703,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 7,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             )
             .unwrap();
             drop(transport);
@@ -2318,6 +3715,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 8,
+                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             )
             .unwrap();
             with_stream
@@ -2649,12 +4047,16 @@ mod tests {
         // Control frames and peer-initiated records are reported on lanes of
         // their own. If either collided with the other, or with a stream a
         // caller could name, replies would be classified as the wrong kind.
-        assert_ne!(CONTROL_LANE, PEER_STREAM_ID);
-        assert_eq!(PEER_STREAM_ID, u64::MAX);
         assert_eq!(CONTROL_LANE, u64::MAX - 1);
+        assert!(is_reserved_lane(CONTROL_LANE));
+        // Every peer lane sits below the control lane and above every lane
+        // either side can name on the wire. A QUIC varint stops one short of
+        // the base, so the two ranges cannot meet.
+        assert_eq!(PEER_LANE_BASE, vot_codec::MAX_QUIC_VARINT + 1);
+        assert_eq!(PEER_LANE_LAST, CONTROL_LANE - 1);
+        assert!(!is_reserved_lane(vot_codec::MAX_QUIC_VARINT));
         // Zero stays an ordinary application lane.
-        assert_ne!(CONTROL_LANE, 0);
-        assert_ne!(PEER_STREAM_ID, 0);
+        assert!(!is_reserved_lane(0));
         // The bounds are the ones the callback path relies on. The event bound
         // covers peer-driven records and control frames; lifecycle events are
         // admitted past it.
@@ -2689,7 +4091,7 @@ mod tests {
         // stream numbered the same way would have its replies classified as
         // control frames or as peer-initiated records.
         let mut adapter = MsQuicAdapter::default();
-        for lane in [CONTROL_LANE, PEER_STREAM_ID] {
+        for lane in [CONTROL_LANE, PEER_LANE_BASE, PEER_LANE_LAST, u64::MAX] {
             assert!(is_reserved_lane(lane));
             assert!(matches!(
                 adapter.send_reliable(StreamId(lane), b"record"),
@@ -2705,10 +4107,10 @@ mod tests {
             ));
         }
         assert_eq!(adapter.pending_commands(), 0);
-        // The lane one below the reserved pair is ordinary.
-        assert!(!is_reserved_lane(CONTROL_LANE - 1));
+        // The largest lane a peer can name on the wire is still ordinary.
+        assert!(!is_reserved_lane(PEER_LANE_BASE - 1));
         adapter
-            .send_reliable(StreamId(CONTROL_LANE - 1), b"record")
+            .send_reliable(StreamId(PEER_LANE_BASE - 1), b"record")
             .unwrap();
         assert_eq!(adapter.pending_commands(), 1);
     }

@@ -220,6 +220,43 @@ pub trait TransportAdapter {
     /// # Errors
     /// Reports a backend failure. Credit is absolute, not additive.
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error>;
+
+    /// Ends the session under a registered `spec/registries.md` close code.
+    ///
+    /// For a peer that broke the protocol. A backend that cannot carry a code
+    /// says so rather than closing without one, because a session that ends for
+    /// no stated reason is indistinguishable from a network failure.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when the backend cannot signal a code.
+    fn close(&mut self, _code: u16) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    /// Reports the largest control-frame payload this endpoint will reassemble.
+    ///
+    /// A caller advertising a limit in `SETTINGS` uses this to check that the
+    /// backend will actually hold it to that, rather than advertising one bound
+    /// and accepting frames up to another.
+    fn control_receive_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Applies a negotiated control-frame payload limit to what is sent.
+    ///
+    /// The peer's advertised maximum is the bound on what this endpoint may
+    /// put on the control stream. A backend that cannot apply it reports
+    /// [`Error::Unsupported`] rather than accepting the call and carrying on
+    /// under its own bound, so a caller can tell an applied limit from one that
+    /// was quietly dropped.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when the backend enforces no such bound,
+    /// and [`Error::InvalidConfiguration`] for a limit outside the protocol
+    /// range.
+    fn set_control_payload_limit(&mut self, _limit: usize) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 
 /// Sole source of truth for receiver staging usage and advertised credit.
@@ -503,6 +540,20 @@ mod tests {
         );
         assert_eq!(adapter.flush(), Ok(()));
         assert_eq!(adapter.path_stats(), None);
+
+        // A backend that has not implemented these says so. Defaulting any of
+        // them to success would let a caller believe a negotiated limit was
+        // applied, or that a peer was told why the session ended, when neither
+        // happened.
+        assert_eq!(
+            adapter.close(vot_codec::error_code::MALFORMED_FRAME),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(adapter.control_receive_limit(), None);
+        assert_eq!(
+            adapter.set_control_payload_limit(MAX_CONTROL_FRAME_PAYLOAD),
+            Err(Error::Unsupported)
+        );
 
         adapter.events.push_back(Event::Connected(ConnectionId(1)));
         adapter

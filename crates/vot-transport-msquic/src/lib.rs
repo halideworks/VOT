@@ -2330,6 +2330,13 @@ mod tests {
             MAX_PARTIAL_CONTROL_FRAME,
             vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES
         );
+        // The byte bound is what actually limits memory, so it is pinned here
+        // rather than only where it is used. Sixteen of the largest frames a
+        // lane carries: enough for the driver to fall briefly behind, and far
+        // below the gigabyte the entry count alone would have allowed, which is
+        // the hole it exists to close.
+        assert_eq!(MAX_CALLBACK_BYTES, 16 * MAX_PARTIAL_CONTROL_FRAME);
+        assert_eq!(MAX_CALLBACK_BYTES / MAX_PARTIAL_CONTROL_FRAME, 16);
         assert_eq!(
             MsQuicAdapter::default().control_payload_limit,
             vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD

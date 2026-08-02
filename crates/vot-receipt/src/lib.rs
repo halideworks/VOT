@@ -501,11 +501,22 @@ pub fn verify_chain(chain: &[AuthenticatedReceipt]) -> Result<(), Error> {
 ///
 /// The scheme is inside the signed input so an authenticator produced under one
 /// scheme can never be replayed as another.
-fn signing_input(scheme: AuthScheme, receipt: &Receipt) -> Result<Vec<u8>, Error> {
+/// Bytes an authenticator covers.
+///
+/// The key identifier is inside them. It names which key the issuer claimed to
+/// be using, and a verifier that treats it as a context label needs it to be
+/// authentic: otherwise a receipt signed by the same issuer for another context
+/// can be relabelled without disturbing the signature. It is length prefixed so
+/// no identifier can be read as the start of the canonical receipt.
+fn signing_input(scheme: AuthScheme, key_id: &[u8], receipt: &Receipt) -> Result<Vec<u8>, Error> {
+    validate_key_id(key_id)?;
+    let key_id_len = u8::try_from(key_id.len()).map_err(|_| Error::InvalidKeyId)?;
     let canonical = receipt.canonical_bytes()?;
-    let mut input = Vec::with_capacity(DOMAIN.len() + 2 + canonical.len());
+    let mut input = Vec::with_capacity(DOMAIN.len() + 3 + key_id.len() + canonical.len());
     input.extend_from_slice(DOMAIN);
     input.extend_from_slice(&(scheme as u16).to_be_bytes());
+    input.push(key_id_len);
+    input.extend_from_slice(key_id);
     input.extend_from_slice(&canonical);
     Ok(input)
 }
@@ -527,8 +538,7 @@ pub fn sign_ed25519(
     key_id: &[u8],
     key: &SigningKey,
 ) -> Result<AuthenticatedReceipt, Error> {
-    validate_key_id(key_id)?;
-    let input = signing_input(AuthScheme::Ed25519, &receipt)?;
+    let input = signing_input(AuthScheme::Ed25519, key_id, &receipt)?;
     let signature = key.sign(&input);
     Ok(AuthenticatedReceipt {
         receipt,
@@ -552,7 +562,7 @@ pub fn verify_ed25519(receipt: &AuthenticatedReceipt, key: &VerifyingKey) -> Res
         .as_slice()
         .try_into()
         .map_err(|_| Error::Authentication)?;
-    let input = signing_input(AuthScheme::Ed25519, &receipt.receipt)?;
+    let input = signing_input(AuthScheme::Ed25519, &receipt.key_id, &receipt.receipt)?;
     // verify_strict rejects signatures under low-order or torsion public keys,
     // so one signature cannot verify under two different keys.
     key.verify_strict(&input, &Signature::from_bytes(&bytes))
@@ -571,11 +581,10 @@ pub fn authenticate_hmac_sha256(
     key_id: &[u8],
     key: &[u8],
 ) -> Result<AuthenticatedReceipt, Error> {
-    validate_key_id(key_id)?;
     if key.len() < 32 {
         return Err(Error::InvalidKey);
     }
-    let input = signing_input(AuthScheme::HmacSha256, &receipt)?;
+    let input = signing_input(AuthScheme::HmacSha256, key_id, &receipt)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Error::InvalidKey)?;
     mac.update(&input);
     let authentication = mac.finalize().into_bytes().to_vec();
@@ -597,7 +606,7 @@ pub fn verify_hmac_sha256(receipt: &AuthenticatedReceipt, key: &[u8]) -> Result<
     if key.len() < 32 {
         return Err(Error::InvalidKey);
     }
-    let input = signing_input(AuthScheme::HmacSha256, &receipt.receipt)?;
+    let input = signing_input(AuthScheme::HmacSha256, &receipt.key_id, &receipt.receipt)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Error::InvalidKey)?;
     mac.update(&input);
     mac.verify_slice(&receipt.authentication)
@@ -1349,6 +1358,31 @@ mod tests {
             verify_ed25519(&signed, &other.verifying_key()),
             Err(Error::Authentication)
         );
+
+        // Relabelling the key identifier breaks the signature. A verifier that
+        // uses it to separate contexts, as the CLI does for its publication
+        // receipts, would otherwise accept a receipt the same issuer signed for
+        // something else entirely.
+        let mut relabelled = signed.clone();
+        relabelled.key_id = b"issuer-2".to_vec();
+        assert_eq!(
+            verify_ed25519(&relabelled, &key.verifying_key()),
+            Err(Error::Authentication)
+        );
+
+        // An identifier outside the registry bound is refused before any
+        // signature check, on the way in and on the way out.
+        let mut unbounded = signed.clone();
+        unbounded.key_id = Vec::new();
+        assert_eq!(
+            verify_ed25519(&unbounded, &key.verifying_key()),
+            Err(Error::InvalidKeyId)
+        );
+        unbounded.key_id = vec![b'k'; 65];
+        assert_eq!(
+            verify_ed25519(&unbounded, &key.verifying_key()),
+            Err(Error::InvalidKeyId)
+        );
     }
 
     #[test]
@@ -1398,8 +1432,20 @@ mod tests {
         // The scheme is inside the signed bytes, so the two cover different
         // input even for an identical receipt.
         assert_ne!(
-            signing_input(AuthScheme::Ed25519, &receipt()).unwrap(),
-            signing_input(AuthScheme::HmacSha256, &receipt()).unwrap()
+            signing_input(AuthScheme::Ed25519, b"issuer-1", &receipt()).unwrap(),
+            signing_input(AuthScheme::HmacSha256, b"issuer-1", &receipt()).unwrap()
+        );
+        // So is the key identifier, so a receipt cannot be relabelled as
+        // belonging to another context without breaking its authenticator.
+        assert_ne!(
+            signing_input(AuthScheme::Ed25519, b"issuer-1", &receipt()).unwrap(),
+            signing_input(AuthScheme::Ed25519, b"issuer-2", &receipt()).unwrap()
+        );
+        // Length prefixed, so a longer identifier cannot absorb the byte that
+        // follows it and leave the same input.
+        assert_ne!(
+            signing_input(AuthScheme::Ed25519, b"ab", &receipt()).unwrap(),
+            signing_input(AuthScheme::Ed25519, b"a", &receipt()).unwrap()
         );
         assert!(!AuthScheme::HmacSha256.is_third_party_verifiable());
     }

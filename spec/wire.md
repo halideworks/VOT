@@ -34,6 +34,105 @@ are validated against `spec/registries.md` before state mutation.
 `SETTINGS_ACK` has an empty payload and confirms that all preceding peer settings
 were parsed and accepted.
 
+### 1.1 Session authentication
+
+Once `SETTINGS_ACK` has been sent, the server sends `AUTH_CONTEXT` on the
+control stream. The client answers `SESSION_OPEN`. The server answers
+`SESSION_ACCEPT` or `SESSION_REJECT`. Frames marked `auth: yes` in section 5 are
+invalid until `SESSION_ACCEPT` has been sent.
+
+A server that requires no authentication says so by advertising no capability
+format, and the session is authenticated the moment the client has read
+`AUTH_CONTEXT`. The exchange is therefore always present and its cost on a
+deployment that does not authenticate is one empty round of frames.
+
+The capability itself is opaque at this layer. Its format is a registered
+identifier and its bytes are handed to the deployment's authentication policy,
+which is what `spec/security.md` section 5 describes. This section defines only
+the exchange that carries it.
+
+Every length below MUST fit within the bytes remaining in the payload, and the
+fields MUST together consume exactly `frame_length`. A length that does not is
+`MALFORMED_FRAME`, detected before any buffer is sized from it, as section 3
+requires.
+
+The `AUTH_CONTEXT` payload is:
+
+```text
+QUIC-varint auth_context_version   ; 1 for vot-draft-04
+QUIC-varint nonce_length           ; 16 to 64
+nonce_length bytes nonce
+QUIC-varint binding                ; 0 none, 1 proof of possession
+QUIC-varint format_count           ; at most 16
+format_count * QUIC-varint capability_format
+```
+
+The nonce is fresh per session and gives the client something to sign when the
+binding is proof of possession. The format list tells a client which capability
+formats this server accepts, so a client holding none of them fails immediately
+rather than after a rejected `SESSION_OPEN`. A `format_count` of 0 means this
+deployment requires no authentication; the client sends no `SESSION_OPEN` and
+the server sends no result. Duplicate format identifiers are rejected. An
+unknown `auth_context_version` causes `UNSUPPORTED_VERSION`.
+
+The `SESSION_OPEN` payload is:
+
+```text
+16 bytes session_id
+QUIC-varint capability_format
+QUIC-varint capability_length
+capability_length bytes capability
+QUIC-varint scope_length
+scope_length bytes requested_scope
+QUIC-varint binding_length
+binding_length bytes binding_proof
+```
+
+`session_id` is an independent random 128-bit value, as section 6 of
+`spec/security.md` requires. `capability_format` MUST be one the server
+advertised. An empty `requested_scope` asks for the capability's whole scope; a
+non-empty one asks for a subset, and a server MUST NOT grant more than the
+capability allows regardless of what is requested. `binding_proof` is empty when
+the binding is 0 and otherwise proves possession of the key the capability
+names, over the `AUTH_CONTEXT` nonce.
+
+The `SESSION_ACCEPT` payload is:
+
+```text
+16 bytes session_id
+QUIC-varint granted_scope_length
+granted_scope_length bytes granted_scope
+```
+
+`session_id` MUST equal the one in `SESSION_OPEN`. `granted_scope` is what the
+server actually authorized, which may be narrower than what was requested. The
+capability governs how long the grant lasts, since it already carries
+not-before and expiry; `SESSION_ACCEPT` does not restate them and no VOT frame
+carries an absolute clock.
+
+The `SESSION_REJECT` payload is:
+
+```text
+16 bytes session_id
+QUIC-varint reason
+QUIC-varint detail_length
+detail_length bytes detail
+```
+
+`reason` is a value from the error code registry in `spec/registries.md`
+section 5, one of `AUTHENTICATION_FAILED`, `AUTHORIZATION_FAILED`, or
+`REPLAY_REJECTED`. `detail` is UTF-8 and may be empty. A server MUST NOT put
+anything in `detail` that distinguishes a valid capability with insufficient
+scope from an invalid one, since that difference is an oracle.
+
+A rejected session does not close the connection. The client may try again with
+a different capability, and each attempt MUST use a fresh `session_id`, so the
+duplicate rules in section 5 apply to a repeated attempt rather than to a new
+one. A server accepts at most three attempts per connection and then closes
+with `AUTHENTICATION_FAILED`. The bound is fixed rather than negotiated so that
+both sides know it without a setting, and it bounds the work an unauthenticated
+peer can ask for, which section 7 of `spec/security.md` requires.
+
 ## 2. Frame envelope
 
 Every control or reliable-record frame is encoded as:

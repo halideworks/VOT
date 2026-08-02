@@ -228,8 +228,13 @@ impl TransportAdapter for TcpAdapter {
     fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
         // The send bound only. What this endpoint accepts is what it
         // advertised, and a peer's limit must not widen or narrow that.
+        //
+        // Clamped to what the outbound queue can hold: a peer allowing more
+        // than this endpoint can enqueue does not oblige it to send that much,
+        // and a bound above the queue refuses the frame at submission for ever.
         vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit = limit;
+        self.control_payload_limit =
+            vot_transport_api::effective_send_limit(limit, self.command_byte_limit);
         Ok(())
     }
 
@@ -820,6 +825,21 @@ mod tests {
         assert_eq!(
             adapter.record_native_event(NativeEvent::Control(vec![0; 2 * 1024 * 1024 + envelope])),
             Ok(())
+        );
+
+        // A peer allowing more than the queue holds does not let this endpoint
+        // send more: the bound is clamped, so an oversized frame is refused at
+        // submission rather than queued for ever.
+        let mut generous = TcpAdapter::default();
+        generous
+            .set_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD)
+            .unwrap();
+        let largest = INBOUND_BYTE_CAPACITY - envelope;
+        generous.send_control(&vec![0; largest + envelope]).unwrap();
+        assert_eq!(
+            generous.send_control(&vec![0; largest + envelope + 1]),
+            Err(Error::RecordTooLarge),
+            "refused at submission, not queued for ever"
         );
 
         // And advertising less is enforced, which is the direction that was

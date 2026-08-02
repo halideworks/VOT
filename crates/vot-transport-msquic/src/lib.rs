@@ -431,7 +431,12 @@ impl TransportAdapter for MsQuicAdapter {
     /// Applies the peer-negotiated control-frame payload ceiling.
     fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
         vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit = limit;
+        // Clamped to what the outbound queue can hold. A peer allowing more
+        // than this endpoint can enqueue does not oblige it to send that much,
+        // and a bound above the queue would refuse the frame at submission for
+        // ever, which a caller reads as backpressure that never clears.
+        self.control_payload_limit =
+            vot_transport_api::effective_send_limit(limit, self.command_byte_limit);
         Ok(())
     }
 

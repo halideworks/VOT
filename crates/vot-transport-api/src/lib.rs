@@ -274,6 +274,13 @@ impl ReceiveLimits {
         settings: &vot_codec::Settings,
         inbound_byte_capacity: usize,
     ) -> Result<Self, Error> {
+        // Against the registry rather than by hand, so a range copied here
+        // could not drift from the one the codec encodes and decodes under.
+        for (setting, value) in settings.advertised() {
+            if !vot_codec::setting_in_range(setting, value) {
+                return Err(Error::InvalidConfiguration);
+            }
+        }
         let control_payload = usize::try_from(settings.max_control_frame_payload)
             .map_err(|_| Error::InvalidConfiguration)?;
         validate_control_payload_limit(control_payload)?;
@@ -285,9 +292,6 @@ impl ReceiveLimits {
         }
         let lanes = usize::try_from(settings.reliable_lane_limit)
             .map_err(|_| Error::InvalidConfiguration)?;
-        if lanes == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
         Ok(Self {
             control_payload,
             lanes,
@@ -397,6 +401,17 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+/// The most a backend may send under a peer's advertised limit.
+///
+/// The smaller of what the peer allows and what this endpoint can enqueue.
+/// Sending less than the peer permits is always allowed; a bound above the
+/// outbound queue is not, because a frame that large is refused at submission
+/// for ever and a caller reads that as backpressure that never clears.
+#[must_use]
+pub fn effective_send_limit(peer_limit: usize, outbound_byte_capacity: usize) -> usize {
+    peer_limit.min(outbound_byte_capacity.saturating_sub(MAX_FRAME_ENVELOPE_BYTES))
 }
 
 /// Validates a negotiated control-frame payload limit.
@@ -562,10 +577,47 @@ mod tests {
             ),
             Err(Error::InvalidConfiguration)
         );
+        // Every registered range applies, from the codec's table rather than one
+        // copied here. Zero lanes leaves a peer unable to send anything, and
+        // one past the registry maximum is not a count the peer could encode.
+        for lanes in [0, 257] {
+            assert_eq!(
+                ReceiveLimits::advertised(&settings(largest as u64, lanes), capacity),
+                Err(Error::InvalidConfiguration),
+                "{lanes} lanes"
+            );
+        }
+        for lanes in [1_u64, 256] {
+            assert_eq!(
+                ReceiveLimits::advertised(&settings(largest as u64, lanes), capacity)
+                    .unwrap()
+                    .lanes(),
+                usize::try_from(lanes).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_send_bound_never_exceeds_what_the_backend_can_queue() {
+        // A peer allowing more than this endpoint can enqueue does not oblige
+        // it to send that much. A bound above the queue would refuse the frame
+        // at submission for ever, which a caller reads as backpressure.
+        let capacity = 4 * 1024 * 1024;
         assert_eq!(
-            ReceiveLimits::advertised(&settings(largest as u64, 0), capacity),
-            Err(Error::InvalidConfiguration)
+            effective_send_limit(64 * 1024, capacity),
+            64 * 1024,
+            "a peer under the capacity is taken as it stands"
         );
+        assert_eq!(
+            effective_send_limit(16 * 1024 * 1024, capacity),
+            capacity - MAX_FRAME_ENVELOPE_BYTES,
+            "and one over it is clamped to what fits"
+        );
+        assert_eq!(
+            effective_send_limit(capacity - MAX_FRAME_ENVELOPE_BYTES, capacity),
+            capacity - MAX_FRAME_ENVELOPE_BYTES
+        );
+        assert_eq!(effective_send_limit(1024, 0), 0, "a queue with no room");
     }
 
     #[test]

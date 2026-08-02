@@ -602,6 +602,12 @@ impl<A: TransportAdapter> Session<A> {
         self.negotiation.is_ready()
     }
 
+    /// The limits this endpoint advertised.
+    #[must_use]
+    pub const fn local_settings(&self) -> Settings {
+        self.negotiation.local_settings()
+    }
+
     /// The limits the peer advertised.
     #[must_use]
     pub const fn peer_settings(&self) -> Option<Settings> {
@@ -1074,14 +1080,11 @@ impl Lane {
     /// Whether a frame of this type belongs on the lane.
     ///
     /// `spec/wire.md` section 7 gives a lane the payload and the control stream
-    /// everything else. It does not enumerate either side, so this is the
-    /// narrow reading: a lane carries a proof-bearing range, which is a
-    /// `PROOF_BUNDLE` and the `DATA_RECORD` frames it covers, and nothing else.
+    /// everything else. `DATA_RECORD` is the payload. A `PROOF_BUNDLE`
+    /// describes the payload and is bounded by the negotiated control ceiling,
+    /// not by the fixed record limit, so it travels on the control stream.
     const fn carries(self, frame_type: u64) -> bool {
-        let payload = matches!(
-            frame_type,
-            vot_codec::frame_type::PROOF_BUNDLE | vot_codec::frame_type::DATA_RECORD
-        );
+        let payload = matches!(frame_type, vot_codec::frame_type::DATA_RECORD);
         match self {
             Self::Control => !payload,
             Self::Reliable => payload,
@@ -2814,15 +2817,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_carries_a_proof_bearing_range() {
-        // A lane carries a PROOF_BUNDLE and the records it covers. Allowing
-        // only DATA_RECORD made proof-bearing transfer impossible, which
-        // nothing noticed until a receiver was wired to a session.
-        for frame_type in [frame_type::PROOF_BUNDLE, frame_type::DATA_RECORD] {
-            assert!(Lane::Reliable.carries(frame_type), "{frame_type:#x}");
-            assert!(!Lane::Control.carries(frame_type), "{frame_type:#x}");
-        }
+    fn a_lane_carries_the_payload_and_the_control_stream_describes_it() {
+        // A PROOF_BUNDLE is bounded by the negotiated control ceiling, which a
+        // lane does not carry: every backend frames a lane at the fixed record
+        // limit, so a proof above it could be routed and never sent.
+        assert!(Lane::Reliable.carries(frame_type::DATA_RECORD));
+        assert!(!Lane::Control.carries(frame_type::DATA_RECORD));
         for frame_type in [
+            frame_type::PROOF_BUNDLE,
             frame_type::HELLO,
             frame_type::SETTINGS,
             frame_type::MANIFEST_PAGE,

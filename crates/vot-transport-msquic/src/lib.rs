@@ -3956,15 +3956,16 @@ pub mod live {
             receiver.admit(subject).unwrap();
             assert!(!receiver.is_verified(subject));
 
-            let mut frames = vec![{
-                let mut out = Vec::new();
-                vot_codec::frames::encode(
-                    &vot_codec::frames::TypedFrame::ProofBundle(bundle),
-                    &mut out,
-                )
-                .unwrap();
-                out
-            }];
+            // The proof describes the range and is bounded by the control
+            // ceiling, so it goes on the control stream; the records it covers
+            // are the payload and go on a lane.
+            let mut proof = Vec::new();
+            vot_codec::frames::encode(
+                &vot_codec::frames::TypedFrame::ProofBundle(bundle),
+                &mut proof,
+            )
+            .unwrap();
+            client.send_control(&proof).unwrap();
             for record in records {
                 let mut out = Vec::new();
                 vot_codec::frames::encode(
@@ -3972,10 +3973,7 @@ pub mod live {
                     &mut out,
                 )
                 .unwrap();
-                frames.push(out);
-            }
-            for frame in frames {
-                client.send_reliable(StreamId(1), &frame).unwrap();
+                client.send_reliable(StreamId(1), &out).unwrap();
             }
             client.flush().unwrap();
 

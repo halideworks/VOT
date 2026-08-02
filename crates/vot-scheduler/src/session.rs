@@ -9,7 +9,7 @@
 //! Held, not unbounded: a peer that sends records for a bundle it never
 //! completes would otherwise grow this without limit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vot_codec::frames::{DataRecord, ProofBundle, TypedFrame};
 use vot_session::Session;
@@ -41,6 +41,36 @@ pub const DEFAULT_ORPHAN_BUNDLES: usize = 2;
 /// Bytes held for records that arrived before their proof.
 pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUNDLE_BYTES;
 
+/// Delivered bundle identities remembered so an exact replay stays idempotent.
+pub const REMEMBERED_BUNDLES: usize = 64;
+
+/// What a delivered bundle covered.
+///
+/// `spec/wire.md` section 5 deduplicates on request and range identity, so this
+/// is what a replay is compared against. The proof bytes are not kept: the
+/// subject is already verified and no proof arriving afterwards can change
+/// that, so a replay is either the same range or a conflicting one.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Delivered {
+    subject: SubjectId,
+    covered_offset: u64,
+    covered_length: u64,
+}
+
+impl Delivered {
+    fn of(bundle: &ProofBundle) -> Self {
+        Self {
+            subject: SubjectId {
+                suite: bundle.object.suite,
+                root: bundle.object.root,
+                length: bundle.object.length,
+            },
+            covered_offset: bundle.covered_offset,
+            covered_length: bundle.covered_length,
+        }
+    }
+}
+
 /// A bundle and the records that belong to it, in whichever order they came.
 #[derive(Default)]
 struct Pending {
@@ -71,6 +101,12 @@ impl Pending {
     }
 }
 
+/// Whether a control frame is the proof that describes a range.
+fn is_proof_bundle(frame: &[u8]) -> bool {
+    vot_codec::decode_varint(frame)
+        .is_ok_and(|(frame_type, _)| frame_type == vot_codec::frame_type::PROOF_BUNDLE)
+}
+
 /// A receiver fed by a session over a real carrier.
 pub struct SessionReceiver<A> {
     session: Session<A>,
@@ -84,6 +120,7 @@ pub struct SessionReceiver<A> {
     /// authentication and authorization frames are unimplemented, so a subject
     /// is admitted by an explicit call rather than by a peer asking.
     admitted: BTreeSet<SubjectId>,
+    delivered: VecDeque<([u8; 16], Delivered)>,
     credit_applied: bool,
 }
 
@@ -100,6 +137,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
             orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
             admitted: BTreeSet::new(),
+            delivered: VecDeque::new(),
             credit_applied: false,
         }
     }
@@ -212,16 +250,20 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                     self.receiver.acknowledged(ack);
                     return Ok(Some(Event::Acknowledged(ack)));
                 }
-                // A lane carries a proof-bearing range and nothing else, which
-                // the session enforces, so every record reaching here is one.
+                // A lane carries payload and nothing else, which the session
+                // enforces, so every frame reaching here is a record.
                 Event::Reliable { bytes, .. } => self.accept_record(&bytes)?,
+                // The proof that describes a range is bounded by the control
+                // ceiling, not the record limit, so it arrives here rather
+                // than on the lane its records travel.
+                Event::Control(bytes) if is_proof_bundle(&bytes) => self.accept_bundle(&bytes)?,
                 other => return Ok(Some(other)),
             }
         }
         Ok(None)
     }
 
-    /// Feeds one frame from a lane.
+    /// Feeds one record from a lane.
     fn accept_record(&mut self, frame: &[u8]) -> Result<(), Error> {
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: vot_transport_api::MAX_DATA_RECORD_BYTES,
@@ -230,10 +272,26 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let (typed, _) =
             vot_codec::frames::decode(frame, limits).map_err(|_| Error::ProofInvalid)?;
         match typed {
-            TypedFrame::ProofBundle(bundle) => self.hold_bundle(bundle),
             TypedFrame::DataRecord(record) => self.hold_record(record),
-            // Unreachable while the session holds a lane to these two types,
-            // and a silent success here would hide it if that changed.
+            // Unreachable while the session holds a lane to one type, and a
+            // silent success here would hide it if that changed.
+            _ => Err(Error::ProofInvalid),
+        }
+    }
+
+    /// Feeds one proof from the control stream.
+    fn accept_bundle(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: usize::try_from(
+                self.session.local_settings().max_control_frame_payload,
+            )
+            .map_err(|_| Error::LengthExceeded)?,
+            max_frames: 1,
+        };
+        let (typed, _) =
+            vot_codec::frames::decode(frame, limits).map_err(|_| Error::ProofInvalid)?;
+        match typed {
+            TypedFrame::ProofBundle(bundle) => self.hold_bundle(bundle),
             _ => Err(Error::ProofInvalid),
         }
     }
@@ -250,6 +308,15 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             return Err(Error::UnknownObject);
         }
         let id = bundle.bundle_id;
+        if let Some((_, prior)) = self.delivered.iter().find(|(seen, _)| *seen == id) {
+            // Already delivered. An exact replay is idempotent; a different
+            // range under the same identity is a conflicting duplicate.
+            return if *prior == Delivered::of(&bundle) {
+                Ok(())
+            } else {
+                Err(Error::ProofInvalid)
+            };
+        }
         if let Some(held) = self
             .pending
             .get(&id)
@@ -288,6 +355,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
 
     fn hold_record(&mut self, record: DataRecord) -> Result<(), Error> {
         let id = record.bundle_id;
+        if self.delivered.iter().any(|(seen, _)| *seen == id) {
+            // Its bundle is verified and gone. Holding the record would leave
+            // an entry that can never complete, which is also what a replayed
+            // record would cost this endpoint.
+            return Ok(());
+        }
         let orphan = self
             .pending
             .get(&id)
@@ -370,6 +443,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let Some(bundle) = pending.bundle else {
             return Ok(());
         };
+        if self.delivered.len() == REMEMBERED_BUNDLES {
+            self.delivered.pop_front();
+        }
+        self.delivered.push_back((id, Delivered::of(&bundle)));
         let subject = SubjectId {
             suite: bundle.object.suite,
             root: bundle.object.root,
@@ -437,11 +514,17 @@ mod tests {
     }
 
     /// One frame on a lane, which is how a record reaches a session.
-    fn lane(bytes: &[u8]) -> Event {
-        Event::Reliable {
-            stream: StreamId(1),
-            sequence: 1,
-            bytes: Payload::from(bytes),
+    /// Delivers a frame the way the session would: payload on a lane, the
+    /// proof that describes it on the control stream.
+    fn carried(bytes: &[u8]) -> Event {
+        if is_proof_bundle(bytes) {
+            Event::Control(Payload::from(bytes))
+        } else {
+            Event::Reliable {
+                stream: StreamId(1),
+                sequence: 1,
+                bytes: Payload::from(bytes),
+            }
         }
     }
 
@@ -453,8 +536,12 @@ mod tests {
 
     /// An object, its subject, and a bundle covering all of it in two records.
     fn object() -> (SubjectId, ProofBundle, Vec<DataRecord>) {
+        object_of(0x5a, [2; 16])
+    }
+
+    fn object_of(fill: u8, id: [u8; 16]) -> (SubjectId, ProofBundle, Vec<DataRecord>) {
         let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
-        let bytes = vec![0x5a; unit * 2];
+        let bytes = vec![fill; unit * 2];
         let subject = SubjectId {
             suite: 1,
             root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
@@ -463,7 +550,7 @@ mod tests {
         let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
         let bundle = ProofBundle {
             request_id: [1; 16],
-            bundle_id: [2; 16],
+            bundle_id: id,
             object: ObjectId {
                 suite: subject.suite,
                 root: subject.root,
@@ -479,7 +566,7 @@ mod tests {
         };
         let records = vec![
             DataRecord {
-                bundle_id: [2; 16],
+                bundle_id: id,
                 record_index: 0,
                 plaintext_offset: 0,
                 plaintext_length: crate::RANGE_UNIT_BYTES,
@@ -487,7 +574,7 @@ mod tests {
                 encoded: bytes[..unit].to_vec(),
             },
             DataRecord {
-                bundle_id: [2; 16],
+                bundle_id: id,
                 record_index: 1,
                 plaintext_offset: crate::RANGE_UNIT_BYTES,
                 plaintext_length: crate::RANGE_UNIT_BYTES,
@@ -548,13 +635,13 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         for record in &records {
             driver
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
         }
 
         // Proof-bearing frames are consumed rather than handed to the caller.
@@ -575,7 +662,7 @@ mod tests {
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bundles(), 1, "held for the bundle");
@@ -587,7 +674,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
         assert_eq!(driver.pending_bundles(), 0);
@@ -606,7 +693,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap_err(), Error::UnknownObject);
         assert_eq!(driver.pending_bundles(), 0);
     }
@@ -624,7 +711,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(records[0].clone()))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(records[0].clone()))));
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bundles(), 1);
 
@@ -635,7 +722,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(other))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(other))));
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
 
         // The bound itself is allowed, and one below it would refuse a
@@ -681,7 +768,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bytes(), proof);
 
@@ -689,7 +776,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(records[0].clone()))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(records[0].clone()))));
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bytes(), proof + records[0].encoded.len());
     }
@@ -710,20 +797,20 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(stray))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(stray))));
         assert_eq!(driver.poll().unwrap(), None);
 
         driver
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         for record in &records {
             driver
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -769,7 +856,7 @@ mod tests {
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bytes(), limit, "the bound itself is held");
@@ -780,7 +867,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(extra))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(extra))));
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
         assert_eq!(driver.pending_bytes(), limit, "a refusal holds nothing");
     }
@@ -803,7 +890,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(stray))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(stray))));
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.orphan_bundles(), 1, "the orphan budget is full");
         assert_eq!(driver.pending_bundles(), 1);
@@ -816,7 +903,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(second))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(second))));
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.orphan_bundles(), 1);
 
@@ -825,13 +912,13 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         for record in &records {
             driver
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -855,7 +942,7 @@ mod tests {
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&frame)));
+                .push_back(carried(&wire(&frame)));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bundles(), 1);
@@ -871,7 +958,7 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::DataRecord(conflicting))));
+            .push_back(carried(&wire(&TypedFrame::DataRecord(conflicting))));
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }
 
@@ -894,14 +981,14 @@ mod tests {
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         driver
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }
 
@@ -919,18 +1006,120 @@ mod tests {
             .session_mut()
             .driver()
             .events
-            .push_back(lane(&wire(&TypedFrame::ProofBundle(bundle))));
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         for record in &records {
             driver
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&TypedFrame::DataRecord(record.clone()))));
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
         }
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject), "the range still verified");
         assert!(!driver.credit_applied(), "and the credit did not apply");
         assert!(driver.session().adapter().credit.is_empty());
+    }
+
+    /// Pushes a bundle and its records the way the session would carry them.
+    fn push_object(
+        driver: &mut SessionReceiver<Loopback>,
+        bundle: &ProofBundle,
+        records: &[DataRecord],
+    ) {
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
+        for record in records {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+    }
+
+    #[test]
+    fn a_control_frame_that_is_not_a_proof_passes_through() {
+        // Only the proof is consumed here. Swallowing the rest of the control
+        // stream would silently drop everything the application waits on.
+        let mut driver = ready();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::PING, &[], &mut frame).unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(frame.as_slice())));
+        assert!(matches!(driver.poll().unwrap(), Some(Event::Control(_))));
+    }
+
+    #[test]
+    fn more_than_one_delivered_bundle_is_remembered() {
+        // The memory is a queue with a bound. Evicting on every delivery would
+        // leave only the last one, and the replay of anything earlier would
+        // fail.
+        let (first_subject, first_bundle, first_records) = object();
+        let (second_subject, second_bundle, second_records) = object_of(0x17, [3; 16]);
+        let mut driver = ready();
+        driver.admit(first_subject).unwrap();
+        driver.admit(second_subject).unwrap();
+        push_object(&mut driver, &first_bundle, &first_records);
+        push_object(&mut driver, &second_bundle, &second_records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(first_subject) && driver.is_verified(second_subject));
+
+        // The older of the two is replayed, so a memory of one is not enough.
+        push_object(&mut driver, &first_bundle, &first_records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bundles(), 0, "the replay held nothing");
+    }
+
+    #[test]
+    fn a_replay_of_a_delivered_bundle_is_idempotent() {
+        // The pending entry is gone and the subject's range state is closed, so
+        // without a memory of what was delivered a protocol-required retry is
+        // reassembled and fails with UnknownObject.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        let frames: Vec<Vec<u8>> = std::iter::once(wire(&TypedFrame::ProofBundle(bundle.clone())))
+            .chain(
+                records
+                    .iter()
+                    .map(|record| wire(&TypedFrame::DataRecord(record.clone()))),
+            )
+            .collect();
+        for _ in 0..2 {
+            for frame in &frames {
+                driver
+                    .session_mut()
+                    .driver()
+                    .events
+                    .push_back(carried(frame));
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        assert_eq!(driver.pending_bundles(), 0, "the replay held nothing");
+
+        // A different object under the same identity is still a conflict.
+        let mut conflicting = bundle;
+        conflicting.object.root = [9; 32];
+        driver
+            .admit(SubjectId {
+                suite: conflicting.object.suite,
+                root: conflicting.object.root,
+                length: conflicting.object.length,
+            })
+            .unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(conflicting))));
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }
 
     #[test]
@@ -948,7 +1137,7 @@ mod tests {
                 .session_mut()
                 .driver()
                 .events
-                .push_back(lane(&wire(&frame)));
+                .push_back(carried(&wire(&frame)));
         }
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }

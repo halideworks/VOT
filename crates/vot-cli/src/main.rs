@@ -38,6 +38,22 @@ fn run() -> Result<(), vot_cli::Error> {
             );
             Ok(())
         }
+        [_, command, receipt, key] if command == "verify-receipt" => {
+            let key = vot_cli::load_key_spec(key)?;
+            let verified = vot_cli::verify_receipt_file(Path::new(receipt), &key)?;
+            println!(
+                "{} {} {:?} {}",
+                root_hex(&verified.root),
+                verified.logical_length,
+                verified.assurance,
+                if verified.third_party_verifiable {
+                    "THIRD-PARTY-VERIFIABLE"
+                } else {
+                    "SHARED-SECRET"
+                }
+            );
+            Ok(())
+        }
         _ => Err(vot_cli::Error::InvalidArguments),
     }
 }

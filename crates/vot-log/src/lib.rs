@@ -562,9 +562,9 @@ pub fn verify_checkpoint(
     required: usize,
 ) -> Result<Vec<String>, Error> {
     let body = signed.checkpoint.body()?;
-    // Keyed by public key, not by name. A policy that lists one key under two
-    // names would otherwise let a single key pair satisfy a threshold of two,
-    // which is not two independent witnesses.
+    // Counted only once per name and once per key. A policy can alias one key
+    // under two names, or hold two keys under one name during rotation, and
+    // either way that is one witness, not two.
     let mut accepted: Vec<(String, [u8; 32])> = Vec::new();
     for signature in &signed.signatures {
         let bytes: [u8; 64] = match signature.signature.as_slice().try_into() {
@@ -585,7 +585,9 @@ pub fn verify_checkpoint(
                 .key
                 .verify_strict(body.as_bytes(), &Signature::from_bytes(&bytes))
                 .is_ok()
-                && !accepted.iter().any(|(_, seen)| *seen == public)
+                && !accepted
+                    .iter()
+                    .any(|(name, seen)| *seen == public || *name == witness.name)
             {
                 accepted.push((witness.name.clone(), public));
             }
@@ -973,8 +975,9 @@ mod tests {
             Err(Error::Unwitnessed)
         );
 
-        // And one key listed under two names is still one witness, or a policy
-        // that aliases a key would silently halve the threshold it asked for.
+        // One witness stays one witness however the policy spells it: one key
+        // under two names, or two keys under one name during a rotation.
+        // Either way a threshold of two must not be satisfied by one party.
         let aliased = vec![
             WitnessKey {
                 name: "alpha".to_owned(),
@@ -991,6 +994,27 @@ mod tests {
         assert_eq!(verify_checkpoint(&doubled, &aliased, 1).unwrap().len(), 1);
         assert_eq!(
             verify_checkpoint(&doubled, &aliased, 2),
+            Err(Error::Unwitnessed)
+        );
+
+        let rotating = SigningKey::from_bytes(&[33; 32]);
+        let two_keys_one_name = vec![
+            WitnessKey {
+                name: "alpha".to_owned(),
+                key: alpha.verifying_key(),
+            },
+            WitnessKey {
+                name: "alpha".to_owned(),
+                key: rotating.verifying_key(),
+            },
+        ];
+        let mut rotated = checkpoint_of(&log_of(9));
+        sign_checkpoint(&mut rotated, "alpha", &alpha).unwrap();
+        sign_checkpoint(&mut rotated, "alpha", &rotating).unwrap();
+        let names = verify_checkpoint(&rotated, &two_keys_one_name, 1).unwrap();
+        assert_eq!(names, ["alpha"]);
+        assert_eq!(
+            verify_checkpoint(&rotated, &two_keys_one_name, 2),
             Err(Error::Unwitnessed)
         );
     }

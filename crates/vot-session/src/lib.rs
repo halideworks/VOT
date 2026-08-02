@@ -242,7 +242,25 @@ impl Negotiation {
         self.peer_settings
     }
 
-    /// The extensions both endpoints advertised.
+    /// The extensions this endpoint may send under.
+    ///
+    /// Always empty, and that is the specification gap rather than a policy.
+    /// Only the client sends `HELLO`, so a server can compute an intersection
+    /// and a client cannot. Sending under the server's half would put a frame
+    /// on the wire that the client is obliged to refuse, closing a session that
+    /// had negotiated correctly.
+    ///
+    /// Strict about what is sent, and [`negotiated_extensions`] for what is
+    /// accepted. This becomes the intersection once the exchange can confirm
+    /// extensions in both directions.
+    ///
+    /// [`negotiated_extensions`]: Self::negotiated_extensions
+    #[must_use]
+    pub fn usable_extensions(&self) -> BTreeSet<u64> {
+        BTreeSet::new()
+    }
+
+    /// The extensions both endpoints advertised, which bound what is accepted.
     ///
     /// Advertising one does not authorise it, so this is the intersection.
     /// Empty until the peer's `HELLO` arrives, which is what keeps an
@@ -913,7 +931,7 @@ impl<A: TransportAdapter> Session<A> {
         check_frame(
             frame,
             &peer,
-            &self.negotiation.negotiated_extensions(),
+            &self.negotiation.usable_extensions(),
             lane,
             Side::Peer,
         )
@@ -2521,7 +2539,8 @@ mod tests {
         }
         client.poll().unwrap();
 
-        // The server saw the offer, so it has an intersection.
+        // The server saw the offer, so it can compute an intersection and
+        // will accept an experimental frame from the client.
         assert_eq!(
             server.negotiation.negotiated_extensions(),
             BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
@@ -2529,6 +2548,19 @@ mod tests {
         // The client saw no HELLO, so it has none and refuses either way.
         assert!(client.negotiation.negotiated_extensions().is_empty());
         assert!(client.send_control(&credit).is_err());
+
+        // And neither may send one. Sending under the server's half would put
+        // a frame on the wire the client is obliged to refuse, closing a
+        // session that had negotiated correctly.
+        assert!(server.negotiation.usable_extensions().is_empty());
+        assert!(client.negotiation.usable_extensions().is_empty());
+        let error = server.send_control(&credit).unwrap_err();
+        assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
+        assert!(!error.kind().is_peer_fault());
+        assert!(
+            server.adapter().closed.is_empty(),
+            "a local refusal does not close the carrier"
+        );
     }
 
     #[test]

@@ -132,10 +132,13 @@ both endpoints must negotiate one before it is used. Only the client sends
 `HELLO`, so the server learns the client's set and the client learns nothing
 about the server's.
 
-A session therefore treats the intersection as negotiated, which on a client is
-always empty. An experimental frame is refused in both directions as a result:
-`DATAGRAM_CREDIT` and the coding-epoch frames close the session with
-`EXPERIMENT_NOT_NEGOTIATED` whatever either side advertised.
+A session is therefore strict about what it sends and uses the intersection only
+for what it accepts. No endpoint may send an experimental frame: a server can
+compute an intersection and a client cannot, so sending under the server's half
+would put a frame on the wire the client is obliged to refuse, closing a session
+that had negotiated correctly. `DATAGRAM_CREDIT` and the coding-epoch frames are
+refused with `EXPERIMENT_NOT_NEGOTIATED` whatever either side advertised: as a
+local refusal on the way out, and as a peer fault on the way in.
 
 That is the safe reading while every experimental feature is disabled by
 default and none are implemented. Making one usable needs the specification to

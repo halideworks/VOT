@@ -451,6 +451,16 @@ pub fn verify_witness(
     .map_err(|_| Error::Authentication)
 }
 
+/// The tuple that identifies what a receipt is about.
+fn subject_identity(receipt: &Receipt) -> (SubjectKind, u16, [u8; 32], u64) {
+    (
+        receipt.subject_kind,
+        receipt.suite_id,
+        receipt.subject_digest,
+        receipt.subject_length,
+    )
+}
+
 /// Checks that a sequence of observations forms one unbroken chain.
 ///
 /// Each entry must link to its predecessor's envelope digest, carry the same
@@ -465,23 +475,17 @@ pub fn verify_chain(chain: &[AuthenticatedReceipt]) -> Result<(), Error> {
     if first.receipt.previous.is_some() {
         return Err(Error::ChainBroken);
     }
-    let subject = (
-        first.receipt.subject_kind,
-        first.receipt.subject_digest,
-        first.receipt.subject_length,
-    );
+    // Object identity is the suite, the root, and the length. Identical digest
+    // bytes under different suites are different objects, so leaving the suite
+    // out would let a chain mix two of them.
+    let subject = subject_identity(&first.receipt);
     let mut previous_digest = first.digest()?;
     let mut previous_sequence = first.receipt.sequence;
     for entry in chain.iter().skip(1) {
         if entry.receipt.previous != Some(previous_digest) {
             return Err(Error::ChainBroken);
         }
-        if (
-            entry.receipt.subject_kind,
-            entry.receipt.subject_digest,
-            entry.receipt.subject_length,
-        ) != subject
-        {
+        if subject_identity(&entry.receipt) != subject {
             return Err(Error::ChainSubjectMismatch);
         }
         if entry.receipt.sequence <= previous_sequence {
@@ -1167,14 +1171,33 @@ mod tests {
         let signed = chain(&key, &[AssuranceLevel::Admitted, AssuranceLevel::Durable]);
         verify_chain(&signed).unwrap();
 
-        // An entry about a different subject.
-        let mut foreign = signed[1].receipt.clone();
-        foreign.subject_digest = [0xfe; 32];
-        let foreign = sign_ed25519(foreign, b"issuer-1", &key).unwrap();
-        assert_eq!(
-            verify_chain(&[signed[0].clone(), foreign]),
-            Err(Error::ChainSubjectMismatch)
-        );
+        // An entry about a different subject. Identity is the suite, the root
+        // and the length, so each of them has to break the chain.
+        for divergent in [
+            Receipt {
+                subject_digest: [0xfe; 32],
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                subject_length: signed[1].receipt.subject_length + 1,
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                // Same digest bytes under another suite is another object.
+                suite_id: 2,
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                subject_kind: SubjectKind::Package,
+                ..signed[1].receipt.clone()
+            },
+        ] {
+            let foreign = sign_ed25519(divergent, b"issuer-1", &key).unwrap();
+            assert_eq!(
+                verify_chain(&[signed[0].clone(), foreign]),
+                Err(Error::ChainSubjectMismatch)
+            );
+        }
 
         // A sequence that does not advance.
         let mut stalled = signed[1].receipt.clone();

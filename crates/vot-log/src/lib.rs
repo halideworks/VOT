@@ -234,7 +234,9 @@ pub fn verify_inclusion(
     proof: &[Hash],
     root: &Hash,
 ) -> Result<(), Error> {
-    if size == 0 || index >= size {
+    // A size is attacker supplied by way of a checkpoint, and a full-width
+    // shift in the decomposition would panic rather than fail.
+    if size == 0 || size > MAX_ENTRIES || index >= size {
         return Err(Error::OutOfRange);
     }
     let (inner, border) = decompose(index, size);
@@ -276,7 +278,7 @@ pub fn verify_consistency(
     new_root: &Hash,
     proof: &[Hash],
 ) -> Result<(), Error> {
-    if old_size == 0 || old_size > new_size {
+    if old_size == 0 || old_size > new_size || new_size > MAX_ENTRIES {
         return Err(Error::OutOfRange);
     }
     if old_size == new_size {
@@ -385,6 +387,19 @@ const ED25519_NOTE_ALGORITHM: u8 = 0x01;
 const MAX_NOTE_BYTES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 256;
 
+/// Whether a name may appear in a signed note.
+///
+/// These are the rules Go's signed-note tooling applies: non-empty, no plus
+/// sign, and no Unicode whitespace. Interoperating with that tooling is the
+/// whole reason for this format, so a name it would reject must not be emitted
+/// here either.
+fn valid_note_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_BYTES
+        && !name.contains('+')
+        && !name.chars().any(char::is_whitespace)
+}
+
 /// Identifier a note signature carries so a verifier can select a key.
 #[must_use]
 pub fn note_key_hash(name: &str, public_key: &[u8; 32]) -> [u8; 4] {
@@ -436,10 +451,7 @@ impl SignedCheckpoint {
         let mut note = self.checkpoint.body()?;
         note.push('\n');
         for signature in &self.signatures {
-            if signature.name.is_empty()
-                || signature.name.len() > MAX_NAME_BYTES
-                || signature.name.contains(['\n', ' '])
-            {
+            if !valid_note_name(&signature.name) {
                 return Err(Error::Malformed);
             }
             let mut blob = signature.key_hash.to_vec();
@@ -515,7 +527,7 @@ pub fn sign_checkpoint(
     name: &str,
     key: &SigningKey,
 ) -> Result<(), Error> {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.contains(['\n', ' ']) {
+    if !valid_note_name(name) {
         return Err(Error::Malformed);
     }
     let body = signed.checkpoint.body()?;
@@ -1039,6 +1051,76 @@ mod tests {
         }
         line(remaining - LINE_OVERHEAD, &mut signed);
         signed.to_note().unwrap()
+    }
+
+    #[test]
+    fn an_absurd_tree_size_is_refused_rather_than_crashing() {
+        // A size arrives inside a checkpoint, so it is attacker supplied. A
+        // full width shift in the proof decomposition would panic.
+        let root = [0; 32];
+        assert_eq!(
+            verify_inclusion(&root, 0, usize::MAX, &[], &root),
+            Err(Error::OutOfRange)
+        );
+        assert_eq!(
+            verify_inclusion(&root, 0, MAX_ENTRIES + 1, &[], &root),
+            Err(Error::OutOfRange)
+        );
+        assert_eq!(
+            verify_consistency(1, &root, usize::MAX, &root, &[]),
+            Err(Error::OutOfRange)
+        );
+
+        // The limit itself is allowed through, and then fails on proof length
+        // rather than range. Testing only past the limit would not observe
+        // where the limit is.
+        assert_eq!(
+            verify_inclusion(&root, 0, MAX_ENTRIES, &[], &root),
+            Err(Error::ProofInvalid)
+        );
+        assert_eq!(
+            verify_consistency(1, &root, MAX_ENTRIES, &root, &[]),
+            Err(Error::ProofInvalid)
+        );
+        // And a note can carry such a size, so the two must agree.
+        let mut signed = checkpoint_of(&log_of(2));
+        signed.checkpoint.size = usize::MAX;
+        let note = signed.to_note().unwrap();
+        let parsed = SignedCheckpoint::parse_note(&note).unwrap();
+        assert_eq!(
+            verify_inclusion(&root, 0, parsed.checkpoint.size, &[], &root),
+            Err(Error::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn signer_names_follow_the_signed_note_rules() {
+        // Go's tooling rejects a plus sign and any Unicode whitespace. Emitting
+        // a name it would reject defeats the reason for using this format.
+        let mut signed = checkpoint_of(&log_of(3));
+        let key = SigningKey::from_bytes(&[81; 32]);
+        for bad in [
+            "",
+            "has space",
+            "has\nnewline",
+            "has\ttab",
+            "has\rreturn",
+            "has+plus",
+            "has\u{00a0}nbsp",
+            "has\u{2003}emspace",
+        ] {
+            assert_eq!(
+                sign_checkpoint(&mut signed, bad, &key),
+                Err(Error::Malformed),
+                "accepted {bad:?}"
+            );
+        }
+        for good in ["vot.example", "witness-1", "a.b/c", "\u{00e9}quipe"] {
+            assert!(sign_checkpoint(&mut signed, good, &key).is_ok(), "{good}");
+        }
+        // to_note applies the same rules, not a weaker set.
+        signed.signatures[0].name = "bad+name".to_owned();
+        assert_eq!(signed.to_note(), Err(Error::Malformed));
     }
 
     #[test]

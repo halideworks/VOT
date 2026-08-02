@@ -53,9 +53,41 @@ Verify and publish a bundle, then write an authenticated receipt:
 cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor KEY_SOURCE 2026-07-31T20:00:00Z
 ```
 
-KEY_SOURCE is `env:NAME`, `-` for stdin, or a file path. Raw key bytes
-(32–64 bytes) are preserved as-is; hexadecimal text must begin with `hex:` (and textual raw keys may begin with `raw:`). The receiver refuses to replace an
-existing destination or receipt.
+The receiver refuses to replace an existing destination or receipt.
+
+Check a receipt without the bundle:
+
+```sh
+cargo run -p vot-cli -- verify-receipt RECEIPT.cbor KEY_SOURCE
+```
+
+`cargo run -p vot-cli -- help` prints the same reference as below.
+
+### Keys
+
+KEY_SOURCE says where to read the key from: `env:NAME`, `-` for standard input,
+or a file path. What it reads decides the kind of key:
+
+| Contents | Meaning |
+| --- | --- |
+| `ed25519-secret:HEX` | signs; 64 hex characters. `receive` only |
+| `ed25519-public:HEX` | checks a signature; 64 hex characters |
+| `hex:HEX` | shared secret, 32 to 64 bytes |
+| `raw:TEXT` | shared secret as text |
+| anything else | shared secret as raw bytes, 32 to 64 bytes |
+
+An Ed25519 key is labelled because a secret and a public key are both 32 bytes,
+and using one as the other would either leak the secret or produce receipts
+nobody can check.
+
+A receipt signed with `ed25519-secret` can be checked by anyone holding only the
+matching `ed25519-public` key, and `verify-receipt` reports
+`THIRD-PARTY-VERIFIABLE`. A shared secret cannot: whoever can check it can also
+forge it, so those report `SHARED-SECRET`.
+
+An auditor holding only the public key can run `verify-receipt`, but not
+`receive`, which has to sign. The one exception is finishing a publication that
+was interrupted after its receipt was already signed.
 
 ## License
 

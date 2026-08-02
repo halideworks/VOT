@@ -674,6 +674,14 @@ pub fn receive_bundle(
     key: &KeyMaterial,
     observed_at: &str,
 ) -> Result<ReceiveReport, Error> {
+    // Receiving ends in publication, which needs a private key. Checking here
+    // rather than at signing time matters: by then the whole bundle has been
+    // copied into staging, and nothing removes that tree on the way out, so a
+    // misconfigured key would leave a full hidden copy of the package behind
+    // and another one for every retry.
+    if matches!(key, KeyMaterial::Verifying(_)) {
+        return Err(Error::InvalidArguments);
+    }
     let receipt_summary_path = receipt_path.with_extension("json");
     if receipt_path == receipt_summary_path {
         return Err(Error::InvalidArguments);
@@ -2709,6 +2717,57 @@ mod tests {
 
         fs::remove_file(&receipt_path).unwrap();
         fs::remove_file(&maced).unwrap();
+    }
+
+    #[test]
+    fn a_verifier_only_key_is_refused_before_anything_is_staged() {
+        // Failing at signing time would already have copied the whole bundle
+        // into staging, and nothing removes that tree, so every retry would
+        // leave another hidden copy of the package on disk.
+        let source = temporary("verify-only-src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("asset.bin"), vec![7; 4096]).unwrap();
+        let bundle = temporary("verify-only.bundle");
+        build_bundle(&source, &bundle).unwrap();
+
+        let destination = temporary("verify-only-dest");
+        let receipt = temporary("verify-only-receipt.cbor");
+        let auditing =
+            KeyMaterial::Verifying(Box::new(SigningKey::from_bytes(&[42; 32]).verifying_key()));
+        assert!(matches!(
+            receive_bundle(
+                &bundle,
+                &destination,
+                &receipt,
+                &auditing,
+                "2026-08-02T00:00:00Z"
+            ),
+            Err(Error::InvalidArguments)
+        ));
+
+        // No staging tree, no destination, no receipt.
+        assert!(!staging_path(&destination).unwrap().exists());
+        assert!(!destination.exists());
+        assert!(!receipt.exists());
+
+        // The same call with a signing key does publish, so the refusal is
+        // about the key material and not about the bundle.
+        let signing = KeyMaterial::Signing(Box::new(SigningKey::from_bytes(&[42; 32])));
+        receive_bundle(
+            &bundle,
+            &destination,
+            &receipt,
+            &signing,
+            "2026-08-02T00:00:00Z",
+        )
+        .unwrap();
+        assert!(receipt.exists());
+
+        fs::remove_dir_all(&source).unwrap();
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&bundle).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        fs::remove_file(receipt.with_extension("json")).unwrap();
     }
 
     #[test]

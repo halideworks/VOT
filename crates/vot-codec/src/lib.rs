@@ -18,7 +18,7 @@ pub const DEFAULT_MAX_UNKNOWN_PAYLOAD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FRAMES_PER_BATCH: usize = 4096;
 pub const MAX_SETTINGS_PER_FRAME: usize = 128;
 pub const MAX_EXTENSIONS_PER_HELLO: usize = 256;
-pub const DRAFT_REVISION: u64 = 3;
+pub const DRAFT_REVISION: u64 = 4;
 
 pub mod setting_id {
     pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 0x01;
@@ -1153,7 +1153,9 @@ mod tests {
             Err(HelloError::RoleMismatch { .. })
         ));
 
-        let server = [3, 1, 0];
+        // The leading value is the draft revision, so this literal moves with
+        // it rather than being a constant that happens to have matched.
+        let server = [u8::try_from(DRAFT_REVISION).unwrap(), 1, 0];
         assert_eq!(
             decode_hello(&server, EndpointRole::Server)
                 .unwrap()

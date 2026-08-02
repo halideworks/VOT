@@ -177,7 +177,7 @@ audit metadata only.
 
 ## 6. Wire and transport architecture
 
-The prototype ALPN is `vot-draft-03`. It MUST NOT claim the unregistered
+The prototype ALPN is `vot-draft-04`. It MUST NOT claim the unregistered
 `vot/1` ALPN. A major incompatible version uses a new ALPN; compatible features
 use `SETTINGS`, registered extension identifiers, and optional frames.
 
@@ -270,7 +270,7 @@ end-to-end deadline certificate.
 | Manifest page maximum | 1 MiB canonical bytes |
 | Session/incarnation identifier | 128 random bits |
 | Default reliable lane count | 16, locally tunable |
-| Prototype ALPN | `vot-draft-03` |
+| Prototype ALPN | `vot-draft-04` |
 | Default idle timeout | 90 s |
 | Active keepalive | 20 s |
 | Online VCRC objective | CVaR95 |
@@ -290,7 +290,7 @@ stable implementation record. All are accepted; none are waived.
 | R3: Risk certificate and exhaustion | Accept | First-wave frontier event and monotonic spend-down ledger; reliable-only behavior at exhaustion; no automatic reset. See ADR-0002. |
 | R4: Congestion-control scope | Accept | Production does not depend on custom CC; clean-room controller remains simulator-only pending safety, coexistence, and legal review. |
 | R5: Proof suites and transport | Accept | Exactly two v1 suites and in-band range proofs; no mandatory proof-index bootstrap. See ADR-0003. |
-| R6: Versioning and extensions | Accept | `vot-draft-03`, length-delimited frames, critical/optional handling, greasing, and registries. |
+| R6: Versioning and extensions | Accept | `vot-draft-04`, length-delimited frames, critical/optional handling, greasing, and registries. |
 | R7: Connection, CID, and credit behavior | Accept | Fixed initial timeout/keepalive defaults, opaque deployable CIDs, bounded reliable flow control, monotonic datagram credit epochs. |
 | R8: Rail policy and restored requirements | Accept | Single production public rail per bottleneck; provisioned multi-rail by policy; restored commit, resume, pack, compression, legal, security, GC, and telemetry gates remain normative. See ADR-0004. |
 

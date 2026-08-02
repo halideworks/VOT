@@ -910,6 +910,142 @@ mod tests {
         }
     }
 
+    /// Pulls one hex string out of the conformance vector without a JSON
+    /// dependency. The file is flat and machine-generated, so a field lookup is
+    /// enough, and `tools/validate_receipt_vectors.py` parses it properly.
+    fn vector_field(name: &str) -> Vec<u8> {
+        vector_field_after("{", name)
+    }
+
+    /// `authenticator_hex` and the key fields appear once per scheme, so a
+    /// lookup says which scheme it means rather than relying on file order.
+    fn vector_field_after(marker: &str, name: &str) -> Vec<u8> {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/receipt/signing-transcript.json"
+        ))
+        .expect("conformance vector is missing");
+        let from = text
+            .find(marker)
+            .unwrap_or_else(|| panic!("no marker {marker}"));
+        let text = &text[from..];
+        let key = format!("\"{name}\": \"");
+        let start = text.find(&key).unwrap_or_else(|| panic!("no field {name}")) + key.len();
+        let value = &text[start..start + text[start..].find('"').expect("unterminated field")];
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for pair in value.as_bytes().chunks_exact(2) {
+            let digit = |b: u8| match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                _ => panic!("{name} is not hexadecimal"),
+            };
+            bytes.push(digit(pair[0]) * 16 + digit(pair[1]));
+        }
+        bytes
+    }
+
+    #[test]
+    fn the_published_conformance_vector_is_what_this_produces() {
+        // ADR-0007 requires vectors for a wire-visible change, and the point of
+        // publishing one is that somebody else's implementation can check
+        // itself against it. This asserts ours still produces those exact
+        // bytes; tools/validate_receipt_vectors.py rebuilds the same transcript
+        // independently in Python and recomputes the MAC, so the two agreeing
+        // is what makes the file trustworthy rather than merely recorded.
+        let key_id = vector_field("key_id_hex");
+        let canonical = vector_field("canonical_receipt_hex");
+        let seed: [u8; 32] = vector_field("secret_key_seed_hex").try_into().unwrap();
+        let signing = SigningKey::from_bytes(&seed);
+
+        let receipt = Receipt {
+            subject_kind: SubjectKind::Package,
+            suite_id: 1,
+            subject_digest: [0x11; 32],
+            subject_length: 1_048_576,
+            assurance: AssuranceLevel::Published,
+            profile: CommitProfile::Fast,
+            actual_predecessor: AssuranceLevel::AtRestVerified,
+            provider: 1,
+            provider_version: [0, 4, 0],
+            session_id: [0x22; 16],
+            incarnation_id: [0x33; 16],
+            sequence: 7,
+            observed_at: "2026-08-02T00:00:00Z".to_owned(),
+            clock_source: 1,
+            flags: 0,
+            previous: None,
+        };
+        assert_eq!(
+            receipt.canonical_bytes().unwrap(),
+            canonical,
+            "the canonical receipt encoding drifted from the published vector"
+        );
+
+        let signed = sign_ed25519(receipt.clone(), &key_id, &signing).unwrap();
+        assert_eq!(
+            signed.authentication,
+            vector_field_after("\"name\": \"ED25519\"", "authenticator_hex"),
+            "the Ed25519 authenticator drifted from the published vector"
+        );
+        assert_eq!(
+            signing.verifying_key().to_bytes().to_vec(),
+            vector_field("public_key_hex")
+        );
+        verify_ed25519(&signed, &signing.verifying_key()).unwrap();
+        assert_eq!(
+            encode_authenticated(&signed).unwrap(),
+            vector_field("authenticated_envelope_ed25519_hex")
+        );
+
+        let mac_key = vector_field_after("\"name\": \"HMAC_SHA256\"", "secret_key_hex");
+        let maced = authenticate_hmac_sha256(receipt, &key_id, &mac_key).unwrap();
+        assert_eq!(
+            maced.authentication,
+            vector_field_after("\"name\": \"HMAC_SHA256\"", "authenticator_hex"),
+            "the HMAC authenticator drifted from the published vector"
+        );
+        verify_hmac_sha256(&maced, &mac_key).unwrap();
+    }
+
+    #[test]
+    fn the_authenticated_bytes_match_the_registry() {
+        // spec/registries.md defines this input normatively: domain separator,
+        // two-byte scheme, key identifier behind a one-byte length, canonical
+        // receipt. An independent implementation follows that text, not this
+        // crate, so the two agreeing is the whole of interoperability. Pinned
+        // as bytes rather than described, because a test that rebuilt the input
+        // the same way the code does would agree with any format at all.
+        let input = signing_input(AuthScheme::Ed25519, b"receiver-1", &receipt()).unwrap();
+        let canonical = receipt().canonical_bytes().unwrap();
+
+        assert_eq!(&input[..DOMAIN.len()], b"VOT receipt v0\0");
+        let rest = &input[DOMAIN.len()..];
+        assert_eq!(&rest[..2], &[0x00, 0x01], "ED25519 is scheme 0x0001");
+        assert_eq!(rest[2], 10, "the key identifier is length prefixed");
+        assert_eq!(&rest[3..13], b"receiver-1");
+        assert_eq!(&rest[13..], canonical.as_slice());
+        assert_eq!(input.len(), DOMAIN.len() + 3 + 10 + canonical.len());
+
+        // The MAC scheme differs only in the two scheme bytes.
+        let maced = signing_input(AuthScheme::HmacSha256, b"receiver-1", &receipt()).unwrap();
+        assert_eq!(&maced[DOMAIN.len()..DOMAIN.len() + 2], &[0x00, 0x02]);
+        assert_eq!(&maced[DOMAIN.len() + 2..], &input[DOMAIN.len() + 2..]);
+
+        // A one-byte prefix covers the identifier bounds receipt.cddl sets.
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, &[b'k'; 64], &receipt()).unwrap()[DOMAIN.len() + 2],
+            64
+        );
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, &[b'k'; 65], &receipt()),
+            Err(Error::InvalidKeyId)
+        );
+        assert_eq!(
+            signing_input(AuthScheme::Ed25519, b"", &receipt()),
+            Err(Error::InvalidKeyId)
+        );
+    }
+
     #[test]
     fn authentication_binds_every_receipt_field() {
         let key = [9; 32];

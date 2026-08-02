@@ -14,7 +14,7 @@ object identity.
 
 ## Decision
 
-The TCP fallback uses rustls 0.23.43 with the same `vot-draft-03` ALPN and the
+The TCP fallback uses rustls 0.23.43 with the same `vot-draft-04` ALPN and the
 same VOT frame bytes. No VOT plaintext is exposed before the TLS peer and server
 name authenticate. QUIC starts first. TLS/TCP starts after a short configurable
 virtual-time delay and may replace QUIC only after TLS is ready and bounded

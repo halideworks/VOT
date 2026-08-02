@@ -1,7 +1,7 @@
 # TLS plaintext requires VOT ALPN
 
 Criterion: authenticated TLS exposes VOT plaintext only after the peer selects
-the `vot-draft-03` application protocol.
+the `vot-draft-04` application protocol.
 
 Passing evidence: `completed_tls_without_vot_alpn_exposes_no_plaintext`
 completes a certificate-authenticated handshake against a server that omits

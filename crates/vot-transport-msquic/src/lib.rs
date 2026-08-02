@@ -787,15 +787,50 @@ pub mod live {
         /// which also keeps a peer from parking a lane's worth of memory per
         /// stream by fragmenting a frame nobody will read.
         discarding: usize,
+        /// What `pending` currently costs against the shared budget.
+        reserved: usize,
+        budget: Arc<Mutex<CallbackQueue>>,
         kind: StreamKind,
     }
 
     impl Framing {
-        const fn new(kind: StreamKind) -> Self {
+        fn new(kind: StreamKind, budget: Arc<Mutex<CallbackQueue>>) -> Self {
             Self {
                 pending: Vec::new(),
                 discarding: 0,
+                reserved: 0,
+                budget,
                 kind,
+            }
+        }
+
+        /// Buffers bytes of a frame still arriving, against the shared budget.
+        ///
+        /// # Errors
+        /// Reports a budget the peer has already spent, which is a resource
+        /// limit rather than a malformed frame.
+        fn hold(&mut self, bytes: &[u8]) -> Result<(), FrameFault> {
+            if !bytes.is_empty() {
+                let Ok(mut budget) = self.budget.lock() else {
+                    return Err(FrameFault::exhausted());
+                };
+                if !budget.reserve_assembly(bytes.len()) {
+                    return Err(FrameFault::exhausted());
+                }
+                self.reserved += bytes.len();
+            }
+            self.pending.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        /// Drops the buffered frame and returns its cost to the budget.
+        fn release(&mut self) {
+            self.pending.clear();
+            if self.reserved != 0 {
+                if let Ok(mut budget) = self.budget.lock() {
+                    budget.release_assembly(self.reserved);
+                }
+                self.reserved = 0;
             }
         }
 
@@ -843,7 +878,7 @@ pub mod live {
                     let Some(envelope) = self.envelope(limits, None)? else {
                         // Not even the header is complete. It is at most a
                         // couple of varints, so take one byte and look again.
-                        self.pending.push(input[0]);
+                        self.hold(&input[..1])?;
                         input = &input[1..];
                         continue;
                     };
@@ -853,17 +888,20 @@ pub mod live {
                         // The header is buffered but the payload is not, so
                         // only the remainder has to be counted down.
                         self.discarding = needed - taken;
-                        self.pending.clear();
+                        self.release();
                         input = &input[taken..];
                         continue;
                     }
-                    self.pending.extend_from_slice(&input[..taken]);
+                    self.hold(&input[..taken])?;
                     input = &input[taken..];
                     if self.pending.len() < envelope.total_length {
                         return Ok(());
                     }
-                    emit(&self.pending)?;
-                    self.pending.clear();
+                    // Released before the frame is queued, so its bytes are
+                    // charged once rather than to both accounts at the handover.
+                    let complete = std::mem::take(&mut self.pending);
+                    self.release();
+                    emit(&complete)?;
                     continue;
                 }
 
@@ -871,7 +909,7 @@ pub mod live {
                 let Some(envelope) = self.envelope(limits, Some(input))? else {
                     // Only a partial header is left. That is bounded by the
                     // envelope size, not by the payload it describes.
-                    self.pending.extend_from_slice(input);
+                    self.hold(input)?;
                     return Ok(());
                 };
                 if input.len() < envelope.total_length {
@@ -881,7 +919,7 @@ pub mod live {
                         self.discarding = envelope.total_length - input.len();
                         return Ok(());
                     }
-                    self.pending.extend_from_slice(input);
+                    self.hold(input)?;
                     return Ok(());
                 }
                 if !envelope.skipped {
@@ -958,6 +996,14 @@ pub mod live {
             }
         }
 
+        /// The shared budget for frames still arriving is spent.
+        const fn exhausted() -> Self {
+            Self {
+                error: Error::InboundQueueFull,
+                close: vot_codec::error_code::RESOURCE_LIMIT,
+            }
+        }
+
         /// A frame that ended when the carrier did.
         const fn truncated() -> Self {
             Self {
@@ -982,7 +1028,7 @@ pub mod live {
         kind: StreamKind,
         peer_owned: bool,
     ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
-        let mut framing = Framing::new(kind);
+        let mut framing = Framing::new(kind, Arc::clone(&inbound));
         move |stream: StreamRef, event: StreamEvent| {
             match event {
                 StreamEvent::Receive { buffers, .. } => {
@@ -1135,21 +1181,49 @@ pub mod live {
     pub struct CallbackQueue {
         events: VecDeque<NativeEvent>,
         bytes: usize,
+        /// Bytes held across every stream for frames still arriving. A lane
+        /// bound covers one stream; a peer that opens many and leaves a nearly
+        /// complete record on each multiplies it by the stream count, which no
+        /// per-stream bound can see. Charged to the same budget as queued
+        /// events, so `MAX_CALLBACK_BYTES` is what a peer can make this hold.
+        assembling: usize,
     }
 
     impl CallbackQueue {
+        /// Peer-driven bytes held, queued and part-way through arriving.
+        const fn charged(&self) -> usize {
+            self.bytes + self.assembling
+        }
+
         /// Queues a peer-driven event. Returns false when either bound is met.
         fn push(&mut self, event: NativeEvent) -> bool {
             let payload = native_payload_len(&event);
-            let Some(next) = self.bytes.checked_add(payload) else {
+            let Some(next) = self.charged().checked_add(payload) else {
                 return false;
             };
             if self.events.len() >= MAX_CALLBACK_EVENTS || next > MAX_CALLBACK_BYTES {
                 return false;
             }
             self.events.push_back(event);
-            self.bytes = next;
+            self.bytes += payload;
             true
+        }
+
+        /// Charges more partial-frame storage. False when the budget is spent.
+        fn reserve_assembly(&mut self, extra: usize) -> bool {
+            let Some(next) = self.charged().checked_add(extra) else {
+                return false;
+            };
+            if next > MAX_CALLBACK_BYTES {
+                return false;
+            }
+            self.assembling += extra;
+            true
+        }
+
+        /// Returns partial-frame storage to the budget.
+        fn release_assembly(&mut self, bytes: usize) {
+            self.assembling = self.assembling.saturating_sub(bytes);
         }
 
         /// Queues a connection lifecycle event past both bounds.
@@ -1431,6 +1505,12 @@ pub mod live {
             ConnectionId, Error, Event, MAX_DATA_RECORD_BYTES, StreamId, TransportAdapter,
         };
 
+        /// A framing with a budget of its own, for tests that only care about
+        /// how one stream parses.
+        fn lone(kind: StreamKind) -> Framing {
+            Framing::new(kind, Arc::new(Mutex::new(super::CallbackQueue::default())))
+        }
+
         /// Drives `accept` and collects what it emitted, which is what the
         /// tests assert on. The transport itself never collects.
         fn collect(framing: &mut Framing, bytes: &[u8]) -> Result<Vec<Vec<u8>>, super::FrameFault> {
@@ -1567,7 +1647,7 @@ pub mod live {
             let real = framed(vot_codec::frame_type::DATA_RECORD, b"payload");
             assert!(vot_codec::is_grease(0x1f00));
 
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             let mut stream = optional.clone();
             stream.extend_from_slice(&grease);
             stream.extend_from_slice(&real);
@@ -1598,7 +1678,7 @@ pub mod live {
             // accept hands each frame over as it is parsed and cannot return a
             // collection, so it has no way to accumulate them. What is
             // observable from outside is what it retains.
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             let mut delivered = 0;
             framing
                 .accept(&read, |frame| {
@@ -1616,12 +1696,62 @@ pub mod live {
 
             // A trailing partial frame is the only thing ever retained, and it
             // is the partial frame alone rather than the read that carried it.
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             let mut ragged = read.clone();
             ragged.truncate(read.len() - 16);
             let delivered = collect(&mut framing, &ragged).unwrap();
             assert_eq!(delivered.len(), 63);
             assert_eq!(framing.buffered(), record.len() - 16);
+        }
+
+        #[test]
+        fn partial_frames_across_streams_share_one_budget() {
+            // A lane bound covers one stream. A peer that opens many and parks a
+            // nearly complete record on each multiplies it by the stream count,
+            // which no per-stream bound can see, so the buffers are charged to
+            // the same budget as queued events.
+            let budget = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            let record = framed(vot_codec::frame_type::DATA_RECORD, &vec![0x5e; 200 * 1024]);
+            let head = record[..record.len() - 1].to_vec();
+            let tail = record[record.len() - 1..].to_vec();
+
+            // Enough lanes that the shared budget must refuse one, derived from
+            // the budget rather than guessed, so the test does not silently stop
+            // proving anything if either constant moves.
+            let lanes = (MAX_CALLBACK_BYTES / head.len() + 8) as u64;
+            let mut streams = Vec::new();
+            let mut refused = None;
+            for lane in 0..lanes {
+                let mut framing = Framing::new(StreamKind::Reliable { lane }, Arc::clone(&budget));
+                match framing.accept(&head, |_| Ok(())) {
+                    Ok(()) => streams.push(framing),
+                    Err(fault) => {
+                        refused = Some(fault);
+                        break;
+                    }
+                }
+            }
+            let refused = refused.expect("the shared budget never bit");
+            assert_eq!(refused, super::FrameFault::exhausted());
+            assert!(
+                streams.len() * head.len() <= MAX_CALLBACK_BYTES,
+                "held {} bytes across {} streams",
+                streams.len() * head.len(),
+                streams.len()
+            );
+            assert!(
+                (streams.len() as u64) < lanes,
+                "the per-stream bound alone would have allowed all of them"
+            );
+
+            // Finishing a frame returns its cost, so the budget is backpressure
+            // rather than a leak.
+            let mut finished = streams.pop().unwrap();
+            assert_eq!(collect(&mut finished, &tail).unwrap(), vec![record]);
+            drop(finished);
+            let mut recovered =
+                Framing::new(StreamKind::Reliable { lane: 999 }, Arc::clone(&budget));
+            recovered.accept(&head, |_| Ok(())).unwrap();
         }
 
         #[test]
@@ -1634,7 +1764,7 @@ pub mod live {
             let optional = framed(0x7ffe, &payload);
             let real = framed(vot_codec::frame_type::DATA_RECORD, b"after");
 
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             assert!(collect(&mut framing, &optional[..8]).unwrap().is_empty());
             assert!(framing.is_assembling(), "the frame is still arriving");
             assert!(
@@ -1699,7 +1829,7 @@ pub mod live {
             let next = framed(vot_codec::frame_type::DATA_RECORD, &[0x21; 64]);
             assert!(big.len() + next.len() > MAX_PARTIAL_FRAME);
 
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             let split = big.len() - 8;
             assert!(collect(&mut framing, &big[..split]).unwrap().is_empty());
             let mut rest = big[split..].to_vec();
@@ -1712,7 +1842,7 @@ pub mod live {
         fn a_frame_that_can_never_complete_is_refused_rather_than_held() {
             // Without this the stream stalls for ever on bytes that will never
             // form a frame, and the buffer grows for as long as they arrive.
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             let head = framed(
                 vot_codec::frame_type::PACKAGE_DESCRIPTOR,
                 &vec![0x11; MAX_DATA_RECORD_BYTES * 2],
@@ -1735,7 +1865,7 @@ pub mod live {
             assert!(frame.len() > MAX_PARTIAL_FRAME);
             assert!(frame.len() <= MAX_PARTIAL_CONTROL_FRAME);
 
-            let mut control = Framing::new(StreamKind::Control);
+            let mut control = lone(StreamKind::Control);
             let head = frame.len() - 1;
             assert!(collect(&mut control, &frame[..head]).unwrap().is_empty());
             assert_eq!(collect(&mut control, &frame[head..]).unwrap(), vec![frame]);
@@ -1761,14 +1891,11 @@ pub mod live {
             assert_eq!(fault.error, Error::RecordTooLarge);
             assert_eq!(fault.close, vot_codec::error_code::FRAME_TOO_LARGE);
             assert_eq!(
-                collect(&mut Framing::new(StreamKind::Control), &oversized),
+                collect(&mut lone(StreamKind::Control), &oversized),
                 Err(fault)
             );
             assert_eq!(
-                collect(
-                    &mut Framing::new(StreamKind::Reliable { lane: 1 }),
-                    &oversized
-                ),
+                collect(&mut lone(StreamKind::Reliable { lane: 1 }), &oversized),
                 Err(fault)
             );
         }
@@ -1780,7 +1907,7 @@ pub mod live {
             // frame is malformed, and discarding it silently would leave the
             // transfer waiting on a record the peer stopped sending.
             let frame = framed(vot_codec::frame_type::DATA_RECORD, b"half-sent");
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             assert!(collect(&mut framing, &frame[..3]).unwrap().is_empty());
             assert!(framing.is_assembling());
             assert_eq!(
@@ -1790,7 +1917,7 @@ pub mod live {
 
             // A frame that landed whole leaves nothing behind, so a FIN there
             // is an ordinary end of stream.
-            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            let mut framing = lone(StreamKind::Reliable { lane: 1 });
             assert_eq!(collect(&mut framing, &frame).unwrap().len(), 1);
             assert!(!framing.is_assembling());
         }
@@ -1803,7 +1930,7 @@ pub mod live {
             let mut unknown_critical = Vec::new();
             vot_codec::encode_frame(0x7fff_ffff, b"payload", &mut unknown_critical).unwrap();
             let fault = collect(
-                &mut Framing::new(StreamKind::Reliable { lane: 1 }),
+                &mut lone(StreamKind::Reliable { lane: 1 }),
                 &unknown_critical,
             )
             .unwrap_err();
@@ -1841,8 +1968,8 @@ pub mod live {
             // them into records neither peer sent.
             let first = framed(vot_codec::frame_type::DATA_RECORD, b"first-record");
             let second = framed(vot_codec::frame_type::DATA_RECORD, b"second");
-            let mut left = Framing::new(StreamKind::Reliable { lane: 1 });
-            let mut right = Framing::new(StreamKind::Reliable { lane: 2 });
+            let mut left = lone(StreamKind::Reliable { lane: 1 });
+            let mut right = lone(StreamKind::Reliable { lane: 2 });
 
             assert!(collect(&mut left, &first[..4]).unwrap().is_empty());
             assert!(collect(&mut right, &second[..4]).unwrap().is_empty());

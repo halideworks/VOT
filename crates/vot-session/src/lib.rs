@@ -673,9 +673,14 @@ impl<A: TransportAdapter> Session<A> {
         self.require_sendable()?;
         self.check_outbound(record)?;
         self.require_lane_allowed(stream)?;
+        // Counted only once the backend has it. A refused send opens no carrier
+        // stream, so counting it would spend a lane on nothing and, at a limit
+        // of one, refuse every later lane for good.
         self.adapter
             .send_reliable(stream, record)
-            .map_err(transport_error)
+            .map_err(transport_error)?;
+        self.lanes.insert(stream);
+        Ok(())
     }
 
     /// Submits an already shared record without another copy.
@@ -688,7 +693,9 @@ impl<A: TransportAdapter> Session<A> {
         self.require_lane_allowed(stream)?;
         self.adapter
             .send_reliable_shared(stream, record)
-            .map_err(transport_error)
+            .map_err(transport_error)?;
+        self.lanes.insert(stream);
+        Ok(())
     }
 
     /// Pushes queued submissions into the backend.
@@ -861,16 +868,11 @@ impl<A: TransportAdapter> Session<A> {
     ///
     /// Counted over every lane this endpoint has used, because nothing here
     /// closes one and the backends open a stream per distinct identifier.
-    fn require_lane_allowed(&mut self, stream: StreamId) -> Result<(), Error> {
+    fn require_lane_allowed(&self, stream: StreamId) -> Result<(), Error> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        admit_lane(
-            &mut self.lanes,
-            stream,
-            peer.reliable_lane_limit,
-            Side::Peer,
-        )
+        lane_allowed(&self.lanes, stream, peer.reliable_lane_limit, Side::Peer)
     }
 
     /// Refuses a peer lane past the number this endpoint said it would carry.
@@ -880,25 +882,24 @@ impl<A: TransportAdapter> Session<A> {
     /// applies inbound.
     fn admit_peer_lane(&mut self, stream: StreamId) -> Result<(), Error> {
         let limit = self.negotiation.local_settings().reliable_lane_limit;
-        admit_lane(&mut self.peer_lanes, stream, limit, Side::Local)
+        lane_allowed(&self.peer_lanes, stream, limit, Side::Local)?;
+        self.peer_lanes.insert(stream);
+        Ok(())
     }
 }
 
-/// Counts one lane against a negotiated limit.
+/// Whether one more lane fits a negotiated limit.
 ///
 /// A lane already in use is free: the limit is on how many exist, and nothing
-/// here closes one.
-fn admit_lane(
-    lanes: &mut BTreeSet<StreamId>,
+/// here closes one. Deciding is separate from recording, so a caller counts a
+/// lane only once whatever it was opening for has succeeded.
+fn lane_allowed(
+    lanes: &BTreeSet<StreamId>,
     stream: StreamId,
     limit: u64,
     side: Side,
 ) -> Result<(), Error> {
-    if lanes.contains(&stream) {
-        return Ok(());
-    }
-    if u64::try_from(lanes.len()).is_ok_and(|used| used < limit) {
-        lanes.insert(stream);
+    if lanes.contains(&stream) || u64::try_from(lanes.len()).is_ok_and(|used| used < limit) {
         return Ok(());
     }
     Err(Error::new(
@@ -2271,6 +2272,36 @@ mod tests {
         );
         assert!(error.kind().is_peer_fault());
         assert_eq!(server.adapter().closed, vec![error_code::RESOURCE_LIMIT]);
+    }
+
+    #[test]
+    fn a_refused_send_does_not_spend_a_lane() {
+        // The send opens no carrier stream when the backend refuses it, so
+        // counting the lane would spend one on nothing and, at a limit of one,
+        // refuse every later lane for good.
+        let peer = Settings {
+            reliable_lane_limit: 1,
+            ..Settings::default()
+        };
+        let (mut client, _server) = negotiated_with(Settings::default(), peer);
+        client.adapter.refuse_sends = Some(TransportError::OutboundQueueFull);
+        let record = data_record(b"record");
+        assert!(client.send_reliable(StreamId(1), &record).is_err());
+
+        // The lane the failed send named is still free, and so is any other.
+        client.adapter.refuse_sends = None;
+        client.send_reliable(StreamId(2), &record).unwrap();
+        assert_eq!(client.adapter().records.len(), 1);
+        assert_eq!(
+            client
+                .send_reliable(StreamId(3), &record)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::LaneLimitExceeded {
+                limit: 1,
+                side: Side::Peer,
+            }
+        );
     }
 
     #[test]

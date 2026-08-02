@@ -55,6 +55,64 @@ pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYT
 /// it advertises at construction and holds every stream to that.
 pub const MAX_PARTIAL_CONTROL_FRAME: usize = vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES;
 
+/// Largest control-frame payload an endpoint may advertise.
+///
+/// A frame this endpoint says it will accept has to fit the inbound event queue
+/// as well as the callback budget. One that reassembles but can never be
+/// enqueued stalls the connection for good, because the driver holds it back as
+/// backpressure that never clears.
+pub const MAX_ADVERTISABLE_CONTROL_PAYLOAD: usize =
+    DEFAULT_COMMAND_BYTE_LIMIT - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES;
+
+/// What this endpoint advertises, applied to every part of the transport that
+/// has to honour it.
+///
+/// Taken whole rather than one number at a time: the reassembly bound, the
+/// callback budget, the inbound queue, and the peer stream count all follow
+/// from the same `SETTINGS` and have to agree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveLimits {
+    control_payload: usize,
+    lanes: usize,
+}
+
+impl ReceiveLimits {
+    /// Derives the limits from what a session will advertise.
+    ///
+    /// # Errors
+    /// Rejects a control-frame limit outside the protocol range or larger than
+    /// the inbound queue can hold, and a lane limit that does not fit.
+    pub fn advertised(settings: &vot_codec::Settings) -> Result<Self, Error> {
+        let control_payload = usize::try_from(settings.max_control_frame_payload)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        vot_transport_api::validate_control_payload_limit(control_payload)?;
+        if control_payload > MAX_ADVERTISABLE_CONTROL_PAYLOAD {
+            return Err(Error::InvalidConfiguration);
+        }
+        let lanes = usize::try_from(settings.reliable_lane_limit)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        if lanes == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            control_payload,
+            lanes,
+        })
+    }
+
+    /// The control-frame payload this endpoint will reassemble.
+    #[must_use]
+    pub const fn control_payload(self) -> usize {
+        self.control_payload
+    }
+
+    /// Peer lanes this endpoint will carry at once.
+    #[must_use]
+    pub const fn lanes(self) -> usize {
+        self.lanes
+    }
+}
+
 /// Whether `lane` is reserved. An application may open neither the control
 /// lane nor a peer lane: their framing and handles belong to the transport.
 #[must_use]
@@ -479,7 +537,7 @@ pub mod live {
 
     use super::{
         CONTROL_STREAM_ID, Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_FRAME,
-        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST,
+        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST, ReceiveLimits,
     };
     use vot_transport_api::PathStats;
 
@@ -816,10 +874,9 @@ pub mod live {
     impl MsQuicTransport {
         /// Connects to `host:port` and returns a transport ready to send.
         ///
-        /// `control_receive_limit` is the largest control-frame payload this
-        /// endpoint will reassemble, and is what it must advertise in
-        /// `SETTINGS`. Taken here rather than set later because a bound that
-        /// arrives after the first byte is a bound the peer already got past.
+        /// `limits` is what this endpoint advertises in `SETTINGS`. Taken here
+        /// rather than set later, because a bound that arrives after the first
+        /// byte is a bound the peer already got past.
         ///
         /// # Errors
         /// Propagates registration, configuration, or connection failures.
@@ -829,15 +886,10 @@ pub mod live {
             host: &str,
             port: u16,
             connection_id: u64,
-            control_receive_limit: usize,
+            limits: ReceiveLimits,
         ) -> Result<Self, msquic::Status> {
-            vot_transport_api::validate_control_payload_limit(control_receive_limit).map_err(
-                |_| msquic::Status::from(msquic::StatusCode::QUIC_STATUS_INVALID_PARAMETER),
-            )?;
             let callbacks = Callbacks::new();
-            callbacks
-                .control_receive_limit
-                .store(control_receive_limit, Ordering::Relaxed);
+            callbacks.apply(limits);
             let (closed_tx, closed) = mpsc::channel();
             let callback_inbound = Arc::clone(&callbacks.inbound);
             let peer_close = Arc::clone(&callbacks.peer_close);
@@ -887,7 +939,7 @@ pub mod live {
             connection.start(&configuration, host, port)?;
             let mut adapter = MsQuicAdapter::default();
             adapter
-                .set_control_receive_limit(control_receive_limit)
+                .set_control_receive_limit(limits.control_payload())
                 .map_err(|_| invalid_parameter())?;
             Ok(Self {
                 carrier: Carrier {
@@ -1312,6 +1364,7 @@ pub mod live {
         sequence: Arc<AtomicU64>,
         close_request: Arc<AtomicU64>,
         control_limit: Arc<AtomicUsize>,
+        peer_streams: Option<Arc<AtomicUsize>>,
         kind: StreamKind,
         callback_owned: bool,
     ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
@@ -1381,6 +1434,11 @@ pub mod live {
                     }
                 }
                 StreamEvent::ShutdownComplete { .. } if callback_owned => {
+                    // The lane is free again, so the advertised count is on
+                    // streams open at once rather than opened ever.
+                    if let Some(peer_streams) = &peer_streams {
+                        peer_streams.fetch_sub(1, Ordering::Relaxed);
+                    }
                     // SAFETY: MsQuic delivered ShutdownComplete for a
                     // peer-created stream this callback has not adopted before.
                     // Streams held in a pool are released by that pool instead.
@@ -1411,9 +1469,24 @@ pub mod live {
         /// is held to what it advertised. Atomic: framing runs on worker
         /// threads.
         control_receive_limit: Arc<AtomicUsize>,
+        /// Peer lanes open now, and the most this endpoint advertised it would
+        /// carry. Counted at adoption rather than on the first record, because
+        /// a peer can hold a stream open without ever sending one this side
+        /// reports.
+        peer_streams: Arc<AtomicUsize>,
+        peer_stream_limit: Arc<AtomicUsize>,
     }
 
     impl Callbacks {
+        /// Puts what this endpoint advertised in force before any handler
+        /// exists.
+        fn apply(&self, limits: ReceiveLimits) {
+            self.control_receive_limit
+                .store(limits.control_payload(), Ordering::Relaxed);
+            self.peer_stream_limit
+                .store(limits.lanes(), Ordering::Relaxed);
+        }
+
         /// Fresh callback state for one connection. Never shared: one peer
         /// would otherwise spend another's byte budget.
         fn new() -> Self {
@@ -1426,6 +1499,8 @@ pub mod live {
                 control_receive_limit: Arc::new(AtomicUsize::new(
                     vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
                 )),
+                peer_streams: Arc::new(AtomicUsize::new(0)),
+                peer_stream_limit: Arc::new(AtomicUsize::new(usize::MAX)),
             }
         }
     }
@@ -1447,17 +1522,36 @@ pub mod live {
     /// # Errors
     /// Reports the code to close under when the carrier cannot identify the
     /// stream or the lane range is spent.
-    fn classify_peer_stream(stream: &StreamRef, next_lane: &AtomicU64) -> Result<StreamKind, u16> {
+    fn classify_peer_stream(stream: &StreamRef, callbacks: &Callbacks) -> Result<StreamKind, u16> {
         // Guessing would parse records as negotiation, or the reverse.
         let id = stream
             .get_stream_id()
             .map_err(|_| vot_codec::error_code::CARRIER_UNAVAILABLE)?;
         if id == CONTROL_STREAM_ID {
+            // Negotiation is not an application lane, so it is not counted.
             return Ok(StreamKind::Control);
         }
-        allocate_peer_lane(next_lane)
+        // Claimed here rather than on the first record: a peer that opens
+        // streams and sends nothing this side reports would otherwise never be
+        // counted at all.
+        claim_peer_stream(&callbacks.peer_streams, &callbacks.peer_stream_limit)
+            .map_err(|()| vot_codec::error_code::RESOURCE_LIMIT)?;
+        allocate_peer_lane(&callbacks.peer_lanes)
             .map(|lane| StreamKind::Reliable { lane })
-            .ok_or(vot_codec::error_code::RESOURCE_LIMIT)
+            .ok_or_else(|| {
+                callbacks.peer_streams.fetch_sub(1, Ordering::Relaxed);
+                vot_codec::error_code::RESOURCE_LIMIT
+            })
+    }
+
+    /// Takes one of the peer stream slots this endpoint advertised.
+    fn claim_peer_stream(open: &AtomicUsize, limit: &AtomicUsize) -> Result<(), ()> {
+        let allowed = limit.load(Ordering::Relaxed);
+        open.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < allowed).then(|| count + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| ())
     }
 
     /// The peer-created negotiation stream on an accepted connection, kept
@@ -1475,7 +1569,7 @@ pub mod live {
     /// `control` is absent on a connecting endpoint, which opens that stream
     /// itself.
     fn adopt_peer_stream(callbacks: &Callbacks, stream: &StreamRef, control: Option<&ControlSlot>) {
-        let kind = match classify_peer_stream(stream, &callbacks.peer_lanes) {
+        let kind = match classify_peer_stream(stream, callbacks) {
             Ok(kind) => kind,
             Err(close) => return refuse_peer_stream(callbacks, stream, close),
         };
@@ -1485,6 +1579,7 @@ pub mod live {
                 Arc::clone(&callbacks.sequence),
                 Arc::clone(&callbacks.close_request),
                 Arc::clone(&callbacks.control_receive_limit),
+                Some(Arc::clone(&callbacks.peer_streams)),
                 kind,
                 true,
             ));
@@ -1506,6 +1601,7 @@ pub mod live {
             Arc::clone(&callbacks.sequence),
             Arc::clone(&callbacks.close_request),
             Arc::clone(&callbacks.control_receive_limit),
+            None,
             kind,
             false,
         ));
@@ -1556,6 +1652,7 @@ pub mod live {
                 Arc::clone(&callbacks.sequence),
                 Arc::clone(&callbacks.close_request),
                 Arc::clone(&callbacks.control_receive_limit),
+                None,
                 kind,
                 false,
             ),
@@ -1885,12 +1982,8 @@ pub mod live {
             registration: Arc<Registration>,
             alpn: &[BufferRef],
             address: &Addr,
-            control_receive_limit: usize,
+            limits: ReceiveLimits,
         ) -> Result<Self, msquic::Status> {
-            // Up front, so a limit out of range fails here rather than on every
-            // connection that then never reaches accept.
-            vot_transport_api::validate_control_payload_limit(control_receive_limit)
-                .map_err(|_| invalid_parameter())?;
             let (accepted_tx, accepted) = mpsc::channel();
             let queued = Arc::new(AtomicUsize::new(0));
             let callback_queued = Arc::clone(&queued);
@@ -1913,7 +2006,7 @@ pub mod live {
                         &listener_configuration,
                         &listener_registration,
                         next_connection_id.fetch_add(1, Ordering::Relaxed),
-                        control_receive_limit,
+                        limits,
                     )
                     .inspect_err(|_| {
                         // The slot is claimed before anything is adopted, so a
@@ -2003,14 +2096,12 @@ pub mod live {
         configuration: &Arc<Configuration>,
         registration: &Arc<Registration>,
         connection_id: u64,
-        control_receive_limit: usize,
+        limits: ReceiveLimits,
     ) -> Result<AcceptedTransport, msquic::Status> {
         let callbacks = Callbacks::new();
-        // Before any handler exists, so the bound is in force for the peer's
+        // Before any handler exists, so the bounds are in force for the peer's
         // first frame rather than tightened underneath one.
-        callbacks
-            .control_receive_limit
-            .store(control_receive_limit, Ordering::Relaxed);
+        callbacks.apply(limits);
         let control: ControlSlot = Arc::new(Mutex::new(None));
         let (closed_tx, closed) = mpsc::channel();
         let callback_inbound = Arc::clone(&callbacks.inbound);
@@ -2053,7 +2144,7 @@ pub mod live {
         let owned = unsafe { Connection::from_raw(connection.as_raw()) };
         let mut adapter = MsQuicAdapter::default();
         adapter
-            .set_control_receive_limit(control_receive_limit)
+            .set_control_receive_limit(limits.control_payload())
             .map_err(|_| invalid_parameter())?;
         Ok(AcceptedTransport {
             carrier: Carrier {
@@ -2898,7 +2989,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 11,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
 
@@ -3035,7 +3126,7 @@ pub mod live {
                 Arc::clone(&registration),
                 &alpn,
                 &address,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             let port = server.local_port().unwrap();
@@ -3047,7 +3138,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 31,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
 
@@ -3148,6 +3239,21 @@ pub mod live {
         /// it is observable.
         const SERVER_CONTROL_LIMIT: usize = 64 * 1024;
 
+        /// What the connecting side of these tests advertises.
+        fn test_limits() -> super::super::ReceiveLimits {
+            super::super::ReceiveLimits::advertised(&vot_codec::Settings::default()).unwrap()
+        }
+
+        /// What the accepting side advertises: a smaller control bound, so
+        /// applying it is observable.
+        fn server_limits() -> super::super::ReceiveLimits {
+            super::super::ReceiveLimits::advertised(&vot_codec::Settings {
+                max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                ..vot_codec::Settings::default()
+            })
+            .unwrap()
+        }
+
         #[test]
         fn two_endpoints_negotiate_over_the_real_carrier_before_any_data_moves() {
             // Everything below runs production code: the assembled client, the
@@ -3167,7 +3273,7 @@ pub mod live {
                 // than the connecting one, so applying it is observable rather
                 // than a no-op. The listener is configured with it because the
                 // bound has to be in force before the client's first byte.
-                SERVER_CONTROL_LIMIT,
+                server_limits(),
             )
             .unwrap();
             let port = listener.local_port().unwrap();
@@ -3179,7 +3285,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 61,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
 
@@ -3298,7 +3404,7 @@ pub mod live {
                 Arc::clone(&registration),
                 &alpn,
                 &address,
-                SERVER_CONTROL_LIMIT,
+                server_limits(),
             )
             .unwrap();
             let port = listener.local_port().unwrap();
@@ -3310,7 +3416,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 connection_id,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
 
@@ -3480,28 +3586,42 @@ pub mod live {
             let alpn = [BufferRef::from(vot_transport_api::ALPN)];
             let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
 
-            // An unusable limit fails here rather than on every connection that
-            // then never reaches accept.
-            for limit in [0, vot_codec::HARD_MAX_FRAME_PAYLOAD + 1] {
+            // An unusable configuration fails before anything listens, rather
+            // than on every connection that then never reaches accept. The
+            // last case is a limit inside the protocol range that the inbound
+            // queue still cannot hold: framing would reassemble a frame the
+            // adapter can never enqueue, and the driver would hold it back as
+            // backpressure that never clears.
+            for control in [
+                0,
+                vot_codec::HARD_MAX_FRAME_PAYLOAD + 1,
+                super::super::MAX_ADVERTISABLE_CONTROL_PAYLOAD + 1,
+            ] {
                 assert!(
-                    MsQuicServer::listen(
-                        Arc::clone(&configuration),
-                        Arc::clone(&registration),
-                        &alpn,
-                        &address,
-                        limit,
-                    )
+                    super::super::ReceiveLimits::advertised(&vot_codec::Settings {
+                        max_control_frame_payload: control as u64,
+                        ..vot_codec::Settings::default()
+                    })
                     .is_err(),
-                    "a limit of {limit} cannot serve anything"
+                    "a control limit of {control} cannot be served"
                 );
             }
+            assert!(
+                super::super::ReceiveLimits::advertised(&vot_codec::Settings {
+                    max_control_frame_payload: super::super::MAX_ADVERTISABLE_CONTROL_PAYLOAD
+                        as u64,
+                    ..vot_codec::Settings::default()
+                })
+                .is_ok(),
+                "the largest servable limit is servable"
+            );
 
             let mut server = MsQuicServer::listen(
                 configuration,
                 Arc::clone(&registration),
                 &alpn,
                 &address,
-                SERVER_CONTROL_LIMIT,
+                server_limits(),
             )
             .unwrap();
             let port = server.local_port().unwrap();
@@ -3520,7 +3640,7 @@ pub mod live {
                         "127.0.0.1",
                         port,
                         id,
-                        vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                        test_limits(),
                     )
                     .unwrap(),
                 );
@@ -3585,7 +3705,7 @@ pub mod live {
                 Arc::clone(&registration),
                 &alpn,
                 &address,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             let port = server.local_port().unwrap();
@@ -3597,7 +3717,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 51,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -3654,7 +3774,7 @@ pub mod live {
                 Arc::clone(&registration),
                 &alpn,
                 &address,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             let port = server.local_port().unwrap();
@@ -3666,7 +3786,7 @@ pub mod live {
                 "127.0.0.1",
                 port,
                 41,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -3738,7 +3858,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 21,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             // Nothing is listening, so the send cannot reach a peer.
@@ -3781,7 +3901,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 7,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             drop(transport);
@@ -3793,7 +3913,7 @@ pub mod live {
                 "127.0.0.1",
                 1,
                 8,
-                vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+                test_limits(),
             )
             .unwrap();
             with_stream
@@ -4118,6 +4238,75 @@ mod tests {
         let stats = adapter.path_stats().unwrap();
         assert_eq!(stats.congestion_window_bytes, Some(1_048_576));
         assert_eq!(stats.smoothed_rtt_us, Some(18_500));
+    }
+
+    #[test]
+    fn advertised_limits_have_to_be_ones_this_transport_can_serve() {
+        let settings = |control: u64, lanes: u64| vot_codec::Settings {
+            max_control_frame_payload: control,
+            reliable_lane_limit: lanes,
+            ..vot_codec::Settings::default()
+        };
+
+        let limits = ReceiveLimits::advertised(&vot_codec::Settings::default()).unwrap();
+        assert_eq!(
+            limits.control_payload(),
+            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
+        );
+        assert_eq!(
+            limits.lanes(),
+            usize::try_from(vot_codec::Settings::default().reliable_lane_limit).unwrap()
+        );
+
+        // A frame this endpoint says it will accept has to fit the inbound
+        // queue. One past that reassembles and can never be enqueued, and the
+        // driver holds it back as backpressure that never clears.
+        assert_eq!(
+            MAX_ADVERTISABLE_CONTROL_PAYLOAD,
+            DEFAULT_COMMAND_BYTE_LIMIT - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+        );
+        let at_bound =
+            ReceiveLimits::advertised(&settings(MAX_ADVERTISABLE_CONTROL_PAYLOAD as u64, 16))
+                .unwrap();
+        assert_eq!(at_bound.control_payload(), MAX_ADVERTISABLE_CONTROL_PAYLOAD);
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(MAX_ADVERTISABLE_CONTROL_PAYLOAD as u64 + 1, 16)),
+            Err(Error::InvalidConfiguration)
+        );
+
+        // And it has to be a limit the protocol allows in the first place.
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(
+                vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD as u64 - 1,
+                16
+            )),
+            Err(Error::InvalidConfiguration)
+        );
+        assert!(
+            ReceiveLimits::advertised(&settings(
+                vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD as u64,
+                16
+            ))
+            .is_ok()
+        );
+
+        // A lane count of zero would leave a peer unable to send anything.
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(1024 * 1024, 0)),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(1024 * 1024, 1))
+                .unwrap()
+                .lanes(),
+            1
+        );
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(1024 * 1024, 256))
+                .unwrap()
+                .lanes(),
+            256
+        );
     }
 
     #[test]

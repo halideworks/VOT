@@ -55,63 +55,11 @@ pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYT
 /// it advertises at construction and holds every stream to that.
 pub const MAX_PARTIAL_CONTROL_FRAME: usize = vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES;
 
-/// Largest control-frame payload an endpoint may advertise.
+/// Most this adapter's inbound queue holds for one event.
 ///
-/// A frame this endpoint says it will accept has to fit the inbound event queue
-/// as well as the callback budget. One that reassembles but can never be
-/// enqueued stalls the connection for good, because the driver holds it back as
-/// backpressure that never clears.
-pub const MAX_ADVERTISABLE_CONTROL_PAYLOAD: usize =
-    DEFAULT_COMMAND_BYTE_LIMIT - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES;
-
-/// What this endpoint advertises, applied to every part of the transport that
-/// has to honour it.
-///
-/// Taken whole rather than one number at a time: the reassembly bound, the
-/// callback budget, the inbound queue, and the peer stream count all follow
-/// from the same `SETTINGS` and have to agree.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReceiveLimits {
-    control_payload: usize,
-    lanes: usize,
-}
-
-impl ReceiveLimits {
-    /// Derives the limits from what a session will advertise.
-    ///
-    /// # Errors
-    /// Rejects a control-frame limit outside the protocol range or larger than
-    /// the inbound queue can hold, and a lane limit that does not fit.
-    pub fn advertised(settings: &vot_codec::Settings) -> Result<Self, Error> {
-        let control_payload = usize::try_from(settings.max_control_frame_payload)
-            .map_err(|_| Error::InvalidConfiguration)?;
-        vot_transport_api::validate_control_payload_limit(control_payload)?;
-        if control_payload > MAX_ADVERTISABLE_CONTROL_PAYLOAD {
-            return Err(Error::InvalidConfiguration);
-        }
-        let lanes = usize::try_from(settings.reliable_lane_limit)
-            .map_err(|_| Error::InvalidConfiguration)?;
-        if lanes == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
-        Ok(Self {
-            control_payload,
-            lanes,
-        })
-    }
-
-    /// The control-frame payload this endpoint will reassemble.
-    #[must_use]
-    pub const fn control_payload(self) -> usize {
-        self.control_payload
-    }
-
-    /// Peer lanes this endpoint will carry at once.
-    #[must_use]
-    pub const fn lanes(self) -> usize {
-        self.lanes
-    }
-}
+/// [`ReceiveLimits`] is built against it, so an endpoint cannot advertise a
+/// control frame this backend could never enqueue.
+pub const INBOUND_BYTE_CAPACITY: usize = DEFAULT_COMMAND_BYTE_LIMIT;
 
 /// Whether `lane` is reserved. An application may open neither the control
 /// lane nor a peer lane: their framing and handles belong to the transport.
@@ -121,8 +69,8 @@ pub const fn is_reserved_lane(lane: u64) -> bool {
 }
 
 use vot_transport_api::{
-    ConnectionId, DatagramSendState, Error, Event, PathStats, Payload, StreamId, TransportAck,
-    TransportAdapter, shared_payload,
+    ConnectionId, DatagramSendState, Error, Event, PathStats, Payload, ReceiveLimits, StreamId,
+    TransportAck, TransportAdapter, shared_payload,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +123,8 @@ pub struct MsQuicAdapter {
     /// What this endpoint accepts, which is what it advertised. Separate from
     /// the send bound, which is the peer's.
     control_receive_limit: usize,
+    /// What this endpoint advertised, once it has been configured.
+    receive_limits: Option<ReceiveLimits>,
     events: VecDeque<Event>,
     event_bytes: usize,
     event_count_limit: usize,
@@ -191,6 +141,7 @@ impl Default for MsQuicAdapter {
             command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
             control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            receive_limits: None,
             events: VecDeque::new(),
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
@@ -201,14 +152,10 @@ impl Default for MsQuicAdapter {
 }
 
 impl MsQuicAdapter {
-    /// Sets what this endpoint accepts, which is what it advertised.
-    ///
-    /// # Errors
-    /// Rejects a limit outside the protocol range.
-    pub fn set_control_receive_limit(&mut self, limit: usize) -> Result<(), Error> {
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_receive_limit = limit;
-        Ok(())
+    /// Applies what this endpoint advertised.
+    pub const fn set_receive_limits(&mut self, limits: ReceiveLimits) {
+        self.control_receive_limit = limits.control_payload();
+        self.receive_limits = Some(limits);
     }
 
     /// Creates an adapter with explicit inbound and outbound queue limits.
@@ -488,8 +435,8 @@ impl TransportAdapter for MsQuicAdapter {
         Ok(())
     }
 
-    fn control_receive_limit(&self) -> Option<usize> {
-        Some(self.control_receive_limit)
+    fn receive_limits(&self) -> Option<ReceiveLimits> {
+        self.receive_limits
     }
 
     fn path_stats(&self) -> Option<PathStats> {
@@ -533,11 +480,13 @@ pub mod live {
         StreamOpenFlags, StreamRef, StreamStartFlags,
     };
 
-    use vot_transport_api::{ConnectionId, Error, Event, Payload, StreamId, TransportAdapter};
+    use vot_transport_api::{
+        ConnectionId, Error, Event, Payload, ReceiveLimits, StreamId, TransportAdapter,
+    };
 
     use super::{
         CONTROL_STREAM_ID, Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_FRAME,
-        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST, ReceiveLimits,
+        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST,
     };
     use vot_transport_api::PathStats;
 
@@ -833,8 +782,8 @@ pub mod live {
             self.adapter.set_control_payload_limit(limit)
         }
 
-        fn control_receive_limit(&self) -> Option<usize> {
-            Some(self.callbacks.control_receive_limit.load(Ordering::Relaxed))
+        fn receive_limits(&self) -> Option<ReceiveLimits> {
+            self.adapter.receive_limits()
         }
 
         fn close(&mut self, code: u16) -> Result<(), Error> {
@@ -938,9 +887,7 @@ pub mod live {
             )?;
             connection.start(&configuration, host, port)?;
             let mut adapter = MsQuicAdapter::default();
-            adapter
-                .set_control_receive_limit(limits.control_payload())
-                .map_err(|_| invalid_parameter())?;
+            adapter.set_receive_limits(limits);
             Ok(Self {
                 carrier: Carrier {
                     adapter,
@@ -1865,8 +1812,8 @@ pub mod live {
                     self.carrier.set_control_payload_limit(limit)
                 }
 
-                fn control_receive_limit(&self) -> Option<usize> {
-                    self.carrier.control_receive_limit()
+                fn receive_limits(&self) -> Option<ReceiveLimits> {
+                    self.carrier.receive_limits()
                 }
 
                 fn close(&mut self, code: u16) -> Result<(), Error> {
@@ -2143,9 +2090,7 @@ pub mod live {
         // so the callback above never closes it.
         let owned = unsafe { Connection::from_raw(connection.as_raw()) };
         let mut adapter = MsQuicAdapter::default();
-        adapter
-            .set_control_receive_limit(limits.control_payload())
-            .map_err(|_| invalid_parameter())?;
+        adapter.set_receive_limits(limits);
         Ok(AcceptedTransport {
             carrier: Carrier {
                 adapter,
@@ -2792,6 +2737,121 @@ pub mod live {
         }
 
         #[test]
+        fn peer_streams_are_bounded_by_what_this_endpoint_advertised() {
+            // The count is on streams open at once, so a peer that closes one
+            // may open another, and one past the advertised number is refused.
+            let open = AtomicUsize::new(0);
+            let limit = AtomicUsize::new(2);
+            assert_eq!(super::claim_peer_stream(&open, &limit), Ok(()));
+            assert_eq!(super::claim_peer_stream(&open, &limit), Ok(()));
+            assert_eq!(open.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                super::claim_peer_stream(&open, &limit),
+                Err(()),
+                "the bound is exact"
+            );
+            assert_eq!(
+                open.load(Ordering::Relaxed),
+                2,
+                "a refused claim spends nothing"
+            );
+
+            // Releasing one, as the stream handler does at shutdown, frees it.
+            open.fetch_sub(1, Ordering::Relaxed);
+            assert_eq!(super::claim_peer_stream(&open, &limit), Ok(()));
+            assert_eq!(super::claim_peer_stream(&open, &limit), Err(()));
+
+            // A limit of one allows exactly one.
+            let single = AtomicUsize::new(0);
+            let one = AtomicUsize::new(1);
+            assert_eq!(super::claim_peer_stream(&single, &one), Ok(()));
+            assert_eq!(super::claim_peer_stream(&single, &one), Err(()));
+        }
+
+        #[test]
+        fn a_peer_opening_more_lanes_than_advertised_ends_the_session() {
+            // The session cannot see a stream open, so this bound exists only
+            // here. Without it a peer could hold open as many streams as its
+            // carrier settings allowed, whatever it was told.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let limits = vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                    reliable_lane_limit: 2,
+                    ..vot_codec::Settings::default()
+                },
+                super::super::INBOUND_BYTE_CAPACITY,
+            )
+            .unwrap();
+            assert_eq!(limits.lanes(), 2);
+            let mut server = MsQuicServer::listen(
+                configuration,
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                limits,
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let mut peer = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                91,
+                test_limits(),
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut peer, deadline, |event| matches!(
+                event,
+                Event::Connected(_)
+            )));
+            let mut accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = server.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+
+            // Two lanes are within the advertised count; the third is not.
+            let record = framed(vot_codec::frame_type::DATA_RECORD, b"lane");
+            for lane in 1..=3 {
+                peer.send_reliable(StreamId(lane), &record).unwrap();
+            }
+            peer.flush().unwrap();
+
+            assert!(
+                drive(&mut accepted, deadline, |event| matches!(
+                    event,
+                    Event::Disconnected(_)
+                )),
+                "a peer past its lane count kept the session"
+            );
+            let mut observed = None;
+            while Instant::now() < deadline && observed.is_none() {
+                while peer.poll().is_some() {}
+                observed = peer.peer_close_code();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                observed,
+                Some(vot_codec::error_code::RESOURCE_LIMIT),
+                "and under the registered code"
+            );
+
+            drop(peer);
+            drop(accepted);
+            drop(server);
+        }
+
+        #[test]
         fn every_peer_stream_gets_a_lane_of_its_own() {
             // A shared identifier made records from independent streams look
             // like one reordered stream, which on an accepted connection is
@@ -3240,17 +3300,24 @@ pub mod live {
         const SERVER_CONTROL_LIMIT: usize = 64 * 1024;
 
         /// What the connecting side of these tests advertises.
-        fn test_limits() -> super::super::ReceiveLimits {
-            super::super::ReceiveLimits::advertised(&vot_codec::Settings::default()).unwrap()
+        fn test_limits() -> vot_transport_api::ReceiveLimits {
+            vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings::default(),
+                super::super::INBOUND_BYTE_CAPACITY,
+            )
+            .unwrap()
         }
 
         /// What the accepting side advertises: a smaller control bound, so
         /// applying it is observable.
-        fn server_limits() -> super::super::ReceiveLimits {
-            super::super::ReceiveLimits::advertised(&vot_codec::Settings {
-                max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
-                ..vot_codec::Settings::default()
-            })
+        fn server_limits() -> vot_transport_api::ReceiveLimits {
+            vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                    ..vot_codec::Settings::default()
+                },
+                super::super::INBOUND_BYTE_CAPACITY,
+            )
             .unwrap()
         }
 
@@ -3595,23 +3662,31 @@ pub mod live {
             for control in [
                 0,
                 vot_codec::HARD_MAX_FRAME_PAYLOAD + 1,
-                super::super::MAX_ADVERTISABLE_CONTROL_PAYLOAD + 1,
+                super::super::INBOUND_BYTE_CAPACITY - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1,
             ] {
                 assert!(
-                    super::super::ReceiveLimits::advertised(&vot_codec::Settings {
-                        max_control_frame_payload: control as u64,
-                        ..vot_codec::Settings::default()
-                    })
+                    vot_transport_api::ReceiveLimits::advertised(
+                        &vot_codec::Settings {
+                            max_control_frame_payload: control as u64,
+                            ..vot_codec::Settings::default()
+                        },
+                        super::super::INBOUND_BYTE_CAPACITY,
+                    )
                     .is_err(),
                     "a control limit of {control} cannot be served"
                 );
             }
             assert!(
-                super::super::ReceiveLimits::advertised(&vot_codec::Settings {
-                    max_control_frame_payload: super::super::MAX_ADVERTISABLE_CONTROL_PAYLOAD
-                        as u64,
-                    ..vot_codec::Settings::default()
-                })
+                vot_transport_api::ReceiveLimits::advertised(
+                    &vot_codec::Settings {
+                        max_control_frame_payload: (super::super::INBOUND_BYTE_CAPACITY
+                            - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES)
+                            as u64,
+                        ..vot_codec::Settings::default()
+                    },
+                    super::super::INBOUND_BYTE_CAPACITY,
+                )
                 .is_ok(),
                 "the largest servable limit is servable"
             );
@@ -4241,75 +4316,6 @@ mod tests {
     }
 
     #[test]
-    fn advertised_limits_have_to_be_ones_this_transport_can_serve() {
-        let settings = |control: u64, lanes: u64| vot_codec::Settings {
-            max_control_frame_payload: control,
-            reliable_lane_limit: lanes,
-            ..vot_codec::Settings::default()
-        };
-
-        let limits = ReceiveLimits::advertised(&vot_codec::Settings::default()).unwrap();
-        assert_eq!(
-            limits.control_payload(),
-            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
-        );
-        assert_eq!(
-            limits.lanes(),
-            usize::try_from(vot_codec::Settings::default().reliable_lane_limit).unwrap()
-        );
-
-        // A frame this endpoint says it will accept has to fit the inbound
-        // queue. One past that reassembles and can never be enqueued, and the
-        // driver holds it back as backpressure that never clears.
-        assert_eq!(
-            MAX_ADVERTISABLE_CONTROL_PAYLOAD,
-            DEFAULT_COMMAND_BYTE_LIMIT - vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
-        );
-        let at_bound =
-            ReceiveLimits::advertised(&settings(MAX_ADVERTISABLE_CONTROL_PAYLOAD as u64, 16))
-                .unwrap();
-        assert_eq!(at_bound.control_payload(), MAX_ADVERTISABLE_CONTROL_PAYLOAD);
-        assert_eq!(
-            ReceiveLimits::advertised(&settings(MAX_ADVERTISABLE_CONTROL_PAYLOAD as u64 + 1, 16)),
-            Err(Error::InvalidConfiguration)
-        );
-
-        // And it has to be a limit the protocol allows in the first place.
-        assert_eq!(
-            ReceiveLimits::advertised(&settings(
-                vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD as u64 - 1,
-                16
-            )),
-            Err(Error::InvalidConfiguration)
-        );
-        assert!(
-            ReceiveLimits::advertised(&settings(
-                vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD as u64,
-                16
-            ))
-            .is_ok()
-        );
-
-        // A lane count of zero would leave a peer unable to send anything.
-        assert_eq!(
-            ReceiveLimits::advertised(&settings(1024 * 1024, 0)),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            ReceiveLimits::advertised(&settings(1024 * 1024, 1))
-                .unwrap()
-                .lanes(),
-            1
-        );
-        assert_eq!(
-            ReceiveLimits::advertised(&settings(1024 * 1024, 256))
-                .unwrap()
-                .lanes(),
-            256
-        );
-    }
-
-    #[test]
     fn reserved_lanes_cannot_collide_with_an_application_stream() {
         // Control frames and peer-initiated records are reported on lanes of
         // their own. If either collided with the other, or with a stream a
@@ -4573,14 +4579,14 @@ mod tests {
             Err(Error::InvalidConfiguration)
         );
         assert_eq!(
-            adapter.set_control_receive_limit(0),
-            Err(Error::InvalidConfiguration)
+            adapter.receive_limits(),
+            None,
+            "nothing is advertised until it is configured"
         );
-        assert_eq!(adapter.control_receive_limit(), Some(default));
 
         // A peer that allows less does not narrow what this endpoint accepts.
         adapter.set_control_payload_limit(64 * 1024).unwrap();
-        assert_eq!(adapter.control_receive_limit(), Some(default));
+        assert_eq!(adapter.receive_limits(), None);
         assert_eq!(
             adapter.send_control(&vec![0; 64 * 1024 + envelope + 1]),
             Err(Error::RecordTooLarge)
@@ -4604,8 +4610,16 @@ mod tests {
         // The receive bound moves on its own, which is what an endpoint
         // advertising less than the default is held to.
         let mut narrow = MsQuicAdapter::default();
-        narrow.set_control_receive_limit(64 * 1024).unwrap();
-        assert_eq!(narrow.control_receive_limit(), Some(64 * 1024));
+        let narrow_limits = ReceiveLimits::advertised(
+            &vot_codec::Settings {
+                max_control_frame_payload: 64 * 1024,
+                ..vot_codec::Settings::default()
+            },
+            INBOUND_BYTE_CAPACITY,
+        )
+        .unwrap();
+        narrow.set_receive_limits(narrow_limits);
+        assert_eq!(narrow.receive_limits(), Some(narrow_limits));
         assert_eq!(
             narrow.record_native_event(NativeEvent::Control(vec![0; 64 * 1024 + envelope])),
             Ok(())

@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 rustls.workspace = true
 vot-transport-api = { path = "../vot-transport-api" }
+vot-codec = { path = "../vot-codec" }
 
 
 [lints]

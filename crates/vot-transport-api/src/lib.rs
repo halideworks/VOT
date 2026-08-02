@@ -230,9 +230,9 @@ pub trait TransportAdapter {
         Err(Error::Unsupported)
     }
 
-    /// The largest control-frame payload this endpoint will reassemble, so a
-    /// caller can check the limit it advertises is the one enforced.
-    fn control_receive_limit(&self) -> Option<usize> {
+    /// The limits this endpoint will hold a peer to, so a caller can check that
+    /// what it advertises is what the carrier enforces.
+    fn receive_limits(&self) -> Option<ReceiveLimits> {
         None
     }
 
@@ -244,6 +244,77 @@ pub trait TransportAdapter {
     /// range.
     fn set_control_payload_limit(&mut self, _limit: usize) -> Result<(), Error> {
         Err(Error::Unsupported)
+    }
+}
+
+/// What an endpoint advertises in `SETTINGS` and will be held to.
+///
+/// Built against the inbound queue that has to hold a frame, so an endpoint
+/// cannot advertise a limit its own backend would refuse. A frame inside the
+/// advertised bound but larger than the queue can hold is never deliverable:
+/// retrying cannot make it fit, and a driver treating a full queue as
+/// backpressure waits for ever.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveLimits {
+    control_payload: usize,
+    lanes: usize,
+}
+
+impl ReceiveLimits {
+    /// Derives the limits from what a session will advertise.
+    ///
+    /// `inbound_byte_capacity` is the most the backend's inbound queue holds
+    /// for one event.
+    ///
+    /// # Errors
+    /// Rejects a control-frame limit outside the protocol range or larger than
+    /// the queue can hold with its envelope, and a lane limit that does not
+    /// fit.
+    pub fn advertised(
+        settings: &vot_codec::Settings,
+        inbound_byte_capacity: usize,
+    ) -> Result<Self, Error> {
+        let control_payload = usize::try_from(settings.max_control_frame_payload)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        validate_control_payload_limit(control_payload)?;
+        let wire = control_payload
+            .checked_add(MAX_FRAME_ENVELOPE_BYTES)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if wire > inbound_byte_capacity {
+            return Err(Error::InvalidConfiguration);
+        }
+        let lanes = usize::try_from(settings.reliable_lane_limit)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        if lanes == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            control_payload,
+            lanes,
+        })
+    }
+
+    /// The control-frame payload this endpoint will reassemble.
+    #[must_use]
+    pub const fn control_payload(self) -> usize {
+        self.control_payload
+    }
+
+    /// Peer lanes this endpoint will carry at once.
+    #[must_use]
+    pub const fn lanes(self) -> usize {
+        self.lanes
+    }
+
+    /// Whether these are the limits `settings` advertises.
+    ///
+    /// Advertising one thing while the carrier enforces another either refuses
+    /// conforming frames or accepts more than was promised, and neither shows
+    /// up without comparing every limit.
+    #[must_use]
+    pub fn match_settings(self, settings: &vot_codec::Settings) -> bool {
+        u64::try_from(self.control_payload) == Ok(settings.max_control_frame_payload)
+            && u64::try_from(self.lanes) == Ok(settings.reliable_lane_limit)
     }
 }
 
@@ -462,6 +533,42 @@ mod tests {
     }
 
     #[test]
+    fn advertised_limits_have_to_fit_the_queue_that_holds_them() {
+        let settings = |control: u64, lanes: u64| vot_codec::Settings {
+            max_control_frame_payload: control,
+            reliable_lane_limit: lanes,
+            ..vot_codec::Settings::default()
+        };
+        let capacity = 4 * 1024 * 1024;
+        let largest = capacity - MAX_FRAME_ENVELOPE_BYTES;
+
+        let limits = ReceiveLimits::advertised(&settings(largest as u64, 16), capacity).unwrap();
+        assert_eq!(limits.control_payload(), largest);
+        assert_eq!(limits.lanes(), 16);
+        assert!(limits.match_settings(&settings(largest as u64, 16)));
+        assert!(!limits.match_settings(&settings(largest as u64, 15)));
+        assert!(!limits.match_settings(&settings(largest as u64 - 1, 16)));
+
+        // One past what the queue holds is never deliverable, so it cannot be
+        // advertised.
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(largest as u64 + 1, 16), capacity),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            ReceiveLimits::advertised(
+                &settings(MIN_CONTROL_FRAME_PAYLOAD as u64 - 1, 16),
+                capacity
+            ),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            ReceiveLimits::advertised(&settings(largest as u64, 0), capacity),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
     fn invalid_capacity_configuration_is_rejected() {
         assert_eq!(
             StagingCapacity::new(0, 1, 1),
@@ -536,7 +643,7 @@ mod tests {
             adapter.close(vot_codec::error_code::MALFORMED_FRAME),
             Err(Error::Unsupported)
         );
-        assert_eq!(adapter.control_receive_limit(), None);
+        assert_eq!(adapter.receive_limits(), None);
         assert_eq!(
             adapter.set_control_payload_limit(MAX_CONTROL_FRAME_PAYLOAD),
             Err(Error::Unsupported)

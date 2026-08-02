@@ -125,11 +125,21 @@ pub enum ErrorKind {
         extension: u64,
         side: Side,
     },
+    /// A frame on a stream that does not carry its type.
+    FrameOnTheWrongLane {
+        frame_type: u64,
+        lane: Lane,
+        side: Side,
+    },
     /// The backend refused something the session needed.
     Transport(TransportError),
-    /// The backend would reassemble control frames larger than this endpoint
-    /// is about to say it accepts.
-    ReceiveLimitMismatch { advertised: u64, backend: usize },
+    /// The backend would hold a peer to different limits from the ones this
+    /// endpoint is about to advertise.
+    ReceiveLimitMismatch {
+        advertised_control: u64,
+        advertised_lanes: u64,
+        backend: vot_transport_api::ReceiveLimits,
+    },
 }
 
 impl ErrorKind {
@@ -147,7 +157,8 @@ impl ErrorKind {
             Self::FrameExceedsLimit { side, .. }
             | Self::LaneLimitExceeded { side, .. }
             | Self::NotExactlyOneFrame { side, .. }
-            | Self::ExperimentNotNegotiated { side, .. } => matches!(side, Side::Local),
+            | Self::ExperimentNotNegotiated { side, .. }
+            | Self::FrameOnTheWrongLane { side, .. } => matches!(side, Side::Local),
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
@@ -582,17 +593,18 @@ impl<A: TransportAdapter> Session<A> {
     /// Reports a backend whose reassembly bound is not the limit this endpoint
     /// is about to advertise.
     fn check_receive_limit(&self) -> Result<(), Error> {
-        let Some(backend) = self.adapter.control_receive_limit() else {
-            // A backend that reassembles nothing has nothing to disagree with.
+        let Some(backend) = self.adapter.receive_limits() else {
+            // A backend that enforces nothing has nothing to disagree with.
             return Ok(());
         };
-        let advertised = self.negotiation.local_settings().max_control_frame_payload;
-        if usize::try_from(advertised) == Ok(backend) {
+        let advertised = self.negotiation.local_settings();
+        if backend.match_settings(&advertised) {
             return Ok(());
         }
         Err(Error::new(
             ErrorKind::ReceiveLimitMismatch {
-                advertised,
+                advertised_control: advertised.max_control_frame_payload,
+                advertised_lanes: advertised.reliable_lane_limit,
                 backend,
             },
             error_code::INVALID_SETTING,
@@ -650,7 +662,7 @@ impl<A: TransportAdapter> Session<A> {
         while let Some(event) = self.adapter.poll() {
             match event {
                 Event::Control(bytes) => {
-                    self.check_inbound(&bytes)?;
+                    self.check_inbound(&bytes, Lane::Control)?;
                     if let Some(event) = self.accept_control(&bytes)? {
                         return Ok(Some(event));
                     }
@@ -666,7 +678,7 @@ impl<A: TransportAdapter> Session<A> {
                     // counts them at adoption and releases them at shutdown,
                     // which is the only place that lifecycle is visible.
                     if let Event::Reliable { bytes, .. } = &record {
-                        self.check_inbound(bytes)?;
+                        self.check_inbound(bytes, Lane::Reliable)?;
                     }
                     if self.negotiation.is_ready() {
                         return Ok(Some(record));
@@ -690,7 +702,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.require_sendable()?;
-        self.check_outbound(frame)?;
+        self.check_outbound(frame, Lane::Control)?;
         self.adapter.send_control(frame).map_err(transport_error)
     }
 
@@ -700,7 +712,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
         self.require_sendable()?;
-        self.check_outbound(record)?;
+        self.check_outbound(record, Lane::Reliable)?;
         self.require_lane_allowed(stream)?;
         // Counted only once the backend has it. A refused send opens no carrier
         // stream, so counting it would spend a lane on nothing and, at a limit
@@ -718,7 +730,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Refuses before `Ready`, and propagates a backend refusal.
     pub fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
         self.require_sendable()?;
-        self.check_outbound(&record)?;
+        self.check_outbound(&record, Lane::Reliable)?;
         self.require_lane_allowed(stream)?;
         self.adapter
             .send_reliable_shared(stream, record)
@@ -880,7 +892,7 @@ impl<A: TransportAdapter> Session<A> {
 
     /// Checks a frame this endpoint is about to send against the peer's limits.
     /// Nothing to check before the peer has advertised any.
-    fn check_outbound(&self, frame: &[u8]) -> Result<(), Error> {
+    fn check_outbound(&self, frame: &[u8], lane: Lane) -> Result<(), Error> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
@@ -888,17 +900,19 @@ impl<A: TransportAdapter> Session<A> {
             frame,
             &peer,
             &self.negotiation.negotiated_extensions(),
+            lane,
             Side::Peer,
         )
     }
 
     /// Checks a frame the peer sent against the limits this endpoint
     /// advertised, which the adapters bound only by the protocol ceiling.
-    fn check_inbound(&self, frame: &[u8]) -> Result<(), Error> {
+    fn check_inbound(&self, frame: &[u8], lane: Lane) -> Result<(), Error> {
         check_frame(
             frame,
             &self.negotiation.local_settings(),
             &self.negotiation.negotiated_extensions(),
+            lane,
             Side::Local,
         )
     }
@@ -956,6 +970,30 @@ fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
     }
 }
 
+/// Which stream a frame is on.
+///
+/// `spec/wire.md` section 7 gives negotiation its own stream and application
+/// records their lanes. A control-only frame on a lane bypasses negotiation
+/// entirely, so a duplicate `HELLO` after readiness would reach the
+/// application instead of producing the sequence error the exchange requires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lane {
+    /// The negotiation stream, which carries every control frame.
+    Control,
+    /// An application lane, which carries records and nothing else.
+    Reliable,
+}
+
+impl Lane {
+    /// Whether a frame of this type belongs on the lane.
+    const fn carries(self, frame_type: u64) -> bool {
+        match self {
+            Self::Control => frame_type != vot_codec::frame_type::DATA_RECORD,
+            Self::Reliable => frame_type == vot_codec::frame_type::DATA_RECORD,
+        }
+    }
+}
+
 /// Whose limits a frame is measured against.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -974,6 +1012,7 @@ fn check_frame(
     frame: &[u8],
     settings: &Settings,
     extensions: &BTreeSet<u64>,
+    lane: Lane,
     side: Side,
 ) -> Result<(), Error> {
     let limits = vot_codec::DecodeLimits {
@@ -993,6 +1032,20 @@ fn check_frame(
                 frame_type: envelope.frame_type,
                 declared: envelope.total_length,
                 found: frame.len(),
+                side,
+            },
+            error_code::MALFORMED_FRAME,
+        ));
+    }
+
+    // The stream a frame is on decides which types it may be. Without this a
+    // control-only frame on a lane skips negotiation and reaches the
+    // application, and a record on the negotiation stream is not a record.
+    if !lane.carries(envelope.frame_type) {
+        return Err(Error::new(
+            ErrorKind::FrameOnTheWrongLane {
+                frame_type: envelope.frame_type,
+                lane,
                 side,
             },
             error_code::MALFORMED_FRAME,
@@ -1065,7 +1118,7 @@ mod tests {
         control_capacity: Option<usize>,
         refuse_control: Option<TransportError>,
         closed: Vec<u16>,
-        receive_limit: Option<usize>,
+        receive_limits: Option<vot_transport_api::ReceiveLimits>,
     }
 
     impl TransportAdapter for Loopback {
@@ -1112,8 +1165,8 @@ mod tests {
             Ok(())
         }
 
-        fn control_receive_limit(&self) -> Option<usize> {
-            self.receive_limit
+        fn receive_limits(&self) -> Option<vot_transport_api::ReceiveLimits> {
+            self.receive_limits
         }
 
         fn close(&mut self, code: u16) -> Result<(), TransportError> {
@@ -1805,7 +1858,16 @@ mod tests {
         // accepts more. The mismatch is caught before the limit goes out.
         let mut mismatched = Session::client(
             Loopback {
-                receive_limit: Some(64 * 1024),
+                receive_limits: Some(
+                    vot_transport_api::ReceiveLimits::advertised(
+                        &Settings {
+                            max_control_frame_payload: 64 * 1024,
+                            ..Settings::default()
+                        },
+                        4 * 1024 * 1024,
+                    )
+                    .unwrap(),
+                ),
                 ..Loopback::default()
             },
             Settings::default(),
@@ -1816,8 +1878,16 @@ mod tests {
         assert_eq!(
             error.kind(),
             &ErrorKind::ReceiveLimitMismatch {
-                advertised: Settings::default().max_control_frame_payload,
-                backend: 64 * 1024,
+                advertised_control: Settings::default().max_control_frame_payload,
+                advertised_lanes: Settings::default().reliable_lane_limit,
+                backend: vot_transport_api::ReceiveLimits::advertised(
+                    &Settings {
+                        max_control_frame_payload: 64 * 1024,
+                        ..Settings::default()
+                    },
+                    4 * 1024 * 1024,
+                )
+                .unwrap(),
             }
         );
         assert!(
@@ -1830,7 +1900,16 @@ mod tests {
         // Agreeing is enough, whatever the value.
         let mut agreed = Session::client(
             Loopback {
-                receive_limit: Some(64 * 1024),
+                receive_limits: Some(
+                    vot_transport_api::ReceiveLimits::advertised(
+                        &Settings {
+                            max_control_frame_payload: 64 * 1024,
+                            ..Settings::default()
+                        },
+                        4 * 1024 * 1024,
+                    )
+                    .unwrap(),
+                ),
                 ..Loopback::default()
             },
             Settings {
@@ -2200,12 +2279,12 @@ mod tests {
             ..Settings::default()
         };
         let cases = [
-            (frame_type::DATA_RECORD, 64 * 1024),
-            (frame_type::MANIFEST_PAGE, 96 * 1024),
-            (frame_type::PROGRESSIVE_PAGE, 96 * 1024),
-            (frame_type::SEAL, 128 * 1024),
+            (frame_type::DATA_RECORD, 64 * 1024, Lane::Reliable),
+            (frame_type::MANIFEST_PAGE, 96 * 1024, Lane::Control),
+            (frame_type::PROGRESSIVE_PAGE, 96 * 1024, Lane::Control),
+            (frame_type::SEAL, 128 * 1024, Lane::Control),
         ];
-        for (frame_type, limit) in cases {
+        for (frame_type, limit, lane) in cases {
             assert_eq!(
                 negotiated_payload_limit(frame_type, &settings),
                 limit as u64,
@@ -2216,6 +2295,7 @@ mod tests {
                     &frame_of(frame_type, limit),
                     &settings,
                     &BTreeSet::new(),
+                    lane,
                     side,
                 )
                 .unwrap();
@@ -2223,6 +2303,7 @@ mod tests {
                     &frame_of(frame_type, limit + 1),
                     &settings,
                     &BTreeSet::new(),
+                    lane,
                     side,
                 )
                 .unwrap_err();
@@ -2434,6 +2515,70 @@ mod tests {
         // The client saw no HELLO, so it has none and refuses either way.
         assert!(client.negotiation.negotiated_extensions().is_empty());
         assert!(client.send_control(&credit).is_err());
+    }
+
+    #[test]
+    fn a_frame_on_the_wrong_stream_is_refused() {
+        // spec/wire.md section 7 gives negotiation its own stream. A
+        // control-only frame on a lane would skip negotiation entirely, so a
+        // duplicate HELLO after readiness would reach the application instead
+        // of producing the sequence error the exchange requires.
+        let (mut client, mut server) = negotiated();
+        let mut hello = Vec::new();
+        vot_codec::encode_hello(
+            &Hello {
+                draft_revision: vot_codec::DRAFT_REVISION,
+                endpoint_role: EndpointRole::Client,
+                extensions: BTreeSet::new(),
+            },
+            &mut hello,
+        )
+        .unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::HELLO, &hello, &mut frame).unwrap();
+
+        // Inbound on a lane: refused rather than delivered.
+        server.adapter.events.push_back(Event::Reliable {
+            stream: StreamId(1),
+            sequence: 1,
+            bytes: vot_transport_api::shared_payload(&frame),
+        });
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::MALFORMED_FRAME);
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::FrameOnTheWrongLane {
+                frame_type: frame_type::HELLO,
+                lane: Lane::Reliable,
+                side: Side::Local,
+            }
+        );
+        assert!(error.kind().is_peer_fault());
+
+        // Outbound the same way, and a record on the negotiation stream is
+        // refused for the mirror reason.
+        assert_eq!(
+            client
+                .send_reliable(StreamId(1), &frame)
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::FrameOnTheWrongLane {
+                frame_type: frame_type::HELLO,
+                lane: Lane::Reliable,
+                side: Side::Peer,
+            }
+        );
+        assert_eq!(
+            client
+                .send_control(&data_record(b"record"))
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::FrameOnTheWrongLane {
+                frame_type: frame_type::DATA_RECORD,
+                lane: Lane::Control,
+                side: Side::Peer,
+            }
+        );
     }
 
     #[test]

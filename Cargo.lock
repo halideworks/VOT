@@ -2128,6 +2128,7 @@ name = "vot-transport-tcp"
 version = "0.0.1"
 dependencies = [
  "rustls",
+ "vot-codec",
  "vot-transport-api",
 ]
 

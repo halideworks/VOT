@@ -15,7 +15,16 @@ const MAGIC: &[u8; 8] = b"VOTRES02";
 const MAX_STORE_BYTES: u64 = 67_108_864;
 const MAX_STORE_PAYLOAD_BYTES: u64 = MAX_STORE_BYTES - 20;
 const MIN_STORE_BYTES: u64 = 8;
-const MAX_UNITS_PER_OBJECT: u64 = 8_388_595;
+/// Largest unit count a single object can reserve.
+///
+/// This is derived from the snapshot format, not chosen: it is the largest
+/// `total_units` whose worst-case checkpoint encoding — every other unit
+/// checkpointed, so the run-length ranges degenerate to one range per pair —
+/// still fits a store holding that object alone. At the 64 KiB unit that is
+/// just under 1 TiB. `max_units_per_object_is_derived_from_the_snapshot_format`
+/// pins both sides of the boundary, so a format change fails the test rather
+/// than silently shifting the limit.
+const MAX_UNITS_PER_OBJECT: u64 = 16_777_198;
 const RECORD_HEADER_BYTES: u64 = 4;
 const RECORD_CHECKSUM_BYTES: u64 = 8;
 const RESERVE_RECORD: u8 = 1;
@@ -659,12 +668,19 @@ fn worst_case_snapshot_payload_length(
     for object in objects.values() {
         validate_total_units(object.total_units)?;
         length = length
-            .checked_add(42)
-            .and_then(|length| length.checked_add(uvarint_length(object.total_units)))
-            .and_then(|length| length.checked_add(worst_case_ranges_length(object.total_units)))
+            .checked_add(worst_case_object_payload_length(object.total_units)?)
             .ok_or(Error::TooLarge)?;
     }
     Ok(length)
+}
+
+/// Worst-case snapshot bytes for one object: identity, total units, and a
+/// fully fragmented checkpoint set.
+fn worst_case_object_payload_length(total_units: u64) -> Result<u64, Error> {
+    42_u64
+        .checked_add(uvarint_length(total_units))
+        .and_then(|length| length.checked_add(worst_case_ranges_length(total_units)))
+        .ok_or(Error::TooLarge)
 }
 
 fn worst_case_ranges_length(total_units: u64) -> u64 {
@@ -854,14 +870,21 @@ fn append_record(path: &Path, payload: &[u8]) -> Result<(), Error> {
     if !append_fits(current_length, header_length, record_length) {
         return Err(Error::TooLarge);
     }
+    // One test for both effects of creating the file: the magic prefix is
+    // written, and the directory entry needs an fsync. Growing an existing file
+    // changes no directory entry, so the parent fsync is charged once per store
+    // rather than once per checkpoint.
+    let created = current_length == 0;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if current_length == 0 {
+    if created {
         file.write_all(MAGIC)?;
     }
     file.write_all(&record)?;
     file.sync_all()?;
     #[cfg(unix)]
-    File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+    if created {
+        File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -1217,6 +1240,20 @@ mod tests {
         fs::remove_file(&exact_header_path).unwrap();
         fs::remove_file(lock_path(&exact_header_path).unwrap()).unwrap();
 
+        // A tail of exactly one header is enough to read a length from, so it
+        // is decoded rather than treated as torn. A zero length is not a record
+        // that was cut short, it is a corrupt one.
+        let zero_header_path = temp_path("zero-length-header");
+        let mut zero_header = MAGIC.to_vec();
+        zero_header.extend_from_slice(&vec![0; RECORD_HEADER_BYTES as usize]);
+        fs::write(&zero_header_path, zero_header).unwrap();
+        assert!(matches!(
+            ResumeStore::open(&zero_header_path),
+            Err(Error::Corrupt)
+        ));
+        fs::remove_file(&zero_header_path).unwrap();
+        fs::remove_file(lock_path(&zero_header_path).unwrap()).unwrap();
+
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
@@ -1393,7 +1430,7 @@ mod tests {
         assert_eq!(MAX_STORE_BYTES, 67_108_864);
         assert_eq!(MAX_STORE_PAYLOAD_BYTES, 67_108_844);
         assert_eq!(MIN_STORE_BYTES, 8);
-        assert_eq!(MAX_UNITS_PER_OBJECT, 8_388_595);
+        assert_eq!(MAX_UNITS_PER_OBJECT, 16_777_198);
         assert!(validate_payload_length(MAX_STORE_PAYLOAD_BYTES).is_ok());
         assert!(matches!(
             validate_payload_length(MAX_STORE_PAYLOAD_BYTES + 1),
@@ -1483,20 +1520,36 @@ mod tests {
             [1, 1, 2, 2, 3, 10]
         );
 
-        let mut four = one.clone();
-        for byte in 18..21 {
-            four.insert(
-                subject(byte),
-                StoredObject {
-                    total_units: MAX_UNITS_PER_OBJECT,
-                    checkpointed: BTreeSet::new(),
-                },
-            );
-        }
+        let mut two = one.clone();
+        two.insert(
+            subject(18),
+            StoredObject {
+                total_units: MAX_UNITS_PER_OBJECT,
+                checkpointed: BTreeSet::new(),
+            },
+        );
         assert!(matches!(
-            validate_reserved_capacity(&four),
+            validate_reserved_capacity(&two),
             Err(Error::TooLarge)
         ));
+    }
+
+    #[test]
+    fn max_units_per_object_is_derived_from_the_snapshot_format() {
+        // A snapshot record holding one object: magic, record header, record
+        // checksum, the snapshot kind byte, and the object-count varint.
+        let ceiling = MAX_STORE_BYTES
+            - MAGIC.len() as u64
+            - RECORD_HEADER_BYTES
+            - RECORD_CHECKSUM_BYTES
+            - 1
+            - uvarint_length(1);
+        assert!(worst_case_object_payload_length(MAX_UNITS_PER_OBJECT).unwrap() <= ceiling);
+        assert!(worst_case_object_payload_length(MAX_UNITS_PER_OBJECT + 1).unwrap() > ceiling);
+        // The cap is a unit count; at 64 KiB units it admits just under 1 TiB.
+        let max_object_bytes = MAX_UNITS_PER_OBJECT * 65_536;
+        assert!(max_object_bytes < 1 << 40);
+        assert!(max_object_bytes > (1 << 40) - (2 << 20));
     }
 
     #[test]
@@ -1720,6 +1773,72 @@ mod tests {
             &BTreeSet::from([0, 1, 2])
         );
         assert!(file_len(&path).unwrap() < MAX_STORE_BYTES);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fully_checkpointed_million_object_snapshot_fits_the_store() {
+        // The reserved-only workload above proves the reservation path. This
+        // proves the durable path it grows into: every object checkpointed, so
+        // every object also carries a range record.
+        let path = temp_path("million-checkpointed");
+        let subject_for = |index: u32| {
+            let mut root = [0; 32];
+            root[..4].copy_from_slice(&index.to_be_bytes());
+            SubjectId {
+                suite: 1,
+                root,
+                length: 1,
+            }
+        };
+        let large_subject = SubjectId {
+            suite: 1,
+            root: [0xaa; 32],
+            length: 100 * 65_536,
+        };
+
+        let mut objects = BTreeMap::new();
+        for index in 0..1_000_000_u32 {
+            objects.insert(
+                subject_for(index),
+                StoredObject {
+                    total_units: 1,
+                    checkpointed: BTreeSet::from([0]),
+                },
+            );
+        }
+        objects.insert(
+            large_subject,
+            StoredObject {
+                total_units: 100,
+                checkpointed: (0..100).collect(),
+            },
+        );
+
+        validate_reserved_capacity(&objects).unwrap();
+        ResumeStore::compact(&path, &objects).unwrap();
+
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.checkpointed(subject_for(0)).unwrap(),
+            &BTreeSet::from([0])
+        );
+        assert_eq!(
+            reopened.checkpointed(subject_for(999_999)).unwrap(),
+            &BTreeSet::from([0])
+        );
+        assert_eq!(
+            reopened.checkpointed(large_subject).unwrap(),
+            &(0..100).collect::<BTreeSet<_>>()
+        );
+
+        let length = file_len(&path).unwrap();
+        let headroom = MAX_STORE_BYTES - length;
+        assert!(
+            headroom >= 16 * 1024 * 1024,
+            "fully checkpointed snapshot is {length} bytes, leaving only {headroom} bytes"
+        );
         fs::remove_file(&path).unwrap();
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }

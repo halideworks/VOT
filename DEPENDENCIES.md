@@ -43,7 +43,8 @@ images are pinned by digest.
 
 Wave 3 adds no new third-party runtime packages. The deterministic simulator
 reuses the workspace `blake3` package for canonical trace digests. The frame and
-manifest fuzz drivers depend only on their corresponding workspace crates.
+manifest fuzz drivers depend on their corresponding workspace crates and on the
+in-repo `vot-fuzz-mutator`, which has no third-party dependencies.
 
 Wave 5 runtime dependencies:
 
@@ -58,3 +59,11 @@ Test-only dependencies:
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz
   processes. It enforces a hard allocation ceiling without adding unsafe code to
   VOT.
+- `libfuzzer-sys` 0.4.13 and its `arbitrary` 1.4.2 dependency provide the
+  coverage-guided entry points in `fuzz/cargo-fuzz`. They are pinned exactly and
+  build only in that workspace, which is separate from the root workspace, so
+  they never reach a shipped artifact. `libfuzzer-sys` bundles LLVM libFuzzer
+  and is licensed `(MIT OR Apache-2.0) AND NCSA`. NCSA is not in the `deny.toml`
+  allow list and `cargo deny` runs only over the root workspace today, so the
+  fuzz workspaces stay outside that gate. Bringing them inside requires allowing
+  NCSA for test-only code, which is a policy decision, not a mechanical one.

@@ -45,10 +45,17 @@ struct ActiveObject {
     received: u64,
 }
 
+/// Accepted ranges for one object.
+///
+/// `segments` is kept non-overlapping and every range covers whole 64 KiB
+/// units, so `bytes` alone decides completeness: a set of disjoint ranges
+/// inside `[0, length)` totalling `length` bytes can only be the whole object.
+/// Tracking coverage as an explicit per-unit set would cost one entry per
+/// 64 KiB — sixteen million of them for a terabyte object — to say the same
+/// thing.
 #[derive(Default)]
 struct RangeState {
     segments: BTreeMap<u64, Vec<u8>>,
-    covered_units: BTreeSet<u64>,
     bytes: u64,
 }
 
@@ -183,6 +190,13 @@ impl ReliableReceiver {
         if covered_offset % RANGE_UNIT_BYTES != 0 || covered_end > subject.length {
             return Err(Error::LengthExceeded);
         }
+        // A range covers whole 64 KiB units unless it ends the object, the same
+        // rule `PROOF_BUNDLE` validation applies on the wire. Both proof suites
+        // enforce it too, but stating it here is what lets completion be decided
+        // from the accepted byte total alone.
+        if covered_end < subject.length && bytes % RANGE_UNIT_BYTES != 0 {
+            return Err(Error::LengthExceeded);
+        }
         match suite(subject.suite)? {
             Suite::Blake3Bao64 => {
                 vot_proof_blake3::verify(
@@ -219,10 +233,24 @@ impl ReliableReceiver {
                 }
                 return Err(Error::ProofInvalid);
             }
-            if active.segments.iter().any(|(offset, segment)| {
-                let end = offset.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
-                covered_offset < end && *offset < covered_end
-            }) {
+            // Accepted segments never overlap, so only the two neighbours of the
+            // new offset can conflict. A linear scan would be quadratic across a
+            // large object's quarter-million segments.
+            let overlaps_earlier = active
+                .segments
+                .range(..covered_offset)
+                .next_back()
+                .is_some_and(|(offset, segment)| {
+                    let end =
+                        offset.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
+                    covered_offset < end
+                });
+            let overlaps_later = active
+                .segments
+                .range(covered_offset..)
+                .next()
+                .is_some_and(|(offset, _)| *offset < covered_end);
+            if overlaps_earlier || overlaps_later {
                 return Err(Error::LengthMismatch);
             }
             active
@@ -237,8 +265,6 @@ impl ReliableReceiver {
             self.peak_staging = self.peak_staging.max(self.staging.used());
             true
         };
-        let first = covered_offset / RANGE_UNIT_BYTES;
-        let last = covered_end.div_ceil(RANGE_UNIT_BYTES);
         let Some(active) = self.range_active.get_mut(&subject) else {
             if reserved_here {
                 self.staging.release(bytes);
@@ -247,7 +273,6 @@ impl ReliableReceiver {
         };
         active.bytes = next_bytes;
         active.segments.insert(covered_offset, data.into_owned());
-        active.covered_units.extend(first..last);
         Ok(())
     }
 
@@ -322,14 +347,10 @@ impl ReliableReceiver {
         if self.verified.contains(&subject) {
             return Ok(());
         }
-        let expected = subject.length.div_ceil(RANGE_UNIT_BYTES);
         let complete = self
             .range_active
             .get(&subject)
-            .map(|active| {
-                u64::try_from(active.covered_units.len()).ok() == Some(expected)
-                    && (0..expected).all(|unit| active.covered_units.contains(&unit))
-            })
+            .map(|active| active.bytes == subject.length)
             .ok_or(Error::UnknownObject)?;
         if !complete {
             return Err(Error::LengthMismatch);
@@ -501,9 +522,7 @@ impl Planner {
 mod tests {
     use super::*;
     use vot_transport_api::{Event, StreamId, TransportAdapter};
-    use vot_transport_sim::{
-        Action, ExpectedOutcome, Scenario, ScheduledAction, Simulator, SimulatorAdapter,
-    };
+    use vot_transport_sim::{Impairment, SimulatorAdapter};
 
     fn subject(bytes: &[u8]) -> SubjectId {
         SubjectId {
@@ -533,35 +552,6 @@ mod tests {
     fn reliable_transfer_uses_transport_adapter_contract() {
         let bytes = vec![0x5a; 700_000];
         let subject = subject(&bytes);
-        let scenario = Scenario {
-            name: "wave4-reliable".to_owned(),
-            seed: 19,
-            expected: ExpectedOutcome::Complete,
-            expected_trace: None,
-            actions: vec![
-                ScheduledAction {
-                    at: 0,
-                    action: Action::AddPath {
-                        path: 1,
-                        mtu: 1500,
-                        latency: 2,
-                    },
-                },
-                ScheduledAction {
-                    at: 1,
-                    action: Action::Send {
-                        path: 1,
-                        transfer: 7,
-                        bytes: subject.length,
-                    },
-                },
-            ],
-        };
-        assert!(matches!(
-            Simulator::run(&scenario).outcome,
-            vot_transport_sim::Outcome::Complete { published: 1 }
-        ));
-
         let mut adapter = SimulatorAdapter::default();
         adapter.set_receive_credit(400_000).unwrap();
         for record in bytes.chunks(256 * 1024) {
@@ -590,6 +580,70 @@ mod tests {
     }
 
     #[test]
+    fn reordered_and_duplicated_delivery_still_verifies_every_range() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        // Each unit carries its own index so the receiver can recover the
+        // covered offset from a record that arrived out of order.
+        let mut bytes = Vec::with_capacity(unit * 3);
+        for index in 0..3_u8 {
+            bytes.extend(std::iter::repeat_n(index, unit));
+        }
+        let subject = subject(&bytes);
+
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            reorder_depth: 2,
+            duplicate_every: 2,
+            ..Impairment::default()
+        })
+        .unwrap();
+        // One stream per range, which is how ranges are fetched concurrently.
+        // A stream is never reordered against itself, so this is the only
+        // arrangement in which out-of-order arrival is a real carrier outcome.
+        for (index, record) in bytes.chunks(unit).enumerate() {
+            adapter
+                .send_reliable(StreamId(7 + index as u64), record)
+                .unwrap();
+        }
+        adapter.flush().unwrap();
+
+        let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
+        receiver.begin_ranges(subject).unwrap();
+        let mut arrivals = Vec::new();
+        while let Some(event) = adapter.poll() {
+            let Event::Reliable { bytes: record, .. } = event else {
+                panic!("simulator emitted a non-reliable event");
+            };
+            let index = u64::from(record[0]);
+            let offset = index * RANGE_UNIT_BYTES;
+            let proof = vot_proof_blake3::prove(&bytes, offset, RANGE_UNIT_BYTES).unwrap();
+            receiver
+                .receive_range(subject, offset, &record, &proof.proof)
+                .unwrap();
+            arrivals.push(index);
+        }
+        // Out of order, with a duplicate the receiver absorbed idempotently.
+        assert_eq!(arrivals.len(), 4);
+        assert_ne!(arrivals, vec![0, 1, 2, 2], "delivery was not reordered");
+        assert_eq!(
+            {
+                let mut sorted = arrivals.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                sorted
+            },
+            vec![0, 1, 2]
+        );
+        receiver.finish_ranges(subject).unwrap();
+        assert!(receiver.is_verified(subject));
+        // The duplicate was not charged twice against staging.
+        assert_eq!(
+            receiver.peak_staging(),
+            3 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION
+        );
+    }
+
+    #[test]
     fn duplicate_begin_modes_are_rejected_while_active() {
         let object = subject(b"duplicate");
         let mut sequential =
@@ -604,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_ranges_requires_the_expected_unit_set() {
+    fn finish_ranges_requires_every_byte_of_the_object() {
         let object = SubjectId {
             suite: 1,
             root: [0; 32],
@@ -616,11 +670,53 @@ mod tests {
             object,
             RangeState {
                 segments: BTreeMap::new(),
-                covered_units: BTreeSet::from([1, 2]),
-                bytes: 0,
+                bytes: RANGE_UNIT_BYTES,
             },
         );
         assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
+        receiver.range_active.insert(
+            object,
+            RangeState {
+                segments: BTreeMap::new(),
+                bytes: 2 * RANGE_UNIT_BYTES,
+            },
+        );
+        receiver.finish_ranges(object).unwrap();
+        assert!(receiver.is_verified(object));
+    }
+
+    #[test]
+    fn a_partial_unit_cannot_stand_in_for_a_whole_one() {
+        // Both proof suites already reject a range that stops mid-unit before
+        // the end of the object. The receiver rejects it first, so deciding
+        // completion from `bytes` alone rests on a rule this crate enforces
+        // rather than on a property of the proof crates.
+        let bytes = vec![0x11; usize::try_from(2 * RANGE_UNIT_BYTES).unwrap()];
+        let object = subject(&bytes);
+        let prefix = vot_proof_blake3::prove(&bytes, 0, 1024).unwrap();
+        let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
+        receiver.begin_ranges(object).unwrap();
+        assert_eq!(
+            receiver.receive_range(object, 0, &bytes[..1024], &prefix.proof),
+            Err(Error::LengthExceeded)
+        );
+
+        // The final range may be short, because it ends the object.
+        let short = vec![0x22; usize::try_from(RANGE_UNIT_BYTES).unwrap() + 7];
+        let short_object = subject(&short);
+        let tail_offset = RANGE_UNIT_BYTES;
+        let tail = vot_proof_blake3::prove(&short, tail_offset, 7).unwrap();
+        let mut tail_receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
+        tail_receiver.begin_ranges(short_object).unwrap();
+        tail_receiver
+            .receive_range(
+                short_object,
+                tail_offset,
+                &short[usize::try_from(tail_offset).unwrap()..],
+                &tail.proof,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -814,6 +910,21 @@ mod tests {
             Err(Error::LengthMismatch)
         );
 
+        let mut overlap_from_below = make_receiver();
+        overlap_from_below.begin_ranges(range_subject).unwrap();
+        overlap_from_below
+            .receive_range(
+                range_subject,
+                RANGE_UNIT_BYTES,
+                overlap_data,
+                &overlap_proof.proof,
+            )
+            .unwrap();
+        assert_eq!(
+            overlap_from_below.receive_range(range_subject, 0, first_two, &first_two_proof.proof),
+            Err(Error::LengthMismatch)
+        );
+
         let second_proof =
             vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let mut adjacent = make_receiver();
@@ -840,9 +951,18 @@ mod tests {
                 &second_proof.proof,
             )
             .unwrap();
+        assert_eq!(middle.range_active[&range_subject].bytes, RANGE_UNIT_BYTES);
         assert_eq!(
-            middle.range_active[&range_subject].covered_units,
-            BTreeSet::from([1])
+            middle.range_active[&range_subject]
+                .segments
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![RANGE_UNIT_BYTES]
+        );
+        assert_eq!(
+            middle.finish_ranges(range_subject),
+            Err(Error::LengthMismatch)
         );
     }
 

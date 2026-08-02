@@ -158,21 +158,48 @@ impl StreamVerifier {
     /// # Errors
     /// Propagates group-order or length overflow errors from the verifier.
     pub fn update(&mut self, mut bytes: &[u8]) -> Result<(), VerifyError> {
-        while !bytes.is_empty() {
-            let available = GROUP_SIZE - self.pending.len();
-            let consumed = available.min(bytes.len());
+        // Finish any partial group first, so the borrowed path below always
+        // starts on a group boundary.
+        if !self.pending.is_empty() {
+            let consumed = (GROUP_SIZE - self.pending.len()).min(bytes.len());
             self.pending.extend_from_slice(&bytes[..consumed]);
             bytes = &bytes[consumed..];
             if self.pending.len() == GROUP_SIZE {
-                self.verifier.feed(self.next_group, &self.pending)?;
-                self.next_group = self
-                    .next_group
-                    .checked_add(1)
-                    .ok_or(VerifyError::LengthOverflow)?;
-                self.pending.clear();
+                self.feed_pending()?;
             }
         }
+        if self.pending.is_empty() {
+            // Whole groups are hashed straight out of the caller's buffer. A
+            // 64 KiB-aligned range is therefore never copied on its way to the
+            // hash, which is the dominant cost on the sequential path.
+            let mut groups = bytes.chunks_exact(GROUP_SIZE);
+            for group in groups.by_ref() {
+                self.feed_group(group)?;
+            }
+            bytes = groups.remainder();
+        }
+        self.pending.extend_from_slice(bytes);
         Ok(())
+    }
+
+    fn feed_group(&mut self, group: &[u8]) -> Result<(), VerifyError> {
+        self.verifier.feed(self.next_group, group)?;
+        self.next_group = self
+            .next_group
+            .checked_add(1)
+            .ok_or(VerifyError::LengthOverflow)?;
+        Ok(())
+    }
+
+    /// Feeds the buffered group, leaving the buffer empty but allocated.
+    fn feed_pending(&mut self) -> Result<(), VerifyError> {
+        let pending = std::mem::take(&mut self.pending);
+        let result = self.feed_group(&pending);
+        self.pending = pending;
+        if result.is_ok() {
+            self.pending.clear();
+        }
+        result
     }
 
     /// # Errors
@@ -250,10 +277,12 @@ impl MerkleAccumulator {
             .checked_next_power_of_two()
             .ok_or(VerifyError::LengthOverflow)?;
         while self.count < target {
-            let remaining = target - self.count;
-            let aligned = 1_u64 << self.count.trailing_zeros();
-            let width = aligned.min(1_u64 << (63 - remaining.leading_zeros()));
-            let level = width.trailing_zeros() as usize;
+            // The largest subtree the current count is aligned for always fits
+            // in the padding: `count` is a multiple of its lowest set bit, and
+            // so is `target - count`, because `target` is a higher power of two.
+            // Clamping the width against the remainder would be dead code.
+            let level = self.count.trailing_zeros() as usize;
+            debug_assert!(1_u64 << level <= target - self.count);
             self.add_subtree(zero_subtree(level), level)?;
         }
         let level = target.trailing_zeros() as usize;
@@ -298,13 +327,10 @@ fn reduce(nodes: &[Root]) -> Root {
     current[0]
 }
 
-fn zero_subtree(mut level: usize) -> Root {
-    let mut value = piece_hash(&[]);
-    while level > 0 {
-        value = parent(&value, &value);
-        level -= 1;
-    }
-    value
+fn zero_subtree(level: usize) -> Root {
+    // A bounded fold rather than a countdown loop: an arithmetic mutation of a
+    // decrementing counter here would hang instead of failing.
+    (0..level).fold(piece_hash(&[]), |value, _| parent(&value, &value))
 }
 
 #[cfg(test)]
@@ -334,13 +360,132 @@ mod tests {
     }
 
     #[test]
+    fn aligned_updates_are_hashed_without_buffering() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let data = fixture(3 * GROUP_SIZE);
+            let mut verifier = StreamVerifier::new(suite);
+            verifier.update(&data).unwrap();
+            assert_eq!(verifier.buffered_bytes(), 0);
+            assert_eq!(verifier.finish().unwrap(), root(suite, &data).unwrap());
+
+            // A misaligned prefix is buffered, then the stream realigns and the
+            // remaining whole groups take the borrowed path again.
+            let mut split = StreamVerifier::new(suite);
+            split.update(&data[..7]).unwrap();
+            assert_eq!(split.buffered_bytes(), 7);
+            split.update(&data[7..]).unwrap();
+            assert_eq!(split.buffered_bytes(), 0);
+            assert_eq!(split.finish().unwrap(), root(suite, &data).unwrap());
+        }
+    }
+
+    #[test]
     fn group_order_and_final_length_are_enforced() {
-        let mut verifier = Verifier::new(Suite::Blake3Bao64);
-        assert_eq!(
-            verifier.feed(1, &vec![0; GROUP_SIZE]),
-            Err(VerifyError::GroupOutOfOrder)
-        );
-        verifier.feed(0, &[1]).unwrap();
-        assert_eq!(verifier.feed(1, &[2]), Err(VerifyError::GroupAfterFinal));
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let mut verifier = Verifier::new(suite);
+            assert_eq!(
+                verifier.feed(1, &vec![0; GROUP_SIZE]),
+                Err(VerifyError::GroupOutOfOrder)
+            );
+            assert_eq!(verifier.feed(0, &[]), Err(VerifyError::InvalidGroupLength));
+            assert_eq!(
+                verifier.feed(0, &vec![0; GROUP_SIZE + 1]),
+                Err(VerifyError::InvalidGroupLength)
+            );
+            // A short group is the final group for both suites.
+            verifier.feed(0, &[1]).unwrap();
+            assert_eq!(verifier.feed(1, &[2]), Err(VerifyError::GroupAfterFinal));
+        }
+    }
+
+    fn patterned(length: usize, step: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| u8::try_from((index * step) % 251).unwrap())
+            .collect()
+    }
+
+    fn hex(root: Root) -> String {
+        use std::fmt::Write as _;
+        root.iter()
+            .fold(String::with_capacity(64), |mut text, byte| {
+                let _ = write!(text, "{byte:02x}");
+                text
+            })
+    }
+
+    /// Known-answer roots for both suites.
+    ///
+    /// The lengths, byte patterns, and expected roots are the committed suite
+    /// vectors in `test-vectors/blake3-bao64/vectors.json` and
+    /// `test-vectors/sha256-bep52-64k/vectors.json`, which
+    /// `tools/verify_wave1_vectors.py` checks independently. Asserting exact
+    /// root bytes here is what makes this crate's accumulator, group reduction,
+    /// and padding testable at all: every other test only checks that the root
+    /// is stable across chunk sizes, which any consistent wrong answer also
+    /// satisfies.
+    #[test]
+    fn suite_roots_match_the_committed_vectors() {
+        const BLAKE3_STEP: usize = 31;
+        const BLAKE3_CASES: [(usize, &str); 4] = [
+            (
+                0,
+                "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            ),
+            (
+                1,
+                "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+            ),
+            (
+                65_536,
+                "41f346d59742824f0994ddec8e9ef409b79edc89383484265b3c0328c07b1ba2",
+            ),
+            (
+                327_699,
+                "d86f6d9efdf00fbc8d659a073b78c28e43a512a4f028ad2bf01cedfc17f6d7da",
+            ),
+        ];
+        const SHA256_STEP: usize = 17;
+        const SHA256_CASES: [(usize, &str); 4] = [
+            (
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                1,
+                "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            ),
+            (
+                65_536,
+                "5d649ce791079f3b6a46c154d02bf35492dd4eaa7b33d5a6acc5dfbf1e8d7ae0",
+            ),
+            (
+                327_699,
+                "3bc7fc08b51b9bb438542846bde6e5714d2509fb1fe7761e0c3d47a9e353032e",
+            ),
+        ];
+
+        for (length, expected) in BLAKE3_CASES {
+            let data = patterned(length, BLAKE3_STEP);
+            assert_eq!(
+                hex(root(Suite::Blake3Bao64, &data).unwrap()),
+                expected,
+                "blake3-bao64 length {length}"
+            );
+        }
+        for (length, expected) in SHA256_CASES {
+            let data = patterned(length, SHA256_STEP);
+            assert_eq!(
+                hex(root(Suite::Sha256Bep52, &data).unwrap()),
+                expected,
+                "sha256-bep52-64k length {length}"
+            );
+            // The same root must come out of a chunked stream, so the
+            // accumulator path and the single-group path agree.
+            let mut streamed = StreamVerifier::new(Suite::Sha256Bep52);
+            for chunk in data.chunks(4096) {
+                streamed.update(chunk).unwrap();
+            }
+            assert_eq!(hex(streamed.finish().unwrap()), expected);
+        }
     }
 }

@@ -5,8 +5,17 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+[lib]
+name = "vot_frame_fuzz_driver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vot-frame-fuzz-driver"
+path = "src/main.rs"
+
 [dependencies]
 cap = "=0.1.2"
 vot-codec = { path = "../../crates/vot-codec" }
+vot-fuzz-mutator = { path = "../mutator" }
 
 [workspace]

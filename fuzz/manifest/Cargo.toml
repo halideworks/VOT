@@ -5,8 +5,17 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+[lib]
+name = "vot_manifest_fuzz_driver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vot-manifest-fuzz-driver"
+path = "src/main.rs"
+
 [dependencies]
 cap = "=0.1.2"
+vot-fuzz-mutator = { path = "../mutator" }
 vot-manifest = { path = "../../crates/vot-manifest" }
 
 [workspace]

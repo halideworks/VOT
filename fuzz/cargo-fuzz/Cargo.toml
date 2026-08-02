@@ -1,0 +1,34 @@
+[package]
+name = "vot-cargo-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cap = "=0.1.2"
+libfuzzer-sys = "=0.4.13"
+vot-frame-fuzz-driver = { path = "../frame_codec" }
+vot-manifest-fuzz-driver = { path = "../manifest" }
+
+[[bin]]
+name = "frame_codec"
+path = "fuzz_targets/frame_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
+
+[workspace]

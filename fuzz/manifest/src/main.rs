@@ -1,46 +1,55 @@
-//! Standalone stdin harness for bounded canonical manifest decoding.
+//! Standalone stdin harness for the pinned-stable bounded fuzz gate.
+//!
+//! Coverage-guided runs use the libFuzzer target in `fuzz/cargo-fuzz`.
 
 #![forbid(unsafe_code)]
 
 use cap::Cap;
 use std::alloc::System;
 use std::io::{self, Read};
-use vot_manifest::{MAX_PAGE_BYTES, decode_page, encode_page};
+use std::path::PathBuf;
 
-const MAX_INPUT: u64 = (MAX_PAGE_BYTES as u64) + 1;
-const ALLOCATION_LIMIT: usize = 256 * 1024 * 1024;
+use vot_fuzz_mutator::{Corpus, read_seed_directory};
+use vot_manifest_fuzz_driver::{ALLOCATION_LIMIT, MAX_INPUT, exercise};
+
+const MAX_POPULATION: usize = 64;
 
 #[global_allocator]
 static ALLOCATOR: Cap<System> = Cap::new(System, ALLOCATION_LIMIT);
 
-fn exercise(input: &[u8]) {
-    if let Ok(page) = decode_page(input) {
-        assert_eq!(encode_page(&page).ok().as_deref(), Some(input));
-    }
+fn argument(name: &str) -> Option<String> {
+    std::env::args()
+        .skip_while(|argument| argument != name)
+        .nth(1)
 }
 
 fn iterations() -> usize {
-    std::env::args()
-        .skip_while(|argument| argument != "--iterations")
-        .nth(1)
+    argument("--iterations")
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
         .max(1)
 }
 
+fn mutation_seed() -> u64 {
+    argument("--seed")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0x5652_4f54_4d41_4e31)
+}
+
 fn main() -> io::Result<()> {
-    let mut input = Vec::new();
-    io::stdin().take(MAX_INPUT).read_to_end(&mut input)?;
-    let mut state = 0x9e37_79b9_u64;
-    for iteration in 0..iterations() {
-        let mut candidate = input.clone();
-        if iteration != 0 && !candidate.is_empty() {
-            state ^= state << 7;
-            state ^= state >> 9;
-            let index = (state as usize) % candidate.len();
-            candidate[index] ^= (state >> 17) as u8 | 1;
-        }
-        exercise(&candidate);
+    let mut seed = Vec::new();
+    io::stdin().take(MAX_INPUT as u64).read_to_end(&mut seed)?;
+    let mut seeds = vec![seed.clone()];
+    if let Some(directory) = argument("--corpus") {
+        seeds.extend(read_seed_directory(&PathBuf::from(directory))?);
+    }
+
+    let mut corpus = Corpus::new(seeds, MAX_POPULATION, MAX_INPUT, mutation_seed());
+    // The unmutated seed runs first so a committed regression input is always
+    // exercised exactly as recorded.
+    exercise(&seed);
+    for _ in 1..iterations() {
+        exercise(&corpus.next_candidate());
     }
     Ok(())
 }

@@ -60,6 +60,7 @@ pub struct MsQuicAdapter {
     event_bytes: usize,
     event_count_limit: usize,
     event_byte_limit: usize,
+    path: Option<(ConnectionId, PathStats)>,
 }
 
 impl Default for MsQuicAdapter {
@@ -74,6 +75,7 @@ impl Default for MsQuicAdapter {
             event_bytes: 0,
             event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
             event_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
+            path: None,
         }
     }
 }
@@ -132,6 +134,9 @@ impl MsQuicAdapter {
         if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
             return Err(Error::InboundQueueFull);
         }
+        if let NativeEvent::Disconnected(id) = &event {
+            self.invalidate_path_stats(ConnectionId(*id));
+        }
         self.events.push_back(match event {
             NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
             NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
@@ -163,6 +168,27 @@ impl MsQuicAdapter {
         });
         self.event_bytes = next_bytes;
         Ok(())
+    }
+
+    /// Records a path sample a backend driver read from a live connection.
+    ///
+    /// The adapter owns no `MsQuic` handle, so path metrics are pushed in the
+    /// same direction as native callbacks rather than pulled on demand. Only
+    /// the most recent sample is retained, and it is discarded once its
+    /// connection disconnects, so a stale path can never seed a new one. A
+    /// driver that wants to save a Careful Resume observation must therefore
+    /// take it before draining the matching `Disconnected` event.
+    pub fn record_path_stats(&mut self, connection: ConnectionId, stats: PathStats) {
+        self.path = Some((connection, stats));
+    }
+
+    fn invalidate_path_stats(&mut self, connection: ConnectionId) {
+        if self
+            .path
+            .is_some_and(|(recorded, _)| recorded == connection)
+        {
+            self.path = None;
+        }
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
@@ -286,7 +312,7 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn path_stats(&self) -> Option<PathStats> {
-        None
+        self.path.map(|(_, stats)| stats)
     }
 }
 
@@ -312,10 +338,12 @@ pub mod live {
 
     use std::ffi::c_void;
 
+    use msquic::ffi::QUIC_STATISTICS_V2;
     use msquic::{
         BufferRef, Connection, ConnectionRef, Registration, RegistrationConfig, SendFlags, Stream,
         StreamRef,
     };
+    use vot_transport_api::PathStats;
 
     pub struct SendBuffer {
         storage: Box<[u8]>,
@@ -328,6 +356,35 @@ pub mod live {
             let buffers = Box::new([BufferRef::from(storage.as_ref())]);
             Self { storage, buffers }
         }
+    }
+
+    /// Reports a measured statistic, treating an unmeasured zero as absent.
+    fn measured(value: u64) -> Option<u64> {
+        if value == 0 { None } else { Some(value) }
+    }
+
+    /// Maps a `QUIC_STATISTICS_V2` sample onto backend-neutral path metrics.
+    ///
+    /// `MsQuic` reports zero for a statistic it has not measured yet, so those
+    /// fields become `None` rather than a congestion window or RTT of zero that
+    /// a BDP or Careful Resume consumer would treat as real. `QUIC_STATISTICS_V2`
+    /// carries no pacing rate, so that metric is always absent on this backend.
+    #[must_use]
+    pub fn path_stats_from_statistics(statistics: &QUIC_STATISTICS_V2) -> PathStats {
+        PathStats {
+            smoothed_rtt_us: measured(u64::from(statistics.Rtt)),
+            congestion_window_bytes: measured(u64::from(statistics.SendCongestionWindow)),
+            mtu_bytes: measured(u64::from(statistics.SendPathMtu)),
+            pacing_rate_bps: None,
+        }
+    }
+
+    /// Reads current path metrics from a live connection.
+    ///
+    /// # Errors
+    /// Propagates an `MsQuic` `GetParam` failure.
+    pub fn path_stats(connection: &Connection) -> Result<PathStats, msquic::Status> {
+        Ok(path_stats_from_statistics(&connection.get_stats_v2()?))
     }
 
     /// Opens an actual `MsQuic` registration and validates the linked API table.
@@ -419,9 +476,9 @@ pub mod live {
             Status, Stream, StreamEvent, StreamOpenFlags, StreamRef, StreamStartFlags,
         };
 
-        use super::super::{Command as AdapterCommand, MsQuicAdapter};
+        use super::super::{Command as AdapterCommand, MsQuicAdapter, NativeEvent};
         use super::{close_peer_connection, close_peer_stream, complete_send, detach_stream};
-        use vot_transport_api::{StreamId, TransportAdapter};
+        use vot_transport_api::{ConnectionId, StreamId, TransportAdapter};
 
         fn test_credential() -> Credential {
             let directory = std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
@@ -552,6 +609,7 @@ pub mod live {
             adapter.send_reliable(StreamId(1), &payload).unwrap();
             let (stream_closed_tx, stream_closed_rx) = mpsc::channel();
             let client_adapter_for_callback = Arc::new(Mutex::new(adapter));
+            let sampled_adapter = Arc::clone(&client_adapter_for_callback);
             let (client_closed_tx, client_closed_rx) = mpsc::channel();
             let client_stream = move |stream: StreamRef, event: StreamEvent| {
                 match event {
@@ -611,6 +669,22 @@ pub mod live {
             stream_closed_rx
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
+
+            let stats = super::path_stats(&client_connection).unwrap();
+            assert!(stats.smoothed_rtt_us.is_some());
+            assert!(stats.congestion_window_bytes.is_some());
+            assert!(stats.mtu_bytes.is_some());
+            assert_eq!(stats.pacing_rate_bps, None);
+            {
+                let mut adapter = sampled_adapter.lock().unwrap();
+                adapter.record_path_stats(ConnectionId(1), stats);
+                assert_eq!(adapter.path_stats(), Some(stats));
+                adapter
+                    .record_native_event(NativeEvent::Disconnected(1))
+                    .unwrap();
+                assert_eq!(adapter.path_stats(), None);
+            }
+
             client_connection.shutdown(msquic::ConnectionShutdownFlags::NONE, 0);
             client_closed_rx
                 .recv_timeout(Duration::from_secs(10))
@@ -735,6 +809,50 @@ mod tests {
     fn path_stats_are_unavailable_without_a_native_path() {
         let adapter = MsQuicAdapter::default();
         assert_eq!(adapter.path_stats(), None);
+    }
+
+    #[test]
+    fn recorded_path_stats_feed_bdp_and_careful_resume_consumers() {
+        let mut adapter = MsQuicAdapter::default();
+        let sample = PathStats {
+            smoothed_rtt_us: Some(18_500),
+            congestion_window_bytes: Some(1_048_576),
+            mtu_bytes: Some(1350),
+            pacing_rate_bps: None,
+        };
+        adapter.record_path_stats(ConnectionId(7), sample);
+        assert_eq!(adapter.path_stats(), Some(sample));
+        let stats = adapter.path_stats().unwrap();
+        assert_eq!(stats.congestion_window_bytes, Some(1_048_576));
+        assert_eq!(stats.smoothed_rtt_us, Some(18_500));
+    }
+
+    #[test]
+    fn path_stats_are_discarded_when_their_connection_disconnects() {
+        let mut adapter = MsQuicAdapter::default();
+        adapter.record_path_stats(ConnectionId(7), PathStats::default());
+        adapter
+            .record_native_event(NativeEvent::Disconnected(9))
+            .unwrap();
+        assert_eq!(adapter.path_stats(), Some(PathStats::default()));
+        adapter
+            .record_native_event(NativeEvent::Disconnected(7))
+            .unwrap();
+        assert_eq!(adapter.path_stats(), None);
+    }
+
+    #[test]
+    fn a_rejected_disconnect_leaves_the_recorded_path_intact() {
+        let mut adapter = MsQuicAdapter::with_queue_limits(1, 64).unwrap();
+        adapter.record_path_stats(ConnectionId(7), PathStats::default());
+        adapter
+            .record_native_event(NativeEvent::Connected(7))
+            .unwrap();
+        assert_eq!(
+            adapter.record_native_event(NativeEvent::Disconnected(7)),
+            Err(Error::InboundQueueFull)
+        );
+        assert_eq!(adapter.path_stats(), Some(PathStats::default()));
     }
 
     #[test]

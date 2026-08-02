@@ -782,6 +782,11 @@ pub mod live {
     /// were never sent.
     struct Framing {
         pending: Vec<u8>,
+        /// Payload bytes of a skipped frame still to arrive. They are dropped as
+        /// they land rather than buffered, which `spec/wire.md` requires and
+        /// which also keeps a peer from parking a lane's worth of memory per
+        /// stream by fragmenting a frame nobody will read.
+        discarding: usize,
         kind: StreamKind,
     }
 
@@ -789,6 +794,7 @@ pub mod live {
         const fn new(kind: StreamKind) -> Self {
             Self {
                 pending: Vec::new(),
+                discarding: 0,
                 kind,
             }
         }
@@ -800,7 +806,12 @@ pub mod live {
         /// malformed, because it is larger than the lane allows, or because it
         /// can never complete, all of which would otherwise stall the stream.
         fn accept(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, FrameFault> {
-            self.pending.extend_from_slice(bytes);
+            // Whatever belongs to a frame already being skipped never reaches
+            // the buffer at all.
+            let skipped = self.discarding.min(bytes.len());
+            self.discarding -= skipped;
+            self.pending.extend_from_slice(&bytes[skipped..]);
+
             let limits = vot_codec::DecodeLimits {
                 max_unknown_payload: self.kind.payload_limit(),
                 max_frames: 1,
@@ -808,37 +819,45 @@ pub mod live {
             let mut frames = Vec::new();
             let mut offset = 0;
             loop {
-                match vot_codec::decode_one(&self.pending[offset..], limits) {
-                    Ok((frame, consumed)) => {
-                        // The codec bounds a known frame by its registered
-                        // limit, which for PROOF_BUNDLE and HAVE is larger than
-                        // this lane carries. Without this the frame decodes,
-                        // reaches the adapter, is refused there as oversized,
-                        // and is retried for ever at the head of the queue.
-                        if consumed > self.kind.partial_frame_limit() {
-                            return Err(FrameFault::too_large());
-                        }
-                        // spec/wire.md: an unknown optional frame is skipped by
-                        // its validated length, and grease is handled the same
-                        // way. Forwarding one would hand the application bytes
-                        // it must ignore and spend queue capacity on them.
-                        if matches!(frame, vot_codec::DecodedFrame::Known { .. }) {
-                            frames.push(self.pending[offset..offset + consumed].to_vec());
-                        }
-                        offset += consumed;
-                    }
-                    // More bytes will finish it, so keep what we have.
+                let envelope = match vot_codec::peek_envelope(&self.pending[offset..], limits) {
+                    Ok(envelope) => envelope,
+                    // The type and length have not both arrived yet.
                     Err(vot_codec::DecodeError::Incomplete { .. }) => break,
                     // The decoder already knows which registered error this is,
                     // and spec/wire.md requires the session to close under that
                     // code rather than under a generic transport abort.
-                    Err(error) => {
-                        return Err(FrameFault {
-                            error: Error::Backend,
-                            close: error.protocol_code(),
-                        });
-                    }
+                    Err(error) => return Err(FrameFault::from_decode(&error)),
+                };
+                // The codec bounds a known frame by its registered limit, which
+                // for PROOF_BUNDLE and HAVE is larger than this lane carries.
+                // Without this the frame decodes, reaches the adapter, is
+                // refused there as oversized, and is retried for ever at the
+                // head of the queue.
+                if envelope.total_length > self.kind.partial_frame_limit() {
+                    return Err(FrameFault::too_large());
                 }
+                let available = self.pending.len() - offset;
+                if envelope.skipped {
+                    // spec/wire.md step 6: stream-discard exactly the declared
+                    // length and never size a buffer from it. Buffering until
+                    // the frame completed would hold a payload that is thrown
+                    // away, once per stream.
+                    if available >= envelope.total_length {
+                        offset += envelope.total_length;
+                        continue;
+                    }
+                    self.discarding = envelope.total_length - available;
+                    offset = self.pending.len();
+                    break;
+                }
+                if available < envelope.total_length {
+                    // A known frame is parsed whole, so its bytes are held
+                    // until the rest arrives. The lane bound above is what
+                    // keeps that finite.
+                    break;
+                }
+                frames.push(self.pending[offset..offset + envelope.total_length].to_vec());
+                offset += envelope.total_length;
             }
             self.pending.drain(..offset);
             // The bound belongs to the frame still being assembled, not to the
@@ -851,9 +870,16 @@ pub mod live {
             Ok(frames)
         }
 
-        /// Whether a frame is part-way through arriving.
+        /// Bytes currently held for a frame still being assembled.
+        #[cfg(test)]
+        const fn buffered(&self) -> usize {
+            self.pending.len()
+        }
+
+        /// Whether a frame is part-way through arriving, whether it is being
+        /// assembled or discarded.
         const fn is_assembling(&self) -> bool {
-            !self.pending.is_empty()
+            !self.pending.is_empty() || self.discarding != 0
         }
     }
 
@@ -870,6 +896,14 @@ pub mod live {
             Self {
                 error: Error::RecordTooLarge,
                 close: vot_codec::error_code::FRAME_TOO_LARGE,
+            }
+        }
+
+        /// A decoder error, closing under the code the registry gives it.
+        fn from_decode(error: &vot_codec::DecodeError) -> Self {
+            Self {
+                error: Error::Backend,
+                close: error.protocol_code(),
             }
         }
 
@@ -1473,13 +1507,41 @@ pub mod live {
             stream.extend_from_slice(&real);
             assert_eq!(
                 framing.accept(&stream).unwrap(),
-                vec![real],
+                vec![real.clone()],
                 "only the known frame reaches the application"
             );
             assert!(
                 !framing.is_assembling(),
                 "the skipped frames were consumed, not left behind"
             );
+        }
+
+        #[test]
+        fn a_fragmented_optional_payload_is_discarded_as_it_arrives() {
+            // spec/wire.md step 6: stream-discard exactly the declared length
+            // and never size a buffer from it. Holding the payload until the
+            // frame completed would let a peer park a lane's worth of memory
+            // per stream by fragmenting a frame nobody will ever read.
+            let payload = vec![0x27; MAX_PARTIAL_FRAME - 128];
+            let optional = framed(0x7ffe, &payload);
+            let real = framed(vot_codec::frame_type::DATA_RECORD, b"after");
+
+            let mut framing = Framing::new(StreamKind::Reliable { lane: 1 });
+            assert!(framing.accept(&optional[..8]).unwrap().is_empty());
+            assert!(framing.is_assembling(), "the frame is still arriving");
+            assert!(
+                framing.buffered() < 64,
+                "the discarded payload must not be buffered, held {}",
+                framing.buffered()
+            );
+
+            // Deliver the rest in pieces, then a real frame right behind it.
+            for chunk in optional[8..].chunks(4096) {
+                assert!(framing.accept(chunk).unwrap().is_empty());
+                assert!(framing.buffered() < 64, "still nothing worth holding");
+            }
+            assert!(!framing.is_assembling(), "the skip finished exactly");
+            assert_eq!(framing.accept(&real).unwrap(), vec![real]);
         }
 
         #[test]

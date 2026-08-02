@@ -516,6 +516,68 @@ pub fn encode_frame(
     Ok(())
 }
 
+/// A frame's type and length, read without touching its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameEnvelope {
+    pub frame_type: u64,
+    pub payload_length: usize,
+    /// Bytes the type and length varints occupy.
+    pub header_length: usize,
+    /// Header plus payload.
+    pub total_length: usize,
+    /// Whether the payload is to be discarded rather than parsed, which is the
+    /// case for an unknown optional type and for grease.
+    pub skipped: bool,
+}
+
+/// Reads the next frame's envelope without requiring its payload to be present.
+///
+/// `spec/wire.md` has a decoder determine the applicable limit and reject an
+/// oversized or unknown critical frame before allocating anything, and
+/// stream-discard an unknown optional payload rather than buffering it. A
+/// stream transport cannot follow that with [`decode_one`] alone, because that
+/// reports the frame incomplete until every byte has arrived, by which point a
+/// caller has already held the payload it was supposed to throw away.
+///
+/// # Errors
+/// Returns `Incomplete` until both varints have arrived, and otherwise the same
+/// overflow, excessive-length, and unknown-critical errors as [`decode_one`].
+pub fn peek_envelope(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope, DecodeError> {
+    validate_limits(limits)?;
+    let (frame_type, type_width) = decode_varint(input)?;
+    let (length, length_width) = decode_varint(&input[type_width..])?;
+    let known_limit = registered_payload_limit(frame_type);
+    let limit = min(
+        known_limit.unwrap_or(limits.max_unknown_payload),
+        HARD_MAX_FRAME_PAYLOAD,
+    );
+    let payload_length =
+        usize::try_from(length).map_err(|_| DecodeError::LengthOverflow(length))?;
+    if payload_length > limit {
+        return Err(DecodeError::FrameTooLarge {
+            frame_type,
+            length,
+            limit,
+        });
+    }
+    if known_limit.is_none() && is_critical(frame_type) {
+        return Err(DecodeError::UnknownCritical(frame_type));
+    }
+    let header_length = type_width
+        .checked_add(length_width)
+        .ok_or(DecodeError::LengthOverflow(length))?;
+    let total_length = header_length
+        .checked_add(payload_length)
+        .ok_or(DecodeError::LengthOverflow(length))?;
+    Ok(FrameEnvelope {
+        frame_type,
+        payload_length,
+        header_length,
+        total_length,
+        skipped: known_limit.is_none() || is_grease(frame_type),
+    })
+}
+
 /// Decodes one bounded frame without owning its payload.
 ///
 /// # Errors
@@ -616,6 +678,75 @@ const fn validate_limits(limits: DecodeLimits) -> Result<(), DecodeError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_envelope_is_read_before_its_payload_arrives() {
+        // spec/wire.md has a decoder decide the limit, reject an oversized or
+        // unknown critical frame, and stream-discard an unknown optional
+        // payload, all before allocating. decode_one cannot serve that on a
+        // stream transport: it reports incomplete until the last byte lands, by
+        // which point the payload it was meant to throw away is already held.
+        let mut frame = Vec::new();
+        encode_frame(frame_type::DATA_RECORD, &[7; 4096], &mut frame).unwrap();
+        let limits = DecodeLimits::default();
+
+        // The header alone is enough, and it agrees with the full decode.
+        let envelope = peek_envelope(&frame[..4], limits).unwrap();
+        assert_eq!(envelope.frame_type, frame_type::DATA_RECORD);
+        assert_eq!(envelope.payload_length, 4096);
+        assert_eq!(envelope.total_length, frame.len());
+        assert_eq!(
+            envelope.header_length + envelope.payload_length,
+            envelope.total_length
+        );
+        assert!(!envelope.skipped);
+        assert_eq!(decode_one(&frame, limits).unwrap().1, envelope.total_length);
+        assert!(matches!(
+            decode_one(&frame[..4], limits),
+            Err(DecodeError::Incomplete { .. })
+        ));
+
+        // An unknown optional type is skipped, and so is grease of a known one.
+        // Each is read from its header alone, with none of the payload present.
+        for (frame_type, payload) in [(0x7ffe_u64, &b"skip me"[..]), (0x1f00, &b"grease"[..])] {
+            let mut encoded = Vec::new();
+            encode_frame(frame_type, payload, &mut encoded).unwrap();
+            let header = peek_envelope(&encoded, limits).unwrap().header_length;
+            let envelope = peek_envelope(&encoded[..header], limits).unwrap();
+            assert!(envelope.skipped, "type {frame_type:#x} must be skipped");
+            assert_eq!(envelope.payload_length, payload.len());
+            // One byte short of the header is not yet decidable.
+            assert!(matches!(
+                peek_envelope(&encoded[..header - 1], limits),
+                Err(DecodeError::Incomplete { .. })
+            ));
+        }
+        assert!(is_grease(0x1f00));
+
+        // Too few bytes for both varints is incomplete, not malformed.
+        assert!(matches!(
+            peek_envelope(&[], limits),
+            Err(DecodeError::Incomplete { .. })
+        ));
+
+        // The rejections happen on the envelope, with no payload in hand.
+        let mut critical = Vec::new();
+        encode_varint(0x7fff, &mut critical).unwrap();
+        encode_varint(16, &mut critical).unwrap();
+        assert_eq!(
+            peek_envelope(&critical, limits),
+            Err(DecodeError::UnknownCritical(0x7fff))
+        );
+        let mut huge = Vec::new();
+        encode_varint(frame_type::DATA_RECORD, &mut huge).unwrap();
+        encode_varint(MAX_DATA_RECORD_PAYLOAD_FOR_TEST + 1, &mut huge).unwrap();
+        assert!(matches!(
+            peek_envelope(&huge, limits),
+            Err(DecodeError::FrameTooLarge { .. })
+        ));
+    }
+
+    const MAX_DATA_RECORD_PAYLOAD_FOR_TEST: u64 = 256 * 1024;
     use super::*;
 
     #[test]

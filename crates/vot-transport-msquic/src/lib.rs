@@ -3738,6 +3738,161 @@ pub mod live {
             drop(listener);
         }
 
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn a_capability_is_presented_and_authorized_over_the_real_carrier() {
+            // The other direction of the same exchange, over a carrier rather
+            // than a loopback: the server asks for a capability, the client's
+            // caller presents one, and the data plane opens only once the
+            // acceptance has crossed the wire in both directions.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut listener = MsQuicServer::listen(
+                Arc::clone(&configuration),
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                server_limits(),
+            )
+            .unwrap();
+            let port = listener.local_port().unwrap();
+
+            let client_registration = super::registration().unwrap();
+            let transport = MsQuicTransport::connect(
+                client_configuration(&client_registration),
+                client_registration,
+                "127.0.0.1",
+                port,
+                71,
+                test_limits(),
+            )
+            .unwrap();
+            let mut client = Session::client(
+                transport,
+                vot_codec::Settings::default(),
+                BTreeSet::new(),
+                vot_session::Authentication::Presenting,
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut connected = false;
+            while Instant::now() < deadline && !connected {
+                while let Some(event) = client.poll().unwrap() {
+                    connected |= matches!(event, Event::Connected(_));
+                }
+                std::thread::yield_now();
+            }
+            assert!(connected, "the client never connected");
+            client.begin().unwrap();
+
+            let accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = listener.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+            let mut server = Session::server(
+                accepted,
+                vot_codec::Settings {
+                    max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
+                    ..vot_codec::Settings::default()
+                },
+                BTreeSet::new(),
+                vot_session::Authentication::Capability {
+                    challenge: vot_codec::frames::AuthContext {
+                        nonce: vec![0x5a; 32],
+                        binding: vot_codec::frames::Binding::None,
+                        formats: vec![1, 7],
+                    },
+                },
+            );
+            server.begin().unwrap();
+
+            // The whole exchange runs on its own up to the challenge. Neither
+            // endpoint is ready at the end of it, which is the difference from
+            // a deployment that requires no authentication.
+            while Instant::now() < deadline && client.pending_presentation().is_none() {
+                let _ = server.poll().unwrap();
+                let _ = client.poll().unwrap();
+                std::thread::yield_now();
+            }
+            let challenge = client
+                .pending_presentation()
+                .expect("the server never asked for a capability");
+            assert_eq!(challenge.nonce, vec![0x5a; 32], "the server's own nonce");
+            assert_eq!(challenge.formats, vec![1, 7]);
+            assert!(!client.is_ready() && !server.is_ready());
+            assert!(
+                client
+                    .send_reliable(
+                        StreamId(1),
+                        &framed(vot_codec::frame_type::DATA_RECORD, b"x")
+                    )
+                    .is_err(),
+                "the data plane is shut until the exchange concludes"
+            );
+
+            client
+                .present(vot_codec::frames::SessionOpen {
+                    session_id: [0xc1; 16],
+                    capability_format: 7,
+                    capability: b"an opaque capability".to_vec(),
+                    requested_scope: b"read:objects".to_vec(),
+                    binding_proof: Vec::new(),
+                })
+                .unwrap();
+
+            while Instant::now() < deadline && server.pending_authorization().is_none() {
+                let _ = server.poll().unwrap();
+                let _ = client.poll().unwrap();
+                std::thread::yield_now();
+            }
+            let (_, open) = server
+                .pending_authorization()
+                .expect("the request never arrived");
+            assert_eq!(open.session_id, [0xc1; 16]);
+            assert_eq!(open.capability_format, 7);
+            assert_eq!(open.capability, b"an opaque capability");
+            assert!(!server.is_ready(), "a request is not a grant");
+
+            // Narrower than what was asked for, which is what the client has no
+            // other way to learn.
+            server.grant(b"read".to_vec()).unwrap();
+            assert!(server.is_ready());
+
+            while Instant::now() < deadline && !client.is_ready() {
+                let _ = server.poll().unwrap();
+                let _ = client.poll().unwrap();
+                std::thread::yield_now();
+            }
+            assert!(client.is_ready(), "the client never read the acceptance");
+            assert_eq!(
+                client.granted().map(|accept| accept.granted_scope.clone()),
+                Some(b"read".to_vec())
+            );
+
+            let payload = framed(vot_codec::frame_type::DATA_RECORD, b"after authentication");
+            client.send_reliable(StreamId(1), &payload).unwrap();
+            client.flush().unwrap();
+            let mut records = Vec::new();
+            while Instant::now() < deadline && records.is_empty() {
+                while let Some(event) = server.poll().unwrap() {
+                    if let Event::Reliable { bytes, .. } = event {
+                        records.push(bytes.to_vec());
+                    }
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(records, vec![payload]);
+
+            drop(client);
+            drop(server);
+            drop(listener);
+        }
+
         /// Brings up a raw connecting transport against a listening server.
         ///
         /// The connecting side is not a `Session`: these tests
@@ -4169,8 +4324,8 @@ pub mod live {
             }
             assert!(client.is_ready() && receiver.session().is_ready());
 
-            // Authorisation is the caller's, since the authentication frames
-            // are unimplemented.
+            // This deployment requires no authentication, so admitting a
+            // subject is the caller's decision and nothing else gates it.
             receiver.admit(subject).unwrap();
             assert!(!receiver.is_verified(subject));
 

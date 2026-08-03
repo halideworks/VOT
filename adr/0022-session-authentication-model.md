@@ -62,6 +62,16 @@ The capability is verified through a `CapabilityPolicy` boundary rather than by
 the session. A deployment that authenticates some other way implements the
 boundary; the session owns the exchange and the state machine.
 
+Stage one is complete, and the boundary is the caller's rather than a trait the
+session calls. A policy needs a deployment's own identity store and clock, so the
+trait would have been a shape with no behaviour behind it, and a boxed policy
+inside `Negotiation` costs the `Clone` and `Debug` derives that make the state
+machine testable without one. The server hands a request out through
+`pending_authorization`, `grant`, and `refuse`; the client is handed a challenge
+through `pending_presentation` and answers with `present`. Both halves check
+every rule section 1.1 states, in the direction that reads a frame and in the
+direction that builds one.
+
 ### Stage two: one concrete capability format
 
 Ed25519 over canonical CBOR, reusing the signing, key identifier, and canonical

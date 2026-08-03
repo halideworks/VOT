@@ -12,6 +12,7 @@ job is not a passing job.
 python3 tools/validate_registries.py
 python3 tools/validate_wire_vectors.py
 python3 tools/validate_negotiation_vectors.py
+python3 tools/validate_session_vectors.py
 python3 tools/validate_receipt_vectors.py
 python3 tools/validate_security_matrix.py
 python3 tools/validate_benchmark_contract.py
@@ -27,6 +28,12 @@ python3 tools/differential_fuzz_codec.py
 `validate_negotiation_vectors.py` reimplements `spec/wire.md` section 1 in
 Python and compares it against the Rust codec through the `vot-codec-oracle`
 binary, so it needs `cargo` on `PATH` as well.
+
+`validate_session_vectors.py` does the same for the section 1.1 payloads and the
+`spec/session.cddl` schemas, and needs `cargo` for the same reason. It covers the
+four payloads in isolation. The rules that span two frames are not vectorable and
+are enforced in `vot-session`: a binding proof matches the binding the challenge
+named, and an answer repeats the identifier of the request it answers.
 
 `validate_registries.py` compares the frame-type and setting-id tables in
 `spec/registries.md` against the constants in `vot-codec`, and checks that

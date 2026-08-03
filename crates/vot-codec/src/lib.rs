@@ -543,6 +543,34 @@ pub const fn is_grease(frame_type: u64) -> bool {
     frame_type >= 0x1f00 && frame_type <= 0x1ffe && frame_type & 1 == 0
 }
 
+/// Whether a frame type requires an authenticated session.
+///
+/// The `Auth` column of the `spec/wire.md` section 5 table, which
+/// `tools/validate_registries.py` checks this against. The session frames are
+/// `no`: requiring an authenticated session to send them would leave no way to
+/// reach one. `ERROR` is phase-dependent there and is never refused here,
+/// since a peer has to be able to report a fault before it authenticates.
+///
+/// An unregistered type answers true, so a frame added to the registry without
+/// a decision here is refused rather than let through.
+#[must_use]
+pub const fn requires_authentication(frame_type: u64) -> bool {
+    use crate::frame_type as ty;
+
+    !matches!(
+        frame_type,
+        ty::HELLO
+            | ty::SETTINGS
+            | ty::SETTINGS_ACK
+            | ty::AUTH_CONTEXT
+            | ty::SESSION_OPEN
+            | ty::SESSION_ACCEPT
+            | ty::SESSION_REJECT
+            | ty::PING
+            | ty::ERROR
+    )
+}
+
 #[must_use]
 pub const fn registered_payload_limit(frame_type: u64) -> Option<usize> {
     use crate::frame_type as ty;
@@ -1526,6 +1554,38 @@ mod tests {
         assert_eq!(error_code::REPLAY_REJECTED, 0x0203);
         assert_eq!(extension_id::DATAGRAM_FEC, 0x01);
         assert_eq!(extension_id::MULTIPATH_QUIC, 0x06);
+    }
+
+    #[test]
+    fn only_the_frames_that_reach_an_authenticated_session_are_exempt() {
+        // tools/validate_registries.py holds this against the Auth column of
+        // spec/wire.md section 5. This states the two ends of it.
+        for frame_type in [
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::SETTINGS_ACK,
+            frame_type::AUTH_CONTEXT,
+            frame_type::SESSION_OPEN,
+            frame_type::SESSION_ACCEPT,
+            frame_type::SESSION_REJECT,
+            frame_type::PING,
+            frame_type::ERROR,
+        ] {
+            assert!(!requires_authentication(frame_type), "{frame_type:#x}");
+        }
+        for frame_type in [
+            frame_type::PROOF_BUNDLE,
+            frame_type::DATA_RECORD,
+            frame_type::MANIFEST_REQUEST,
+            frame_type::PACKAGE_DESCRIPTOR,
+            frame_type::PUBLISH_RECEIPT,
+            frame_type::GOAWAY,
+        ] {
+            assert!(requires_authentication(frame_type), "{frame_type:#x}");
+        }
+        // A type nobody decided on is refused rather than let through.
+        assert!(requires_authentication(0x1f00));
+        assert!(requires_authentication(u64::MAX));
     }
 
     #[test]

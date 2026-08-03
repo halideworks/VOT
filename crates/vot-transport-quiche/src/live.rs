@@ -13,7 +13,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vot_transport_api::{
     ConnectionId, Error, Event, PathStats, Payload, ReceiveLimits, StreamId, TransportAdapter,
@@ -276,10 +276,12 @@ impl Transport {
         let inbound = Arc::new(Mutex::new(Inbound::default()));
         let close = Arc::new(AtomicU64::new(NO_CLOSE));
         let control_limit = Arc::new(AtomicUsize::new(config.limits.control_payload()));
-        // One command in flight beyond the adapter's queue. The adapter's bound
-        // is the real one; a full channel leaves the submission at the head of
-        // that queue rather than dropping it.
-        let (commands, receiver) = mpsc::sync_channel(1);
+        // As deep as the adapter's own queue, so one flush moves a batch. The
+        // adapter's bound is the real one either way, and a full channel leaves
+        // the submission at the head of that queue rather than dropping it, but a
+        // channel of one would have bounded throughput by the driver's loop rate
+        // rather than by the carrier.
+        let (commands, receiver) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
         let path = Arc::new(Mutex::new(None));
         let driver_inbound = Arc::clone(&inbound);
         let driver_close = Arc::clone(&close);
@@ -379,6 +381,12 @@ impl Transport {
 }
 
 impl Drop for Transport {
+    /// Stops the driver, which can wait on the peer.
+    ///
+    /// The close has to reach the peer for the connection to finish draining, so
+    /// dropping an endpoint whose peer has vanished waits out the idle timeout
+    /// rather than returning at once. That is the cost of the driver owning the
+    /// socket: it cannot be released while a packet might still be owed.
     fn drop(&mut self) {
         // The driver owns the socket, so it has to stop before this returns or
         // the port outlives the endpoint that bound it. Dropping an endpoint is
@@ -547,10 +555,11 @@ fn drive(
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream);
         }
-        if send_all(socket, &mut conn, &mut out).is_err() {
+        let paced = match send_all(socket, &mut conn, &mut out) {
+            Ok(paced) => paced,
             // A socket that will not take a packet is a carrier that has gone.
-            return Ok(());
-        }
+            Err(_) => return Ok(()),
+        };
 
         if conn.is_established() && !announced {
             announced = true;
@@ -563,11 +572,20 @@ fn drive(
             return Ok(());
         }
 
-        let deadline = conn.timeout().unwrap_or(TICK).min(TICK).max(
-            // A zero timeout would spin; the connection wants attention now and
-            // gets it on the next pass either way.
-            Duration::from_micros(200),
-        );
+        // The soonest of what the connection asked for: its own timer, the
+        // pacing deadline, and the cap that keeps a submission from waiting on
+        // the peer.
+        let pacing = paced.map(|at| at.saturating_duration_since(Instant::now()));
+        let deadline = conn
+            .timeout()
+            .unwrap_or(TICK)
+            .min(pacing.unwrap_or(TICK))
+            .min(TICK)
+            .max(
+                // A zero timeout would spin; the connection wants attention now
+                // and gets it on the next pass either way.
+                Duration::from_micros(200),
+            );
         socket
             .set_read_timeout(Some(deadline))
             .map_err(|_| Error::Backend)?;
@@ -595,6 +613,7 @@ fn drive(
             inbound,
             control_limit,
             role,
+            &mut buffer,
         );
         drain_datagrams(&mut conn);
         if let Some(sample) = path_sample(&conn) {
@@ -660,26 +679,32 @@ fn scid_for(local: SocketAddr) -> quiche::ConnectionId<'static> {
     quiche::ConnectionId::from_vec(bytes.to_vec())
 }
 
-/// Sends everything the connection has generated.
+/// Sends what the connection has generated, and says when it wants to send more.
+///
+/// A congestion controller that asks for the next packet later is not asking this
+/// thread to stop: sleeping inside this loop would stop reading the socket, so
+/// acknowledgements would queue in the kernel and the window would stop opening.
+/// The deadline goes back to the caller instead, which waits on the socket until
+/// then and keeps reading the whole time.
 fn send_all(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
-) -> Result<(), Error> {
+) -> Result<Option<Instant>, Error> {
     loop {
         match conn.send(out) {
             Ok((written, info)) => {
-                // Pacing is the connection's decision, so a packet it wants held
-                // is held rather than sent early.
-                let now = std::time::Instant::now();
-                if info.at > now {
-                    std::thread::sleep(info.at - now);
-                }
                 if socket.send_to(&out[..written], info.to).is_err() {
                     return Err(Error::Backend);
                 }
+                // Pacing is the connection's decision, and it applies to what
+                // comes after this packet rather than to this one, which is
+                // already in flight as far as the connection is concerned.
+                if info.at > Instant::now() {
+                    return Ok(Some(info.at));
+                }
             }
-            Err(quiche::Error::Done) => return Ok(()),
+            Err(quiche::Error::Done) => return Ok(None),
             Err(_) => return Err(Error::Backend),
         }
     }
@@ -784,9 +809,11 @@ fn read_streams(
     inbound: &Arc<Mutex<Inbound>>,
     control_limit: &Arc<AtomicUsize>,
     role: Role,
+    // The driver's own buffer, so a read costs no allocation. One per loop is
+    // sixty-four kilobytes a pass, which at ten gigabits is most of the work.
+    buffer: &mut [u8],
 ) {
     let readable: Vec<u64> = conn.readable().collect();
-    let mut buffer = vec![0_u8; 65_535];
     for id in readable {
         // Which lane a stream's bytes belong to depends on who opened it, so a
         // peer's stream is never reported as a reply to this endpoint's own
@@ -801,7 +828,7 @@ fn read_streams(
             StreamKind::Reliable { lane }
         };
         let state = stream_state(streams, id, kind, budget, control_limit);
-        while let Ok((len, fin)) = conn.stream_recv(id, &mut buffer) {
+        while let Ok((len, fin)) = conn.stream_recv(id, buffer) {
             let kind = state.kind;
             let sequence = &mut state.sequence;
             let outcome = state.framing.accept(&buffer[..len], |frame| {
@@ -1213,6 +1240,68 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Disconnected(_))),
             "the peer heard the connection end"
+        );
+    }
+
+    /// What one lane carries over loopback, in bytes per second.
+    ///
+    /// Ignored because it is a measurement rather than a rule: a shared machine
+    /// makes the number vary, and a threshold here would fail for reasons that
+    /// have nothing to do with the carrier. Run it when the pump changes:
+    ///
+    /// ```text
+    /// cargo test -p vot-transport-quiche --features live --release \
+    ///     one_lane_throughput -- --ignored --nocapture
+    /// ```
+    ///
+    /// It exists because the adapter can be the ceiling rather than the engine,
+    /// which is exactly what PERF-001 must not measure. A number far below the
+    /// link says to look here first.
+    #[test]
+    #[ignore = "a measurement, not a rule"]
+    fn one_lane_throughput() {
+        let (mut client, mut server) = pair();
+        pump_until(&mut client, &mut server, 10, |a, b| {
+            connected(a) && connected(b)
+        });
+
+        let payload = vec![0x5a; vot_transport_api::MAX_DATA_RECORD_BYTES];
+        let bytes = record(&payload);
+        let target = 256_usize;
+        let started = Instant::now();
+        let mut sent = 0_usize;
+        let mut received = 0_usize;
+        let mut carried = 0_u64;
+        let deadline = started + Duration::from_secs(30);
+        while received < target && Instant::now() < deadline {
+            while sent < target {
+                match client.send_reliable(StreamId(0), &bytes) {
+                    Ok(()) => sent += 1,
+                    // The queue is full, which is the backpressure this exists to
+                    // measure rather than an error.
+                    Err(_) => break,
+                }
+            }
+            let _ = client.flush();
+            let _ = server.flush();
+            while let Some(event) = server.poll() {
+                if let Event::Reliable { bytes, .. } = event {
+                    received += 1;
+                    carried += bytes.len() as u64;
+                }
+            }
+            while client.poll().is_some() {}
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(received, target, "every record arrived in {elapsed:?}");
+        let per_second = (carried as f64 / elapsed.as_secs_f64()) as u64;
+        println!(
+            "one lane, one worker: {} records, {} bytes in {:?} = {} bytes/s ({:.2} Gbit/s)",
+            received,
+            carried,
+            elapsed,
+            per_second,
+            per_second as f64 * 8.0 / 1_000_000_000.0
         );
     }
 

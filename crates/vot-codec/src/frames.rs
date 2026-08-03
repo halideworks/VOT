@@ -20,10 +20,20 @@ pub const MAX_DATA_RECORDS_PER_BUNDLE: usize = 17;
 const MAX_AUTH_NONCE: usize = 64;
 const MIN_AUTH_NONCE: usize = 16;
 const MAX_CAPABILITY_FORMATS: u64 = 16;
-const MAX_CAPABILITY_BYTES: usize = 49_152;
 const MAX_SCOPE_BYTES: usize = 4_096;
 const MAX_REJECT_DETAIL_BYTES: usize = 1_024;
 const MAX_CAPABILITY_FORMAT: u64 = 65_535;
+
+/// What is left of a `SESSION_OPEN` after the two scopes and the framing.
+///
+/// The registry gives the frame 64 KiB. A capability sized without regard to
+/// what travels beside it would be encodable alone and refused in a real
+/// request, which is the bound admitting something the wire never can.
+const MAX_CAPABILITY_BYTES: usize = 49_152;
+const _: () = assert!(
+    MAX_CAPABILITY_BYTES + 2 * MAX_SCOPE_BYTES + 1_024 <= 64 * 1024,
+    "a maximal SESSION_OPEN must fit the frame its registry entry allows"
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {

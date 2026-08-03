@@ -123,6 +123,17 @@ def validate(root: Path) -> None:
         match["name"]: match["auth"] for match in BEHAVIOR_ROW.finditer(behavior_text)
     }
     assert behavior_rows, "no frame behavior rows parsed"
+    # Every table line parsed, so a row the regex silently skips cannot make
+    # this check weaker than it reads.
+    table_lines = sum(1 for line in behavior_text.splitlines() if line.startswith("| `"))
+    assert len(behavior_rows) == table_lines, (
+        f"parsed {len(behavior_rows)} of {table_lines} frame behavior rows"
+    )
+    assert behavior_rows.keys() == registry_rows.keys(), (
+        "frame registry/behavior mismatch: "
+        f"registry-only={registry_rows.keys() - behavior_rows.keys()}, "
+        f"behavior-only={behavior_rows.keys() - registry_rows.keys()}"
+    )
     exempt = re.search(
         r"pub const fn requires_authentication\(frame_type: u64\) -> bool \{"
         r".*?!matches!\((?P<body>.*?)\)\n\}",
@@ -132,8 +143,6 @@ def validate(root: Path) -> None:
     assert exempt, "requires_authentication not found"
     exempt_names = set(re.findall(r"ty::([A-Z0-9_]+)", exempt["body"]))
     for name, auth in behavior_rows.items():
-        if name not in frame_rust_rows:
-            continue
         # A phase-dependent frame is never refused: a peer has to be able to
         # report a fault before it authenticates.
         expected_exempt = auth in ("no", "depends on phase")

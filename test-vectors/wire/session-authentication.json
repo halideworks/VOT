@@ -41,6 +41,17 @@
       "hex": "072da40000015820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a102010383010209"
     },
     {
+      "name": "auth_context_unbound_bearer",
+      "frame": "auth_context",
+      "note": "A capability with no channel binding, which spec/security.md section 5 allows only where policy declares the shorter lifetime and the replay exposure it costs.",
+      "nonce_hex": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "binding": 0,
+      "formats": [
+        1
+      ],
+      "hex": "0723a400000158183e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e0200038101"
+    },
+    {
       "name": "auth_context_longest_nonce",
       "frame": "auth_context",
       "note": "The nonce bound and the format bound each admit their own maximum.",
@@ -89,6 +100,15 @@
       "reason": 514,
       "detail": "",
       "hex": "0d1ba40000015022222222222222222222222222222222021902020360"
+    },
+    {
+      "name": "session_reject_authentication_failed",
+      "frame": "session_reject",
+      "note": "The third of the three reasons a rejection may carry, so every one of them is frozen here.",
+      "session_id_hex": "44444444444444444444444444444444",
+      "reason": 513,
+      "detail": "",
+      "hex": "0d1ba40000015044444444444444444444444444444444021902010360"
     },
     {
       "name": "session_reject_replay",

@@ -117,6 +117,10 @@ pub enum ErrorKind {
     AuthContextInvalid,
     /// `SESSION_OPEN` did not carry a request.
     SessionOpenInvalid,
+    /// The caller answered a request with something that cannot be encoded: a
+    /// scope too wide for the frame, or a reason the registry does not assign
+    /// to authentication or authorization.
+    SessionAnswerInvalid,
     /// A retry reused a session identifier.
     SessionIdentifierReused,
     /// A request named a capability format this endpoint never advertised.
@@ -206,6 +210,7 @@ impl ErrorKind {
             | Self::Interrupted { .. }
             | Self::ReceiveLimitMismatch { .. }
             | Self::NegotiationFrameFromApplication { .. }
+            | Self::SessionAnswerInvalid
             | Self::HandshakeUnsent { .. } => false,
         }
     }
@@ -611,7 +616,7 @@ impl Negotiation {
     pub fn grant(&mut self, granted_scope: Vec<u8>) -> Result<Vec<Vec<u8>>, Error> {
         let open = self
             .open
-            .take()
+            .as_ref()
             .ok_or_else(|| self.out_of_sequence(frame_type::SESSION_ACCEPT))?;
         let accept = SessionAccept {
             // The identity the request carried. A server choosing its own would
@@ -619,7 +624,11 @@ impl Negotiation {
             session_id: open.session_id,
             granted_scope,
         };
+        // Encoded before the request is spent. An answer that cannot go out
+        // must leave the caller able to make another, and dropping the request
+        // first would leave a peer waiting on a decision nothing still holds.
         let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionAccept(accept))?;
+        self.open = None;
         self.state = State::Authenticated;
         Ok(vec![frame])
     }
@@ -635,7 +644,7 @@ impl Negotiation {
     pub fn refuse(&mut self, reason: u16, detail: String) -> Result<Vec<Vec<u8>>, Error> {
         let open = self
             .open
-            .take()
+            .as_ref()
             .ok_or_else(|| self.out_of_sequence(frame_type::SESSION_REJECT))?;
         let reject = SessionReject {
             session_id: open.session_id,
@@ -643,13 +652,17 @@ impl Negotiation {
             detail,
         };
         let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionReject(reject))?;
+        self.open = None;
         Ok(vec![frame])
     }
 
     fn session_frame(frame: &vot_codec::frames::TypedFrame) -> Result<Vec<u8>, Error> {
         let mut encoded = Vec::new();
-        vot_codec::frames::encode(frame, &mut encoded)
-            .map_err(|_| Error::new(ErrorKind::SessionOpenInvalid, error_code::MALFORMED_FRAME))?;
+        // The caller's answer, not the peer's request. Blaming the peer for it
+        // would close the carrier over a local mistake.
+        vot_codec::frames::encode(frame, &mut encoded).map_err(|_| {
+            Error::new(ErrorKind::SessionAnswerInvalid, error_code::MALFORMED_FRAME)
+        })?;
         Ok(encoded)
     }
 
@@ -2190,11 +2203,28 @@ mod tests {
         // And a reason the registry does not assign to authentication or
         // authorization never reaches the wire.
         server.accept_control(&session_open([7; 16], 1)).unwrap();
+        let error = server
+            .refuse(error_code::MALFORMED_FRAME, String::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::SessionAnswerInvalid);
         assert!(
-            server
-                .refuse(error_code::MALFORMED_FRAME, String::new())
-                .is_err()
+            !error.kind().is_peer_fault(),
+            "the caller's answer, not the peer's request"
         );
+        // An answer that could not go out leaves the request to answer again.
+        // Spending it would leave the peer waiting on a decision nothing holds.
+        assert!(server.pending_authorization().is_some());
+        let scope = vec![0; 4097];
+        assert_eq!(
+            server.grant(scope).unwrap_err().kind(),
+            &ErrorKind::SessionAnswerInvalid
+        );
+        assert!(server.pending_authorization().is_some());
+        assert_eq!(server.state(), State::Negotiated, "and not authenticated");
+        server
+            .refuse(error_code::AUTHORIZATION_FAILED, String::new())
+            .unwrap();
+        assert_eq!(server.pending_authorization(), None);
     }
 
     #[test]

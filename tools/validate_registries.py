@@ -21,6 +21,10 @@ RUST_CONSTANT = re.compile(
     r"^\s*pub const (?P<name>[A-Z0-9_]+): u64 = (?P<value>0x[0-9a-f]+);$",
     re.MULTILINE,
 )
+OPERATION_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| (?P<status>[a-z ]+) \|$",
+    re.MULTILINE,
+)
 
 
 def section(document: str, heading: str, next_heading: str) -> str:
@@ -110,6 +114,50 @@ def validate(root: Path) -> None:
         "REGISTERED_SETTINGS/setting_id mismatch: "
         f"listed-only={set(listed_names) - setting_rust_rows.keys()}, "
         f"constant-only={setting_rust_rows.keys() - set(listed_names)}"
+    )
+
+    # Section 12 is the vocabulary a capability's operation set draws from, and
+    # `is_registered_operation` is what decides whether a verifier knows a value.
+    # A table row without a constant is an operation nothing can authorize; a
+    # constant the list omits is one every verifier silently ignores.
+    operation_text = registry_text[registry_text.index("## 12. Capability operations") :]
+    operation_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in OPERATION_ROW.finditer(operation_text)
+    }
+    assert operation_rows, "no capability operation rows parsed"
+    table_lines = sum(
+        1 for line in operation_text.splitlines() if line.startswith("| `0x")
+    )
+    assert len(operation_rows) == table_lines, (
+        f"parsed {len(operation_rows)} of {table_lines} capability operation rows"
+    )
+    assert 0 not in operation_rows.values(), "0x0000 is reserved"
+    operation_rust_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in RUST_CONSTANT.finditer(rust_module(rust_text, "operation"))
+    }
+    assert operation_rust_rows == operation_rows, (
+        "Rust/operation registry mismatch: "
+        f"Rust-only={operation_rust_rows.keys() - operation_rows.keys()}, "
+        f"registry-only={operation_rows.keys() - operation_rust_rows.keys()}"
+    )
+    listed_operations = re.search(
+        r"pub const REGISTERED_OPERATIONS: \[u64; (?P<count>\d+)\] = \[(?P<body>[^\]]*)\];",
+        rust_text,
+    )
+    assert listed_operations, "REGISTERED_OPERATIONS not found"
+    listed_operation_names = re.findall(
+        r"operation::([A-Z0-9_]+)", listed_operations["body"]
+    )
+    assert len(listed_operation_names) == int(listed_operations["count"]), (
+        f"REGISTERED_OPERATIONS declares {listed_operations['count']} entries "
+        f"but lists {len(listed_operation_names)}"
+    )
+    assert set(listed_operation_names) == operation_rust_rows.keys(), (
+        "REGISTERED_OPERATIONS/operation mismatch: "
+        f"listed-only={set(listed_operation_names) - operation_rust_rows.keys()}, "
+        f"constant-only={operation_rust_rows.keys() - set(listed_operation_names)}"
     )
 
     # The Auth column of wire.md section 5 is enforced by

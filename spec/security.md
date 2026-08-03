@@ -90,7 +90,7 @@ certificate, an application identity authenticated above TLS, or both.
 A capability is signed or authenticated data containing at least:
 
 - issuer, audience, and subject or holder constraint;
-- allowed operation set;
+- allowed operation set, whose values come from `spec/registries.md` section 12;
 - package/object identity scope, including suite, root, and exact length when
   known;
 - allowed byte ranges or bounded package scope;

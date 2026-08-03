@@ -254,3 +254,47 @@ A format defines its own delegation rules, and one that defines none refuses a
 capability claiming any. Chained delegation is therefore a new identifier rather
 than a new claim inside an existing format: a verifier that does not implement
 chains never advertises the format that carries them.
+
+## 12. Capability operations
+
+An operation names something a capability authorizes. `spec/security.md` section
+5 requires a capability to carry an allowed operation set, and every value in
+that set comes from here.
+
+| Value | Name | Status |
+|---:|---|---|
+| `0x0001` | `PUBLISH` | draft |
+| `0x0002` | `READ_MANIFEST` | draft |
+| `0x0003` | `READ_RANGES` | draft |
+
+`0x0000` is reserved and MUST NOT appear in a capability.
+
+An operation is coarser than a frame type, because authorization is a decision
+about what a peer may ask for rather than about one message. Each names the
+frames it authorizes, in the direction the holder sends them:
+
+- `PUBLISH` covers offering an object and causing its publication:
+  `PACKAGE_DESCRIPTOR`, `MANIFEST_PAGE`, `PROGRESSIVE_PAGE`, `SEAL`,
+  `PROOF_BUNDLE`, and `DATA_RECORD`. The assurance frames and `PUBLISH_RECEIPT`
+  that come back are the receiver's answer to it rather than separate
+  operations.
+- `READ_MANIFEST` covers `MANIFEST_REQUEST`, whose answer is manifest pages and
+  a seal.
+- `READ_RANGES` covers `HAVE`, `RANGE_REQUEST`, and `RANGE_CANCEL`, whose answer
+  is proof bundles and data records.
+
+Reading metadata and reading payload are separate because a deployment may allow
+a holder to learn that an object exists and what shape it is without allowing it
+to fetch the bytes. Granting both is two values in the set.
+
+An unknown operation identifier in a capability's set grants nothing, and does
+not invalidate the capability. A verifier authorizes the values it recognizes and
+ignores the rest, which stays fail-closed: an operation a verifier cannot name is
+one it never authorizes. Rejecting the whole capability instead would make a
+token issued for a later revision unusable for the operations this revision does
+implement.
+
+The relay and broker layer adds operations for source lists, alias creation, and
+lease renewal, which `spec/security.md` section 5 already names as points where
+authorization is rechecked. They are not numbered here, because nothing defines
+what they authorize yet; they arrive with the layer that does.

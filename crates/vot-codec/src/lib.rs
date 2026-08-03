@@ -31,6 +31,16 @@ pub mod setting_id {
     pub const TELEMETRY_LEVEL: u64 = 0x22;
 }
 
+/// What a capability authorizes, from `spec/registries.md` section 12.
+///
+/// Coarser than a frame type, because authorization is a decision about what a
+/// peer may ask for rather than about one message.
+pub mod operation {
+    pub const PUBLISH: u64 = 0x0001;
+    pub const READ_MANIFEST: u64 = 0x0002;
+    pub const READ_RANGES: u64 = 0x0003;
+}
+
 pub mod error_code {
     pub const UNKNOWN_CRITICAL_FRAME: u16 = 0x0101;
     pub const MALFORMED_FRAME: u16 = 0x0102;
@@ -389,6 +399,25 @@ pub const REGISTERED_SETTINGS: [u64; 8] = [
     setting_id::COMPRESSION_MIN_GAIN_BPS,
     setting_id::TELEMETRY_LEVEL,
 ];
+
+/// Every operation `spec/registries.md` section 12 defines, in identifier order.
+pub const REGISTERED_OPERATIONS: [u64; 3] = [
+    operation::PUBLISH,
+    operation::READ_MANIFEST,
+    operation::READ_RANGES,
+];
+
+/// Whether this revision knows what an operation authorizes.
+///
+/// `spec/registries.md` section 12: an unknown identifier in a capability's set
+/// grants nothing and does not invalidate the capability, so a verifier asks this
+/// per value rather than refusing a token issued for a later revision. Answering
+/// from one list is what keeps a value registered but unauthorizable from being
+/// an oversight in one verifier and not another.
+#[must_use]
+pub fn is_registered_operation(identifier: u64) -> bool {
+    REGISTERED_OPERATIONS.contains(&identifier)
+}
 
 /// The inclusive value range `spec/registries.md` gives a setting. One source
 /// for both directions.
@@ -1422,6 +1451,33 @@ mod tests {
         }
         assert_eq!(identifiers, REGISTERED_SETTINGS.to_vec());
         assert!(payload.len() <= registered_payload_limit(frame_type::SETTINGS).unwrap());
+    }
+
+    #[test]
+    fn only_registered_operations_are_recognized() {
+        // spec/registries.md section 12: an unknown identifier grants nothing and
+        // does not invalidate the capability, so a verifier asks per value. The
+        // reserved zero is unknown like any other unassigned value, which is what
+        // stops it being a wildcard.
+        for identifier in REGISTERED_OPERATIONS {
+            assert!(is_registered_operation(identifier), "{identifier:#06x}");
+        }
+        for identifier in [0x0000, 0x0004, 0x0011, u64::MAX] {
+            assert!(!is_registered_operation(identifier), "{identifier:#06x}");
+        }
+        // Named rather than only counted, so a value that moved would fail here
+        // as well as in the registry cross-check.
+        assert_eq!(
+            REGISTERED_OPERATIONS,
+            [
+                operation::PUBLISH,
+                operation::READ_MANIFEST,
+                operation::READ_RANGES
+            ]
+        );
+        assert_eq!(operation::PUBLISH, 0x0001);
+        assert_eq!(operation::READ_MANIFEST, 0x0002);
+        assert_eq!(operation::READ_RANGES, 0x0003);
     }
 
     #[test]

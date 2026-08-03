@@ -389,6 +389,25 @@ fn validate_auth_context(value: &AuthContext) -> Result<(), Error> {
     Ok(())
 }
 
+/// Decodes an `AUTH_CONTEXT` payload, envelope excluded.
+///
+/// The negotiation state machine reads this one payload without going through
+/// the typed frame dispatch, since it handles the frame itself.
+///
+/// # Errors
+/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`.
+pub fn decode_auth_context_payload(payload: &[u8]) -> Result<AuthContext, Error> {
+    decode_auth_context(payload)
+}
+
+/// Encodes an `AUTH_CONTEXT` payload, envelope excluded.
+///
+/// # Errors
+/// Rejects a nonce or format list outside the bounds section 1.1 gives.
+pub fn encode_auth_context_payload(value: &AuthContext, output: &mut Vec<u8>) -> Result<(), Error> {
+    encode_auth_context(value, output)
+}
+
 fn decode_auth_context(input: &[u8]) -> Result<AuthContext, Error> {
     let mut reader = Reader::new(input);
     reader.map(4)?;

@@ -12,8 +12,8 @@ optional length-delimited frames.
 VOT v1 defines no mandatory custom QUIC transport parameters. Application
 negotiation starts on the first client-initiated bidirectional control stream.
 The client sends `HELLO` followed by `SETTINGS`. The server sends its `SETTINGS`
-and then `SETTINGS_ACK`. Frames that require an authenticated session are invalid
-until the authentication policy succeeds and `SESSION_ACCEPT` is sent.
+and then `SETTINGS_ACK`. Section 1.1 gives what follows and when a frame that
+requires an authenticated session becomes valid.
 
 The `HELLO` payload is:
 

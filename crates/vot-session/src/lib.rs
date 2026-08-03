@@ -40,7 +40,11 @@ pub enum State {
     /// Both `SETTINGS` frames have been accounted for.
     SettingsExchanged,
     /// `SETTINGS_ACK` has been sent by the server, or seen by the client.
-    Ready,
+    /// Negotiation is done and the authentication exchange is not.
+    Negotiated,
+    /// The concluding frame of `spec/wire.md` section 1.1 has been sent or
+    /// read, so frames the registry marks `auth: yes` are valid.
+    Authenticated,
     /// The carrier is gone.
     Closed,
 }
@@ -49,7 +53,14 @@ impl State {
     /// Whether the application may use the data plane.
     #[must_use]
     pub const fn is_ready(self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Authenticated)
+    }
+
+    /// Whether negotiation has finished, which is when the authentication
+    /// exchange runs.
+    #[must_use]
+    pub const fn is_negotiated(self) -> bool {
+        matches!(self, Self::Negotiated | Self::Authenticated)
     }
 }
 
@@ -95,6 +106,14 @@ pub enum ErrorKind {
     OutOfSequence { frame_type: u64, state: State },
     /// A frame that needs a negotiated session arrived before there was one.
     NotNegotiated { frame_type: u64 },
+    /// A frame the registry marks `auth: yes` arrived after negotiation and
+    /// before the authentication exchange concluded.
+    NotAuthenticated { frame_type: u64 },
+    /// The server asked for a capability, which no policy boundary can present
+    /// yet.
+    CapabilityRequired { formats: usize },
+    /// `AUTH_CONTEXT` did not carry a challenge.
+    AuthContextInvalid,
     /// The carrier ended before the exchange finished.
     Interrupted { state: State },
     /// The application tried to use the data plane before `Ready`.
@@ -154,6 +173,12 @@ impl ErrorKind {
             | Self::Decode(_)
             | Self::OutOfSequence { .. }
             | Self::NotNegotiated { .. }
+            | Self::NotAuthenticated { .. }
+            | Self::AuthContextInvalid
+            // The server did nothing wrong here; this endpoint cannot answer
+            // it. The carrier still has to close, and under the registered
+            // code rather than a bare disconnect.
+            | Self::CapabilityRequired { .. }
             | Self::PendingRecordsExhausted { .. } => true,
             // Only when the peer is the one that went past its limit.
             Self::FrameExceedsLimit { side, .. }
@@ -190,6 +215,10 @@ pub struct Negotiation {
     state: State,
     local: Settings,
     extensions: BTreeSet<u64>,
+    /// The challenge a server advertises. Supplied by the caller: this crate
+    /// has no randomness, and a session whose freshness came from inside it
+    /// could not be tested for the value it actually sent.
+    nonce: [u8; 32],
     peer_hello: Option<Hello>,
     peer_settings: Option<Settings>,
 }
@@ -199,21 +228,27 @@ impl Negotiation {
     /// first.
     #[must_use]
     pub fn client(local: Settings, extensions: BTreeSet<u64>) -> Self {
-        Self::new(EndpointRole::Client, local, extensions)
+        Self::new(EndpointRole::Client, local, extensions, [0; 32])
     }
 
     /// An accepting endpoint, which answers on the stream the client opened.
     #[must_use]
-    pub fn server(local: Settings, extensions: BTreeSet<u64>) -> Self {
-        Self::new(EndpointRole::Server, local, extensions)
+    pub fn server(local: Settings, extensions: BTreeSet<u64>, nonce: [u8; 32]) -> Self {
+        Self::new(EndpointRole::Server, local, extensions, nonce)
     }
 
-    fn new(role: EndpointRole, local: Settings, extensions: BTreeSet<u64>) -> Self {
+    fn new(
+        role: EndpointRole,
+        local: Settings,
+        extensions: BTreeSet<u64>,
+        nonce: [u8; 32],
+    ) -> Self {
         Self {
             role,
             state: State::Connecting,
             local,
             extensions,
+            nonce,
             peer_hello: None,
             peer_settings: None,
         }
@@ -350,6 +385,7 @@ impl Negotiation {
             frame_type::HELLO => self.accept_hello(payload),
             frame_type::SETTINGS => self.accept_settings(payload),
             frame_type::SETTINGS_ACK => self.accept_settings_ack(),
+            frame_type::AUTH_CONTEXT => self.accept_auth_context(payload),
             other => self.accept_application(other),
         }
     }
@@ -412,9 +448,20 @@ impl Negotiation {
         match self.role {
             EndpointRole::Client => Ok(Accepted::Consumed { reply: Vec::new() }),
             EndpointRole::Server => {
-                // Answer and acknowledgement together: nothing further to ask.
-                let reply = vec![self.settings_frame()?, settings_ack_frame()?];
-                self.state = State::Ready;
+                // Answer, acknowledgement, and challenge together: nothing
+                // further to ask. spec/wire.md section 1.1 puts AUTH_CONTEXT
+                // straight after SETTINGS_ACK, so a peer never has to be told
+                // to expect it.
+                let reply = vec![
+                    self.settings_frame()?,
+                    settings_ack_frame()?,
+                    self.auth_context_frame()?,
+                ];
+                self.state = State::Negotiated;
+                // This deployment advertises no capability format, so
+                // AUTH_CONTEXT is the concluding frame and sending it is what
+                // authenticates this endpoint.
+                self.state = State::Authenticated;
                 Ok(Accepted::Consumed { reply })
             }
         }
@@ -425,27 +472,61 @@ impl Negotiation {
     fn accept_settings_ack(&mut self) -> Result<Accepted, Error> {
         // spec/wire.md section 5: a duplicate acknowledgement is ignored, so a
         // second one after readiness is not an error.
-        if self.role == EndpointRole::Client && self.state.is_ready() {
+        if self.role == EndpointRole::Client && self.state.is_negotiated() {
             return Ok(Accepted::Consumed { reply: Vec::new() });
         }
         if self.role != EndpointRole::Client || self.state != State::SettingsExchanged {
             return Err(self.out_of_sequence(frame_type::SETTINGS_ACK));
         }
-        self.state = State::Ready;
+        self.state = State::Negotiated;
         Ok(Accepted::Consumed { reply: Vec::new() })
     }
 
-    fn accept_application(&mut self, frame_type: u64) -> Result<Accepted, Error> {
-        if self.state.is_ready() {
-            return Ok(Accepted::Application);
+    /// Accepts the server's challenge.
+    ///
+    /// No capability format is advertised yet, so this is the concluding frame
+    /// of the exchange and reading it is what authenticates the client.
+    fn accept_auth_context(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
+        if self.role != EndpointRole::Client || self.state != State::Negotiated {
+            return Err(self.out_of_sequence(frame_type::AUTH_CONTEXT));
         }
-        // spec/wire.md section 1: frames needing a session are invalid until
-        // there is one. A state violation, not an authentication failure: no
-        // authentication policy has run.
-        Err(Error::new(
-            ErrorKind::NotNegotiated { frame_type },
-            error_code::MALFORMED_FRAME,
-        ))
+        let context = vot_codec::frames::decode_auth_context_payload(payload)
+            .map_err(|_| Error::new(ErrorKind::AuthContextInvalid, error_code::MALFORMED_FRAME))?;
+        if !context.formats.is_empty() {
+            // A server asking for a capability this endpoint cannot present.
+            // Refusing is what stops a client from looking authenticated to
+            // itself while the server waits for a SESSION_OPEN.
+            return Err(Error::new(
+                ErrorKind::CapabilityRequired {
+                    formats: context.formats.len(),
+                },
+                error_code::AUTHENTICATION_FAILED,
+            ));
+        }
+        self.state = State::Authenticated;
+        Ok(Accepted::Consumed { reply: Vec::new() })
+    }
+
+    /// Decides whether a frame outside the exchange may be carried.
+    ///
+    /// Two gates, in the order `spec/wire.md` puts them: section 1 refuses
+    /// everything until negotiation has finished, and section 1.1 refuses the
+    /// subset the registry marks `auth: yes` until the authentication exchange
+    /// concludes. A frame the registry does not mark passes in between.
+    fn accept_application(&mut self, frame_type: u64) -> Result<Accepted, Error> {
+        if !self.state.is_negotiated() {
+            return Err(Error::new(
+                ErrorKind::NotNegotiated { frame_type },
+                error_code::MALFORMED_FRAME,
+            ));
+        }
+        if !self.state.is_ready() && vot_codec::requires_authentication(frame_type) {
+            return Err(Error::new(
+                ErrorKind::NotAuthenticated { frame_type },
+                error_code::AUTHENTICATION_FAILED,
+            ));
+        }
+        Ok(Accepted::Application)
     }
 
     fn out_of_sequence(&self, frame_type: u64) -> Error {
@@ -465,6 +546,30 @@ impl Negotiation {
             Error::new(ErrorKind::Hello(error), close)
         })?;
         frame(frame_type::HELLO, &payload)
+    }
+
+    /// The challenge this endpoint advertises.
+    ///
+    /// No capability format, since no policy boundary exists yet. The nonce is
+    /// still fresh per session: a client that starts binding to it must not
+    /// find a constant here.
+    fn auth_context_frame(&self) -> Result<Vec<u8>, Error> {
+        let context = vot_codec::frames::AuthContext {
+            nonce: self.nonce.to_vec(),
+
+            binding: vot_codec::frames::Binding::None,
+            formats: Vec::new(),
+        };
+        let mut payload = Vec::new();
+        // Unreachable: a 32-byte nonce is inside the 16 to 64 the CDDL gives,
+        // and an empty format list is always valid. Reported rather than
+        // unwrapped so a later change to either cannot panic a session.
+        vot_codec::frames::encode_auth_context_payload(&context, &mut payload)
+            .map_err(|_| Error::new(ErrorKind::AuthContextInvalid, error_code::MALFORMED_FRAME))?;
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::AUTH_CONTEXT, &payload, &mut frame)
+            .map_err(|error| Error::new(ErrorKind::Decode(error), error_code::MALFORMED_FRAME))?;
+        Ok(frame)
     }
 
     fn settings_frame(&self) -> Result<Vec<u8>, Error> {
@@ -539,23 +644,23 @@ impl<A: TransportAdapter> Session<A> {
 
     /// An accepting session, which answers on the stream the client opened.
     ///
-    /// `authentication` has to be named because there is no implementation
-    /// behind it: see [`Authentication`].
+    /// `authentication` has to be named because the exchange is
+    /// unconditional: see [`Authentication`].
     pub fn server(
         adapter: A,
         local: Settings,
         extensions: BTreeSet<u64>,
         authentication: Authentication,
     ) -> Self {
+        let Authentication::NotRequired { nonce } = authentication;
         Self::new(
             adapter,
-            Negotiation::server(local, extensions),
+            Negotiation::server(local, extensions, nonce),
             authentication,
         )
     }
 
-    /// What this session can say about authentication, which is that there is
-    /// none.
+    /// What this endpoint does about authentication.
     #[must_use]
     pub const fn authentication(&self) -> Authentication {
         self.authentication
@@ -1045,24 +1150,22 @@ fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
     }
 }
 
-/// Whether a session has completed an authentication policy.
+/// What this endpoint does about authentication.
 ///
-/// `spec/wire.md` section 1 makes a frame the registry marks `auth: yes`
-/// invalid until the authentication policy succeeds and `SESSION_ACCEPT` is
-/// sent. `AUTH_CONTEXT`, `SESSION_OPEN`, and `SESSION_ACCEPT` are not
-/// implemented, so no session can reach that state.
-///
-/// The enum has one variant on purpose. Refusing every `auth: yes` frame would
-/// leave no data plane at all, since `DATA_RECORD` is one of them, so a caller
-/// that wants to move records has to name the state it is accepting. It cannot
-/// be reached by default, and the variant that means authenticated appears when
-/// there is an implementation behind it.
+/// `spec/wire.md` section 1.1 makes the exchange unconditional, so a caller
+/// names its stance rather than opting in. The variant that presents or
+/// verifies a capability appears when there is a policy boundary behind it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Authentication {
-    /// No authentication policy has run, and none can. Frames the registry
-    /// marks `auth: yes` are carried anyway, which `spec/wire.md` does not
-    /// permit.
-    Unimplemented,
+    /// This deployment requires none. The server advertises no capability
+    /// format, so section 1.1 concludes the exchange at `AUTH_CONTEXT` and
+    /// both endpoints are authenticated once it has been sent or read.
+    ///
+    /// The nonce is what a server puts in that frame. It is supplied rather
+    /// than generated because this crate has no randomness, and a session
+    /// whose freshness came from inside it could not be tested for the value
+    /// it actually sent. A client ignores it.
+    NotRequired { nonce: [u8; 32] },
 }
 
 /// Which stream a frame is on.
@@ -1103,7 +1206,10 @@ impl Lane {
 const fn is_negotiation(frame_type: u64) -> bool {
     matches!(
         frame_type,
-        frame_type::HELLO | frame_type::SETTINGS | frame_type::SETTINGS_ACK
+        frame_type::HELLO
+            | frame_type::SETTINGS
+            | frame_type::SETTINGS_ACK
+            | frame_type::AUTH_CONTEXT
     )
 }
 
@@ -1332,13 +1438,13 @@ mod tests {
             Loopback::default(),
             client_settings,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             server_settings,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -1360,13 +1466,13 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -1391,7 +1497,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::from([1, 2]),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         assert_eq!(client.state(), State::Connecting);
         client.begin().unwrap();
@@ -1410,7 +1516,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         // The server answers rather than speaking first, so nothing goes out
@@ -1432,13 +1538,21 @@ mod tests {
         assert!(server.is_ready());
 
         // spec/wire.md section 1: the server sends its SETTINGS then
-        // SETTINGS_ACK.
+        // SETTINGS_ACK, and section 1.1 puts AUTH_CONTEXT straight after.
         let answer = server.adapter.sent.clone();
-        assert_eq!(answer.len(), 2);
-        let (first, _) = vot_codec::decode_one(&answer[0], limits).unwrap();
-        let (second, _) = vot_codec::decode_one(&answer[1], limits).unwrap();
-        assert_eq!(first.frame_type(), frame_type::SETTINGS);
-        assert_eq!(second.frame_type(), frame_type::SETTINGS_ACK);
+        assert_eq!(answer.len(), 3);
+        let types: Vec<u64> = answer
+            .iter()
+            .map(|frame| vot_codec::decode_one(frame, limits).unwrap().0.frame_type())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                frame_type::SETTINGS,
+                frame_type::SETTINGS_ACK,
+                frame_type::AUTH_CONTEXT
+            ]
+        );
 
         for frame in answer {
             client.adapter.events.push_back(control(&frame));
@@ -1448,13 +1562,209 @@ mod tests {
         assert_eq!(client.peer_settings(), Some(Settings::default()));
     }
 
+    /// A client and a server driven to the end of the exchange, with what the
+    /// server sent.
+    fn negotiated_pair() -> (Session<Loopback>, Session<Loopback>, Vec<Vec<u8>>) {
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(server.poll().unwrap(), None);
+        let answer = std::mem::take(&mut server.adapter.sent);
+        for frame in &answer {
+            client.adapter.events.push_back(control(frame));
+        }
+        assert_eq!(client.poll().unwrap(), None);
+        (client, server, answer)
+    }
+
+    /// An `AUTH_CONTEXT` frame carrying the given challenge.
+    fn auth_context(nonce: &[u8], formats: Vec<u64>) -> Vec<u8> {
+        let context = vot_codec::frames::AuthContext {
+            nonce: nonce.to_vec(),
+            binding: vot_codec::frames::Binding::None,
+            formats,
+        };
+        let mut payload = Vec::new();
+        vot_codec::frames::encode_auth_context_payload(&context, &mut payload).unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::AUTH_CONTEXT, &payload, &mut frame).unwrap();
+        frame
+    }
+
+    #[test]
+    fn the_exchange_concludes_at_the_challenge_when_none_is_required() {
+        // spec/wire.md section 1.1: a server advertising no capability format
+        // requires no authentication, and AUTH_CONTEXT is the concluding
+        // frame. Each endpoint reaches it by sending or reading that frame.
+        let (client, server, answer) = negotiated_pair();
+        assert_eq!(server.state(), State::Authenticated);
+        assert_eq!(client.state(), State::Authenticated);
+        assert!(server.is_ready() && client.is_ready());
+
+        // The nonce is the caller's, not a constant this crate chose.
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: 64 * 1024,
+            max_frames: 8,
+        };
+        let challenge = answer
+            .iter()
+            .find(|frame| {
+                vot_codec::decode_one(frame, limits).unwrap().0.frame_type()
+                    == frame_type::AUTH_CONTEXT
+            })
+            .expect("the server sent a challenge");
+        let (decoded, _) = vot_codec::decode_one(challenge, limits).unwrap();
+        let vot_codec::DecodedFrame::Known { payload, .. } = decoded else {
+            panic!("AUTH_CONTEXT is a known frame");
+        };
+        let context = vot_codec::frames::decode_auth_context_payload(payload).unwrap();
+        assert_eq!(context.nonce, vec![0x5a; 32]);
+        assert!(context.formats.is_empty(), "no capability format");
+        assert_eq!(context.binding, vot_codec::frames::Binding::None);
+    }
+
+    #[test]
+    fn a_negotiated_session_is_not_yet_an_authenticated_one() {
+        // The window between the two states is what the gate exists for. A
+        // record arriving in it is well sequenced and not yet allowed.
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        server.negotiation.state = State::Negotiated;
+        assert!(!server.is_ready(), "negotiated is not ready");
+        assert!(server.negotiation.state().is_negotiated());
+
+        let error = server
+            .send_reliable(StreamId(1), &data_record(b"early"))
+            .unwrap_err();
+        assert_eq!(error.close_code(), error_code::MALFORMED_FRAME);
+
+        let mut inbound = Negotiation::server(Settings::default(), BTreeSet::new(), [1; 32]);
+        inbound.state = State::Negotiated;
+        let error = inbound.accept_control(&data_record(b"early")).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::NotAuthenticated {
+                frame_type: frame_type::DATA_RECORD
+            }
+        );
+        assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
+        assert!(error.kind().is_peer_fault(), "the peer sent it too early");
+
+        // A frame the registry does not gate still passes in that window.
+        inbound.state = State::Negotiated;
+        assert_eq!(
+            inbound
+                .accept_control(&frame_of(frame_type::PING, 0))
+                .unwrap(),
+            Accepted::Application
+        );
+    }
+
+    #[test]
+    fn a_challenge_asking_for_a_capability_is_refused() {
+        // Nothing can present one yet. Accepting the frame would leave this
+        // endpoint believing it is authenticated while the server waits for a
+        // SESSION_OPEN that never comes.
+        let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
+        client.state = State::Negotiated;
+        let error = client
+            .accept_control(&auth_context(&[7; 16], vec![1, 2]))
+            .unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::CapabilityRequired { formats: 2 });
+        assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
+        assert!(
+            error.kind().is_peer_fault(),
+            "the carrier still has to close"
+        );
+        assert_eq!(client.state(), State::Negotiated, "not authenticated");
+    }
+
+    #[test]
+    fn a_challenge_out_of_sequence_or_out_of_shape_is_refused() {
+        // A server never reads one: it is the endpoint that sends it.
+        let mut server = Negotiation::server(Settings::default(), BTreeSet::new(), [1; 32]);
+        server.state = State::Negotiated;
+        assert_eq!(
+            server
+                .accept_control(&auth_context(&[7; 16], Vec::new()))
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::OutOfSequence {
+                frame_type: frame_type::AUTH_CONTEXT,
+                state: State::Negotiated
+            }
+        );
+
+        // Nor does a client before negotiation finishes.
+        let mut early = Negotiation::client(Settings::default(), BTreeSet::new());
+        early.state = State::HelloSent;
+        assert!(
+            early
+                .accept_control(&auth_context(&[7; 16], Vec::new()))
+                .is_err()
+        );
+
+        // A second one after the exchange concluded is out of sequence too.
+        let mut done = Negotiation::client(Settings::default(), BTreeSet::new());
+        done.state = State::Negotiated;
+        done.accept_control(&auth_context(&[7; 16], Vec::new()))
+            .unwrap();
+        assert_eq!(done.state(), State::Authenticated);
+        assert!(
+            done.accept_control(&auth_context(&[7; 16], Vec::new()))
+                .is_err()
+        );
+
+        // A payload that is not a challenge closes under the decode code, not
+        // the authentication one: nothing was decided about a capability.
+        let mut malformed = Negotiation::client(Settings::default(), BTreeSet::new());
+        malformed.state = State::Negotiated;
+        let error = malformed
+            .accept_control(&frame_of(frame_type::AUTH_CONTEXT, 3))
+            .unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::AuthContextInvalid);
+        assert_eq!(error.close_code(), error_code::MALFORMED_FRAME);
+    }
+
+    #[test]
+    fn the_application_may_not_send_the_challenge_itself() {
+        // The state machine owns it. An application-sent AUTH_CONTEXT would
+        // let a caller claim an exchange the machine never ran.
+        let (mut client, _server, _answer) = negotiated_pair();
+        let error = client
+            .send_control(&auth_context(&[7; 16], Vec::new()))
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::NegotiationFrameFromApplication { .. }
+        ));
+    }
+
     #[test]
     fn the_data_plane_is_refused_until_the_exchange_finishes() {
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         for state in [State::Connecting, State::HelloSent] {
             assert_eq!(
@@ -1495,13 +1805,13 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -1532,7 +1842,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         server
@@ -1561,7 +1871,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let older = Hello {
@@ -1592,7 +1902,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let wrong_role = Hello {
@@ -1617,7 +1927,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         client.adapter.events.push_back(control(&frame));
@@ -1632,7 +1942,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         early.begin().unwrap();
         let mut payload = Vec::new();
@@ -1655,7 +1965,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let mut frame = Vec::new();
@@ -1685,7 +1995,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let mut grease = Vec::new();
@@ -1711,7 +2021,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         client
@@ -1750,13 +2060,13 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             peer,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -1782,13 +2092,13 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut answering = Session::server(
             Loopback::default(),
             peer,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         refusing.begin().unwrap();
         answering.begin().unwrap();
@@ -1863,9 +2173,9 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
-        refusing.negotiation.state = State::Ready;
+        refusing.negotiation.state = State::Authenticated;
         let error = refusing
             .send_reliable(StreamId(1), &data_record(b"record"))
             .unwrap_err();
@@ -1891,9 +2201,9 @@ mod tests {
                 },
                 Settings::default(),
                 BTreeSet::new(),
-                Authentication::Unimplemented,
+                Authentication::NotRequired { nonce: [0x5a; 32] },
             );
-            session.negotiation.state = State::Ready;
+            session.negotiation.state = State::Authenticated;
             assert_eq!(
                 session
                     .send_reliable(StreamId(1), &data_record(b"record"))
@@ -1914,7 +2224,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         server
@@ -1930,7 +2240,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         exact.begin().unwrap();
         exact.pending_byte_limit = 2 * record_wire_len(1024);
@@ -1968,7 +2278,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let hello = Hello {
@@ -1999,7 +2309,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         let mut ack = Vec::new();
@@ -2026,7 +2336,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let mut frame = Vec::new();
@@ -2044,7 +2354,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         early.begin().unwrap();
         assert!(early.send_reliable(StreamId(1), b"record").is_err());
@@ -2063,9 +2373,9 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
-        refusing.negotiation.state = State::Ready;
+        refusing.negotiation.state = State::Authenticated;
         assert!(
             refusing
                 .send_reliable(StreamId(1), &data_record(b"record"))
@@ -2078,7 +2388,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         gone.begin().unwrap();
         gone.adapter
@@ -2103,7 +2413,7 @@ mod tests {
                 Loopback::default(),
                 Settings::default(),
                 BTreeSet::new(),
-                Authentication::Unimplemented,
+                Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             session.begin().unwrap();
             let mut frame = Vec::new();
@@ -2135,7 +2445,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let error = mismatched.begin().unwrap_err();
         assert_eq!(error.close_code(), error_code::INVALID_SETTING);
@@ -2181,7 +2491,7 @@ mod tests {
                 ..Settings::default()
             },
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         agreed.begin().unwrap();
         assert_eq!(agreed.adapter().sent.len(), 2);
@@ -2191,7 +2501,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         silent.begin().unwrap();
         assert_eq!(silent.adapter().sent.len(), 2);
@@ -2206,7 +2516,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         let mut older = Vec::new();
@@ -2266,7 +2576,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         assert_eq!(client.adapter().sent.len(), 1, "only HELLO fitted");
@@ -2300,7 +2610,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         polling.begin().unwrap();
         assert_eq!(polling.unsent_negotiation_frames(), 2);
@@ -2309,7 +2619,7 @@ mod tests {
         assert_eq!(polling.unsent_negotiation_frames(), 0);
         assert_eq!(polling.adapter().sent.len(), 2);
 
-        // The server's answer is a pair too, and stalls the same way.
+        // The server's answer is three frames, and stalls the same way.
         let mut server = Session::server(
             Loopback {
                 control_capacity: Some(1),
@@ -2317,7 +2627,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         for frame in polling.adapter().sent.clone() {
@@ -2326,16 +2636,18 @@ mod tests {
         assert_eq!(server.poll().unwrap(), None);
         assert!(server.is_ready());
         assert_eq!(server.adapter().sent.len(), 1, "only SETTINGS fitted");
-        assert_eq!(server.unsent_negotiation_frames(), 1);
+        assert_eq!(server.unsent_negotiation_frames(), 2);
         server.adapter.control_capacity = None;
         server.flush().unwrap();
-        assert_eq!(server.adapter().sent.len(), 2);
+        assert_eq!(server.adapter().sent.len(), 3);
+        let held: Vec<u64> = server.adapter().sent[1..]
+            .iter()
+            .map(|frame| vot_codec::decode_one(frame, limits).unwrap().0.frame_type())
+            .collect();
         assert_eq!(
-            vot_codec::decode_one(&server.adapter().sent[1], limits)
-                .unwrap()
-                .0
-                .frame_type(),
-            frame_type::SETTINGS_ACK
+            held,
+            vec![frame_type::SETTINGS_ACK, frame_type::AUTH_CONTEXT],
+            "in the order the exchange gives them"
         );
 
         // A refusal that is not capacity is still a failure, and keeps the
@@ -2347,7 +2659,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         assert!(broken.begin().is_err());
         assert_eq!(broken.unsent_negotiation_frames(), 2);
@@ -2366,7 +2678,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         assert_eq!(client.unsent_negotiation_frames(), 2);
@@ -2412,7 +2724,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback {
@@ -2421,7 +2733,7 @@ mod tests {
             },
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -2430,7 +2742,11 @@ mod tests {
         }
         server.poll().unwrap();
         assert!(server.is_ready());
-        assert_eq!(server.unsent_negotiation_frames(), 1, "the ACK did not fit");
+        assert_eq!(
+            server.unsent_negotiation_frames(),
+            2,
+            "the ACK and the challenge did not fit"
+        );
 
         for send in [
             server.send_control(&frame_of(frame_type::PING, 0)),
@@ -2438,7 +2754,7 @@ mod tests {
         ] {
             assert_eq!(
                 send.unwrap_err().kind(),
-                &ErrorKind::HandshakeUnsent { remaining: 1 }
+                &ErrorKind::HandshakeUnsent { remaining: 2 }
             );
         }
         assert_eq!(
@@ -2453,7 +2769,7 @@ mod tests {
         server.flush().unwrap();
         assert_eq!(server.unsent_negotiation_frames(), 0);
         server.send_control(&frame_of(frame_type::PING, 0)).unwrap();
-        assert_eq!(server.adapter().sent.len(), 3);
+        assert_eq!(server.adapter().sent.len(), 4);
     }
 
     #[test]
@@ -2468,13 +2784,13 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             peer,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -2533,7 +2849,7 @@ mod tests {
             Loopback::default(),
             local,
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
         server
@@ -2799,13 +3115,13 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             fec.clone(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
             fec,
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         server.begin().unwrap();
@@ -2935,7 +3251,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         assert_eq!(client.adapter().sent.len(), 2);
@@ -2963,6 +3279,7 @@ mod tests {
             frame_type::HELLO,
             frame_type::SETTINGS,
             frame_type::SETTINGS_ACK,
+            frame_type::AUTH_CONTEXT,
         ] {
             let error = client.send_control(&frame_of(frame_type, 0)).unwrap_err();
             assert_eq!(
@@ -2980,7 +3297,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         fresh.begin().unwrap();
         assert_eq!(fresh.adapter().sent.len(), 2);
@@ -2997,7 +3314,7 @@ mod tests {
             Loopback::default(),
             Settings::default(),
             BTreeSet::new(),
-            Authentication::Unimplemented,
+            Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         assert!(matches!(

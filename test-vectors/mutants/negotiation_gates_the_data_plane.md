@@ -8,7 +8,7 @@ Passing evidence: `the_exchange_follows_the_order_the_specification_gives_it`
 drives a client and a server through `HELLO`, `SETTINGS`, `SETTINGS`,
 `SETTINGS_ACK` and checks each frame type and each state transition in order.
 `the_data_plane_is_refused_until_the_exchange_finishes` proves every send path
-is refused before `Ready` and that nothing reached the backend.
+is refused before `Negotiated` and that nothing reached the backend.
 `records_that_arrive_early_are_held_rather_than_refused` interleaves a record
 between the two negotiation frames, which is the worst ordering a carrier can
 produce, and proves the record neither surfaces early nor blocks the frame
@@ -28,8 +28,15 @@ same exchange between the assembled client and the assembled server,
 in-flight record against MsQuic, and `a_registered_close_code_reaches_the_peer`
 proves the peer reads `UNSUPPORTED_VERSION` back off the wire.
 
+`the_exchange_concludes_at_the_challenge_when_none_is_required` and
+`a_negotiated_session_is_not_yet_an_authenticated_one` prove the second gate:
+negotiation opens the frames the registry does not mark, and only the
+authentication exchange opens the ones it does.
+
 Mutants: accept `SETTINGS` before `HELLO`; accept a second `HELLO`; let the
-client become ready without `SETTINGS_ACK`; return `Ok` from `require_ready`;
+client become ready without `SETTINGS_ACK`; open the data plane at
+`Negotiated`; apply the authentication gate to every frame rather than the
+marked subset; return `Ok` from `require_ready`;
 drop a held record instead of releasing it; compare the pending byte total with
 `>=` instead of `>`; delete the `Event::Reliable` arm from `hold` so held bytes
 are not counted; treat `NotReady` as a peer fault; skip the receive-limit check
@@ -39,7 +46,7 @@ Observed failure:
 
 ```text
 assertion `left == right` failed
-  left: Ready
+  left: Negotiated
  right: HelloSent
 called `Result::unwrap()` on an `Err` value: Error { kind: OutOfSequence { frame_type: 3, state: ControlReserved }, close: 258 }
 assertion failed: early.adapter().closed.is_empty()
@@ -51,6 +58,6 @@ assertion `left == right` failed
  right: PendingRecordsExhausted { bytes: 2048, count: 2 }
 ```
 
-The required `vot-session` mutation run reports 107 total, 78 caught, 29
+The required `vot-session` mutation run reports 164 total, 129 caught, 35
 unviable, and 0 missed. The required `vot-transport-api` run reports 50 total,
 49 caught, 1 unviable, and 0 missed.

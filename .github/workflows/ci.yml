@@ -221,6 +221,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
+      # The adapter answers an S3 endpoint in process, so this needs no service
+      # of its own. It runs before MinIO starts: an adapter that is wrong about
+      # its own protocol is wrong before a bucket is involved.
+      - name: Test the S3 adapter against a local endpoint
+        run: cargo +1.88.0 test -p vot-object-store --features s3-live --locked
+
       - name: Start pinned MinIO
         run: |
           docker network create vot-wave2-s3
@@ -415,17 +421,15 @@ jobs:
           - { package: vot-journal, required: true }
           - { package: vot-proof-blake3, required: true }
           - { package: vot-proof-sha256, required: true }
-          # vot-codec is advisory pending survivor cleanup: a large share of its
-          # mutants survive, almost all in the frame parser. The last count
-          # written here was stale within two changes of being written, which is
-          # the failure this file already learned once, so measuring it is part
-          # of promoting it rather than a number kept beside it.
-          - { package: vot-codec, required: false }
+          - { package: vot-codec, required: true }
           - { package: vot-verifier, required: true }
-          - { package: vot-manifest, required: false }
+          - { package: vot-manifest, required: true }
           - { package: vot-pack, required: true }
-          - { package: vot-object-store, required: false }
-          - { package: vot-commit-object, required: false }
+          # The live adapter is behind a feature, so a run without it mutates a
+          # file the tests never compile and calls every one of those mutants
+          # missed. Measuring it means building it.
+          - { package: vot-object-store, required: true, features: s3-live }
+          - { package: vot-commit-object, required: true }
           - { package: vot-receipt, required: true }
           - { package: vot-platform-fs, required: true }
           - { package: vot-transport-api, required: true }
@@ -482,9 +486,13 @@ jobs:
         continue-on-error: ${{ !matrix.required }}
         env:
           PACKAGE: ${{ matrix.package }}
+          FEATURES: ${{ matrix.features }}
         run: |
           scope=()
           if [ -f changed.diff ]; then
             scope=(--in-diff changed.diff)
+          fi
+          if [ -n "$FEATURES" ]; then
+            scope+=(--features "$FEATURES")
           fi
           cargo +1.88.0 mutants --package "$PACKAGE" --jobs 2 "${scope[@]}"

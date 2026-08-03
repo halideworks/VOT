@@ -301,6 +301,49 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_is_checked_against_the_part_it_names_field_by_field() {
+        // A receipt names a length and a checksum, and both are compared. Either
+        // one taken for the other lets a caller publish an object of bytes it
+        // never uploaded.
+        let mut store = MockStore::default();
+        let id = store.create_multipart("object", 0).unwrap();
+        let one = store
+            .upload_part(&id, 1, b"one", vot_journal::crc32c(b"one"))
+            .unwrap();
+
+        for (name, receipt) in [
+            (
+                "a checksum that is not the part's",
+                PartReceipt {
+                    checksum_crc32c: one.checksum_crc32c ^ 1,
+                    ..one.clone()
+                },
+            ),
+            (
+                "a length that is not the part's",
+                PartReceipt {
+                    length: one.length + 1,
+                    ..one.clone()
+                },
+            ),
+        ] {
+            assert_eq!(
+                store.complete_multipart(&id, std::slice::from_ref(&receipt)),
+                Err(Error::CompletionMismatch),
+                "{name}"
+            );
+            assert!(store.object("object").is_none(), "{name} published nothing");
+        }
+
+        // The receipt that does match publishes the object, and the store hands
+        // back what it holds rather than nothing.
+        let object = store.complete_multipart(&id, &[one]).unwrap();
+        assert_eq!(store.object("object"), Some(&object));
+        assert_eq!(object.bytes, b"one");
+        assert!(store.object("absent").is_none());
+    }
+
+    #[test]
     fn completion_requires_the_exact_consecutive_uploaded_part_set() {
         let mut store = MockStore::default();
         let id = store.create_multipart("object", 0).unwrap();

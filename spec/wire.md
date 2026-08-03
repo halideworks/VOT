@@ -37,14 +37,16 @@ were parsed and accepted.
 ### 1.1 Session authentication
 
 Once `SETTINGS_ACK` has been sent, the server sends `AUTH_CONTEXT` on the
-control stream. The client answers `SESSION_OPEN`. The server answers
-`SESSION_ACCEPT` or `SESSION_REJECT`. Frames marked `auth: yes` in section 5 are
-invalid until `SESSION_ACCEPT` has been sent.
+control stream. If it advertised at least one capability format, the client
+answers `SESSION_OPEN` and the server answers `SESSION_ACCEPT` or
+`SESSION_REJECT`. If it advertised none, this deployment requires no
+authentication, and neither side sends anything further.
 
-A server that requires no authentication advertises no capability format. The
-client then sends no `SESSION_OPEN`, the server sends no result, and the session
-is authenticated once `AUTH_CONTEXT` has been read. The exchange is therefore
-always present, and it costs a deployment that does not authenticate one frame.
+The concluding frame is therefore `SESSION_ACCEPT` when a capability format was
+advertised and `AUTH_CONTEXT` when none was. A session is authenticated at each
+endpoint once that endpoint has sent or read the concluding frame, and frames
+marked `auth: yes` in section 5 are invalid before then. The exchange is always
+present, and it costs a deployment that does not authenticate one frame.
 
 The capability itself is opaque at this layer. Its format is a value from the
 capability format registry in `spec/registries.md` section 11 and its bytes are

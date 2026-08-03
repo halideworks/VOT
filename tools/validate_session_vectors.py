@@ -342,16 +342,6 @@ def split_frame(data: bytes) -> tuple[str, bytes]:
     return names[frame_type], data[offset:]
 
 
-def expand(case: dict[str, Any]) -> dict[str, Any]:
-    """Expands the repeat-count form the fixture uses for long fields."""
-    expanded = dict(case)
-    for key, value in case.items():
-        if key.endswith("_repeat"):
-            byte, count = value
-            expanded[key[: -len("_repeat")]] = f"{byte:02x}" * count
-    return expanded
-
-
 def canonical_line(kind: str, decoded: dict[str, Any], encoded: bytes) -> str:
     parts = ["ok", kind]
     if kind == "auth_context":
@@ -381,7 +371,6 @@ def validate(document: dict[str, Any]) -> tuple[list[str], list[str]]:
     expectations: list[str] = []
 
     for case in document["canonical"]:
-        case = expand(case)
         kind = case["frame"]
         payload = ENCODERS[kind](case)
         encoded = frame(kind, payload)
@@ -397,7 +386,6 @@ def validate(document: dict[str, Any]) -> tuple[list[str], list[str]]:
         expectations.append(canonical_line(kind, decoded, encoded))
 
     for case in document["rejected"]:
-        case = expand(case)
         data = bytes.fromhex(case["hex"])
         try:
             name, body = split_frame(data)

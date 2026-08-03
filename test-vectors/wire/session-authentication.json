@@ -1,7 +1,7 @@
 {
   "format": "vot-session-authentication-v1",
   "alpn": "vot-draft-04",
-  "note": "The four session authentication payloads as spec/wire.md section 1.1 and spec/session.cddl define them, frame envelope included. Encoders must match every canonical case byte for byte. tools/validate_session_vectors.py reimplements the rules from the specification and cross-checks them against the Rust codec.",
+  "note": "The four session authentication payloads as spec/wire.md section 1.1 and spec/session.cddl define them, frame envelope included. Encoders must match every canonical case byte for byte. tools/validate_session_vectors.py reimplements the rules from the specification and cross-checks them against the Rust codec. Every case here is one whole frame: bytes past the length the envelope declares are a caller mistake rather than a payload, and are covered by the oracle's own unit test instead.",
   "bounds": {
     "nonce_bytes": [
       16,

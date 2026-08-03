@@ -44,20 +44,45 @@ pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUND
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
 pub const REMEMBERED_BUNDLES: usize = 64;
 
-/// What a delivered bundle covered.
+/// The identity of one record of a delivered bundle.
+///
+/// Its framing, not its bytes. Comparing bytes would mean keeping every
+/// delivered record or hashing verified plaintext again on each replay, and a
+/// record arriving after its range is verified cannot change that range either
+/// way. A record whose framing differs is a conflicting duplicate.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DeliveredRecord {
+    record_index: u64,
+    plaintext_offset: u64,
+    plaintext_length: u64,
+    compression: u8,
+    encoded_length: usize,
+}
+
+impl DeliveredRecord {
+    fn of(record: &DataRecord) -> Self {
+        Self {
+            record_index: record.record_index,
+            plaintext_offset: record.plaintext_offset,
+            plaintext_length: record.plaintext_length,
+            compression: record.compression,
+            encoded_length: record.encoded.len(),
+        }
+    }
+}
+
+/// The range a delivered bundle covered.
 ///
 /// `spec/wire.md` section 5 deduplicates on request and range identity, so this
-/// is what a replay is compared against. The proof bytes are not kept: the
-/// subject is already verified and no proof arriving afterwards can change
-/// that, so a replay is either the same range or a conflicting one.
+/// is what a replayed bundle is compared against.
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct Delivered {
+struct DeliveredRange {
     subject: SubjectId,
     covered_offset: u64,
     covered_length: u64,
 }
 
-impl Delivered {
+impl DeliveredRange {
     fn of(bundle: &ProofBundle) -> Self {
         Self {
             subject: SubjectId {
@@ -67,6 +92,22 @@ impl Delivered {
             },
             covered_offset: bundle.covered_offset,
             covered_length: bundle.covered_length,
+        }
+    }
+}
+
+/// What a delivered bundle covered, and the records that covered it.
+#[derive(Clone, Eq, PartialEq)]
+struct Delivered {
+    range: DeliveredRange,
+    records: Vec<DeliveredRecord>,
+}
+
+impl Delivered {
+    fn of(bundle: &ProofBundle, records: &[DataRecord]) -> Self {
+        Self {
+            range: DeliveredRange::of(bundle),
+            records: records.iter().map(DeliveredRecord::of).collect(),
         }
     }
 }
@@ -116,6 +157,7 @@ pub struct SessionReceiver<A> {
     pending_byte_limit: usize,
     orphan_bundle_limit: usize,
     orphan_byte_limit: usize,
+    remembered_bundle_limit: usize,
     /// Subjects the caller has authorised. Nothing here decides that: the
     /// authentication and authorization frames are unimplemented, so a subject
     /// is admitted by an explicit call rather than by a peer asking.
@@ -136,6 +178,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             pending_byte_limit: DEFAULT_PENDING_BUNDLE_BYTES,
             orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
             orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
+            remembered_bundle_limit: REMEMBERED_BUNDLES,
             admitted: BTreeSet::new(),
             delivered: VecDeque::new(),
             credit_applied: false,
@@ -155,6 +198,26 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         }
         self.pending_bundle_limit = bundles;
         self.pending_byte_limit = bytes;
+        Ok(())
+    }
+
+    /// Sets how many delivered bundle identities are remembered.
+    ///
+    /// Forgetting one costs nothing beyond the conflict check: a replay of a
+    /// verified subject is idempotent whether or not its identity is still
+    /// held.
+    ///
+    /// # Errors
+    /// Rejects a bound of zero, which would forget every identity at once.
+    pub fn set_remembered_bundles(&mut self, bundles: usize) -> Result<(), Error> {
+        if bundles == 0 {
+            return Err(Error::Staging(
+                vot_transport_api::Error::InvalidConfiguration,
+            ));
+        }
+        self.remembered_bundle_limit = bundles;
+        let excess = self.delivered.len().saturating_sub(bundles);
+        self.delivered.drain(..excess);
         Ok(())
     }
 
@@ -213,6 +276,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     #[must_use]
     pub fn pending_bundles(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Delivered bundle identities still remembered.
+    #[must_use]
+    pub fn remembered_bundles(&self) -> usize {
+        self.delivered.len()
     }
 
     /// Bundles holding records whose proof has not arrived.
@@ -310,8 +379,9 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let id = bundle.bundle_id;
         if let Some((_, prior)) = self.delivered.iter().find(|(seen, _)| *seen == id) {
             // Already delivered. An exact replay is idempotent; a different
-            // range under the same identity is a conflicting duplicate.
-            return if *prior == Delivered::of(&bundle) {
+            // range under the same identity is a conflicting duplicate. The
+            // records it covers are compared as they arrive.
+            return if prior.range == DeliveredRange::of(&bundle) {
                 Ok(())
             } else {
                 Err(Error::ProofInvalid)
@@ -355,11 +425,15 @@ impl<A: TransportAdapter> SessionReceiver<A> {
 
     fn hold_record(&mut self, record: DataRecord) -> Result<(), Error> {
         let id = record.bundle_id;
-        if self.delivered.iter().any(|(seen, _)| *seen == id) {
-            // Its bundle is verified and gone. Holding the record would leave
-            // an entry that can never complete, which is also what a replayed
-            // record would cost this endpoint.
-            return Ok(());
+        if let Some((_, prior)) = self.delivered.iter().find(|(seen, _)| *seen == id) {
+            // Its bundle is verified and gone, so holding this would leave an
+            // entry that can never complete. An exact retry is idempotent and
+            // anything else conflicts with what was verified.
+            return if prior.records.contains(&DeliveredRecord::of(&record)) {
+                Ok(())
+            } else {
+                Err(Error::ProofInvalid)
+            };
         }
         let orphan = self
             .pending
@@ -443,17 +517,26 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let Some(bundle) = pending.bundle else {
             return Ok(());
         };
-        if self.delivered.len() == REMEMBERED_BUNDLES {
-            self.delivered.pop_front();
-        }
-        self.delivered.push_back((id, Delivered::of(&bundle)));
         let subject = SubjectId {
             suite: bundle.object.suite,
             root: bundle.object.root,
             length: bundle.object.length,
         };
+        let delivered = Delivered::of(&bundle, &pending.records);
+        // A bundle whose identity is still remembered never reaches here, so
+        // this is one whose identity was evicted. Every byte of the subject is
+        // already verified and its range state is closed, so reassembling it
+        // would fail rather than repeat. Remembering it again is what makes
+        // the bound on that memory harmless.
+        if self.receiver.is_verified(subject) {
+            self.remember(id, delivered);
+            return Ok(());
+        }
         self.receiver
             .receive_typed_bundle(subject, &bundle, &pending.records)?;
+        // Remembered only once the receiver has accepted it. A bundle that
+        // failed verification must stay retryable under its own identity.
+        self.remember(id, delivered);
         // The receiver promotes a subject to verified once every byte is
         // covered, and reports a length mismatch until then, which is what a
         // partly covered object looks like rather than a failure.
@@ -466,6 +549,17 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let credit = self.receiver.advertised_credit();
         self.credit_applied = self.session.driver().set_receive_credit(credit).is_ok();
         Ok(())
+    }
+
+    /// Records a bundle identity, evicting the oldest when the bound is met.
+    fn remember(&mut self, id: [u8; 16], delivered: Delivered) {
+        let excess = self
+            .delivered
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.remembered_bundle_limit);
+        self.delivered.drain(..excess);
+        self.delivered.push_back((id, delivered));
     }
 }
 
@@ -1053,6 +1147,98 @@ mod tests {
             .events
             .push_back(Event::Control(Payload::from(frame.as_slice())));
         assert!(matches!(driver.poll().unwrap(), Some(Event::Control(_))));
+    }
+
+    #[test]
+    fn a_replay_is_idempotent_even_after_its_identity_is_forgotten() {
+        // The memory of delivered identities is bounded, so a long session
+        // forgets. What makes that harmless is the verified subject: its range
+        // state is closed, so a replay is repeated rather than reassembled.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+
+        driver.set_remembered_bundles(1).unwrap();
+        assert_eq!(driver.remembered_bundles(), 1);
+        assert!(driver.set_remembered_bundles(0).is_err());
+
+        driver.delivered.clear();
+        assert_eq!(driver.remembered_bundles(), 0);
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bundles(), 0, "the replay held nothing");
+        assert!(driver.is_verified(subject));
+        assert_eq!(driver.remembered_bundles(), 1, "and it is remembered again");
+    }
+
+    #[test]
+    fn the_memory_of_delivered_identities_is_bounded() {
+        // Unbounded, a long session would grow this without limit.
+        let (first_subject, first_bundle, first_records) = object();
+        let (second_subject, second_bundle, second_records) = object_of(0x17, [3; 16]);
+        let mut driver = ready();
+        driver.set_remembered_bundles(1).unwrap();
+        driver.admit(first_subject).unwrap();
+        driver.admit(second_subject).unwrap();
+        push_object(&mut driver, &first_bundle, &first_records);
+        push_object(&mut driver, &second_bundle, &second_records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.remembered_bundles(), 1, "the bound holds");
+        assert!(driver.is_verified(first_subject) && driver.is_verified(second_subject));
+    }
+
+    #[test]
+    fn a_bundle_that_failed_verification_is_still_retryable() {
+        // Remembering it before the receiver accepted it would make the
+        // corrected retry look like a replay and never verify anything.
+        let (subject, bundle, records) = object();
+        let mut broken = records.clone();
+        broken[1].encoded[0] ^= 0xff;
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        push_object(&mut driver, &bundle, &broken);
+        assert!(
+            driver.poll().is_err(),
+            "the proof did not cover those bytes"
+        );
+        assert!(!driver.is_verified(subject));
+
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject), "the retry verified");
+    }
+
+    #[test]
+    fn a_record_conflicting_with_a_delivered_bundle_is_refused() {
+        // spec/wire.md section 5: exact range bytes deduplicate and a
+        // conflicting identity is rejected, which does not stop at delivery.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+
+        // The same record again is a retry.
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::DataRecord(records[0].clone()))));
+        assert_eq!(driver.poll().unwrap(), None);
+
+        // A record the delivered bundle never covered is not.
+        let mut conflicting = records[0].clone();
+        conflicting.record_index = 9;
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::DataRecord(conflicting))));
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
     }
 
     #[test]

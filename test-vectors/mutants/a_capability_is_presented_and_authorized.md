@@ -78,7 +78,7 @@ assertion `left == right` failed
  right: 3
 ```
 
-The required `vot-session` mutation run reports 232 mutants, 183 caught, 49
-unviable, and 0 missed. The live MsQuic suite runs 58 tests in debug and in
-release. The totals move with every change to the crate, so a number written here
-is stale before it is read; what the runs have to say is that nothing survived.
+The required `vot-session` mutation run reports 0 missed, and the live MsQuic
+suite runs in debug and in release. The totals move with every change to the
+crate, so a number written here is stale before it is read; what the runs have to
+say is that nothing survived.

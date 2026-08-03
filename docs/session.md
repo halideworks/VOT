@@ -45,19 +45,23 @@ happen before authentication concludes.
 ## What the exchange does
 
 The server sends `AUTH_CONTEXT` immediately after `SETTINGS_ACK`, in the same
-reply, so a peer never has to be told to expect it. What it advertises decides
-where the exchange ends.
+reply, so a peer never has to be told to expect it. What that frame advertises
+decides where the exchange ends, and only the server's stance decides that: the
+concluding frame is `AUTH_CONTEXT` when it advertises no capability format and
+`SESSION_ACCEPT` when it advertises one. Each endpoint is authenticated once it
+has sent or read the concluding frame.
 
-| Stance | Role | Concluding frame |
+| Stance | Role | What it does |
 | --- | --- | --- |
-| `Authentication::NotRequired` | either | `AUTH_CONTEXT`, advertising no format |
-| `Authentication::Capability` | server | `SESSION_ACCEPT` |
-| `Authentication::Presenting` | client | `SESSION_ACCEPT` |
+| `Authentication::NotRequired` | either | a server advertises no format; a client answers no challenge |
+| `Authentication::Capability` | server | advertises formats and runs the exchange to an answer |
+| `Authentication::Presenting` | client | answers a challenge with what its caller presents |
 
-Each endpoint is authenticated once it has sent or read the concluding frame.
-`Session::begin` refuses a stance the role cannot act on: a server given
-`Presenting` would advertise a nonce no caller chose, and a client given
-`Capability` would ignore the challenge it was handed.
+A `Presenting` client against a server that requires nothing is authenticated at
+`AUTH_CONTEXT` like any other, and presents nothing. `Session::begin` refuses a
+stance the role cannot act on: a server given `Presenting` would advertise a
+nonce no caller chose, and a client given `Capability` would ignore the challenge
+it was handed.
 
 The nonce is supplied by the caller. This crate has no randomness, and a session
 whose freshness came from inside it could not be tested for the value it

@@ -79,11 +79,15 @@
       "assets": ["media confidentiality", "operation authorization", "tenant isolation"],
       "controls": [
         "authenticated capability with issuer, audience, scope, bounds, expiry, and token ID",
+        "issuer key anchored at the verifier by key identifier, issuer identity, and permitted audiences",
+        "no issuer key fetched while authenticating, and an unavailable key fails closed",
         "TLS exporter, peer key, or proof-of-possession binding when supported",
         "unknown mandatory claims fail closed",
+        "delegation constraints refused by a format that does not define delegation",
+        "deployment-local deny list on the token identifier, with lifetime as the primary control",
         "tokens forbidden from telemetry, diagnostics, and crash output"
       ],
-      "tests": ["token_signature_rejected", "token_audience_rejected", "token_scope_rejected", "token_expiry_rejected", "token_channel_binding_rejected", "trace_token_sentinel_absent"],
+      "tests": ["token_signature_rejected", "token_audience_rejected", "token_issuer_rejected", "token_scope_rejected", "token_expiry_rejected", "token_delegation_rejected", "token_revoked_rejected", "token_channel_binding_rejected", "trace_token_sentinel_absent"],
       "telemetry": ["vot.session.closed"],
       "residual_risk": "A deployment allowing unbound bearer tokens accepts declared replay exposure until expiry.",
       "gate": "required"

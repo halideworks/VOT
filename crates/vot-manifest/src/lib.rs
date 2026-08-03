@@ -333,25 +333,25 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
     validate_entry_count(page.entries.len())?;
     validate_entries(&page.entries, page.profile)?;
     let mut out = Vec::new();
-    cbor_map(&mut out, 7);
-    cbor_uint(&mut out, 0);
-    cbor_uint(&mut out, 0);
-    cbor_uint(&mut out, 1);
-    cbor_bytes(&mut out, &page.manifest_id);
-    cbor_uint(&mut out, 2);
-    cbor_uint(&mut out, page.index);
-    cbor_uint(&mut out, 3);
+    vot_cbor::map(&mut out, 7);
+    vot_cbor::uint(&mut out, 0);
+    vot_cbor::uint(&mut out, 0);
+    vot_cbor::uint(&mut out, 1);
+    vot_cbor::bytes(&mut out, &page.manifest_id);
+    vot_cbor::uint(&mut out, 2);
+    vot_cbor::uint(&mut out, page.index);
+    vot_cbor::uint(&mut out, 3);
     if let Some(total) = page.total {
-        cbor_uint(&mut out, total);
+        vot_cbor::uint(&mut out, total);
     } else {
         out.push(0xf6);
     }
-    cbor_uint(&mut out, 4);
-    cbor_bytes(&mut out, &page.previous_digest);
-    cbor_uint(&mut out, 5);
-    cbor_uint(&mut out, u64::from(page.profile == PathProfile::RawPosix));
-    cbor_uint(&mut out, 6);
-    cbor_array(&mut out, page.entries.len() as u64);
+    vot_cbor::uint(&mut out, 4);
+    vot_cbor::bytes(&mut out, &page.previous_digest);
+    vot_cbor::uint(&mut out, 5);
+    vot_cbor::uint(&mut out, u64::from(page.profile == PathProfile::RawPosix));
+    vot_cbor::uint(&mut out, 6);
+    vot_cbor::array(&mut out, page.entries.len() as u64);
     for entry in &page.entries {
         encode_entry(&mut out, entry);
     }
@@ -362,28 +362,28 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
 pub fn encode_seal(seal: &Seal) -> Result<Vec<u8>, Error> {
     validate_seal(seal)?;
     let mut out = Vec::new();
-    cbor_map(&mut out, 6);
-    cbor_uint(&mut out, 0);
-    cbor_uint(&mut out, 0);
-    cbor_uint(&mut out, 1);
-    cbor_bytes(&mut out, &seal.manifest_id);
-    cbor_uint(&mut out, 2);
-    cbor_uint(&mut out, seal.final_page_count);
-    cbor_uint(&mut out, 3);
-    cbor_bytes(&mut out, &seal.final_page_digest);
-    cbor_uint(&mut out, 4);
-    cbor_array(&mut out, 4);
-    cbor_uint(&mut out, 1);
-    cbor_uint(&mut out, u64::from(seal.package.suite));
-    cbor_bytes(&mut out, &seal.package.root);
-    cbor_uint(&mut out, seal.package.length);
-    cbor_uint(&mut out, 5);
-    cbor_array(&mut out, seal.pages.len() as u64);
+    vot_cbor::map(&mut out, 6);
+    vot_cbor::uint(&mut out, 0);
+    vot_cbor::uint(&mut out, 0);
+    vot_cbor::uint(&mut out, 1);
+    vot_cbor::bytes(&mut out, &seal.manifest_id);
+    vot_cbor::uint(&mut out, 2);
+    vot_cbor::uint(&mut out, seal.final_page_count);
+    vot_cbor::uint(&mut out, 3);
+    vot_cbor::bytes(&mut out, &seal.final_page_digest);
+    vot_cbor::uint(&mut out, 4);
+    vot_cbor::array(&mut out, 4);
+    vot_cbor::uint(&mut out, 1);
+    vot_cbor::uint(&mut out, u64::from(seal.package.suite));
+    vot_cbor::bytes(&mut out, &seal.package.root);
+    vot_cbor::uint(&mut out, seal.package.length);
+    vot_cbor::uint(&mut out, 5);
+    vot_cbor::array(&mut out, seal.pages.len() as u64);
     for commitment in &seal.pages {
-        cbor_array(&mut out, 3);
-        cbor_uint(&mut out, commitment.index);
-        cbor_bytes(&mut out, &commitment.digest);
-        cbor_array(&mut out, 0);
+        vot_cbor::array(&mut out, 3);
+        vot_cbor::uint(&mut out, commitment.index);
+        vot_cbor::bytes(&mut out, &commitment.digest);
+        vot_cbor::array(&mut out, 0);
     }
     validate_page_length(out.len())?;
     Ok(out)
@@ -507,8 +507,11 @@ pub fn decode_page(input: &[u8]) -> Result<ManifestPage, DecodeError> {
     decoder.exact_key(2)?;
     let index = decoder.uint()?;
     decoder.exact_key(3)?;
-    let total = if decoder.peek()? == 0xf6 {
-        decoder.advance(1)?;
+    // An absent total is `null`, which is the one simple value this encoding
+    // has. Reading it as an item rather than as a byte is what keeps another
+    // simple value from being taken for it.
+    let total = if decoder.peek_null() {
+        decoder.null()?;
         None
     } else {
         Some(decoder.uint()?)
@@ -666,101 +669,54 @@ fn decode_metadata(decoder: &mut Decoder<'_>) -> Result<FileMetadata, DecodeErro
     Ok(metadata)
 }
 
+/// The manifest's view of a deterministic CBOR reader.
+///
+/// `vot-cbor` decides what a well-formed canonical item is. This decides what a
+/// manifest calls each failure, which is not one mapping but several: a byte
+/// string past its bound is a component that is too large, and a collection
+/// count past `usize` is an invalid structure.
 struct Decoder<'a> {
-    input: &'a [u8],
-    offset: usize,
+    reader: vot_cbor::Reader<'a>,
+}
+
+/// The failures that mean the bytes are not deterministic CBOR at all, whatever
+/// the manifest expected to find.
+fn structural(error: vot_cbor::Error) -> DecodeError {
+    match error {
+        vot_cbor::Error::Truncated => DecodeError::Truncated,
+        vot_cbor::Error::NonCanonical => DecodeError::NonCanonical,
+        vot_cbor::Error::WrongType => DecodeError::WrongType,
+        vot_cbor::Error::NotUtf8 => DecodeError::InvalidUtf8,
+        vot_cbor::Error::Malformed | vot_cbor::Error::Trailing => DecodeError::InvalidCbor,
+        vot_cbor::Error::TooLarge => DecodeError::InvalidStructure,
+    }
 }
 
 impl<'a> Decoder<'a> {
     const fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
-    }
-
-    fn peek(&self) -> Result<u8, DecodeError> {
-        self.input
-            .get(self.offset)
-            .copied()
-            .ok_or(DecodeError::Truncated)
-    }
-
-    fn advance(&mut self, bytes: usize) -> Result<(), DecodeError> {
-        self.offset = self
-            .offset
-            .checked_add(bytes)
-            .filter(|offset| *offset <= self.input.len())
-            .ok_or(DecodeError::Truncated)?;
-        Ok(())
-    }
-
-    fn head(&mut self) -> Result<(u8, u64), DecodeError> {
-        let first = self.peek()?;
-        self.advance(1)?;
-        let major = first >> 5;
-        let additional = first & 0x1f;
-        let value = match additional {
-            value @ 0..=23 => u64::from(value),
-            24 => u64::from(self.read_array::<1>()?[0]),
-            25 => u64::from(u16::from_be_bytes(self.read_array::<2>()?)),
-            26 => u64::from(u32::from_be_bytes(self.read_array::<4>()?)),
-            27 => u64::from_be_bytes(self.read_array::<8>()?),
-            _ => return Err(DecodeError::InvalidCbor),
-        };
-        if (additional == 24 && value < 24)
-            || (additional == 25 && value <= 0xff)
-            || (additional == 26 && value <= 0xffff)
-            || (additional == 27 && value <= 0xffff_ffff)
-        {
-            return Err(DecodeError::NonCanonical);
+        Self {
+            reader: vot_cbor::Reader::new(input),
         }
-        Ok((major, value))
-    }
-
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        let end = self.offset.checked_add(N).ok_or(DecodeError::Truncated)?;
-        let bytes = self
-            .input
-            .get(self.offset..end)
-            .ok_or(DecodeError::Truncated)?;
-        let mut result = [0; N];
-        result.copy_from_slice(bytes);
-        self.offset = end;
-        Ok(result)
     }
 
     fn uint(&mut self) -> Result<u64, DecodeError> {
-        let (major, value) = self.head()?;
-        if major == 0 {
-            Ok(value)
-        } else {
-            Err(DecodeError::WrongType)
-        }
+        self.reader.uint().map_err(structural)
     }
 
     fn int(&mut self) -> Result<i64, DecodeError> {
-        let (major, value) = self.head()?;
-        match major {
-            0 => i64::try_from(value).map_err(|_| DecodeError::InvalidStructure),
-            1 => {
-                let signed = -1_i128 - i128::from(value);
-                i64::try_from(signed).map_err(|_| DecodeError::InvalidStructure)
-            }
-            _ => Err(DecodeError::WrongType),
-        }
+        self.reader.int().map_err(structural)
     }
 
     fn array_len(&mut self) -> Result<usize, DecodeError> {
-        self.collection_len(4)
+        self.collection_len(vot_cbor::major::ARRAY)
     }
 
     fn map_len(&mut self) -> Result<usize, DecodeError> {
-        self.collection_len(5)
+        self.collection_len(vot_cbor::major::MAP)
     }
 
     fn collection_len(&mut self, expected_major: u8) -> Result<usize, DecodeError> {
-        let (major, length) = self.head()?;
-        if major != expected_major {
-            return Err(DecodeError::WrongType);
-        }
+        let length = self.reader.typed_head(expected_major).map_err(structural)?;
         usize::try_from(length).map_err(|_| DecodeError::InvalidStructure)
     }
 
@@ -778,58 +734,42 @@ impl<'a> Decoder<'a> {
     }
 
     fn bytes(&mut self, limit: usize) -> Result<&'a [u8], DecodeError> {
-        let (major, length) = self.head()?;
-        if major != 2 {
-            return Err(DecodeError::WrongType);
-        }
-        let length = usize::try_from(length).map_err(|_| DecodeError::ComponentTooLarge)?;
-        if length > limit {
-            return Err(DecodeError::ComponentTooLarge);
-        }
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or(DecodeError::Truncated)?;
-        let value = self
-            .input
-            .get(self.offset..end)
-            .ok_or(DecodeError::Truncated)?;
-        self.offset = end;
-        Ok(value)
+        self.reader.bytes(limit).map_err(|error| match error {
+            // The bound is the manifest's, so exceeding it is a component that
+            // is too large rather than a structural fault.
+            vot_cbor::Error::TooLarge => DecodeError::ComponentTooLarge,
+            other => structural(other),
+        })
     }
 
     fn fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        let value = self.bytes(N)?;
-        if value.len() != N {
-            return Err(DecodeError::InvalidStructure);
-        }
-        let mut result = [0; N];
-        result.copy_from_slice(value);
-        Ok(result)
+        self.reader.fixed_bytes::<N>().map_err(|error| match error {
+            // A byte string of another length where a fixed one was expected is
+            // the wrong shape rather than an oversized component.
+            vot_cbor::Error::TooLarge => DecodeError::InvalidStructure,
+            other => structural(other),
+        })
     }
 
     fn text(&mut self, limit: usize) -> Result<&'a str, DecodeError> {
-        let (major, length) = self.head()?;
-        if major != 3 {
-            return Err(DecodeError::WrongType);
-        }
-        let length = usize::try_from(length).map_err(|_| DecodeError::ComponentTooLarge)?;
-        if length > limit {
-            return Err(DecodeError::ComponentTooLarge);
-        }
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or(DecodeError::Truncated)?;
-        let value = self
-            .input
-            .get(self.offset..end)
-            .ok_or(DecodeError::Truncated)?;
-        self.offset = end;
-        std::str::from_utf8(value).map_err(|_| DecodeError::InvalidUtf8)
+        self.reader.text(limit).map_err(|error| match error {
+            vot_cbor::Error::TooLarge => DecodeError::ComponentTooLarge,
+            other => structural(other),
+        })
+    }
+
+    /// Whether the next item is the `null` an absent optional field encodes as.
+    fn peek_null(&self) -> bool {
+        self.reader.peek_null()
+    }
+
+    fn null(&mut self) -> Result<(), DecodeError> {
+        self.reader.null().map_err(structural)
     }
 
     fn exact_key(&mut self, expected: u64) -> Result<(), DecodeError> {
+        // A key out of order or absent is what makes a map non-canonical here,
+        // rather than merely the wrong type.
         if self.uint()? == expected {
             Ok(())
         } else {
@@ -838,11 +778,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn finish(&self) -> Result<(), DecodeError> {
-        if self.offset == self.input.len() {
-            Ok(())
-        } else {
-            Err(DecodeError::InvalidStructure)
-        }
+        self.reader
+            .finish()
+            .map_err(|_| DecodeError::InvalidStructure)
     }
 }
 
@@ -977,43 +915,43 @@ fn encode_entry(out: &mut Vec<u8>, entry: &ManifestEntry) {
         + usize::from(entry.length.is_some())
         + usize::from(entry.storage.is_some())
         + usize::from(entry.metadata.is_some());
-    cbor_map(out, fields as u64);
-    cbor_uint(out, 0);
-    cbor_array(out, entry.path.len() as u64);
+    vot_cbor::map(out, fields as u64);
+    vot_cbor::uint(out, 0);
+    vot_cbor::array(out, entry.path.len() as u64);
     for component in &entry.path {
         match component {
-            Component::Text(text) => cbor_text(out, text),
-            Component::Bytes(bytes) => cbor_bytes(out, bytes),
+            Component::Text(text) => vot_cbor::text(out, text),
+            Component::Bytes(bytes) => vot_cbor::bytes(out, bytes),
         }
     }
-    cbor_uint(out, 1);
-    cbor_uint(out, u64::from(entry.kind == EntryKind::Directory));
+    vot_cbor::uint(out, 1);
+    vot_cbor::uint(out, u64::from(entry.kind == EntryKind::Directory));
     if let Some(length) = entry.length {
-        cbor_uint(out, 2);
-        cbor_uint(out, length);
+        vot_cbor::uint(out, 2);
+        vot_cbor::uint(out, length);
     }
     if let Some(storage) = &entry.storage {
-        cbor_uint(out, 3);
+        vot_cbor::uint(out, 3);
         encode_storage(out, storage);
     }
     if let Some(metadata) = &entry.metadata {
-        cbor_uint(out, 4);
+        vot_cbor::uint(out, 4);
         encode_metadata(out, metadata);
     }
 }
 
 fn encode_object(out: &mut Vec<u8>, object: &ObjectId) {
-    cbor_array(out, 3);
-    cbor_uint(out, u64::from(object.suite));
-    cbor_bytes(out, &object.root);
-    cbor_uint(out, object.length);
+    vot_cbor::array(out, 3);
+    vot_cbor::uint(out, u64::from(object.suite));
+    vot_cbor::bytes(out, &object.root);
+    vot_cbor::uint(out, object.length);
 }
 
 fn encode_storage(out: &mut Vec<u8>, storage: &StorageRef) {
     match storage {
         StorageRef::Direct(object) => {
-            cbor_array(out, 2);
-            cbor_uint(out, 0);
+            vot_cbor::array(out, 2);
+            vot_cbor::uint(out, 0);
             encode_object(out, object);
         }
         StorageRef::Pack {
@@ -1022,11 +960,11 @@ fn encode_storage(out: &mut Vec<u8>, storage: &StorageRef) {
             length,
             logical,
         } => {
-            cbor_array(out, 5);
-            cbor_uint(out, 1);
+            vot_cbor::array(out, 5);
+            vot_cbor::uint(out, 1);
             encode_object(out, pack);
-            cbor_uint(out, *offset);
-            cbor_uint(out, *length);
+            vot_cbor::uint(out, *offset);
+            vot_cbor::uint(out, *length);
             encode_object(out, logical);
         }
     }
@@ -1037,68 +975,23 @@ fn encode_metadata(out: &mut Vec<u8>, metadata: &FileMetadata) {
         + usize::from(metadata.mtime_seconds.is_some())
         + usize::from(metadata.mtime_nanoseconds.is_some())
         + usize::from(metadata.media_type.is_some());
-    cbor_map(out, fields as u64);
+    vot_cbor::map(out, fields as u64);
     if let Some(mode) = metadata.mode {
-        cbor_uint(out, 0);
-        cbor_uint(out, u64::from(mode));
+        vot_cbor::uint(out, 0);
+        vot_cbor::uint(out, u64::from(mode));
     }
     if let Some(seconds) = metadata.mtime_seconds {
-        cbor_uint(out, 1);
-        cbor_int(out, seconds);
+        vot_cbor::uint(out, 1);
+        vot_cbor::int(out, seconds);
     }
     if let Some(nanoseconds) = metadata.mtime_nanoseconds {
-        cbor_uint(out, 2);
-        cbor_uint(out, u64::from(nanoseconds));
+        vot_cbor::uint(out, 2);
+        vot_cbor::uint(out, u64::from(nanoseconds));
     }
     if let Some(media_type) = &metadata.media_type {
-        cbor_uint(out, 3);
-        cbor_text(out, media_type);
+        vot_cbor::uint(out, 3);
+        vot_cbor::text(out, media_type);
     }
-}
-
-fn cbor_head(out: &mut Vec<u8>, major: u8, value: u64) {
-    let prefix = major << 5;
-    match value {
-        0..=23 => out.push(prefix | value as u8),
-        24..=0xff => out.extend_from_slice(&[prefix | 24, value as u8]),
-        0x100..=0xffff => {
-            out.push(prefix | 25);
-            out.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            out.push(prefix | 26);
-            out.extend_from_slice(&(value as u32).to_be_bytes());
-        }
-        _ => {
-            out.push(prefix | 27);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
-fn cbor_uint(out: &mut Vec<u8>, value: u64) {
-    cbor_head(out, 0, value);
-}
-fn cbor_int(out: &mut Vec<u8>, value: i64) {
-    if value >= 0 {
-        cbor_uint(out, value as u64);
-    } else {
-        cbor_head(out, 1, (-1_i128 - i128::from(value)) as u64);
-    }
-}
-fn cbor_bytes(out: &mut Vec<u8>, value: &[u8]) {
-    cbor_head(out, 2, value.len() as u64);
-    out.extend_from_slice(value);
-}
-fn cbor_text(out: &mut Vec<u8>, value: &str) {
-    cbor_head(out, 3, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-fn cbor_array(out: &mut Vec<u8>, length: u64) {
-    cbor_head(out, 4, length);
-}
-fn cbor_map(out: &mut Vec<u8>, length: u64) {
-    cbor_head(out, 5, length);
 }
 
 #[cfg(test)]

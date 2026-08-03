@@ -406,6 +406,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { package: vot-cbor, required: true }
           - { package: vot-commit-model, required: true }
           - { package: vot-commit-posix, required: true }
           - { package: vot-commit-strict, required: true }

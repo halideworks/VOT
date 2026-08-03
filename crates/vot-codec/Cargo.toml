@@ -10,6 +10,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+vot-cbor = { path = "../vot-cbor" }
 vot-manifest = { path = "../vot-manifest" }
 vot-receipt = { path = "../vot-receipt" }
 

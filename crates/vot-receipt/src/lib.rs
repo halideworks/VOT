@@ -176,45 +176,45 @@ impl Receipt {
         let mut output = Vec::with_capacity(160);
         // Key 17 is optional, so the map length depends on whether this
         // observation links to a predecessor.
-        encode_map(if self.previous.is_some() { 15 } else { 14 }, &mut output);
-        encode_uint(0, &mut output);
-        encode_uint(0, &mut output);
-        encode_uint(1, &mut output);
-        encode_array(4, &mut output);
-        encode_uint(self.subject_kind as u64, &mut output);
-        encode_uint(u64::from(self.suite_id), &mut output);
-        encode_bytes(&self.subject_digest, &mut output);
-        encode_uint(self.subject_length, &mut output);
-        encode_uint(2, &mut output);
-        encode_uint(self.assurance as u64, &mut output);
-        encode_uint(3, &mut output);
-        encode_uint(self.profile as u64, &mut output);
-        encode_uint(4, &mut output);
-        encode_uint(self.actual_predecessor as u64, &mut output);
-        encode_uint(5, &mut output);
-        encode_uint(u64::from(self.provider), &mut output);
-        encode_uint(6, &mut output);
-        encode_array(3, &mut output);
+        vot_cbor::map(&mut output, if self.previous.is_some() { 15 } else { 14 });
+        vot_cbor::uint(&mut output, 0);
+        vot_cbor::uint(&mut output, 0);
+        vot_cbor::uint(&mut output, 1);
+        vot_cbor::array(&mut output, 4);
+        vot_cbor::uint(&mut output, self.subject_kind as u64);
+        vot_cbor::uint(&mut output, u64::from(self.suite_id));
+        vot_cbor::bytes(&mut output, &self.subject_digest);
+        vot_cbor::uint(&mut output, self.subject_length);
+        vot_cbor::uint(&mut output, 2);
+        vot_cbor::uint(&mut output, self.assurance as u64);
+        vot_cbor::uint(&mut output, 3);
+        vot_cbor::uint(&mut output, self.profile as u64);
+        vot_cbor::uint(&mut output, 4);
+        vot_cbor::uint(&mut output, self.actual_predecessor as u64);
+        vot_cbor::uint(&mut output, 5);
+        vot_cbor::uint(&mut output, u64::from(self.provider));
+        vot_cbor::uint(&mut output, 6);
+        vot_cbor::array(&mut output, 3);
         for component in self.provider_version {
-            encode_uint(u64::from(component), &mut output);
+            vot_cbor::uint(&mut output, u64::from(component));
         }
-        encode_uint(7, &mut output);
-        encode_bytes(&self.session_id, &mut output);
-        encode_uint(8, &mut output);
-        encode_bytes(&self.incarnation_id, &mut output);
-        encode_uint(9, &mut output);
-        encode_uint(self.sequence, &mut output);
-        encode_uint(10, &mut output);
-        encode_text(&self.observed_at, &mut output);
-        encode_uint(11, &mut output);
-        encode_uint(u64::from(self.clock_source), &mut output);
-        encode_uint(12, &mut output);
-        encode_uint(u64::from(self.suite_id), &mut output);
-        encode_uint(13, &mut output);
-        encode_uint(u64::from(self.flags), &mut output);
+        vot_cbor::uint(&mut output, 7);
+        vot_cbor::bytes(&mut output, &self.session_id);
+        vot_cbor::uint(&mut output, 8);
+        vot_cbor::bytes(&mut output, &self.incarnation_id);
+        vot_cbor::uint(&mut output, 9);
+        vot_cbor::uint(&mut output, self.sequence);
+        vot_cbor::uint(&mut output, 10);
+        vot_cbor::text(&mut output, &self.observed_at);
+        vot_cbor::uint(&mut output, 11);
+        vot_cbor::uint(&mut output, u64::from(self.clock_source));
+        vot_cbor::uint(&mut output, 12);
+        vot_cbor::uint(&mut output, u64::from(self.suite_id));
+        vot_cbor::uint(&mut output, 13);
+        vot_cbor::uint(&mut output, u64::from(self.flags));
         if let Some(previous) = &self.previous {
-            encode_uint(17, &mut output);
-            encode_bytes(previous, &mut output);
+            vot_cbor::uint(&mut output, 17);
+            vot_cbor::bytes(&mut output, previous);
         }
         Ok(output)
     }
@@ -300,54 +300,6 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
-fn encode_head(major: u8, value: u64, output: &mut Vec<u8>) {
-    match value {
-        0..=23 => output.push(head_byte(major, u8::try_from(value).unwrap())),
-        24..=0xff => {
-            output.push(head_byte(major, 24));
-            output.push(u8::try_from(value).unwrap());
-        }
-        0x100..=0xffff => {
-            output.push(head_byte(major, 25));
-            output.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            output.push(head_byte(major, 26));
-            output.extend_from_slice(&u32::try_from(value).unwrap().to_be_bytes());
-        }
-        _ => {
-            output.push(head_byte(major, 27));
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
-const fn head_byte(major: u8, additional: u8) -> u8 {
-    major * 32 + additional
-}
-
-fn encode_uint(value: u64, output: &mut Vec<u8>) {
-    encode_head(0, value, output);
-}
-
-fn encode_bytes(value: &[u8], output: &mut Vec<u8>) {
-    encode_head(2, value.len() as u64, output);
-    output.extend_from_slice(value);
-}
-
-fn encode_text(value: &str, output: &mut Vec<u8>) {
-    encode_head(3, value.len() as u64, output);
-    output.extend_from_slice(value.as_bytes());
-}
-
-fn encode_array(length: u64, output: &mut Vec<u8>) {
-    encode_head(4, length, output);
-}
-
-fn encode_map(length: u64, output: &mut Vec<u8>) {
-    encode_head(5, length, output);
-}
-
 /// A witness statement: an independent party recording that it saw a chain head
 /// at its own clock time.
 ///
@@ -393,13 +345,13 @@ impl WitnessStatement {
         self.validate()?;
         let mut output = Vec::with_capacity(WITNESS_DOMAIN.len() + 96);
         output.extend_from_slice(WITNESS_DOMAIN);
-        encode_map(3, &mut output);
-        encode_uint(0, &mut output);
-        encode_bytes(&self.head, &mut output);
-        encode_uint(1, &mut output);
-        encode_text(&self.observed_at, &mut output);
-        encode_uint(2, &mut output);
-        encode_bytes(&self.key_id, &mut output);
+        vot_cbor::map(&mut output, 3);
+        vot_cbor::uint(&mut output, 0);
+        vot_cbor::bytes(&mut output, &self.head);
+        vot_cbor::uint(&mut output, 1);
+        vot_cbor::text(&mut output, &self.observed_at);
+        vot_cbor::uint(&mut output, 2);
+        vot_cbor::bytes(&mut output, &self.key_id);
         Ok(output)
     }
 }
@@ -620,15 +572,15 @@ pub fn encode_authenticated(receipt: &AuthenticatedReceipt) -> Result<Vec<u8>, E
     }
     let canonical = receipt.receipt.canonical_bytes()?;
     let mut output = Vec::with_capacity(canonical.len() + receipt.key_id.len() + 48);
-    encode_map(4, &mut output);
-    encode_uint(0, &mut output);
+    vot_cbor::map(&mut output, 4);
+    vot_cbor::uint(&mut output, 0);
     output.extend_from_slice(&canonical);
-    encode_uint(1, &mut output);
-    encode_uint(receipt.scheme as u64, &mut output);
-    encode_uint(2, &mut output);
-    encode_bytes(&receipt.key_id, &mut output);
-    encode_uint(3, &mut output);
-    encode_bytes(&receipt.authentication, &mut output);
+    vot_cbor::uint(&mut output, 1);
+    vot_cbor::uint(&mut output, receipt.scheme as u64);
+    vot_cbor::uint(&mut output, 2);
+    vot_cbor::bytes(&mut output, &receipt.key_id);
+    vot_cbor::uint(&mut output, 3);
+    vot_cbor::bytes(&mut output, &receipt.authentication);
     Ok(output)
 }
 
@@ -668,7 +620,7 @@ pub fn decode_authenticated(input: &[u8]) -> Result<AuthenticatedReceipt, Error>
 
 fn decode_receipt(decoder: &mut Decoder<'_>) -> Result<Receipt, Error> {
     // Fourteen keys, or fifteen when the observation links to a predecessor.
-    let entries = decoder.head(5)?;
+    let entries = decoder.map_len()?;
     if entries != 14 && entries != 15 {
         return Err(Error::InvalidEncoding);
     }
@@ -757,67 +709,37 @@ fn decode_assurance(value: u64) -> Result<AssuranceLevel, Error> {
     }
 }
 
+/// The receipt crate's view of a deterministic CBOR reader.
+///
+/// `vot-cbor` decides what a well-formed canonical item is. This decides what a
+/// receipt calls each failure: everything structural is an invalid encoding
+/// except a shortest-form violation, which callers distinguish, and a bound the
+/// receipt set, which is too large.
 struct Decoder<'a> {
-    remaining: &'a [u8],
+    reader: vot_cbor::Reader<'a>,
+}
+
+fn structural(error: vot_cbor::Error) -> Error {
+    match error {
+        vot_cbor::Error::NonCanonical => Error::NonCanonical,
+        vot_cbor::Error::TooLarge => Error::TooLarge,
+        vot_cbor::Error::Truncated
+        | vot_cbor::Error::Malformed
+        | vot_cbor::Error::WrongType
+        | vot_cbor::Error::NotUtf8
+        | vot_cbor::Error::Trailing => Error::InvalidEncoding,
+    }
 }
 
 impl<'a> Decoder<'a> {
     const fn new(remaining: &'a [u8]) -> Self {
-        Self { remaining }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
-        if self.remaining.len() < length {
-            return Err(Error::InvalidEncoding);
-        }
-        let (value, remaining) = self.remaining.split_at(length);
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn head(&mut self, expected_major: u8) -> Result<u64, Error> {
-        let first = *self.take(1)?.first().ok_or(Error::InvalidEncoding)?;
-        if first >> 5 != expected_major {
-            return Err(Error::InvalidEncoding);
-        }
-        match first & 0x1f {
-            value @ 0..=23 => Ok(u64::from(value)),
-            24 => {
-                let value = u64::from(self.take(1)?[0]);
-                (value >= 24).then_some(value).ok_or(Error::NonCanonical)
-            }
-            25 => {
-                let value = u64::from(u16::from_be_bytes(
-                    self.take(2)?
-                        .try_into()
-                        .map_err(|_| Error::InvalidEncoding)?,
-                ));
-                (value > 0xff).then_some(value).ok_or(Error::NonCanonical)
-            }
-            26 => {
-                let value = u64::from(u32::from_be_bytes(
-                    self.take(4)?
-                        .try_into()
-                        .map_err(|_| Error::InvalidEncoding)?,
-                ));
-                (value > 0xffff).then_some(value).ok_or(Error::NonCanonical)
-            }
-            27 => {
-                let value = u64::from_be_bytes(
-                    self.take(8)?
-                        .try_into()
-                        .map_err(|_| Error::InvalidEncoding)?,
-                );
-                (value > 0xffff_ffff)
-                    .then_some(value)
-                    .ok_or(Error::NonCanonical)
-            }
-            _ => Err(Error::InvalidEncoding),
+        Self {
+            reader: vot_cbor::Reader::new(remaining),
         }
     }
 
     fn uint(&mut self) -> Result<u64, Error> {
-        self.head(0)
+        self.reader.uint().map_err(structural)
     }
 
     fn u16(&mut self) -> Result<u16, Error> {
@@ -828,6 +750,12 @@ impl<'a> Decoder<'a> {
         u8::try_from(self.uint()?).map_err(|_| Error::InvalidEncoding)
     }
 
+    /// A map head whose length the caller decides about, which is how an
+    /// envelope that carries one optional key is read.
+    fn map_len(&mut self) -> Result<u64, Error> {
+        self.reader.map_len(u64::MAX).map_err(structural)
+    }
+
     fn exact_key(&mut self, expected: u64) -> Result<(), Error> {
         if self.uint()? == expected {
             Ok(())
@@ -836,8 +764,14 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// A map of exactly `expected` pairs.
+    ///
+    /// The length is compared here rather than by the reader, because a wider
+    /// head than the length needs is a non-canonical encoding and a length that
+    /// is simply not the one expected is an invalid one. Letting the reader
+    /// decide both would report the first as the second.
     fn exact_map(&mut self, expected: u64) -> Result<(), Error> {
-        if self.head(5)? == expected {
+        if self.map_len()? == expected {
             Ok(())
         } else {
             Err(Error::InvalidEncoding)
@@ -845,7 +779,8 @@ impl<'a> Decoder<'a> {
     }
 
     fn exact_array(&mut self, expected: u64) -> Result<(), Error> {
-        if self.head(4)? == expected {
+        let length = self.reader.array_len(u64::MAX).map_err(structural)?;
+        if length == expected {
             Ok(())
         } else {
             Err(Error::InvalidEncoding)
@@ -853,35 +788,30 @@ impl<'a> Decoder<'a> {
     }
 
     fn bytes(&mut self, maximum: usize) -> Result<Vec<u8>, Error> {
-        let length = usize::try_from(self.head(2)?).map_err(|_| Error::TooLarge)?;
-        if length > maximum {
-            return Err(Error::TooLarge);
-        }
-        Ok(self.take(length)?.to_vec())
+        self.reader
+            .bytes(maximum)
+            .map(<[u8]>::to_vec)
+            .map_err(structural)
     }
 
     fn fixed_bytes<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.bytes(N)?
-            .try_into()
-            .map_err(|_| Error::InvalidEncoding)
+        self.reader.fixed_bytes::<N>().map_err(|error| match error {
+            // A byte string of another length is the wrong shape rather than a
+            // bound this receipt set being exceeded.
+            vot_cbor::Error::TooLarge => Error::InvalidEncoding,
+            other => structural(other),
+        })
     }
 
     fn text(&mut self, maximum: usize) -> Result<String, Error> {
-        let length = usize::try_from(self.head(3)?).map_err(|_| Error::TooLarge)?;
-        if length > maximum {
-            return Err(Error::TooLarge);
-        }
-        std::str::from_utf8(self.take(length)?)
+        self.reader
+            .text(maximum)
             .map(str::to_owned)
-            .map_err(|_| Error::InvalidEncoding)
+            .map_err(structural)
     }
 
     fn finish(self) -> Result<(), Error> {
-        if self.remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::InvalidEncoding)
-        }
+        self.reader.finish().map_err(|_| Error::InvalidEncoding)
     }
 }
 
@@ -1187,11 +1117,10 @@ mod tests {
 
     #[test]
     fn deterministic_cbor_integer_widths_and_decoder_edges_are_exact() {
-        for major in 0..=5 {
-            for additional in [0, 23, 24, 25, 26, 27] {
-                assert_eq!(head_byte(major, additional), major * 32 + additional);
-            }
-        }
+        // The head itself is `vot-cbor`'s to get right and its tests cover every
+        // width for every major type. What belongs here is that a receipt whose
+        // field lands on each boundary still round-trips, and that this crate's
+        // decoder reports a non-canonical width as one.
         for value in [
             23,
             24,

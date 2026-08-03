@@ -111,6 +111,11 @@ cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 ```
 
+`vot-cbor` is the deterministic CBOR every VOT structure encodes in, and it is
+where the head rules and the shortest-form checks live. Three crates had grown
+their own copy of them; a change to canonical encoding now has one place to be
+made and one mutation run to answer for.
+
 `.github/workflows/ci.yml` holds the package matrix and which packages are
 required rather than advisory. `vot-codec` is advisory: a large share of its
 mutants survive, almost all in the frame parser.

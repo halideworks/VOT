@@ -353,17 +353,17 @@ pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize),
 
 fn encode_auth_context(value: &AuthContext, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_auth_context(value)?;
-    map(4, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.nonce, output);
-    uint(2, output);
-    uint(value.binding.to_wire(), output);
-    uint(3, output);
-    array(value.formats.len() as u64, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.nonce);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.binding.to_wire());
+    vot_cbor::uint(output, 3);
+    vot_cbor::array(output, value.formats.len() as u64);
     for format in &value.formats {
-        uint(*format, output);
+        vot_cbor::uint(output, *format);
     }
     Ok(())
 }
@@ -437,19 +437,19 @@ fn decode_auth_context(input: &[u8]) -> Result<AuthContext, Error> {
 
 fn encode_session_open(value: &SessionOpen, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_session_open(value)?;
-    map(6, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.session_id, output);
-    uint(2, output);
-    uint(value.capability_format, output);
-    uint(3, output);
-    bytes(&value.capability, output);
-    uint(4, output);
-    bytes(&value.requested_scope, output);
-    uint(5, output);
-    bytes(&value.binding_proof, output);
+    vot_cbor::map(output, 6);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.session_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.capability_format);
+    vot_cbor::uint(output, 3);
+    vot_cbor::bytes(output, &value.capability);
+    vot_cbor::uint(output, 4);
+    vot_cbor::bytes(output, &value.requested_scope);
+    vot_cbor::uint(output, 5);
+    vot_cbor::bytes(output, &value.binding_proof);
     Ok(())
 }
 
@@ -505,13 +505,13 @@ fn decode_session_open(input: &[u8]) -> Result<SessionOpen, Error> {
 
 fn encode_session_accept(value: &SessionAccept, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_session_accept(value)?;
-    map(3, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.session_id, output);
-    uint(2, output);
-    bytes(&value.granted_scope, output);
+    vot_cbor::map(output, 3);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.session_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::bytes(output, &value.granted_scope);
     Ok(())
 }
 
@@ -566,15 +566,15 @@ fn decode_session_accept(input: &[u8]) -> Result<SessionAccept, Error> {
 
 fn encode_session_reject(value: &SessionReject, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_session_reject(value)?;
-    map(4, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.session_id, output);
-    uint(2, output);
-    uint(value.reason, output);
-    uint(3, output);
-    text(&value.detail, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.session_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.reason);
+    vot_cbor::uint(output, 3);
+    vot_cbor::text(output, &value.detail);
     Ok(())
 }
 
@@ -622,13 +622,13 @@ fn encode_package_descriptor(value: &PackageDescriptor, output: &mut Vec<u8>) ->
     if value.page_count == 0 {
         return Err(Error::InvalidValue);
     }
-    map(3, output);
-    uint(0, output);
+    vot_cbor::map(output, 3);
+    vot_cbor::uint(output, 0);
     encode_object(&value.package, output);
-    uint(1, output);
-    bytes(&value.manifest_id, output);
-    uint(2, output);
-    uint(value.page_count, output);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.manifest_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.page_count);
     Ok(())
 }
 
@@ -656,15 +656,15 @@ fn decode_package_descriptor(input: &[u8]) -> Result<PackageDescriptor, Error> {
 
 fn encode_manifest_request(value: &ManifestRequest, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_manifest_request(value)?;
-    map(4, output);
-    uint(0, output);
-    bytes(&value.request_id, output);
-    uint(1, output);
-    bytes(&value.manifest_id, output);
-    uint(2, output);
-    uint(value.first_page, output);
-    uint(3, output);
-    uint(value.page_count, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
+    vot_cbor::bytes(output, &value.request_id);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.manifest_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.first_page);
+    vot_cbor::uint(output, 3);
+    vot_cbor::uint(output, value.page_count);
     Ok(())
 }
 
@@ -714,15 +714,15 @@ fn encode_range_request(value: &RangeRequest, output: &mut Vec<u8>) -> Result<()
     {
         return Err(Error::InvalidValue);
     }
-    map(4, output);
-    uint(0, output);
-    bytes(&value.request_id, output);
-    uint(1, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
+    vot_cbor::bytes(output, &value.request_id);
+    vot_cbor::uint(output, 1);
     encode_object(&value.object, output);
-    uint(2, output);
-    uint(value.offset, output);
-    uint(3, output);
-    uint(value.length, output);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.offset);
+    vot_cbor::uint(output, 3);
+    vot_cbor::uint(output, value.length);
     Ok(())
 }
 
@@ -750,29 +750,29 @@ fn decode_range_request(input: &[u8]) -> Result<RangeRequest, Error> {
 
 fn encode_proof_bundle(value: &ProofBundle, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_proof_bundle(value)?;
-    map(11, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.request_id, output);
-    uint(2, output);
-    bytes(&value.bundle_id, output);
-    uint(3, output);
+    vot_cbor::map(output, 11);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.request_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::bytes(output, &value.bundle_id);
+    vot_cbor::uint(output, 3);
     encode_object(&value.object, output);
-    uint(4, output);
-    uint(value.requested_offset, output);
-    uint(5, output);
-    uint(value.requested_length, output);
-    uint(6, output);
-    uint(value.covered_offset, output);
-    uint(7, output);
-    uint(value.covered_length, output);
-    uint(8, output);
-    uint(value.data_record_count, output);
-    uint(9, output);
-    uint(value.total_plaintext_length, output);
-    uint(10, output);
-    bytes(&value.proof, output);
+    vot_cbor::uint(output, 4);
+    vot_cbor::uint(output, value.requested_offset);
+    vot_cbor::uint(output, 5);
+    vot_cbor::uint(output, value.requested_length);
+    vot_cbor::uint(output, 6);
+    vot_cbor::uint(output, value.covered_offset);
+    vot_cbor::uint(output, 7);
+    vot_cbor::uint(output, value.covered_length);
+    vot_cbor::uint(output, 8);
+    vot_cbor::uint(output, value.data_record_count);
+    vot_cbor::uint(output, 9);
+    vot_cbor::uint(output, value.total_plaintext_length);
+    vot_cbor::uint(output, 10);
+    vot_cbor::bytes(output, &value.proof);
     Ok(())
 }
 
@@ -911,23 +911,23 @@ fn proof_bundle_payload_len_with(value: &ProofBundle, proof_len: usize) -> usize
 
 fn encode_data_record(value: &DataRecord, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_data_record(value)?;
-    map(8, output);
-    uint(0, output);
-    uint(0, output);
-    uint(1, output);
-    bytes(&value.bundle_id, output);
-    uint(2, output);
-    uint(value.record_index, output);
-    uint(3, output);
-    uint(value.plaintext_offset, output);
-    uint(4, output);
-    uint(value.plaintext_length, output);
-    uint(5, output);
-    uint(u64::from(value.compression), output);
-    uint(6, output);
-    uint(value.encoded.len() as u64, output);
-    uint(7, output);
-    bytes(&value.encoded, output);
+    vot_cbor::map(output, 8);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, 1);
+    vot_cbor::bytes(output, &value.bundle_id);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.record_index);
+    vot_cbor::uint(output, 3);
+    vot_cbor::uint(output, value.plaintext_offset);
+    vot_cbor::uint(output, 4);
+    vot_cbor::uint(output, value.plaintext_length);
+    vot_cbor::uint(output, 5);
+    vot_cbor::uint(output, u64::from(value.compression));
+    vot_cbor::uint(output, 6);
+    vot_cbor::uint(output, value.encoded.len() as u64);
+    vot_cbor::uint(output, 7);
+    vot_cbor::bytes(output, &value.encoded);
     Ok(())
 }
 
@@ -1021,17 +1021,17 @@ fn cbor_head_len(value: u64) -> usize {
 
 fn encode_have(value: &Have, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_have(value)?;
-    map(3, output);
-    uint(0, output);
+    vot_cbor::map(output, 3);
+    vot_cbor::uint(output, 0);
     encode_object(&value.object, output);
-    uint(1, output);
-    uint(value.map_sequence, output);
-    uint(2, output);
-    array(value.runs.len() as u64, output);
+    vot_cbor::uint(output, 1);
+    vot_cbor::uint(output, value.map_sequence);
+    vot_cbor::uint(output, 2);
+    vot_cbor::array(output, value.runs.len() as u64);
     for run in &value.runs {
-        array(2, output);
-        uint(run.start_group, output);
-        uint(run.group_count, output);
+        vot_cbor::array(output, 2);
+        vot_cbor::uint(output, run.start_group);
+        vot_cbor::uint(output, run.group_count);
     }
     Ok(())
 }
@@ -1115,15 +1115,15 @@ fn have_payload_len(value: &Have) -> usize {
 }
 
 fn encode_capacity(value: &Capacity, output: &mut Vec<u8>) {
-    map(4, output);
-    uint(0, output);
-    uint(value.epoch, output);
-    uint(1, output);
-    uint(value.available_bytes, output);
-    uint(2, output);
-    uint(value.bdp_target_bytes, output);
-    uint(3, output);
-    uint(value.max_inflight_bytes, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
+    vot_cbor::uint(output, value.epoch);
+    vot_cbor::uint(output, 1);
+    vot_cbor::uint(output, value.available_bytes);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.bdp_target_bytes);
+    vot_cbor::uint(output, 3);
+    vot_cbor::uint(output, value.max_inflight_bytes);
 }
 
 fn decode_capacity(input: &[u8]) -> Result<Capacity, Error> {
@@ -1148,15 +1148,15 @@ fn decode_capacity(input: &[u8]) -> Result<Capacity, Error> {
 
 fn encode_assurance(value: &AssuranceFrame, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_assurance(value)?;
-    map(4, output);
-    uint(0, output);
+    vot_cbor::map(output, 4);
+    vot_cbor::uint(output, 0);
     encode_object(&value.object, output);
-    uint(1, output);
-    uint(value.sequence, output);
-    uint(2, output);
-    uint(value.unit_start, output);
-    uint(3, output);
-    uint(value.unit_count, output);
+    vot_cbor::uint(output, 1);
+    vot_cbor::uint(output, value.sequence);
+    vot_cbor::uint(output, 2);
+    vot_cbor::uint(output, value.unit_start);
+    vot_cbor::uint(output, 3);
+    vot_cbor::uint(output, value.unit_count);
     Ok(())
 }
 
@@ -1219,11 +1219,11 @@ fn validate_receipt(bytes: &[u8]) -> Result<(), Error> {
 }
 
 fn encode_object(value: &ObjectId, output: &mut Vec<u8>) {
-    array(4, output);
-    uint(1, output);
-    uint(u64::from(value.suite), output);
-    bytes(&value.root, output);
-    uint(value.length, output);
+    vot_cbor::array(output, 4);
+    vot_cbor::uint(output, 1);
+    vot_cbor::uint(output, u64::from(value.suite));
+    vot_cbor::bytes(output, &value.root);
+    vot_cbor::uint(output, value.length);
 }
 
 fn decode_object(reader: &mut Reader<'_>) -> Result<ObjectId, Error> {
@@ -1245,192 +1245,91 @@ fn decode_object(reader: &mut Reader<'_>) -> Result<ObjectId, Error> {
     Ok(object)
 }
 
-fn map(length: u64, output: &mut Vec<u8>) {
-    head(5, length, output);
-}
-
-fn array(length: u64, output: &mut Vec<u8>) {
-    head(4, length, output);
-}
-
-fn uint(value: u64, output: &mut Vec<u8>) {
-    head(0, value, output);
-}
-
-fn bytes(value: &[u8], output: &mut Vec<u8>) {
-    head(2, value.len() as u64, output);
-    output.extend_from_slice(value);
-}
-
-fn text(value: &str, output: &mut Vec<u8>) {
-    head(3, value.len() as u64, output);
-    output.extend_from_slice(value.as_bytes());
-}
-
-fn head(major: u8, value: u64, output: &mut Vec<u8>) {
-    let major = major << 5;
-    match value {
-        0..=23 => output.push(major | value as u8),
-        24..=0xff => {
-            output.push(major | 24);
-            output.push(value as u8);
-        }
-        0x100..=0xffff => {
-            output.push(major | 25);
-            output.extend_from_slice(&(value as u16).to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            output.push(major | 26);
-            output.extend_from_slice(&(value as u32).to_be_bytes());
-        }
-        _ => {
-            output.push(major | 27);
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
+/// The frame codec's view of a deterministic CBOR reader.
+///
+/// `vot-cbor` decides what a well-formed canonical item is. This decides what a
+/// frame payload calls each failure, which is two things: a bound the registry
+/// set is `TooLarge`, and everything else is `Malformed`. A peer that sent an
+/// item of the wrong type and a peer that sent a wider head than its value needs
+/// have both sent a frame this endpoint refuses the same way.
 struct Reader<'a> {
-    input: &'a [u8],
-    offset: usize,
+    reader: vot_cbor::Reader<'a>,
+}
+
+fn structural(error: vot_cbor::Error) -> Error {
+    match error {
+        vot_cbor::Error::TooLarge => Error::TooLarge,
+        vot_cbor::Error::Truncated
+        | vot_cbor::Error::Malformed
+        | vot_cbor::Error::NonCanonical
+        | vot_cbor::Error::WrongType
+        | vot_cbor::Error::NotUtf8
+        | vot_cbor::Error::Trailing => Error::Malformed,
+    }
 }
 
 impl<'a> Reader<'a> {
     const fn new(input: &'a [u8]) -> Self {
-        Self { input, offset: 0 }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
-        let end = self.offset.checked_add(length).ok_or(Error::TooLarge)?;
-        let bytes = self.input.get(self.offset..end).ok_or(Error::Malformed)?;
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    fn head(&mut self) -> Result<(u8, u64), Error> {
-        let first = *self.take(1)?.first().ok_or(Error::Malformed)?;
-        let major = first >> 5;
-        let additional = first & 0x1f;
-        let (value, width) = match additional {
-            0..=23 => (u64::from(additional), 0),
-            24 => (
-                u64::from(*self.take(1)?.first().ok_or(Error::Malformed)?),
-                1,
-            ),
-            25 => (
-                u64::from(u16::from_be_bytes(
-                    self.take(2)?.try_into().map_err(|_| Error::Malformed)?,
-                )),
-                2,
-            ),
-            26 => (
-                u64::from(u32::from_be_bytes(
-                    self.take(4)?.try_into().map_err(|_| Error::Malformed)?,
-                )),
-                4,
-            ),
-            27 => (
-                u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| Error::Malformed)?),
-                8,
-            ),
-            _ => return Err(Error::Malformed),
-        };
-        let canonical = match width {
-            0 => true,
-            1 => value >= 24,
-            2 => value > 0xff,
-            4 => value > 0xffff,
-            8 => value > 0xffff_ffff,
-            _ => false,
-        };
-        if !canonical {
-            return Err(Error::Malformed);
+        Self {
+            reader: vot_cbor::Reader::new(input),
         }
-        Ok((major, value))
     }
 
     fn uint(&mut self) -> Result<u64, Error> {
-        let (major, value) = self.head()?;
-        if major == 0 {
-            Ok(value)
-        } else {
-            Err(Error::Malformed)
-        }
+        self.reader.uint().map_err(structural)
     }
 
+    /// A map key, which has to be the one the schema puts there.
+    ///
+    /// A key that is not the expected value is the same refusal as one that is
+    /// not an integer: this payload is not the shape the schema fixes.
     fn key(&mut self, expected: u64) -> Result<(), Error> {
-        if self.uint()? == expected {
-            Ok(())
-        } else {
-            Err(Error::Malformed)
-        }
+        self.reader.key(expected).map_err(|_| Error::Malformed)
     }
 
     fn map(&mut self, expected: u64) -> Result<(), Error> {
-        let (major, value) = self.head()?;
-        if major == 5 && value == expected {
-            Ok(())
-        } else {
-            Err(Error::Malformed)
-        }
+        self.reader.map(expected).map_err(|_| Error::Malformed)
     }
 
     fn array(&mut self, expected: u64) -> Result<u64, Error> {
-        let (major, value) = self.head()?;
-        if major == 4 && value == expected {
-            Ok(value)
-        } else {
-            Err(Error::Malformed)
-        }
+        self.reader
+            .array(expected)
+            .map(|()| expected)
+            .map_err(|_| Error::Malformed)
     }
 
+    /// An array head bounded by a registered maximum.
+    ///
+    /// Both halves are `TooLarge`, which is what the caller acts on: a count
+    /// past the bound and a head that is not an array both mean this payload
+    /// cannot be admitted.
     fn array_len(&mut self, maximum: u64) -> Result<u64, Error> {
-        let (major, value) = self.head()?;
-        if major != 4 || value > maximum {
-            Err(Error::TooLarge)
-        } else {
-            Ok(value)
-        }
+        self.reader.array_len(maximum).map_err(|_| Error::TooLarge)
     }
 
     fn bytes(&mut self, maximum: usize) -> Result<&'a [u8], Error> {
-        let (major, length) = self.head()?;
-        if major != 2 {
-            return Err(Error::Malformed);
-        }
-        let length = usize::try_from(length).map_err(|_| Error::TooLarge)?;
-        if length > maximum {
-            return Err(Error::TooLarge);
-        }
-        self.take(length)
+        self.reader.bytes(maximum).map_err(structural)
     }
 
     fn text(&mut self, maximum: usize) -> Result<&'a str, Error> {
-        let (major, length) = self.head()?;
-        if major != 3 {
-            return Err(Error::Malformed);
-        }
-        let length = usize::try_from(length).map_err(|_| Error::TooLarge)?;
-        if length > maximum {
-            return Err(Error::TooLarge);
-        }
-        core::str::from_utf8(self.take(length)?).map_err(|_| Error::Malformed)
+        self.reader.text(maximum).map_err(structural)
     }
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.bytes(N)?.try_into().map_err(|_| Error::Malformed)
+        self.reader.fixed_bytes::<N>().map_err(|error| match error {
+            // A byte string of another length where a fixed one was expected is
+            // the wrong shape rather than an oversized one.
+            vot_cbor::Error::TooLarge => Error::Malformed,
+            other => structural(other),
+        })
     }
 
     fn finish(&self) -> Result<(), Error> {
-        if self.offset == self.input.len() {
-            Ok(())
-        } else {
-            Err(Error::Malformed)
-        }
+        self.reader.finish().map_err(|_| Error::Malformed)
     }
 
     fn remaining_len(&self) -> usize {
-        self.input.len().saturating_sub(self.offset)
+        self.reader.remaining().len()
     }
 }
 
@@ -1559,18 +1458,18 @@ mod tests {
         // encoded one, so the payload is refused for its reason and not for a
         // key the edit moved.
         let mut unregistered = Vec::new();
-        map(4, &mut unregistered);
-        uint(0, &mut unregistered);
-        uint(0, &mut unregistered);
-        uint(1, &mut unregistered);
-        bytes(&[2; 16], &mut unregistered);
-        uint(2, &mut unregistered);
-        uint(
-            u64::from(crate::error_code::MALFORMED_FRAME),
+        vot_cbor::map(&mut unregistered, 4);
+        vot_cbor::uint(&mut unregistered, 0);
+        vot_cbor::uint(&mut unregistered, 0);
+        vot_cbor::uint(&mut unregistered, 1);
+        vot_cbor::bytes(&mut unregistered, &[2; 16]);
+        vot_cbor::uint(&mut unregistered, 2);
+        vot_cbor::uint(
             &mut unregistered,
+            u64::from(crate::error_code::MALFORMED_FRAME),
         );
-        uint(3, &mut unregistered);
-        text("", &mut unregistered);
+        vot_cbor::uint(&mut unregistered, 3);
+        vot_cbor::text(&mut unregistered, "");
         assert_eq!(
             decode_session_reject_payload(&unregistered),
             Err(Error::InvalidValue)
@@ -1752,29 +1651,29 @@ mod tests {
     fn proof_bundle_metadata_is_checked_before_proof_size() {
         let proof = vec![0xaa; 1024];
         let mut payload = Vec::new();
-        map(11, &mut payload);
-        uint(0, &mut payload);
-        uint(0, &mut payload);
-        uint(1, &mut payload);
-        bytes(&[1; 16], &mut payload);
-        uint(2, &mut payload);
-        bytes(&[2; 16], &mut payload);
-        uint(3, &mut payload);
+        vot_cbor::map(&mut payload, 11);
+        vot_cbor::uint(&mut payload, 0);
+        vot_cbor::uint(&mut payload, 0);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::bytes(&mut payload, &[1; 16]);
+        vot_cbor::uint(&mut payload, 2);
+        vot_cbor::bytes(&mut payload, &[2; 16]);
+        vot_cbor::uint(&mut payload, 3);
         encode_object(&object(), &mut payload);
-        uint(4, &mut payload);
-        uint(GROUP_BYTES, &mut payload);
-        uint(5, &mut payload);
-        uint(GROUP_BYTES, &mut payload);
-        uint(6, &mut payload);
-        uint(GROUP_BYTES, &mut payload);
-        uint(7, &mut payload);
-        uint(GROUP_BYTES, &mut payload);
-        uint(8, &mut payload);
-        uint(0, &mut payload);
-        uint(9, &mut payload);
-        uint(GROUP_BYTES, &mut payload);
-        uint(10, &mut payload);
-        bytes(&proof, &mut payload);
+        vot_cbor::uint(&mut payload, 4);
+        vot_cbor::uint(&mut payload, GROUP_BYTES);
+        vot_cbor::uint(&mut payload, 5);
+        vot_cbor::uint(&mut payload, GROUP_BYTES);
+        vot_cbor::uint(&mut payload, 6);
+        vot_cbor::uint(&mut payload, GROUP_BYTES);
+        vot_cbor::uint(&mut payload, 7);
+        vot_cbor::uint(&mut payload, GROUP_BYTES);
+        vot_cbor::uint(&mut payload, 8);
+        vot_cbor::uint(&mut payload, 0);
+        vot_cbor::uint(&mut payload, 9);
+        vot_cbor::uint(&mut payload, GROUP_BYTES);
+        vot_cbor::uint(&mut payload, 10);
+        vot_cbor::bytes(&mut payload, &proof);
         let mut encoded = Vec::new();
         encode_frame(frame_type::PROOF_BUNDLE, &payload, &mut encoded).unwrap();
         assert_eq!(

@@ -108,6 +108,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-cbor"
+version = "0.0.1"
+
+[[package]]
 name = "vot-fuzz-mutator"
 version = "0.0.0"
 
@@ -117,6 +121,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "unicode-normalization",
+ "vot-cbor",
 ]
 
 [[package]]

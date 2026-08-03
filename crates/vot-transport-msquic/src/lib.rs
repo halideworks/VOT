@@ -3821,8 +3821,10 @@ pub mod live {
                 vot_session::Authentication::Capability {
                     challenge: vot_codec::frames::AuthContext {
                         nonce: vec![0x5a; 32],
-                        binding: vot_codec::frames::Binding::None,
-                        formats: vec![1, 7],
+                        // Proof of possession, which is what ADR-0022 chose and
+                        // what `ed25519-cbor-v1` carries a holder key for.
+                        binding: vot_codec::frames::Binding::ProofOfPossession,
+                        formats: vec![vot_capability::FORMAT_ID.into()],
                     },
                 },
             );
@@ -3838,9 +3840,13 @@ pub mod live {
             }
             let challenge = client
                 .pending_presentation()
-                .expect("the server never asked for a capability");
+                .expect("the server never asked for a capability")
+                .clone();
             assert_eq!(challenge.nonce, vec![0x5a; 32], "the server's own nonce");
-            assert_eq!(challenge.formats, vec![1, 7]);
+            assert_eq!(
+                challenge.formats,
+                vec![u64::from(vot_capability::FORMAT_ID)]
+            );
             assert!(!client.is_ready() && !server.is_ready());
             assert!(
                 client
@@ -3852,13 +3858,51 @@ pub mod live {
                 "the data plane is shut until the exchange concludes"
             );
 
+            // A real capability from here on: minted by an issuer this deployment
+            // anchors, presented with a proof of possession over the challenge,
+            // and decided by the verifier rather than by the test.
+            let issuer_key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+            let holder_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+            let session_id = [0xc1; 16];
+            let capability = vot_capability::Capability {
+                issuer: "issuer.example".to_owned(),
+                audience: "receiver.example".to_owned(),
+                holder_key: holder_key.verifying_key().to_bytes(),
+                operations: vec![vot_codec::operation::PUBLISH],
+                scope: vot_capability::Scope {
+                    suite: 1,
+                    root: [7; 32],
+                    length: Some(1 << 20),
+                    ranges: vec![vot_capability::Range {
+                        offset: 0,
+                        length: 65_536,
+                    }],
+                },
+                limits: vec![vot_capability::Limit {
+                    id: u16::try_from(vot_codec::resource_limit::CONCURRENT_LANES).unwrap(),
+                    value: 4,
+                }],
+                not_before: 1_700_000_000,
+                expiry: 1_700_003_600,
+                token_id: [0xc7; 16],
+                delegation: vot_capability::NO_FURTHER_DELEGATION,
+            };
+            let signed = vot_capability::sign(&capability, b"issuer-1", &issuer_key).unwrap();
+            let proof = vot_capability::verify::prove_possession(
+                &capability,
+                &session_id,
+                &challenge.nonce,
+                &holder_key,
+            )
+            .unwrap();
+
             client
                 .present(vot_codec::frames::SessionOpen {
-                    session_id: [0xc1; 16],
-                    capability_format: 7,
-                    capability: b"an opaque capability".to_vec(),
-                    requested_scope: b"read:objects".to_vec(),
-                    binding_proof: Vec::new(),
+                    session_id,
+                    capability_format: u64::from(vot_capability::FORMAT_ID),
+                    capability: vot_capability::encode(&signed).unwrap(),
+                    requested_scope: vot_capability::encode_scope(&capability.scope).unwrap(),
+                    binding_proof: proof,
                 })
                 .unwrap();
 
@@ -3867,17 +3911,100 @@ pub mod live {
                 let _ = client.poll().unwrap();
                 std::thread::yield_now();
             }
-            let (_, open) = server
+            let (asked, open) = server
                 .pending_authorization()
                 .expect("the request never arrived");
-            assert_eq!(open.session_id, [0xc1; 16]);
-            assert_eq!(open.capability_format, 7);
-            assert_eq!(open.capability, b"an opaque capability");
+            assert_eq!(open.session_id, session_id);
+            assert_eq!(open.capability_format, u64::from(vot_capability::FORMAT_ID));
             assert!(!server.is_ready(), "a request is not a grant");
 
+            // The policy boundary a deployment owns: ADR-0023's anchor set, this
+            // deployment's audience and clock, and the verifier between them. The
+            // session hands the request out and takes an answer back; it reads
+            // none of this.
+            let anchors =
+                vot_capability::verify::Anchors::new().with(vot_capability::verify::IssuerEntry {
+                    key_id: b"issuer-1".to_vec(),
+                    issuer: "issuer.example".to_owned(),
+                    audiences: vec!["receiver.example".to_owned()],
+                    key: issuer_key.verifying_key(),
+                });
+            let enforceable = vot_capability::verify::enforceable_limits();
+            let presented = vot_capability::verify::Presentation {
+                nonce: &asked.nonce,
+                session_id: open.session_id,
+                proof: &open.binding_proof,
+            };
+            let authorized = vot_capability::verify::authorize(
+                &vot_capability::decode(&open.capability).unwrap(),
+                presented,
+                &anchors,
+                vot_capability::verify::Policy {
+                    audience: "receiver.example",
+                    now: 1_700_001_000,
+                    skew: 30,
+                    denied: &[],
+                    known_limits: &enforceable,
+                },
+            )
+            .expect("the verifier refused a capability it anchored");
+
+            // The same presentation with one bit of the signature turned over, so
+            // this test fails if the verifier ever answers yes to everything. The
+            // bytes are in hand, so it costs no carrier work.
+            let mut tampered = vot_capability::decode(&open.capability).unwrap();
+            tampered.signature[0] ^= 1;
+            let refused = vot_capability::verify::authorize(
+                &tampered,
+                presented,
+                &anchors,
+                vot_capability::verify::Policy {
+                    audience: "receiver.example",
+                    now: 1_700_001_000,
+                    skew: 30,
+                    denied: &[],
+                    known_limits: &enforceable,
+                },
+            )
+            .expect_err("a tampered signature is refused");
+            assert_eq!(refused, vot_capability::verify::Denial::Signature);
+            assert_eq!(
+                refused.wire_reason(),
+                vot_codec::error_code::AUTHENTICATION_FAILED,
+                "and what the peer would be told is the registered code"
+            );
+            assert_eq!(
+                authorized
+                    .limit(u16::try_from(vot_codec::resource_limit::CONCURRENT_LANES).unwrap()),
+                Some(4),
+                "and the ceiling reached the deployment that has to hold it"
+            );
+            assert_eq!(
+                authorized.allows(vot_capability::verify::Request {
+                    operation: vot_codec::operation::PUBLISH,
+                    suite: 1,
+                    root: [7; 32],
+                    range: Some(vot_capability::Range {
+                        offset: 0,
+                        length: 65_536,
+                    }),
+                }),
+                Ok(())
+            );
+
             // Narrower than what was asked for, which is what the client has no
-            // other way to learn.
-            server.grant(b"read".to_vec()).unwrap();
+            // other way to learn. The narrowing is the verifier's decision, so
+            // what goes back is a scope and not a string.
+            let granted = vot_capability::Scope {
+                ranges: vec![vot_capability::Range {
+                    offset: 0,
+                    length: 32_768,
+                }],
+                ..authorized.capability().scope.clone()
+            };
+            server
+                .grant(vot_capability::encode_scope(&granted).unwrap())
+                .unwrap();
             assert!(server.is_ready());
 
             while Instant::now() < deadline && !client.is_ready() {
@@ -3886,9 +4013,13 @@ pub mod live {
                 std::thread::yield_now();
             }
             assert!(client.is_ready(), "the client never read the acceptance");
+            let accepted = client
+                .granted()
+                .expect("the acceptance carries what was granted");
             assert_eq!(
-                client.granted().map(|accept| accept.granted_scope.clone()),
-                Some(b"read".to_vec())
+                vot_capability::decode_scope(&accepted.granted_scope),
+                Ok(granted),
+                "the client reads the narrowed scope the verifier decided"
             );
 
             let payload = framed(vot_codec::frame_type::DATA_RECORD, b"after authentication");

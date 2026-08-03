@@ -75,8 +75,10 @@ assertion `left == right` failed
 The required `vot-capability` mutation run reports 134 mutants, 122 caught, 12
 unviable, and 0 missed.
 
-What this still does not do is drive a session. `Session::pending_authorization`
-hands a request out and `grant` answers it, and a deployment wires this verifier
-between the two. The live exchange that presents a real capability end to end is
-the next change, and it needs no new protocol surface: the frames, the format, and
-the decision all exist now.
+Over a real carrier,
+`a_capability_is_presented_and_authorized_over_the_real_carrier` runs the whole
+arc: an issuer mints a capability, a client presents it with a proof of possession
+over the server's own challenge, this verifier decides, and the server grants a
+narrower scope than was asked for. The same presentation with one bit of the
+signature turned over is refused in the same test, so it fails if the verifier ever
+answers yes to everything.

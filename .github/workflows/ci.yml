@@ -294,14 +294,13 @@ jobs:
         run: cargo +1.88.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
 
   msquic-mutation:
-    # Advisory. The live module was excluded from mutation testing entirely, so
-    # nothing measured it and the note claiming what survived went stale without
-    # anyone noticing. This runs it. Promote to required once the survivors in
-    # test-vectors/mutants/the_live_transport_is_mutation_tested.md are killed
-    # or classified there.
+    # The live module was excluded from mutation testing entirely, so nothing
+    # measured it and the note claiming what survived went stale without anyone
+    # noticing. This runs it, and fails only when something survives that
+    # test-vectors/mutants/the_live_transport_is_mutation_tested.md does not
+    # already account for.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4.3.1
         with:
@@ -327,10 +326,36 @@ jobs:
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
+      # cargo-mutants exits non-zero whenever anything survives at all, and
+      # what survives here is a classified list. A check that is red for a known
+      # list teaches people to ignore red, so this compares against the list.
+      #
+      # The bound lives here rather than in a comment because CI reads it every
+      # run. That is the whole difference: a number nothing checks is what went
+      # stale and started this.
       - name: Test live mutants
-        run: >-
-          cargo +1.88.0 mutants --package vot-transport-msquic --features live
-          --config .cargo/mutants-live.toml --timeout 120 --jobs 2
+        env:
+          CLASSIFIED_SURVIVORS: 13
+        run: |
+          set -o pipefail
+          cargo +1.88.0 mutants --package vot-transport-msquic --features live \
+            --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
+            | tee mutants.log || true
+          missed=$(grep -c '^MISSED' mutants.log || true)
+          timeouts=$(grep -c '^TIMEOUT' mutants.log || true)
+          echo "missed=$missed timeouts=$timeouts classified=$CLASSIFIED_SURVIVORS"
+          if [ "$missed" -gt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::error::$missed live mutants survived, more than the $CLASSIFIED_SURVIVORS the evidence file accounts for"
+            grep '^MISSED' mutants.log
+            exit 1
+          fi
+          if [ "$missed" -lt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::notice::$missed survivors, fewer than the $CLASSIFIED_SURVIVORS recorded. Lower CLASSIFIED_SURVIVORS and the evidence file."
+          fi
+          # Timeouts are a test waiting out its own deadline rather than a hang,
+          # and whether one reproduces depends on how loaded the runner is, so
+          # they are reported and not enforced.
+          echo "timeouts: $timeouts"
 
   msquic-sanitizer:
     runs-on: ubuntu-24.04

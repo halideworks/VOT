@@ -14,6 +14,15 @@ Passing evidence: `.cargo/mutants-live.toml` is the same configuration without
 that exclusion, and the `msquic-mutation` job runs it with the feature on, so
 the measurement cannot silently rot again.
 
+The job fails when more survives than this file accounts for, and says so when
+less does. `cargo-mutants` exits non-zero whenever anything survives at all, and
+a check that is red for a known list teaches people to ignore red. The bound is
+in the job rather than in a comment, which is the whole difference: CI reads it
+every run, and a number nothing checks is what went stale and started this.
+
+The count that bound holds is 13, measured in CI at 265 mutants, 219 caught, 13
+missed, 31 unviable, and 2 timeouts. Every one of the 13 is below.
+
 The tests written against what the run found:
 `a_skipped_frame_counts_down_exactly_what_is_left_of_it` covers the discard
 remainder across read boundaries, including a read that ends exactly where the

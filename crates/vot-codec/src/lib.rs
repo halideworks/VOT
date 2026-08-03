@@ -40,6 +40,8 @@ pub mod error_code {
     pub const UNSUPPORTED_VERSION: u16 = 0x0104;
     pub const RESOURCE_LIMIT: u16 = 0x0502;
     pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
+    pub const AUTHENTICATION_FAILED: u16 = 0x0201;
+    pub const AUTHORIZATION_FAILED: u16 = 0x0202;
     pub const REPLAY_REJECTED: u16 = 0x0203;
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
 }

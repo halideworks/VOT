@@ -121,6 +121,7 @@ fn name(error: &Error) -> &'static str {
         Error::InvalidRange => "INVALID_RANGE",
         Error::InvalidValidity => "INVALID_VALIDITY",
         Error::UnsupportedDelegation(_) => "UNSUPPORTED_DELEGATION",
+        Error::InvalidLength => "INVALID_LENGTH",
         Error::Signature => "SIGNATURE",
         Error::TooLarge => "TOO_LARGE",
     }

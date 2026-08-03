@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod verify;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// The format identifier `spec/registries.md` section 11 gives this format.
@@ -91,6 +93,8 @@ pub enum Error {
     InvalidValidity,
     /// A delegation constraint other than [`NO_FURTHER_DELEGATION`].
     UnsupportedDelegation(u64),
+    /// A nonce or proof outside the size `spec/session.cddl` fixes for it.
+    InvalidLength,
     /// The signature does not verify under the key it names.
     Signature,
     /// A structure too large to encode within the bounds the format fixes.

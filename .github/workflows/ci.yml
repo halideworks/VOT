@@ -210,6 +210,34 @@ jobs:
       - name: Test native commit provider
         run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-resume --locked
 
+  quiche-live:
+    name: quiche live (loopback)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      # quiche builds BoringSSL, and the tests generate their own certificate.
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      # Both profiles, because a debug assertion and a release optimisation catch
+      # different things in a threaded driver, and the pump is one.
+      - name: Test the quiche pump over loopback
+        run: |
+          cargo +1.88.0 test -p vot-transport-quiche --features live --locked
+          cargo +1.88.0 test -p vot-transport-quiche --features live --release --locked
+
+      - name: Lint the pump
+        run: >-
+          cargo +1.88.0 clippy -p vot-transport-quiche --all-targets
+          --features live --locked -- -D warnings
+
   s3-live:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

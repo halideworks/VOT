@@ -16,7 +16,14 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # spec/capability.cddl, which validate_capability_vectors.py does on every run and
 # cargo-mutants does not; its vector writer produces the committed file that
 # comparison reads. Mutating either measures the wrong thing.
+#
+# The quiche pump is a file rather than an inline module, and the `live::`
+# expression above only matches what cargo-mutants prints with that prefix, which
+# a free function inside the module is not. The file is named instead. It is
+# measured where it compiles: the quiche-live job runs its tests, and a live
+# mutation run belongs beside the msquic one when its survivors are classified.
 exclude_globs = [
+  "crates/vot-transport-quiche/src/live.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

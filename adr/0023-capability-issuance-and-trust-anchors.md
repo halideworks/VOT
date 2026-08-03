@@ -47,13 +47,20 @@ certificate authority, no fetch, and no blessed issuer.
 Each entry is three things together:
 
 - a key identifier, which names the key rather than being the key;
-- an Ed25519 public key; and
+- a verification key, which is an Ed25519 public key wherever the capability
+  crosses a trust boundary, and may be a shared secret only where the issuer and
+  the verifier are the same party; and
 - the audiences that key may issue for.
 
 A capability is accepted only when its signature verifies under an entry's key,
 **and** its issuer claim matches that entry's identity, **and** its audience
 claim is one that entry permits. All three, because each alone admits something
 the deployment did not authorize.
+
+A key identifier is chosen by its issuer and is not globally unique, so it
+selects candidate entries rather than one, and the issuer claim decides between
+them. A verifier keyed on the identifier alone works until the second issuer
+arrives and then silently resolves to whichever entry it happened to keep.
 
 Audience is a checked bound and not a claim carried for the record. Without it, a
 capability issued for one deployment verifies at every other deployment that

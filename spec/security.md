@@ -108,7 +108,9 @@ policy and audit data.
 A verifier accepts a capability only against a configured issuer entry naming a
 key identifier, a verification key, and the audiences that key may issue for. All
 three MUST match: the signature verifies under that key, the issuer claim is that
-entry's identity, and the audience claim is one the entry permits. An issuer set
+entry's identity, and the audience claim is one the entry permits. A key
+identifier is issuer-chosen and not globally unique, so it selects candidate
+entries and the issuer claim MUST decide between them. An issuer set
 is deployment configuration. A verifier MUST NOT originate network work to obtain
 an issuer key while authenticating: an unauthenticated peer would otherwise
 decide when the verifier makes a request, which is the reflection lever section 7

@@ -538,9 +538,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-cbor"
+version = "0.0.1"
+
+[[package]]
 name = "vot-codec"
 version = "0.0.1"
 dependencies = [
+ "vot-cbor",
  "vot-manifest",
  "vot-receipt",
 ]
@@ -564,6 +569,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "unicode-normalization",
+ "vot-cbor",
 ]
 
 [[package]]
@@ -582,6 +588,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac",
  "sha2 0.11.0",
+ "vot-cbor",
 ]
 
 [[package]]

@@ -9,8 +9,9 @@
 #     cargo mutants --package vot-transport-msquic --features live \
 #         --config .cargo/mutants-live.toml --timeout 120
 #
-# Measured 2026-08-03 on that command: 265 mutants, 12 or fewer missed. What
-# survives, and why, is written up in
+# The count is deliberately not recorded here. A number beside an exclusion is
+# what went stale last time; the job runs the measurement instead. What survives
+# and why is written up in
 # `test-vectors/mutants/the_live_transport_is_mutation_tested.md`. The job is
 # advisory until those are killed or classified there; promote it then.
 gitignore = true

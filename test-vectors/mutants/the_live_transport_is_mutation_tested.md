@@ -7,7 +7,8 @@ of the run.
 `.cargo/mutants.toml` excluded `live::` outright, so nothing measured it. The
 note beside that exclusion recorded 277 mutants, 33 missed, and 9 timeouts.
 Re-running it produced 265, 28, and 2. The figure had gone stale without anyone
-noticing, which is what an exclusion with a number attached will do.
+noticing, which is what an exclusion with a number attached will do, and is why
+the run now happens in CI rather than being written down.
 
 Passing evidence: `.cargo/mutants-live.toml` is the same configuration without
 that exclusion, and the `msquic-mutation` job runs it with the feature on, so
@@ -78,5 +79,10 @@ Stream events: deleting `SendComplete` or `PeerSendShutdown` from
 it leaks, which again is the sanitizer's to catch rather than a functional
 test's.
 
-The two timeouts are the test harness rather than a hang: `local_port`
-returning `Ok(0)` makes a test dial port zero and wait out its own deadline.
+Timeouts are a live test waiting out its own deadline rather than a hang in the
+transport: `local_port` returning `Ok(0)` makes a test dial port zero, and the
+`callback_owned` guard turned off breaks the handshake the test is waiting on.
+Two more appeared with the tests added here, both from a `push` that always
+accepts; the mechanism for those is not confirmed, only that they exceed the
+deadline rather than fail. A mutant that hangs is worth less than one that
+fails, so these say less than the count suggests either way.

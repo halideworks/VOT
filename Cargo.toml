@@ -9,11 +9,11 @@ license = "AGPL-3.0-only"
 rust-version = "1.88"
 [workspace.dependencies]
 blake3 = "1.8.5"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
 unicode-normalization = "0.1.24"
 rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-base64 = "=0.22.1"
+base64 = "=0.23.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

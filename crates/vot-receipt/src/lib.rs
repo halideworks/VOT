@@ -3,7 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 const DOMAIN: &[u8] = b"VOT receipt v0\0";

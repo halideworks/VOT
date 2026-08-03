@@ -122,7 +122,11 @@ pub enum ErrorKind {
     SessionAnswerInvalid { frame_type: u64 },
     /// An answer named an attempt this endpoint did not make, so nothing here
     /// can tell which request it belongs to.
-    SessionIdentifierMismatch { answered: [u8; 16], sent: [u8; 16] },
+    ///
+    /// Neither identifier is carried. `spec/telemetry.md` section 3 puts a raw
+    /// session identifier on the list that must not appear at any level, and an
+    /// error kind with a `Debug` derive is one log line away from being one.
+    SessionIdentifierMismatch,
     /// The caller answered a request with something that cannot be encoded: a
     /// scope too wide for the frame, or a reason the registry does not assign
     /// to authentication or authorization.
@@ -724,7 +728,7 @@ impl Negotiation {
             return Ok(());
         }
         Err(Error::new(
-            ErrorKind::SessionIdentifierMismatch { answered, sent },
+            ErrorKind::SessionIdentifierMismatch,
             error_code::AUTHENTICATION_FAILED,
         ))
     }
@@ -2373,7 +2377,7 @@ mod tests {
     }
 
     /// One of the server's answers, as a frame.
-    fn answer(frame: &vot_codec::frames::TypedFrame) -> Vec<u8> {
+    fn answer_frame(frame: &vot_codec::frames::TypedFrame) -> Vec<u8> {
         let mut encoded = Vec::new();
         vot_codec::frames::encode(frame, &mut encoded).unwrap();
         encoded
@@ -2751,13 +2755,13 @@ mod tests {
         );
         client
             .negotiation
-            .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionReject(
-                SessionReject {
+            .accept_control(&answer_frame(
+                &vot_codec::frames::TypedFrame::SessionReject(SessionReject {
                     session_id: [7; 16],
                     reason: u64::from(error_code::AUTHENTICATION_FAILED),
                     detail: String::new(),
-                },
-            )))
+                }),
+            ))
             .unwrap();
         assert_eq!(
             client.present(request([7; 16], 1)).unwrap_err().kind(),
@@ -2848,20 +2852,14 @@ mod tests {
         client.present(request([7; 16], 1)).unwrap();
         let mut mismatched = client.negotiation.clone();
         let error = mismatched
-            .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionAccept(
-                SessionAccept {
+            .accept_control(&answer_frame(
+                &vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
                     session_id: [8; 16],
                     granted_scope: Vec::new(),
-                },
-            )))
+                }),
+            ))
             .unwrap_err();
-        assert_eq!(
-            error.kind(),
-            &ErrorKind::SessionIdentifierMismatch {
-                answered: [8; 16],
-                sent: [7; 16]
-            }
-        );
+        assert_eq!(error.kind(), &ErrorKind::SessionIdentifierMismatch);
         assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
         assert!(error.kind().is_peer_fault());
         assert!(!mismatched.is_ready(), "and the data plane stays shut");
@@ -2871,13 +2869,13 @@ mod tests {
         let mut rejected = client.negotiation.clone();
         assert!(
             rejected
-                .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionReject(
-                    SessionReject {
+                .accept_control(&answer_frame(
+                    &vot_codec::frames::TypedFrame::SessionReject(SessionReject {
                         session_id: [8; 16],
                         reason: u64::from(error_code::AUTHENTICATION_FAILED),
                         detail: String::new(),
-                    },
-                )))
+                    },)
+                ))
                 .is_err()
         );
         assert!(
@@ -2894,12 +2892,12 @@ mod tests {
         let mut unasked = demanding_server();
         assert_eq!(
             unasked
-                .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionAccept(
-                    SessionAccept {
+                .accept_control(&answer_frame(
+                    &vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
                         session_id: [7; 16],
                         granted_scope: Vec::new(),
-                    },
-                )))
+                    },)
+                ))
                 .unwrap_err()
                 .kind(),
             &ErrorKind::OutOfSequence {
@@ -2925,7 +2923,7 @@ mod tests {
                 detail: String::new(),
             }),
         ] {
-            let error = holding.accept_control(&answer(&reply)).unwrap_err();
+            let error = holding.accept_control(&answer_frame(&reply)).unwrap_err();
             assert_eq!(
                 error.kind(),
                 &ErrorKind::OutOfSequence {
@@ -3099,6 +3097,18 @@ mod tests {
         );
         assert!(!error.kind().is_peer_fault(), "the caller's own doing");
         assert_eq!(server.state(), State::Connecting, "and nothing began");
+
+        // Nor can a server present one, whatever state it is in. It holds
+        // requests in the same field a client holds its own attempt in, and the
+        // role is what tells the two apart.
+        let mut accepting = demanding_server();
+        assert_eq!(accepting.pending_presentation(), None);
+        assert_eq!(
+            accepting.present(request([7; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
+                state: State::Negotiated
+            })
+        );
 
         let mut client = Session::client(
             Loopback::default(),

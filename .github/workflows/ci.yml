@@ -219,8 +219,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # With clippy, because the lint step below is the only one that sees this
+      # crate under the feature that compiles the pump.
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       # quiche builds BoringSSL, and the tests generate their own certificate.
       - name: Install native build tools

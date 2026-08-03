@@ -433,6 +433,7 @@ jobs:
           - { package: vot-receipt, required: true }
           - { package: vot-platform-fs, required: true }
           - { package: vot-transport-api, required: true }
+          - { package: vot-transport-framing, required: true }
           - { package: vot-transport-queue, required: true }
           - { package: vot-transport-sim, required: true }
           - { package: vot-transport-msquic, required: true }

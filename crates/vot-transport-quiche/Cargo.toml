@@ -1,0 +1,23 @@
+[package]
+name = "vot-transport-quiche"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+# The pump: a UDP socket, a quiche connection, and the timer that drives loss
+# recovery. Off by default because quiche builds BoringSSL through cmake, which
+# costs minutes where the rest of this workspace costs seconds.
+live = []
+
+[dependencies]
+vot-codec = { path = "../vot-codec" }
+vot-transport-api = { path = "../vot-transport-api" }
+vot-transport-framing = { path = "../vot-transport-framing" }
+vot-transport-queue = { path = "../vot-transport-queue" }
+
+[lints]
+workspace = true

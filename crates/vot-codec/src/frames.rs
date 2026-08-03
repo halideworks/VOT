@@ -24,15 +24,25 @@ const MAX_SCOPE_BYTES: usize = 4_096;
 const MAX_REJECT_DETAIL_BYTES: usize = 1_024;
 const MAX_CAPABILITY_FORMAT: u64 = 65_535;
 
+/// The CBOR around a `SESSION_OPEN`: the map head, six keys, the session
+/// identifier, the format, and three byte-string heads.
+///
+/// 39 bytes at the maximum sizes, rounded up, so a head that widens does not
+/// take the bound below with it.
+const SESSION_OPEN_FRAMING: usize = 64;
+
 /// What is left of a `SESSION_OPEN` after the two scopes and the framing.
 ///
-/// The registry gives the frame 64 KiB. A capability sized without regard to
-/// what travels beside it would be encodable alone and refused in a real
-/// request, which is the bound admitting something the wire never can.
+/// A capability sized without regard to what travels beside it would encode
+/// alone and be refused in a real request, which is a bound admitting
+/// something the wire never can.
 const MAX_CAPABILITY_BYTES: usize = 49_152;
 const _: () = assert!(
-    MAX_CAPABILITY_BYTES + 2 * MAX_SCOPE_BYTES + 1_024 <= 64 * 1024,
-    "a maximal SESSION_OPEN must fit the frame its registry entry allows"
+    match crate::registered_payload_limit(frame_type::SESSION_OPEN) {
+        Some(limit) => MAX_CAPABILITY_BYTES + 2 * MAX_SCOPE_BYTES + SESSION_OPEN_FRAMING <= limit,
+        None => false,
+    },
+    "a maximal SESSION_OPEN must fit the payload its registry entry allows"
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]

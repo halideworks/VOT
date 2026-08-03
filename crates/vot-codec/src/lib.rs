@@ -551,8 +551,13 @@ pub const fn is_grease(frame_type: u64) -> bool {
 /// reach one. `ERROR` is phase-dependent there and is never refused here,
 /// since a peer has to be able to report a fault before it authenticates.
 ///
-/// An unregistered type answers true, so a frame added to the registry without
-/// a decision here is refused rather than let through.
+/// This answers for a known frame type. A gate consults it after the section 3
+/// step 6 skip, so an unknown optional or grease type is discarded by its
+/// length rather than refused: section 2 asks a peer to grease live handshakes,
+/// which happen before authentication concludes.
+///
+/// An unregistered type answers true, so a critical frame added to the registry
+/// without a decision here is refused rather than let through.
 #[must_use]
 pub const fn requires_authentication(frame_type: u64) -> bool {
     use crate::frame_type as ty;
@@ -1583,8 +1588,11 @@ mod tests {
         ] {
             assert!(requires_authentication(frame_type), "{frame_type:#x}");
         }
-        // A type nobody decided on is refused rather than let through.
-        assert!(requires_authentication(0x1f00));
+        // A critical type nobody decided on is refused rather than let
+        // through. A grease or unknown optional type never reaches here: a
+        // gate consults this after the section 3 step 6 skip, since section 2
+        // asks a peer to grease handshakes, which precede authentication.
+        assert!(requires_authentication(0x1f01));
         assert!(requires_authentication(u64::MAX));
     }
 

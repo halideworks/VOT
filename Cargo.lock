@@ -1975,6 +1975,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-cbor"
+version = "0.0.1"
+
+[[package]]
 name = "vot-cli"
 version = "0.0.1"
 dependencies = [
@@ -1994,6 +1998,7 @@ dependencies = [
 name = "vot-codec"
 version = "0.0.1"
 dependencies = [
+ "vot-cbor",
  "vot-manifest",
  "vot-receipt",
 ]
@@ -2059,6 +2064,7 @@ dependencies = [
  "blake3",
  "cap",
  "unicode-normalization",
+ "vot-cbor",
 ]
 
 [[package]]
@@ -2109,6 +2115,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac 0.13.0",
  "sha2 0.11.0",
+ "vot-cbor",
 ]
 
 [[package]]

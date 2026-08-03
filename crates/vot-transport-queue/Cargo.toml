@@ -1,5 +1,5 @@
 [package]
-name = "vot-transport-tcp"
+name = "vot-transport-queue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-rustls.workspace = true
 vot-transport-api = { path = "../vot-transport-api" }
-vot-transport-queue = { path = "../vot-transport-queue" }
-vot-codec = { path = "../vot-codec" }
 
+[dev-dependencies]
+vot-codec = { path = "../vot-codec" }
 
 [lints]
 workspace = true

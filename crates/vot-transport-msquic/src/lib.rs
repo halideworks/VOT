@@ -2,8 +2,6 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::VecDeque;
-
 /// First lane reported for a peer-initiated stream.
 ///
 /// Each gets its own, so interleaving between two peer streams is not mistaken
@@ -72,14 +70,9 @@ use vot_transport_api::{
     ConnectionId, DatagramSendState, Error, Event, PathStats, Payload, ReceiveLimits, StreamId,
     TransportAck, TransportAdapter, shared_payload,
 };
+use vot_transport_queue::Queue;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Command {
-    Control(Payload),
-    Reliable { stream: StreamId, bytes: Payload },
-    Datagram { context: u64, bytes: Payload },
-    ReceiveCredit(u64),
-}
+pub use vot_transport_queue::Command;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeEvent {
@@ -110,52 +103,24 @@ pub enum NativeDatagramSendState {
     Canceled,
 }
 
-const DEFAULT_COMMAND_COUNT_LIMIT: usize = 64;
-const DEFAULT_COMMAND_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_COMMAND_BYTE_LIMIT: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
 
-/// Owns a bounded outbound command queue and translates `MsQuic` callbacks.
+/// Holds the bounded queue every adapter has and translates `MsQuic` callbacks
+/// into it.
+///
+/// What is here rather than in `vot-transport-queue` is what this backend has of
+/// its own: a stream per lane, so there are reserved identifiers to refuse, and
+/// a path sample a driver reads off a live connection.
+#[derive(Clone, Debug, Default)]
 pub struct MsQuicAdapter {
-    commands: VecDeque<Command>,
-    command_bytes: usize,
-    command_count_limit: usize,
-    command_byte_limit: usize,
-    control_payload_limit: usize,
-    /// What this endpoint accepts, which is what it advertised. Separate from
-    /// the send bound, which is the peer's.
-    control_receive_limit: usize,
-    /// What this endpoint advertised, once it has been configured.
-    receive_limits: Option<ReceiveLimits>,
-    events: VecDeque<Event>,
-    event_bytes: usize,
-    event_count_limit: usize,
-    event_byte_limit: usize,
+    queue: Queue,
     path: Option<(ConnectionId, PathStats)>,
-}
-
-impl Default for MsQuicAdapter {
-    fn default() -> Self {
-        Self {
-            commands: VecDeque::new(),
-            command_bytes: 0,
-            command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
-            command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
-            control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
-            control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
-            receive_limits: None,
-            events: VecDeque::new(),
-            event_bytes: 0,
-            event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
-            event_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
-            path: None,
-        }
-    }
 }
 
 impl MsQuicAdapter {
     /// Applies what this endpoint advertised.
     pub const fn set_receive_limits(&mut self, limits: ReceiveLimits) {
-        self.control_receive_limit = limits.control_payload();
-        self.receive_limits = Some(limits);
+        self.queue.set_receive_limits(limits);
     }
 
     /// Creates an adapter with explicit inbound and outbound queue limits.
@@ -163,15 +128,9 @@ impl MsQuicAdapter {
     /// # Errors
     /// Rejects a zero command-count or byte limit.
     pub fn with_queue_limits(command_count: usize, command_bytes: usize) -> Result<Self, Error> {
-        if command_count == 0 || command_bytes == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
         Ok(Self {
-            command_count_limit: command_count,
-            command_byte_limit: command_bytes,
-            event_count_limit: command_count,
-            event_byte_limit: command_bytes,
-            ..Self::default()
+            queue: Queue::with_limits(command_count, command_bytes)?,
+            path: None,
         })
     }
 
@@ -180,9 +139,8 @@ impl MsQuicAdapter {
     /// # Errors
     /// Rejects oversized records, arithmetic overflow, or a full inbound queue.
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
-        let next_bytes = self.admit(&event)?;
-        self.accept(event, next_bytes);
-        Ok(())
+        self.try_record_native_event(event)
+            .map_err(|(_, error)| error)
     }
 
     /// Queues a native callback, handing the event back when the inbound queue
@@ -199,79 +157,22 @@ impl MsQuicAdapter {
         &mut self,
         event: NativeEvent,
     ) -> Result<(), (NativeEvent, Error)> {
-        match self.admit(&event) {
-            Ok(next_bytes) => {
-                self.accept(event, next_bytes);
+        // A disconnect drops the path sample, but only once the event is taken:
+        // a refused event leaves the connection as it was, and a driver that
+        // retries it must not find the sample already gone.
+        let disconnected = match &event {
+            NativeEvent::Disconnected(id) => Some(ConnectionId(*id)),
+            _ => None,
+        };
+        match self.queue.try_admit_event(translate(event.clone())) {
+            Ok(()) => {
+                if let Some(id) = disconnected {
+                    self.invalidate_path_stats(id);
+                }
                 Ok(())
             }
-            Err(error) => Err((event, error)),
+            Err((_, error)) => Err((event, error)),
         }
-    }
-
-    /// Checks an event against the protocol and memory bounds, returning the
-    /// queue size it would produce.
-    fn admit(&self, event: &NativeEvent) -> Result<usize, Error> {
-        let payload_len = match event {
-            NativeEvent::Control(bytes) => {
-                // The receive bound: the peer's limit governs what goes out,
-                // not what may arrive.
-                vot_transport_api::validate_control_frame(bytes, self.control_receive_limit)?;
-                bytes.len()
-            }
-            NativeEvent::Reliable { bytes, .. } => {
-                vot_transport_api::validate_data_record(bytes)?;
-                bytes.len()
-            }
-            NativeEvent::Connected(_)
-            | NativeEvent::Disconnected(_)
-            | NativeEvent::Acknowledged { .. }
-            | NativeEvent::DatagramState { .. } => 0,
-        };
-        let next_bytes = self
-            .event_bytes
-            .checked_add(payload_len)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
-            return Err(Error::InboundQueueFull);
-        }
-        Ok(next_bytes)
-    }
-
-    /// Translates an admitted event and takes its space.
-    fn accept(&mut self, event: NativeEvent, next_bytes: usize) {
-        if let NativeEvent::Disconnected(id) = &event {
-            self.invalidate_path_stats(ConnectionId(*id));
-        }
-        self.events.push_back(match event {
-            NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
-            NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
-            NativeEvent::Control(bytes) => Event::Control(bytes.into()),
-            NativeEvent::Reliable {
-                stream,
-                sequence,
-                bytes,
-            } => Event::Reliable {
-                stream: StreamId(stream),
-                sequence,
-                bytes: bytes.into(),
-            },
-            NativeEvent::Acknowledged { stream, sequence } => {
-                Event::Acknowledged(TransportAck::new(stream, sequence))
-            }
-            NativeEvent::DatagramState { context, state } => Event::DatagramState {
-                context,
-                state: match state {
-                    NativeDatagramSendState::Sent => DatagramSendState::Sent,
-                    NativeDatagramSendState::LostSuspect => DatagramSendState::SuspectedLost,
-                    NativeDatagramSendState::Acknowledged
-                    | NativeDatagramSendState::AcknowledgedSpurious => {
-                        DatagramSendState::Acknowledged
-                    }
-                    NativeDatagramSendState::Canceled => DatagramSendState::Canceled,
-                },
-            },
-        });
-        self.event_bytes = next_bytes;
     }
 
     /// Records a path sample a backend driver read from a live connection.
@@ -300,13 +201,11 @@ impl MsQuicAdapter {
     /// A driver watches this to know whether a failed flush left work behind.
     #[must_use]
     pub fn pending_commands(&self) -> usize {
-        self.commands.len()
+        self.queue.pending_commands()
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
-        let command = self.commands.pop_front()?;
-        self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
-        Some(command)
+        self.queue.next_command()
     }
 
     /// Gives a backend driver one queued command at a time.
@@ -316,42 +215,42 @@ impl MsQuicAdapter {
     ///
     /// # Errors
     /// Returns the first backend error reported by `submit`.
-    pub fn drain_commands<F, E>(&mut self, mut submit: F) -> Result<(), E>
+    pub fn drain_commands<F, E>(&mut self, submit: F) -> Result<(), E>
     where
         F: FnMut(Command) -> Result<(), E>,
     {
-        while let Some(command) = self.commands.front().cloned() {
-            submit(command)?;
-            let Some(command) = self.commands.pop_front() else {
-                break;
-            };
-            self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
-        }
-        Ok(())
-    }
-
-    fn enqueue(&mut self, command: Command) -> Result<(), Error> {
-        let next_bytes = self
-            .command_bytes
-            .checked_add(command.payload_len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.commands.len() >= self.command_count_limit || next_bytes > self.command_byte_limit {
-            return Err(Error::OutboundQueueFull);
-        }
-        self.commands.push_back(command);
-        self.command_bytes = next_bytes;
-        Ok(())
+        self.queue.drain_commands(submit)
     }
 }
 
-impl Command {
-    fn payload_len(&self) -> usize {
-        match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
-                bytes.len()
-            }
-            Self::ReceiveCredit(_) => 0,
+/// Reads one `MsQuic` callback as the event the queue carries.
+fn translate(event: NativeEvent) -> Event {
+    match event {
+        NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
+        NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
+        NativeEvent::Control(bytes) => Event::Control(bytes.into()),
+        NativeEvent::Reliable {
+            stream,
+            sequence,
+            bytes,
+        } => Event::Reliable {
+            stream: StreamId(stream),
+            sequence,
+            bytes: bytes.into(),
+        },
+        NativeEvent::Acknowledged { stream, sequence } => {
+            Event::Acknowledged(TransportAck::new(stream, sequence))
         }
+        NativeEvent::DatagramState { context, state } => Event::DatagramState {
+            context,
+            state: match state {
+                NativeDatagramSendState::Sent => DatagramSendState::Sent,
+                NativeDatagramSendState::LostSuspect => DatagramSendState::SuspectedLost,
+                NativeDatagramSendState::Acknowledged
+                | NativeDatagramSendState::AcknowledgedSpurious => DatagramSendState::Acknowledged,
+                NativeDatagramSendState::Canceled => DatagramSendState::Canceled,
+            },
+        },
     }
 }
 
@@ -361,11 +260,12 @@ impl TransportAdapter for MsQuicAdapter {
     }
 
     fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
-        vot_transport_api::validate_control_frame(&frame, self.control_payload_limit)?;
-        self.enqueue(Command::Control(frame))
+        self.queue.send_control(frame)
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+        // Checked before the payload is shared, so an oversized record costs no
+        // allocation.
         vot_transport_api::validate_data_record(record)?;
         self.send_reliable_shared(stream, shared_payload(record))
     }
@@ -374,24 +274,7 @@ impl TransportAdapter for MsQuicAdapter {
         if is_reserved_lane(stream.0) {
             return Err(Error::InvalidConfiguration);
         }
-        let next_bytes = records
-            .iter()
-            .try_fold(self.command_bytes, |bytes, record| {
-                vot_transport_api::validate_data_record(record)?;
-                bytes
-                    .checked_add(record.len())
-                    .ok_or(Error::ArithmeticOverflow)
-            })?;
-        let next_count = self
-            .commands
-            .len()
-            .checked_add(records.len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if next_count > self.command_count_limit || next_bytes > self.command_byte_limit {
-            Err(Error::OutboundQueueFull)
-        } else {
-            Ok(())
-        }
+        self.queue.preflight_reliable_batch(records)
     }
 
     fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
@@ -401,61 +284,32 @@ impl TransportAdapter for MsQuicAdapter {
         if is_reserved_lane(stream.0) {
             return Err(Error::InvalidConfiguration);
         }
-        vot_transport_api::validate_data_record(&record)?;
-        self.enqueue(Command::Reliable {
-            stream,
-            bytes: record,
-        })
+        self.queue.send_reliable(stream, record)
     }
 
     fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
-        if payload.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
-            return Err(Error::RecordTooLarge);
-        }
-        self.enqueue(Command::Datagram {
-            context,
-            bytes: shared_payload(payload),
-        })
+        self.queue.send_datagram(context, payload)
     }
 
     fn poll(&mut self) -> Option<Event> {
-        let event = self.events.pop_front()?;
-        self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
-        Some(event)
+        self.queue.poll()
     }
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
-        self.enqueue(Command::ReceiveCredit(bytes))
+        self.queue.set_receive_credit(bytes)
     }
 
     /// Applies the peer-negotiated control-frame payload ceiling.
     fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        // Clamped to what the outbound queue can hold. A peer allowing more
-        // than this endpoint can enqueue does not oblige it to send that much,
-        // and a bound above the queue would refuse the frame at submission for
-        // ever, which a caller reads as backpressure that never clears.
-        self.control_payload_limit =
-            vot_transport_api::effective_send_limit(limit, self.command_byte_limit);
-        Ok(())
+        self.queue.set_control_send_limit(limit)
     }
 
     fn receive_limits(&self) -> Option<ReceiveLimits> {
-        self.receive_limits
+        self.queue.receive_limits()
     }
 
     fn path_stats(&self) -> Option<PathStats> {
         self.path.map(|(_, stats)| stats)
-    }
-}
-
-fn event_payload_len(event: &Event) -> usize {
-    match event {
-        Event::Control(bytes) | Event::Reliable { bytes, .. } => bytes.len(),
-        Event::Connected(_)
-        | Event::Disconnected(_)
-        | Event::Acknowledged(_)
-        | Event::DatagramState { .. } => 0,
     }
 }
 
@@ -5111,7 +4965,7 @@ mod tests {
         assert_eq!(MAX_CALLBACK_BYTES, 16 * MAX_PARTIAL_CONTROL_FRAME);
         assert_eq!(MAX_CALLBACK_BYTES / MAX_PARTIAL_CONTROL_FRAME, 16);
         assert_eq!(
-            MsQuicAdapter::default().control_payload_limit,
+            MsQuicAdapter::default().queue.control_send_limit(),
             vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
         );
     }
@@ -5390,7 +5244,7 @@ mod tests {
 
     #[test]
     fn outbound_queue_applies_count_and_byte_backpressure() {
-        assert_eq!(DEFAULT_COMMAND_COUNT_LIMIT, 64);
+        assert_eq!(vot_transport_queue::DEFAULT_COUNT_LIMIT, 64);
         assert_eq!(DEFAULT_COMMAND_BYTE_LIMIT, 4_194_304);
         assert_eq!(
             MsQuicAdapter::with_queue_limits(0, 1).err(),

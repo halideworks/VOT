@@ -123,7 +123,10 @@ cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 `vot-cbor` is the deterministic CBOR every VOT structure encodes in, and it is
 where the head rules and the shortest-form checks live. Three crates had grown
 their own copy of them; a change to canonical encoding now has one place to be
-made and one mutation run to answer for.
+made and one mutation run to answer for. `vot-transport-queue` is the same
+arrangement for the bounded queue under every backend adapter: what a submission
+costs, what refuses it, and what stays at the head of the queue when a driver
+cannot take it.
 
 `.github/workflows/ci.yml` holds the package matrix. Every package in it is
 required, and no mutant survives any of them: a survivor fails the run rather

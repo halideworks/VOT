@@ -555,10 +555,9 @@ fn drive(
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream);
         }
-        let paced = match send_all(socket, &mut conn, &mut out) {
-            Ok(paced) => paced,
-            // A socket that will not take a packet is a carrier that has gone.
-            Err(_) => return Ok(()),
+        // A socket that will not take a packet is a carrier that has gone.
+        let Ok(paced) = send_all(socket, &mut conn, &mut out) else {
+            return Ok(());
         };
 
         if conn.is_established() && !announced {
@@ -1294,14 +1293,16 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert_eq!(received, target, "every record arrived in {elapsed:?}");
-        let per_second = (carried as f64 / elapsed.as_secs_f64()) as u64;
+        // Integer arithmetic, so the report needs no cast a lint has to forgive.
+        // Nanoseconds keep the ratio exact at any rate this carries.
+        let nanos = elapsed.as_nanos().max(1);
+        let per_second = u64::try_from(u128::from(carried) * 1_000_000_000 / nanos).unwrap_or(0);
+        // Megabits, because a gigabit rounded to an integer says almost nothing
+        // at this scale and a float needs a cast a lint has to forgive.
+        let megabits_per_second = per_second / 125_000;
         println!(
-            "one lane, one worker: {} records, {} bytes in {:?} = {} bytes/s ({:.2} Gbit/s)",
-            received,
-            carried,
-            elapsed,
-            per_second,
-            per_second as f64 * 8.0 / 1_000_000_000.0
+            "one lane, one worker: {received} records, {carried} bytes in {elapsed:?} \
+             = {per_second} bytes/s = {megabits_per_second} Mbit/s"
         );
     }
 

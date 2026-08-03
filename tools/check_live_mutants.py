@@ -72,6 +72,11 @@ def survivors(log: Path) -> list[str]:
         _, _, rest = line.partition(": ")
         if not rest:
             fail(f"could not read the mutant out of: {line}")
+        # The timing is what the description ends at. A line without it means the
+        # tool prints something else now, and every mutant would then fail to
+        # match the table for a reason that has nothing to do with the code.
+        if not TIMING.search(rest):
+            fail(f"no build and test timing in: {line}")
         found.append(TIMING.sub("", rest).strip())
     return found
 

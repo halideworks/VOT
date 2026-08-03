@@ -48,7 +48,7 @@ one byte past the holding limit, or refuse one exactly at it; refuse a callback
 event that lands exactly on the byte budget; answer `receive_limits`,
 `send_reliable_shared`, `preflight_reliable_batch`, or
 `set_control_payload_limit` without reaching the carrier; give every accepted
-connection the same identifier.
+connection the same identifier; drop the accepted side's `Connected` event.
 
 Observed failure:
 
@@ -61,6 +61,7 @@ assertion `left == right` failed
  right: 1048593
 refused at 16 of 16, inside its own bound
 two connections, two identities
+an accepted connection reports ConnectionId(1)
 ```
 
 ## What still survives, and why

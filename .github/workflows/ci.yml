@@ -334,13 +334,6 @@ jobs:
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
-      # cargo-mutants exits non-zero whenever anything survives at all, and
-      # what survives here is a classified list. A check that is red for a known
-      # list teaches people to ignore red, so this compares against the list.
-      #
-      # The bound lives here rather than in a comment because CI reads it every
-      # run. That is the whole difference: a number nothing checks is what went
-      # stale and started this.
       - name: Test live mutants
         env:
           EVENT_NAME: ${{ github.event_name }}

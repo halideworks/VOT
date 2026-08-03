@@ -293,6 +293,45 @@ jobs:
       - name: Lint isolated FFI crate
         run: cargo +1.88.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
 
+  msquic-mutation:
+    # Advisory. The live module was excluded from mutation testing entirely, so
+    # nothing measured it and the note claiming what survived went stale without
+    # anyone noticing. This runs it. Promote to required once the survivors in
+    # test-vectors/mutants/the_live_transport_is_mutation_tested.md are killed
+    # or classified there.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-mutants-26.0.0
+
+      - name: Install pinned cargo-mutants
+        run: >-
+          cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+          || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
+
+      - name: Test live mutants
+        run: >-
+          cargo +1.88.0 mutants --package vot-transport-msquic --features live
+          --config .cargo/mutants-live.toml --timeout 120 --jobs 2
+
   msquic-sanitizer:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

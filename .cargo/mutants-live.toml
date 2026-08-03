@@ -1,0 +1,19 @@
+# Mutation configuration for the assembled MsQuic transport.
+#
+# The same settings as `.cargo/mutants.toml` without its `live::` exclusion,
+# because this one is run with `--features live` and that module is the point.
+# Kept as a second file because a configuration cannot exclude conditionally.
+#
+# Run it as the msquic-mutation job does:
+#
+#     cargo mutants --package vot-transport-msquic --features live \
+#         --config .cargo/mutants-live.toml --timeout 120
+#
+# Measured 2026-08-03 on that command: 265 mutants, 12 or fewer missed. What
+# survives, and why, is written up in
+# `test-vectors/mutants/the_live_transport_is_mutation_tested.md`. The job is
+# advisory until those are killed or classified there; promote it then.
+gitignore = true
+minimum_test_timeout = 60.0
+timeout_multiplier = 4.0
+exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]

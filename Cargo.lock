@@ -2172,7 +2172,9 @@ dependencies = [
 name = "vot-transport-msquic"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
  "msquic",
+ "vot-capability",
  "vot-codec",
  "vot-proof-blake3",
  "vot-scheduler",

@@ -16,6 +16,8 @@ vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
+vot-capability = { path = "../vot-capability" }
 vot-session = { path = "../vot-session" }
 vot-scheduler = { path = "../vot-scheduler" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }

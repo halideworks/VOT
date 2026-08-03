@@ -2202,6 +2202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-transport-quiche"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+ "vot-transport-api",
+ "vot-transport-framing",
+ "vot-transport-queue",
+]
+
+[[package]]
 name = "vot-transport-sim"
 version = "0.0.1"
 dependencies = [

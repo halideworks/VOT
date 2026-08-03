@@ -435,6 +435,7 @@ jobs:
           - { package: vot-transport-api, required: true }
           - { package: vot-transport-framing, required: true }
           - { package: vot-transport-queue, required: true }
+          - { package: vot-transport-quiche, required: true }
           - { package: vot-transport-sim, required: true }
           - { package: vot-transport-msquic, required: true }
           - { package: vot-session, required: true }

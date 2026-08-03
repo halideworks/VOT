@@ -3432,7 +3432,7 @@ pub mod live {
                 transport,
                 vot_codec::Settings::default(),
                 BTreeSet::from([1]),
-                vot_session::Authentication::Unimplemented,
+                vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -3464,7 +3464,7 @@ pub mod live {
                 accepted,
                 peer_settings,
                 BTreeSet::new(),
-                vot_session::Authentication::Unimplemented,
+                vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             server.begin().unwrap();
 
@@ -3588,7 +3588,7 @@ pub mod live {
                     ..vot_codec::Settings::default()
                 },
                 BTreeSet::new(),
-                vot_session::Authentication::Unimplemented,
+                vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             (listener, peer, server, deadline)
         }
@@ -3908,7 +3908,7 @@ pub mod live {
                 transport,
                 vot_codec::Settings::default(),
                 BTreeSet::new(),
-                vot_session::Authentication::Unimplemented,
+                vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut connected = false;
@@ -3935,7 +3935,7 @@ pub mod live {
                     ..vot_codec::Settings::default()
                 },
                 BTreeSet::new(),
-                vot_session::Authentication::Unimplemented,
+                vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             let mut receiver = vot_scheduler::session::SessionReceiver::new(
                 server,

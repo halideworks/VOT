@@ -22,27 +22,49 @@ initiator is `MALFORMED_FRAME`; on a client-initiated stream that leaves one
 sender. A server never advertises `EndpointRole::Server`.
 
 The states are `Connecting`, `ControlReserved`, `HelloSent`,
-`SettingsExchanged`, `Ready`, `Closed`. They are named from the client's side.
-On a server, `HelloSent` means the peer's `HELLO` arrived.
+`SettingsExchanged`, `Negotiated`, `Authenticated`, `Closed`. They are named
+from the client's side. On a server, `HelloSent` means the peer's `HELLO`
+arrived.
 
-## What `Ready` does not mean
+## Two gates, not one
 
-`Ready` means version and limits are agreed. It does not mean authenticated.
+`Negotiated` means version and limits are agreed. `Authenticated` means the
+`spec/wire.md` section 1.1 exchange concluded. They are separate because the
+specification gates two different sets: section 1 refuses every application
+frame until negotiation finishes, and section 1.1 refuses the subset the
+registry marks `auth: yes` until authentication finishes. A `PING` between the
+two states is fine; a `DATA_RECORD` is not.
 
-`spec/wire.md` also defines `AUTH_CONTEXT`, `SESSION_OPEN`, and
-`SESSION_ACCEPT`, and section 1 makes a frame the registry marks `auth: yes`
-invalid until the authentication policy succeeds and `SESSION_ACCEPT` is sent.
-None of those are implemented, so no session can reach that state.
+`requires_authentication` in `vot-codec` is that subset, and
+`tools/validate_registries.py` holds it against the `Auth` column of the section
+5 table, so the gate and the column that defines it cannot drift. It answers for
+a known frame type: an unknown optional or grease frame is discarded by its
+length first, since section 2 asks a peer to grease live handshakes and those
+happen before authentication concludes.
 
-Refusing every `auth: yes` frame would leave no data plane at all, since
-`DATA_RECORD` is one of them. So a session is constructed with an explicit
-`Authentication` instead, whose only variant is `Unimplemented`. A caller that
-wants to move records has to name the state it is accepting, and cannot reach it
-by default. The variant that means authenticated appears when there is an
-implementation behind it.
+## What the exchange does today
 
-This is the largest gap in the vertical path and it cannot be closed without
-implementing the authentication frames.
+The server sends `AUTH_CONTEXT` immediately after `SETTINGS_ACK`, in the same
+reply, so a peer never has to be told to expect it. It advertises no capability
+format, which section 1.1 defines as this deployment requiring no
+authentication. `AUTH_CONTEXT` is then the concluding frame, and each endpoint
+is authenticated once it has sent or read it.
+
+A client that receives a challenge advertising a capability format closes with
+`AUTHENTICATION_FAILED`. Nothing can present one yet, and accepting the frame
+would leave the client believing it is authenticated while the server waits for
+a `SESSION_OPEN` that never comes.
+
+The nonce is supplied by the caller through `Authentication::NotRequired`. This
+crate has no randomness, and a session whose freshness came from inside it could
+not be tested for the value it actually sent.
+
+`SESSION_OPEN`, `SESSION_ACCEPT`, and `SESSION_REJECT` are defined in
+`vot-codec` and are not yet driven by this state machine. What is left of
+section 1.1 is the capability path: a policy boundary to verify one, the bound
+of three attempts per connection, a fresh session identifier per attempt, and
+the identity rules tying an accept to its request. ADR-0022 stage two picks the
+capability format itself.
 
 ## The gate is asymmetric
 

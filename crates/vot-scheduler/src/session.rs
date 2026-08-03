@@ -676,7 +676,7 @@ mod tests {
             backend,
             vot_codec::Settings::default(),
             std::collections::BTreeSet::new(),
-            vot_session::Authentication::Unimplemented,
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         session.begin().unwrap();
         // Driven to readiness through the client's frames, which is the only
@@ -685,7 +685,7 @@ mod tests {
             Loopback::default(),
             vot_codec::Settings::default(),
             std::collections::BTreeSet::new(),
-            vot_session::Authentication::Unimplemented,
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
         for frame in std::mem::take(&mut client.driver().sent) {

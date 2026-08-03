@@ -405,8 +405,11 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             .get(&id)
             .is_some_and(|pending| pending.records.len() as u64 > bundle.data_record_count)
         {
-            // More records than the proof covers. Without this the entry can
-            // never reach its declared count and never leaves.
+            // More records than the proof covers. The records held under this
+            // identity are unusable, and left in place they would occupy the
+            // budget for the rest of the session: nothing else can complete
+            // an entry whose proof was refused.
+            self.pending.remove(&id);
             return Err(Error::ProofInvalid);
         }
         // The records already held move to the admitted budget along with the
@@ -1084,6 +1087,10 @@ mod tests {
             .events
             .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+        // Nothing else can complete an entry whose proof was refused, so it
+        // would hold its budget for the rest of the session.
+        assert_eq!(driver.pending_bundles(), 0);
+        assert_eq!(driver.pending_bytes(), 0);
     }
 
     #[test]

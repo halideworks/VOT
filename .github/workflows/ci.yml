@@ -343,7 +343,9 @@ jobs:
           scope=()
           sweep=(--full)
           if [ "$EVENT_NAME" = pull_request ]; then
-            git fetch --no-tags --quiet origin "$BASE_REF"
+            # origin/<base> comes from the checkout above, which fetched every
+            # branch. Fetching it again would be a network call this job does
+            # not need and a way for it to fail.
             git diff "origin/$BASE_REF...HEAD" > changed.diff
             scope=(--in-diff changed.diff)
             # A diff run tests a subset, so it cannot say a classified survivor
@@ -470,9 +472,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags --quiet origin "$BASE_REF"
-          git diff "origin/$BASE_REF...HEAD" > changed.diff
+        run: git diff "origin/$BASE_REF...HEAD" > changed.diff
 
       - name: Test mutants
         continue-on-error: ${{ !matrix.required }}

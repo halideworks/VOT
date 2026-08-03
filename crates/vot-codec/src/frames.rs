@@ -8,7 +8,22 @@ const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 const GROUP_BYTES: u64 = 65_536;
 
 const MAX_REQUESTED_RANGE: u64 = 4_194_304;
-const MAX_COVERED_RANGE: u64 = 4_259_840;
+
+/// What a covered range can reach, which is not a rule of its own.
+///
+/// Used by the tests that construct the maximum, rather than by a check.
+///
+/// The covered range runs from the group the request starts in to the group its
+/// end falls in, so an unaligned request of the largest allowed length covers one
+/// group more: 64 groups requested, 65 covered. That is fixed by
+/// `MAX_REQUESTED_RANGE` and the rule that the covered range ends exactly at the
+/// aligned request end, so checking it separately would be a condition no value
+/// can reach on its own. It is kept as the number a reader needs and asserted
+/// against the arithmetic that produces it.
+#[cfg(test)]
+const MAX_COVERED_RANGE: u64 = MAX_REQUESTED_RANGE + GROUP_BYTES;
+#[cfg(test)]
+const _: () = assert!(MAX_COVERED_RANGE == 4_259_840);
 const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DATA_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_REQUEST_PAGES: u64 = 8_192;
@@ -704,9 +719,11 @@ fn validate_manifest_request(value: &ManifestRequest) -> Result<(), Error> {
 
 fn encode_range_request(value: &RangeRequest, output: &mut Vec<u8>) -> Result<(), Error> {
     value.object.validate()?;
+    // No separate bound on the offset. An object is never longer than
+    // MAX_OBJECT_LENGTH, so an offset past that is already past this object, and
+    // the end check below refuses it before a bound of its own could.
     if value.length == 0
         || value.length > MAX_REQUESTED_RANGE
-        || value.offset > MAX_OBJECT_LENGTH
         || value
             .offset
             .checked_add(value.length)
@@ -837,19 +854,20 @@ fn validate_proof_bundle_with_proof_len(
             .requested_offset
             .checked_add(value.requested_length)
             .is_none_or(|end| end > value.object.length)
+        // The covered offset is the group the request starts in. That makes it a
+        // multiple of the group size and never past the request, so neither of
+        // those follows as a rule of its own: a value that broke them would have
+        // to break this one first. Nor does the covered range need a length or an
+        // end of its own here: the end below is exact, so a length of zero or an
+        // end past the object cannot reach it.
         || value.covered_offset != value.requested_offset / GROUP_BYTES * GROUP_BYTES
-        || value.covered_offset % GROUP_BYTES != 0
-        || value.covered_offset > value.requested_offset
-        || value.covered_length == 0
-        || value.covered_length > MAX_COVERED_RANGE
-        || value
-            .covered_offset
-            .checked_add(value.covered_length)
-            .is_none_or(|end| end > value.object.length)
         || value.data_record_count == 0
         || value.data_record_count > MAX_DATA_RECORDS_PER_BUNDLE as u64
         || value.total_plaintext_length != value.covered_length
-        || proof_len > MAX_PROOF_BYTES
+        // No separate bound on the proof. It travels inside the payload, and the
+        // payload limit is the same 16 MiB, so a proof past its own bound has
+        // already passed this one. The decoder bounds the byte string it reads,
+        // which is where an untrusted length is refused before it is allocated.
         || crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
             .is_some_and(|limit| proof_bundle_payload_len_with(value, proof_len) > limit)
     {
@@ -864,12 +882,15 @@ fn validate_proof_bundle_with_proof_len(
         .checked_mul(GROUP_BYTES)
         .ok_or(Error::InvalidValue)?
         .min(value.object.length);
-    if value.covered_offset.checked_add(value.covered_length) != Some(expected_end)
-        || (expected_end < value.object.length && value.covered_length % GROUP_BYTES != 0)
-    {
-        Err(Error::InvalidValue)
-    } else {
+    // Nothing here asks whether the covered length is a whole number of groups.
+    // The offset is the group the request starts in and the end is the group its
+    // end falls in, so the length between them is a multiple of the group size
+    // wherever the object does not cut it short, which is the only case such a
+    // rule would cover.
+    if value.covered_offset.checked_add(value.covered_length) == Some(expected_end) {
         Ok(())
+    } else {
+        Err(Error::InvalidValue)
     }
 }
 
@@ -1045,9 +1066,10 @@ fn decode_have(input: &[u8]) -> Result<Have, Error> {
     let map_sequence = reader.uint()?;
     reader.key(2)?;
     let count = reader.array_len(MAX_HAVE_RUNS)?;
-    if count > (reader.remaining_len() / 2) as u64 {
-        return Err(Error::Malformed);
-    }
+    // The count is not compared against the bytes that are left. A run is three
+    // bytes at the very least, so the loop below cannot read more runs than the
+    // input holds however many the head claims, and what is reserved up front is
+    // capped rather than taken from the claim.
     let mut runs = Vec::with_capacity(count.min(8_192) as usize);
     for _ in 0..count {
         if reader.array(2)? != 2 {
@@ -1106,12 +1128,16 @@ fn have_payload_len(value: &Have) -> usize {
         .saturating_add(cbor_head_len(2))
         .saturating_add(cbor_head_len(value.runs.len() as u64));
     for run in &value.runs {
-        length = length
-            .saturating_add(cbor_head_len(2))
-            .saturating_add(cbor_head_len(run.start_group))
-            .saturating_add(cbor_head_len(run.group_count));
+        length = length.saturating_add(have_run_len(run));
     }
     length
+}
+
+/// What one run costs on the wire, which is what a map is built up from.
+fn have_run_len(run: &HaveRun) -> usize {
+    cbor_head_len(2)
+        .saturating_add(cbor_head_len(run.start_group))
+        .saturating_add(cbor_head_len(run.group_count))
 }
 
 fn encode_capacity(value: &Capacity, output: &mut Vec<u8>) {
@@ -1327,10 +1353,6 @@ impl<'a> Reader<'a> {
     fn finish(&self) -> Result<(), Error> {
         self.reader.finish().map_err(|_| Error::Malformed)
     }
-
-    fn remaining_len(&self) -> usize {
-        self.reader.remaining().len()
-    }
 }
 
 #[cfg(test)]
@@ -1343,6 +1365,999 @@ mod tests {
             root: [7; 32],
             length: GROUP_BYTES * 2,
         }
+    }
+
+    /// A valid object, a valid frame of each kind, and one rule broken at a time.
+    ///
+    /// Every validator here is a chain of disjuncts, and a chain is where a rule
+    /// goes missing without anything noticing: each `||` that never decides an
+    /// outcome, and each comparison never tested at its edge, is a rule the wire
+    /// does not actually have. These tables break one rule per row and require
+    /// the value that must be accepted beside it.
+    fn wide_object() -> ObjectId {
+        ObjectId {
+            suite: 2,
+            root: [9; 32],
+            length: GROUP_BYTES * 64,
+        }
+    }
+
+    /// A HAVE map whose payload is exactly what the registry allows.
+    ///
+    /// Built by measuring rather than by dividing: a run's size depends on the
+    /// group numbers in it, so the count that reaches the limit is found and the
+    /// last few bytes are spent one at a time.
+    fn have_at_payload_limit() -> Have {
+        let limit = crate::registered_payload_limit(frame_type::HAVE).unwrap();
+        let mut value = Have {
+            object: ObjectId {
+                suite: 2,
+                root: [3; 32],
+                length: MAX_OBJECT_LENGTH,
+            },
+            map_sequence: 0,
+            runs: Vec::new(),
+        };
+        // Runs 25 groups apart, which leaves room for a count of 24 below. Each
+        // one is measured by the function under test rather than by arithmetic
+        // written here, so the count that reaches the limit is right even when
+        // what a run costs is not what this test would have guessed.
+        let mut total = have_payload_len(&value);
+        for index in 0..MAX_HAVE_RUNS {
+            let run = HaveRun {
+                start_group: index * 25,
+                group_count: 1,
+            };
+            let cost = have_run_len(&run);
+            if total + cost > limit {
+                break;
+            }
+            total += cost;
+            value.runs.push(run);
+        }
+        // The run array's own head grew while the runs did, so the size is
+        // measured again rather than accumulated.
+        while have_payload_len(&value) > limit {
+            assert!(value.runs.pop().is_some(), "no map reaches the limit");
+        }
+        // A run of 24 groups spends one byte more than a run of one, so what is
+        // left over is spent a byte at a time.
+        let short = limit - have_payload_len(&value);
+        for run in value.runs.iter_mut().take(short) {
+            run.group_count = 24;
+        }
+        assert_eq!(have_payload_len(&value), limit, "the limit was not reached");
+        value
+    }
+
+    #[test]
+    fn a_have_map_at_its_registered_limit_is_carried_and_one_byte_more_is_not() {
+        let limit = crate::registered_payload_limit(frame_type::HAVE).unwrap();
+        let value = have_at_payload_limit();
+
+        let mut encoded = Vec::new();
+        encode(&TypedFrame::Have(value.clone()), &mut encoded).unwrap();
+        // The size this endpoint refuses on is the size it would have written. An
+        // estimate that ran high would refuse a map a peer is allowed to send.
+        assert_eq!(payload_of(&encoded).len(), limit);
+        assert_eq!(decode_have(payload_of(&encoded)), Ok(value.clone()));
+        // And through the frame layer, which holds the same limit one step out.
+        assert_eq!(
+            decode(&encoded, DecodeLimits::default()),
+            Ok((TypedFrame::Have(value.clone()), encoded.len())),
+            "a map at its limit is a frame the layer above carries"
+        );
+
+        // One byte more, spent on the map sequence rather than on a run, so the
+        // map is otherwise the one just carried.
+        let over = Have {
+            map_sequence: 24,
+            ..value
+        };
+        assert_eq!(have_payload_len(&over), limit + 1);
+        assert_eq!(validate_have(&over), Err(Error::TooLarge));
+    }
+
+    #[test]
+    fn a_have_map_is_refused_before_its_runs_are_reserved() {
+        // The count is bounded twice: by the registry, and by what the remaining
+        // bytes could possibly hold. The second is what stops a peer naming two
+        // million runs in a short frame and having them reserved.
+        let valid = have();
+        let mut encoded = Vec::new();
+        encode(&TypedFrame::Have(valid.clone()), &mut encoded).unwrap();
+        let payload = payload_of(&encoded);
+        assert_eq!(decode_have(payload), Ok(valid));
+
+        // A run count the frame cannot hold: the head says many, the bytes are
+        // few. Each run is two integers, so the bound is half of what is left.
+        let mut lying = Vec::new();
+        vot_cbor::map(&mut lying, 3);
+        vot_cbor::uint(&mut lying, 0);
+        encode_object(&wide_object(), &mut lying);
+        vot_cbor::uint(&mut lying, 1);
+        vot_cbor::uint(&mut lying, 3);
+        vot_cbor::uint(&mut lying, 2);
+        vot_cbor::array(&mut lying, 64);
+        assert_eq!(decode_have(&lying), Err(Error::Malformed));
+
+        // The bound has to be half of what is left rather than any larger
+        // multiple of it. Two well-formed runs occupy six bytes, so a count of
+        // four is more than those bytes can hold and is refused here, before the
+        // reader gets to run out of input and answer something else.
+        let mut over_half = Vec::new();
+        vot_cbor::map(&mut over_half, 3);
+        vot_cbor::uint(&mut over_half, 0);
+        encode_object(&wide_object(), &mut over_half);
+        vot_cbor::uint(&mut over_half, 1);
+        vot_cbor::uint(&mut over_half, 3);
+        vot_cbor::uint(&mut over_half, 2);
+        vot_cbor::array(&mut over_half, 4);
+        for index in 0..2u64 {
+            vot_cbor::array(&mut over_half, 2);
+            vot_cbor::uint(&mut over_half, index * 2);
+            vot_cbor::uint(&mut over_half, 1);
+        }
+        assert_eq!(decode_have(&over_half), Err(Error::Malformed));
+
+        // A map that claims nothing. Nothing remains after the run head, so the
+        // count and the bound are both zero, and a peer that has verified no group
+        // yet says so with an empty sequence of runs rather than being refused.
+        let empty = Have {
+            object: wide_object(),
+            map_sequence: 7,
+            runs: Vec::new(),
+        };
+        let mut encoded_empty = Vec::new();
+        encode(&TypedFrame::Have(empty.clone()), &mut encoded_empty).unwrap();
+        assert_eq!(decode_have(payload_of(&encoded_empty)), Ok(empty));
+
+        // And the count the remaining bytes do allow is read rather than refused,
+        // which is what says the bound is not simply always refusing.
+        let mut exact = Vec::new();
+        vot_cbor::map(&mut exact, 3);
+        vot_cbor::uint(&mut exact, 0);
+        encode_object(&wide_object(), &mut exact);
+        vot_cbor::uint(&mut exact, 1);
+        vot_cbor::uint(&mut exact, 3);
+        vot_cbor::uint(&mut exact, 2);
+        vot_cbor::array(&mut exact, 2);
+        for index in 0..2u64 {
+            vot_cbor::array(&mut exact, 2);
+            vot_cbor::uint(&mut exact, index * 2);
+            vot_cbor::uint(&mut exact, 1);
+        }
+        assert!(decode_have(&exact).is_ok(), "a count the bytes can hold");
+
+        // A run at the very last group of the object, which is the edge the end
+        // check sits on inside validate_have.
+        let groups = wide_object().length.div_ceil(GROUP_BYTES);
+        round_trip(&TypedFrame::Have(Have {
+            runs: vec![HaveRun {
+                start_group: groups - 1,
+                group_count: 1,
+            }],
+            ..have()
+        }));
+    }
+
+    /// The payload of a single encoded frame, envelope removed.
+    fn payload_of(frame: &[u8]) -> &[u8] {
+        let limits = DecodeLimits {
+            max_unknown_payload: 1 << 22,
+            max_frames: 1,
+        };
+        let (decoded, _) = crate::decode_one(frame, limits).unwrap();
+        match decoded {
+            crate::DecodedFrame::Known { payload, .. } => payload,
+            crate::DecodedFrame::SkippedOptional { .. } => panic!("a known frame"),
+        }
+    }
+
+    #[test]
+    fn a_seal_is_bounded_by_the_payload_its_registry_entry_allows() {
+        let limit = crate::registered_payload_limit(frame_type::SEAL)
+            .expect("a seal has a registered payload limit");
+        // One byte past the limit is refused for its size, before anything tries
+        // to read a manifest structure out of it.
+        assert_eq!(validate_seal(&vec![0; limit + 1]), Err(Error::TooLarge));
+        // At the limit it is refused for what it is instead, which is what says
+        // the comparison is on the right side of its edge.
+        assert_eq!(validate_seal(&vec![0; limit]), Err(Error::Seal));
+    }
+
+    #[test]
+    fn a_challenge_outside_its_bounds_never_reaches_the_wire() {
+        // encode_auth_context_payload is the door the session state machine uses,
+        // so a challenge it would refuse must not encode through this one either.
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_auth_context_payload(
+                &AuthContext {
+                    nonce: vec![1; MIN_AUTH_NONCE - 1],
+                    binding: Binding::None,
+                    formats: Vec::new(),
+                },
+                &mut out
+            ),
+            Err(Error::InvalidValue)
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            encode_auth_context_payload(
+                &AuthContext {
+                    nonce: vec![1; MIN_AUTH_NONCE],
+                    binding: Binding::None,
+                    formats: Vec::new(),
+                },
+                &mut out
+            ),
+            Ok(())
+        );
+        assert!(!out.is_empty(), "and one inside them does");
+    }
+
+    #[test]
+    fn a_covered_range_that_stops_short_of_the_object_ends_on_a_group() {
+        // The last group of an object is short, so a covered range that reaches
+        // the end of the object need not be a whole number of groups. One that
+        // stops before the end must be. Both sides of that condition, which is
+        // the only place the object length decides the rule.
+        let ragged = ObjectId {
+            length: GROUP_BYTES * 2 + 17,
+            ..wide_object()
+        };
+        assert_eq!(
+            validate_proof_bundle(&ProofBundle {
+                object: ragged,
+                requested_offset: GROUP_BYTES * 2,
+                requested_length: 17,
+                covered_offset: GROUP_BYTES * 2,
+                covered_length: 17,
+                total_plaintext_length: 17,
+                data_record_count: 1,
+                ..bundle()
+            }),
+            Ok(()),
+            "the last group of the object, which is short"
+        );
+        assert_eq!(
+            validate_proof_bundle(&ProofBundle {
+                object: ragged,
+                requested_offset: 0,
+                requested_length: 17,
+                covered_offset: 0,
+                covered_length: 17,
+                total_plaintext_length: 17,
+                data_record_count: 1,
+                ..bundle()
+            }),
+            Err(Error::InvalidValue),
+            "a covered range that stops inside the object and not on a group"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_has_not_finished_says_so() {
+        // Reader::finish is what refuses trailing bytes inside a payload, and
+        // every typed decoder ends with it.
+        let mut encoded = Vec::new();
+        encode(
+            &TypedFrame::Capacity(Capacity {
+                epoch: 1,
+                available_bytes: 2,
+                bdp_target_bytes: 3,
+                max_inflight_bytes: 4,
+            }),
+            &mut encoded,
+        )
+        .unwrap();
+        let payload = payload_of(&encoded).to_vec();
+        assert!(decode_capacity(&payload).is_ok());
+        let mut trailing = payload;
+        trailing.push(0);
+        assert_eq!(decode_capacity(&trailing), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn an_object_identity_is_one_of_the_registered_suites_and_a_representable_length() {
+        assert_eq!(object().validate(), Ok(()));
+        for suite in [0, 3, u16::MAX] {
+            assert_eq!(
+                ObjectId { suite, ..object() }.validate(),
+                Err(Error::InvalidValue),
+                "suite {suite}"
+            );
+        }
+        for suite in [1, 2] {
+            assert_eq!(ObjectId { suite, ..object() }.validate(), Ok(()));
+        }
+        // The longest object the registry allows, and one byte more.
+        assert_eq!(
+            ObjectId {
+                length: MAX_OBJECT_LENGTH,
+                ..object()
+            }
+            .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            ObjectId {
+                length: MAX_OBJECT_LENGTH + 1,
+                ..object()
+            }
+            .validate(),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    fn range_request() -> RangeRequest {
+        RangeRequest {
+            request_id: [1; 16],
+            object: wide_object(),
+            offset: GROUP_BYTES,
+            length: GROUP_BYTES,
+        }
+    }
+
+    #[test]
+    fn every_rule_on_a_range_request_is_refused_on_its_own() {
+        let valid = range_request();
+        let mut out = Vec::new();
+        assert_eq!(encode_range_request(&valid, &mut out), Ok(()));
+
+        for (name, value) in [
+            (
+                "a zero length, which asks for nothing",
+                RangeRequest {
+                    length: 0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "one byte past the largest range a request may name",
+                RangeRequest {
+                    offset: 0,
+                    length: MAX_REQUESTED_RANGE + 1,
+                    object: ObjectId {
+                        length: MAX_OBJECT_LENGTH,
+                        ..wide_object()
+                    },
+                    ..valid.clone()
+                },
+            ),
+            (
+                "an offset past the longest representable object",
+                RangeRequest {
+                    offset: MAX_OBJECT_LENGTH + 1,
+                    length: 1,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a range that ends past the object",
+                RangeRequest {
+                    offset: wide_object().length - 1,
+                    length: 2,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a range whose end overflows",
+                RangeRequest {
+                    offset: u64::MAX,
+                    length: 2,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "an object identity that is not valid",
+                RangeRequest {
+                    object: ObjectId {
+                        suite: 9,
+                        ..wide_object()
+                    },
+                    ..valid.clone()
+                },
+            ),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                encode_range_request(&value, &mut out),
+                Err(Error::InvalidValue),
+                "{name}"
+            );
+            assert!(out.is_empty(), "{name} wrote bytes before refusing");
+        }
+
+        // The bounds themselves are allowed, which is what says each comparison
+        // is on the right side of its edge.
+        let mut out = Vec::new();
+        assert_eq!(
+            encode_range_request(
+                &RangeRequest {
+                    offset: 0,
+                    length: MAX_REQUESTED_RANGE,
+                    object: ObjectId {
+                        length: MAX_OBJECT_LENGTH,
+                        ..wide_object()
+                    },
+                    ..valid.clone()
+                },
+                &mut out
+            ),
+            Ok(())
+        );
+        out.clear();
+        assert_eq!(
+            encode_range_request(
+                &RangeRequest {
+                    offset: wide_object().length - 1,
+                    length: 1,
+                    ..valid
+                },
+                &mut out
+            ),
+            Ok(()),
+            "the last byte of the object"
+        );
+    }
+
+    fn manifest_request() -> ManifestRequest {
+        ManifestRequest {
+            request_id: [1; 16],
+            manifest_id: [2; 16],
+            first_page: 0,
+            page_count: 4,
+        }
+    }
+
+    #[test]
+    fn every_rule_on_a_manifest_request_is_refused_on_its_own() {
+        round_trip(&TypedFrame::ManifestRequest(manifest_request()));
+        for (name, value) in [
+            (
+                "no pages, which asks for nothing",
+                ManifestRequest {
+                    page_count: 0,
+                    ..manifest_request()
+                },
+            ),
+            (
+                "one page past the bound",
+                ManifestRequest {
+                    page_count: MAX_MANIFEST_REQUEST_PAGES + 1,
+                    ..manifest_request()
+                },
+            ),
+            (
+                "a first page past the longest representable object",
+                ManifestRequest {
+                    first_page: MAX_OBJECT_LENGTH + 1,
+                    ..manifest_request()
+                },
+            ),
+            (
+                "a page range whose end overflows",
+                ManifestRequest {
+                    first_page: u64::MAX,
+                    page_count: 2,
+                    ..manifest_request()
+                },
+            ),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                encode(&TypedFrame::ManifestRequest(value), &mut out),
+                Err(Error::InvalidValue),
+                "{name}"
+            );
+        }
+        // Both bounds at their own maximum.
+        round_trip(&TypedFrame::ManifestRequest(ManifestRequest {
+            page_count: MAX_MANIFEST_REQUEST_PAGES,
+            ..manifest_request()
+        }));
+        round_trip(&TypedFrame::ManifestRequest(ManifestRequest {
+            first_page: MAX_OBJECT_LENGTH,
+            page_count: 1,
+            ..manifest_request()
+        }));
+    }
+
+    fn have() -> Have {
+        Have {
+            object: wide_object(),
+            map_sequence: 3,
+            runs: vec![
+                HaveRun {
+                    start_group: 0,
+                    group_count: 2,
+                },
+                HaveRun {
+                    start_group: 4,
+                    group_count: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per rule reads as a table")]
+    fn every_rule_on_a_have_map_is_refused_on_its_own() {
+        round_trip(&TypedFrame::Have(have()));
+        let groups = wide_object().length.div_ceil(GROUP_BYTES);
+
+        for (name, runs) in [
+            (
+                "a run of no groups",
+                vec![HaveRun {
+                    start_group: 0,
+                    group_count: 0,
+                }],
+            ),
+            (
+                "runs out of order",
+                vec![
+                    HaveRun {
+                        start_group: 4,
+                        group_count: 1,
+                    },
+                    HaveRun {
+                        start_group: 0,
+                        group_count: 1,
+                    },
+                ],
+            ),
+            (
+                "overlapping runs",
+                vec![
+                    HaveRun {
+                        start_group: 0,
+                        group_count: 4,
+                    },
+                    HaveRun {
+                        start_group: 2,
+                        group_count: 1,
+                    },
+                ],
+            ),
+            (
+                "adjacent runs, which are one run written twice",
+                vec![
+                    HaveRun {
+                        start_group: 0,
+                        group_count: 2,
+                    },
+                    HaveRun {
+                        start_group: 2,
+                        group_count: 1,
+                    },
+                ],
+            ),
+            (
+                "a run ending past the object's groups",
+                vec![HaveRun {
+                    start_group: groups - 1,
+                    group_count: 2,
+                }],
+            ),
+            (
+                "a run whose end overflows",
+                vec![HaveRun {
+                    start_group: u64::MAX,
+                    group_count: 2,
+                }],
+            ),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                encode(&TypedFrame::Have(Have { runs, ..have() }), &mut out),
+                Err(Error::InvalidValue),
+                "{name}"
+            );
+        }
+
+        // A single run covering every group, which is the edge the end check sits
+        // on, and a first run starting at zero, which the adjacency rule must not
+        // refuse.
+        round_trip(&TypedFrame::Have(Have {
+            runs: vec![HaveRun {
+                start_group: 0,
+                group_count: groups,
+            }],
+            ..have()
+        }));
+        round_trip(&TypedFrame::Have(Have {
+            runs: vec![HaveRun {
+                start_group: groups - 1,
+                group_count: 1,
+            }],
+            ..have()
+        }));
+
+        // An object identity that is not valid is refused before any run is read.
+        let mut out = Vec::new();
+        assert_eq!(
+            encode(
+                &TypedFrame::Have(Have {
+                    object: ObjectId {
+                        suite: 0,
+                        ..wide_object()
+                    },
+                    ..have()
+                }),
+                &mut out
+            ),
+            Err(Error::InvalidValue)
+        );
+
+        // More runs than the payload limit can carry, which is a size refusal
+        // rather than a rule about the runs themselves.
+        let crowded = Have {
+            object: ObjectId {
+                length: MAX_OBJECT_LENGTH,
+                ..wide_object()
+            },
+            // Wide start groups, so each run needs the widest heads and the
+            // payload reaches its bound in a few hundred thousand of them.
+            runs: (0..400_000)
+                .map(|index| HaveRun {
+                    start_group: index * (1 << 40),
+                    group_count: 1,
+                })
+                .collect(),
+            ..have()
+        };
+        out.clear();
+        assert_eq!(
+            encode(&TypedFrame::Have(crowded), &mut out),
+            Err(Error::TooLarge)
+        );
+    }
+
+    fn bundle() -> ProofBundle {
+        ProofBundle {
+            request_id: [1; 16],
+            bundle_id: [2; 16],
+            object: wide_object(),
+            requested_offset: GROUP_BYTES,
+            requested_length: GROUP_BYTES,
+            covered_offset: GROUP_BYTES,
+            covered_length: GROUP_BYTES,
+            data_record_count: 1,
+            total_plaintext_length: GROUP_BYTES,
+            proof: vec![3; 64],
+        }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one row per rule reads as a table")]
+    fn every_rule_on_a_proof_bundle_is_refused_on_its_own() {
+        let valid = bundle();
+        assert_eq!(validate_proof_bundle(&valid), Ok(()));
+
+        for (name, value) in [
+            (
+                "an object of no length",
+                ProofBundle {
+                    object: ObjectId {
+                        length: 0,
+                        ..wide_object()
+                    },
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a requested length of zero",
+                ProofBundle {
+                    requested_length: 0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                // The same rule, isolated. Above it, the covered range disagrees
+                // with the request as well, so the second check refuses the value
+                // too and either rule alone would look sufficient. Here the
+                // covered range is what a zero-length request at offset one would
+                // cover, so this is refused for that reason and no other.
+                "a requested length of zero with a covered range that agrees",
+                ProofBundle {
+                    requested_offset: 1,
+                    requested_length: 0,
+                    covered_offset: 0,
+                    covered_length: GROUP_BYTES,
+                    total_plaintext_length: GROUP_BYTES,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a requested range that ends past the object",
+                ProofBundle {
+                    requested_offset: wide_object().length - GROUP_BYTES,
+                    requested_length: GROUP_BYTES + 1,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a covered offset that is not the group the request starts in",
+                ProofBundle {
+                    covered_offset: 0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a covered offset past the requested one",
+                ProofBundle {
+                    requested_offset: GROUP_BYTES + 1,
+                    covered_offset: GROUP_BYTES * 2,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a covered length of zero",
+                ProofBundle {
+                    covered_length: 0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a covered range that ends past the object",
+                ProofBundle {
+                    requested_offset: wide_object().length - GROUP_BYTES,
+                    covered_offset: wide_object().length - GROUP_BYTES,
+                    covered_length: GROUP_BYTES * 2,
+                    total_plaintext_length: GROUP_BYTES * 2,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "no data records",
+                ProofBundle {
+                    data_record_count: 0,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "one record more than a bundle may carry",
+                ProofBundle {
+                    data_record_count: MAX_DATA_RECORDS_PER_BUNDLE as u64 + 1,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a plaintext length that is not the covered length",
+                ProofBundle {
+                    total_plaintext_length: GROUP_BYTES - 1,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "an object identity that is not valid",
+                ProofBundle {
+                    object: ObjectId {
+                        suite: 7,
+                        ..wide_object()
+                    },
+                    ..valid.clone()
+                },
+            ),
+        ] {
+            assert_eq!(
+                validate_proof_bundle(&value),
+                Err(Error::InvalidValue),
+                "{name}"
+            );
+        }
+
+        // Each bound at its own maximum. The covered range may exceed the
+        // requested one by design, so both maxima are their own case.
+        let long = ObjectId {
+            length: MAX_OBJECT_LENGTH,
+            ..wide_object()
+        };
+        // The largest bundle there is, and the reason the covered maximum is one
+        // group more than the requested one: an unaligned request of 64 groups is
+        // covered by 65.
+        assert_eq!(
+            validate_proof_bundle(&ProofBundle {
+                object: long,
+                requested_offset: 1,
+                requested_length: MAX_REQUESTED_RANGE,
+                covered_offset: 0,
+                covered_length: MAX_COVERED_RANGE,
+                total_plaintext_length: MAX_COVERED_RANGE,
+                data_record_count: MAX_DATA_RECORDS_PER_BUNDLE as u64,
+                ..valid.clone()
+            }),
+            Ok(()),
+            "every bound at its maximum together"
+        );
+        assert_eq!(
+            validate_proof_bundle(&ProofBundle {
+                object: long,
+                requested_offset: 1,
+                requested_length: MAX_REQUESTED_RANGE + 1,
+                covered_offset: 0,
+                covered_length: MAX_COVERED_RANGE,
+                total_plaintext_length: MAX_COVERED_RANGE,
+                ..valid.clone()
+            }),
+            Err(Error::InvalidValue),
+            "one byte past the requested maximum"
+        );
+        // A covered range that does not end where the request's group does, in
+        // both directions, which is the rule that fixes it rather than a bound.
+        for covered_length in [MAX_COVERED_RANGE - GROUP_BYTES, MAX_COVERED_RANGE + 1] {
+            assert_eq!(
+                validate_proof_bundle(&ProofBundle {
+                    object: long,
+                    requested_offset: 1,
+                    requested_length: MAX_REQUESTED_RANGE,
+                    covered_offset: 0,
+                    covered_length,
+                    total_plaintext_length: covered_length,
+                    ..valid.clone()
+                }),
+                Err(Error::InvalidValue),
+                "{covered_length} covered"
+            );
+        }
+
+        // The proof is bounded by the payload it travels in, so the edge is where
+        // the estimate meets the registry's limit. Found rather than assumed: a
+        // number written here would be one the estimate could drift away from.
+        let limit = crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
+            .expect("a proof bundle has a registered payload limit");
+        let widest = (1..=limit)
+            .rev()
+            .find(|proof_len| proof_bundle_payload_len_with(&valid, *proof_len) <= limit)
+            .expect("some proof length fits");
+        assert!(
+            widest < MAX_PROOF_BYTES,
+            "the fields take room of their own"
+        );
+        assert_eq!(
+            validate_proof_bundle_with_proof_len(&valid, widest),
+            Ok(()),
+            "the widest proof that fits its payload"
+        );
+        assert_eq!(
+            validate_proof_bundle_with_proof_len(&valid, widest + 1),
+            Err(Error::InvalidValue),
+            "and one byte more"
+        );
+    }
+
+    fn assurance() -> AssuranceFrame {
+        AssuranceFrame {
+            object: wide_object(),
+            sequence: 1,
+            unit_start: 0,
+            unit_count: 2,
+        }
+    }
+
+    #[test]
+    fn every_rule_on_an_assurance_frame_is_refused_on_its_own() {
+        round_trip(&TypedFrame::TransitVerified(assurance()));
+        let units = wide_object().length.div_ceil(GROUP_BYTES);
+
+        for (name, value) in [
+            (
+                "a sequence of zero, which is not monotonic from anywhere",
+                AssuranceFrame {
+                    sequence: 0,
+                    ..assurance()
+                },
+            ),
+            (
+                "no units",
+                AssuranceFrame {
+                    unit_count: 0,
+                    ..assurance()
+                },
+            ),
+            (
+                "units ending past the object",
+                AssuranceFrame {
+                    unit_start: units - 1,
+                    unit_count: 2,
+                    ..assurance()
+                },
+            ),
+            (
+                "a unit range whose end overflows",
+                AssuranceFrame {
+                    unit_start: u64::MAX,
+                    unit_count: 2,
+                    ..assurance()
+                },
+            ),
+            (
+                "an object identity that is not valid",
+                AssuranceFrame {
+                    object: ObjectId {
+                        suite: 0,
+                        ..wide_object()
+                    },
+                    ..assurance()
+                },
+            ),
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                encode(&TypedFrame::ChunkDurable(value), &mut out),
+                Err(Error::InvalidValue),
+                "{name}"
+            );
+        }
+
+        // Every unit of the object, and the last unit alone.
+        round_trip(&TypedFrame::ChunkAtRestVerified(AssuranceFrame {
+            unit_start: 0,
+            unit_count: units,
+            ..assurance()
+        }));
+        round_trip(&TypedFrame::TransitVerified(AssuranceFrame {
+            unit_start: units - 1,
+            unit_count: 1,
+            ..assurance()
+        }));
+    }
+
+    #[test]
+    fn a_package_descriptor_names_at_least_one_page() {
+        let valid = PackageDescriptor {
+            package: wide_object(),
+            manifest_id: [4; 16],
+            page_count: 1,
+        };
+        round_trip(&TypedFrame::PackageDescriptor(valid.clone()));
+        let mut out = Vec::new();
+        assert_eq!(
+            encode(
+                &TypedFrame::PackageDescriptor(PackageDescriptor {
+                    page_count: 0,
+                    ..valid.clone()
+                }),
+                &mut out
+            ),
+            Err(Error::InvalidValue)
+        );
+        out.clear();
+        assert_eq!(
+            encode(
+                &TypedFrame::PackageDescriptor(PackageDescriptor {
+                    package: ObjectId {
+                        suite: 0,
+                        ..wide_object()
+                    },
+                    ..valid
+                }),
+                &mut out
+            ),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn a_capacity_frame_carries_what_it_was_given() {
+        // Nothing about a capacity frame is bounded, so what a test can say is
+        // that every field reaches the wire and comes back. A writer that dropped
+        // one would round-trip as a default.
+        round_trip(&TypedFrame::Capacity(Capacity {
+            epoch: 7,
+            available_bytes: 1 << 40,
+            bdp_target_bytes: 1 << 20,
+            max_inflight_bytes: u64::MAX,
+        }));
+        round_trip(&TypedFrame::Capacity(Capacity {
+            epoch: 0,
+            available_bytes: 0,
+            bdp_target_bytes: 0,
+            max_inflight_bytes: 0,
+        }));
     }
 
     fn round_trip(frame: &TypedFrame) {

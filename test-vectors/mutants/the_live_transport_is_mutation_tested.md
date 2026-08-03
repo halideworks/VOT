@@ -79,10 +79,14 @@ Stream events: deleting `SendComplete` or `PeerSendShutdown` from
 it leaks, which again is the sanitizer's to catch rather than a functional
 test's.
 
-Timeouts are a live test waiting out its own deadline rather than a hang in the
-transport: `local_port` returning `Ok(0)` makes a test dial port zero, and the
-`callback_owned` guard turned off breaks the handshake the test is waiting on.
-Two more appeared with the tests added here, both from a `push` that always
-accepts; the mechanism for those is not confirmed, only that they exceed the
-deadline rather than fail. A mutant that hangs is worth less than one that
-fails, so these say less than the count suggests either way.
+Two timeouts, both a live test waiting out its own deadline rather than a hang
+in the transport: `local_port` returning `Ok(0)` makes a test dial port zero,
+and the `callback_owned` guard turned off breaks the handshake the test is
+waiting on. A mutant that hangs is worth less than one that fails, so a timeout
+says less than a caught mutant either way.
+
+Two more appeared partway through this work, from a `push` that always accepts.
+They are gone: the callback budget test that lands its last event exactly on the
+bound now refuses the one past it, which fails fast instead of letting a queue
+grow until a deadline expires. Recorded because the intermediate run said
+otherwise and the write-up said so too.

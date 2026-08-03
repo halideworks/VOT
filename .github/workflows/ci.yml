@@ -466,9 +466,10 @@ jobs:
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
       - name: Select the mutants this change can affect
-        # A pull request mutates only the lines it changed, so a package the
-        # change does not touch costs one build and nothing else. The full sweep
-        # runs on every push to main.
+        # A pull request mutates only the lines it changed. The filter runs
+        # before anything is built, so a package the change does not touch costs
+        # this job's setup and nothing else. The full sweep runs on every push to
+        # main.
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}

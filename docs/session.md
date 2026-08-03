@@ -182,10 +182,26 @@ rather than implying the limit took effect.
 
 The reverse direction is configuration rather than negotiation. An endpoint's
 own reassembly bound has to be in force before the peer's first byte, so
-`MsQuicTransport::connect` and `MsQuicServer::listen` take it, and
-`Session::begin` refuses to advertise a limit the backend will not keep.
-Advertising one bound and accepting frames up to another is silent otherwise:
-the peer sends what it was told it could, and this endpoint takes more.
+`MsQuicTransport::connect` and `MsQuicServer::listen` take it,
+`SimulatorAdapter::set_receive_limits` and `TcpAdapter::set_receive_limits` do
+the same, and `Session::begin` refuses to advertise a limit the backend will not
+keep. Advertising one bound and accepting frames up to another is silent
+otherwise: the peer sends what it was told it could, and this endpoint takes
+more.
+
+Every carrier answers the same three methods, and what each one can honour
+differs:
+
+| Carrier | Peer's control bound | Advertised limits | Close code |
+| --- | --- | --- | --- |
+| MsQuic | applied | enforced | sent to the peer |
+| TCP | applied, clamped to the outbound queue | enforced | not signalled |
+| Simulator | applied | enforced once set | recorded, no peer to tell |
+
+A method a carrier cannot honour answers `Unsupported` rather than `Ok`, because
+a caller that was told a limit applied when it did not is worse off than one that
+knows it did not. What that costs is visible: `Session::control_limit_applied`
+reports false rather than implying the limit took effect.
 
 ## What an application may send
 

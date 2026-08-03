@@ -2170,6 +2170,7 @@ name = "vot-transport-sim"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "vot-codec",
  "vot-commit-model",
  "vot-journal",
  "vot-manifest",

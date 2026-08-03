@@ -72,7 +72,12 @@ decide.
 
 `accept_control` returns `Accepted::AuthorizationRequired`, nothing reaches the
 carrier, and the caller answers through `pending_authorization`, `grant`, and
-`refuse`. The boundary is the caller's rather than a trait this crate calls: a
+`refuse`.
+
+A caller has to look. `poll` returns `None` while a request waits, the same as
+it does with nothing to report, so a loop that only drains events and never
+checks `pending_authorization` stalls with the data plane shut and no error to
+show for it. The boundary is the caller's rather than a trait this crate calls: a
 policy needs a deployment's own identity store and clock, and a session has
 neither. It also keeps `Negotiation` free of a trait object, which is what lets
 it stay `Clone` and `Debug` and testable without a policy at all.

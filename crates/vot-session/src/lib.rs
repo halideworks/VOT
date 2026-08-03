@@ -1073,9 +1073,14 @@ impl<A: TransportAdapter> Session<A> {
                 bytes,
             )))),
             Accepted::Consumed { reply } => {
-                let became_ready = self.negotiation.is_ready();
+                // Applied at Negotiated rather than at Authenticated. The
+                // peer's limit is known as soon as its SETTINGS arrive, and
+                // the authentication exchange itself sends frames under it: a
+                // peer advertising the registry minimum would otherwise be
+                // sent a challenge or an answer larger than it accepts.
+                let negotiated = self.negotiation.state().is_negotiated();
                 self.submit(reply)?;
-                if became_ready {
+                if negotiated {
                     self.apply_peer_limits();
                 }
                 Ok(None)
@@ -1098,9 +1103,7 @@ impl<A: TransportAdapter> Session<A> {
     /// Reports nothing pending, an unencodable scope, or a backend refusal.
     pub fn grant(&mut self, granted_scope: Vec<u8>) -> Result<(), Error> {
         let reply = self.negotiation.grant(granted_scope)?;
-        self.submit(reply)?;
-        self.apply_peer_limits();
-        Ok(())
+        self.submit(reply)
     }
 
     /// Refuses the pending request and sends the refusal.
@@ -1336,6 +1339,12 @@ pub enum Authentication {
     /// The boundary is the caller's rather than a trait this crate calls: a
     /// policy needs a deployment's own identity store and clock, neither of
     /// which a session has.
+    ///
+    /// One rule decides which of the two variants a challenge behaves as, and
+    /// it is the one `spec/wire.md` section 1.1 states: an empty format list
+    /// means no authentication is required. A `Capability` carrying an empty
+    /// list is therefore a `NotRequired` with a longer name, not a server that
+    /// silently asks for nothing.
     Capability { challenge: AuthContext },
 }
 
@@ -2017,6 +2026,13 @@ mod tests {
             State::Negotiated,
             "a challenge asking for a capability does not conclude the exchange"
         );
+        // The exchange itself sends frames under the peer's limit, so that
+        // limit has to reach the backend before the challenge does, not when
+        // the exchange concludes.
+        assert!(
+            server.control_limit_applied(),
+            "the peer's limit is known once its SETTINGS arrive"
+        );
         assert!(!server.is_ready(), "and the data plane stays shut");
         assert_eq!(
             server
@@ -2064,6 +2080,35 @@ mod tests {
                 .refuse(error_code::AUTHENTICATION_FAILED, String::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn an_empty_format_list_means_the_same_thing_whichever_variant_names_it() {
+        // One rule decides, and it is the one section 1.1 states. A Capability
+        // carrying no format is a server that requires none, not one that
+        // silently asks for nothing and waits.
+        let mut named = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: no_capability([9; 32]),
+            },
+        );
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        named.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            named.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(named.poll().unwrap(), None);
+        assert!(named.is_ready(), "the exchange concluded at the challenge");
+        assert_eq!(named.pending_authorization(), None);
     }
 
     #[test]

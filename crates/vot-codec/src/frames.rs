@@ -477,9 +477,7 @@ fn decode_session_open(input: &[u8]) -> Result<SessionOpen, Error> {
 }
 
 fn encode_session_accept(value: &SessionAccept, output: &mut Vec<u8>) -> Result<(), Error> {
-    if value.granted_scope.len() > MAX_SCOPE_BYTES {
-        return Err(Error::TooLarge);
-    }
+    validate_session_accept(value)?;
     map(3, output);
     uint(0, output);
     uint(0, output);
@@ -487,6 +485,13 @@ fn encode_session_accept(value: &SessionAccept, output: &mut Vec<u8>) -> Result<
     bytes(&value.session_id, output);
     uint(2, output);
     bytes(&value.granted_scope, output);
+    Ok(())
+}
+
+fn validate_session_accept(value: &SessionAccept) -> Result<(), Error> {
+    if value.granted_scope.len() > MAX_SCOPE_BYTES {
+        return Err(Error::TooLarge);
+    }
     Ok(())
 }
 
@@ -502,10 +507,14 @@ fn decode_session_accept(input: &[u8]) -> Result<SessionAccept, Error> {
     reader.key(2)?;
     let granted_scope = reader.bytes(MAX_SCOPE_BYTES)?.to_vec();
     reader.finish()?;
-    Ok(SessionAccept {
+    let value = SessionAccept {
         session_id,
         granted_scope,
-    })
+    };
+    // Every one of the four checks the same rules on both sides, so a rule
+    // added to one direction cannot be missed in the other.
+    validate_session_accept(&value)?;
+    Ok(value)
 }
 
 fn encode_session_reject(value: &SessionReject, output: &mut Vec<u8>) -> Result<(), Error> {

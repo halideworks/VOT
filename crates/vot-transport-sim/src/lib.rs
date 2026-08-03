@@ -135,7 +135,20 @@ pub struct SimulatorAdapter {
     events: VecDeque<TransportEvent>,
     next_sequence: u64,
     receive_credit: u64,
+    /// What the peer said it would accept, so it bounds what is sent.
     control_payload_limit: usize,
+    /// What this endpoint advertised, so it bounds what is delivered. Separate
+    /// from the send bound because negotiation moves the two independently, and
+    /// a loopback that shared one would report a peer's limit as its own.
+    control_receive_limit: usize,
+    /// The limits this endpoint advertised, once a caller has said. Absent until
+    /// then: an adapter that claimed limits it does not hold anything to would
+    /// let a session advertise them and enforce nothing.
+    receive_limits: Option<vot_transport_api::ReceiveLimits>,
+    /// Lanes seen in delivery, counted against the advertised limit.
+    inbound_lanes: BTreeSet<StreamId>,
+    /// The registered code this endpoint ended the session under, if it has.
+    closed: Option<u16>,
     impairment: Impairment,
     reliable_delivered: u64,
     datagrams_sent: u64,
@@ -149,6 +162,10 @@ impl Default for SimulatorAdapter {
             next_sequence: 0,
             receive_credit: 0,
             control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            receive_limits: None,
+            inbound_lanes: BTreeSet::new(),
+            closed: None,
             impairment: Impairment::default(),
             reliable_delivered: 0,
             datagrams_sent: 0,
@@ -213,19 +230,101 @@ impl SimulatorAdapter {
         Ok(())
     }
 
-    /// Applies the peer-negotiated control-frame payload ceiling.
+    /// Applies what this endpoint advertises, so delivery holds a peer to it.
+    ///
+    /// Configuration rather than negotiation: the bound has to be in force
+    /// before the first frame, or this endpoint accepts more than it promised
+    /// and nothing says so. Absent by default, because a simulator that claimed
+    /// limits it enforced nothing against would be worse than one that claims
+    /// none.
     ///
     /// # Errors
-    /// Rejects zero or out-of-range negotiated payload limits.
-    pub fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), TransportError> {
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit = limit;
+    /// Rejects a control-frame bound outside the protocol range.
+    pub fn set_receive_limits(
+        &mut self,
+        limits: vot_transport_api::ReceiveLimits,
+    ) -> Result<(), TransportError> {
+        vot_transport_api::validate_control_payload_limit(limits.control_payload())?;
+        self.control_receive_limit = limits.control_payload();
+        self.receive_limits = Some(limits);
+        Ok(())
+    }
+
+    /// The code this endpoint ended the session under, once it has.
+    #[must_use]
+    pub const fn close_code(&self) -> Option<u16> {
+        self.closed
+    }
+
+    /// Counts one lane in delivery against the advertised limit.
+    ///
+    /// A lane already seen is free: the limit is on how many exist. Nothing here
+    /// closes one, which is the same reading the TCP carrier takes, where a lane
+    /// is an identifier on one byte stream rather than a stream of its own.
+    fn admit_lane(&mut self, stream: StreamId) -> Result<(), TransportError> {
+        let Some(limits) = self.receive_limits else {
+            // Nothing advertised, so nothing to hold anyone to.
+            return Ok(());
+        };
+        if self.inbound_lanes.contains(&stream) {
+            return Ok(());
+        }
+        if self.inbound_lanes.len() >= limits.lanes() {
+            return Err(TransportError::LaneLimitExceeded);
+        }
+        self.inbound_lanes.insert(stream);
+        Ok(())
+    }
+
+    /// Refuses a submission after this endpoint has closed the session.
+    fn require_open(&self) -> Result<(), TransportError> {
+        if self.closed.is_some() {
+            // The carrier is gone. Queueing more would let a caller believe a
+            // frame went out after the code that ended the session.
+            return Err(TransportError::Backend);
+        }
         Ok(())
     }
 }
 
 impl vot_transport_api::TransportAdapter for SimulatorAdapter {
+    /// Applies the peer-negotiated control-frame payload ceiling.
+    ///
+    /// On the trait rather than beside it. An inherent method of the same name
+    /// shadows the trait's for a caller holding the concrete type, so this was
+    /// reachable from a test and unreachable from a session, which drives every
+    /// adapter through `TransportAdapter`.
+    ///
+    /// # Errors
+    /// Rejects zero or out-of-range negotiated payload limits.
+    fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), TransportError> {
+        vot_transport_api::validate_control_payload_limit(limit)?;
+        self.control_payload_limit = limit;
+        Ok(())
+    }
+
+    /// The limits this endpoint will hold a peer to, when a caller has set any.
+    fn receive_limits(&self) -> Option<vot_transport_api::ReceiveLimits> {
+        self.receive_limits
+    }
+
+    /// Ends the session under a registered code.
+    ///
+    /// A simulator has no peer to tell, so the code is recorded rather than
+    /// sent, and [`close_code`](SimulatorAdapter::close_code) is how a test
+    /// reads what a session decided. Returning `Unsupported` instead made every
+    /// close over this carrier silently do nothing.
+    fn close(&mut self, code: u16) -> Result<(), TransportError> {
+        // The first code, not the last. What ended the session is the reason a
+        // later teardown reports nothing new.
+        if self.closed.is_none() {
+            self.closed = Some(code);
+        }
+        Ok(())
+    }
+
     fn send_control(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        self.require_open()?;
         vot_transport_api::validate_control_frame(frame, self.control_payload_limit)?;
         self.submissions
             .push_back(Submission::Control(vot_transport_api::shared_payload(
@@ -255,6 +354,7 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
         stream: StreamId,
         record: Payload,
     ) -> Result<(), TransportError> {
+        self.require_open()?;
         vot_transport_api::validate_data_record(&record)?;
         self.submissions.push_back(Submission::Reliable {
             stream,
@@ -264,6 +364,7 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
     }
 
     fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), TransportError> {
+        self.require_open()?;
         if payload.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
             return Err(TransportError::RecordTooLarge);
         }
@@ -278,8 +379,15 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
         let mut delivered = Vec::with_capacity(self.submissions.len());
         while let Some(submission) = self.submissions.pop_front() {
             match submission {
-                Submission::Control(bytes) => delivered.push(TransportEvent::Control(bytes)),
+                Submission::Control(bytes) => {
+                    // Against the advertised bound rather than the peer's. A
+                    // frame inside what this endpoint promised to reassemble is
+                    // deliverable; one past it is what the promise refuses.
+                    vot_transport_api::validate_control_frame(&bytes, self.control_receive_limit)?;
+                    delivered.push(TransportEvent::Control(bytes));
+                }
                 Submission::Reliable { stream, bytes } => {
+                    self.admit_lane(stream)?;
                     let sequence = self
                         .next_sequence
                         .checked_add(1)
@@ -1399,6 +1507,146 @@ mod tests {
 
     const FALLBACK: &str = include_str!("../../../sim/scenarios/rebind-fallback.vot");
     const STORAGE_FAULT: &str = include_str!("../../../sim/scenarios/storage-fault.vot");
+
+    /// Applies a peer's limit the way a session does: through the trait, with no
+    /// access to the concrete type.
+    ///
+    /// `Session::apply_peer_limits` is generic over `TransportAdapter` and calls
+    /// exactly this. An inherent method of the same name shadows the trait's for
+    /// a caller that holds a `SimulatorAdapter`, so the limit was reachable from
+    /// a test here and unreachable from anything generic, which answered
+    /// `Unsupported` and applied nothing.
+    fn apply_peer_limit<A: vot_transport_api::TransportAdapter>(
+        adapter: &mut A,
+        limit: usize,
+    ) -> Result<(), TransportError> {
+        adapter.set_control_payload_limit(limit)
+    }
+
+    #[test]
+    fn a_peer_limit_reaches_the_adapter_through_the_trait() {
+        let mut adapter = SimulatorAdapter::default();
+        apply_peer_limit(&mut adapter, 2 * 1024 * 1024).unwrap();
+        assert_eq!(
+            apply_peer_limit(&mut adapter, 0),
+            Err(TransportError::InvalidConfiguration),
+            "and a limit outside the protocol range is refused there too"
+        );
+        // The bound it set is the one submissions are held to, so this says the
+        // call arrived rather than only that it returned Ok.
+        assert_eq!(
+            adapter.send_control(&vec![
+                0;
+                2 * 1024 * 1024
+                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
+                    + 1
+            ]),
+            Err(TransportError::RecordTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_closed_carrier_reports_its_code_and_carries_nothing_further() {
+        // Answering Unsupported made every close over this carrier do nothing,
+        // so no scenario could show that a session ended under the code the
+        // registry gives the fault.
+        let mut adapter = SimulatorAdapter::default();
+        assert_eq!(adapter.close_code(), None);
+        adapter
+            .close(vot_codec::error_code::RESOURCE_LIMIT)
+            .unwrap();
+        assert_eq!(
+            adapter.close_code(),
+            Some(vot_codec::error_code::RESOURCE_LIMIT)
+        );
+
+        // The first code, not the last: a second teardown reports nothing new.
+        adapter
+            .close(vot_codec::error_code::MALFORMED_FRAME)
+            .unwrap();
+        assert_eq!(
+            adapter.close_code(),
+            Some(vot_codec::error_code::RESOURCE_LIMIT)
+        );
+
+        // And nothing else goes on a carrier that has ended.
+        assert_eq!(adapter.send_control(b"late"), Err(TransportError::Backend));
+        assert_eq!(
+            adapter.send_reliable(StreamId(1), b"late"),
+            Err(TransportError::Backend)
+        );
+        assert_eq!(
+            adapter.send_datagram(1, b"late"),
+            Err(TransportError::Backend)
+        );
+        // Draining what was already accepted still works: the events are the
+        // carrier's, and a driver has to learn what happened before it closed.
+        adapter.flush().unwrap();
+    }
+
+    #[test]
+    fn what_is_advertised_is_what_delivery_holds_a_peer_to() {
+        // Absent by default, because an adapter reporting limits it enforces
+        // nothing against would let a session advertise them and hold nobody.
+        let mut adapter = SimulatorAdapter::default();
+        assert_eq!(adapter.receive_limits(), None);
+
+        let settings = vot_codec::Settings {
+            max_control_frame_payload: 64 * 1024,
+            reliable_lane_limit: 2,
+            ..vot_codec::Settings::default()
+        };
+        let limits = vot_transport_api::ReceiveLimits::advertised(
+            &settings,
+            vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES,
+        )
+        .unwrap();
+        adapter.set_receive_limits(limits).unwrap();
+        assert_eq!(adapter.receive_limits(), Some(limits));
+        assert!(
+            limits.match_settings(&settings),
+            "which is what a session checks before it advertises them"
+        );
+
+        // Two lanes were advertised. A third in delivery is what the advertised
+        // bound refuses, and the lanes already seen stay free.
+        for lane in [7, 9, 7, 9] {
+            adapter.send_reliable(StreamId(lane), b"record").unwrap();
+        }
+        adapter.flush().unwrap();
+        adapter.send_reliable(StreamId(11), b"record").unwrap();
+        assert_eq!(adapter.flush(), Err(TransportError::LaneLimitExceeded));
+    }
+
+    #[test]
+    fn the_two_control_bounds_move_independently() {
+        // What a peer accepts and what this endpoint reassembles are different
+        // bounds, and negotiation moves them apart. A loopback sharing one field
+        // would report a peer's limit as its own and hold delivery to it.
+        let mut adapter = SimulatorAdapter::default();
+        adapter
+            .set_receive_limits(
+                vot_transport_api::ReceiveLimits::advertised(
+                    &vot_codec::Settings {
+                        max_control_frame_payload: 1024,
+                        ..vot_codec::Settings::default()
+                    },
+                    vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // The peer accepts more than this endpoint reassembles, so submission
+        // succeeds and delivery is what refuses.
+        apply_peer_limit(&mut adapter, 64 * 1024).unwrap();
+        adapter
+            .send_control(&vec![
+                0;
+                1024 + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES + 1
+            ])
+            .unwrap();
+        assert_eq!(adapter.flush(), Err(TransportError::RecordTooLarge));
+    }
 
     #[test]
     fn negotiated_control_payload_limit_is_applied() {

@@ -11,6 +11,10 @@ blake3.workspace = true
 vot-transport-api = { path = "../vot-transport-api" }
 
 [dev-dependencies]
+# The advertised limits are built from `vot_codec::Settings`, which
+# `vot-transport-api` takes in its own signature, and the close codes are the
+# registry's.
+vot-codec = { path = "../vot-codec" }
 vot-commit-model = { path = "../vot-commit-model" }
 vot-journal = { path = "../vot-journal" }
 vot-manifest = { path = "../vot-manifest" }

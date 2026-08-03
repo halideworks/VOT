@@ -67,6 +67,11 @@ const NULL: u8 = 0xf6;
 /// the shift has a mutant that is not: with the low five bits clear, `|` and `^`
 /// agree on every input, so a test cannot tell one from the other and the
 /// arithmetic form is the one a mutation run can hold.
+///
+/// `major` is a CBOR major type, so at most [`major::SIMPLE`]. A larger value is
+/// a caller error: a debug assertion catches it, and a release build wraps rather
+/// than corrupting the tag of some other type. Every caller in this crate passes
+/// a constant from [`major`].
 pub fn head(out: &mut Vec<u8>, major: u8, value: u64) {
     debug_assert!(major <= major::SIMPLE, "major type outside CBOR's range");
     let tag = major.wrapping_mul(32);

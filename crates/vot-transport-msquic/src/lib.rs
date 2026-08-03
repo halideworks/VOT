@@ -4002,6 +4002,13 @@ pub mod live {
                 }],
                 ..authorized.capability().scope.clone()
             };
+            assert!(
+                !granted.allows(vot_capability::Range {
+                    offset: 0,
+                    length: 65_536,
+                }),
+                "the grant is narrower than the capability, or narrowing means nothing"
+            );
             server
                 .grant(vot_capability::encode_scope(&granted).unwrap())
                 .unwrap();

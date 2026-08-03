@@ -2096,6 +2096,51 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_the_backend_has_no_room_for_does_not_open_the_data_plane() {
+        // The exchange concluded on this side, but the peer has not read the
+        // acceptance yet. Sending records over it would put them in front of
+        // the frame that authorises them.
+        let mut server = Session::server(
+            Loopback {
+                control_capacity: Some(0),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: demanding([3; 32]),
+            },
+        );
+        server.begin().unwrap();
+        server.negotiation.state = State::Negotiated;
+        server
+            .adapter
+            .events
+            .push_back(control(&session_open([7; 16], 1)));
+        assert_eq!(server.poll().unwrap(), None);
+        server.grant(b"scope".to_vec()).unwrap();
+
+        assert!(server.is_ready(), "the exchange concluded on this side");
+        assert!(server.adapter().sent.is_empty(), "and nothing went out");
+        let remaining = server.unsent_negotiation_frames();
+        assert!(remaining > 0);
+        assert_eq!(
+            server
+                .send_reliable(StreamId(1), &data_record(b"record"))
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::HandshakeUnsent { remaining }
+        );
+
+        server.adapter.control_capacity = None;
+        server.flush().unwrap();
+        assert_eq!(server.unsent_negotiation_frames(), 0);
+        server
+            .send_reliable(StreamId(1), &data_record(b"record"))
+            .unwrap();
+    }
+
+    #[test]
     fn an_empty_format_list_means_the_same_thing_whichever_variant_names_it() {
         // One rule decides, and it is the one section 1.1 states. A Capability
         // carrying no format is a server that requires none, not one that

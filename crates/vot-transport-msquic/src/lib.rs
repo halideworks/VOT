@@ -2473,7 +2473,7 @@ pub mod live {
         #[test]
         fn the_callback_budget_admits_the_bound_it_states() {
             // A budget that refuses its own maximum is a smaller budget than
-            // the one every comment and constant here describes.
+            // every comment and constant here describes.
             let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
             {
                 let mut held = queue.lock().unwrap();
@@ -2483,21 +2483,24 @@ pub mod live {
                 );
                 assert!(!held.reserve_assembly(1), "and nothing more");
                 held.release_assembly(MAX_CALLBACK_BYTES);
-                assert!(held.reserve_assembly(MAX_CALLBACK_BYTES - 1));
-                held.release_assembly(MAX_CALLBACK_BYTES - 1);
             }
-            let frame = vec![0x33; MAX_CALLBACK_BYTES / MAX_CALLBACK_EVENTS];
-            let mut admitted = 0;
-            while super::push(&queue, NativeEvent::Control(frame.clone())) {
-                admitted += 1;
+
+            // Sized so the last one lands exactly on the bound. Anything that
+            // does not divide it leaves the boundary itself untested, which is
+            // the only place an off-by-one lives.
+            let size = MAX_CALLBACK_BYTES / 16;
+            assert_eq!(size * 16, MAX_CALLBACK_BYTES);
+            let frame = vec![0x33; size];
+            for admitted in 1..=16 {
+                assert!(
+                    super::push(&queue, NativeEvent::Control(frame.clone())),
+                    "refused at {admitted} of 16, inside its own bound"
+                );
             }
-            let held = queue.lock().unwrap();
-            assert_eq!(
-                admitted * frame.len(),
-                MAX_CALLBACK_BYTES.min(admitted * frame.len()),
-                "the bound itself is spendable"
+            assert!(
+                !super::push(&queue, NativeEvent::Control(vec![0x33; 1])),
+                "and one byte past it is refused"
             );
-            drop(held);
         }
 
         #[test]

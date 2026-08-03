@@ -133,6 +133,12 @@ def validate(root: Path) -> None:
         f"parsed {len(operation_rows)} of {table_lines} capability operation rows"
     )
     assert 0 not in operation_rows.values(), "0x0000 is reserved"
+    # The name map collapses a duplicate name, which the row count above catches.
+    # Two names sharing a value survives both, and is what makes an operation set
+    # ambiguous on the wire.
+    assert len(set(operation_rows.values())) == len(operation_rows), (
+        "duplicate capability operation value"
+    )
     operation_rust_rows = {
         match["name"]: int(match["value"], 16)
         for match in RUST_CONSTANT.finditer(rust_module(rust_text, "operation"))

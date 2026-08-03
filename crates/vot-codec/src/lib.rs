@@ -1475,6 +1475,15 @@ mod tests {
                 operation::READ_RANGES
             ]
         );
+        // Ascending, which the list claims and nothing else checks. An operation
+        // set on the wire is canonical, so the order this is written in is the
+        // order an issuer will encode.
+        assert!(
+            REGISTERED_OPERATIONS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "REGISTERED_OPERATIONS is not ascending"
+        );
         assert_eq!(operation::PUBLISH, 0x0001);
         assert_eq!(operation::READ_MANIFEST, 0x0002);
         assert_eq!(operation::READ_RANGES, 0x0003);

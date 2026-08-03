@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 ed25519-dalek.workspace = true
-hmac = "0.12.1"
+hmac = "0.13.0"
 sha2.workspace = true
 
 [lints]

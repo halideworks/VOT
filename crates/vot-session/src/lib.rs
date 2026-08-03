@@ -2216,6 +2216,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::SessionOpenInvalid);
 
+        // A request declaring more than the registry gives SESSION_OPEN is
+        // refused on its declared length, before a byte of it is read. The
+        // envelope is built by hand because no encoder will produce one.
+        let mut oversized = demanding_server();
+        let mut envelope = Vec::new();
+        vot_codec::encode_varint(frame_type::SESSION_OPEN, &mut envelope).unwrap();
+        vot_codec::encode_varint(64 * 1024 + 1, &mut envelope).unwrap();
+        let error = oversized.accept_control(&envelope).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::Decode(DecodeError::FrameTooLarge { .. })
+            ),
+            "{:?}",
+            error.kind()
+        );
+
         // A deployment advertising no format concluded at AUTH_CONTEXT, so
         // there is nothing here to open.
         let mut open_to_nobody =

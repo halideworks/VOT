@@ -15,5 +15,5 @@ timeout_multiplier = 4.0
 # caught, 33 missed, 9 timeouts, 12 minutes. Promoting it needs those 33
 # classified and the timeouts understood first, and the job would have to build
 # MsQuic from source as the msquic-live job does.
-exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
+exclude_re = ["(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
 exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]

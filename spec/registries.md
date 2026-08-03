@@ -246,5 +246,11 @@ bytes so a server can reject a format it does not implement without parsing
 anything an unauthenticated peer chose the shape of.
 
 `ed25519-cbor-v1` is registered here so the identifier is stable, and is defined
-by ADR-0022 stage two. A server advertising no format requires no
-authentication, which `spec/wire.md` section 1.1 describes.
+by ADR-0022 stage two, with the issuer anchor it verifies against defined by
+ADR-0023. A server advertising no format requires no authentication, which
+`spec/wire.md` section 1.1 describes.
+
+A format defines its own delegation rules, and one that defines none refuses a
+capability claiming any. Chained delegation is therefore a new identifier rather
+than a new claim inside an existing format: a verifier that does not implement
+chains never advertises the format that carries them.

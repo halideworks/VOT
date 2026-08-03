@@ -128,6 +128,14 @@ What is left of section 1.1 is the capability format itself, which ADR-0022
 stage two picks. Nothing here reads a capability or produces a binding proof:
 the bytes are opaque, and a proof is whatever the caller signs the nonce with.
 
+Whose capability to believe is settled, though, and it is settled outside this
+crate as well. ADR-0023 makes the trust anchor a set of issuer entries the
+verifier configures, each binding a key identifier to an issuer identity and the
+audiences that key may issue for, with all three checked. That set belongs beside
+the identity store and the clock, which is to say at the same boundary
+`pending_authorization` already hands the decision to. A session neither holds
+issuer keys nor knows the time.
+
 ## The gate is asymmetric
 
 Sending application data before local readiness is refused. Receiving it before

@@ -95,8 +95,8 @@ the carrier switch the specification requires, and it needs nothing the MsQuic
 wrapper does not expose. A deployment wanting certificate binding can implement
 it in the policy boundary.
 
-One specification question remains open and is recorded here rather than
-answered.
-
-Nothing says who issues capabilities. Section 5 names issuer and audience but no
-trust anchor distribution. Stage two cannot ship without an answer.
+One specification question was left open here and is now answered in ADR-0023:
+nothing said who issues capabilities, and section 5 named issuer and audience
+with no trust anchor distribution. The anchor is a verifier-configured set of
+issuer entries, each binding a key identifier to an issuer identity and the
+audiences it may issue for.

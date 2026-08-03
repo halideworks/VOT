@@ -105,6 +105,29 @@ key, or proof-of-possession key. When deployment constraints require an unbound
 bearer token, its shorter lifetime and replay exposure MUST be declared in
 policy and audit data.
 
+A verifier accepts a capability only against a configured issuer entry naming a
+key identifier, a verification key, and the audiences that key may issue for. All
+three MUST match: the signature verifies under that key, the issuer claim is that
+entry's identity, and the audience claim is one the entry permits. An issuer set
+is deployment configuration. A verifier MUST NOT originate network work to obtain
+an issuer key while authenticating: an unauthenticated peer would otherwise
+decide when the verifier makes a request, which is the reflection lever section 7
+denies it on the VOT connection, and it makes authentication fail whenever that
+service is unreachable. A verifier that cannot evaluate an issuer entry MUST fail
+closed. A capability whose issuer is not in the set is refused whatever else it
+carries, and an empty set with a capability format advertised accepts nothing.
+
+Not-before and expiry are evaluated against the verifier's clock, since no VOT
+frame carries an absolute one. Skew tolerance MUST be declared in policy. Between
+issuance and expiry, revocation is a deployment-local deny list on the unique
+token identifier; no frame carries a revocation, so a deployment needing one
+faster than expiry MUST shorten the lifetime.
+
+A verifier MUST evaluate the delegation constraints claim rather than carry it
+unread. A capability format that does not define delegation MUST refuse a
+capability claiming any, which is what `ed25519-cbor-v1` does; chained delegation
+is a separate capability format identifier.
+
 Authorization is checked again when a request expands scope, switches source or
 carrier, publishes an object, creates an alias, or renews a lease. Cache presence
 does not confer read authorization. A dual-suite alias does not broaden the

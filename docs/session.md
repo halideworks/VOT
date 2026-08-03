@@ -42,53 +42,87 @@ a known frame type: an unknown optional or grease frame is discarded by its
 length first, since section 2 asks a peer to grease live handshakes and those
 happen before authentication concludes.
 
-## What the exchange does today
+## What the exchange does
 
 The server sends `AUTH_CONTEXT` immediately after `SETTINGS_ACK`, in the same
-reply, so a peer never has to be told to expect it. It advertises no capability
-format, which section 1.1 defines as this deployment requiring no
-authentication. `AUTH_CONTEXT` is then the concluding frame, and each endpoint
-is authenticated once it has sent or read it.
+reply, so a peer never has to be told to expect it. What it advertises decides
+where the exchange ends.
 
-A client that receives a challenge advertising a capability format closes with
-`AUTHENTICATION_FAILED`. Nothing can present one yet, and accepting the frame
-would leave the client believing it is authenticated while the server waits for
-a `SESSION_OPEN` that never comes.
+| Stance | Role | Concluding frame |
+| --- | --- | --- |
+| `Authentication::NotRequired` | either | `AUTH_CONTEXT`, advertising no format |
+| `Authentication::Capability` | server | `SESSION_ACCEPT` |
+| `Authentication::Presenting` | client | `SESSION_ACCEPT` |
 
-The nonce is supplied by the caller through `Authentication::NotRequired`. This
-crate has no randomness, and a session whose freshness came from inside it could
-not be tested for the value it actually sent.
+Each endpoint is authenticated once it has sent or read the concluding frame.
+`Session::begin` refuses a stance the role cannot act on: a server given
+`Presenting` would advertise a nonce no caller chose, and a client given
+`Capability` would ignore the challenge it was handed.
 
-A server whose caller supplies `Authentication::Capability` advertises formats
-instead, and then the exchange concludes at `SESSION_ACCEPT`.
+The nonce is supplied by the caller. This crate has no randomness, and a session
+whose freshness came from inside it could not be tested for the value it
+actually sent.
+
+A client whose caller presents nothing closes with `AUTHENTICATION_FAILED` when
+a challenge advertises a format. That is what section 1.1 gives the format list
+for, and accepting the frame instead would leave the client believing it is
+authenticated while the server waits for a `SESSION_OPEN` that never comes.
 
 ## Where the capability decision lives
 
-Not here. A session checks everything section 1.1 states about a request: that
-the format is one it advertised, that the identifier is not one an earlier
-attempt used, that no more than three attempts arrive, and that the answer
-carries the identifier the request did. What a capability is worth it does not
-decide.
+Not here. A session checks everything section 1.1 states about a request and
+about the answer to one. What a capability is worth it does not decide.
 
-`accept_control` returns `Accepted::AuthorizationRequired`, nothing reaches the
-carrier, and the caller answers through `pending_authorization`, `grant`, and
-`refuse`.
+`accept_control` returns `Accepted::AuthorizationRequired` on a server and
+`Accepted::PresentationRequired` on a client. Nothing reaches the carrier either
+way, and the caller answers through `pending_authorization`, `grant`, and
+`refuse` on one side, and `pending_presentation` and `present` on the other.
 
-A caller has to look. `poll` returns `None` while a request waits, the same as
+A caller has to look. `poll` returns `None` while a decision waits, the same as
 it does with nothing to report, so a loop that only drains events and never
-checks `pending_authorization` stalls with the data plane shut and no error to
-show for it. The boundary is the caller's rather than a trait this crate calls: a
-policy needs a deployment's own identity store and clock, and a session has
-neither. It also keeps `Negotiation` free of a trait object, which is what lets
-it stay `Clone` and `Debug` and testable without a policy at all.
+checks stalls with the data plane shut and no error to show for it. The boundary
+is the caller's rather than a trait this crate calls: a policy needs a
+deployment's own identity store and clock, and a session has neither. It also
+keeps `Negotiation` free of a trait object, which is what lets it stay `Clone`
+and `Debug` and testable without a policy at all.
 
 A refusal leaves the session open, since section 1.1 lets a client try again
 with another capability. The fourth attempt closes with
 `AUTHENTICATION_FAILED`.
 
-What is left of section 1.1 is the client half: presenting a capability against
-a challenge that asks for one. A client that receives such a challenge closes
-today. ADR-0022 stage two picks the capability format itself.
+### Every rule holds in both directions
+
+Each row is one rule, checked where a request is read and where one is built.
+The client half refuses locally rather than sending: a request that breaks one
+of these is answered with a close rather than a rejection, so sending it would
+cost the session every attempt it had left.
+
+| Rule | Reading a request | Building one |
+| --- | --- | --- |
+| The format is one the server advertised | `CapabilityFormatNotOffered` | `PresentationError::FormatNotOffered` |
+| The identifier is fresh | `SessionIdentifierReused` | `PresentationError::IdentifierReused` |
+| At most three attempts | `TooManyAuthenticationAttempts` | `PresentationError::AttemptsSpent` |
+| The binding proof matches the binding | `BindingProofMismatch` | `PresentationError::BindingProof` |
+| The answer repeats the request's identifier | `SessionIdentifierMismatch` | the answer carries the request's |
+
+The binding rule is one function both sides call: the proof is empty when the
+binding is none and present when it is proof of possession. Length bounds cannot
+express it, since only the challenge says which binding is in force, and the
+challenge is a different frame from the request.
+
+A client reads the challenge once. A demanding one leaves the client
+`Negotiated`, which is the state `AUTH_CONTEXT` arrives in, so a second would
+otherwise replace the nonce a proof was computed over.
+
+An exchange frame is also measured against the peer's negotiated control-frame
+limit before it is sent. A capability may be 48 KiB and a peer may advertise a
+maximum of 1 KiB, and the exchange does not go through the application send path
+that would otherwise catch it. Without the check the frame goes out and the peer
+closes the session for a frame it said it would not accept.
+
+What is left of section 1.1 is the capability format itself, which ADR-0022
+stage two picks. Nothing here reads a capability or produces a binding proof:
+the bytes are opaque, and a proof is whatever the caller signs the nonce with.
 
 ## The gate is asymmetric
 

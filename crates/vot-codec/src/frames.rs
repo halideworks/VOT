@@ -522,6 +522,26 @@ fn validate_session_accept(value: &SessionAccept) -> Result<(), Error> {
     Ok(())
 }
 
+/// Decodes a `SESSION_ACCEPT` payload, envelope excluded.
+///
+/// The negotiation state machine reads the four section 1.1 payloads without
+/// going through the typed frame dispatch, since it handles the frames itself.
+///
+/// # Errors
+/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`.
+pub fn decode_session_accept_payload(payload: &[u8]) -> Result<SessionAccept, Error> {
+    decode_session_accept(payload)
+}
+
+/// Decodes a `SESSION_REJECT` payload, envelope excluded.
+///
+/// # Errors
+/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`, and
+/// a reason `spec/wire.md` section 1.1 does not assign to a rejection.
+pub fn decode_session_reject_payload(payload: &[u8]) -> Result<SessionReject, Error> {
+    decode_session_reject(payload)
+}
+
 fn decode_session_accept(input: &[u8]) -> Result<SessionAccept, Error> {
     let mut reader = Reader::new(input);
     reader.map(3)?;

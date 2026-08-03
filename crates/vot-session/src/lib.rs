@@ -1,9 +1,11 @@
-//! The `spec/wire.md` section 1 exchange, and the gate it puts in front of the
-//! data plane. See `docs/session.md`.
+//! The `spec/wire.md` section 1 and 1.1 exchanges, and the gates they put in
+//! front of the data plane. See `docs/session.md`.
 //!
-//! `Ready` means negotiated, not authenticated. `AUTH_CONTEXT`,
-//! `SESSION_OPEN`, and `SESSION_ACCEPT` are unimplemented, so every frame the
-//! registry marks `auth: yes` is not yet conforming.
+//! Both halves of the authentication exchange run here. What a capability is
+//! worth, and what one to present, are the caller's: the state machine owns the
+//! sequence and the identities, and hands the decision out through
+//! [`Accepted::AuthorizationRequired`] on a server and
+//! [`Accepted::PresentationRequired`] on a client.
 
 #![forbid(unsafe_code)]
 
@@ -110,23 +112,39 @@ pub enum ErrorKind {
     /// A frame the registry marks `auth: yes` arrived after negotiation and
     /// before the authentication exchange concluded.
     NotAuthenticated { frame_type: u64 },
-    /// The server asked for a capability, which no policy boundary can present
-    /// yet.
+    /// The server asked for a capability and this endpoint has none to present.
     CapabilityRequired { formats: usize },
     /// `AUTH_CONTEXT` did not carry a challenge.
     AuthContextInvalid,
     /// `SESSION_OPEN` did not carry a request.
     SessionOpenInvalid,
+    /// `SESSION_ACCEPT` or `SESSION_REJECT` did not carry an answer.
+    SessionAnswerInvalid { frame_type: u64 },
+    /// An answer named an attempt this endpoint did not make, so nothing here
+    /// can tell which request it belongs to.
+    SessionIdentifierMismatch { answered: [u8; 16], sent: [u8; 16] },
     /// The caller answered a request with something that cannot be encoded: a
     /// scope too wide for the frame, or a reason the registry does not assign
     /// to authentication or authorization.
-    SessionAnswerInvalid,
+    SessionAnswerUnencodable,
+    /// The caller's request cannot be presented, with the section 1.1 rule it
+    /// broke. Local, so it closes nothing: another request may follow.
+    PresentationInvalid(PresentationError),
+    /// A request whose binding proof does not match the binding the challenge
+    /// named.
+    BindingProofMismatch {
+        binding: Binding,
+        proof_bytes: usize,
+    },
     /// A retry reused a session identifier.
     SessionIdentifierReused,
     /// A request named a capability format this endpoint never advertised.
     CapabilityFormatNotOffered { format: u64 },
     /// More attempts than section 1.1 allows.
     TooManyAuthenticationAttempts { attempts: usize },
+    /// A stance that means nothing for this endpoint's role, which would leave
+    /// it advertising a challenge it never built or ignoring one it did.
+    AuthenticationRoleMismatch { role: EndpointRole },
     /// The carrier ended before the exchange finished.
     Interrupted { state: State },
     /// The application tried to use the data plane before `Ready`.
@@ -176,6 +194,32 @@ pub enum ErrorKind {
     },
 }
 
+/// Why a request the caller built cannot go out, from the rules
+/// `spec/wire.md` section 1.1 puts on `SESSION_OPEN`.
+///
+/// One table rather than an error kind per rule: every one of these is the
+/// caller handing the client half something the section forbids, and none of
+/// them is the peer's doing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationError {
+    /// No challenge is waiting for one, or an attempt is already out.
+    NothingToAnswer { state: State },
+    /// The attempts section 1.1 allows are spent, so a further request would
+    /// be closed on rather than answered.
+    AttemptsSpent { attempts: usize },
+    /// A session identifier an earlier attempt used, which the server rejects
+    /// as a duplicate rather than reading as a retry.
+    IdentifierReused,
+    /// A capability format the server did not advertise.
+    FormatNotOffered { format: u64 },
+    /// A binding proof that does not match the binding the challenge named:
+    /// empty under proof of possession, or present under none.
+    BindingProof {
+        binding: Binding,
+        proof_bytes: usize,
+    },
+}
+
 impl ErrorKind {
     /// Whether the peer caused this, and so whether it belongs on the wire.
     #[must_use]
@@ -189,6 +233,9 @@ impl ErrorKind {
             | Self::NotAuthenticated { .. }
             | Self::AuthContextInvalid
             | Self::SessionOpenInvalid
+            | Self::SessionAnswerInvalid { .. }
+            | Self::SessionIdentifierMismatch { .. }
+            | Self::BindingProofMismatch { .. }
             | Self::SessionIdentifierReused
             | Self::CapabilityFormatNotOffered { .. }
             | Self::TooManyAuthenticationAttempts { .. }
@@ -210,7 +257,9 @@ impl ErrorKind {
             | Self::Interrupted { .. }
             | Self::ReceiveLimitMismatch { .. }
             | Self::NegotiationFrameFromApplication { .. }
-            | Self::SessionAnswerInvalid
+            | Self::SessionAnswerUnencodable
+            | Self::PresentationInvalid(_)
+            | Self::AuthenticationRoleMismatch { .. }
             | Self::HandshakeUnsent { .. } => false,
         }
     }
@@ -229,6 +278,14 @@ pub enum Accepted {
     /// Nothing moves until it does: the exchange is not concluded and the data
     /// plane is still shut.
     AuthorizationRequired,
+    /// A server asked this client for a capability, or refused the last one it
+    /// presented. The caller answers with [`Negotiation::present`], reading the
+    /// challenge from [`Negotiation::pending_presentation`] and the refusal, if
+    /// there was one, from [`Negotiation::last_refusal`].
+    ///
+    /// A caller with nothing left to present closes the carrier: no request is
+    /// also no conclusion, and the data plane stays shut either way.
+    PresentationRequired,
 }
 
 /// The exchange as a state machine, with no carrier and no buffers.
@@ -243,17 +300,31 @@ pub struct Negotiation {
     /// the caller: this crate has no randomness, and a session whose freshness
     /// came from inside it could not be tested for the value it actually sent.
     challenge: AuthContext,
-    /// What the peer opened, once one attempt is under way.
+    /// Whether a client has read the server's challenge. A demanding challenge
+    /// leaves the client `Negotiated`, so without this a second `AUTH_CONTEXT`
+    /// would replace the one an attempt is already answering.
+    challenge_read: bool,
+    /// Whether this client will answer a challenge that asks for a capability.
+    /// False on a server, and on a client whose caller presents nothing.
+    presenting: bool,
+    /// The attempt under way: what the peer opened on a server, and what this
+    /// endpoint sent on a client.
     open: Option<SessionOpen>,
     /// Session identifiers already attempted, so a retry cannot reuse one.
     attempted: Vec<[u8; 16]>,
+    /// What the server authorized, which may be narrower than what a client
+    /// asked for. The caller has no other way to learn it.
+    granted: Option<SessionAccept>,
+    /// Why the last attempt was refused, for a caller deciding whether another
+    /// is worth making. Cleared when one is.
+    refusal: Option<SessionReject>,
     peer_hello: Option<Hello>,
     peer_settings: Option<Settings>,
 }
 
 impl Negotiation {
     /// A connecting endpoint, which opens the negotiation stream and speaks
-    /// first.
+    /// first, and presents no capability.
     #[must_use]
     pub fn client(local: Settings, extensions: BTreeSet<u64>) -> Self {
         Self::new(
@@ -261,13 +332,31 @@ impl Negotiation {
             local,
             extensions,
             no_capability([0; 32]),
+            false,
+        )
+    }
+
+    /// A connecting endpoint whose caller answers a challenge that asks for a
+    /// capability.
+    ///
+    /// Nothing is declared here. A request binds to the nonce in the challenge,
+    /// which does not exist until the server sends one, so the caller builds it
+    /// then and passes it to [`present`](Self::present).
+    #[must_use]
+    pub fn presenting_client(local: Settings, extensions: BTreeSet<u64>) -> Self {
+        Self::new(
+            EndpointRole::Client,
+            local,
+            extensions,
+            no_capability([0; 32]),
+            true,
         )
     }
 
     /// An accepting endpoint, which answers on the stream the client opened.
     #[must_use]
     pub fn server(local: Settings, extensions: BTreeSet<u64>, challenge: AuthContext) -> Self {
-        Self::new(EndpointRole::Server, local, extensions, challenge)
+        Self::new(EndpointRole::Server, local, extensions, challenge, false)
     }
 
     fn new(
@@ -275,6 +364,7 @@ impl Negotiation {
         local: Settings,
         extensions: BTreeSet<u64>,
         challenge: AuthContext,
+        presenting: bool,
     ) -> Self {
         Self {
             role,
@@ -282,8 +372,12 @@ impl Negotiation {
             local,
             extensions,
             challenge,
+            challenge_read: false,
+            presenting,
             open: None,
             attempted: Vec::new(),
+            granted: None,
+            refusal: None,
             peer_hello: None,
             peer_settings: None,
         }
@@ -422,13 +516,12 @@ impl Negotiation {
             frame_type::SETTINGS_ACK => self.accept_settings_ack(),
             frame_type::AUTH_CONTEXT => self.accept_auth_context(payload),
             frame_type::SESSION_OPEN => self.accept_session_open(payload),
-            // The exchange owns its answers inbound as well as outbound. This
-            // endpoint never sends SESSION_OPEN, so an answer to one is a
-            // frame nothing here asked for, and handing it to the application
-            // would let a peer look like it had authenticated.
-            answer @ (frame_type::SESSION_ACCEPT | frame_type::SESSION_REJECT) => {
-                Err(self.out_of_sequence(answer))
-            }
+            // The exchange owns its answers inbound as well as outbound.
+            // Refused rather than handed to the application when no attempt is
+            // out, since an answer to a request nothing made would let a peer
+            // look like it had authenticated.
+            frame_type::SESSION_ACCEPT => self.accept_session_accept(payload),
+            frame_type::SESSION_REJECT => self.accept_session_reject(payload),
             other => self.accept_application(other),
         }
     }
@@ -530,18 +623,32 @@ impl Negotiation {
 
     /// Accepts the server's challenge.
     ///
-    /// No capability format is advertised yet, so this is the concluding frame
-    /// of the exchange and reading it is what authenticates the client.
+    /// A challenge advertising no capability format is the concluding frame of
+    /// the exchange, so reading it is what authenticates the client. One that
+    /// advertises a format needs an answer, which the caller builds.
     fn accept_auth_context(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
-        if self.role != EndpointRole::Client || self.state != State::Negotiated {
+        // Sent once. A demanding challenge leaves the client Negotiated, so
+        // without the flag a second one would replace the challenge an attempt
+        // is answering and change what it was signed over.
+        if self.role != EndpointRole::Client
+            || self.state != State::Negotiated
+            || self.challenge_read
+        {
             return Err(self.out_of_sequence(frame_type::AUTH_CONTEXT));
         }
         let context = vot_codec::frames::decode_auth_context_payload(payload)
             .map_err(|_| Error::new(ErrorKind::AuthContextInvalid, error_code::MALFORMED_FRAME))?;
-        if !context.formats.is_empty() {
-            // A server asking for a capability this endpoint cannot present.
-            // Refusing is what stops a client from looking authenticated to
-            // itself while the server waits for a SESSION_OPEN.
+        if context.formats.is_empty() {
+            self.challenge_read = true;
+            self.challenge = context;
+            self.state = State::Authenticated;
+            return Ok(Accepted::Consumed { reply: Vec::new() });
+        }
+        if !self.presenting {
+            // A server asking for a capability this endpoint has none of.
+            // Refusing immediately is what section 1.1 gives the format list
+            // for, and it stops a client from looking authenticated to itself
+            // while the server waits for a SESSION_OPEN.
             return Err(Error::new(
                 ErrorKind::CapabilityRequired {
                     formats: context.formats.len(),
@@ -549,8 +656,77 @@ impl Negotiation {
                 error_code::AUTHENTICATION_FAILED,
             ));
         }
+        self.challenge_read = true;
+        self.challenge = context;
+        Ok(Accepted::PresentationRequired)
+    }
+
+    /// Accepts the server's acceptance, which concludes the exchange.
+    fn accept_session_accept(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
+        let sent = self.answered_attempt(frame_type::SESSION_ACCEPT)?;
+        let accept = vot_codec::frames::decode_session_accept_payload(payload).map_err(|_| {
+            Error::new(
+                ErrorKind::SessionAnswerInvalid {
+                    frame_type: frame_type::SESSION_ACCEPT,
+                },
+                error_code::MALFORMED_FRAME,
+            )
+        })?;
+        Self::require_answers_attempt(accept.session_id, sent)?;
+        self.open = None;
+        self.refusal = None;
+        self.granted = Some(accept);
         self.state = State::Authenticated;
         Ok(Accepted::Consumed { reply: Vec::new() })
+    }
+
+    /// Accepts the server's refusal, which leaves the session open for another
+    /// attempt.
+    fn accept_session_reject(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
+        let sent = self.answered_attempt(frame_type::SESSION_REJECT)?;
+        // The reason is one of the three section 1.1 assigns to a rejection:
+        // the codec refuses the rest, so nothing here has to name them twice.
+        let reject = vot_codec::frames::decode_session_reject_payload(payload).map_err(|_| {
+            Error::new(
+                ErrorKind::SessionAnswerInvalid {
+                    frame_type: frame_type::SESSION_REJECT,
+                },
+                error_code::MALFORMED_FRAME,
+            )
+        })?;
+        Self::require_answers_attempt(reject.session_id, sent)?;
+        self.open = None;
+        self.refusal = Some(reject);
+        // Still Negotiated, and the challenge still stands. Another attempt may
+        // follow while section 1.1 allows one.
+        Ok(Accepted::PresentationRequired)
+    }
+
+    /// The identifier of the attempt an inbound answer must belong to.
+    ///
+    /// One pattern rather than a chain of conditions, so the only way to widen
+    /// what an answer is accepted in is to write another arm. A server holds a
+    /// request in the same field and must not read an answer to it.
+    fn answered_attempt(&self, frame_type: u64) -> Result<[u8; 16], Error> {
+        match (self.role, self.state, &self.open) {
+            (EndpointRole::Client, State::Negotiated, Some(open)) => Ok(open.session_id),
+            _ => Err(self.out_of_sequence(frame_type)),
+        }
+    }
+
+    /// Refuses an answer that names an attempt this endpoint did not make.
+    ///
+    /// Section 1.1 has both answers repeat the request's identifier. Without
+    /// this a server could authenticate a client by answering an attempt that
+    /// was never sent, and a rejection could clear an attempt still in flight.
+    fn require_answers_attempt(answered: [u8; 16], sent: [u8; 16]) -> Result<(), Error> {
+        if answered == sent {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::SessionIdentifierMismatch { answered, sent },
+            error_code::AUTHENTICATION_FAILED,
+        ))
     }
 
     /// Decides whether a frame outside the exchange may be carried.
@@ -602,6 +778,18 @@ impl Negotiation {
                 error_code::AUTHENTICATION_FAILED,
             ));
         }
+        // The same rule the client half applies before sending. A proof under a
+        // binding that asks for none, or none under a binding that asks for a
+        // proof, is a request no policy can weigh.
+        if !binding_proof_agrees(self.challenge.binding, &open.binding_proof) {
+            return Err(Error::new(
+                ErrorKind::BindingProofMismatch {
+                    binding: self.challenge.binding,
+                    proof_bytes: open.binding_proof.len(),
+                },
+                error_code::AUTHENTICATION_FAILED,
+            ));
+        }
         self.attempted.push(open.session_id);
         self.open = Some(open);
         Ok(Accepted::AuthorizationRequired)
@@ -614,6 +802,138 @@ impl Negotiation {
             Some(open) => Some((&self.challenge, open)),
             None => None,
         }
+    }
+
+    /// The challenge awaiting a capability, on a client that can present one.
+    ///
+    /// Absent while an attempt is out: the answer to that one decides whether
+    /// another is needed. The nonce is here because a proof of possession is
+    /// over it.
+    /// One pattern rather than a chain of negations: a client, negotiated, able
+    /// to present, having read a challenge, and with no attempt out.
+    #[must_use]
+    pub const fn pending_presentation(&self) -> Option<&AuthContext> {
+        match (
+            self.role,
+            self.state,
+            self.presenting,
+            self.challenge_read,
+            &self.open,
+        ) {
+            (EndpointRole::Client, State::Negotiated, true, true, None) => Some(&self.challenge),
+            _ => None,
+        }
+    }
+
+    /// Attempts section 1.1 still allows this session. Zero means a further
+    /// request would be closed on rather than answered.
+    #[must_use]
+    pub const fn attempts_remaining(&self) -> usize {
+        MAX_AUTHENTICATION_ATTEMPTS.saturating_sub(self.attempted.len())
+    }
+
+    /// What the server authorized, once it has accepted an attempt. Empty is a
+    /// grant of the capability's whole scope, not an absent one.
+    #[must_use]
+    pub const fn granted(&self) -> Option<&SessionAccept> {
+        self.granted.as_ref()
+    }
+
+    /// Why the last attempt was refused, for a caller deciding whether to make
+    /// another.
+    #[must_use]
+    pub const fn last_refusal(&self) -> Option<&SessionReject> {
+        self.refusal.as_ref()
+    }
+
+    /// Presents the caller's capability against the challenge that asked for
+    /// one.
+    ///
+    /// Every rule section 1.1 puts on a request is checked here, so a request
+    /// this endpoint would be closed on never reaches the carrier. What the
+    /// capability itself is worth is the server's to decide.
+    ///
+    /// # Errors
+    /// Reports a request that answers no challenge, spent attempts, a reused
+    /// identifier, a format the server did not advertise, a binding proof that
+    /// does not match the challenge, and a request the peer's negotiated
+    /// control-frame limit will not carry. None of them closes the session.
+    pub fn present(&mut self, request: SessionOpen) -> Result<Vec<Vec<u8>>, Error> {
+        if self.pending_presentation().is_none() {
+            return Err(presentation_error(PresentationError::NothingToAnswer {
+                state: self.state,
+            }));
+        }
+        if self.attempts_remaining() == 0 {
+            return Err(presentation_error(PresentationError::AttemptsSpent {
+                attempts: self.attempted.len(),
+            }));
+        }
+        // The rules the server checks on arrival, checked here first. A request
+        // breaking one of them is answered with a close rather than a rejection,
+        // so sending it costs the session every attempt it had left.
+        if self.attempted.contains(&request.session_id) {
+            return Err(presentation_error(PresentationError::IdentifierReused));
+        }
+        if !self.challenge.formats.contains(&request.capability_format) {
+            return Err(presentation_error(PresentationError::FormatNotOffered {
+                format: request.capability_format,
+            }));
+        }
+        if !binding_proof_agrees(self.challenge.binding, &request.binding_proof) {
+            return Err(presentation_error(PresentationError::BindingProof {
+                binding: self.challenge.binding,
+                proof_bytes: request.binding_proof.len(),
+            }));
+        }
+        // Encoded and measured before the attempt is spent, so a request that
+        // cannot go out leaves the caller able to make another.
+        let frame =
+            Self::session_frame(&vot_codec::frames::TypedFrame::SessionOpen(request.clone()))?;
+        self.within_peer_control_limit(&frame)?;
+        self.attempted.push(request.session_id);
+        self.refusal = None;
+        self.open = Some(request);
+        Ok(vec![frame])
+    }
+
+    /// Refuses an exchange frame the peer's negotiated limit would not carry.
+    ///
+    /// A capability can be 48 KiB and a peer may advertise a control-frame
+    /// maximum of 1 KiB, so this is the difference between a local error and a
+    /// session the peer closes for a frame it said it would not accept. The
+    /// exchange does not go through [`Session::check_outbound`], which refuses
+    /// its frames as application ones.
+    ///
+    /// [`Session::check_outbound`]: Session::check_outbound
+    fn within_peer_control_limit(&self, frame: &[u8]) -> Result<(), Error> {
+        let Some(peer) = self.peer_settings else {
+            return Ok(());
+        };
+        let limits = vot_codec::DecodeLimits {
+            // The protocol ceiling, not the negotiated one. This endpoint
+            // encoded the frame, so the only bound that matters is the peer's,
+            // and reporting it as a decode failure would say the wrong thing.
+            max_unknown_payload: vot_codec::HARD_MAX_FRAME_PAYLOAD,
+            max_frames: 1,
+        };
+        let envelope = vot_codec::peek_envelope(frame, limits).map_err(decode_error)?;
+        let bytes = u64::try_from(envelope.payload_length).unwrap_or(u64::MAX);
+        let limit = negotiated_payload_limit(envelope.frame_type, &peer);
+        if bytes <= limit {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::FrameExceedsLimit {
+                frame_type: envelope.frame_type,
+                bytes,
+                limit,
+                // The peer's limit, so going past it would be this endpoint's
+                // doing.
+                side: Side::Peer,
+            },
+            error_code::FRAME_TOO_LARGE,
+        ))
     }
 
     /// Authorizes the pending request with the scope the policy granted.
@@ -631,10 +951,12 @@ impl Negotiation {
             session_id: open.session_id,
             granted_scope,
         };
-        // Encoded before the request is spent. An answer that cannot go out
-        // must leave the caller able to make another, and dropping the request
-        // first would leave a peer waiting on a decision nothing still holds.
+        // Encoded and measured before the request is spent. An answer that
+        // cannot go out must leave the caller able to make another, and dropping
+        // the request first would leave a peer waiting on a decision nothing
+        // still holds.
         let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionAccept(accept))?;
+        self.within_peer_control_limit(&frame)?;
         self.open = None;
         self.state = State::Authenticated;
         Ok(vec![frame])
@@ -659,16 +981,20 @@ impl Negotiation {
             detail,
         };
         let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionReject(reject))?;
+        self.within_peer_control_limit(&frame)?;
         self.open = None;
         Ok(vec![frame])
     }
 
     fn session_frame(frame: &vot_codec::frames::TypedFrame) -> Result<Vec<u8>, Error> {
         let mut encoded = Vec::new();
-        // The caller's answer, not the peer's request. Blaming the peer for it
-        // would close the carrier over a local mistake.
+        // The caller's own frame, not the peer's. Blaming the peer for it would
+        // close the carrier over a local mistake.
         vot_codec::frames::encode(frame, &mut encoded).map_err(|_| {
-            Error::new(ErrorKind::SessionAnswerInvalid, error_code::MALFORMED_FRAME)
+            Error::new(
+                ErrorKind::SessionAnswerUnencodable,
+                error_code::MALFORMED_FRAME,
+            )
         })?;
         Ok(encoded)
     }
@@ -719,6 +1045,11 @@ impl Negotiation {
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type::AUTH_CONTEXT, &payload, &mut frame)
             .map_err(|error| Error::new(ErrorKind::Decode(error), error_code::MALFORMED_FRAME))?;
+        // Measured like the other three, though a maximal challenge is around
+        // 130 bytes and the smallest limit a peer may advertise is 1024. Uniform
+        // rather than reasoned about per frame, so a registry that widens the
+        // challenge does not leave one frame unmeasured.
+        self.within_peer_control_limit(&frame)?;
         Ok(frame)
     }
 
@@ -734,6 +1065,27 @@ impl Negotiation {
 
 fn settings_ack_frame() -> Result<Vec<u8>, Error> {
     frame(frame_type::SETTINGS_ACK, &[])
+}
+
+/// Whether a request's binding proof matches the binding the challenge named.
+///
+/// `spec/wire.md` section 1.1: the proof is empty when the binding is none, and
+/// otherwise proves possession of the key the capability names. One function for
+/// both directions, so the rule cannot hold on the side that sends and not on
+/// the side that reads.
+const fn binding_proof_agrees(binding: Binding, proof: &[u8]) -> bool {
+    match binding {
+        Binding::None => proof.is_empty(),
+        Binding::ProofOfPossession => !proof.is_empty(),
+    }
+}
+
+/// A request the caller cannot present. Local, so it closes nothing.
+const fn presentation_error(reason: PresentationError) -> Error {
+    Error::new(
+        ErrorKind::PresentationInvalid(reason),
+        error_code::AUTHENTICATION_FAILED,
+    )
 }
 
 fn frame(frame_type: u64, payload: &[u8]) -> Result<Vec<u8>, Error> {
@@ -785,11 +1137,12 @@ impl<A: TransportAdapter> Session<A> {
         extensions: BTreeSet<u64>,
         authentication: Authentication,
     ) -> Self {
-        Self::new(
-            adapter,
-            Negotiation::client(local, extensions),
-            authentication,
-        )
+        let negotiation = if matches!(authentication, Authentication::Presenting) {
+            Negotiation::presenting_client(local, extensions)
+        } else {
+            Negotiation::client(local, extensions)
+        };
+        Self::new(adapter, negotiation, authentication)
     }
 
     /// An accepting session, which answers on the stream the client opened.
@@ -803,8 +1156,11 @@ impl<A: TransportAdapter> Session<A> {
         authentication: Authentication,
     ) -> Self {
         let challenge = match &authentication {
-            Authentication::NotRequired { nonce } => no_capability(*nonce),
             Authentication::Capability { challenge } => challenge.clone(),
+            // A client's stance, which `begin` refuses on a server rather than
+            // advertising a challenge this endpoint never built.
+            Authentication::NotRequired { nonce } => no_capability(*nonce),
+            Authentication::Presenting => no_capability([0; 32]),
         };
         Self::new(
             adapter,
@@ -912,9 +1268,36 @@ impl<A: TransportAdapter> Session<A> {
     /// Reports a second call, an unencodable local frame, or a backend that
     /// refused the submission.
     pub fn begin(&mut self) -> Result<(), Error> {
+        self.check_authentication_role()?;
         self.check_receive_limit()?;
         let frames = self.negotiation.begin()?;
         self.submit(frames)
+    }
+
+    /// Refuses a stance that means nothing for this endpoint's role.
+    ///
+    /// A server given a client's stance would advertise a nonce no caller
+    /// chose, and a client given a server's would ignore the challenge it was
+    /// handed. Both used to pass and do nothing, which is the failure that
+    /// shows up as a peer refusing the exchange.
+    fn check_authentication_role(&self) -> Result<(), Error> {
+        let role = self.negotiation.role;
+        let fits = match (&self.authentication, role) {
+            // NotRequired is the one stance both roles can act on: a server
+            // advertises no format, and a client refuses a challenge that asks
+            // for one.
+            (Authentication::NotRequired { .. }, _)
+            | (Authentication::Capability { .. }, EndpointRole::Server)
+            | (Authentication::Presenting, EndpointRole::Client) => true,
+            (Authentication::Capability { .. } | Authentication::Presenting, _) => false,
+        };
+        if fits {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::AuthenticationRoleMismatch { role },
+            error_code::MALFORMED_FRAME,
+        ))
     }
 
     /// Refuses to advertise a control-frame limit the backend will not keep.
@@ -1106,8 +1489,8 @@ impl<A: TransportAdapter> Session<A> {
                 Ok(None)
             }
             // The caller's policy decides. Nothing is sent and nothing moves
-            // until it answers through grant or refuse.
-            Accepted::AuthorizationRequired => Ok(None),
+            // until it answers through grant, refuse, or present.
+            Accepted::AuthorizationRequired | Accepted::PresentationRequired => Ok(None),
         }
     }
 
@@ -1115,6 +1498,39 @@ impl<A: TransportAdapter> Session<A> {
     #[must_use]
     pub const fn pending_authorization(&self) -> Option<(&AuthContext, &SessionOpen)> {
         self.negotiation.pending_authorization()
+    }
+
+    /// The challenge awaiting a capability from the caller.
+    #[must_use]
+    pub const fn pending_presentation(&self) -> Option<&AuthContext> {
+        self.negotiation.pending_presentation()
+    }
+
+    /// Attempts section 1.1 still allows this session.
+    #[must_use]
+    pub const fn attempts_remaining(&self) -> usize {
+        self.negotiation.attempts_remaining()
+    }
+
+    /// What the server authorized, once it has accepted an attempt.
+    #[must_use]
+    pub const fn granted(&self) -> Option<&SessionAccept> {
+        self.negotiation.granted()
+    }
+
+    /// Why the last attempt was refused.
+    #[must_use]
+    pub const fn last_refusal(&self) -> Option<&SessionReject> {
+        self.negotiation.last_refusal()
+    }
+
+    /// Presents the caller's capability and sends the request.
+    ///
+    /// # Errors
+    /// Reports a request section 1.1 does not allow, and a backend refusal.
+    pub fn present(&mut self, request: SessionOpen) -> Result<(), Error> {
+        let reply = self.negotiation.present(request)?;
+        self.submit(reply)
     }
 
     /// Authorizes the pending request and sends the acceptance.
@@ -1338,8 +1754,8 @@ fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
 /// What this endpoint does about authentication.
 ///
 /// `spec/wire.md` section 1.1 makes the exchange unconditional, so a caller
-/// names its stance rather than opting in. The variant that presents or
-/// verifies a capability appears when there is a policy boundary behind it.
+/// names its stance rather than opting in. Two of the three are for one role
+/// only, and [`Session::begin`] refuses a stance the role cannot act on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Authentication {
     /// This deployment requires none. The server advertises no capability
@@ -1366,6 +1782,14 @@ pub enum Authentication {
     /// list is therefore a `NotRequired` with a longer name, not a server that
     /// silently asks for nothing.
     Capability { challenge: AuthContext },
+    /// A client that answers a challenge asking for a capability.
+    ///
+    /// Nothing is named here. A request carries a fresh identifier and binds to
+    /// the nonce the challenge brings, neither of which exists before the server
+    /// sends one, so the caller builds the request then and passes it to
+    /// [`Session::present`]. A client that presents nothing uses
+    /// `NotRequired` and refuses a demanding challenge on the spot.
+    Presenting,
 }
 
 /// Which stream a frame is on.
@@ -1822,9 +2246,18 @@ mod tests {
 
     /// An `AUTH_CONTEXT` frame carrying the given challenge.
     fn auth_context(nonce: &[u8], formats: Vec<u64>) -> Vec<u8> {
+        challenge_frame(nonce, Binding::None, formats)
+    }
+
+    /// The same, for a challenge whose binding is what is under test.
+    fn auth_context_of(binding: Binding, formats: Vec<u64>) -> Vec<u8> {
+        challenge_frame(&[3; 32], binding, formats)
+    }
+
+    fn challenge_frame(nonce: &[u8], binding: Binding, formats: Vec<u64>) -> Vec<u8> {
         let context = vot_codec::frames::AuthContext {
             nonce: nonce.to_vec(),
-            binding: vot_codec::frames::Binding::None,
+            binding,
             formats,
         };
         let mut payload = Vec::new();
@@ -1917,22 +2350,70 @@ mod tests {
         }
     }
 
-    /// A `SESSION_OPEN` frame.
-    fn session_open(session_id: [u8; 16], capability_format: u64) -> Vec<u8> {
-        let open = SessionOpen {
+    /// A request a client presents, and a server reads.
+    fn request(session_id: [u8; 16], capability_format: u64) -> SessionOpen {
+        SessionOpen {
             session_id,
             capability_format,
             capability: vec![9; 32],
             requested_scope: Vec::new(),
             binding_proof: Vec::new(),
-        };
+        }
+    }
+
+    /// A `SESSION_OPEN` frame.
+    fn session_open(session_id: [u8; 16], capability_format: u64) -> Vec<u8> {
         let mut frame = Vec::new();
         vot_codec::frames::encode(
-            &vot_codec::frames::TypedFrame::SessionOpen(open),
+            &vot_codec::frames::TypedFrame::SessionOpen(request(session_id, capability_format)),
             &mut frame,
         )
         .unwrap();
         frame
+    }
+
+    /// One of the server's answers, as a frame.
+    fn answer(frame: &vot_codec::frames::TypedFrame) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        vot_codec::frames::encode(frame, &mut encoded).unwrap();
+        encoded
+    }
+
+    /// Hands everything one endpoint submitted to the other, and polls it.
+    fn pump(from: &mut Session<Loopback>, to: &mut Session<Loopback>) {
+        for frame in std::mem::take(&mut from.adapter.sent) {
+            to.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(to.poll().unwrap(), None);
+    }
+
+    /// A pair whose server asks for a capability, driven to the point where the
+    /// client has read the challenge and presented nothing.
+    fn demanding_pair(
+        client_settings: Settings,
+        server_settings: Settings,
+    ) -> (Session<Loopback>, Session<Loopback>) {
+        let mut client = Session::client(
+            Loopback::default(),
+            client_settings,
+            BTreeSet::new(),
+            Authentication::Presenting,
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            server_settings,
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: demanding([3; 32]),
+            },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        pump(&mut client, &mut server);
+        pump(&mut server, &mut client);
+        assert_eq!(client.state(), State::Negotiated);
+        assert!(!client.is_ready() && !server.is_ready());
+        (client, server)
     }
 
     /// A server that has negotiated and is asking for a capability.
@@ -2112,6 +2593,561 @@ mod tests {
     }
 
     #[test]
+    fn a_challenge_is_answered_with_the_capability_the_caller_presents() {
+        // Both halves of section 1.1 over one carrier: the server asks, the
+        // caller answers, and neither endpoint opens the data plane until
+        // SESSION_ACCEPT has been sent and read.
+        let (mut client, mut server) = demanding_pair(Settings::default(), Settings::default());
+        let challenge = client
+            .pending_presentation()
+            .expect("the client was asked for a capability");
+        assert_eq!(
+            challenge.nonce,
+            vec![3; 32],
+            "the nonce a proof of possession would be over"
+        );
+        assert_eq!(challenge.formats, vec![1, 2]);
+        assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
+        assert!(client.granted().is_none() && client.last_refusal().is_none());
+
+        client.present(request([7; 16], 2)).unwrap();
+        assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS - 1);
+        assert_eq!(
+            client.pending_presentation(),
+            None,
+            "the answer to this attempt decides whether another is needed"
+        );
+        assert!(!client.is_ready(), "a request is not a conclusion");
+
+        pump(&mut client, &mut server);
+        let (_, open) = server.pending_authorization().expect("the request arrived");
+        assert_eq!(open.session_id, [7; 16]);
+        assert_eq!(open.capability_format, 2);
+        server.grant(b"read:objects".to_vec()).unwrap();
+        assert!(server.is_ready());
+
+        pump(&mut server, &mut client);
+        assert_eq!(client.state(), State::Authenticated);
+        assert!(client.is_ready(), "the client read the concluding frame");
+        assert_eq!(
+            client.granted().map(|accept| accept.granted_scope.clone()),
+            Some(b"read:objects".to_vec()),
+            "the scope the server authorized, which the caller has no other way to learn"
+        );
+        assert!(client.last_refusal().is_none());
+        client
+            .send_reliable(StreamId(1), &data_record(b"payload"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_attempt_is_followed_by_another_until_the_bound_is_reached() {
+        // Section 1.1: a rejection does not close the connection, and a server
+        // accepts three attempts. The client counts the same bound, so a fourth
+        // request never goes out to be closed on.
+        let (mut client, mut server) = demanding_pair(Settings::default(), Settings::default());
+        for attempt in 0..MAX_AUTHENTICATION_ATTEMPTS {
+            let id = [u8::try_from(attempt).unwrap(); 16];
+            assert!(
+                client.pending_presentation().is_some(),
+                "attempt {attempt} may be made"
+            );
+            client.present(request(id, 1)).unwrap();
+            pump(&mut client, &mut server);
+            server
+                .refuse(error_code::AUTHORIZATION_FAILED, "not enough".to_owned())
+                .unwrap();
+            pump(&mut server, &mut client);
+
+            assert_eq!(client.state(), State::Negotiated, "and not closed");
+            let refusal = client.last_refusal().expect("the refusal is reported");
+            assert_eq!(refusal.session_id, id);
+            assert_eq!(refusal.reason, u64::from(error_code::AUTHORIZATION_FAILED));
+            assert_eq!(refusal.detail, "not enough");
+            assert!(client.granted().is_none());
+            assert_eq!(
+                client.attempts_remaining(),
+                MAX_AUTHENTICATION_ATTEMPTS - attempt - 1
+            );
+        }
+
+        // Nothing left to try. The request is refused here rather than sent for
+        // the server to close on, and the carrier is still this endpoint's.
+        assert_eq!(client.attempts_remaining(), 0);
+        let error = client.present(request([9; 16], 1)).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::AttemptsSpent {
+                attempts: MAX_AUTHENTICATION_ATTEMPTS
+            })
+        );
+        assert!(
+            !error.kind().is_peer_fault(),
+            "the caller's, not the peer's"
+        );
+        assert!(client.adapter().sent.is_empty(), "and nothing went out");
+        assert_eq!(client.state(), State::Negotiated);
+    }
+
+    #[test]
+    fn a_request_section_1_1_forbids_never_reaches_the_carrier() {
+        // Every rule the server checks on arrival, checked before sending.
+        // Breaking one of them is answered with a close rather than a
+        // rejection, so it would cost the session every attempt it had left.
+        let mut plain = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        plain.begin().unwrap();
+        assert_eq!(
+            plain.present(request([7; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
+                state: State::HelloSent
+            }),
+            "a client that presents nothing has nothing to present"
+        );
+
+        let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
+        let format = client
+            .present(request([7; 16], 9))
+            .unwrap_err()
+            .kind()
+            .clone();
+        assert_eq!(
+            format,
+            ErrorKind::PresentationInvalid(PresentationError::FormatNotOffered { format: 9 })
+        );
+        assert_eq!(
+            client.attempts_remaining(),
+            MAX_AUTHENTICATION_ATTEMPTS,
+            "a refused request spends no attempt"
+        );
+        assert!(client.adapter().sent.is_empty());
+
+        // A proof under a binding that asks for none. The challenge here names
+        // Binding::None, so the request has nothing to prove possession of.
+        let mut signed = request([7; 16], 1);
+        signed.binding_proof = vec![4; 8];
+        assert_eq!(
+            client.present(signed).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::BindingProof {
+                binding: Binding::None,
+                proof_bytes: 8
+            })
+        );
+
+        // Sent, and then reused. Section 1.1 requires a fresh identifier per
+        // attempt, and a server reads a repeat as a duplicate rather than a
+        // retry.
+        client.present(request([7; 16], 1)).unwrap();
+        assert_eq!(
+            client.present(request([8; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
+                state: State::Negotiated
+            }),
+            "one attempt at a time"
+        );
+        client
+            .negotiation
+            .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionReject(
+                SessionReject {
+                    session_id: [7; 16],
+                    reason: u64::from(error_code::AUTHENTICATION_FAILED),
+                    detail: String::new(),
+                },
+            )))
+            .unwrap();
+        assert_eq!(
+            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::IdentifierReused)
+        );
+    }
+
+    #[test]
+    fn the_binding_proof_rule_holds_in_both_directions() {
+        // One function decides it, so a request the client half refuses to send
+        // is one the server half refuses to read. A proof of possession with no
+        // proof in it is the case a length bound cannot catch: the codec accepts
+        // an empty byte string, and only the challenge says it may not be one.
+        let mut server = Negotiation::server(
+            Settings::default(),
+            BTreeSet::new(),
+            AuthContext {
+                nonce: vec![3; 32],
+                binding: Binding::ProofOfPossession,
+                formats: vec![1],
+            },
+        );
+        server.state = State::Negotiated;
+        let error = server
+            .accept_control(&session_open([7; 16], 1))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::BindingProofMismatch {
+                binding: Binding::ProofOfPossession,
+                proof_bytes: 0
+            }
+        );
+        assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
+        assert!(error.kind().is_peer_fault(), "the peer built the request");
+        assert_eq!(
+            server.pending_authorization(),
+            None,
+            "and no policy is asked to weigh it"
+        );
+
+        // The other direction of the same rule: a proof where the binding asks
+        // for none.
+        let mut none = demanding_server();
+        let mut open = request([7; 16], 1);
+        open.binding_proof = vec![4; 8];
+        let mut frame = Vec::new();
+        vot_codec::frames::encode(
+            &vot_codec::frames::TypedFrame::SessionOpen(open),
+            &mut frame,
+        )
+        .unwrap();
+        assert_eq!(
+            none.accept_control(&frame).unwrap_err().kind(),
+            &ErrorKind::BindingProofMismatch {
+                binding: Binding::None,
+                proof_bytes: 8
+            }
+        );
+
+        // And a client asked for a proof of possession must send one. Nothing
+        // here produces a proof; the caller does, which is what ADR-0022 stage
+        // two picks a format for.
+        let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
+        client.state = State::Negotiated;
+        client
+            .accept_control(&auth_context_of(Binding::ProofOfPossession, vec![1]))
+            .unwrap();
+        assert_eq!(
+            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::BindingProof {
+                binding: Binding::ProofOfPossession,
+                proof_bytes: 0
+            })
+        );
+        let mut proved = request([7; 16], 1);
+        proved.binding_proof = vec![4; 64];
+        client.present(proved).unwrap();
+    }
+
+    #[test]
+    fn an_answer_naming_another_attempt_is_refused() {
+        // Section 1.1 has both answers repeat the request's identifier. Without
+        // that check a server could authenticate this client by answering an
+        // attempt it never made, and a rejection could clear one still in
+        // flight.
+        let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
+        client.present(request([7; 16], 1)).unwrap();
+        let mut mismatched = client.negotiation.clone();
+        let error = mismatched
+            .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionAccept(
+                SessionAccept {
+                    session_id: [8; 16],
+                    granted_scope: Vec::new(),
+                },
+            )))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::SessionIdentifierMismatch {
+                answered: [8; 16],
+                sent: [7; 16]
+            }
+        );
+        assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
+        assert!(error.kind().is_peer_fault());
+        assert!(!mismatched.is_ready(), "and the data plane stays shut");
+
+        // The same rule on a rejection, which would otherwise clear the attempt
+        // this client is still waiting on.
+        let mut rejected = client.negotiation.clone();
+        assert!(
+            rejected
+                .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionReject(
+                    SessionReject {
+                        session_id: [8; 16],
+                        reason: u64::from(error_code::AUTHENTICATION_FAILED),
+                        detail: String::new(),
+                    },
+                )))
+                .is_err()
+        );
+        assert!(
+            rejected.pending_presentation().is_none(),
+            "the attempt this client is waiting on was not cleared"
+        );
+        assert!(
+            rejected.last_refusal().is_none(),
+            "and nothing was recorded as its answer"
+        );
+
+        // An answer to a request nothing made is out of sequence, whichever
+        // endpoint reads it.
+        let mut unasked = demanding_server();
+        assert_eq!(
+            unasked
+                .accept_control(&answer(&vot_codec::frames::TypedFrame::SessionAccept(
+                    SessionAccept {
+                        session_id: [7; 16],
+                        granted_scope: Vec::new(),
+                    },
+                )))
+                .unwrap_err()
+                .kind(),
+            &ErrorKind::OutOfSequence {
+                frame_type: frame_type::SESSION_ACCEPT,
+                state: State::Negotiated
+            }
+        );
+
+        // A server holding a request is the case the field alone cannot tell
+        // apart: it has an attempt in hand, and an answer to it is still a
+        // frame it must not read. Authenticating on one would let a peer
+        // authorize itself with the identifier it chose.
+        let mut holding = demanding_server();
+        holding.accept_control(&session_open([7; 16], 1)).unwrap();
+        for reply in [
+            vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
+                session_id: [7; 16],
+                granted_scope: Vec::new(),
+            }),
+            vot_codec::frames::TypedFrame::SessionReject(SessionReject {
+                session_id: [7; 16],
+                reason: u64::from(error_code::AUTHENTICATION_FAILED),
+                detail: String::new(),
+            }),
+        ] {
+            let error = holding.accept_control(&answer(&reply)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &ErrorKind::OutOfSequence {
+                    frame_type: reply.frame_type(),
+                    state: State::Negotiated
+                }
+            );
+        }
+        assert!(!holding.is_ready(), "and it did not authenticate itself");
+        assert!(
+            holding.pending_authorization().is_some(),
+            "the request it holds is still its own to answer"
+        );
+
+        // And an answer that does not decode is the peer's, not the caller's.
+        let mut malformed = client.negotiation.clone();
+        let error = malformed
+            .accept_control(&frame_of(frame_type::SESSION_ACCEPT, 3))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::SessionAnswerInvalid {
+                frame_type: frame_type::SESSION_ACCEPT
+            }
+        );
+        assert!(error.kind().is_peer_fault());
+    }
+
+    #[test]
+    fn a_client_that_can_present_asks_for_nothing_until_it_is_asked() {
+        // A client that presents a capability still works against a deployment
+        // that requires none, and has nothing pending in the window between
+        // negotiating and reading the challenge.
+        let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
+        client.begin().unwrap();
+        client
+            .accept_control(&settings_of(Settings::default()))
+            .unwrap();
+        client
+            .accept_control(&frame_of(frame_type::SETTINGS_ACK, 0))
+            .unwrap();
+        assert_eq!(client.state(), State::Negotiated);
+        assert_eq!(
+            client.pending_presentation(),
+            None,
+            "negotiated is not the same as asked"
+        );
+
+        assert_eq!(
+            client.accept_control(&auth_context(&[7; 16], Vec::new())),
+            Ok(Accepted::Consumed { reply: Vec::new() })
+        );
+        assert_eq!(
+            client.state(),
+            State::Authenticated,
+            "a challenge advertising no format concludes the exchange"
+        );
+        assert_eq!(client.pending_presentation(), None);
+        assert_eq!(
+            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
+                state: State::Authenticated
+            }),
+            "and there is nothing to present to a server that asked for nothing"
+        );
+    }
+
+    #[test]
+    fn a_second_challenge_cannot_replace_the_one_an_attempt_answers() {
+        // A demanding challenge leaves the client Negotiated, which is the
+        // state AUTH_CONTEXT arrives in. Without the flag a second one would
+        // replace the nonce a proof was computed over and the formats a request
+        // was checked against.
+        let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
+        let error = client
+            .negotiation
+            .accept_control(&auth_context_of(Binding::None, vec![4]))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::OutOfSequence {
+                frame_type: frame_type::AUTH_CONTEXT,
+                state: State::Negotiated
+            }
+        );
+        assert_eq!(
+            client
+                .pending_presentation()
+                .map(|challenge| challenge.formats.clone()),
+            Some(vec![1, 2]),
+            "the challenge it was asked with"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_peer_will_not_carry_is_refused_before_it_is_sent() {
+        // A capability can be 48 KiB and a peer may advertise a control-frame
+        // maximum of 1 KiB. The exchange does not go through the application
+        // send path, so without this the frame goes out and the peer closes the
+        // session for a frame it said it would not accept.
+        let narrow = Settings {
+            max_control_frame_payload: 1024,
+            ..Settings::default()
+        };
+        let (mut client, mut server) = demanding_pair(Settings::default(), narrow);
+        let mut large = request([7; 16], 1);
+        large.capability = vec![9; 4096];
+        let error = client.present(large).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::FrameExceedsLimit {
+                frame_type: frame_type::SESSION_OPEN,
+                bytes: 4127,
+                limit: 1024,
+                side: Side::Peer
+            }
+        );
+        assert!(
+            !error.kind().is_peer_fault(),
+            "the peer's limit, so this endpoint would be the one breaking it"
+        );
+        assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
+        assert!(client.adapter().sent.is_empty());
+
+        // The same bound on the answers a server sends, which is the same class
+        // of frame going the other way.
+        client.present(request([7; 16], 1)).unwrap();
+        pump(&mut client, &mut server);
+        let mut narrow_client = server.negotiation.clone();
+        narrow_client.peer_settings = Some(Settings {
+            max_control_frame_payload: 1024,
+            ..Settings::default()
+        });
+        assert_eq!(
+            narrow_client
+                .grant(vec![0; 2048])
+                .unwrap_err()
+                .kind()
+                .clone(),
+            ErrorKind::FrameExceedsLimit {
+                frame_type: frame_type::SESSION_ACCEPT,
+                bytes: 2073,
+                limit: 1024,
+                side: Side::Peer
+            }
+        );
+        assert!(
+            narrow_client.pending_authorization().is_some(),
+            "an answer that cannot go out leaves the request to answer again"
+        );
+        assert!(!narrow_client.is_ready());
+    }
+
+    #[test]
+    fn a_stance_the_role_cannot_act_on_is_refused() {
+        // A server given a client's stance would advertise a nonce no caller
+        // chose, and a client given a server's would ignore the challenge it
+        // was handed. Both used to pass and quietly do nothing.
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Presenting,
+        );
+        let error = server.begin().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::AuthenticationRoleMismatch {
+                role: EndpointRole::Server
+            }
+        );
+        assert!(!error.kind().is_peer_fault(), "the caller's own doing");
+        assert_eq!(server.state(), State::Connecting, "and nothing began");
+
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: demanding([3; 32]),
+            },
+        );
+        assert_eq!(
+            client.begin().unwrap_err().kind(),
+            &ErrorKind::AuthenticationRoleMismatch {
+                role: EndpointRole::Client
+            }
+        );
+
+        // The stances that do fit each role begin, including the one that fits
+        // both.
+        for authentication in [
+            Authentication::NotRequired { nonce: [1; 32] },
+            Authentication::Presenting,
+        ] {
+            Session::client(
+                Loopback::default(),
+                Settings::default(),
+                BTreeSet::new(),
+                authentication,
+            )
+            .begin()
+            .unwrap();
+        }
+        for authentication in [
+            Authentication::NotRequired { nonce: [1; 32] },
+            Authentication::Capability {
+                challenge: demanding([3; 32]),
+            },
+        ] {
+            Session::server(
+                Loopback::default(),
+                Settings::default(),
+                BTreeSet::new(),
+                authentication,
+            )
+            .begin()
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn a_grant_the_backend_has_no_room_for_does_not_open_the_data_plane() {
         // The exchange concluded on this side, but the peer has not read the
         // acceptance yet. Sending records over it would put them in front of
@@ -2284,7 +3320,7 @@ mod tests {
         let error = server
             .refuse(error_code::MALFORMED_FRAME, String::new())
             .unwrap_err();
-        assert_eq!(error.kind(), &ErrorKind::SessionAnswerInvalid);
+        assert_eq!(error.kind(), &ErrorKind::SessionAnswerUnencodable);
         assert!(
             !error.kind().is_peer_fault(),
             "the caller's answer, not the peer's request"
@@ -2295,7 +3331,7 @@ mod tests {
         let scope = vec![0; 4097];
         assert_eq!(
             server.grant(scope).unwrap_err().kind(),
-            &ErrorKind::SessionAnswerInvalid
+            &ErrorKind::SessionAnswerUnencodable
         );
         assert!(server.pending_authorization().is_some());
         assert_eq!(server.state(), State::Negotiated, "and not authenticated");
@@ -3575,6 +4611,15 @@ mod tests {
     fn frame_of(frame_type: u64, payload: usize) -> Vec<u8> {
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type, &vec![0; payload], &mut frame).unwrap();
+        frame
+    }
+
+    /// One encoded `SETTINGS` frame carrying `settings`.
+    fn settings_of(settings: Settings) -> Vec<u8> {
+        let mut payload = Vec::new();
+        vot_codec::encode_settings(&settings, &mut payload).unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::SETTINGS, &payload, &mut frame).unwrap();
         frame
     }
 

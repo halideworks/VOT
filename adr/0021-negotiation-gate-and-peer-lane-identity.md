@@ -40,16 +40,17 @@ role inconsistent with the stream initiator is `MALFORMED_FRAME`. On a
 client-initiated stream that leaves exactly one sender. A server therefore never
 sends `HELLO` and never advertises `EndpointRole::Server`.
 
-`Ready` means negotiated, not authenticated. `AUTH_CONTEXT`, `SESSION_OPEN`, and
-`SESSION_ACCEPT` are unimplemented, so every frame the registry marks
-`auth: yes` is not yet conforming.
+Readiness means negotiated and authenticated, and those are two states rather
+than one. ADR-0022 records the section 1.1 exchange that separates them; the
+state this ADR called `Ready` is now `Negotiated`, with `Authenticated` after
+it.
 
 ### The gate is asymmetric
 
 Application sends are refused before local readiness. Application records that
 arrive before local readiness are held, not refused.
 
-The two endpoints reach `Ready` at different moments, and QUIC orders nothing
+The two endpoints reach readiness at different moments, and QUIC orders nothing
 between the negotiation stream and an application lane, so a conforming peer can
 have records in flight before it learns this side is ready. Closing the session
 over them would punish it for the protocol's own shape.

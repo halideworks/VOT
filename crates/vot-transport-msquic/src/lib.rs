@@ -3376,6 +3376,23 @@ pub mod live {
                 "two connections, two identities"
             );
 
+            // And each reports that it connected, under its own identifier. The
+            // connecting side was asserted on and the accepted side was not, so
+            // a callback that dropped the event looked the same as one that
+            // reported it, and a driver waiting to be told would have waited for
+            // ever.
+            for taken in &mut accepted {
+                let expected = ConnectionId(taken.connection_id());
+                let mut reported = false;
+                while Instant::now() < deadline && !reported {
+                    while let Some(event) = taken.poll() {
+                        reported |= event == Event::Connected(expected);
+                    }
+                    std::thread::yield_now();
+                }
+                assert!(reported, "an accepted connection reports {expected:?}");
+            }
+
             // Path statistics are read from the connection, so an accepted one
             // has to answer for its own.
             accepted[0].sample_path().unwrap();

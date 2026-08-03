@@ -299,12 +299,20 @@ jobs:
     # noticing. This runs it, and fails only when something survives that
     # test-vectors/mutants/the_live_transport_is_mutation_tested.md does not
     # already account for.
+    #
+    # A pull request mutates only the lines it changed, which took this job from
+    # 28 minutes to a couple. The full sweep runs on every push to main, where a
+    # 28-minute job blocks nobody. What a diff run cannot see is a change that
+    # uncovers code it did not touch, and that is what the sweep is for.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4.3.1
         with:
           persist-credentials: false
+          # Both sides of the diff, and the merge base between them, which a
+          # shallow clone does not have.
+          fetch-depth: 0
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
@@ -335,30 +343,33 @@ jobs:
       # stale and started this.
       - name: Test live mutants
         env:
-          # Missed and timed out together. A survivor that hangs rather than
-          # fails is still a survivor, and which of the two a given mutant
-          # lands in depends on how loaded the runner is: two runs of the same
-          # commit reported 13 and 2, then 12 and 3. Counting them separately
-          # makes the bound oscillate and the notice below ask for a number
-          # that fails on the next run.
-          CLASSIFIED_SURVIVORS: 15
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -o pipefail
+          scope=()
+          sweep=(--full)
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git fetch --no-tags --quiet origin "$BASE_REF"
+            git diff "origin/$BASE_REF...HEAD" > changed.diff
+            scope=(--in-diff changed.diff)
+            # A diff run tests a subset, so it cannot say a classified survivor
+            # is gone. Only the sweep can.
+            sweep=()
+          fi
+          # cargo-mutants exits non-zero whenever anything survives at all, and
+          # what survives here is a classified list. A check that is red for a
+          # known list teaches people to ignore red, so the checker decides
+          # instead, and it compares mutants rather than counting them.
+          #
+          # Both streams: the survivors and the summary are on stdout, and a
+          # diff that selects nothing is announced on stderr. Without stderr a
+          # change touching no Rust file leaves an empty log, which the checker
+          # is right to refuse as a run that did not happen.
           cargo +1.88.0 mutants --package vot-transport-msquic --features live \
             --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
-            | tee mutants.log || true
-          missed=$(grep -c '^MISSED' mutants.log || true)
-          timeouts=$(grep -c '^TIMEOUT' mutants.log || true)
-          survivors=$((missed + timeouts))
-          echo "missed=$missed timeouts=$timeouts survivors=$survivors classified=$CLASSIFIED_SURVIVORS"
-          if [ "$survivors" -gt "$CLASSIFIED_SURVIVORS" ]; then
-            echo "::error::$survivors live mutants survived, more than the $CLASSIFIED_SURVIVORS the evidence file accounts for"
-            grep -E '^(MISSED|TIMEOUT)' mutants.log
-            exit 1
-          fi
-          if [ "$survivors" -lt "$CLASSIFIED_SURVIVORS" ]; then
-            echo "::notice::$survivors survivors, fewer than the $CLASSIFIED_SURVIVORS recorded. Lower CLASSIFIED_SURVIVORS and the evidence file."
-          fi
+            "${scope[@]}" 2>&1 | tee mutants.log || true
+          python3 tools/check_live_mutants.py "${sweep[@]}" mutants.log
 
   msquic-sanitizer:
     runs-on: ubuntu-24.04
@@ -406,9 +417,11 @@ jobs:
           - { package: vot-journal, required: true }
           - { package: vot-proof-blake3, required: true }
           - { package: vot-proof-sha256, required: true }
-          # vot-codec is advisory pending survivor cleanup: 159 of 493 mutants
-          # currently survive, almost all in the frame parser. Promote it once
-          # those are killed.
+          # vot-codec is advisory pending survivor cleanup: a large share of its
+          # mutants survive, almost all in the frame parser. The last count
+          # written here was stale within two changes of being written, which is
+          # the failure this file already learned once, so measuring it is part
+          # of promoting it rather than a number kept beside it.
           - { package: vot-codec, required: false }
           - { package: vot-verifier, required: true }
           - { package: vot-manifest, required: false }
@@ -431,6 +444,8 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          # Both sides of the diff, and the merge base between them.
+          fetch-depth: 0
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
@@ -455,6 +470,24 @@ jobs:
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
+      - name: Select the mutants this change can affect
+        # A pull request mutates only the lines it changed, so a package the
+        # change does not touch costs one build and nothing else. The full sweep
+        # runs on every push to main.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --quiet origin "$BASE_REF"
+          git diff "origin/$BASE_REF...HEAD" > changed.diff
+
       - name: Test mutants
         continue-on-error: ${{ !matrix.required }}
-        run: cargo +1.88.0 mutants --package "${{ matrix.package }}" --jobs 2
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          scope=()
+          if [ -f changed.diff ]; then
+            scope=(--in-diff changed.diff)
+          fi
+          cargo +1.88.0 mutants --package "$PACKAGE" --jobs 2 "${scope[@]}"

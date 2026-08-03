@@ -105,13 +105,38 @@ be attributed.
 
 ```sh
 cargo mutants --package PACKAGE --jobs 2
+git diff origin/main...HEAD > changed.diff
+cargo mutants --package PACKAGE --jobs 2 --in-diff changed.diff
 cargo build --manifest-path fuzz/frame_codec/Cargo.toml --locked
 cargo build --manifest-path fuzz/manifest/Cargo.toml --locked
 ```
 
 `.github/workflows/ci.yml` holds the package matrix and which packages are
-required rather than advisory. `vot-codec` is advisory: roughly 158 of its
+required rather than advisory. `vot-codec` is advisory: a large share of its
 mutants survive, almost all in the frame parser.
+
+The second form is what a pull request runs, and it mutates only the lines the
+change touched. It is minutes rather than half an hour, and it cannot see a
+change that uncovers code it did not touch. The full sweep runs on every push to
+main, which is what covers that.
+
+The live transport is measured under its own configuration, because its module
+only compiles with the feature on:
+
+```sh
+cargo mutants --package vot-transport-msquic --features live \
+  --config .cargo/mutants-live.toml --timeout 120 --jobs 2 | tee mutants.log
+python3 tools/check_live_mutants.py --full mutants.log
+```
+
+What survives there is classified in
+`test-vectors/mutants/the_live_transport_is_mutation_tested.md`, with a reason per
+mutant. `check_live_mutants.py` holds the run against that table: an
+unclassified survivor fails, and a classified one that no longer survives is
+reported so the row can go. It compares mutants rather than counting them,
+because a count passes a run that kills one survivor and grows another. Pass
+`--full` only for a sweep; a diff run tests a subset and cannot say a row is
+stale.
 
 ## Simulator
 

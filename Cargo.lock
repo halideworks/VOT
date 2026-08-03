@@ -2180,7 +2180,16 @@ dependencies = [
  "vot-scheduler",
  "vot-session",
  "vot-transport-api",
+ "vot-transport-queue",
  "vot-verifier",
+]
+
+[[package]]
+name = "vot-transport-queue"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+ "vot-transport-api",
 ]
 
 [[package]]
@@ -2202,6 +2211,7 @@ dependencies = [
  "rustls",
  "vot-codec",
  "vot-transport-api",
+ "vot-transport-queue",
 ]
 
 [[package]]

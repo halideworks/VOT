@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -13,9 +13,13 @@ use vot_transport_api::{
     ConnectionId, Error, Event, PathStats, Payload, StreamId, TransportAck, TransportAdapter,
     shared_payload,
 };
+use vot_transport_queue::Queue;
 
-const DEFAULT_COMMAND_COUNT_LIMIT: usize = 64;
-const DEFAULT_COMMAND_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const DEFAULT_COMMAND_COUNT_LIMIT: usize = vot_transport_queue::DEFAULT_COUNT_LIMIT;
+#[cfg(test)]
+const DEFAULT_COMMAND_BYTE_LIMIT: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
+#[cfg(test)]
 const CONTROL_LIMIT: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
 
 /// Most this adapter's inbound queue holds for one event.
@@ -23,36 +27,9 @@ const CONTROL_LIMIT: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
 /// `ReceiveLimits` is built against it, so an endpoint cannot advertise a
 /// control frame this backend could never enqueue: retrying would not make it
 /// fit and the queue is empty either way.
-pub const INBOUND_BYTE_CAPACITY: usize = DEFAULT_COMMAND_BYTE_LIMIT;
+pub const INBOUND_BYTE_CAPACITY: usize = vot_transport_queue::INBOUND_BYTE_CAPACITY;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Command {
-    Control(Payload),
-    Reliable { stream: StreamId, bytes: Payload },
-    Datagram { context: u64, bytes: Payload },
-    ReceiveCredit(u64),
-}
-
-impl Command {
-    fn payload_len(&self) -> usize {
-        match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
-                bytes.len()
-            }
-            Self::ReceiveCredit(_) => 0,
-        }
-    }
-
-    #[must_use]
-    pub fn vot_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Control(bytes) | Self::Reliable { bytes, .. } | Self::Datagram { bytes, .. } => {
-                Some(bytes)
-            }
-            Self::ReceiveCredit(_) => None,
-        }
-    }
-}
+pub use vot_transport_queue::Command;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeEvent {
@@ -71,59 +48,27 @@ pub enum NativeEvent {
 }
 
 /// Bounded TLS/TCP command and event adapter. VOT frame bytes are not rewritten.
+///
+/// What is here rather than in `vot-transport-queue` is what this carrier has of
+/// its own. It is one byte stream, so a lane is a logical identifier with no
+/// open or close, and the count of distinct identifiers a peer has named is the
+/// only lane count there is.
+#[derive(Clone, Debug, Default)]
 pub struct TcpAdapter {
-    commands: VecDeque<Command>,
-    command_bytes: usize,
-    command_count_limit: usize,
-    command_byte_limit: usize,
-    control_payload_limit: usize,
-    /// Largest control-frame payload this endpoint will accept, which is what
-    /// it advertises. Separate from the send bound, which is the peer's.
-    control_receive_limit: usize,
-    /// What this endpoint advertised, once it has been configured.
-    receive_limits: Option<vot_transport_api::ReceiveLimits>,
-    /// Lanes the peer has sent on.
-    ///
-    /// This carrier is one byte stream, so a lane is a logical identifier with
-    /// no open or close of its own. Distinct identifiers seen is therefore the
-    /// only lane count there is, and it only grows.
+    queue: Queue,
+    /// Lanes the peer has sent on. Only grows, for the reason above.
     inbound_lanes: BTreeSet<u64>,
-    events: VecDeque<Event>,
-    event_bytes: usize,
-    event_count_limit: usize,
-    event_byte_limit: usize,
-}
-
-impl Default for TcpAdapter {
-    fn default() -> Self {
-        Self {
-            commands: VecDeque::new(),
-            command_bytes: 0,
-            command_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
-            command_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
-            control_payload_limit: CONTROL_LIMIT,
-            control_receive_limit: CONTROL_LIMIT,
-            receive_limits: None,
-            inbound_lanes: BTreeSet::new(),
-            events: VecDeque::new(),
-            event_bytes: 0,
-            event_count_limit: DEFAULT_COMMAND_COUNT_LIMIT,
-            event_byte_limit: DEFAULT_COMMAND_BYTE_LIMIT,
-        }
-    }
 }
 
 impl TcpAdapter {
+    /// Creates an adapter with explicit inbound and outbound queue limits.
+    ///
+    /// # Errors
+    /// Rejects a zero command-count or byte limit.
     pub fn with_queue_limits(command_count: usize, command_bytes: usize) -> Result<Self, Error> {
-        if command_count == 0 || command_bytes == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
         Ok(Self {
-            command_count_limit: command_count,
-            command_byte_limit: command_bytes,
-            event_count_limit: command_count,
-            event_byte_limit: command_bytes,
-            ..Self::default()
+            queue: Queue::with_limits(command_count, command_bytes)?,
+            inbound_lanes: BTreeSet::new(),
         })
     }
 
@@ -132,7 +77,7 @@ impl TcpAdapter {
     /// # Errors
     /// Reports a peer using more lanes than it was told this endpoint carries.
     fn admit_lane(&mut self, stream: u64) -> Result<(), Error> {
-        let Some(limits) = self.receive_limits else {
+        let Some(limits) = self.queue.receive_limits() else {
             // Nothing advertised, so nothing to hold the peer to.
             return Ok(());
         };
@@ -152,8 +97,7 @@ impl TcpAdapter {
     /// more than was advertised is silent otherwise, since the peer sends what
     /// it was told it could and this endpoint takes more.
     pub const fn set_receive_limits(&mut self, limits: vot_transport_api::ReceiveLimits) {
-        self.control_receive_limit = limits.control_payload();
-        self.receive_limits = Some(limits);
+        self.queue.set_receive_limits(limits);
     }
 
     /// Queues a native callback after enforcing protocol and memory bounds.
@@ -161,52 +105,18 @@ impl TcpAdapter {
     /// # Errors
     /// Rejects oversized records, arithmetic overflow, or a full inbound queue.
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
-        let payload_len = match &event {
-            NativeEvent::Control(bytes) => {
-                vot_transport_api::validate_control_frame(bytes, self.control_receive_limit)?;
-                bytes.len()
-            }
-            NativeEvent::Reliable { stream, bytes, .. } => {
-                vot_transport_api::validate_data_record(bytes)?;
-                self.admit_lane(*stream)?;
-                bytes.len()
-            }
-            NativeEvent::Connected(_)
-            | NativeEvent::Disconnected(_)
-            | NativeEvent::Acknowledged { .. } => 0,
-        };
-        let next_bytes = self
-            .event_bytes
-            .checked_add(payload_len)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
-            return Err(Error::InboundQueueFull);
+        let event = translate(event);
+        // The payload rules first, so a record this endpoint would refuse never
+        // counts a lane against the peer that sent it.
+        self.queue.validate_event(&event)?;
+        if let Event::Reliable { stream, .. } = &event {
+            self.admit_lane(stream.0)?;
         }
-        self.events.push_back(match event {
-            NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
-            NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
-            NativeEvent::Control(bytes) => Event::Control(bytes.into()),
-            NativeEvent::Reliable {
-                stream,
-                sequence,
-                bytes,
-            } => Event::Reliable {
-                stream: StreamId(stream),
-                sequence,
-                bytes: bytes.into(),
-            },
-            NativeEvent::Acknowledged { stream, sequence } => {
-                Event::Acknowledged(TransportAck::new(stream, sequence))
-            }
-        });
-        self.event_bytes = next_bytes;
-        Ok(())
+        self.queue.admit_event(event)
     }
 
     pub fn next_command(&mut self) -> Option<Command> {
-        let command = self.commands.pop_front()?;
-        self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
-        Some(command)
+        self.queue.next_command()
     }
 
     /// Gives a carrier driver one queued command at a time.
@@ -216,31 +126,32 @@ impl TcpAdapter {
     ///
     /// # Errors
     /// Returns the first carrier error reported by `submit`.
-    pub fn drain_commands<F, E>(&mut self, mut submit: F) -> Result<(), E>
+    pub fn drain_commands<F, E>(&mut self, submit: F) -> Result<(), E>
     where
         F: FnMut(Command) -> Result<(), E>,
     {
-        while let Some(command) = self.commands.front().cloned() {
-            submit(command)?;
-            let Some(command) = self.commands.pop_front() else {
-                break;
-            };
-            self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
-        }
-        Ok(())
+        self.queue.drain_commands(submit)
     }
+}
 
-    fn enqueue(&mut self, command: Command) -> Result<(), Error> {
-        let next_bytes = self
-            .command_bytes
-            .checked_add(command.payload_len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.commands.len() >= self.command_count_limit || next_bytes > self.command_byte_limit {
-            return Err(Error::OutboundQueueFull);
+/// Reads one carrier callback as the event the queue carries.
+fn translate(event: NativeEvent) -> Event {
+    match event {
+        NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
+        NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
+        NativeEvent::Control(bytes) => Event::Control(bytes.into()),
+        NativeEvent::Reliable {
+            stream,
+            sequence,
+            bytes,
+        } => Event::Reliable {
+            stream: StreamId(stream),
+            sequence,
+            bytes: bytes.into(),
+        },
+        NativeEvent::Acknowledged { stream, sequence } => {
+            Event::Acknowledged(TransportAck::new(stream, sequence))
         }
-        self.commands.push_back(command);
-        self.command_bytes = next_bytes;
-        Ok(())
     }
 }
 
@@ -249,20 +160,13 @@ impl TransportAdapter for TcpAdapter {
         // This adapter does bound the control frames it accepts, in
         // `record_native_event`, so a session can check that what it is about
         // to advertise is what will be enforced.
-        self.receive_limits
+        self.queue.receive_limits()
     }
 
     fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
         // The send bound only. What this endpoint accepts is what it
         // advertised, and a peer's limit must not widen or narrow that.
-        //
-        // Clamped to what the outbound queue can hold: a peer allowing more
-        // than this endpoint can enqueue does not oblige it to send that much,
-        // and a bound above the queue refuses the frame at submission for ever.
-        vot_transport_api::validate_control_payload_limit(limit)?;
-        self.control_payload_limit =
-            vot_transport_api::effective_send_limit(limit, self.command_byte_limit);
-        Ok(())
+        self.queue.set_control_send_limit(limit)
     }
 
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
@@ -270,11 +174,12 @@ impl TransportAdapter for TcpAdapter {
     }
 
     fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
-        vot_transport_api::validate_control_frame(&frame, self.control_payload_limit)?;
-        self.enqueue(Command::Control(frame))
+        self.queue.send_control(frame)
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+        // Checked before the payload is shared, so an oversized record costs no
+        // allocation.
         vot_transport_api::validate_data_record(record)?;
         self.send_reliable_shared(stream, shared_payload(record))
     }
@@ -284,42 +189,19 @@ impl TransportAdapter for TcpAdapter {
         _stream: StreamId,
         records: &[Payload],
     ) -> Result<(), Error> {
-        let next_bytes = records
-            .iter()
-            .try_fold(self.command_bytes, |bytes, record| {
-                vot_transport_api::validate_data_record(record)?;
-                bytes
-                    .checked_add(record.len())
-                    .ok_or(Error::ArithmeticOverflow)
-            })?;
-        let next_count = self
-            .commands
-            .len()
-            .checked_add(records.len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if next_count > self.command_count_limit || next_bytes > self.command_byte_limit {
-            Err(Error::OutboundQueueFull)
-        } else {
-            Ok(())
-        }
+        self.queue.preflight_reliable_batch(records)
     }
 
     fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
-        vot_transport_api::validate_data_record(&record)?;
-        self.enqueue(Command::Reliable {
-            stream,
-            bytes: record,
-        })
+        self.queue.send_reliable(stream, record)
     }
 
     fn poll(&mut self) -> Option<Event> {
-        let event = self.events.pop_front()?;
-        self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
-        Some(event)
+        self.queue.poll()
     }
 
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), Error> {
-        self.enqueue(Command::ReceiveCredit(bytes))
+        self.queue.set_receive_credit(bytes)
     }
 
     /// Always absent on this backend.
@@ -333,16 +215,6 @@ impl TransportAdapter for TcpAdapter {
     /// decision is made from this value.
     fn path_stats(&self) -> Option<PathStats> {
         None
-    }
-}
-
-fn event_payload_len(event: &Event) -> usize {
-    match event {
-        Event::Control(bytes) | Event::Reliable { bytes, .. } => bytes.len(),
-        Event::Connected(_)
-        | Event::Disconnected(_)
-        | Event::Acknowledged(_)
-        | Event::DatagramState { .. } => 0,
     }
 }
 

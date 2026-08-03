@@ -1417,6 +1417,59 @@ mod tests {
     }
 
     #[test]
+    fn every_authentication_bound_admits_its_own_maximum() {
+        // A bound that refuses its own maximum refuses a peer that sent
+        // nothing oversized, and nothing else here would notice.
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![1; MIN_AUTH_NONCE],
+            binding: Binding::None,
+            formats: (1..=MAX_CAPABILITY_FORMATS).collect(),
+        }));
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![1; MAX_AUTH_NONCE],
+            binding: Binding::ProofOfPossession,
+            formats: vec![MAX_CAPABILITY_FORMAT],
+        }));
+        round_trip(&TypedFrame::SessionOpen(SessionOpen {
+            session_id: [1; 16],
+            capability_format: MAX_CAPABILITY_FORMAT,
+            capability: vec![2; MAX_CAPABILITY_BYTES],
+            requested_scope: vec![3; MAX_SCOPE_BYTES],
+            binding_proof: vec![4; MAX_SCOPE_BYTES],
+        }));
+        round_trip(&TypedFrame::SessionAccept(SessionAccept {
+            session_id: [1; 16],
+            granted_scope: vec![5; MAX_SCOPE_BYTES],
+        }));
+        round_trip(&TypedFrame::SessionReject(SessionReject {
+            session_id: [1; 16],
+            reason: u64::from(crate::error_code::AUTHENTICATION_FAILED),
+            detail: "d".repeat(MAX_REJECT_DETAIL_BYTES),
+        }));
+
+        let mut out = Vec::new();
+        let mut wide = SessionAccept {
+            session_id: [1; 16],
+            granted_scope: vec![5; MAX_SCOPE_BYTES + 1],
+        };
+        assert!(encode_session_accept(&wide, &mut out).is_err());
+        wide.granted_scope.pop();
+        out.clear();
+        assert!(encode_session_accept(&wide, &mut out).is_ok());
+
+        let mut long = SessionReject {
+            session_id: [1; 16],
+            reason: u64::from(crate::error_code::AUTHENTICATION_FAILED),
+            detail: "d".repeat(MAX_REJECT_DETAIL_BYTES + 1),
+        };
+        out.clear();
+        assert!(encode_session_reject(&long, &mut out).is_err());
+        long.detail.pop();
+        out.clear();
+        assert!(encode_session_reject(&long, &mut out).is_ok());
+    }
+
+    #[test]
     fn an_auth_context_states_one_server_policy_one_way() {
         let context = |formats: Vec<u64>| AuthContext {
             nonce: vec![7; 16],

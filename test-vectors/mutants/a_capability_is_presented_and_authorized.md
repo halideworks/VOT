@@ -72,7 +72,7 @@ called `Result::unwrap_err()` on an `Ok` value: AuthorizationRequired
 assertion `left == right` failed
   left: Negotiated
  right: Authenticated
-assertion failed: rejected.pending_presentation().is_none(): the attempt this client is waiting on was not cleared
+the attempt this client is waiting on was not cleared
 assertion `left == right` failed
   left: 2
  right: 3

@@ -422,6 +422,13 @@ impl Negotiation {
             frame_type::SETTINGS_ACK => self.accept_settings_ack(),
             frame_type::AUTH_CONTEXT => self.accept_auth_context(payload),
             frame_type::SESSION_OPEN => self.accept_session_open(payload),
+            // The exchange owns its answers inbound as well as outbound. This
+            // endpoint never sends SESSION_OPEN, so an answer to one is a
+            // frame nothing here asked for, and handing it to the application
+            // would let a peer look like it had authenticated.
+            answer @ (frame_type::SESSION_ACCEPT | frame_type::SESSION_REJECT) => {
+                Err(self.out_of_sequence(answer))
+            }
             other => self.accept_application(other),
         }
     }
@@ -2346,6 +2353,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::AuthContextInvalid);
         assert_eq!(error.close_code(), error_code::MALFORMED_FRAME);
+    }
+
+    #[test]
+    fn an_answer_to_a_request_this_endpoint_never_made_is_refused() {
+        // Nothing here sends SESSION_OPEN yet, so an acceptance or a refusal
+        // answers nothing. Handing it to the application would let a peer look
+        // like it had authenticated this endpoint.
+        for frame in [
+            vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
+                session_id: [7; 16],
+                granted_scope: Vec::new(),
+            }),
+            vot_codec::frames::TypedFrame::SessionReject(SessionReject {
+                session_id: [7; 16],
+                reason: u64::from(error_code::AUTHENTICATION_FAILED),
+                detail: String::new(),
+            }),
+        ] {
+            let mut encoded = Vec::new();
+            vot_codec::frames::encode(&frame, &mut encoded).unwrap();
+            for state in [State::Negotiated, State::Authenticated] {
+                let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
+                client.state = state;
+                let error = client.accept_control(&encoded).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    &ErrorKind::OutOfSequence {
+                        frame_type: frame.frame_type(),
+                        state
+                    }
+                );
+            }
+        }
     }
 
     #[test]

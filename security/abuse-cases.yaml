@@ -89,6 +89,7 @@
       ],
       "tests": ["token_signature_rejected", "token_audience_rejected", "token_issuer_rejected", "token_scope_rejected", "token_expiry_rejected", "token_delegation_rejected", "token_revoked_rejected", "token_channel_binding_rejected", "trace_token_sentinel_absent"],
       "telemetry": ["vot.session.closed"],
+      "test_location": "crates/vot-capability/src/verify.rs, except trace_token_sentinel_absent which is telemetry redaction",
       "residual_risk": "A deployment allowing unbound bearer tokens accepts declared replay exposure until expiry.",
       "gate": "required"
     },

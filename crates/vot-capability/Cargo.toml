@@ -1,0 +1,25 @@
+[package]
+name = "vot-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vot-capability-oracle"
+path = "src/bin/vot-capability-oracle.rs"
+
+[[bin]]
+name = "vot-capability-vectors"
+path = "src/bin/vot-capability-vectors.rs"
+
+[dependencies]
+ed25519-dalek.workspace = true
+vot-cbor = { path = "../vot-cbor" }
+
+[lints]
+workspace = true

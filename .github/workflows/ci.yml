@@ -75,6 +75,7 @@ jobs:
           python3 tools/validate_commit_model_sync.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_negotiation_vectors.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_session_vectors.py
+          VOT_CARGO="cargo +1.88.0" python3 tools/validate_capability_vectors.py
           VOT_CARGO="cargo +1.88.0" python3 tools/differential_fuzz_codec.py
 
       - name: Model-check commit invariants
@@ -407,6 +408,7 @@ jobs:
       matrix:
         include:
           - { package: vot-cbor, required: true }
+          - { package: vot-capability, required: true }
           - { package: vot-commit-model, required: true }
           - { package: vot-commit-posix, required: true }
           - { package: vot-commit-strict, required: true }

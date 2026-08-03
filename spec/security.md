@@ -94,7 +94,7 @@ A capability is signed or authenticated data containing at least:
 - package/object identity scope, including suite, root, and exact length when
   known;
 - allowed byte ranges or bounded package scope;
-- tenant, job, storage, wire, and concurrency limits;
+- resource limits, whose identifiers come from `spec/registries.md` section 13;
 - not-before, expiry, and unique token identifier;
 - delegation constraints; and
 - signing key identifier and capability format version.

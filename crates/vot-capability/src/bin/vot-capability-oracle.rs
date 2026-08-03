@@ -1,0 +1,144 @@
+//! Line-oriented oracle for the `ed25519-cbor-v1` conformance vectors.
+//!
+//! `tools/validate_capability_vectors.py` reimplements `spec/capability.cddl`
+//! from the specification text and compares its answer to this one, so agreement
+//! is evidence rather than a restatement of the same code.
+
+use std::fmt::Write as _;
+use std::io::{self, BufRead};
+
+use vot_capability::{Capability, Error, Scope, SignedCapability};
+
+fn main() -> io::Result<()> {
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        let Some((kind, hex)) = line.split_once(' ') else {
+            println!("err|INVALID_REQUEST");
+            continue;
+        };
+        let Some(input) = decode_hex(hex) else {
+            println!("err|INVALID_HEX");
+            continue;
+        };
+        let answer = match kind {
+            "signed" => signed_line(&input),
+            "capability" => capability_line(&input),
+            "scope" => scope_line(&input),
+            _ => "err|INVALID_REQUEST".to_owned(),
+        };
+        println!("{answer}");
+    }
+    Ok(())
+}
+
+/// The envelope, without checking its signature: that needs a key the vectors do
+/// not carry, and what a vector fixes is the encoding.
+fn signed_line(input: &[u8]) -> String {
+    match vot_capability::decode(input) {
+        Ok(SignedCapability {
+            key_id,
+            capability,
+            signature,
+        }) => format!(
+            "ok|signed|{}|{}|{}",
+            encode_hex(&key_id),
+            capability.len(),
+            encode_hex(&signature[..4])
+        ),
+        Err(error) => format!("err|{}", name(&error)),
+    }
+}
+
+fn capability_line(input: &[u8]) -> String {
+    match Capability::from_canonical_bytes(input) {
+        Ok(value) => {
+            let mut answer = format!(
+                "ok|capability|{}|{}|{}|{}|{}|{}|{}",
+                value.issuer,
+                value.audience,
+                encode_hex(&value.holder_key[..4]),
+                value
+                    .operations
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                value.not_before,
+                value.expiry,
+                encode_hex(&value.token_id[..4])
+            );
+            let _ = write!(answer, "|{}", scope_fields(&value.scope));
+            for limit in &value.limits {
+                let _ = write!(answer, "|l{}={}", limit.id, limit.value);
+            }
+            answer
+        }
+        Err(error) => format!("err|{}", name(&error)),
+    }
+}
+
+fn scope_line(input: &[u8]) -> String {
+    match vot_capability::decode_scope(input) {
+        Ok(scope) => format!("ok|scope|{}", scope_fields(&scope)),
+        Err(error) => format!("err|{}", name(&error)),
+    }
+}
+
+fn scope_fields(scope: &Scope) -> String {
+    let ranges = scope
+        .ranges
+        .iter()
+        .map(|range| format!("{}:{}", range.offset, range.length))
+        .collect::<Vec<_>>()
+        .join("+");
+    format!(
+        "{},{},{},{ranges}",
+        scope.suite,
+        encode_hex(&scope.root[..4]),
+        scope
+            .length
+            .map_or_else(|| "null".to_owned(), |length| length.to_string())
+    )
+}
+
+/// The name a vector states, so a refusal is compared by its rule and not by a
+/// message.
+fn name(error: &Error) -> &'static str {
+    match error {
+        Error::Encoding(vot_cbor::Error::Truncated) => "TRUNCATED",
+        Error::Encoding(vot_cbor::Error::NonCanonical) => "NON_CANONICAL",
+        Error::Encoding(vot_cbor::Error::Trailing) => "TRAILING",
+        Error::Encoding(vot_cbor::Error::NotUtf8) => "NOT_UTF8",
+        Error::Encoding(
+            vot_cbor::Error::Malformed | vot_cbor::Error::WrongType | vot_cbor::Error::TooLarge,
+        ) => "MALFORMED",
+        Error::UnsupportedVersion(_) => "UNSUPPORTED_VERSION",
+        Error::InvalidIdentity => "INVALID_IDENTITY",
+        Error::InvalidKeyId => "INVALID_KEY_ID",
+        Error::InvalidOperations => "INVALID_OPERATIONS",
+        Error::InvalidLimits => "INVALID_LIMITS",
+        Error::InvalidSuite(_) => "INVALID_SUITE",
+        Error::InvalidRange => "INVALID_RANGE",
+        Error::InvalidValidity => "INVALID_VALIDITY",
+        Error::UnsupportedDelegation(_) => "UNSUPPORTED_DELEGATION",
+        Error::Signature => "SIGNATURE",
+        Error::TooLarge => "TOO_LARGE",
+    }
+}
+
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    (0..input.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(input.get(index..index + 2)?, 16).ok())
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}

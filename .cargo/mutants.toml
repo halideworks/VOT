@@ -11,4 +11,13 @@ timeout_multiplier = 4.0
 # `.cargo/mutants-live.toml` is the same configuration without that exclusion,
 # and the msquic-mutation job runs it with the feature on.
 exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
-exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]
+# Binaries whose correctness a different check establishes. vot-capability's
+# oracle exists to be compared against an independent Python implementation of
+# spec/capability.cddl, which validate_capability_vectors.py does on every run and
+# cargo-mutants does not; its vector writer produces the committed file that
+# comparison reads. Mutating either measures the wrong thing.
+exclude_globs = [
+  "crates/vot-cli/src/main.rs",
+  "crates/vot-bench-driver/src/main.rs",
+  "crates/vot-capability/src/bin/*",
+]

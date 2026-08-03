@@ -17,4 +17,8 @@
 gitignore = true
 minimum_test_timeout = 60.0
 timeout_multiplier = 4.0
-exclude_globs = ["crates/vot-cli/src/main.rs", "crates/vot-bench-driver/src/main.rs"]
+exclude_globs = [
+  "crates/vot-cli/src/main.rs",
+  "crates/vot-bench-driver/src/main.rs",
+  "crates/vot-capability/src/bin/*",
+]

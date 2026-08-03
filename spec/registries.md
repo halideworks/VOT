@@ -236,7 +236,7 @@ field of the statement it signs.
 
 | Value | Name | Status |
 |---:|---|---|
-| `0x0001` | `ed25519-cbor-v1` | reserved for stage two |
+| `0x0001` | `ed25519-cbor-v1` | draft |
 
 `0x0000` is reserved and MUST NOT be advertised or sent.
 
@@ -245,9 +245,10 @@ capability bytes in `SESSION_OPEN`. The format identifier travels outside those
 bytes so a server can reject a format it does not implement without parsing
 anything an unauthenticated peer chose the shape of.
 
-`ed25519-cbor-v1` is registered here so the identifier is stable, and is defined
-by ADR-0022 stage two, with the issuer anchor it verifies against defined by
-ADR-0023. A server advertising no format requires no authentication, which
+`ed25519-cbor-v1` is defined by `spec/capability.cddl`, with the issuer anchor it
+verifies against defined by ADR-0023. Its capability is Ed25519 over canonical
+CBOR, signed as the bytes it travels as rather than as a re-encoding of its
+claims. A server advertising no format requires no authentication, which
 `spec/wire.md` section 1.1 describes.
 
 A format defines its own delegation rules, and one that defines none refuses a
@@ -298,3 +299,33 @@ The relay and broker layer adds operations for source lists, alias creation, and
 lease renewal, which `spec/security.md` section 5 already names as points where
 authorization is rechecked. They are not numbered here, because nothing defines
 what they authorize yet; they arrive with the layer that does.
+
+## 13. Capability resource limits
+
+A resource limit is a ceiling a capability puts on its holder. `spec/security.md`
+section 5 requires a capability to carry them, and every identifier in that map
+comes from here.
+
+| Value | Name | Unit | Status |
+|---:|---|---|---|
+| `0x0001` | `CONCURRENT_LANES` | reliable lanes open at once | draft |
+| `0x0002` | `WIRE_BYTES` | bytes on the wire under this capability | draft |
+| `0x0003` | `STORAGE_BYTES` | bytes stored at the receiver | draft |
+
+`0x0000` is reserved and MUST NOT appear in a capability.
+
+A limit a capability does not state is not a grant of unlimited use. The
+deployment's own ceilings still apply, and a verifier applies the lower of the
+two.
+
+An unknown limit identifier MUST fail closed: the capability is refused. This is
+the opposite of the rule section 12 gives an unknown operation, and deliberately
+so. An operation is a grant, so one a verifier cannot name is one it never
+authorizes and ignoring it grants nothing. A limit is a restriction, so ignoring
+one a verifier cannot name would lift it, and a capability that says "at most this
+much" would be honoured as "as much as you like".
+
+Cross-job and cross-tenant quotas are the broker's, which schedules across both.
+They are not numbered here for the reason the relay's operations are not: nothing
+defines what they bound yet, and `VOT_v0.3_Agent_Backlog.yaml` puts
+`quotas_enforced_across_network_CPU_IO_storage` in wave 7.

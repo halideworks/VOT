@@ -25,12 +25,29 @@ OPERATION_ROW = re.compile(
     r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| (?P<status>[a-z ]+) \|$",
     re.MULTILINE,
 )
+# Section 13 carries a unit column between the name and the status.
+LIMIT_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| [^|]+ \| (?P<status>[a-z ]+) \|$",
+    re.MULTILINE,
+)
 
 
 def section(document: str, heading: str, next_heading: str) -> str:
     start = document.index(heading)
     end = document.index(next_heading, start)
     return document[start:end]
+
+
+def numbered_section(document: str, heading: str) -> str:
+    """One section, whether or not another follows it.
+
+    Slicing to the end of the document instead reads the next section's rows as
+    this one's, which is what a table-line count then reports as a parse failure.
+    """
+    start = document.index(heading)
+    body = document[start + len(heading) :]
+    offset = body.find("\n## ")
+    return heading + (body if offset < 0 else body[:offset])
 
 
 def rust_module(source: str, name: str) -> str:
@@ -120,7 +137,7 @@ def validate(root: Path) -> None:
     # `is_registered_operation` is what decides whether a verifier knows a value.
     # A table row without a constant is an operation nothing can authorize; a
     # constant the list omits is one every verifier silently ignores.
-    operation_text = registry_text[registry_text.index("## 12. Capability operations") :]
+    operation_text = numbered_section(registry_text, "## 12. Capability operations")
     operation_rows = {
         match["name"]: int(match["value"], 16)
         for match in OPERATION_ROW.finditer(operation_text)
@@ -164,6 +181,47 @@ def validate(root: Path) -> None:
         "REGISTERED_OPERATIONS/operation mismatch: "
         f"listed-only={set(listed_operation_names) - operation_rust_rows.keys()}, "
         f"constant-only={operation_rust_rows.keys() - set(listed_operation_names)}"
+    )
+
+    # Section 13 is the same shape as section 12 and needs the same two checks,
+    # because a limit is what a verifier refuses a capability over.
+    limit_text = numbered_section(registry_text, "## 13. Capability resource limits")
+    limit_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in LIMIT_ROW.finditer(limit_text)
+    }
+    assert limit_rows, "no capability limit rows parsed"
+    table_lines = sum(1 for line in limit_text.splitlines() if line.startswith("| `0x"))
+    assert len(limit_rows) == table_lines, (
+        f"parsed {len(limit_rows)} of {table_lines} capability limit rows"
+    )
+    assert 0 not in limit_rows.values(), "0x0000 is reserved"
+    assert len(set(limit_rows.values())) == len(limit_rows), (
+        "duplicate capability limit value"
+    )
+    limit_rust_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in RUST_CONSTANT.finditer(rust_module(rust_text, "resource_limit"))
+    }
+    assert limit_rust_rows == limit_rows, (
+        "Rust/limit registry mismatch: "
+        f"Rust-only={limit_rust_rows.keys() - limit_rows.keys()}, "
+        f"registry-only={limit_rows.keys() - limit_rust_rows.keys()}"
+    )
+    listed_limits = re.search(
+        r"pub const REGISTERED_LIMITS: \[u64; (?P<count>\d+)\] = \[(?P<body>[^\]]*)\];",
+        rust_text,
+    )
+    assert listed_limits, "REGISTERED_LIMITS not found"
+    listed_limit_names = re.findall(r"resource_limit::([A-Z0-9_]+)", listed_limits["body"])
+    assert len(listed_limit_names) == int(listed_limits["count"]), (
+        f"REGISTERED_LIMITS declares {listed_limits['count']} entries "
+        f"but lists {len(listed_limit_names)}"
+    )
+    assert set(listed_limit_names) == limit_rust_rows.keys(), (
+        "REGISTERED_LIMITS/resource_limit mismatch: "
+        f"listed-only={set(listed_limit_names) - limit_rust_rows.keys()}, "
+        f"constant-only={limit_rust_rows.keys() - set(listed_limit_names)}"
     )
 
     # The Auth column of wire.md section 5 is enforced by

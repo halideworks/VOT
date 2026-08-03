@@ -20,8 +20,11 @@ a check that is red for a known list teaches people to ignore red. The bound is
 in the job rather than in a comment, which is the whole difference: CI reads it
 every run, and a number nothing checks is what went stale and started this.
 
-The count that bound holds is 13, measured in CI at 265 mutants, 219 caught, 13
-missed, 31 unviable, and 2 timeouts. Every one of the 13 is below.
+The count that bound holds is 15, and it counts missed and timed out together.
+A survivor that hangs rather than fails is still a survivor, and which of the
+two a given mutant lands in depends on how loaded the runner is: two CI runs of
+the same commit reported 13 missed with 2 timeouts, then 12 with 3. Counting
+them apart makes the bound oscillate. All 15 are below.
 
 The tests written against what the run found:
 `a_skipped_frame_counts_down_exactly_what_is_left_of_it` covers the discard

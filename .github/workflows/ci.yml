@@ -335,7 +335,13 @@ jobs:
       # stale and started this.
       - name: Test live mutants
         env:
-          CLASSIFIED_SURVIVORS: 13
+          # Missed and timed out together. A survivor that hangs rather than
+          # fails is still a survivor, and which of the two a given mutant
+          # lands in depends on how loaded the runner is: two runs of the same
+          # commit reported 13 and 2, then 12 and 3. Counting them separately
+          # makes the bound oscillate and the notice below ask for a number
+          # that fails on the next run.
+          CLASSIFIED_SURVIVORS: 15
         run: |
           set -o pipefail
           cargo +1.88.0 mutants --package vot-transport-msquic --features live \
@@ -343,19 +349,16 @@ jobs:
             | tee mutants.log || true
           missed=$(grep -c '^MISSED' mutants.log || true)
           timeouts=$(grep -c '^TIMEOUT' mutants.log || true)
-          echo "missed=$missed timeouts=$timeouts classified=$CLASSIFIED_SURVIVORS"
-          if [ "$missed" -gt "$CLASSIFIED_SURVIVORS" ]; then
-            echo "::error::$missed live mutants survived, more than the $CLASSIFIED_SURVIVORS the evidence file accounts for"
-            grep '^MISSED' mutants.log
+          survivors=$((missed + timeouts))
+          echo "missed=$missed timeouts=$timeouts survivors=$survivors classified=$CLASSIFIED_SURVIVORS"
+          if [ "$survivors" -gt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::error::$survivors live mutants survived, more than the $CLASSIFIED_SURVIVORS the evidence file accounts for"
+            grep -E '^(MISSED|TIMEOUT)' mutants.log
             exit 1
           fi
-          if [ "$missed" -lt "$CLASSIFIED_SURVIVORS" ]; then
-            echo "::notice::$missed survivors, fewer than the $CLASSIFIED_SURVIVORS recorded. Lower CLASSIFIED_SURVIVORS and the evidence file."
+          if [ "$survivors" -lt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::notice::$survivors survivors, fewer than the $CLASSIFIED_SURVIVORS recorded. Lower CLASSIFIED_SURVIVORS and the evidence file."
           fi
-          # Timeouts are a test waiting out its own deadline rather than a hang,
-          # and whether one reproduces depends on how loaded the runner is, so
-          # they are reported and not enforced.
-          echo "timeouts: $timeouts"
 
   msquic-sanitizer:
     runs-on: ubuntu-24.04

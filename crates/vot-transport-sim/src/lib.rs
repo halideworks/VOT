@@ -238,16 +238,12 @@ impl SimulatorAdapter {
     /// limits it enforced nothing against would be worse than one that claims
     /// none.
     ///
-    /// # Errors
-    /// Rejects a control-frame bound outside the protocol range.
-    pub fn set_receive_limits(
-        &mut self,
-        limits: vot_transport_api::ReceiveLimits,
-    ) -> Result<(), TransportError> {
-        vot_transport_api::validate_control_payload_limit(limits.control_payload())?;
+    /// Infallible, like the TCP carrier's. `ReceiveLimits` can only be built by
+    /// `advertised`, which checks every value against the registry, so there is
+    /// nothing left here to refuse.
+    pub const fn set_receive_limits(&mut self, limits: vot_transport_api::ReceiveLimits) {
         self.control_receive_limit = limits.control_payload();
         self.receive_limits = Some(limits);
-        Ok(())
     }
 
     /// The code this endpoint ended the session under, once it has.
@@ -320,6 +316,11 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
         if self.closed.is_none() {
             self.closed = Some(code);
         }
+        // What was queued never went anywhere. Delivering it after the close
+        // would model a carrier that finishes sending as it ends, which no
+        // carrier does. Events already delivered stay pollable: a driver still
+        // has to read what arrived before this.
+        self.submissions.clear();
         Ok(())
     }
 
@@ -432,6 +433,9 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
         self.events.pop_front()
     }
 
+    /// Not guarded by the close: credit is this endpoint's own receive window
+    /// rather than something that goes to a peer, and a closed carrier drops the
+    /// queue it would have been applied from anyway.
     fn set_receive_credit(&mut self, bytes: u64) -> Result<(), TransportError> {
         self.submissions.push_back(Submission::ReceiveCredit(bytes));
         Ok(())
@@ -1552,6 +1556,14 @@ mod tests {
         // registry gives the fault.
         let mut adapter = SimulatorAdapter::default();
         assert_eq!(adapter.close_code(), None);
+
+        // Queued before the close, and delivered after an earlier flush. One of
+        // each, so the close has something to drop and something to leave alone.
+        adapter.send_control(b"delivered").unwrap();
+        adapter.flush().unwrap();
+        adapter.send_control(b"still queued").unwrap();
+        assert_eq!(adapter.pending_submissions(), 1);
+
         adapter
             .close(vot_codec::error_code::RESOURCE_LIMIT)
             .unwrap();
@@ -1579,9 +1591,19 @@ mod tests {
             adapter.send_datagram(1, b"late"),
             Err(TransportError::Backend)
         );
-        // Draining what was already accepted still works: the events are the
-        // carrier's, and a driver has to learn what happened before it closed.
+        // What it was holding never went anywhere. Delivering it after the close
+        // would model a carrier that finishes sending as it ends, which no
+        // carrier does.
+        assert_eq!(adapter.pending_submissions(), 0);
         adapter.flush().unwrap();
+
+        // What had already been delivered is still there to read: a driver has
+        // to learn what arrived before the close.
+        let polled: Vec<TransportEvent> = std::iter::from_fn(|| adapter.poll()).collect();
+        assert!(
+            matches!(&polled[..], [TransportEvent::Control(bytes)] if &**bytes == b"delivered"),
+            "delivered before the close and dropped after it, got {polled:?}"
+        );
     }
 
     #[test]
@@ -1601,7 +1623,7 @@ mod tests {
             vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES,
         )
         .unwrap();
-        adapter.set_receive_limits(limits).unwrap();
+        adapter.set_receive_limits(limits);
         assert_eq!(adapter.receive_limits(), Some(limits));
         assert!(
             limits.match_settings(&settings),
@@ -1624,18 +1646,16 @@ mod tests {
         // bounds, and negotiation moves them apart. A loopback sharing one field
         // would report a peer's limit as its own and hold delivery to it.
         let mut adapter = SimulatorAdapter::default();
-        adapter
-            .set_receive_limits(
-                vot_transport_api::ReceiveLimits::advertised(
-                    &vot_codec::Settings {
-                        max_control_frame_payload: 1024,
-                        ..vot_codec::Settings::default()
-                    },
-                    vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES,
-                )
-                .unwrap(),
+        adapter.set_receive_limits(
+            vot_transport_api::ReceiveLimits::advertised(
+                &vot_codec::Settings {
+                    max_control_frame_payload: 1024,
+                    ..vot_codec::Settings::default()
+                },
+                vot_transport_api::MAX_CONTROL_FRAME_WIRE_BYTES,
             )
-            .unwrap();
+            .unwrap(),
+        );
         // The peer accepts more than this endpoint reassembles, so submission
         // succeeds and delivery is what refuses.
         apply_peer_limit(&mut adapter, 64 * 1024).unwrap();

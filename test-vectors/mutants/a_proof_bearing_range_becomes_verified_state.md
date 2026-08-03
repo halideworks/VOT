@@ -30,6 +30,11 @@ On replay, `an_exact_duplicate_is_ignored_and_a_conflicting_one_is_refused`,
 remembered identities does not reintroduce the failure.
 `a_bundle_that_failed_verification_is_still_retryable` proves an unverified
 bundle is not remembered as delivered.
+`a_replay_differing_anywhere_is_a_conflict` proves the remembered identity is
+the frame rather than a chosen set of fields.
+`a_bundle_for_a_verified_subject_still_has_to_verify` proves a subject with no
+range state left is not a hole: an identifier never seen is not a replay, and
+its proof is checked before anything is accepted.
 
 Over a real carrier,
 `a_proof_bearing_range_becomes_verified_state_over_the_carrier` drives the
@@ -42,7 +47,9 @@ count bundles without counting bytes; hold records for an unadmitted subject;
 share one budget between admitted bundles and orphan records; treat an exact
 duplicate as a conflict; remember a bundle before the receiver accepted it;
 evict the whole memory of delivered identities on each delivery; leave the
-entry in place when a proof is refused.
+entry in place when a proof is refused; accept any bundle naming a verified
+subject without checking its proof; compare a replay on subject and covered
+range alone.
 
 Observed failure:
 
@@ -57,6 +64,6 @@ assertion `left == right` failed: the replay held nothing
  right: 0
 ```
 
-The required `vot-scheduler` mutation run reports 195 total, 174 caught, 21
+The required `vot-scheduler` mutation run reports 196 total, 176 caught, 20
 unviable, and 0 missed. The required `vot-session` run reports 148 total, 114
 caught, 34 unviable, and 0 missed.

@@ -184,7 +184,11 @@ impl ReliableReceiver {
         proof: &[u8],
         staging_reserved: bool,
     ) -> Result<(), Error> {
-        if !self.range_active.contains_key(&subject) {
+        // A subject whose every byte is verified has no range state left, but a
+        // peer may still replay a range it already sent. The replay is checked
+        // like any other and then changes nothing.
+        let replay = self.verified.contains(&subject);
+        if !replay && !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
         }
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
@@ -225,6 +229,14 @@ impl ReliableReceiver {
                 )
                 .map_err(|_| Error::ProofInvalid)?;
             }
+        }
+        // Checked after the proof, so a bundle that does not verify against the
+        // subject root is refused rather than accepted as a replay.
+        if replay {
+            if staging_reserved {
+                self.staging.release(bytes);
+            }
+            return Ok(());
         }
         let next_bytes = {
             let active = self

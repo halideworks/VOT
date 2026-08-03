@@ -71,42 +71,21 @@ impl DeliveredRecord {
     }
 }
 
-/// The range a delivered bundle covered.
+/// What a delivered bundle was, and the records that covered it.
 ///
-/// `spec/wire.md` section 5 deduplicates on request and range identity, so this
-/// is what a replayed bundle is compared against.
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct DeliveredRange {
-    subject: SubjectId,
-    covered_offset: u64,
-    covered_length: u64,
-}
-
-impl DeliveredRange {
-    fn of(bundle: &ProofBundle) -> Self {
-        Self {
-            subject: SubjectId {
-                suite: bundle.object.suite,
-                root: bundle.object.root,
-                length: bundle.object.length,
-            },
-            covered_offset: bundle.covered_offset,
-            covered_length: bundle.covered_length,
-        }
-    }
-}
-
-/// What a delivered bundle covered, and the records that covered it.
+/// The bundle is kept as a hash of the frame it arrived in rather than as a
+/// choice of fields, so a replay differing anywhere the wire carries a
+/// difference is a conflicting duplicate rather than an accepted one.
 #[derive(Clone, Eq, PartialEq)]
 struct Delivered {
-    range: DeliveredRange,
+    identity: [u8; 32],
     records: Vec<DeliveredRecord>,
 }
 
 impl Delivered {
-    fn of(bundle: &ProofBundle, records: &[DataRecord]) -> Self {
+    fn of(identity: [u8; 32], records: &[DataRecord]) -> Self {
         Self {
-            range: DeliveredRange::of(bundle),
+            identity,
             records: records.iter().map(DeliveredRecord::of).collect(),
         }
     }
@@ -116,6 +95,8 @@ impl Delivered {
 #[derive(Default)]
 struct Pending {
     bundle: Option<ProofBundle>,
+    /// The hash of the frame the bundle arrived in, kept for the replay check.
+    identity: Option<[u8; 32]>,
     records: Vec<DataRecord>,
 }
 
@@ -360,12 +341,17 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let (typed, _) =
             vot_codec::frames::decode(frame, limits).map_err(|_| Error::ProofInvalid)?;
         match typed {
-            TypedFrame::ProofBundle(bundle) => self.hold_bundle(bundle),
+            // Hashed as it arrived. Canonical encoding is mandatory, so the
+            // same bundle always produces the same bytes, and nothing has to
+            // choose which fields count as its identity.
+            TypedFrame::ProofBundle(bundle) => {
+                self.hold_bundle(bundle, *blake3::hash(frame).as_bytes())
+            }
             _ => Err(Error::ProofInvalid),
         }
     }
 
-    fn hold_bundle(&mut self, bundle: ProofBundle) -> Result<(), Error> {
+    fn hold_bundle(&mut self, bundle: ProofBundle, identity: [u8; 32]) -> Result<(), Error> {
         let subject = SubjectId {
             suite: bundle.object.suite,
             root: bundle.object.root,
@@ -378,10 +364,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         }
         let id = bundle.bundle_id;
         if let Some((_, prior)) = self.delivered.iter().find(|(seen, _)| *seen == id) {
-            // Already delivered. An exact replay is idempotent; a different
-            // range under the same identity is a conflicting duplicate. The
+            // Already delivered. An exact replay is idempotent; anything else
+            // under the same bundle identifier is a conflicting duplicate. The
             // records it covers are compared as they arrive.
-            return if prior.range == DeliveredRange::of(&bundle) {
+            return if prior.identity == identity {
                 Ok(())
             } else {
                 Err(Error::ProofInvalid)
@@ -422,7 +408,9 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             .checked_add(carried)
             .ok_or(Error::LengthExceeded)?;
         self.reserve(&id, bytes, false)?;
-        self.pending.entry(id).or_default().bundle = Some(bundle);
+        let pending = self.pending.entry(id).or_default();
+        pending.bundle = Some(bundle);
+        pending.identity = Some(identity);
         self.deliver(id)
     }
 
@@ -517,7 +505,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let Some(pending) = self.pending.remove(&id) else {
             return Ok(());
         };
-        let Some(bundle) = pending.bundle else {
+        let (Some(bundle), Some(identity)) = (pending.bundle, pending.identity) else {
             return Ok(());
         };
         let subject = SubjectId {
@@ -525,16 +513,11 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             root: bundle.object.root,
             length: bundle.object.length,
         };
-        let delivered = Delivered::of(&bundle, &pending.records);
-        // A bundle whose identity is still remembered never reaches here, so
-        // this is one whose identity was evicted. Every byte of the subject is
-        // already verified and its range state is closed, so reassembling it
-        // would fail rather than repeat. Remembering it again is what makes
-        // the bound on that memory harmless.
-        if self.receiver.is_verified(subject) {
-            self.remember(id, delivered);
-            return Ok(());
-        }
+        let delivered = Delivered::of(identity, &pending.records);
+        // A bundle whose identity is still remembered never reaches here, so a
+        // replay arriving here is one whose identity was evicted. The receiver
+        // checks its proof either way and treats a verified subject as
+        // unchanged, which is what makes the bound on that memory harmless.
         self.receiver
             .receive_typed_bundle(subject, &bundle, &pending.records)?;
         // Remembered only once the receiver has accepted it. A bundle that
@@ -1313,6 +1296,61 @@ mod tests {
             .events
             .push_back(carried(&wire(&TypedFrame::ProofBundle(conflicting))));
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+    }
+
+    #[test]
+    fn a_replay_differing_anywhere_is_a_conflict() {
+        // The identity is the frame, not a chosen set of fields, so a bundle
+        // reusing an identifier with different request metadata is refused
+        // even when its subject and covered range match.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+
+        let mut relabelled = bundle;
+        relabelled.request_id = [0xaa; 16];
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(relabelled))));
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+    }
+
+    #[test]
+    fn a_bundle_for_a_verified_subject_still_has_to_verify() {
+        // A subject with no range state left must not become a hole: an
+        // identifier this has never seen is not a replay, and accepting one
+        // unchecked would let a peer have arbitrary proof bytes remembered as
+        // delivered.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject).unwrap();
+        push_object(&mut driver, &bundle, &records);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        let remembered = driver.remembered_bundles();
+
+        let mut forged = bundle;
+        forged.bundle_id = [0x5e; 16];
+        forged.proof[0] ^= 0xff;
+        let forged_records: Vec<DataRecord> = records
+            .iter()
+            .map(|record| DataRecord {
+                bundle_id: forged.bundle_id,
+                ..record.clone()
+            })
+            .collect();
+        push_object(&mut driver, &forged, &forged_records);
+        assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+        assert_eq!(
+            driver.remembered_bundles(),
+            remembered,
+            "an unverified bundle is not remembered"
+        );
     }
 
     #[test]

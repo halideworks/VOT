@@ -344,10 +344,11 @@ pub mod live {
     };
 
     use super::{
-        CONTROL_STREAM_ID, Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MAX_PARTIAL_FRAME,
-        MsQuicAdapter, NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST,
+        CONTROL_STREAM_ID, Command, MAX_CALLBACK_BYTES, MAX_CALLBACK_EVENTS, MsQuicAdapter,
+        NativeEvent, PEER_LANE_BASE, PEER_LANE_LAST,
     };
     use vot_transport_api::PathStats;
+    use vot_transport_framing::{FrameFault, Framing, StreamKind};
 
     pub struct SendBuffer {
         storage: Box<[u8]>,
@@ -854,301 +855,26 @@ pub mod live {
         }
     }
 
-    /// What a stream carries, which decides both the frame bound applied to it
-    /// and the kind of event its bytes become.
+    /// What this backend's partial frames are charged against.
     ///
-    /// Carried explicitly rather than inferred from the lane number, so an
-    /// application stream can never be mistaken for the control stream.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum StreamKind {
-        /// The negotiation stream `spec/wire.md` reserves.
-        Control,
-        /// An application lane, reported under `lane`.
-        Reliable { lane: u64 },
-    }
+    /// The same budget as queued events, so `MAX_CALLBACK_BYTES` is what a peer
+    /// can make this connection hold whichever side of the handover the bytes
+    /// are on. One lock covers both, so a frame cannot complete into a queue
+    /// that filled while it was being charged.
+    #[derive(Clone)]
+    struct SharedBudget(Arc<Mutex<CallbackQueue>>);
 
-    impl StreamKind {
-        /// Largest payload a frame on this kind of stream may declare.
-        ///
-        /// `control` is what this endpoint advertised, which is at most the
-        /// compiled-in ceiling and may be less.
-        const fn payload_limit(self, control: usize) -> usize {
-            match self {
-                Self::Control => control,
-                Self::Reliable { .. } => vot_transport_api::MAX_DATA_RECORD_BYTES,
-            }
-        }
-
-        /// Largest partial frame this kind of stream may hold, envelope
-        /// included.
-        const fn partial_frame_limit(self, control: usize) -> usize {
-            match self {
-                Self::Control => {
-                    control.saturating_add(vot_transport_api::MAX_FRAME_ENVELOPE_BYTES)
-                }
-                Self::Reliable { .. } => MAX_PARTIAL_FRAME,
-            }
-        }
-    }
-
-    /// Per-stream reassembly state.
-    ///
-    /// QUIC preserves a byte stream, not message boundaries, and `spec/wire.md`
-    /// permits a frame to be split across callbacks or several to arrive in
-    /// one. Treating a callback buffer as a record would deliver truncated or
-    /// combined ones. Each stream owns its own state, because bytes from two
-    /// streams share no ordering and combining them would build frames that
-    /// were never sent.
-    struct Framing {
-        pending: Vec<u8>,
-        /// The control bound this stream reassembles under. A frame already
-        /// part-way through keeps the bound its envelope was read under.
-        control_limit: Arc<AtomicUsize>,
-        /// Payload bytes of a skipped frame still to arrive. They are dropped as
-        /// they land rather than buffered, which `spec/wire.md` requires and
-        /// which also keeps a peer from parking a lane's worth of memory per
-        /// stream by fragmenting a frame nobody will read.
-        discarding: usize,
-        /// What `pending` currently costs against the shared budget.
-        reserved: usize,
-        budget: Arc<Mutex<CallbackQueue>>,
-        kind: StreamKind,
-    }
-
-    impl Framing {
-        fn new(
-            kind: StreamKind,
-            budget: Arc<Mutex<CallbackQueue>>,
-            control_limit: Arc<AtomicUsize>,
-        ) -> Self {
-            Self {
-                pending: Vec::new(),
-                control_limit,
-                discarding: 0,
-                reserved: 0,
-                budget,
-                kind,
-            }
-        }
-
-        /// Buffers bytes of a frame still arriving, against the shared budget.
-        ///
-        /// # Errors
-        /// Reports a budget the peer has already spent, which is a resource
-        /// limit rather than a malformed frame.
-        fn hold(&mut self, bytes: &[u8]) -> Result<(), FrameFault> {
-            if !bytes.is_empty() {
-                let Ok(mut budget) = self.budget.lock() else {
-                    return Err(FrameFault::exhausted());
-                };
-                if !budget.reserve_assembly(bytes.len()) {
-                    return Err(FrameFault::exhausted());
-                }
-                self.reserved += bytes.len();
-            }
-            self.pending.extend_from_slice(bytes);
-            Ok(())
-        }
-
-        /// Drops the buffered frame and returns its cost to the budget.
-        fn release(&mut self) {
-            self.pending.clear();
-            if self.reserved != 0 {
-                if let Ok(mut budget) = self.budget.lock() {
-                    budget.release_assembly(self.reserved);
-                }
-                self.reserved = 0;
-            }
-        }
-
-        /// Feeds received bytes to `emit`, one complete frame at a time.
-        ///
-        /// Frames are handed over as they are parsed rather than collected,
-        /// and only a trailing incomplete frame is ever copied into the buffer.
-        /// A coalesced read can carry many valid frames at once, so returning
-        /// them together would let one callback hold the whole read plus a copy
-        /// of every frame in it before the bounded queue saw any of them.
-        ///
-        /// # Errors
-        /// Reports a frame this lane cannot carry, either because it is
-        /// malformed, because it is larger than the lane allows, or because it
-        /// can never complete, all of which would otherwise stall the stream.
-        /// Propagates whatever `emit` reports.
-        fn accept(
-            &mut self,
-            bytes: &[u8],
-            mut emit: impl FnMut(&[u8]) -> Result<(), FrameFault>,
-        ) -> Result<(), FrameFault> {
-            // Once per call, so one carrier read uses one bound.
-            let control = self.control_limit.load(Ordering::Relaxed);
-            let limits = vot_codec::DecodeLimits {
-                max_unknown_payload: self.kind.payload_limit(control),
-                max_frames: 1,
+    impl vot_transport_framing::AssemblyBudget for SharedBudget {
+        fn reserve(&self, bytes: usize) -> bool {
+            let Ok(mut budget) = self.0.lock() else {
+                return false;
             };
-            let mut input = bytes;
-            loop {
-                // Bytes belonging to a frame being skipped never reach the
-                // buffer at all.
-                if self.discarding != 0 {
-                    let dropped = self.discarding.min(input.len());
-                    self.discarding -= dropped;
-                    input = &input[dropped..];
-                    if self.discarding != 0 {
-                        return Ok(());
-                    }
-                }
-                if input.is_empty() {
-                    return Ok(());
-                }
-
-                // A frame already part-way through is completed from the buffer,
-                // which is the only place bytes accumulate.
-                if !self.pending.is_empty() {
-                    let Some(envelope) = self.envelope(limits, control, None)? else {
-                        // Not even the header is complete. It is at most a
-                        // couple of varints, so take one byte and look again.
-                        self.hold(&input[..1])?;
-                        input = &input[1..];
-                        continue;
-                    };
-                    let needed = envelope.total_length - self.pending.len();
-                    let taken = needed.min(input.len());
-                    if envelope.skipped {
-                        // The header is buffered but the payload is not, so
-                        // only the remainder has to be counted down.
-                        self.discarding = needed - taken;
-                        self.release();
-                        input = &input[taken..];
-                        continue;
-                    }
-                    self.hold(&input[..taken])?;
-                    input = &input[taken..];
-                    if self.pending.len() < envelope.total_length {
-                        return Ok(());
-                    }
-                    // Released before the frame is queued, so its bytes are
-                    // charged once rather than to both accounts at the handover.
-                    let complete = std::mem::take(&mut self.pending);
-                    self.release();
-                    emit(&complete)?;
-                    continue;
-                }
-
-                // Nothing buffered, so parse straight out of the read.
-                let Some(envelope) = self.envelope(limits, control, Some(input))? else {
-                    // Only a partial header is left. That is bounded by the
-                    // envelope size, not by the payload it describes.
-                    self.hold(input)?;
-                    return Ok(());
-                };
-                if input.len() < envelope.total_length {
-                    if envelope.skipped {
-                        // spec/wire.md step 6: stream-discard exactly the
-                        // declared length and never size a buffer from it.
-                        self.discarding = envelope.total_length - input.len();
-                        return Ok(());
-                    }
-                    self.hold(input)?;
-                    return Ok(());
-                }
-                if !envelope.skipped {
-                    emit(&input[..envelope.total_length])?;
-                }
-                input = &input[envelope.total_length..];
-            }
+            budget.reserve_assembly(bytes)
         }
 
-        /// Reads the next envelope from `input`, or from the buffer when
-        /// `input` is `None`, applying this lane's bound to it.
-        ///
-        /// Returns `None` while the header is still arriving.
-        fn envelope(
-            &self,
-            limits: vot_codec::DecodeLimits,
-            control: usize,
-            input: Option<&[u8]>,
-        ) -> Result<Option<vot_codec::FrameEnvelope>, FrameFault> {
-            match vot_codec::peek_envelope(input.unwrap_or(&self.pending), limits) {
-                Ok(envelope) => {
-                    // The codec bounds a known frame by its registered limit,
-                    // which for PROOF_BUNDLE and HAVE is larger than this lane
-                    // carries. Without this the frame decodes, reaches the
-                    // adapter, is refused there as oversized, and is retried for
-                    // ever at the head of the queue.
-                    if envelope.total_length > self.kind.partial_frame_limit(control) {
-                        return Err(FrameFault::too_large());
-                    }
-                    Ok(Some(envelope))
-                }
-                // The type and length have not both arrived yet.
-                Err(vot_codec::DecodeError::Incomplete { .. }) => Ok(None),
-                // The decoder already knows which registered error this is, and
-                // spec/wire.md requires the session to close under that code
-                // rather than under a generic transport abort.
-                Err(error) => Err(FrameFault::from_decode(&error)),
-            }
-        }
-
-        /// Bytes currently held for a frame still being assembled.
-        #[cfg(test)]
-        const fn buffered(&self) -> usize {
-            self.pending.len()
-        }
-
-        /// Whether a frame is part-way through arriving, whether it is being
-        /// assembled or discarded.
-        const fn is_assembling(&self) -> bool {
-            !self.pending.is_empty() || self.discarding != 0
-        }
-    }
-
-    impl Drop for Framing {
-        fn drop(&mut self) {
-            // A peer that resets a stream part-way through a frame destroys this
-            // without the frame ever completing. Without returning the
-            // reservation those bytes stay charged for ever, and enough resets
-            // refuse streams that have done nothing wrong.
-            self.release();
-        }
-    }
-
-    /// A stream's bytes could not be framed, with the code the session closes
-    /// under.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FrameFault {
-        error: Error,
-        close: u16,
-    }
-
-    impl FrameFault {
-        const fn too_large() -> Self {
-            Self {
-                error: Error::RecordTooLarge,
-                close: vot_codec::error_code::FRAME_TOO_LARGE,
-            }
-        }
-
-        /// A decoder error, closing under the code the registry gives it.
-        fn from_decode(error: &vot_codec::DecodeError) -> Self {
-            Self {
-                error: Error::Backend,
-                close: error.protocol_code(),
-            }
-        }
-
-        /// The shared budget for frames still arriving is spent.
-        const fn exhausted() -> Self {
-            Self {
-                error: Error::InboundQueueFull,
-                close: vot_codec::error_code::RESOURCE_LIMIT,
-            }
-        }
-
-        /// A frame that ended when the carrier did.
-        const fn truncated() -> Self {
-            Self {
-                error: Error::Backend,
-                close: vot_codec::error_code::MALFORMED_FRAME,
+        fn release(&self, bytes: usize) {
+            if let Ok(mut budget) = self.0.lock() {
+                budget.release_assembly(bytes);
             }
         }
     }
@@ -1174,7 +900,7 @@ pub mod live {
         kind: StreamKind,
         callback_owned: bool,
     ) -> impl FnMut(StreamRef, StreamEvent) -> Result<(), msquic::Status> + 'static {
-        let mut framing = Framing::new(kind, Arc::clone(&inbound), control_limit);
+        let mut framing = Framing::new(kind, SharedBudget(Arc::clone(&inbound)), control_limit);
         // Set once a fault has ended this stream, so the remaining bytes of a
         // coalesced read are not parsed against state the fault invalidated.
         let mut faulted = false;
@@ -1215,15 +941,12 @@ pub mod live {
                                 // The queue is full and a callback cannot
                                 // wait, so the connection fails loudly
                                 // instead of growing without limit.
-                                Err(FrameFault {
-                                    error: Error::InboundQueueFull,
-                                    close: vot_codec::error_code::RESOURCE_LIMIT,
-                                })
+                                Err(FrameFault::exhausted())
                             }
                         });
                         if let Err(fault) = outcome {
                             faulted = true;
-                            request_close(&close_request, fault.close);
+                            request_close(&close_request, fault.close());
                         }
                     }
                 }
@@ -1240,7 +963,7 @@ pub mod live {
                     // a record the peer already stopped sending.
                     if framing.is_assembling() {
                         faulted = true;
-                        request_close(&close_request, FrameFault::truncated().close);
+                        request_close(&close_request, FrameFault::truncated().close());
                     } else if callback_owned {
                         // Without closing our side the stream never reaches
                         // ShutdownComplete, so its native resources live until
@@ -2116,17 +1839,20 @@ pub mod live {
             ))
         }
 
-        fn lone(kind: StreamKind) -> Framing {
+        fn lone(kind: StreamKind) -> Framing<super::SharedBudget> {
             Framing::new(
                 kind,
-                Arc::new(Mutex::new(super::CallbackQueue::default())),
+                super::SharedBudget(Arc::new(Mutex::new(super::CallbackQueue::default()))),
                 control_bound(),
             )
         }
 
         /// Drives `accept` and collects what it emitted, which is what the
         /// tests assert on. The transport itself never collects.
-        fn collect(framing: &mut Framing, bytes: &[u8]) -> Result<Vec<Vec<u8>>, super::FrameFault> {
+        fn collect(
+            framing: &mut Framing<super::SharedBudget>,
+            bytes: &[u8],
+        ) -> Result<Vec<Vec<u8>>, super::FrameFault> {
             let mut frames = Vec::new();
             framing.accept(bytes, |frame| {
                 frames.push(frame.to_vec());
@@ -2419,7 +2145,7 @@ pub mod live {
             for lane in 0..lanes {
                 let mut framing = Framing::new(
                     StreamKind::Reliable { lane },
-                    Arc::clone(&budget),
+                    super::SharedBudget(Arc::clone(&budget)),
                     control_bound(),
                 );
                 match framing.accept(&head, |_| Ok(())) {
@@ -2450,7 +2176,7 @@ pub mod live {
             drop(finished);
             let mut recovered = Framing::new(
                 StreamKind::Reliable { lane: 999 },
-                Arc::clone(&budget),
+                super::SharedBudget(Arc::clone(&budget)),
                 control_bound(),
             );
             recovered.accept(&head, |_| Ok(())).unwrap();
@@ -2469,7 +2195,7 @@ pub mod live {
             for reset in 0..8 {
                 let mut framing = Framing::new(
                     StreamKind::Reliable { lane: reset },
-                    Arc::clone(&budget),
+                    super::SharedBudget(Arc::clone(&budget)),
                     control_bound(),
                 );
                 framing.accept(&head, |_| Ok(())).unwrap();
@@ -2621,8 +2347,8 @@ pub mod live {
             // The wire code travels with the refusal, so the peer is closed on
             // FRAME_TOO_LARGE rather than a bare transport abort.
             let fault = super::FrameFault::too_large();
-            assert_eq!(fault.error, Error::RecordTooLarge);
-            assert_eq!(fault.close, vot_codec::error_code::FRAME_TOO_LARGE);
+            assert_eq!(fault.error(), Error::RecordTooLarge);
+            assert_eq!(fault.close(), vot_codec::error_code::FRAME_TOO_LARGE);
             assert_eq!(
                 collect(&mut lone(StreamKind::Control), &oversized),
                 Err(fault)
@@ -2644,7 +2370,7 @@ pub mod live {
             assert!(collect(&mut framing, &frame[..3]).unwrap().is_empty());
             assert!(framing.is_assembling());
             assert_eq!(
-                super::FrameFault::truncated().close,
+                super::FrameFault::truncated().close(),
                 vot_codec::error_code::MALFORMED_FRAME
             );
 
@@ -2667,7 +2393,7 @@ pub mod live {
                 &unknown_critical,
             )
             .unwrap_err();
-            assert_eq!(fault.close, vot_codec::error_code::UNKNOWN_CRITICAL_FRAME);
+            assert_eq!(fault.close(), vot_codec::error_code::UNKNOWN_CRITICAL_FRAME);
         }
 
         #[test]

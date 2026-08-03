@@ -2422,6 +2422,88 @@ pub mod live {
         }
 
         #[test]
+        fn a_frame_at_the_holding_limit_is_accepted_and_one_past_it_is_not() {
+            // The bound exists because the codec lets a known frame be larger
+            // than a lane carries. Refusing its own maximum would refuse a peer
+            // that sent nothing oversized.
+            let mut framing = lone(StreamKind::Control);
+            let control = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
+            let limit = StreamKind::Control.partial_frame_limit(control);
+            // PROOF_BUNDLE, because the bound only bites for a frame whose
+            // registered limit is larger than the lane carries.
+            let kind = vot_codec::frame_type::PROOF_BUNDLE;
+            let envelope = framed(kind, &vec![0; limit]).len() - limit;
+            let exact = framed(kind, &vec![0; limit - envelope]);
+            assert_eq!(exact.len(), limit, "the frame is exactly the bound");
+            assert_eq!(collect(&mut framing, &exact).unwrap().len(), 1);
+
+            let mut past = lone(StreamKind::Control);
+            let over = framed(kind, &vec![0; limit - envelope + 1]);
+            assert_eq!(over.len(), limit + 1);
+            assert!(collect(&mut past, &over).is_err());
+        }
+
+        #[test]
+        fn a_skipped_frame_counts_down_exactly_what_is_left_of_it() {
+            // The remainder of a discarded payload is counted across reads. An
+            // arithmetic slip here either eats the frame behind it or never
+            // stops discarding, and the stream carries nothing again either
+            // way.
+            let skipped = framed(0x1f00, &vec![0x77; 300]);
+            let wanted = framed(vot_codec::frame_type::PING, b"");
+            let mut joined = skipped.clone();
+            joined.extend_from_slice(&wanted);
+
+            // Split inside the skipped payload, so the count has to survive the
+            // boundary.
+            for split in [1, 5, skipped.len() - 1, skipped.len()] {
+                let mut framing = lone(StreamKind::Control);
+                let first = collect(&mut framing, &joined[..split]).unwrap();
+                assert!(first.is_empty(), "nothing completes at {split}");
+                let rest = collect(&mut framing, &joined[split..]).unwrap();
+                assert_eq!(rest, vec![wanted.clone()], "split at {split}");
+            }
+
+            // And a read that ends exactly where the discard does still hands
+            // over what follows in the same read.
+            let mut framing = lone(StreamKind::Control);
+            assert_eq!(collect(&mut framing, &joined).unwrap(), vec![wanted]);
+        }
+
+        #[test]
+        fn the_callback_budget_admits_the_bound_it_states() {
+            // A budget that refuses its own maximum is a smaller budget than
+            // every comment and constant here describes.
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            {
+                let mut held = queue.lock().unwrap();
+                assert!(
+                    held.reserve_assembly(MAX_CALLBACK_BYTES),
+                    "the whole budget is reservable"
+                );
+                assert!(!held.reserve_assembly(1), "and nothing more");
+                held.release_assembly(MAX_CALLBACK_BYTES);
+            }
+
+            // Sized so the last one lands exactly on the bound. Anything that
+            // does not divide it leaves the boundary itself untested, which is
+            // the only place an off-by-one lives.
+            let size = MAX_CALLBACK_BYTES / 16;
+            assert_eq!(size * 16, MAX_CALLBACK_BYTES);
+            let frame = vec![0x33; size];
+            for admitted in 1..=16 {
+                assert!(
+                    super::push(&queue, NativeEvent::Control(frame.clone())),
+                    "refused at {admitted} of 16, inside its own bound"
+                );
+            }
+            assert!(
+                !super::push(&queue, NativeEvent::Control(vec![0x33; 1])),
+                "and one byte past it is refused"
+            );
+        }
+
+        #[test]
         fn a_coalesced_read_is_handed_over_frame_by_frame() {
             // MsQuic can deliver one buffer holding many complete frames.
             // Collecting them before offering any to the bounded queue would
@@ -3239,6 +3321,140 @@ pub mod live {
         }
 
         #[test]
+        fn each_accepted_connection_gets_its_own_identity_and_reports_its_own_close() {
+            // One test asserted the identifier equalled one, which is what a
+            // constant returns too. Two connections is what says the value
+            // comes from anywhere, and reporting two peers' records under one
+            // identifier would make their interleaving look like reordering
+            // within a single connection.
+            let registration = Arc::new(super::registration().unwrap());
+            let configuration = server_configuration(&registration);
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            let address = Addr::from(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            let mut server = MsQuicServer::listen(
+                configuration,
+                Arc::clone(&registration),
+                &alpn,
+                &address,
+                server_limits(),
+            )
+            .unwrap();
+            let port = server.local_port().unwrap();
+            assert!(port != 0, "a listener reports the port it actually bound");
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut peers = Vec::new();
+            let mut accepted = Vec::new();
+            for context in 0..2u64 {
+                let client_registration = super::registration().unwrap();
+                let mut peer = MsQuicTransport::connect(
+                    client_configuration(&client_registration),
+                    client_registration,
+                    "127.0.0.1",
+                    port,
+                    context,
+                    test_limits(),
+                )
+                .unwrap();
+                assert!(drive(&mut peer, deadline, |event| matches!(
+                    event,
+                    Event::Connected(_)
+                )));
+                let taken = loop {
+                    assert!(Instant::now() < deadline, "the server never accepted");
+                    if let Some(taken) = server.accept() {
+                        break taken;
+                    }
+                    std::thread::yield_now();
+                };
+                peers.push(peer);
+                accepted.push(taken);
+            }
+            assert_ne!(
+                accepted[0].connection_id(),
+                accepted[1].connection_id(),
+                "two connections, two identities"
+            );
+
+            // Path statistics are read from the connection, so an accepted one
+            // has to answer for its own.
+            accepted[0].sample_path().unwrap();
+
+            // A peer closing under a registered code is reported on the
+            // accepted side, which is the side that has to log why a transfer
+            // ended.
+            let mut closing = peers.remove(1);
+            let mut ending = accepted.remove(1);
+            closing
+                .close(vot_codec::error_code::RESOURCE_LIMIT)
+                .unwrap();
+            closing.flush().unwrap();
+            let mut observed = None;
+            while Instant::now() < deadline && observed.is_none() {
+                while ending.poll().is_some() {}
+                while closing.poll().is_some() {}
+                observed = ending.peer_close_code();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                observed,
+                Some(vot_codec::error_code::RESOURCE_LIMIT),
+                "the accepted side reports the code the peer closed under"
+            );
+
+            // And the connection that stayed is untouched by the one that went.
+            assert!(accepted[0].peer_close_code().is_none());
+
+            drop(ending);
+            drop(closing);
+            drop(peers);
+            drop(accepted);
+            drop(server);
+        }
+
+        /// Every adapter method an accepted connection only delegates. One
+        /// that quietly answers for itself is what a caller cannot see.
+        fn assert_delegates_to_its_carrier(accepted: &mut AcceptedTransport) {
+            // The adapter surface an accepted connection exposes is delegation,
+            // and a delegation that quietly answers for itself is the one thing
+            // a caller cannot see. Each of these has to reach the carrier.
+            use vot_transport_api::TransportAdapter as _;
+            let limits = accepted
+                .receive_limits()
+                .expect("an accepted side advertises");
+            assert_eq!(limits.lanes(), test_limits().lanes());
+            assert_eq!(limits.control_payload(), test_limits().control_payload());
+
+            // A record past what a lane carries is refused before it is
+            // queued, whether it is offered alone or in a batch.
+            let oversized = vot_transport_api::Payload::from(vec![
+                0;
+                vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES
+                    + 1
+            ]);
+            assert!(
+                accepted
+                    .preflight_reliable_batch(StreamId(1), &[oversized.clone()])
+                    .is_err()
+            );
+            assert!(
+                accepted
+                    .send_reliable_shared(StreamId(1), oversized)
+                    .is_err()
+            );
+
+            // And the control limit reaches the carrier, so a frame past
+            // the new one is refused where it was accepted before.
+            let small = vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD;
+            accepted.set_control_payload_limit(small).unwrap();
+            let past = framed(vot_codec::frame_type::SETTINGS, &vec![0; small + 1024]);
+            assert!(accepted.send_control(&past).is_err());
+            accepted
+                .set_control_payload_limit(vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD)
+                .unwrap();
+        }
+
+        #[test]
         fn an_accepted_connection_drives_the_same_transport_as_the_client() {
             // Both directions run production code here. A listener that
             // hand-rolls its own receive stack proves nothing about the one a
@@ -3286,6 +3502,8 @@ pub mod live {
                 std::thread::yield_now();
             };
             assert_eq!(accepted.connection_id(), 1);
+
+            assert_delegates_to_its_carrier(&mut accepted);
 
             // A control frame and records on two lanes. The lanes are the point:
             // they arrive as two independent peer-created streams, and reporting

@@ -293,6 +293,73 @@ jobs:
       - name: Lint isolated FFI crate
         run: cargo +1.88.0 clippy -p vot-transport-msquic --all-targets --features live --locked -- -D warnings
 
+  msquic-mutation:
+    # The live module was excluded from mutation testing entirely, so nothing
+    # measured it and the note claiming what survived went stale without anyone
+    # noticing. This runs it, and fails only when something survives that
+    # test-vectors/mutants/the_live_transport_is_mutation_tested.md does not
+    # already account for.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-mutants-26.0.0
+
+      - name: Install pinned cargo-mutants
+        run: >-
+          cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+          || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
+
+      # cargo-mutants exits non-zero whenever anything survives at all, and
+      # what survives here is a classified list. A check that is red for a known
+      # list teaches people to ignore red, so this compares against the list.
+      #
+      # The bound lives here rather than in a comment because CI reads it every
+      # run. That is the whole difference: a number nothing checks is what went
+      # stale and started this.
+      - name: Test live mutants
+        env:
+          # Missed and timed out together. A survivor that hangs rather than
+          # fails is still a survivor, and which of the two a given mutant
+          # lands in depends on how loaded the runner is: two runs of the same
+          # commit reported 13 and 2, then 12 and 3. Counting them separately
+          # makes the bound oscillate and the notice below ask for a number
+          # that fails on the next run.
+          CLASSIFIED_SURVIVORS: 15
+        run: |
+          set -o pipefail
+          cargo +1.88.0 mutants --package vot-transport-msquic --features live \
+            --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
+            | tee mutants.log || true
+          missed=$(grep -c '^MISSED' mutants.log || true)
+          timeouts=$(grep -c '^TIMEOUT' mutants.log || true)
+          survivors=$((missed + timeouts))
+          echo "missed=$missed timeouts=$timeouts survivors=$survivors classified=$CLASSIFIED_SURVIVORS"
+          if [ "$survivors" -gt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::error::$survivors live mutants survived, more than the $CLASSIFIED_SURVIVORS the evidence file accounts for"
+            grep -E '^(MISSED|TIMEOUT)' mutants.log
+            exit 1
+          fi
+          if [ "$survivors" -lt "$CLASSIFIED_SURVIVORS" ]; then
+            echo "::notice::$survivors survivors, fewer than the $CLASSIFIED_SURVIVORS recorded. Lower CLASSIFIED_SURVIVORS and the evidence file."
+          fi
+
   msquic-sanitizer:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

@@ -41,6 +41,16 @@ pub mod operation {
     pub const READ_RANGES: u64 = 0x0003;
 }
 
+/// What a capability may cap, from `spec/registries.md` section 13.
+///
+/// A limit is a restriction rather than a grant, so an identifier a verifier
+/// cannot name fails closed: see [`is_registered_limit`].
+pub mod resource_limit {
+    pub const CONCURRENT_LANES: u64 = 0x0001;
+    pub const WIRE_BYTES: u64 = 0x0002;
+    pub const STORAGE_BYTES: u64 = 0x0003;
+}
+
 pub mod error_code {
     pub const UNKNOWN_CRITICAL_FRAME: u16 = 0x0101;
     pub const MALFORMED_FRAME: u16 = 0x0102;
@@ -417,6 +427,24 @@ pub const REGISTERED_OPERATIONS: [u64; 3] = [
 #[must_use]
 pub fn is_registered_operation(identifier: u64) -> bool {
     REGISTERED_OPERATIONS.contains(&identifier)
+}
+
+/// Every resource limit `spec/registries.md` section 13 defines, in identifier
+/// order.
+pub const REGISTERED_LIMITS: [u64; 3] = [
+    resource_limit::CONCURRENT_LANES,
+    resource_limit::WIRE_BYTES,
+    resource_limit::STORAGE_BYTES,
+];
+
+/// Whether this revision knows what a resource limit bounds.
+///
+/// `spec/registries.md` section 13: an unknown identifier fails closed and the
+/// capability is refused, which is the opposite of what an unknown operation
+/// does. Ignoring a restriction lifts it; ignoring a grant grants nothing.
+#[must_use]
+pub fn is_registered_limit(identifier: u64) -> bool {
+    REGISTERED_LIMITS.contains(&identifier)
 }
 
 /// The inclusive value range `spec/registries.md` gives a setting. One source

@@ -1,0 +1,55 @@
+; VOT ed25519-cbor-v1 capability, registered as `0x0001` in
+; spec/registries.md section 11 and defined by ADR-0022 stage two.
+; RFC 8949 core deterministic encoding is mandatory in addition to CDDL.
+;
+; The signature covers key 2 of `signed-capability` exactly as it arrives. A
+; verifier checks the signature over those bytes and then reads them; it does not
+; re-encode the claims, because that would make verification depend on a decoder
+; and an encoder being exact inverses.
+
+signed-capability = {
+  0: 0,                          ; envelope format version
+  1: bstr .size (1..64),         ; signing key identifier, bound into the signature
+  2: bstr,                       ; the canonical capability, as signed
+  3: bstr .size 64,              ; Ed25519 signature over the signing input
+}
+
+capability = {
+  0: 0,                          ; capability format version
+  1: identity,                   ; issuer
+  2: identity,                   ; audience
+  3: bstr .size 32,              ; holder public key, for proof of possession
+  4: [1*16 operation],           ; ascending, no duplicates
+  5: scope,
+  6: { 0*16 limit => uint },      ; ascending keys, no duplicates
+  7: uint,                       ; not-before, seconds since 1970-01-01T00:00:00Z
+  8: uint,                       ; expiry, strictly after not-before
+  9: id128,                      ; unique token identifier
+  10: 0,                         ; delegation: no further delegation
+}
+
+scope = {
+  0: suite,
+  1: bstr .size 32,              ; object root under that suite
+  2: uint / null,                ; exact length when known
+  3: [0*64 range],               ; ascending and disjoint; empty is the whole object
+}
+
+; Offset and length. The length is at least 1 and the end does not exceed a known
+; object length. Two adjacent ranges are two authorizations and do not combine.
+range = [uint, uint]
+
+; Non-empty, at most 128 bytes, and no control characters: an identity is a value
+; an operator prints.
+identity = tstr .size (1..128)
+
+; spec/registries.md section 5. 0x0000 is not a suite.
+suite = 1..2
+
+; spec/registries.md section 12. 0x0000 is reserved and never appears.
+operation = 1..65535
+
+; spec/registries.md section 13. 0x0000 is reserved and never appears.
+limit = 1..65535
+
+id128 = bstr .size 16

@@ -13,6 +13,7 @@ python3 tools/validate_registries.py
 python3 tools/validate_wire_vectors.py
 python3 tools/validate_negotiation_vectors.py
 python3 tools/validate_session_vectors.py
+python3 tools/validate_capability_vectors.py
 python3 tools/validate_receipt_vectors.py
 python3 tools/validate_security_matrix.py
 python3 tools/validate_benchmark_contract.py
@@ -34,6 +35,14 @@ binary, so it needs `cargo` on `PATH` as well.
 four payloads in isolation. The rules that span two frames are not vectorable and
 are enforced in `vot-session`: a binding proof matches the binding the challenge
 named, and an answer repeats the identifier of the request it answers.
+
+`validate_capability_vectors.py` reimplements `spec/capability.cddl` and the rules
+`spec/security.md` section 5 puts on a capability, and cross-checks 13 cases
+against the Rust crate through `vot-capability-oracle`. Five of them are refusals,
+which the validator requires: a file of nothing but accepted cases proves only
+that the decoder decodes. The canonical cases are the bytes the crate writes; the
+refusals are hand-written, so a rule the crate cannot express is visible in the
+file rather than absent from it.
 
 `validate_registries.py` compares the frame-type and setting-id tables in
 `spec/registries.md` against the constants in `vot-codec`, and checks that

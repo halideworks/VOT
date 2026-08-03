@@ -29,9 +29,10 @@ this endpoint would not is submitted and then refused at delivery.
 
 Mutants: answer `set_control_payload_limit`, `receive_limits`, or `close` from
 the trait default; validate a peer's limit and apply nothing; keep the limit a
-peer sent as the bound delivery is held to;
-record the last close code rather than the first; accept a submission after the
-carrier closed; deliver what was queued when it closed; admit a lane past the
+peer sent as the bound delivery is held to; record the last close code rather
+than the first; accept a submission after the
+carrier closed; deliver what was queued when it closed; discard what was
+delivered before a refusal partway through a flush; admit a lane past the
 advertised count; count a lane already seen against the limit again.
 
 Observed failure:
@@ -53,6 +54,7 @@ assertion `left == right` failed
 assertion `left == right` failed
   left: 1
  right: 0
+the record on an admitted lane still arrived, got []
 ```
 
 What the simulator still does not answer is `path_stats`, which stays `None`

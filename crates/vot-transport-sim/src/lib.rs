@@ -230,6 +230,60 @@ impl SimulatorAdapter {
         Ok(())
     }
 
+    /// Moves every submission into `delivered`, in submission order.
+    ///
+    /// Separate from `flush` so a refusal partway through cannot discard what
+    /// was delivered before it.
+    fn deliver(&mut self, delivered: &mut Vec<TransportEvent>) -> Result<(), TransportError> {
+        while let Some(submission) = self.submissions.pop_front() {
+            match submission {
+                Submission::Control(bytes) => {
+                    // Against the advertised bound rather than the peer's. A
+                    // frame inside what this endpoint promised to reassemble is
+                    // deliverable; one past it is what the promise refuses.
+                    vot_transport_api::validate_control_frame(&bytes, self.control_receive_limit)?;
+                    delivered.push(TransportEvent::Control(bytes));
+                }
+                Submission::Reliable { stream, bytes } => {
+                    self.admit_lane(stream)?;
+                    let sequence = self
+                        .next_sequence
+                        .checked_add(1)
+                        .ok_or(TransportError::ArithmeticOverflow)?;
+                    self.next_sequence = sequence;
+                    delivered.push(TransportEvent::Reliable {
+                        stream,
+                        sequence,
+                        bytes,
+                    });
+                }
+                Submission::Datagram { context, bytes } => {
+                    self.datagrams_sent = self
+                        .datagrams_sent
+                        .checked_add(1)
+                        .ok_or(TransportError::ArithmeticOverflow)?;
+                    delivered.push(TransportEvent::DatagramState {
+                        context,
+                        state: vot_transport_api::DatagramSendState::Queued,
+                    });
+                    let lost = self.impairment.drop_datagram_every != 0
+                        && self.datagrams_sent % self.impairment.drop_datagram_every == 0;
+                    delivered.push(TransportEvent::DatagramState {
+                        context,
+                        state: if lost {
+                            vot_transport_api::DatagramSendState::SuspectedLost
+                        } else {
+                            vot_transport_api::DatagramSendState::Sent
+                        },
+                    });
+                    let _ = bytes;
+                }
+                Submission::ReceiveCredit(bytes) => self.receive_credit = bytes,
+            }
+        }
+        Ok(())
+    }
+
     /// Applies what this endpoint advertises, so delivery holds a peer to it.
     ///
     /// Configuration rather than negotiation: the bound has to be in force
@@ -378,55 +432,15 @@ impl vot_transport_api::TransportAdapter for SimulatorAdapter {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         let mut delivered = Vec::with_capacity(self.submissions.len());
-        while let Some(submission) = self.submissions.pop_front() {
-            match submission {
-                Submission::Control(bytes) => {
-                    // Against the advertised bound rather than the peer's. A
-                    // frame inside what this endpoint promised to reassemble is
-                    // deliverable; one past it is what the promise refuses.
-                    vot_transport_api::validate_control_frame(&bytes, self.control_receive_limit)?;
-                    delivered.push(TransportEvent::Control(bytes));
-                }
-                Submission::Reliable { stream, bytes } => {
-                    self.admit_lane(stream)?;
-                    let sequence = self
-                        .next_sequence
-                        .checked_add(1)
-                        .ok_or(TransportError::ArithmeticOverflow)?;
-                    self.next_sequence = sequence;
-                    delivered.push(TransportEvent::Reliable {
-                        stream,
-                        sequence,
-                        bytes,
-                    });
-                }
-                Submission::Datagram { context, bytes } => {
-                    self.datagrams_sent = self
-                        .datagrams_sent
-                        .checked_add(1)
-                        .ok_or(TransportError::ArithmeticOverflow)?;
-                    delivered.push(TransportEvent::DatagramState {
-                        context,
-                        state: vot_transport_api::DatagramSendState::Queued,
-                    });
-                    let lost = self.impairment.drop_datagram_every != 0
-                        && self.datagrams_sent % self.impairment.drop_datagram_every == 0;
-                    delivered.push(TransportEvent::DatagramState {
-                        context,
-                        state: if lost {
-                            vot_transport_api::DatagramSendState::SuspectedLost
-                        } else {
-                            vot_transport_api::DatagramSendState::Sent
-                        },
-                    });
-                    let _ = bytes;
-                }
-                Submission::ReceiveCredit(bytes) => self.receive_credit = bytes,
-            }
+        let mut outcome = self.deliver(&mut delivered);
+        if outcome.is_ok() {
+            outcome = self.impair(&mut delivered);
         }
-        self.impair(&mut delivered)?;
+        // Whatever reached delivery before a refusal is still delivered.
+        // Dropping it would lose frames this carrier had already carried, and
+        // leave the refusal looking like it applied to all of them.
         self.events.extend(delivered);
-        Ok(())
+        outcome
     }
 
     fn poll(&mut self) -> Option<TransportEvent> {
@@ -1637,8 +1651,29 @@ mod tests {
             adapter.send_reliable(StreamId(lane), b"record").unwrap();
         }
         adapter.flush().unwrap();
-        adapter.send_reliable(StreamId(11), b"record").unwrap();
+        assert_eq!(
+            std::iter::from_fn(|| adapter.poll()).count(),
+            4,
+            "two lanes, and the second record on each is free"
+        );
+
+        // The refusal is for the lane past the bound and not for what came
+        // before it in the same flush. Dropping the earlier record would lose a
+        // frame this carrier had already carried.
+        adapter.send_reliable(StreamId(7), b"allowed").unwrap();
+        adapter
+            .send_reliable(StreamId(11), b"one lane too many")
+            .unwrap();
         assert_eq!(adapter.flush(), Err(TransportError::LaneLimitExceeded));
+        let kept: Vec<TransportEvent> = std::iter::from_fn(|| adapter.poll()).collect();
+        assert!(
+            matches!(
+                &kept[..],
+                [TransportEvent::Reliable { stream, bytes, .. }]
+                    if *stream == StreamId(7) && &**bytes == b"allowed"
+            ),
+            "the record on an admitted lane still arrived, got {kept:?}"
+        );
     }
 
     #[test]

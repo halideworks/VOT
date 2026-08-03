@@ -17,6 +17,30 @@ const MAX_HAVE_RUNS: u64 = 2_097_152;
 /// The most records one bundle can declare, from `spec/proof-bundle.cddl`.
 pub const MAX_DATA_RECORDS_PER_BUNDLE: usize = 17;
 
+const MAX_AUTH_NONCE: usize = 64;
+const MIN_AUTH_NONCE: usize = 16;
+const MAX_CAPABILITY_FORMATS: u64 = 16;
+const MAX_SCOPE_BYTES: usize = 4_096;
+const MAX_REJECT_DETAIL_BYTES: usize = 1_024;
+const MAX_CAPABILITY_FORMAT: u64 = 65_535;
+
+/// What is left of a `SESSION_OPEN` after the two scopes and the framing.
+///
+/// A capability sized without regard to what travels beside it would encode
+/// alone and be refused in a real request, which is a bound admitting
+/// something the wire never can. The 64 below is the CBOR around the fields:
+/// the map head, six keys, the session identifier, the format, and three
+/// byte-string heads come to 39 at these sizes, rounded up so a head that
+/// widens does not take the bound with it.
+const MAX_CAPABILITY_BYTES: usize = 49_152;
+const _: () = assert!(
+    match crate::registered_payload_limit(frame_type::SESSION_OPEN) {
+        Some(limit) => MAX_CAPABILITY_BYTES + 2 * MAX_SCOPE_BYTES + 64 <= limit,
+        None => false,
+    },
+    "a maximal SESSION_OPEN must fit the payload its registry entry allows"
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     Envelope(DecodeError),
@@ -95,6 +119,66 @@ impl ProofBundle {
     }
 }
 
+/// How a capability is bound to the peer that presents it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Binding {
+    None,
+    ProofOfPossession,
+}
+
+impl Binding {
+    const fn from_wire(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::ProofOfPossession),
+            _ => None,
+        }
+    }
+
+    const fn to_wire(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::ProofOfPossession => 1,
+        }
+    }
+}
+
+/// What the server asks a client to present, and what it accepts.
+///
+/// An empty `formats` means this deployment requires no authentication, which
+/// `spec/wire.md` section 1.1 gives as the way to say so.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthContext {
+    pub nonce: Vec<u8>,
+    pub binding: Binding,
+    pub formats: Vec<u64>,
+}
+
+/// A client's request to open an authenticated session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionOpen {
+    pub session_id: [u8; 16],
+    pub capability_format: u64,
+    pub capability: Vec<u8>,
+    pub requested_scope: Vec<u8>,
+    pub binding_proof: Vec<u8>,
+}
+
+/// What the server authorized, which may be narrower than what was asked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAccept {
+    pub session_id: [u8; 16],
+    pub granted_scope: Vec<u8>,
+}
+
+/// Why the server refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionReject {
+    pub session_id: [u8; 16],
+    pub reason: u64,
+    pub detail: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataRecord {
     pub bundle_id: [u8; 16],
@@ -142,6 +226,10 @@ pub struct AssuranceFrame {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedFrame {
+    AuthContext(AuthContext),
+    SessionOpen(SessionOpen),
+    SessionAccept(SessionAccept),
+    SessionReject(SessionReject),
     PackageDescriptor(PackageDescriptor),
     ManifestRequest(ManifestRequest),
     ManifestPage(Vec<u8>),
@@ -161,6 +249,10 @@ impl TypedFrame {
     #[must_use]
     pub const fn frame_type(&self) -> u64 {
         match self {
+            Self::AuthContext(_) => frame_type::AUTH_CONTEXT,
+            Self::SessionOpen(_) => frame_type::SESSION_OPEN,
+            Self::SessionAccept(_) => frame_type::SESSION_ACCEPT,
+            Self::SessionReject(_) => frame_type::SESSION_REJECT,
             Self::PackageDescriptor(_) => frame_type::PACKAGE_DESCRIPTOR,
             Self::ManifestRequest(_) => frame_type::MANIFEST_REQUEST,
             Self::ManifestPage(_) => frame_type::MANIFEST_PAGE,
@@ -182,6 +274,10 @@ impl TypedFrame {
 pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
     let mut payload = Vec::new();
     match frame {
+        TypedFrame::AuthContext(value) => encode_auth_context(value, &mut payload)?,
+        TypedFrame::SessionOpen(value) => encode_session_open(value, &mut payload)?,
+        TypedFrame::SessionAccept(value) => encode_session_accept(value, &mut payload)?,
+        TypedFrame::SessionReject(value) => encode_session_reject(value, &mut payload)?,
         TypedFrame::PackageDescriptor(value) => encode_package_descriptor(value, &mut payload)?,
         TypedFrame::ManifestRequest(value) => encode_manifest_request(value, &mut payload)?,
         TypedFrame::ManifestPage(bytes) => {
@@ -218,6 +314,10 @@ pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize),
         DecodedFrame::SkippedOptional { .. } => return Err(Error::WrongFrameType(frame_kind)),
     };
     let frame = match frame_kind {
+        frame_type::AUTH_CONTEXT => TypedFrame::AuthContext(decode_auth_context(payload)?),
+        frame_type::SESSION_OPEN => TypedFrame::SessionOpen(decode_session_open(payload)?),
+        frame_type::SESSION_ACCEPT => TypedFrame::SessionAccept(decode_session_accept(payload)?),
+        frame_type::SESSION_REJECT => TypedFrame::SessionReject(decode_session_reject(payload)?),
         frame_type::PACKAGE_DESCRIPTOR => {
             TypedFrame::PackageDescriptor(decode_package_descriptor(payload)?)
         }
@@ -249,6 +349,225 @@ pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize),
         other => return Err(Error::WrongFrameType(other)),
     };
     Ok((frame, consumed))
+}
+
+fn encode_auth_context(value: &AuthContext, output: &mut Vec<u8>) -> Result<(), Error> {
+    validate_auth_context(value)?;
+    map(4, output);
+    uint(0, output);
+    uint(0, output);
+    uint(1, output);
+    bytes(&value.nonce, output);
+    uint(2, output);
+    uint(value.binding.to_wire(), output);
+    uint(3, output);
+    array(value.formats.len() as u64, output);
+    for format in &value.formats {
+        uint(*format, output);
+    }
+    Ok(())
+}
+
+fn validate_auth_context(value: &AuthContext) -> Result<(), Error> {
+    if value.nonce.len() < MIN_AUTH_NONCE || value.nonce.len() > MAX_AUTH_NONCE {
+        return Err(Error::InvalidValue);
+    }
+    if value.formats.len() as u64 > MAX_CAPABILITY_FORMATS {
+        return Err(Error::TooLarge);
+    }
+    // Ascending with no repeats, so one server policy has one encoding, and
+    // `0x0000` is reserved by `spec/registries.md` section 11.
+    let ordered = value.formats.windows(2).all(|pair| pair[0] < pair[1]);
+    if !ordered
+        || value
+            .formats
+            .iter()
+            .any(|format| *format == 0 || *format > MAX_CAPABILITY_FORMAT)
+    {
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
+}
+
+fn decode_auth_context(input: &[u8]) -> Result<AuthContext, Error> {
+    let mut reader = Reader::new(input);
+    reader.map(4)?;
+    reader.key(0)?;
+    if reader.uint()? != 0 {
+        return Err(Error::InvalidValue);
+    }
+    reader.key(1)?;
+    let nonce = reader.bytes(MAX_AUTH_NONCE)?.to_vec();
+    reader.key(2)?;
+    let binding = Binding::from_wire(reader.uint()?).ok_or(Error::InvalidValue)?;
+    reader.key(3)?;
+    let count = reader.array_len(MAX_CAPABILITY_FORMATS)?;
+    let mut formats = Vec::with_capacity(usize::try_from(count).map_err(|_| Error::TooLarge)?);
+    for _ in 0..count {
+        formats.push(reader.uint()?);
+    }
+    reader.finish()?;
+    let value = AuthContext {
+        nonce,
+        binding,
+        formats,
+    };
+    validate_auth_context(&value)?;
+    Ok(value)
+}
+
+fn encode_session_open(value: &SessionOpen, output: &mut Vec<u8>) -> Result<(), Error> {
+    validate_session_open(value)?;
+    map(6, output);
+    uint(0, output);
+    uint(0, output);
+    uint(1, output);
+    bytes(&value.session_id, output);
+    uint(2, output);
+    uint(value.capability_format, output);
+    uint(3, output);
+    bytes(&value.capability, output);
+    uint(4, output);
+    bytes(&value.requested_scope, output);
+    uint(5, output);
+    bytes(&value.binding_proof, output);
+    Ok(())
+}
+
+fn validate_session_open(value: &SessionOpen) -> Result<(), Error> {
+    if value.capability_format == 0 || value.capability_format > MAX_CAPABILITY_FORMAT {
+        return Err(Error::InvalidValue);
+    }
+    if value.capability.len() > MAX_CAPABILITY_BYTES
+        || value.requested_scope.len() > MAX_SCOPE_BYTES
+        || value.binding_proof.len() > MAX_SCOPE_BYTES
+    {
+        return Err(Error::TooLarge);
+    }
+    Ok(())
+}
+
+fn decode_session_open(input: &[u8]) -> Result<SessionOpen, Error> {
+    let mut reader = Reader::new(input);
+    reader.map(6)?;
+    reader.key(0)?;
+    if reader.uint()? != 0 {
+        return Err(Error::InvalidValue);
+    }
+    reader.key(1)?;
+    let session_id = reader.fixed::<16>()?;
+    reader.key(2)?;
+    let capability_format = reader.uint()?;
+    reader.key(3)?;
+    let capability = reader.bytes(MAX_CAPABILITY_BYTES)?.to_vec();
+    reader.key(4)?;
+    let requested_scope = reader.bytes(MAX_SCOPE_BYTES)?.to_vec();
+    reader.key(5)?;
+    let binding_proof = reader.bytes(MAX_SCOPE_BYTES)?.to_vec();
+    reader.finish()?;
+    let value = SessionOpen {
+        session_id,
+        capability_format,
+        capability,
+        requested_scope,
+        binding_proof,
+    };
+    validate_session_open(&value)?;
+    Ok(value)
+}
+
+fn encode_session_accept(value: &SessionAccept, output: &mut Vec<u8>) -> Result<(), Error> {
+    validate_session_accept(value)?;
+    map(3, output);
+    uint(0, output);
+    uint(0, output);
+    uint(1, output);
+    bytes(&value.session_id, output);
+    uint(2, output);
+    bytes(&value.granted_scope, output);
+    Ok(())
+}
+
+fn validate_session_accept(value: &SessionAccept) -> Result<(), Error> {
+    if value.granted_scope.len() > MAX_SCOPE_BYTES {
+        return Err(Error::TooLarge);
+    }
+    Ok(())
+}
+
+fn decode_session_accept(input: &[u8]) -> Result<SessionAccept, Error> {
+    let mut reader = Reader::new(input);
+    reader.map(3)?;
+    reader.key(0)?;
+    if reader.uint()? != 0 {
+        return Err(Error::InvalidValue);
+    }
+    reader.key(1)?;
+    let session_id = reader.fixed::<16>()?;
+    reader.key(2)?;
+    let granted_scope = reader.bytes(MAX_SCOPE_BYTES)?.to_vec();
+    reader.finish()?;
+    let value = SessionAccept {
+        session_id,
+        granted_scope,
+    };
+    // Every one of the four checks the same rules on both sides, so a rule
+    // added to one direction cannot be missed in the other.
+    validate_session_accept(&value)?;
+    Ok(value)
+}
+
+fn encode_session_reject(value: &SessionReject, output: &mut Vec<u8>) -> Result<(), Error> {
+    validate_session_reject(value)?;
+    map(4, output);
+    uint(0, output);
+    uint(0, output);
+    uint(1, output);
+    bytes(&value.session_id, output);
+    uint(2, output);
+    uint(value.reason, output);
+    uint(3, output);
+    text(&value.detail, output);
+    Ok(())
+}
+
+fn validate_session_reject(value: &SessionReject) -> Result<(), Error> {
+    // spec/wire.md section 1.1 names the three codes a rejection may carry, so
+    // a rejection cannot report something that is not an authentication or
+    // authorization outcome.
+    let registered = matches!(
+        u16::try_from(value.reason),
+        Ok(crate::error_code::AUTHENTICATION_FAILED
+            | crate::error_code::AUTHORIZATION_FAILED
+            | crate::error_code::REPLAY_REJECTED)
+    );
+    if !registered || value.detail.len() > MAX_REJECT_DETAIL_BYTES {
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
+}
+
+fn decode_session_reject(input: &[u8]) -> Result<SessionReject, Error> {
+    let mut reader = Reader::new(input);
+    reader.map(4)?;
+    reader.key(0)?;
+    if reader.uint()? != 0 {
+        return Err(Error::InvalidValue);
+    }
+    reader.key(1)?;
+    let session_id = reader.fixed::<16>()?;
+    reader.key(2)?;
+    let reason = reader.uint()?;
+    reader.key(3)?;
+    let detail = reader.text(MAX_REJECT_DETAIL_BYTES)?.to_owned();
+    reader.finish()?;
+    let value = SessionReject {
+        session_id,
+        reason,
+        detail,
+    };
+    validate_session_reject(&value)?;
+    Ok(value)
 }
 
 fn encode_package_descriptor(value: &PackageDescriptor, output: &mut Vec<u8>) -> Result<(), Error> {
@@ -896,6 +1215,11 @@ fn bytes(value: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(value);
 }
 
+fn text(value: &str, output: &mut Vec<u8>) {
+    head(3, value.len() as u64, output);
+    output.extend_from_slice(value.as_bytes());
+}
+
 fn head(major: u8, value: u64, output: &mut Vec<u8>) {
     let major = major << 5;
     match value {
@@ -1034,6 +1358,18 @@ impl<'a> Reader<'a> {
         self.take(length)
     }
 
+    fn text(&mut self, maximum: usize) -> Result<&'a str, Error> {
+        let (major, length) = self.head()?;
+        if major != 3 {
+            return Err(Error::Malformed);
+        }
+        let length = usize::try_from(length).map_err(|_| Error::TooLarge)?;
+        if length > maximum {
+            return Err(Error::TooLarge);
+        }
+        core::str::from_utf8(self.take(length)?).map_err(|_| Error::Malformed)
+    }
+
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         self.bytes(N)?.try_into().map_err(|_| Error::Malformed)
     }
@@ -1061,6 +1397,195 @@ mod tests {
             root: [7; 32],
             length: GROUP_BYTES * 2,
         }
+    }
+
+    fn round_trip(frame: &TypedFrame) {
+        let mut out = Vec::new();
+        encode(frame, &mut out).unwrap();
+        let limits = DecodeLimits {
+            max_unknown_payload: 1 << 20,
+            max_frames: 1,
+        };
+        let (decoded, consumed) = decode(&out, limits).unwrap();
+        assert_eq!(&decoded, frame);
+        assert_eq!(consumed, out.len());
+    }
+
+    #[test]
+    fn session_authentication_frames_round_trip() {
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![7; 16],
+            binding: Binding::ProofOfPossession,
+            formats: vec![1, 2, 9],
+        }));
+        // No capability format means no authentication is required, which
+        // spec/wire.md section 1.1 gives as the way a server says so.
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![3; 64],
+            binding: Binding::None,
+            formats: Vec::new(),
+        }));
+        round_trip(&TypedFrame::SessionOpen(SessionOpen {
+            session_id: [4; 16],
+            capability_format: 1,
+            capability: vec![9; 128],
+            requested_scope: Vec::new(),
+            binding_proof: vec![1; 64],
+        }));
+        round_trip(&TypedFrame::SessionAccept(SessionAccept {
+            session_id: [4; 16],
+            granted_scope: vec![2; 32],
+        }));
+        round_trip(&TypedFrame::SessionReject(SessionReject {
+            session_id: [4; 16],
+            reason: u64::from(crate::error_code::AUTHORIZATION_FAILED),
+            detail: String::new(),
+        }));
+        round_trip(&TypedFrame::SessionReject(SessionReject {
+            session_id: [4; 16],
+            reason: u64::from(crate::error_code::REPLAY_REJECTED),
+            detail: "scope".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn every_authentication_bound_admits_its_own_maximum() {
+        // A bound that refuses its own maximum refuses a peer that sent
+        // nothing oversized, and nothing else here would notice.
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![1; MIN_AUTH_NONCE],
+            binding: Binding::None,
+            formats: (1..=MAX_CAPABILITY_FORMATS).collect(),
+        }));
+        round_trip(&TypedFrame::AuthContext(AuthContext {
+            nonce: vec![1; MAX_AUTH_NONCE],
+            binding: Binding::ProofOfPossession,
+            formats: vec![MAX_CAPABILITY_FORMAT],
+        }));
+        round_trip(&TypedFrame::SessionOpen(SessionOpen {
+            session_id: [1; 16],
+            capability_format: MAX_CAPABILITY_FORMAT,
+            capability: vec![2; MAX_CAPABILITY_BYTES],
+            requested_scope: vec![3; MAX_SCOPE_BYTES],
+            binding_proof: vec![4; MAX_SCOPE_BYTES],
+        }));
+        round_trip(&TypedFrame::SessionAccept(SessionAccept {
+            session_id: [1; 16],
+            granted_scope: vec![5; MAX_SCOPE_BYTES],
+        }));
+        round_trip(&TypedFrame::SessionReject(SessionReject {
+            session_id: [1; 16],
+            reason: u64::from(crate::error_code::AUTHENTICATION_FAILED),
+            detail: "d".repeat(MAX_REJECT_DETAIL_BYTES),
+        }));
+
+        let mut out = Vec::new();
+        let mut wide = SessionAccept {
+            session_id: [1; 16],
+            granted_scope: vec![5; MAX_SCOPE_BYTES + 1],
+        };
+        assert!(encode_session_accept(&wide, &mut out).is_err());
+        wide.granted_scope.pop();
+        out.clear();
+        assert!(encode_session_accept(&wide, &mut out).is_ok());
+
+        let mut long = SessionReject {
+            session_id: [1; 16],
+            reason: u64::from(crate::error_code::AUTHENTICATION_FAILED),
+            detail: "d".repeat(MAX_REJECT_DETAIL_BYTES + 1),
+        };
+        out.clear();
+        assert!(encode_session_reject(&long, &mut out).is_err());
+        long.detail.pop();
+        out.clear();
+        assert!(encode_session_reject(&long, &mut out).is_ok());
+    }
+
+    #[test]
+    fn an_auth_context_states_one_server_policy_one_way() {
+        let context = |formats: Vec<u64>| AuthContext {
+            nonce: vec![7; 16],
+            binding: Binding::None,
+            formats,
+        };
+        let mut out = Vec::new();
+        // Descending or repeated formats would give one policy two encodings.
+        assert!(encode_auth_context(&context(vec![2, 1]), &mut out).is_err());
+        assert!(encode_auth_context(&context(vec![1, 1]), &mut out).is_err());
+        // 0x0000 is reserved by spec/registries.md section 11.
+        assert!(encode_auth_context(&context(vec![0]), &mut out).is_err());
+        assert!(encode_auth_context(&context(vec![65_536]), &mut out).is_err());
+        assert!(
+            encode_auth_context(&context((1..=17).collect()), &mut out).is_err(),
+            "at most 16 formats"
+        );
+
+        let short = AuthContext {
+            nonce: vec![7; 15],
+            binding: Binding::None,
+            formats: Vec::new(),
+        };
+        assert!(encode_auth_context(&short, &mut out).is_err());
+        let long = AuthContext {
+            nonce: vec![7; 65],
+            binding: Binding::None,
+            formats: Vec::new(),
+        };
+        assert!(encode_auth_context(&long, &mut out).is_err());
+    }
+
+    #[test]
+    fn a_rejection_carries_a_registered_reason() {
+        // A rejection that could report anything would let a server describe
+        // an outcome the error registry never assigned.
+        let mut out = Vec::new();
+        for reason in [
+            crate::error_code::AUTHENTICATION_FAILED,
+            crate::error_code::AUTHORIZATION_FAILED,
+            crate::error_code::REPLAY_REJECTED,
+        ] {
+            let reject = SessionReject {
+                session_id: [1; 16],
+                reason: u64::from(reason),
+                detail: String::new(),
+            };
+            out.clear();
+            assert!(encode_session_reject(&reject, &mut out).is_ok());
+        }
+        for reason in [0, u64::from(crate::error_code::MALFORMED_FRAME), 1 << 40] {
+            let reject = SessionReject {
+                session_id: [1; 16],
+                reason,
+                detail: String::new(),
+            };
+            out.clear();
+            assert!(
+                encode_session_reject(&reject, &mut out).is_err(),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_open_names_a_registered_capability_format() {
+        let mut out = Vec::new();
+        let open = |capability_format| SessionOpen {
+            session_id: [1; 16],
+            capability_format,
+            capability: Vec::new(),
+            requested_scope: Vec::new(),
+            binding_proof: Vec::new(),
+        };
+        assert!(encode_session_open(&open(1), &mut out).is_ok());
+        assert!(encode_session_open(&open(0), &mut out).is_err());
+        assert!(encode_session_open(&open(65_536), &mut out).is_err());
+
+        let mut oversized = open(1);
+        oversized.capability = vec![0; MAX_CAPABILITY_BYTES + 1];
+        assert!(encode_session_open(&oversized, &mut out).is_err());
+        let mut wide_scope = open(1);
+        wide_scope.requested_scope = vec![0; MAX_SCOPE_BYTES + 1];
+        assert!(encode_session_open(&wide_scope, &mut out).is_err());
     }
 
     #[test]

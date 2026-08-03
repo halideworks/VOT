@@ -13,6 +13,10 @@ ROW = re.compile(
     re.MULTILINE,
 )
 SETTING_ROW = re.compile(r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_-]+)` \|.*\| (?P<handling>critical|optional) \|$", re.MULTILINE)
+BEHAVIOR_ROW = re.compile(
+    r"^\| `(?P<name>[A-Z0-9_]+)` \|[^|]*\|[^|]*\| (?P<auth>yes|no|depends on phase) \|",
+    re.MULTILINE,
+)
 RUST_CONSTANT = re.compile(
     r"^\s*pub const (?P<name>[A-Z0-9_]+): u64 = (?P<value>0x[0-9a-f]+);$",
     re.MULTILINE,
@@ -107,6 +111,47 @@ def validate(root: Path) -> None:
         f"listed-only={set(listed_names) - setting_rust_rows.keys()}, "
         f"constant-only={setting_rust_rows.keys() - set(listed_names)}"
     )
+
+    # The Auth column of wire.md section 5 is enforced by
+    # `requires_authentication`. Nothing else compares the two, so the column
+    # and the gate could drift silently.
+    wire_text = (root / "spec" / "wire.md").read_text(encoding="utf-8")
+    behavior_text = section(
+        wire_text, "## 5. Frame behavior registry", "## 6. State and assurance"
+    )
+    behavior_rows = {
+        match["name"]: match["auth"] for match in BEHAVIOR_ROW.finditer(behavior_text)
+    }
+    assert behavior_rows, "no frame behavior rows parsed"
+    # Every table line parsed, so a row the regex silently skips cannot make
+    # this check weaker than it reads.
+    table_lines = sum(1 for line in behavior_text.splitlines() if line.startswith("| `"))
+    assert len(behavior_rows) == table_lines, (
+        f"parsed {len(behavior_rows)} of {table_lines} frame behavior rows"
+    )
+    assert behavior_rows.keys() == registry_rows.keys(), (
+        "frame registry/behavior mismatch: "
+        f"registry-only={registry_rows.keys() - behavior_rows.keys()}, "
+        f"behavior-only={behavior_rows.keys() - registry_rows.keys()}"
+    )
+    exempt = re.search(
+        r"pub const fn requires_authentication\(frame_type: u64\) -> bool \{"
+        r".*?!matches!\((?P<body>.*?)\)\n\}",
+        rust_text,
+        re.DOTALL,
+    )
+    assert exempt, "requires_authentication not found"
+    exempt_names = set(re.findall(r"ty::([A-Z0-9_]+)", exempt["body"]))
+    for name, auth in behavior_rows.items():
+        # A phase-dependent frame is never refused: a peer has to be able to
+        # report a fault before it authenticates.
+        expected_exempt = auth in ("no", "depends on phase")
+        assert (name in exempt_names) == expected_exempt, (
+            f"{name}: wire.md says auth {auth!r}, "
+            f"requires_authentication says {name not in exempt_names}"
+        )
+    unknown = exempt_names - behavior_rows.keys()
+    assert not unknown, f"requires_authentication exempts unlisted frames: {unknown}"
 
     grease_values = range(0x1F00, 0x1FFF, 2)
     assert all(value % 2 == 0 for value in grease_values)

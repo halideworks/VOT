@@ -1,0 +1,209 @@
+{
+  "format": "vot-session-authentication-v1",
+  "alpn": "vot-draft-04",
+  "note": "The four session authentication payloads as spec/wire.md section 1.1 and spec/session.cddl define them, frame envelope included. Encoders must match every canonical case byte for byte. tools/validate_session_vectors.py reimplements the rules from the specification and cross-checks them against the Rust codec. Every case here is one whole frame: bytes past the length the envelope declares are a caller mistake rather than a payload, and are covered by the oracle's own unit test instead.",
+  "bounds": {
+    "nonce_bytes": [
+      16,
+      64
+    ],
+    "capability_formats": 16,
+    "capability_format_range": [
+      1,
+      65535
+    ],
+    "capability_bytes": 49152,
+    "scope_bytes": 4096,
+    "detail_bytes": 1024,
+    "frame_payload_bytes": 65536
+  },
+  "canonical": [
+    {
+      "name": "auth_context_requires_no_authentication",
+      "frame": "auth_context",
+      "note": "No capability format advertised, which spec/wire.md section 1.1 gives as the way a deployment says it requires no authentication.",
+      "nonce_hex": "00000000000000000000000000000000",
+      "binding": 0,
+      "formats": [],
+      "hex": "0719a4000001500000000000000000000000000000000002000380"
+    },
+    {
+      "name": "auth_context_proof_of_possession",
+      "frame": "auth_context",
+      "note": "Formats ascend and never repeat, so one server policy has one encoding.",
+      "nonce_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "binding": 1,
+      "formats": [
+        1,
+        2,
+        9
+      ],
+      "hex": "072da40000015820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a102010383010209"
+    },
+    {
+      "name": "auth_context_unbound_bearer",
+      "frame": "auth_context",
+      "note": "A capability with no channel binding, which spec/security.md section 5 allows only where policy declares the shorter lifetime and the replay exposure it costs.",
+      "nonce_hex": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "binding": 0,
+      "formats": [
+        1
+      ],
+      "hex": "0723a400000158183e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e0200038101"
+    },
+    {
+      "name": "auth_context_longest_nonce",
+      "frame": "auth_context",
+      "note": "The nonce bound and the format bound each admit their own maximum.",
+      "nonce_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "binding": 1,
+      "formats": [
+        65535
+      ],
+      "hex": "07404da400000158405c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c0201038119ffff"
+    },
+    {
+      "name": "session_open_minimal",
+      "frame": "session_open",
+      "note": "An empty requested scope asks for the capability's whole scope.",
+      "session_id_hex": "11111111111111111111111111111111",
+      "capability_format": 1,
+      "capability_hex": "",
+      "requested_scope_hex": "",
+      "binding_proof_hex": "",
+      "hex": "091da600000150111111111111111111111111111111110201034004400540"
+    },
+    {
+      "name": "session_open_bound_capability",
+      "frame": "session_open",
+      "note": "A capability bound by proof of possession, with a scope narrower than the capability's own.",
+      "session_id_hex": "22222222222222222222222222222222",
+      "capability_format": 2,
+      "capability_hex": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",
+      "requested_scope_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "binding_proof_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "hex": "0940afa6000001502222222222222222222222222222222202020358407b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b04500a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a055840cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    },
+    {
+      "name": "session_accept_narrowed_scope",
+      "frame": "session_accept",
+      "note": "The granted scope may be narrower than what was requested.",
+      "session_id_hex": "22222222222222222222222222222222",
+      "granted_scope_hex": "0a0a0a0a0a0a0a0a",
+      "hex": "0b1fa3000001502222222222222222222222222222222202480a0a0a0a0a0a0a0a"
+    },
+    {
+      "name": "session_reject_authorization_failed",
+      "frame": "session_reject",
+      "note": "An empty detail, which is what a server sends when any detail would be an oracle.",
+      "session_id_hex": "22222222222222222222222222222222",
+      "reason": 514,
+      "detail": "",
+      "hex": "0d1ba40000015022222222222222222222222222222222021902020360"
+    },
+    {
+      "name": "session_reject_authentication_failed",
+      "frame": "session_reject",
+      "note": "The third of the three reasons a rejection may carry, so every one of them is frozen here.",
+      "session_id_hex": "44444444444444444444444444444444",
+      "reason": 513,
+      "detail": "",
+      "hex": "0d1ba40000015044444444444444444444444444444444021902010360"
+    },
+    {
+      "name": "session_reject_replay",
+      "frame": "session_reject",
+      "note": "A registered reason and a bounded UTF-8 detail.",
+      "session_id_hex": "33333333333333333333333333333333",
+      "reason": 515,
+      "detail": "stale",
+      "hex": "0d20a400000150333333333333333333333333333333330219020303657374616c65"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "nonce_shorter_than_the_bound",
+      "note": "A nonce below 16 bytes has less freshness than the exchange assumes.",
+      "error": "INVALID_VALUE",
+      "hex": "0718a40000014f00000000000000000000000000000002000380"
+    },
+    {
+      "name": "nonce_longer_than_the_bound",
+      "note": "Refused by length before the value is examined.",
+      "error": "FRAME_TOO_LARGE",
+      "hex": "07404ba40000015841000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000380"
+    },
+    {
+      "name": "formats_out_of_order",
+      "note": "Descending formats would give one server policy two encodings.",
+      "error": "INVALID_VALUE",
+      "hex": "071ba40000015000000000000000000000000000000000020003820201"
+    },
+    {
+      "name": "formats_repeated",
+      "note": "So would a repeat.",
+      "error": "INVALID_VALUE",
+      "hex": "071ba40000015000000000000000000000000000000000020003820101"
+    },
+    {
+      "name": "format_zero_is_reserved",
+      "note": "spec/registries.md section 11 reserves 0x0000.",
+      "error": "INVALID_VALUE",
+      "hex": "071aa400000150000000000000000000000000000000000200038100"
+    },
+    {
+      "name": "more_formats_than_the_bound",
+      "note": "At most 16 formats.",
+      "error": "FRAME_TOO_LARGE",
+      "hex": "072aa40000015000000000000000000000000000000000020003910102030405060708090a0b0c0d0e0f1011"
+    },
+    {
+      "name": "unknown_binding",
+      "note": "Only none and proof of possession are defined.",
+      "error": "INVALID_VALUE",
+      "hex": "0719a4000001500000000000000000000000000000000002020380"
+    },
+    {
+      "name": "unknown_format_version",
+      "note": "A version this endpoint does not implement is refused rather than guessed at.",
+      "error": "INVALID_VALUE",
+      "hex": "0719a4000101500000000000000000000000000000000002000380"
+    },
+    {
+      "name": "non_canonical_length_head",
+      "note": "RFC 8949 core deterministic encoding requires the shortest head that fits.",
+      "error": "MALFORMED_FRAME",
+      "hex": "071aa400000158100000000000000000000000000000000002000380"
+    },
+    {
+      "name": "trailing_bytes_inside_the_payload",
+      "note": "A payload longer than its own structure is malformed, not ignored.",
+      "error": "MALFORMED_FRAME",
+      "hex": "071aa400000150000000000000000000000000000000000200038000"
+    },
+    {
+      "name": "capability_format_zero",
+      "note": "A client cannot name the reserved format.",
+      "error": "INVALID_VALUE",
+      "hex": "091da600000150111111111111111111111111111111110200034004400540"
+    },
+    {
+      "name": "capability_format_above_the_registry",
+      "note": "The registry is two bytes wide.",
+      "error": "INVALID_VALUE",
+      "hex": "0921a60000015011111111111111111111111111111111021a00010000034004400540"
+    },
+    {
+      "name": "unregistered_reject_reason",
+      "note": "A rejection reports an authentication or authorization outcome, not any error code.",
+      "error": "INVALID_VALUE",
+      "hex": "0d1ba40000015022222222222222222222222222222222021901020360"
+    },
+    {
+      "name": "detail_is_not_utf8",
+      "note": "The detail is text.",
+      "error": "MALFORMED_FRAME",
+      "hex": "0d1da40000015022222222222222222222222222222222021902010362fffe"
+    }
+  ]
+}

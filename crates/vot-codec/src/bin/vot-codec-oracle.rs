@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 
+use vot_codec::frames::TypedFrame;
 use vot_codec::{
     DecodeError, DecodeLimits, DecodedFrame, EndpointRole, HelloError, Settings, SettingsError,
     decode_all, decode_hello, decode_settings, encode_hello, encode_settings,
@@ -17,6 +18,10 @@ fn main() -> io::Result<()> {
         }
         if let Some(rest) = line.strip_prefix("settings ") {
             println!("{}", settings_line(rest));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("session ") {
+            println!("{}", session_line(rest));
             continue;
         }
         let Some(input) = decode_hex(&line) else {
@@ -48,6 +53,86 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decodes one session authentication frame, envelope included, and reports
+/// what it holds or why it was refused.
+///
+/// The re-encoding is what makes a vector catch an encoder that disagrees with
+/// the decoder, which is the failure a single-direction check cannot see.
+fn session_line(hex: &str) -> String {
+    let Some(input) = decode_hex(hex) else {
+        return "err|INVALID_HEX".to_string();
+    };
+    let limits = DecodeLimits {
+        // The four session frames are known types, so the registered limits
+        // apply and this bounds only a type that is not one of them.
+        max_unknown_payload: 0,
+        max_frames: 1,
+    };
+    let (frame, consumed) = match vot_codec::frames::decode(&input, limits) {
+        Ok(decoded) => decoded,
+        Err(error) => return format!("err|{}", frame_error_name(&error)),
+    };
+    if consumed != input.len() {
+        return "err|TRAILING_BYTES".to_string();
+    }
+    let mut output = match &frame {
+        TypedFrame::AuthContext(value) => {
+            let mut line = format!(
+                "ok|auth_context|{}|{}",
+                encode_hex(&value.nonce),
+                u64::from(value.binding == vot_codec::frames::Binding::ProofOfPossession)
+            );
+            for format in &value.formats {
+                let _ = write!(line, "|{format}");
+            }
+            line
+        }
+        TypedFrame::SessionOpen(value) => format!(
+            "ok|session_open|{}|{}|{}|{}|{}",
+            encode_hex(&value.session_id),
+            value.capability_format,
+            encode_hex(&value.capability),
+            encode_hex(&value.requested_scope),
+            encode_hex(&value.binding_proof)
+        ),
+        TypedFrame::SessionAccept(value) => format!(
+            "ok|session_accept|{}|{}",
+            encode_hex(&value.session_id),
+            encode_hex(&value.granted_scope)
+        ),
+        TypedFrame::SessionReject(value) => format!(
+            "ok|session_reject|{}|{}|{}",
+            encode_hex(&value.session_id),
+            value.reason,
+            encode_hex(value.detail.as_bytes())
+        ),
+        other => return format!("err|WRONG_FRAME_TYPE_{}", other.frame_type()),
+    };
+    let mut encoded = Vec::new();
+    match vot_codec::frames::encode(&frame, &mut encoded) {
+        Ok(()) => {
+            let _ = write!(output, "|re={}", encode_hex(&encoded));
+            output
+        }
+        Err(error) => format!("err|{}", frame_error_name(&error)),
+    }
+}
+
+fn frame_error_name(error: &vot_codec::frames::Error) -> &'static str {
+    use vot_codec::frames::Error as FrameError;
+
+    match error {
+        FrameError::Envelope(inner) => error_name(inner),
+        FrameError::WrongFrameType(_) => "WRONG_FRAME_TYPE",
+        FrameError::Malformed => "MALFORMED_FRAME",
+        FrameError::InvalidValue => "INVALID_VALUE",
+        FrameError::TooLarge => "FRAME_TOO_LARGE",
+        FrameError::Manifest => "MANIFEST_INVALID",
+        FrameError::Seal => "SEAL_INVALID",
+        FrameError::Receipt => "RECEIPT_INVALID",
+    }
 }
 
 /// Decodes one HELLO payload and reports what it holds, or why it was refused.
@@ -194,6 +279,61 @@ mod tests {
         assert_eq!(decode_hex("0"), None);
         assert_eq!(decode_hex("0g"), None);
         assert_eq!(encode_hex(&[0, 1, 0xaf, 0xff]), "0001afff");
+    }
+
+    #[test]
+    fn session_lines_report_values_and_refusals() {
+        // The oracle is what a validator written from the specification talks
+        // to, so its own encoding of a result has to be exercised. These are
+        // vectors from test-vectors/wire/session-authentication.json.
+        let minimal = "0719a4000001500000000000000000000000000000000002000380";
+        assert_eq!(
+            session_line(minimal),
+            format!("ok|auth_context|{}|0|re={minimal}", "00".repeat(16))
+        );
+        let open = "091da600000150111111111111111111111111111111110201034004400540";
+        assert_eq!(
+            session_line(open),
+            format!("ok|session_open|{}|1||||re={open}", "11".repeat(16))
+        );
+        let accept = "0b1fa3000001502222222222222222222222222222222202480a0a0a0a0a0a0a0a";
+        assert_eq!(
+            session_line(accept),
+            format!(
+                "ok|session_accept|{}|{}|re={accept}",
+                "22".repeat(16),
+                "0a".repeat(8)
+            )
+        );
+        let reject = "0d20a400000150333333333333333333333333333333330219020303657374616c65";
+        assert_eq!(
+            session_line(reject),
+            format!(
+                "ok|session_reject|{}|515|7374616c65|re={reject}",
+                "33".repeat(16)
+            )
+        );
+
+        assert_eq!(
+            session_line("071ba40000015000000000000000000000000000000000020003820201"),
+            "err|INVALID_VALUE"
+        );
+        assert_eq!(
+            session_line(
+                "072aa40000015000000000000000000000000000000000020003910102030405060708090a0b0c0d0e0f1011"
+            ),
+            "err|FRAME_TOO_LARGE"
+        );
+        assert_eq!(
+            session_line("0d1da40000015022222222222222222222222222222222021902010362fffe"),
+            "err|MALFORMED_FRAME"
+        );
+        // A frame this oracle does not answer for is named, not misreported.
+        assert_eq!(session_line("2d00"), "err|MALFORMED_FRAME");
+        assert_eq!(session_line("0"), "err|INVALID_HEX");
+        // Bytes past the frame the envelope declares are the caller's mistake,
+        // and reporting the frame alone would hide a vector that carries them.
+        assert_eq!(session_line(&format!("{accept}00")), "err|TRAILING_BYTES");
     }
 
     #[test]

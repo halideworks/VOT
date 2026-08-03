@@ -34,6 +34,67 @@ are validated against `spec/registries.md` before state mutation.
 `SETTINGS_ACK` has an empty payload and confirms that all preceding peer settings
 were parsed and accepted.
 
+### 1.1 Session authentication
+
+Once `SETTINGS_ACK` has been sent, the server sends `AUTH_CONTEXT` on the
+control stream. If it advertised at least one capability format, the client
+answers `SESSION_OPEN` and the server answers `SESSION_ACCEPT` or
+`SESSION_REJECT`. If it advertised none, this deployment requires no
+authentication, and neither side sends anything further.
+
+The concluding frame is therefore `SESSION_ACCEPT` when a capability format was
+advertised and `AUTH_CONTEXT` when none was. A session is authenticated at each
+endpoint once that endpoint has sent or read the concluding frame, and frames
+marked `auth: yes` in section 5 are invalid before then. The exchange is always
+present, and it costs a deployment that does not authenticate one frame.
+
+The capability itself is opaque at this layer. Its format is a value from the
+capability format registry in `spec/registries.md` section 11 and its bytes are
+handed to the deployment's authentication policy, which is what
+`spec/security.md` section 5 describes. This section defines only the exchange
+that carries it.
+
+The four payloads are canonical CBOR maps under `spec/session.cddl`, encoded and
+decoded by the deterministic rules the other typed payloads use. A payload that
+is not in that form is `MALFORMED_FRAME`.
+
+`AUTH_CONTEXT` carries a nonce, the channel binding this deployment uses, and
+the capability formats it accepts. The nonce is fresh per session and gives the
+client something to sign when the binding is proof of possession. The format
+list lets a client holding none of the accepted formats fail immediately rather
+than after a rejected `SESSION_OPEN`. Formats are ascending and duplicates are
+rejected, so one server policy has one encoding. An empty list means no
+authentication is required.
+
+`SESSION_OPEN` carries a session identifier, the chosen format, the capability,
+the requested scope, and the binding proof. The session identifier is an
+independent random 128-bit value, as section 6 of `spec/security.md` requires.
+The format MUST be one the server advertised. An empty requested scope asks for
+the capability's whole scope; a non-empty one asks for a subset, and a server
+MUST NOT grant more than the capability allows regardless of what is requested.
+The binding proof is empty when the binding is none, and otherwise proves
+possession of the key the capability names, over the `AUTH_CONTEXT` nonce.
+
+`SESSION_ACCEPT` repeats the session identifier and carries the scope the server
+actually authorized, which may be narrower than what was requested. The
+capability governs how long the grant lasts, since it already carries not-before
+and expiry, and no VOT frame carries an absolute clock.
+
+`SESSION_REJECT` repeats the session identifier and carries a reason from the
+error code registry in `spec/registries.md` section 8, one of
+`AUTHENTICATION_FAILED`, `AUTHORIZATION_FAILED`, or `REPLAY_REJECTED`, with an
+optional UTF-8 detail. A server MUST NOT put anything in the detail that
+distinguishes a valid capability with insufficient scope from an invalid one,
+since that difference is an oracle.
+
+A rejected session does not close the connection. The client may try again with
+a different capability, and each attempt MUST use a fresh session identifier, so
+the duplicate rules in section 5 apply to a repeated attempt rather than to a
+new one. A server accepts at most three attempts per connection and then closes
+with `AUTHENTICATION_FAILED`. The bound is fixed rather than negotiated so both
+sides know it without a setting, and it bounds the work an unauthenticated peer
+can ask for, which section 7 of `spec/security.md` requires.
+
 ## 2. Frame envelope
 
 Every control or reliable-record frame is encoded as:
@@ -189,6 +250,11 @@ are carrier-local and never key resume state. Resume discovery uses immutable
 object or package identity.
 
 ## 8. Conformance vectors
+
+`test-vectors/wire/session-authentication.json` is normative for the section
+1.1 payloads. `tools/validate_session_vectors.py` reimplements those rules from
+this document and cross-checks them against the codec, so agreement is evidence
+rather than a restatement.
 
 `test-vectors/wire/frame-envelope.json` is normative for the envelope. Each case
 contains the complete encoded bytes and an expected result. Encoders must match

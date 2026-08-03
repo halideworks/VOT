@@ -125,9 +125,15 @@ where the head rules and the shortest-form checks live. Three crates had grown
 their own copy of them; a change to canonical encoding now has one place to be
 made and one mutation run to answer for.
 
-`.github/workflows/ci.yml` holds the package matrix and which packages are
-required rather than advisory. `vot-codec` is advisory: a large share of its
-mutants survive, almost all in the frame parser.
+`.github/workflows/ci.yml` holds the package matrix. Every package in it is
+required, and no mutant survives any of them: a survivor fails the run rather
+than being noted. The matrix also carries the features a package must be built
+with, because a mutant in a module the tests never compile is reported missed
+whatever the tests say. That is what `vot-object-store` needs `s3-live` for.
+
+The live transport is the one exception, and it is a separate job rather than a
+matrix entry, because what survives there is classified rather than absent. See
+below.
 
 The second form is what a pull request runs, and it mutates only the lines the
 change touched. It is minutes rather than half an hour, and it cannot see a

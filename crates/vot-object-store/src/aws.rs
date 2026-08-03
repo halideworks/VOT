@@ -296,7 +296,715 @@ const fn read_back_matches(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// One S3 request, as much of it as a test needs to answer.
+    #[derive(Clone, Debug)]
+    struct Request {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Request {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(header, _)| header == name)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn is_create_multipart(&self) -> bool {
+            self.method == "POST" && self.target.contains("uploads")
+        }
+
+        fn is_upload_part(&self) -> bool {
+            self.method == "PUT" && self.target.contains("partNumber=")
+        }
+
+        fn is_complete_multipart(&self) -> bool {
+            self.method == "POST" && self.target.contains("uploadId=")
+        }
+    }
+
+    /// An S3-compatible endpoint that answers from a rule rather than a script.
+    ///
+    /// The SDK retries what it considers retryable and sends what it considers
+    /// necessary, and neither is this test's business. A handler that answers by
+    /// what it was asked is right however many times it is asked, which is what
+    /// keeps these tests about the adapter rather than about the SDK's policy.
+    struct FakeS3 {
+        endpoint: String,
+        seen: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FakeS3 {
+        fn new<H>(handler: H) -> Self
+        where
+            H: Fn(&Request) -> Vec<u8> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+            let endpoint = format!("http://{}", listener.local_addr().expect("an address"));
+            listener.set_nonblocking(true).expect("a polled listener");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let recorder = Arc::clone(&seen);
+            let halt = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !halt.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("a blocking connection");
+                            // One connection is served at a time, so a client
+                            // that opens one and says nothing would hold every
+                            // later request behind it until the job times out.
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                .expect("a connection that gives up");
+                            let Some(request) = read_request(&mut stream) else {
+                                continue;
+                            };
+                            let response = handler(&request);
+                            recorder.lock().expect("the recorder").push(request);
+                            let _ = stream.write_all(&response);
+                            let _ = stream.flush();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                seen,
+                stop,
+            }
+        }
+
+        fn store(&self) -> AwsS3Store {
+            AwsS3Store::new(&self.endpoint, "bucket", "us-east-1", "key", "secret")
+                .expect("a store against the local endpoint")
+        }
+
+        fn requests(&self) -> Vec<Request> {
+            self.seen.lock().expect("the recorder").clone()
+        }
+    }
+
+    impl Drop for FakeS3 {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return None,
+            }
+        }
+        let text = String::from_utf8_lossy(&head).into_owned();
+        let mut lines = text.lines();
+        let mut start = lines.next()?.split_whitespace();
+        let method = start.next()?.to_owned();
+        let target = start.next()?.to_owned();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
+        let length: usize = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        if length > 0 && stream.read_exact(&mut body).is_err() {
+            return None;
+        }
+        Some(Request {
+            method,
+            target,
+            headers,
+            body,
+        })
+    }
+
+    fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\n").into_bytes();
+        for (name, value) in headers {
+            out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+        out.extend_from_slice(b"connection: close\r\n\r\n");
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn xml(body: &str) -> Vec<u8> {
+        response(
+            "200 OK",
+            &[("content-type", "application/xml")],
+            body.as_bytes(),
+        )
+    }
+
+    fn created(upload_id: &str) -> Vec<u8> {
+        xml(&format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <InitiateMultipartUploadResult>\
+             <Bucket>bucket</Bucket><Key>key</Key><UploadId>{upload_id}</UploadId>\
+             </InitiateMultipartUploadResult>"
+        ))
+    }
+
+    fn completed_upload() -> Vec<u8> {
+        xml("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <CompleteMultipartUploadResult>\
+             <Location>http://localhost/bucket/key</Location>\
+             <Bucket>bucket</Bucket><Key>key</Key><ETag>\"final\"</ETag>\
+             </CompleteMultipartUploadResult>")
+    }
+
+    fn service_error(status: &str, code: &str) -> Vec<u8> {
+        response(
+            status,
+            &[("content-type", "application/xml")],
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>{code}</Code><Message>{code}</Message></Error>"
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// The whole upload answered as an S3 endpoint would, with the part echoed
+    /// back and the object readable afterwards.
+    fn happy_endpoint(object: &'static [u8]) -> impl Fn(&Request) -> Vec<u8> {
+        move |request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                completed_upload()
+            } else if request.method == "GET" {
+                response("200 OK", &[("etag", "\"final\"")], object)
+            } else {
+                response("204 No Content", &[], b"")
+            }
+        }
+    }
+
+    fn upload_one_part(store: &mut AwsS3Store, bytes: &[u8]) -> (String, PartReceipt) {
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        let receipt = store
+            .upload_part(&upload_id, 1, bytes, vot_journal::crc32c(bytes))
+            .expect("a part");
+        (upload_id, receipt)
+    }
+
+    #[test]
+    fn an_upload_runs_from_creation_to_an_object_read_back() {
+        let endpoint = FakeS3::new(happy_endpoint(b"payload"));
+        let mut store = endpoint.store();
+
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(upload_id, "upload-1", "the identifier the endpoint gave");
+        assert_eq!(
+            receipt,
+            PartReceipt {
+                number: 1,
+                checksum_crc32c: vot_journal::crc32c(b"payload"),
+                length: 7,
+            }
+        );
+
+        let object = store
+            .complete_multipart(&upload_id, std::slice::from_ref(&receipt))
+            .expect("a completed object");
+        assert_eq!(
+            object,
+            CompletedObject {
+                key: "key".to_owned(),
+                bytes: b"payload".to_vec(),
+                checksum_crc32c: vot_journal::crc32c(b"payload"),
+            }
+        );
+
+        // What the object store reports about an object is what it read, not what
+        // it was told.
+        assert_eq!(
+            store.head("key"),
+            Some((7, vot_journal::crc32c(b"payload")))
+        );
+
+        // The part went up with the checksum the caller gave, encoded as S3 wants
+        // it. A part sent under another checksum is a part the endpoint verifies
+        // against the wrong number.
+        let sent = endpoint.requests();
+        let part = sent
+            .iter()
+            .find(|request| request.is_upload_part())
+            .expect("a part request");
+        assert_eq!(
+            part.header("x-amz-checksum-crc32c"),
+            Some(
+                BASE64
+                    .encode(vot_journal::crc32c(b"payload").to_be_bytes())
+                    .as_str()
+            )
+        );
+        assert_eq!(part.body, b"payload");
+        assert!(part.target.contains("partNumber=1"));
+
+        // And the object is deletable, which is the other half of the lease the
+        // collector holds.
+        assert_eq!(store.delete_object("key"), Ok(()));
+    }
+
+    #[test]
+    fn a_part_is_refused_before_it_reaches_the_endpoint() {
+        let endpoint = FakeS3::new(happy_endpoint(b"payload"));
+        let mut store = endpoint.store();
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        let before = endpoint.requests().len();
+
+        for (name, id, number, checksum, expected) in [
+            (
+                "a part numbered zero",
+                upload_id.as_str(),
+                0_u32,
+                vot_journal::crc32c(b"payload"),
+                Error::InvalidPart,
+            ),
+            (
+                "a part past the last a multipart upload may have",
+                upload_id.as_str(),
+                10_001,
+                vot_journal::crc32c(b"payload"),
+                Error::InvalidPart,
+            ),
+            (
+                "a checksum that is not the bytes",
+                upload_id.as_str(),
+                1,
+                vot_journal::crc32c(b"payload") ^ 1,
+                Error::ChecksumMismatch,
+            ),
+            (
+                "an upload nothing created",
+                "upload-absent",
+                1,
+                vot_journal::crc32c(b"payload"),
+                Error::UnknownUpload,
+            ),
+        ] {
+            assert_eq!(
+                store.upload_part(id, number, b"payload", checksum),
+                Err(expected),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            endpoint.requests().len(),
+            before,
+            "nothing a caller got wrong was sent"
+        );
+
+        // The last part a multipart upload may have is not one of the refusals.
+        assert!(
+            store
+                .upload_part(
+                    &upload_id,
+                    10_000,
+                    b"payload",
+                    vot_journal::crc32c(b"payload")
+                )
+                .is_ok(),
+            "the last part number allowed"
+        );
+    }
+
+    #[test]
+    fn a_part_the_endpoint_echoes_differently_is_refused() {
+        // S3 answers with the checksum it stored. A part that comes back under
+        // another number was not stored as it was sent, whatever the transfer
+        // said.
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else {
+                response(
+                    "200 OK",
+                    &[
+                        ("etag", "\"part-1\""),
+                        ("x-amz-checksum-crc32c", "AAAAAA=="),
+                    ],
+                    b"",
+                )
+            }
+        });
+        let mut store = endpoint.store();
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        assert_eq!(
+            store.upload_part(&upload_id, 1, b"payload", vot_journal::crc32c(b"payload")),
+            Err(Error::ChecksumMismatch)
+        );
+
+        // An endpoint that says nothing about the checksum is not contradicting
+        // the one that was sent.
+        let quiet = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else {
+                response("200 OK", &[("etag", "\"part-1\"")], b"")
+            }
+        });
+        let mut store = quiet.store();
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        assert!(
+            store
+                .upload_part(&upload_id, 1, b"payload", vot_journal::crc32c(b"payload"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_completion_that_does_not_match_what_went_up_is_refused_and_the_upload_kept() {
+        let endpoint = FakeS3::new(happy_endpoint(b"onetwo"));
+        let mut store = endpoint.store();
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        let one = store
+            .upload_part(&upload_id, 1, b"one", vot_journal::crc32c(b"one"))
+            .expect("the first part");
+        let two = store
+            .upload_part(&upload_id, 2, b"two", vot_journal::crc32c(b"two"))
+            .expect("the second part");
+
+        for (name, parts) in [
+            ("fewer receipts than parts", vec![one.clone()]),
+            (
+                "more receipts than parts",
+                vec![one.clone(), two.clone(), two.clone()],
+            ),
+            ("a first part that is not the first", vec![two.clone()]),
+            (
+                "a gap between receipts",
+                vec![
+                    one.clone(),
+                    PartReceipt {
+                        number: 3,
+                        ..two.clone()
+                    },
+                ],
+            ),
+            (
+                "a receipt for a part that never went up",
+                vec![
+                    one.clone(),
+                    PartReceipt {
+                        number: 2,
+                        checksum_crc32c: two.checksum_crc32c,
+                        length: two.length,
+                    },
+                    PartReceipt {
+                        number: 3,
+                        checksum_crc32c: two.checksum_crc32c,
+                        length: two.length,
+                    },
+                ],
+            ),
+            (
+                "a length that is not the part's",
+                vec![
+                    one.clone(),
+                    PartReceipt {
+                        length: two.length + 1,
+                        ..two.clone()
+                    },
+                ],
+            ),
+            (
+                "a checksum that is not the part's",
+                vec![
+                    one.clone(),
+                    PartReceipt {
+                        checksum_crc32c: two.checksum_crc32c ^ 1,
+                        ..two.clone()
+                    },
+                ],
+            ),
+        ] {
+            assert_eq!(
+                store.complete_multipart(&upload_id, &parts),
+                Err(Error::CompletionMismatch),
+                "{name}"
+            );
+        }
+
+        // A part set that is consistent with itself and still not an upload. Each
+        // of these agrees with what went up receipt for receipt, so only the rule
+        // about which parts an upload is made of refuses them.
+        let mut from_two = endpoint.store();
+        let second_upload = from_two.create_multipart("key", 0).expect("an upload");
+        let two_of_two = from_two
+            .upload_part(&second_upload, 2, b"two", vot_journal::crc32c(b"two"))
+            .expect("a second part with no first");
+        let three = from_two
+            .upload_part(&second_upload, 3, b"three", vot_journal::crc32c(b"three"))
+            .expect("a third part");
+        assert_eq!(
+            from_two.complete_multipart(&second_upload, &[two_of_two, three.clone()]),
+            Err(Error::CompletionMismatch),
+            "an upload that does not begin at the first part"
+        );
+
+        let mut gapped = endpoint.store();
+        let third_upload = gapped.create_multipart("key", 0).expect("an upload");
+        let first = gapped
+            .upload_part(&third_upload, 1, b"one", vot_journal::crc32c(b"one"))
+            .expect("a first part");
+        let third = gapped
+            .upload_part(&third_upload, 3, b"three", vot_journal::crc32c(b"three"))
+            .expect("a third part with no second");
+        assert_eq!(
+            gapped.complete_multipart(&third_upload, &[first, third]),
+            Err(Error::CompletionMismatch),
+            "an upload with a part missing from the middle"
+        );
+
+        // The upload survived every refusal. An upload dropped on a caller's
+        // mistake would have to be uploaded again.
+        let object = store
+            .complete_multipart(&upload_id, &[one, two])
+            .expect("the completion that matches");
+        assert_eq!(object.bytes, b"onetwo");
+        assert_eq!(object.checksum_crc32c, vot_journal::crc32c(b"onetwo"));
+    }
+
+    #[test]
+    fn an_object_that_is_not_what_went_up_is_refused_after_completion() {
+        // The endpoint takes the completion and then serves something else. The
+        // read back is what decides, so this is a checksum mismatch rather than an
+        // object.
+        let endpoint = FakeS3::new(happy_endpoint(b"something else"));
+        let mut store = endpoint.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt.clone()]),
+            Err(Error::ChecksumMismatch)
+        );
+
+        // An object of the right length and the wrong bytes is refused for the
+        // same reason, which is what says the checksum is compared and not only
+        // the length.
+        let swapped = FakeS3::new(happy_endpoint(b"paylaod"));
+        let mut store = swapped.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn a_completion_that_may_have_landed_is_reconciled_by_reading_it_back() {
+        // NoSuchUpload after a completion means the upload was consumed, which is
+        // what a retried completion looks like. The object decides.
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                service_error("404 Not Found", "NoSuchUpload")
+            } else {
+                response("200 OK", &[], b"payload")
+            }
+        });
+        let mut store = endpoint.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let object = store
+            .complete_multipart(&upload_id, &[receipt])
+            .expect("an upload that had already landed");
+        assert_eq!(object.bytes, b"payload");
+
+        // The same answer with an object that is not what went up is ambiguous
+        // rather than a mismatch: this endpoint never said the completion
+        // happened, so the difference is not evidence of corruption.
+        let wrong = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                service_error("404 Not Found", "NoSuchUpload")
+            } else {
+                response("200 OK", &[], b"something else")
+            }
+        });
+        let mut store = wrong.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::CompletionAmbiguous)
+        );
+
+        // An object that cannot be read at all is ambiguous for the same reason.
+        let absent = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                completed_upload()
+            } else {
+                service_error("404 Not Found", "NoSuchKey")
+            }
+        });
+        let mut store = absent.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::CompletionAmbiguous)
+        );
+        assert_eq!(store.head("key"), None, "an object that is not there");
+    }
+
+    #[test]
+    fn a_completion_that_is_never_answered_is_reconciled_like_any_other() {
+        // The endpoint takes the completion and closes without answering, so there
+        // is no service error to read a code out of. That is the case where the
+        // object is the only evidence, and reading it back is what settles it.
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                Vec::new()
+            } else {
+                response("200 OK", &[], b"payload")
+            }
+        });
+        let mut store = endpoint.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let object = store
+            .complete_multipart(&upload_id, &[receipt])
+            .expect("an object the endpoint never confirmed but did store");
+        assert_eq!(object.bytes, b"payload");
+    }
+
+    #[test]
+    fn a_completion_the_endpoint_refuses_outright_is_a_backend_failure() {
+        // A service error that is not the consumed upload is not reconciled. The
+        // upload is still there, and the caller is told the backend refused
+        // rather than that the object may exist.
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                service_error("412 Precondition Failed", "PreconditionFailed")
+            } else {
+                response("200 OK", &[], b"payload")
+            }
+        });
+        let mut store = endpoint.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt.clone()]),
+            Err(Error::Backend)
+        );
+        // And the upload is still known, so the caller may try again.
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::Backend)
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_says_nothing_is_a_backend_failure() {
+        // Nothing listens on the address, so every call fails at the transport.
+        // A store that read an empty object out of that would report an object
+        // that does not exist.
+        let mut store =
+            AwsS3Store::new("http://127.0.0.1:1", "bucket", "us-east-1", "key", "secret")
+                .expect("a store against a closed port");
+        assert_eq!(store.create_multipart("key", 0), Err(Error::Backend));
+        assert_eq!(store.head("key"), None);
+        assert_eq!(store.delete_object("key"), Err(Error::Backend));
+        assert_eq!(
+            store.upload_part("upload-1", 1, b"payload", vot_journal::crc32c(b"payload")),
+            Err(Error::UnknownUpload),
+            "no upload was ever created"
+        );
+    }
 
     #[test]
     fn retained_parts_detect_stable_read_back_corruption() {
@@ -317,20 +1025,34 @@ mod tests {
                 etag: "one".to_owned(),
             },
         );
+        // The parts are summed in part order rather than insertion order, which is
+        // what makes the checksum the object's rather than this map's.
         let expected_checksum = crc32c_parts(&parts);
         assert_eq!(expected_checksum, vot_journal::crc32c(b"onetwo"));
+        assert_ne!(expected_checksum, vot_journal::crc32c(b"twoone"));
+        assert_eq!(crc32c_parts(&BTreeMap::new()), vot_journal::crc32c(b""));
+
         assert!(read_back_matches(
             6,
             expected_checksum,
             6,
             vot_journal::crc32c(b"onetwo")
         ));
+        // Each half of the comparison on its own. A length that matches is not an
+        // object that matches, and neither is a checksum.
         assert!(!read_back_matches(
             6,
             expected_checksum,
             6,
             vot_journal::crc32c(b"oneXwo")
         ));
+        assert!(!read_back_matches(
+            6,
+            expected_checksum,
+            7,
+            expected_checksum
+        ));
+        assert!(!read_back_matches(6, expected_checksum, 7, 0));
     }
 
     #[test]

@@ -685,15 +685,18 @@ pub fn encode_varint(value: u64, output: &mut Vec<u8>) -> Result<(), DecodeError
     if value < (1 << 6) {
         output.push(u8::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))?);
     } else if value < (1 << 14) {
+        // The two length bits are added rather than set. They are clear in a
+        // value this small, so `|`, `^`, and `+` write the same byte, and only
+        // the arithmetic form has no mutant that agrees with it.
         let encoded =
-            u16::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))? | 0x4000;
+            u16::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))? + 0x4000;
         output.extend_from_slice(&encoded.to_be_bytes());
     } else if value < (1 << 30) {
         let encoded =
-            u32::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))? | 0x8000_0000;
+            u32::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))? + 0x8000_0000;
         output.extend_from_slice(&encoded.to_be_bytes());
     } else {
-        output.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes());
+        output.extend_from_slice(&(value + 0xc000_0000_0000_0000).to_be_bytes());
     }
 
     Ok(())
@@ -721,7 +724,10 @@ pub fn decode_varint(input: &[u8]) -> Result<(u64, usize), DecodeError> {
 
     let mut value = u64::from(first & 0x3f);
     for byte in &input[1..width] {
-        value = (value << 8) | u64::from(*byte);
+        // Added rather than set, for the reason `encode_varint` gives: the shift
+        // clears the low eight bits, so the bitwise and arithmetic forms agree
+        // and only one of them can be held by a test.
+        value = (value << 8) + u64::from(*byte);
     }
     Ok((value, width))
 }
@@ -1479,6 +1485,161 @@ mod tests {
         }
         assert_eq!(identifiers, REGISTERED_SETTINGS.to_vec());
         assert!(payload.len() <= registered_payload_limit(frame_type::SETTINGS).unwrap());
+    }
+
+    #[test]
+    fn every_frame_type_carries_the_payload_limit_the_registry_gives_it() {
+        // Pinned per arm, and the arms are what a peer is held to. A limit written
+        // as 4 * 1024 and read as 4 + 1024 is a frame this endpoint refuses that
+        // the registry allows, which nothing else here would notice.
+        use frame_type as ty;
+        for (frame, limit) in [
+            (ty::HELLO, 4 * 1024),
+            (ty::CAPACITY, 4 * 1024),
+            (ty::DATAGRAM_CREDIT, 4 * 1024),
+            (ty::GOAWAY, 4 * 1024),
+            (ty::SETTINGS, 16 * 1024),
+            (ty::SETTINGS_ACK, 0),
+            (ty::PING, 0),
+            (ty::AUTH_CONTEXT, 64 * 1024),
+            (ty::SESSION_OPEN, 64 * 1024),
+            (ty::SESSION_ACCEPT, 64 * 1024),
+            (ty::SESSION_REJECT, 64 * 1024),
+            (ty::MANIFEST_REQUEST, 64 * 1024),
+            (ty::RANGE_CANCEL, 64 * 1024),
+            (ty::TRANSIT_VERIFIED, 64 * 1024),
+            (ty::CHUNK_DURABLE, 64 * 1024),
+            (ty::CHUNK_AT_REST_VERIFIED, 64 * 1024),
+            (ty::PUBLISH_RECEIPT, 64 * 1024),
+            (ty::CODING_EPOCH_OPEN, 64 * 1024),
+            (ty::GEN_STATE, 64 * 1024),
+            (ty::GEN_DONE, 64 * 1024),
+            (ty::CODING_EPOCH_CLOSE, 64 * 1024),
+            (ty::ERROR, 64 * 1024),
+            (ty::SOURCE_SCORE_HINT, 64 * 1024),
+            (ty::JOB_PRIORITY_UPDATE, 64 * 1024),
+            (ty::SEAL, 256 * 1024),
+            (ty::DATA_RECORD, 256 * 1024),
+            (ty::PACKAGE_DESCRIPTOR, 1024 * 1024),
+            (ty::MANIFEST_PAGE, 1024 * 1024),
+            (ty::PROGRESSIVE_PAGE, 1024 * 1024),
+            (ty::RANGE_REQUEST, 1024 * 1024),
+            (ty::HAVE, 4 * 1024 * 1024),
+            (ty::PROOF_BUNDLE, HARD_MAX_FRAME_PAYLOAD),
+        ] {
+            assert_eq!(
+                registered_payload_limit(frame),
+                Some(limit),
+                "frame {frame:#04x}"
+            );
+            assert!(is_known(frame), "frame {frame:#04x}");
+        }
+
+        // A frame with an empty payload is registered with a limit of zero, which
+        // is not the same as having no limit: is_known has to answer for it.
+        assert_eq!(registered_payload_limit(ty::PING), Some(0));
+        assert!(is_known(ty::PING));
+
+        // And a type the registry does not define has no limit and is not known.
+        for frame in [0x00, 0x02, 0x1f00, u64::MAX] {
+            assert_eq!(registered_payload_limit(frame), None, "frame {frame:#04x}");
+            assert!(!is_known(frame), "frame {frame:#04x}");
+        }
+    }
+
+    #[test]
+    fn only_registered_limits_are_enforceable() {
+        // The companion of only_registered_operations_are_recognized, and the
+        // opposite rule: section 13 has an unknown limit refuse the capability, so
+        // a verifier asks this and fails closed rather than ignoring it.
+        for identifier in REGISTERED_LIMITS {
+            assert!(is_registered_limit(identifier), "{identifier:#06x}");
+        }
+        for identifier in [0x0000, 0x0004, 0x4000, u64::MAX] {
+            assert!(!is_registered_limit(identifier), "{identifier:#06x}");
+        }
+        assert!(
+            REGISTERED_LIMITS.windows(2).all(|pair| pair[0] < pair[1]),
+            "REGISTERED_LIMITS is not ascending"
+        );
+        assert_eq!(resource_limit::CONCURRENT_LANES, 0x0001);
+        assert_eq!(resource_limit::WIRE_BYTES, 0x0002);
+        assert_eq!(resource_limit::STORAGE_BYTES, 0x0003);
+    }
+
+    #[test]
+    fn decode_limits_are_refused_before_anything_is_read() {
+        // Both halves of the guard, each at its own edge. A caller that asked for
+        // an unknown payload past the protocol ceiling, or for no frames at all,
+        // is asking for something no input can satisfy.
+        let mut payload = Vec::new();
+        encode_frame(frame_type::PING, &[], &mut payload).unwrap();
+        assert_eq!(
+            decode_all(
+                &payload,
+                DecodeLimits {
+                    max_unknown_payload: HARD_MAX_FRAME_PAYLOAD,
+                    max_frames: 1,
+                },
+            )
+            .map(|frames| frames.len()),
+            Ok(1),
+            "the ceiling itself is allowed"
+        );
+        assert_eq!(
+            decode_all(
+                &payload,
+                DecodeLimits {
+                    max_unknown_payload: HARD_MAX_FRAME_PAYLOAD + 1,
+                    max_frames: 1,
+                },
+            ),
+            Err(DecodeError::InvalidLimits),
+            "one byte past it is not"
+        );
+        assert_eq!(
+            decode_all(
+                &payload,
+                DecodeLimits {
+                    max_unknown_payload: 1024,
+                    max_frames: 0,
+                },
+            ),
+            Err(DecodeError::InvalidLimits),
+            "and no frames at all is not a limit but a contradiction"
+        );
+    }
+
+    #[test]
+    fn a_payload_at_its_registered_limit_decodes_and_one_byte_more_does_not() {
+        // The frame-too-large comparison, at the edge. A SETTINGS_ACK is
+        // registered with a limit of zero, so its own edge is one byte.
+        let mut exact = Vec::new();
+        encode_frame(frame_type::SETTINGS_ACK, &[], &mut exact).unwrap();
+        let limits = DecodeLimits::default();
+        assert!(decode_all(&exact, limits).is_ok());
+
+        let mut oversized = Vec::new();
+        encode_varint(frame_type::SETTINGS_ACK, &mut oversized).unwrap();
+        encode_varint(1, &mut oversized).unwrap();
+        oversized.push(0);
+        assert!(matches!(
+            decode_all(&oversized, limits),
+            Err(DecodeError::FrameTooLarge { limit: 0, .. })
+        ));
+
+        // And a frame whose payload is exactly its registered limit is accepted,
+        // which is what says the comparison is not off by one in the other
+        // direction.
+        let limit = registered_payload_limit(frame_type::HELLO).unwrap();
+        let mut at_limit = Vec::new();
+        encode_varint(frame_type::HELLO, &mut at_limit).unwrap();
+        encode_varint(limit as u64, &mut at_limit).unwrap();
+        at_limit.extend(std::iter::repeat_n(0, limit));
+        assert!(
+            decode_all(&at_limit, limits).is_ok(),
+            "a payload at its own limit"
+        );
     }
 
     #[test]

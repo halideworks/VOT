@@ -789,8 +789,11 @@ fn validate_entry(entry: &ManifestEntry) -> Result<(), Error> {
         EntryKind::File => {
             let length = entry.length.ok_or(Error::InvalidObject)?;
             let storage = entry.storage.as_ref().ok_or(Error::InvalidObject)?;
-            if i64::try_from(length).is_err()
-                || !valid_storage(storage, length)
+            // No separate check that the length is representable. Storage is
+            // either a whole object, whose own length must be representable and
+            // must equal this one, or a record, which is bounded well below that,
+            // so a length this side cannot hold has already failed below.
+            if !valid_storage(storage, length)
                 || entry
                     .metadata
                     .as_ref()
@@ -846,10 +849,11 @@ fn valid_storage(storage: &StorageRef, entry_length: u64) -> bool {
 }
 
 fn validate_portable_component(component: &str) -> Result<(), Error> {
+    // Neither "." nor ".." is named here. Both end in a dot, which the rule
+    // below refuses, and their compatibility spellings are settled after the
+    // NFKC form is taken rather than before it.
     if component.is_empty()
         || component.len() > 255
-        || component == "."
-        || component == ".."
         || component.contains(['\0', '/', '\\', '<', '>', ':', '"', '|', '?', '*'])
         || component.ends_with(['.', ' '])
         || component.chars().any(|character| {
@@ -1322,7 +1326,727 @@ mod tests {
 
     #[test]
     fn index_entry_geometry_is_fixed() {
-        assert!(ManifestIndex::bytes_per_entry() <= 24);
-        assert!(ManifestIndex::bytes_per_entry() * 1_000_000 <= 24_000_000);
+        // The exact size rather than a bound on it. A budget written with room to
+        // spare is a budget that an entry growing by a field still fits.
+        assert_eq!(ManifestIndex::bytes_per_entry(), 24);
+        assert_eq!(ManifestIndex::bytes_per_entry() * 1_000_000, 24_000_000);
+    }
+
+    /// A file entry whose storage is a pack record rather than a whole object.
+    fn packed(entry_length: u64) -> StorageRef {
+        StorageRef::Pack {
+            // A pack that holds the record and no less, so a row that breaks the
+            // record's own bound does not break the pack's as well.
+            pack: ObjectId {
+                suite: 1,
+                root: [1; 32],
+                length: (entry_length + 10).max(1_000),
+            },
+            offset: 10,
+            length: entry_length,
+            logical: ObjectId {
+                suite: 1,
+                root: [2; 32],
+                length: entry_length,
+            },
+        }
+    }
+
+    fn direct(length: u64) -> ObjectId {
+        ObjectId {
+            suite: 1,
+            root: [7; 32],
+            length,
+        }
+    }
+
+    #[test]
+    fn every_rule_on_a_storage_reference_is_refused_on_its_own() {
+        // A reference is a chain of conjuncts, and a chain is where a rule hides:
+        // break one at a time, and a row no other rule also refuses is what says
+        // this one is asked.
+        assert!(valid_storage(&StorageRef::Direct(direct(3)), 3));
+        assert!(valid_storage(&packed(3), 3));
+
+        let object_of = |suite: u16, length: u64| ObjectId {
+            suite,
+            root: [1; 32],
+            length,
+        };
+        let pack_of =
+            |pack: ObjectId, offset: u64, length: u64, logical: ObjectId| StorageRef::Pack {
+                pack,
+                offset,
+                length,
+                logical,
+            };
+        let unrepresentable = i64::MAX as u64 + 1;
+
+        for (name, storage, entry_length) in [
+            (
+                "a direct object of an unregistered suite",
+                StorageRef::Direct(object_of(3, 3)),
+                3,
+            ),
+            (
+                "a direct object longer than a signed length holds",
+                StorageRef::Direct(object_of(1, unrepresentable)),
+                unrepresentable,
+            ),
+            (
+                "a direct object that is not the length of the entry",
+                StorageRef::Direct(direct(4)),
+                3,
+            ),
+            (
+                "a pack of an unregistered suite",
+                pack_of(object_of(0, 1_000), 10, 3, direct(3)),
+                3,
+            ),
+            (
+                "a logical object of an unregistered suite",
+                pack_of(object_of(1, 1_000), 10, 3, object_of(0, 3)),
+                3,
+            ),
+            ("a record that is not the length of the entry", packed(4), 3),
+            (
+                "a record longer than a record may be",
+                packed(262_145),
+                262_145,
+            ),
+            (
+                "a logical length that is not the record's",
+                pack_of(object_of(1, 1_000), 10, 3, object_of(1, 2)),
+                3,
+            ),
+            (
+                "a record that ends past the pack",
+                pack_of(object_of(1, 1_000), 998, 3, direct(3)),
+                3,
+            ),
+            (
+                "an offset that overflows rather than ending anywhere",
+                pack_of(object_of(1, 1_000), u64::MAX, 3, direct(3)),
+                3,
+            ),
+            (
+                "a pack longer than a pack may be",
+                pack_of(object_of(1, 134_217_729), 10, 3, direct(3)),
+                3,
+            ),
+        ] {
+            assert!(!valid_storage(&storage, entry_length), "{name}");
+        }
+
+        // Each bound at the value it allows, which is what says it is a bound
+        // rather than a refusal.
+        assert!(valid_storage(&packed(262_144), 262_144));
+        assert!(valid_storage(
+            &pack_of(object_of(2, 134_217_728), 134_217_725, 3, direct(3)),
+            3
+        ));
+    }
+
+    #[test]
+    fn every_rule_on_file_metadata_is_refused_on_its_own() {
+        assert!(valid_metadata(&FileMetadata::default()));
+        assert!(valid_metadata(&FileMetadata {
+            mode: Some(511),
+            mtime_seconds: Some(i64::MIN),
+            mtime_nanoseconds: Some(999_999_999),
+            media_type: Some("a".repeat(127)),
+        }));
+
+        for (name, metadata) in [
+            (
+                "a mode outside the permission bits",
+                FileMetadata {
+                    mode: Some(512),
+                    ..FileMetadata::default()
+                },
+            ),
+            (
+                "a nanosecond that is a whole second",
+                FileMetadata {
+                    mtime_nanoseconds: Some(1_000_000_000),
+                    ..FileMetadata::default()
+                },
+            ),
+            (
+                "a media type of no length",
+                FileMetadata {
+                    media_type: Some(String::new()),
+                    ..FileMetadata::default()
+                },
+            ),
+            (
+                "a media type past its bound",
+                FileMetadata {
+                    media_type: Some("a".repeat(128)),
+                    ..FileMetadata::default()
+                },
+            ),
+        ] {
+            assert!(!valid_metadata(&metadata), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_rule_on_an_entry_is_refused_on_its_own() {
+        assert_eq!(validate_entry(&file("a.txt")), Ok(()));
+        let directory = ManifestEntry {
+            path: vec![Component::Text("d".to_owned())],
+            kind: EntryKind::Directory,
+            length: None,
+            storage: None,
+            metadata: None,
+        };
+        assert_eq!(validate_entry(&directory), Ok(()));
+
+        for (name, entry) in [
+            (
+                "a file without a length",
+                ManifestEntry {
+                    length: None,
+                    ..file("a.txt")
+                },
+            ),
+            (
+                "a file without storage",
+                ManifestEntry {
+                    storage: None,
+                    ..file("a.txt")
+                },
+            ),
+            (
+                "a file whose storage is not the length it claims",
+                ManifestEntry {
+                    storage: Some(StorageRef::Direct(direct(4))),
+                    ..file("a.txt")
+                },
+            ),
+            (
+                "a file whose metadata is not valid",
+                ManifestEntry {
+                    metadata: Some(FileMetadata {
+                        mode: Some(512),
+                        ..FileMetadata::default()
+                    }),
+                    ..file("a.txt")
+                },
+            ),
+            (
+                "a directory with a length",
+                ManifestEntry {
+                    length: Some(0),
+                    ..directory.clone()
+                },
+            ),
+            (
+                "a directory with storage",
+                ManifestEntry {
+                    storage: Some(StorageRef::Direct(direct(3))),
+                    ..directory.clone()
+                },
+            ),
+            (
+                "a directory with metadata",
+                ManifestEntry {
+                    metadata: Some(FileMetadata::default()),
+                    ..directory.clone()
+                },
+            ),
+        ] {
+            assert_eq!(validate_entry(&entry), Err(Error::InvalidObject), "{name}");
+        }
+
+        // A file that carries valid metadata is accepted with it, which is what
+        // says the metadata rule is asked rather than assumed.
+        assert_eq!(
+            validate_entry(&ManifestEntry {
+                metadata: Some(FileMetadata {
+                    mode: Some(420),
+                    ..FileMetadata::default()
+                }),
+                ..file("a.txt")
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn every_rule_on_a_portable_component_is_refused_on_its_own() {
+        assert_eq!(validate_portable_component("a.txt"), Ok(()));
+        // The longest component allowed, and the shortest refused.
+        assert_eq!(validate_portable_component(&"a".repeat(255)), Ok(()));
+
+        let mut refused = vec![
+            ("no component at all".to_owned(), String::new()),
+            ("one byte past the bound".to_owned(), "a".repeat(256)),
+            ("this directory".to_owned(), ".".to_owned()),
+            ("the one above".to_owned(), "..".to_owned()),
+            ("a name that ends in a dot".to_owned(), "a.".to_owned()),
+            ("a name that ends in a space".to_owned(), "a ".to_owned()),
+            (
+                "a compatibility form of the one above".to_owned(),
+                "\u{2024}\u{2024}".to_owned(),
+            ),
+        ];
+        for character in ['\0', '/', '\\', '<', '>', ':', '"', '|', '?', '*'] {
+            refused.push((
+                format!("a name holding {character:?}"),
+                format!("a{character}b"),
+            ));
+        }
+        for character in [
+            '\u{1}', '\u{1f}', '\u{200c}', '\u{200d}', '\u{202a}', '\u{202e}', '\u{2066}',
+            '\u{2069}', '\u{feff}',
+        ] {
+            refused.push((
+                format!("a name holding {character:?}"),
+                format!("a{character}b"),
+            ));
+        }
+        for name in [
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "com9",
+            "lpt1",
+            "lpt9",
+            "CON",
+            "con.txt",
+            "com\u{b9}",
+            "com\u{b2}",
+            "com\u{b3}",
+        ] {
+            refused.push((format!("the device name {name}"), name.to_owned()));
+        }
+        for (name, component) in refused {
+            assert_eq!(
+                validate_portable_component(&component),
+                Err(Error::InvalidPath),
+                "{name}"
+            );
+        }
+
+        // Names that only look like device names. The digit after the prefix is
+        // what makes one, so a name without one is a name.
+        for allowed in ["com", "com0", "comx", "com10", "lpt", "connect", "nulls"] {
+            assert_eq!(validate_portable_component(allowed), Ok(()), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn every_rule_on_a_raw_component_is_refused_on_its_own() {
+        assert!(valid_raw_component(b"a"));
+        assert!(valid_raw_component(&[b'a'; 255]));
+
+        for (name, component) in [
+            ("no component at all", Vec::new()),
+            ("one byte past the bound", vec![b'a'; 256]),
+            ("a name holding a zero byte", b"a\0b".to_vec()),
+            ("a name holding a separator", b"a/b".to_vec()),
+        ] {
+            assert!(!valid_raw_component(&component), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_path_key_joins_components_and_prefixes_nothing() {
+        // The separator goes between components, not before the first: a key that
+        // began with one would sort a path under the empty component.
+        assert_eq!(
+            canonical_path_key(
+                &vec![
+                    Component::Text("a".to_owned()),
+                    Component::Text("b".to_owned())
+                ],
+                PathProfile::Portable
+            ),
+            Ok(b"a\0b".to_vec())
+        );
+        assert_eq!(
+            canonical_path_key(
+                &vec![Component::Bytes(b"a".to_vec())],
+                PathProfile::RawPosix
+            ),
+            Ok(b"a".to_vec())
+        );
+
+        // A path of no components names nothing.
+        assert_eq!(
+            canonical_path_key(&Vec::new(), PathProfile::Portable),
+            Err(Error::InvalidPath)
+        );
+
+        // Each profile takes one kind of component and refuses the other, and the
+        // raw profile asks whether the bytes are a component at all rather than
+        // taking them.
+        for (name, path, profile) in [
+            (
+                "bytes under the portable profile",
+                vec![Component::Bytes(b"a".to_vec())],
+                PathProfile::Portable,
+            ),
+            (
+                "text under the raw profile",
+                vec![Component::Text("a".to_owned())],
+                PathProfile::RawPosix,
+            ),
+            (
+                "raw bytes holding a separator",
+                vec![Component::Bytes(b"a/b".to_vec())],
+                PathProfile::RawPosix,
+            ),
+            (
+                "raw bytes holding a zero",
+                vec![Component::Bytes(b"a\0b".to_vec())],
+                PathProfile::RawPosix,
+            ),
+            (
+                "no raw bytes at all",
+                vec![Component::Bytes(Vec::new())],
+                PathProfile::RawPosix,
+            ),
+        ] {
+            assert_eq!(
+                canonical_path_key(&path, profile),
+                Err(Error::InvalidPath),
+                "{name}"
+            );
+        }
+
+        // Portable keys are folded and stripped of what a case-insensitive
+        // filesystem would drop, so two spellings of one name share a key.
+        assert_eq!(
+            canonical_path_key(
+                &vec![Component::Text("A.TXT".to_owned())],
+                PathProfile::Portable
+            ),
+            canonical_path_key(
+                &vec![Component::Text("a.txt".to_owned())],
+                PathProfile::Portable
+            )
+        );
+    }
+
+    #[test]
+    fn a_page_of_sorted_entries_is_accepted_and_one_out_of_order_is_not() {
+        let sorted = vec![file("a.txt"), file("b.txt"), file("c.txt")];
+        assert_eq!(
+            validate_entries(&sorted, PathProfile::Portable).map(|keys| keys.len()),
+            Ok(3)
+        );
+
+        let unsorted = vec![file("b.txt"), file("a.txt")];
+        assert_eq!(
+            validate_entries(&unsorted, PathProfile::Portable),
+            Err(Error::EntriesUnsorted)
+        );
+
+        // The same path twice is a collision rather than a sort fault, which is
+        // the answer a reader can act on.
+        let repeated = vec![file("a.txt"), file("a.txt")];
+        assert_eq!(
+            validate_entries(&repeated, PathProfile::Portable),
+            Err(Error::PathCollision)
+        );
+    }
+
+    #[test]
+    fn a_progressive_stream_answers_each_page_rule_on_its_own() {
+        let first = page(0, [0; 32], "a.txt");
+        let mut ingest = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        let digest = ingest.accept(&first).expect("the first page");
+
+        // Each of the two halves of the identity check, one at a time. A stream
+        // that took either for the other would accept a page of another manifest.
+        for (name, wrong) in [
+            (
+                "another manifest, this profile",
+                ManifestPage {
+                    manifest_id: [8; 16],
+                    ..page(1, digest, "b.txt")
+                },
+            ),
+            (
+                "this manifest, another profile",
+                ManifestPage {
+                    profile: PathProfile::RawPosix,
+                    entries: vec![ManifestEntry {
+                        path: vec![Component::Bytes(b"b.txt".to_vec())],
+                        ..file("b.txt")
+                    }],
+                    ..page(1, digest, "b.txt")
+                },
+            ),
+        ] {
+            let mut stream = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+            stream.accept(&first).expect("the first page");
+            assert_eq!(stream.accept(&wrong), Err(Error::WrongManifest), "{name}");
+            assert!(stream.is_poisoned(), "{name} poisons the stream");
+        }
+
+        // A page whose first path is the one the last page ended on. The pages
+        // are each sorted, so only the seam says the stream is not.
+        let mut seam = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        let two = ManifestPage {
+            entries: vec![file("a.txt"), file("b.txt")],
+            ..page(0, [0; 32], "a.txt")
+        };
+        let seam_digest = seam.accept(&two).expect("a page of two entries");
+        assert_eq!(
+            seam.accept(&page(1, seam_digest, "b.txt")),
+            Err(Error::EntriesUnsorted),
+            "the path the last page ended on"
+        );
+
+        // And the path after it, which is the same seam one step along.
+        let mut continued = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        let continued_digest = continued.accept(&two).expect("a page of two entries");
+        assert!(
+            continued
+                .accept(&page(1, continued_digest, "c.txt"))
+                .is_ok(),
+            "the path after the one the last page ended on"
+        );
+        assert!(!continued.is_poisoned());
+    }
+
+    #[test]
+    fn every_rule_on_a_seal_is_refused_on_its_own_by_the_ingest() {
+        let mut ingest = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        let digest = ingest.accept(&page(0, [0; 32], "a.txt")).expect("a page");
+        let valid = Seal {
+            manifest_id: [9; 16],
+            final_page_count: 1,
+            final_page_digest: digest,
+            package: ObjectId {
+                suite: 1,
+                root: [5; 32],
+                length: 3,
+            },
+            pages: vec![PageCommitment { index: 0, digest }],
+        };
+        assert_eq!(ingest.verify_seal(&valid), Ok(()));
+
+        for (name, seal) in [
+            (
+                "another manifest",
+                Seal {
+                    manifest_id: [8; 16],
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a page count that is not what arrived",
+                Seal {
+                    final_page_count: 2,
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a final digest that is not the last page",
+                Seal {
+                    final_page_digest: [4; 32],
+                    ..valid.clone()
+                },
+            ),
+            (
+                "one commitment more than there are pages",
+                Seal {
+                    pages: vec![
+                        PageCommitment { index: 0, digest },
+                        PageCommitment { index: 1, digest },
+                    ],
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a package of an unregistered suite",
+                Seal {
+                    package: ObjectId {
+                        suite: 0,
+                        root: [5; 32],
+                        length: 3,
+                    },
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a commitment at the wrong index",
+                Seal {
+                    pages: vec![PageCommitment { index: 1, digest }],
+                    ..valid.clone()
+                },
+            ),
+            (
+                "a commitment to another digest",
+                Seal {
+                    pages: vec![PageCommitment {
+                        index: 0,
+                        digest: [1; 32],
+                    }],
+                    ..valid.clone()
+                },
+            ),
+        ] {
+            assert_eq!(ingest.verify_seal(&seal), Err(Error::InvalidSeal), "{name}");
+        }
+
+        // Verification does not poison: a seal that does not match is the sender's
+        // to correct, and the pages that arrived are still good.
+        assert!(!ingest.is_poisoned());
+        assert_eq!(ingest.verify_seal(&valid), Ok(()));
+
+        // A stream that has taken no page has nothing to seal.
+        let empty = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        assert_eq!(empty.verify_seal(&valid), Err(Error::Poisoned));
+    }
+
+    #[test]
+    fn an_index_finds_every_path_it_holds_and_nothing_it_does_not() {
+        // Sixteen paths, so the lookup depends on the order the index puts them in
+        // rather than on where one of them happens to land.
+        let paths: Vec<PackagePath> = (0..16)
+            .map(|index| {
+                vec![
+                    Component::Text(format!("dir{index}")),
+                    Component::Text(format!("file{index}.txt")),
+                ]
+            })
+            .collect();
+
+        let mut index = ManifestIndex::with_capacity(paths.len());
+        // The capacity asked for is taken up front. A million entries growing an
+        // entry at a time is the cost this constructor exists to avoid.
+        assert!(index.entries.capacity() >= paths.len());
+
+        for (position, path) in paths.iter().enumerate() {
+            index
+                .push(path, PathProfile::Portable, 3, position as u32)
+                .expect("a valid path");
+        }
+        index.finish();
+
+        for (position, path) in paths.iter().enumerate() {
+            assert_eq!(
+                index.candidates(path, PathProfile::Portable),
+                vec![(3, position as u32)],
+                "{path:?}"
+            );
+        }
+
+        // A path nothing pushed, and a path no profile can key.
+        assert!(
+            index
+                .candidates(
+                    &vec![Component::Text("absent".to_owned())],
+                    PathProfile::Portable
+                )
+                .is_empty()
+        );
+        assert!(
+            index
+                .candidates(&Vec::new(), PathProfile::Portable)
+                .is_empty()
+        );
+
+        // The same path under two entries answers with both, in the order they
+        // were pushed.
+        let mut twice = ManifestIndex::with_capacity(2);
+        twice
+            .push(&paths[0], PathProfile::Portable, 0, 0)
+            .expect("a valid path");
+        twice
+            .push(&paths[0], PathProfile::Portable, 1, 1)
+            .expect("a valid path");
+        twice.finish();
+        assert_eq!(
+            twice.candidates(&paths[0], PathProfile::Portable),
+            vec![(0, 0), (1, 1)]
+        );
+
+        // A path the profile refuses is not indexed, and the refusal is the
+        // profile's rather than swallowed.
+        assert_eq!(
+            twice.push(
+                &vec![Component::Bytes(b"a".to_vec())],
+                PathProfile::Portable,
+                0,
+                0
+            ),
+            Err(Error::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn a_page_at_its_decoding_edges_round_trips() {
+        // A path of exactly as many components as one may have. The bound is the
+        // count itself, so the page at it has to be readable.
+        let deep = ManifestEntry {
+            path: (0..MAX_PATH_COMPONENTS)
+                .map(|index| Component::Text(format!("c{index}")))
+                .collect(),
+            ..file("unused.txt")
+        };
+        let deep_page = ManifestPage {
+            entries: vec![deep],
+            ..page(0, [0; 32], "unused.txt")
+        };
+        let encoded = encode_page(&deep_page).expect("a page at the component bound");
+        assert_eq!(decode_page(&encoded), Ok(deep_page));
+
+        // A directory entry, which is the other kind a page may hold.
+        let directory_page = ManifestPage {
+            entries: vec![ManifestEntry {
+                path: vec![Component::Text("d".to_owned())],
+                kind: EntryKind::Directory,
+                length: None,
+                storage: None,
+                metadata: None,
+            }],
+            ..page(0, [0; 32], "d")
+        };
+        let encoded = encode_page(&directory_page).expect("a directory entry");
+        assert_eq!(decode_page(&encoded), Ok(directory_page));
+
+        // Metadata that states nothing. An empty map is as canonical as a full
+        // one, and a decoder that read the field count as a lower bound would
+        // refuse it.
+        let bare_metadata = ManifestPage {
+            entries: vec![ManifestEntry {
+                metadata: Some(FileMetadata::default()),
+                ..file("a.txt")
+            }],
+            ..page(0, [0; 32], "a.txt")
+        };
+        let encoded = encode_page(&bare_metadata).expect("metadata of no fields");
+        assert_eq!(decode_page(&encoded), Ok(bare_metadata));
+
+        // Metadata of every field it may carry, which is the other edge of the
+        // same count.
+        let full_metadata = ManifestPage {
+            entries: vec![ManifestEntry {
+                metadata: Some(FileMetadata {
+                    mode: Some(420),
+                    mtime_seconds: Some(-1),
+                    mtime_nanoseconds: Some(999_999_999),
+                    media_type: Some("text/plain".to_owned()),
+                }),
+                ..file("a.txt")
+            }],
+            ..page(0, [0; 32], "a.txt")
+        };
+        let encoded = encode_page(&full_metadata).expect("metadata of every field");
+        assert_eq!(decode_page(&encoded), Ok(full_metadata));
+
+        // And a byte after the page, which is not part of it.
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(decode_page(&trailing), Err(DecodeError::InvalidStructure));
     }
 }

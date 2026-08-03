@@ -364,6 +364,12 @@ mod tests {
                             stream
                                 .set_nonblocking(false)
                                 .expect("a blocking connection");
+                            // One connection is served at a time, so a client
+                            // that opens one and says nothing would hold every
+                            // later request behind it until the job times out.
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                                .expect("a connection that gives up");
                             let Some(request) = read_request(&mut stream) else {
                                 continue;
                             };
@@ -587,49 +593,42 @@ mod tests {
         let upload_id = store.create_multipart("key", 0).expect("an upload");
         let before = endpoint.requests().len();
 
-        for (name, id, number, bytes, checksum) in [
+        for (name, id, number, checksum, expected) in [
             (
                 "a part numbered zero",
                 upload_id.as_str(),
                 0_u32,
-                b"payload".as_slice(),
                 vot_journal::crc32c(b"payload"),
+                Error::InvalidPart,
             ),
             (
                 "a part past the last a multipart upload may have",
                 upload_id.as_str(),
                 10_001,
-                b"payload".as_slice(),
                 vot_journal::crc32c(b"payload"),
+                Error::InvalidPart,
             ),
             (
                 "a checksum that is not the bytes",
                 upload_id.as_str(),
                 1,
-                b"payload".as_slice(),
                 vot_journal::crc32c(b"payload") ^ 1,
+                Error::ChecksumMismatch,
+            ),
+            (
+                "an upload nothing created",
+                "upload-absent",
+                1,
+                vot_journal::crc32c(b"payload"),
+                Error::UnknownUpload,
             ),
         ] {
-            let expected = if name == "a checksum that is not the bytes" {
-                Error::ChecksumMismatch
-            } else {
-                Error::InvalidPart
-            };
             assert_eq!(
-                store.upload_part(id, number, bytes, checksum),
+                store.upload_part(id, number, b"payload", checksum),
                 Err(expected),
                 "{name}"
             );
         }
-        assert_eq!(
-            store.upload_part(
-                "upload-absent",
-                1,
-                b"payload",
-                vot_journal::crc32c(b"payload")
-            ),
-            Err(Error::UnknownUpload)
-        );
         assert_eq!(
             endpoint.requests().len(),
             before,

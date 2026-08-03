@@ -1530,22 +1530,23 @@ mod tests {
     #[test]
     fn a_peer_limit_reaches_the_adapter_through_the_trait() {
         let mut adapter = SimulatorAdapter::default();
-        apply_peer_limit(&mut adapter, 2 * 1024 * 1024).unwrap();
+        // Below the default, so what follows can only pass if the call arrived:
+        // an adapter still on its default bound accepts both of these.
+        let peer = 4096;
+        assert!(peer < vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD);
+        apply_peer_limit(&mut adapter, peer).unwrap();
         assert_eq!(
             apply_peer_limit(&mut adapter, 0),
             Err(TransportError::InvalidConfiguration),
             "and a limit outside the protocol range is refused there too"
         );
-        // The bound it set is the one submissions are held to, so this says the
-        // call arrived rather than only that it returned Ok.
+
+        let envelope = vot_transport_api::MAX_FRAME_ENVELOPE_BYTES;
+        adapter.send_control(&vec![0; peer + envelope]).unwrap();
         assert_eq!(
-            adapter.send_control(&vec![
-                0;
-                2 * 1024 * 1024
-                    + vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
-                    + 1
-            ]),
-            Err(TransportError::RecordTooLarge)
+            adapter.send_control(&vec![0; peer + envelope + 1]),
+            Err(TransportError::RecordTooLarge),
+            "one byte past the bound the peer advertised"
         );
     }
 

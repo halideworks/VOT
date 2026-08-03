@@ -28,7 +28,8 @@ send bound and the receive bound are separate: a frame the peer would accept and
 this endpoint would not is submitted and then refused at delivery.
 
 Mutants: answer `set_control_payload_limit`, `receive_limits`, or `close` from
-the trait default; keep the limit a peer sent as the bound delivery is held to;
+the trait default; validate a peer's limit and apply nothing; keep the limit a
+peer sent as the bound delivery is held to;
 record the last close code rather than the first; accept a submission after the
 carrier closed; deliver what was queued when it closed; admit a lane past the
 advertised count; count a lane already seen against the limit again.
@@ -37,6 +38,9 @@ Observed failure:
 
 ```text
 called `Result::unwrap()` on an `Err` value: Unsupported
+assertion `left == right` failed: one byte past the bound the peer advertised
+  left: Ok(())
+ right: Err(RecordTooLarge)
 assertion `left == right` failed
   left: Some(258)
  right: Some(1282)

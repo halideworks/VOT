@@ -1396,13 +1396,22 @@ impl Lane {
 /// An application sending one drives the peer's exchange by hand: a second
 /// `HELLO` or `SETTINGS` is refused as out of sequence and closes a session
 /// that was working.
-const fn is_negotiation(frame_type: u64) -> bool {
+/// Whether the exchange owns this frame type.
+///
+/// Every frame `spec/wire.md` sections 1 and 1.1 define. An application sending
+/// one would drive the peer's state machine while leaving its own behind, and a
+/// server sending its own `SESSION_ACCEPT` would claim an exchange this
+/// endpoint never ran. `grant` and `refuse` are the way to answer.
+const fn is_exchange_frame(frame_type: u64) -> bool {
     matches!(
         frame_type,
         frame_type::HELLO
             | frame_type::SETTINGS
             | frame_type::SETTINGS_ACK
             | frame_type::AUTH_CONTEXT
+            | frame_type::SESSION_OPEN
+            | frame_type::SESSION_ACCEPT
+            | frame_type::SESSION_REJECT
     )
 }
 
@@ -1486,7 +1495,7 @@ fn check_frame(
 
     // Outbound only: the exchange consumes these on the way in, and reaching
     // here on the way out means an application encoded one itself.
-    if matches!(side, Side::Peer) && is_negotiation(envelope.frame_type) {
+    if matches!(side, Side::Peer) && is_exchange_frame(envelope.frame_type) {
         return Err(Error::new(
             ErrorKind::NegotiationFrameFromApplication {
                 frame_type: envelope.frame_type,
@@ -2340,17 +2349,50 @@ mod tests {
     }
 
     #[test]
-    fn the_application_may_not_send_the_challenge_itself() {
-        // The state machine owns it. An application-sent AUTH_CONTEXT would
-        // let a caller claim an exchange the machine never ran.
+    fn the_application_may_not_send_the_exchange_itself() {
+        // The state machine owns every frame sections 1 and 1.1 define. A
+        // server sending its own SESSION_ACCEPT would claim an exchange the
+        // machine never ran, and grant is how it answers instead.
         let (mut client, _server, _answer) = negotiated_pair();
-        let error = client
-            .send_control(&auth_context(&[7; 16], Vec::new()))
-            .unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            ErrorKind::NegotiationFrameFromApplication { .. }
-        ));
+        let mut accept = Vec::new();
+        vot_codec::frames::encode(
+            &vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
+                session_id: [7; 16],
+                granted_scope: Vec::new(),
+            }),
+            &mut accept,
+        )
+        .unwrap();
+        let mut reject = Vec::new();
+        vot_codec::frames::encode(
+            &vot_codec::frames::TypedFrame::SessionReject(SessionReject {
+                session_id: [7; 16],
+                reason: u64::from(error_code::AUTHENTICATION_FAILED),
+                detail: String::new(),
+            }),
+            &mut reject,
+        )
+        .unwrap();
+        for frame in [
+            auth_context(&[7; 16], Vec::new()),
+            session_open([7; 16], 1),
+            accept,
+            reject,
+            frame_of(frame_type::HELLO, 0),
+        ] {
+            let error = client.send_control(&frame).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::NegotiationFrameFromApplication { .. }
+                ),
+                "{:?}",
+                error.kind()
+            );
+        }
+
+        // A frame the exchange does not own still goes out.
+        client.send_control(&frame_of(frame_type::PING, 0)).unwrap();
     }
 
     #[test]
@@ -3875,6 +3917,9 @@ mod tests {
             frame_type::SETTINGS,
             frame_type::SETTINGS_ACK,
             frame_type::AUTH_CONTEXT,
+            frame_type::SESSION_OPEN,
+            frame_type::SESSION_ACCEPT,
+            frame_type::SESSION_REJECT,
         ] {
             let error = client.send_control(&frame_of(frame_type, 0)).unwrap_err();
             assert_eq!(

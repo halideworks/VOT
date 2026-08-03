@@ -82,10 +82,13 @@ def survivors(log: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> None:
-    full = "--full" in argv
-    paths = [argument for argument in argv if not argument.startswith("--")]
-    if len(paths) != 1:
+    flags = [argument for argument in argv if argument.startswith("-")]
+    paths = [argument for argument in argv if not argument.startswith("-")]
+    # A mistyped flag would otherwise run the weaker check and say nothing, which
+    # is the shape of the problem this script exists to remove.
+    if set(flags) - {"--full"} or len(paths) != 1:
         raise SystemExit("usage: check_live_mutants.py [--full] <mutants.log>")
+    full = "--full" in flags
     log = Path(paths[0])
     if not log.is_file():
         fail(f"{log} does not exist, so the run it should hold said nothing")

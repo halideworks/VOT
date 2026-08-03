@@ -1496,6 +1496,88 @@ mod tests {
     }
 
     #[test]
+    fn the_payload_api_reads_what_the_typed_frame_api_writes() {
+        // The negotiation state machine handles the section 1.1 frames itself,
+        // so it decodes payloads rather than typed frames and never goes through
+        // the dispatch the tests above use. Only these four have that door, and
+        // it has to lead to the same place.
+        let frames = [
+            TypedFrame::AuthContext(AuthContext {
+                nonce: vec![1; MIN_AUTH_NONCE],
+                binding: Binding::ProofOfPossession,
+                formats: vec![1, 7],
+            }),
+            TypedFrame::SessionOpen(SessionOpen {
+                session_id: [2; 16],
+                capability_format: 7,
+                capability: vec![3; 8],
+                requested_scope: vec![4; 8],
+                binding_proof: vec![5; 8],
+            }),
+            TypedFrame::SessionAccept(SessionAccept {
+                session_id: [2; 16],
+                granted_scope: vec![6; 8],
+            }),
+            TypedFrame::SessionReject(SessionReject {
+                session_id: [2; 16],
+                reason: u64::from(crate::error_code::REPLAY_REJECTED),
+                detail: "why".to_owned(),
+            }),
+        ];
+        let limits = DecodeLimits {
+            max_unknown_payload: 64 * 1024,
+            max_frames: 1,
+        };
+        for frame in frames {
+            let mut encoded = Vec::new();
+            encode(&frame, &mut encoded).unwrap();
+            let (envelope, _) = crate::decode_one(&encoded, limits).unwrap();
+            let crate::DecodedFrame::Known { payload, .. } = envelope else {
+                panic!("every section 1.1 frame is a known type");
+            };
+            let read = match &frame {
+                TypedFrame::AuthContext(_) => {
+                    TypedFrame::AuthContext(decode_auth_context_payload(payload).unwrap())
+                }
+                TypedFrame::SessionOpen(_) => {
+                    TypedFrame::SessionOpen(decode_session_open_payload(payload).unwrap())
+                }
+                TypedFrame::SessionAccept(_) => {
+                    TypedFrame::SessionAccept(decode_session_accept_payload(payload).unwrap())
+                }
+                _ => TypedFrame::SessionReject(decode_session_reject_payload(payload).unwrap()),
+            };
+            assert_eq!(read, frame);
+        }
+
+        // And the same refusals, since a payload decoder that skipped the
+        // validation the dispatch applies would be a way around it.
+        assert!(decode_session_accept_payload(&[]).is_err());
+
+        // Canonical CBOR under the schema, carrying a code section 1.1 does not
+        // assign to a rejection. Built field by field rather than by editing an
+        // encoded one, so the payload is refused for its reason and not for a
+        // key the edit moved.
+        let mut unregistered = Vec::new();
+        map(4, &mut unregistered);
+        uint(0, &mut unregistered);
+        uint(0, &mut unregistered);
+        uint(1, &mut unregistered);
+        bytes(&[2; 16], &mut unregistered);
+        uint(2, &mut unregistered);
+        uint(
+            u64::from(crate::error_code::MALFORMED_FRAME),
+            &mut unregistered,
+        );
+        uint(3, &mut unregistered);
+        text("", &mut unregistered);
+        assert_eq!(
+            decode_session_reject_payload(&unregistered),
+            Err(Error::InvalidValue)
+        );
+    }
+
+    #[test]
     fn every_authentication_bound_admits_its_own_maximum() {
         // A bound that refuses its own maximum refuses a peer that sent
         // nothing oversized, and nothing else here would notice.

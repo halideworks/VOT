@@ -3458,6 +3458,46 @@ pub mod live {
             };
             assert_eq!(accepted.connection_id(), 1);
 
+            // The adapter surface an accepted connection exposes is delegation,
+            // and a delegation that quietly answers for itself is the one thing
+            // a caller cannot see. Each of these has to reach the carrier.
+            {
+                use vot_transport_api::TransportAdapter as _;
+                let limits = accepted
+                    .receive_limits()
+                    .expect("an accepted side advertises");
+                assert_eq!(limits.lanes(), test_limits().lanes());
+                assert_eq!(limits.control_payload(), test_limits().control_payload());
+
+                // A record past what a lane carries is refused before it is
+                // queued, whether it is offered alone or in a batch.
+                let oversized = vot_transport_api::Payload::from(vec![
+                    0;
+                    vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES
+                        + 1
+                ]);
+                assert!(
+                    accepted
+                        .preflight_reliable_batch(StreamId(1), &[oversized.clone()])
+                        .is_err()
+                );
+                assert!(
+                    accepted
+                        .send_reliable_shared(StreamId(1), oversized)
+                        .is_err()
+                );
+
+                // And the control limit reaches the carrier, so a frame past
+                // the new one is refused where it was accepted before.
+                let small = vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD;
+                accepted.set_control_payload_limit(small).unwrap();
+                let past = framed(vot_codec::frame_type::SETTINGS, &vec![0; small + 1024]);
+                assert!(accepted.send_control(&past).is_err());
+                accepted
+                    .set_control_payload_limit(vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD)
+                    .unwrap();
+            }
+
             // A control frame and records on two lanes. The lanes are the point:
             // they arrive as two independent peer-created streams, and reporting
             // both under one identifier would make their interleaving look like

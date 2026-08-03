@@ -125,6 +125,8 @@ pub enum ErrorKind {
         extension: u64,
         side: Side,
     },
+    /// An application submitted a frame the exchange owns.
+    NegotiationFrameFromApplication { frame_type: u64 },
     /// A frame on a stream that does not carry its type.
     FrameOnTheWrongLane {
         frame_type: u64,
@@ -165,6 +167,7 @@ impl ErrorKind {
             | Self::Transport(_)
             | Self::Interrupted { .. }
             | Self::ReceiveLimitMismatch { .. }
+            | Self::NegotiationFrameFromApplication { .. }
             | Self::HandshakeUnsent { .. } => false,
         }
     }
@@ -1092,6 +1095,18 @@ impl Lane {
     }
 }
 
+/// Frames the negotiation state machine owns.
+///
+/// An application sending one drives the peer's exchange by hand: a second
+/// `HELLO` or `SETTINGS` is refused as out of sequence and closes a session
+/// that was working.
+const fn is_negotiation(frame_type: u64) -> bool {
+    matches!(
+        frame_type,
+        frame_type::HELLO | frame_type::SETTINGS | frame_type::SETTINGS_ACK
+    )
+}
+
 /// Whose limits a frame is measured against.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Side {
@@ -1145,6 +1160,17 @@ fn check_frame(
                 frame_type: envelope.frame_type,
                 lane,
                 side,
+            },
+            error_code::MALFORMED_FRAME,
+        ));
+    }
+
+    // Outbound only: the exchange consumes these on the way in, and reaching
+    // here on the way out means an application encoded one itself.
+    if matches!(side, Side::Peer) && is_negotiation(envelope.frame_type) {
+        return Err(Error::new(
+            ErrorKind::NegotiationFrameFromApplication {
+                frame_type: envelope.frame_type,
             },
             error_code::MALFORMED_FRAME,
         ));
@@ -2925,6 +2951,44 @@ mod tests {
             client.poll().unwrap(),
             Some(Event::Connected(vot_transport_api::ConnectionId(1)))
         );
+    }
+
+    #[test]
+    fn an_application_cannot_send_the_frames_the_exchange_owns() {
+        // A caller encoding its own HELLO or SETTINGS drives the peer's state
+        // machine by hand: the peer refuses it as out of sequence and closes a
+        // session that was working.
+        let (mut client, _server) = negotiated();
+        for frame_type in [
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::SETTINGS_ACK,
+        ] {
+            let error = client.send_control(&frame_of(frame_type, 0)).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &ErrorKind::NegotiationFrameFromApplication { frame_type }
+            );
+            // The caller's mistake, so the carrier is left alone.
+            assert!(!error.kind().is_peer_fault());
+            assert!(client.adapter().closed.is_empty());
+        }
+        assert!(client.adapter().sent.is_empty(), "none reached the backend");
+
+        // The exchange still sends its own, which do not go through this path.
+        let mut fresh = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Unimplemented,
+        );
+        fresh.begin().unwrap();
+        assert_eq!(fresh.adapter().sent.len(), 2);
+
+        // And an ordinary application frame is unaffected.
+        let (mut ready, _peer) = negotiated();
+        ready.send_control(&frame_of(frame_type::PING, 0)).unwrap();
+        assert_eq!(ready.adapter().sent.len(), 1);
     }
 
     #[test]

@@ -103,6 +103,13 @@ own reassembly bound has to be in force before the peer's first byte, so
 Advertising one bound and accepting frames up to another is silent otherwise:
 the peer sends what it was told it could, and this endpoint takes more.
 
+## What an application may send
+
+`Session::send_control` refuses `HELLO`, `SETTINGS`, and `SETTINGS_ACK`. The
+exchange owns them, and an application encoding one drives the peer's state
+machine by hand: the peer refuses it as out of sequence and closes a session
+that was working. The frames the exchange sends itself do not take that path.
+
 ## Which settings are enforced
 
 `spec/registries.md` defines eight settings. Four bound framing and are applied

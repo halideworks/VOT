@@ -605,6 +605,12 @@ impl<A: TransportAdapter> Session<A> {
         self.negotiation.is_ready()
     }
 
+    /// The limits this endpoint advertised.
+    #[must_use]
+    pub const fn local_settings(&self) -> Settings {
+        self.negotiation.local_settings()
+    }
+
     /// The limits the peer advertised.
     #[must_use]
     pub const fn peer_settings(&self) -> Option<Settings> {
@@ -1075,10 +1081,16 @@ pub enum Lane {
 
 impl Lane {
     /// Whether a frame of this type belongs on the lane.
+    ///
+    /// `spec/wire.md` section 7 gives a lane the payload and the control stream
+    /// everything else. `DATA_RECORD` is the payload. A `PROOF_BUNDLE`
+    /// describes the payload and is bounded by the negotiated control ceiling,
+    /// not by the fixed record limit, so it travels on the control stream.
     const fn carries(self, frame_type: u64) -> bool {
+        let payload = matches!(frame_type, vot_codec::frame_type::DATA_RECORD);
         match self {
-            Self::Control => frame_type != vot_codec::frame_type::DATA_RECORD,
-            Self::Reliable => frame_type == vot_codec::frame_type::DATA_RECORD,
+            Self::Control => !payload,
+            Self::Reliable => payload,
         }
     }
 }
@@ -2828,6 +2840,26 @@ mod tests {
             server.adapter().closed.is_empty(),
             "a local refusal does not close the carrier"
         );
+    }
+
+    #[test]
+    fn a_lane_carries_the_payload_and_the_control_stream_describes_it() {
+        // A PROOF_BUNDLE is bounded by the negotiated control ceiling, which a
+        // lane does not carry: every backend frames a lane at the fixed record
+        // limit, so a proof above it could be routed and never sent.
+        assert!(Lane::Reliable.carries(frame_type::DATA_RECORD));
+        assert!(!Lane::Control.carries(frame_type::DATA_RECORD));
+        for frame_type in [
+            frame_type::PROOF_BUNDLE,
+            frame_type::HELLO,
+            frame_type::SETTINGS,
+            frame_type::MANIFEST_PAGE,
+            frame_type::PUBLISH_RECEIPT,
+            frame_type::PING,
+        ] {
+            assert!(Lane::Control.carries(frame_type), "{frame_type:#x}");
+            assert!(!Lane::Reliable.carries(frame_type), "{frame_type:#x}");
+        }
     }
 
     #[test]

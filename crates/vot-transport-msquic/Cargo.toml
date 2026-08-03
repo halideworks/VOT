@@ -17,6 +17,9 @@ vot-transport-api = { path = "../vot-transport-api" }
 
 [dev-dependencies]
 vot-session = { path = "../vot-session" }
+vot-scheduler = { path = "../vot-scheduler" }
+vot-proof-blake3 = { path = "../vot-proof-blake3" }
+vot-verifier = { path = "../vot-verifier" }
 
 [lints.rust]
 unsafe_code = "deny"

@@ -14,6 +14,9 @@ const MAX_DATA_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_REQUEST_PAGES: u64 = 8_192;
 const MAX_HAVE_RUNS: u64 = 2_097_152;
 
+/// The most records one bundle can declare, from `spec/proof-bundle.cddl`.
+pub const MAX_DATA_RECORDS_PER_BUNDLE: usize = 17;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     Envelope(DecodeError),
@@ -478,7 +481,7 @@ fn validate_proof_bundle_with_proof_len(
             .checked_add(value.covered_length)
             .is_none_or(|end| end > value.object.length)
         || value.data_record_count == 0
-        || value.data_record_count > 17
+        || value.data_record_count > MAX_DATA_RECORDS_PER_BUNDLE as u64
         || value.total_plaintext_length != value.covered_length
         || proof_len > MAX_PROOF_BYTES
         || crate::registered_payload_limit(frame_type::PROOF_BUNDLE)

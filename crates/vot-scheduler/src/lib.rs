@@ -7,14 +7,17 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
 use vot_transport_api::{ConnectionId, PathStats, StagingCapacity, SubjectId, TransportAck};
+
+pub mod session;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
-const RANGE_UNIT_BYTES: u64 = 65_536;
+/// Range granularity a proof covers, from spec/proofs.md.
+pub const RANGE_UNIT_BYTES: u64 = 65_536;
 const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     UnknownObject,
     AlreadyReceiving,
@@ -26,6 +29,10 @@ pub enum Error {
     Verification(vot_verifier::VerifyError),
     ProofInvalid,
     UnsupportedCompression,
+    /// The session failed before a frame could be interpreted.
+    Session(vot_session::Error),
+    /// More incomplete bundle state than this receiver will hold.
+    PendingBundlesExhausted,
 }
 
 impl From<vot_transport_api::Error> for Error {
@@ -177,7 +184,11 @@ impl ReliableReceiver {
         proof: &[u8],
         staging_reserved: bool,
     ) -> Result<(), Error> {
-        if !self.range_active.contains_key(&subject) {
+        // A subject whose every byte is verified has no range state left, but a
+        // peer may still replay a range it already sent. The replay is checked
+        // like any other and then changes nothing.
+        let replay = self.verified.contains(&subject);
+        if !replay && !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
         }
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
@@ -218,6 +229,14 @@ impl ReliableReceiver {
                 )
                 .map_err(|_| Error::ProofInvalid)?;
             }
+        }
+        // Checked after the proof, so a bundle that does not verify against the
+        // subject root is refused rather than accepted as a replay.
+        if replay {
+            if staging_reserved {
+                self.staging.release(bytes);
+            }
+            return Ok(());
         }
         let next_bytes = {
             let active = self

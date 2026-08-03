@@ -64,6 +64,6 @@ assertion `left == right` failed: the replay held nothing
  right: 0
 ```
 
-The required `vot-scheduler` mutation run reports 196 total, 176 caught, 20
-unviable, and 0 missed. The required `vot-session` run reports 164 total, 129
-caught, 35 unviable, and 0 missed.
+The required `vot-scheduler` and `vot-session` mutation runs report 0 missed.
+The totals move with every change to either crate, so a number written here is
+stale before it is read.

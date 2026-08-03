@@ -488,11 +488,14 @@ impl Negotiation {
                     settings_ack_frame()?,
                     self.auth_context_frame()?,
                 ];
-                self.state = State::Negotiated;
-                // This deployment advertises no capability format, so
-                // AUTH_CONTEXT is the concluding frame and sending it is what
-                // authenticates this endpoint.
-                self.state = State::Authenticated;
+                // spec/wire.md section 1.1: the concluding frame is
+                // AUTH_CONTEXT when no capability format was advertised, and
+                // SESSION_ACCEPT when one was. Only the first concludes here.
+                self.state = if self.challenge.formats.is_empty() {
+                    State::Authenticated
+                } else {
+                    State::Negotiated
+                };
                 Ok(Accepted::Consumed { reply })
             }
         }
@@ -1994,8 +1997,34 @@ mod tests {
                 challenge: demanding([3; 32]),
             },
         );
+        // Driven through the real transition rather than a state set by hand.
+        // A server that advertises a format has not concluded the exchange by
+        // sending its challenge, and hand-setting the state hides that.
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
         server.begin().unwrap();
-        server.negotiation.state = State::Negotiated;
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(server.poll().unwrap(), None);
+        assert_eq!(
+            server.state(),
+            State::Negotiated,
+            "a challenge asking for a capability does not conclude the exchange"
+        );
+        assert!(!server.is_ready(), "and the data plane stays shut");
+        assert_eq!(
+            server
+                .send_reliable(StreamId(1), &data_record(b"early"))
+                .unwrap_err()
+                .close_code(),
+            error_code::MALFORMED_FRAME
+        );
         std::mem::take(&mut server.adapter.sent);
 
         server

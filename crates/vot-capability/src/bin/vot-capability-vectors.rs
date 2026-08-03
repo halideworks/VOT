@@ -65,7 +65,20 @@ fn main() {
         delegation: NO_FURTHER_DELEGATION,
     };
 
-    for (name, capability) in [("full", &full), ("minimal", &minimal)] {
+    // A non-ASCII identity with a non-breaking space in it. The rule is "no
+    // control characters", and an implementation reaching for a printability test
+    // instead refuses this one.
+    let unicode = Capability {
+        issuer: "issüer.example".to_owned(),
+        audience: "receiver\u{a0}example".to_owned(),
+        ..minimal.clone()
+    };
+
+    for (name, capability) in [
+        ("full", &full),
+        ("minimal", &minimal),
+        ("unicode", &unicode),
+    ] {
         let bytes = capability.canonical_bytes().unwrap();
         println!("{name} capability {}", hex(&bytes));
         let signed = vot_capability::sign(capability, b"issuer-1", &issuer).unwrap();

@@ -14,6 +14,7 @@ import os
 import shlex
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -144,7 +145,11 @@ def check_identity(value: str) -> str:
     low, high = IDENTITY
     if not low <= len(value.encode("utf-8")) <= high:
         raise Refused("INVALID_IDENTITY")
-    if any(character.isprintable() is False for character in value):
+    # Control characters, which is the Unicode Cc category and what Rust's
+    # `char::is_control` answers. `str.isprintable` is not the same rule: it also
+    # refuses a non-breaking space, and an implementation using it would reject an
+    # identity this format allows.
+    if any(unicodedata.category(character) == "Cc" for character in value):
         raise Refused("INVALID_IDENTITY")
     return value
 
@@ -174,7 +179,9 @@ def read_scope(reader: Reader) -> dict[str, Any]:
         end = offset + span
         if end > 1 << 64:
             raise Refused("INVALID_RANGE")
-        if index > 0 and offset < previous_end:
+        # Strictly separated, not merely disjoint: two adjacent ranges are one
+        # range written twice, and the format refuses the second way of saying it.
+        if index > 0 and offset <= previous_end:
             raise Refused("INVALID_RANGE")
         if length is not None and end > length:
             raise Refused("INVALID_RANGE")

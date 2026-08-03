@@ -35,11 +35,17 @@ format does not define.
 
 Cross-implementation evidence: `tools/validate_capability_vectors.py` reimplements
 `spec/capability.cddl` and the section 5 rules in Python and cross-checks 13 cases
-against the Rust crate through `vot-capability-oracle`. Five of them are refusals,
-which the validator requires: a file of nothing but accepted cases proves only
-that a decoder decodes. Checked in both directions by changing a byte of a
-canonical vector and by deleting the delegation rule from the crate; each fails
-it.
+against the Rust crate through `vot-capability-oracle`. Seven of the seventeen are
+refusals, which the validator requires: a file of nothing but accepted cases proves
+only that a decoder decodes. Checked in both directions by changing a byte of a
+canonical vector and by deleting the delegation rule from the crate; each fails it.
+
+Two of those cases exist because reviewing the pair found the implementations
+disagreeing where no vector looked. The Python refused an identity containing a
+non-breaking space, because `str.isprintable` is not the rule this format states
+and `char::is_control` is; and it accepted adjacent ranges, because it still held
+the disjoint rule after the crate moved to strict separation. Both rules now have a
+vector, so the agreement is checked rather than assumed.
 
 Mutants: encode a head wider than its value needs; accept adjacent ranges; accept
 a range ending one byte past a known length; accept the reserved operation or

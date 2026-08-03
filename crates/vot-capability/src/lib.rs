@@ -91,8 +91,6 @@ pub enum Error {
     InvalidValidity,
     /// A delegation constraint other than [`NO_FURTHER_DELEGATION`].
     UnsupportedDelegation(u64),
-    /// A holder key, signature, or capability outside its fixed size.
-    InvalidLength,
     /// The signature does not verify under the key it names.
     Signature,
     /// A structure too large to encode within the bounds the format fixes.
@@ -272,7 +270,8 @@ impl Scope {
     fn decode(reader: &mut vot_cbor::Reader<'_>) -> Result<Self, Error> {
         reader.map(4)?;
         reader.key(0)?;
-        let suite = u16::try_from(reader.uint()?).map_err(|_| Error::InvalidSuite(u64::MAX))?;
+        let value = reader.uint()?;
+        let suite = u16::try_from(value).map_err(|_| Error::InvalidSuite(value))?;
         reader.key(1)?;
         let root = reader.fixed_bytes::<32>()?;
         reader.key(2)?;

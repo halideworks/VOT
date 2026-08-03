@@ -466,6 +466,14 @@ fn validate_session_open(value: &SessionOpen) -> Result<(), Error> {
     Ok(())
 }
 
+/// Decodes a `SESSION_OPEN` payload, envelope excluded.
+///
+/// # Errors
+/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`.
+pub fn decode_session_open_payload(payload: &[u8]) -> Result<SessionOpen, Error> {
+    decode_session_open(payload)
+}
+
 fn decode_session_open(input: &[u8]) -> Result<SessionOpen, Error> {
     let mut reader = Reader::new(input);
     reader.map(6)?;

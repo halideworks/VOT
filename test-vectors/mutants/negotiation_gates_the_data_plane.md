@@ -58,6 +58,7 @@ assertion `left == right` failed
  right: PendingRecordsExhausted { bytes: 2048, count: 2 }
 ```
 
-The required `vot-session` mutation run reports 164 total, 129 caught, 35
-unviable, and 0 missed. The required `vot-transport-api` run reports 50 total,
-49 caught, 1 unviable, and 0 missed.
+The required `vot-session` and `vot-transport-api` mutation runs report 0
+missed. The totals move with every change to either crate, so a number written
+here is stale before it is read; what the runs have to say is that nothing
+survived.

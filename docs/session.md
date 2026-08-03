@@ -59,12 +59,36 @@ The nonce is supplied by the caller through `Authentication::NotRequired`. This
 crate has no randomness, and a session whose freshness came from inside it could
 not be tested for the value it actually sent.
 
-`SESSION_OPEN`, `SESSION_ACCEPT`, and `SESSION_REJECT` are defined in
-`vot-codec` and are not yet driven by this state machine. What is left of
-section 1.1 is the capability path: a policy boundary to verify one, the bound
-of three attempts per connection, a fresh session identifier per attempt, and
-the identity rules tying an accept to its request. ADR-0022 stage two picks the
-capability format itself.
+A server whose caller supplies `Authentication::Capability` advertises formats
+instead, and then the exchange concludes at `SESSION_ACCEPT`.
+
+## Where the capability decision lives
+
+Not here. A session checks everything section 1.1 states about a request: that
+the format is one it advertised, that the identifier is not one an earlier
+attempt used, that no more than three attempts arrive, and that the answer
+carries the identifier the request did. What a capability is worth it does not
+decide.
+
+`accept_control` returns `Accepted::AuthorizationRequired`, nothing reaches the
+carrier, and the caller answers through `pending_authorization`, `grant`, and
+`refuse`.
+
+A caller has to look. `poll` returns `None` while a request waits, the same as
+it does with nothing to report, so a loop that only drains events and never
+checks `pending_authorization` stalls with the data plane shut and no error to
+show for it. The boundary is the caller's rather than a trait this crate calls: a
+policy needs a deployment's own identity store and clock, and a session has
+neither. It also keeps `Negotiation` free of a trait object, which is what lets
+it stay `Clone` and `Debug` and testable without a policy at all.
+
+A refusal leaves the session open, since section 1.1 lets a client try again
+with another capability. The fourth attempt closes with
+`AUTHENTICATION_FAILED`.
+
+What is left of section 1.1 is the client half: presenting a capability against
+a challenge that asks for one. A client that receives such a challenge closes
+today. ADR-0022 stage two picks the capability format itself.
 
 ## The gate is asymmetric
 

@@ -5,7 +5,7 @@ auth-context = {
   0: 0,                         ; auth context format version
   1: bstr .size (16..64),       ; nonce, fresh per session
   2: binding,
-  3: [* capability-format],     ; at most 16, ascending, no duplicates
+  3: [0*16 capability-format],  ; ascending, no duplicates
 }
 
 session-open = {
@@ -33,8 +33,8 @@ session-reject = {
 ; 0 none, 1 proof of possession
 binding = 0 / 1
 
-; 0 is reserved and never advertised; see spec/registries.md section 11.
-capability-format = uint .le 65535
+; 0 is reserved and never sent; see spec/registries.md section 11.
+capability-format = 1..65535
 
 ; AUTHENTICATION_FAILED, AUTHORIZATION_FAILED, REPLAY_REJECTED
 reject-reason = 513 / 514 / 515

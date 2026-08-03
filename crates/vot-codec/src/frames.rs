@@ -118,6 +118,13 @@ impl Binding {
             _ => None,
         }
     }
+
+    const fn to_wire(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::ProofOfPossession => 1,
+        }
+    }
 }
 
 /// What the server asks a client to present, and what it accepts.
@@ -336,7 +343,7 @@ fn encode_auth_context(value: &AuthContext, output: &mut Vec<u8>) -> Result<(), 
     uint(1, output);
     bytes(&value.nonce, output);
     uint(2, output);
-    uint(value.binding as u64, output);
+    uint(value.binding.to_wire(), output);
     uint(3, output);
     array(value.formats.len() as u64, output);
     for format in &value.formats {

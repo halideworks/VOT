@@ -249,6 +249,11 @@ object or package identity.
 
 ## 8. Conformance vectors
 
+`test-vectors/wire/session-authentication.json` is normative for the section
+1.1 payloads. `tools/validate_session_vectors.py` reimplements those rules from
+this document and cross-checks them against the codec, so agreement is evidence
+rather than a restatement.
+
 `test-vectors/wire/frame-envelope.json` is normative for the envelope. Each case
 contains the complete encoded bytes and an expected result. Encoders must match
 successful canonical vectors byte-for-byte. Decoders must also accept legal

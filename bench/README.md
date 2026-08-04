@@ -132,9 +132,13 @@ names each one rather than leaving a reader to assume the path matched the
 file.
 
 `memory_high_water_bytes` is `VmHWM` from `/proc/self/status`. On a platform
-without that, the driver fails instead of reporting zero. `cycles` is always
-null; no cycle counter is wired, and the contract is explicit that a missing
-counter cannot satisfy the Wave 6 cycle metric.
+without that, the driver fails instead of reporting zero. `cycles` is
+`PERF_COUNT_HW_CPU_CYCLES` from `perf_event_open`, opened with inherit before
+the transfer's threads exist so every thread the measurement creates is
+counted. A host that refuses the counter yields null and `notes` says
+`cycles=unmeasured`: on Linux that means `kernel.perf_event_paranoid` above 2
+without `CAP_PERFMON`, and the contract is explicit that a missing counter
+cannot satisfy the Wave 6 cycle metric, so a measuring host must grant one.
 
 Output is JSON Lines: every measured iteration independently satisfies
 public_result_schema.json, and can be archived without aggregation losing

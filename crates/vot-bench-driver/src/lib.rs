@@ -27,6 +27,8 @@ mod backend_quiche;
 #[cfg(any(feature = "msquic", feature = "quiche"))]
 pub mod role;
 
+mod cycles;
+
 /// Suite identifiers as the benchmark contract spells them.
 const SUITE_BLAKE3: &str = "blake3-bao64";
 const SUITE_SHA256: &str = "sha256-bep52";
@@ -1255,7 +1257,6 @@ fn transfer_notes(
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&carrier.unmodelled().join(","));
     }
-    notes.push_str(";cycles=unmeasured");
     notes
 }
 
@@ -1381,6 +1382,17 @@ impl Carrier for SimulatorCarrier {
 /// Propagates transport, receive, and verification failures, and rejects any
 /// case this driver cannot run honestly.
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
+    // Opened before any carrier or worker thread exists, so inherit covers
+    // every thread this measurement creates; the counter's span is the whole
+    // case, connection setup included, which is milliseconds against seconds.
+    let counter = cycles::CycleCounter::start();
+    let mut measured = measure_case(config)?;
+    measured.cycles = counter.and_then(cycles::CycleCounter::read);
+    note_cycles(&mut measured.notes, measured.cycles);
+    Ok(measured)
+}
+
+fn measure_case(config: &Config) -> Result<Measurement, Error> {
     // One worker keeps the sequential path every landed number was taken on;
     // more run the ranged path, where workers carry disjoint proof-bearing
     // ranges of the one object (ADR-0025).
@@ -1807,8 +1819,17 @@ fn ranged_notes(
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&carrier.unmodelled().join(","));
     }
-    notes.push_str(";cycles=unmeasured");
     notes
+}
+
+/// Renders the cycle count into the notes, unmeasured where the host refused
+/// a counter, so a reader never mistakes a null for a zero.
+pub(crate) fn note_cycles(notes: &mut String, cycles: Option<u64>) {
+    notes.push_str(";cycles=");
+    match cycles {
+        Some(count) => notes.push_str(&count.to_string()),
+        None => notes.push_str("unmeasured"),
+    }
 }
 
 /// A mutant that breaks a loop's progress check can turn an allocating loop
@@ -1858,7 +1879,7 @@ mod test_guard {
 mod tests {
     use super::{
         Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, Rails,
-        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, parse_vm_hwm,
+        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, note_cycles, parse_vm_hwm,
         record_lengths, record_payload, shared_payload, transfer_ranged, transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
@@ -2109,8 +2130,20 @@ mod tests {
                 assert!(note_field(&measured.notes, "wire_bytes") > object_bytes);
                 // One shared carrier is not the provisioned arrangement.
                 assert!(!measured.notes.contains(";rails="));
+                // Counted or refused, the field is always named.
+                assert!(measured.notes.contains(";cycles="));
             }
         }
+    }
+
+    #[test]
+    fn the_notes_always_name_the_cycle_field() {
+        let mut counted = String::from("x");
+        note_cycles(&mut counted, Some(5));
+        assert_eq!(counted, "x;cycles=5");
+        let mut refused = String::from("x");
+        note_cycles(&mut refused, None);
+        assert_eq!(refused, "x;cycles=unmeasured");
     }
 
     #[test]

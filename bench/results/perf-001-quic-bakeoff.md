@@ -268,6 +268,30 @@ send ceiling the iperf section below measured, so the ordering here is
 packets carried, not engine cost: the wider path moved the same pps ceiling
 up by the ratio of the packet sizes.
 
+### The ceiling was twice a lie (2026-08-04, after `ce0bcf4`)
+
+Two corrections from making the largest configurable datagram provable.
+`LARGEST_DATAGRAM_SIZE` said 65527, which is IPv6's payload ceiling; IPv4's
+total-length field also counts its own and UDP's 28 header bytes, so the
+largest payload a v4 socket carries is 65507, and validation accepted a
+size nothing could send. The constant now says 65507, and the loopback
+suite sends a record at exactly that size and then asserts the discovered
+path MTU equals the ceiling, which is what turned up the second lie:
+discovery never converged at jumbo ceilings. quiche only generates a probe
+when the send buffer offered could hold one, and its packet-size accessor
+caps its answer at 16383, so burst slots sized from it could never carry a
+probe for a larger ceiling and the connection stayed at the 1200-byte
+handshake floor for its whole life. The burst now opens at the configured
+ceiling and takes its segment size from the first packet written. Ceilings
+at or under 16383, including the 1472 default, were never affected: their
+probes always fit the slot. Confirmed on the wire at the stock config,
+2735 Mbit/s median over five runs (1.44x, the familiar cold first run;
+the warm four hold 2679-2777) against 2769 before, the same band. On
+loopback the stock config measures a 9.0 Gbit/s median over five runs
+(1.27x, 8.0-10.2), its first stock measurement there; the jumbo rows in
+the loopback table above predate discovery and pinned their sizes, so
+they stand as history.
+
 ### What the path does without VOT
 
 iperf 3.21, same direction, measured to separate this stack's overhead from

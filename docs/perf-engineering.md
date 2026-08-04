@@ -26,7 +26,7 @@ within one machine and one configuration; the report format in
 
 ## Entries
 
-### 2026-08-02: the adapter was the ceiling, not the engine
+### 2026-08-03: the adapter was the ceiling, not the engine
 
 One quiche lane over loopback went from about 740 to about 1400 Mbit/s by
 holding the caller's `Payload` instead of copying each record three times on
@@ -43,7 +43,7 @@ The general form: when a backend adapter sits between the benchmark and the
 engine, the first ceiling found is usually the adapter's. PERF-001's numbers
 are only about the engines if the adapter's own costs are known to be small.
 
-### 2026-08-02: sleeping in the send loop stops the world
+### 2026-08-03: sleeping in the send loop stops the world
 
 Waiting out the pacing deadline inside the send loop stopped the driver from
 reading, so acknowledgements queued and the congestion window stopped opening.
@@ -51,7 +51,7 @@ The deadline belongs on the socket wait, where sleeping and listening are the
 same act. A command channel of depth one had the same shape: any point where
 the driver can only do one thing at a time bounds throughput by the loop rate.
 
-### 2026-08-02: per-pass allocation in a hot loop
+### 2026-08-03: per-pass allocation in a hot loop
 
 Allocating the stream read buffer per pass cost 64 KB of allocation every loop.
 Buffers that live as long as the loop should be allocated once outside it; the

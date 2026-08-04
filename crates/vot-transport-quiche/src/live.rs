@@ -608,6 +608,14 @@ fn drive(
         (Role::Client, None) => return Err(Error::InvalidConfiguration),
     };
 
+    // Receive-side offload from here on: the handshake above read plain
+    // datagrams, and everything after this can be handed a coalesced buffer
+    // with the segment size beside it. A kernel that refuses the option
+    // leaves each datagram its own read.
+    enable_receive_offload(socket);
+    // Allocated once, because a control-message buffer per read is a malloc
+    // per packet, which is the cost this path exists to remove.
+    let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut closing = false;
 
@@ -667,14 +675,10 @@ fn drive(
         socket
             .set_read_timeout(Some(deadline))
             .map_err(|_| Error::Backend)?;
-        match socket.recv_from(&mut buffer) {
-            Ok((len, from)) => {
-                let info = quiche::RecvInfo { from, to: local };
-                // A packet this connection cannot read is not this connection's
-                // problem: another peer's or a stray one, and dropping it is what
-                // spec/security.md section 7 asks for rather than answering it.
-                let _ = conn.recv(&mut buffer[..len], info);
-                drain_arrivals(socket, &mut conn, local, &mut buffer)?;
+        match receive_segmented(socket, &mut buffer, &mut space) {
+            Ok((len, from, segment)) => {
+                feed_received(&mut conn, local, &mut buffer[..len], from, segment);
+                drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -760,6 +764,115 @@ fn scid_for(local: SocketAddr) -> quiche::ConnectionId<'static> {
     quiche::ConnectionId::from_vec(bytes.to_vec())
 }
 
+/// Turns on coalesced receive, where several datagrams of one flow arrive as
+/// one buffer with the segment size beside them.
+///
+/// A cost saving and never a requirement: a kernel without the option leaves
+/// each datagram its own read, and the feed path handles both shapes.
+#[cfg(target_os = "linux")]
+fn enable_receive_offload(socket: &UdpSocket) {
+    let _ = nix::sys::socket::setsockopt(socket, nix::sys::socket::sockopt::UdpGroSegment, &true);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_receive_offload(_socket: &UdpSocket) {}
+
+/// One read: the bytes, the sender, and the segment size when the kernel
+/// coalesced several datagrams into this buffer.
+///
+/// `recvmsg` rather than `recv_from`, because the segment size rides a control
+/// message; the socket's read timeout applies the same either way. The unsafe
+/// stays in `nix`, which is why this crate still forbids unsafe of its own.
+#[cfg(target_os = "linux")]
+#[expect(clippy::ptr_arg, reason = "nix's recvmsg takes the Vec itself")]
+fn receive_segmented(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    space: &mut Vec<u8>,
+) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut slices = [std::io::IoSliceMut::new(buffer)];
+    let message = nix::sys::socket::recvmsg::<nix::sys::socket::SockaddrStorage>(
+        socket.as_raw_fd(),
+        &mut slices,
+        Some(space),
+        nix::sys::socket::MsgFlags::empty(),
+    )
+    .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+    let segment = message.cmsgs().ok().and_then(|mut messages| {
+        messages.find_map(|control| match control {
+            nix::sys::socket::ControlMessageOwned::UdpGroSegments(size) => {
+                usize::try_from(size).ok()
+            }
+            _ => None,
+        })
+    });
+    let from = message
+        .address
+        .as_ref()
+        .and_then(address_of)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    Ok((message.bytes, from, segment))
+}
+
+/// The standard read where no coalescing exists to report.
+#[cfg(not(target_os = "linux"))]
+fn receive_segmented(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    _space: &mut Vec<u8>,
+) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
+    let (len, from) = socket.recv_from(buffer)?;
+    Ok((len, from, None))
+}
+
+/// Room for the coalesced-segment control message, made once per driver.
+#[cfg(target_os = "linux")]
+fn receive_space() -> Vec<u8> {
+    nix::cmsg_space!(nix::libc::c_int)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn receive_space() -> Vec<u8> {
+    Vec::new()
+}
+
+/// The peer's address out of what `recvmsg` reports.
+#[cfg(target_os = "linux")]
+fn address_of(storage: &nix::sys::socket::SockaddrStorage) -> Option<SocketAddr> {
+    if let Some(v4) = storage.as_sockaddr_in() {
+        return Some(SocketAddr::from((v4.ip(), v4.port())));
+    }
+    let v6 = storage.as_sockaddr_in6()?;
+    Some(SocketAddr::from((v6.ip(), v6.port())))
+}
+
+/// Hands one read to the connection, split back into datagrams if the kernel
+/// coalesced them.
+///
+/// The kernel cuts a coalesced buffer into `segment`-sized pieces with only
+/// the last allowed short, so the split is the counted walk of those pieces.
+/// A packet the connection cannot read is not this connection's problem:
+/// another peer's or a stray one, and dropping it is what spec/security.md
+/// section 7 asks for rather than answering it.
+fn feed_received(
+    conn: &mut quiche::Connection,
+    local: SocketAddr,
+    received: &mut [u8],
+    from: SocketAddr,
+    segment: Option<usize>,
+) {
+    let step = match segment {
+        Some(step) if step > 0 => step,
+        _ => received.len().max(1),
+    };
+    for piece in received.chunks_mut(step) {
+        let info = quiche::RecvInfo { from, to: local };
+        let _ = conn.recv(piece, info);
+    }
+}
+
 /// Takes what has already arrived without waiting, up to the counted budget.
 ///
 /// The wait was paid on the pass's first read; this hands the rest of the
@@ -771,16 +884,16 @@ fn drain_arrivals(
     conn: &mut quiche::Connection,
     local: SocketAddr,
     buffer: &mut [u8],
+    space: &mut Vec<u8>,
 ) -> Result<(), Error> {
     if socket.set_nonblocking(true).is_err() {
         // Still blocking, so the pass loses nothing but the batch.
         return Ok(());
     }
     for _ in 0..DRAIN_BUDGET {
-        match socket.recv_from(buffer) {
-            Ok((len, from)) => {
-                let info = quiche::RecvInfo { from, to: local };
-                let _ = conn.recv(&mut buffer[..len], info);
+        match receive_segmented(socket, buffer, space) {
+            Ok((len, from, segment)) => {
+                feed_received(conn, local, &mut buffer[..len], from, segment);
             }
             Err(_) => break,
         }

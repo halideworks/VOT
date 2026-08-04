@@ -4,8 +4,9 @@ Date: 2026-08-04
 
 Both QUIC backends carry one object through the same transfer loop, the same
 framing, and the same inline verification, so a difference between two results
-is a difference between two carriers. This is the one-rail, one-worker half of
-PERF-001. What is not here, and why, is at the bottom.
+is a difference between two carriers. The first table is the one-rail,
+one-worker half of PERF-001; the spine measurement that completes it follows.
+What is not here, and why, is at the bottom.
 
 ## Environment
 
@@ -113,6 +114,62 @@ Each run reports its own `datagram_bytes`, `cpu_user_ns`, and `cpu_sys_ns` in
 `notes`, so a result says which path it describes without a reader having to
 reconstruct the configuration.
 
+## The spine measurement: workers against rails
+
+Ruling 6's hypothesis: one connection with W payload workers retains a
+serialized packet-number, loss-detection, and ACK spine, and tops out below W
+provisioned connections carrying one worker each. Same workload, host, and seed
+as above, 512 MB, three runs per cell, medians, source commit `1c72173`. The
+W=1 rows are the sequential path and anchor each curve; every W>1 cell runs the
+ranged path (ADR-0025), which pays its own bundle framing and whole-object
+receive staging, so the comparison the hypothesis is about is shared against
+provisioned at the same W, never W=1 against anything.
+
+| carrier | datagram | W | rails | Gbit/s (median) | spread | user CPU | system CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MsQuic | segmented | 1 | | 11.07 | 1.13x | 0.91 s | 0.20 s |
+| MsQuic | segmented | 2 | shared | 8.94 | 1.07x | 1.59 s | 0.37 s |
+| MsQuic | segmented | 2 | provisioned | 8.83 | 1.22x | 1.76 s | 0.47 s |
+| MsQuic | segmented | 4 | shared | 8.01 | 1.34x | 1.76 s | 0.38 s |
+| MsQuic | segmented | 4 | provisioned | 7.51 | 1.24x | 1.85 s | 0.42 s |
+| quiche | 1350 | 1 | | 1.74 | 1.05x | 2.23 s | 3.09 s |
+| quiche | 1350 | 2 | shared | 1.54 | 1.21x | 3.00 s | 3.65 s |
+| quiche | 1350 | 2 | provisioned | 1.58 | 1.62x | 5.45 s | 6.14 s |
+| quiche | 1350 | 4 | shared | 1.43 | 1.38x | 3.43 s | 3.84 s |
+| quiche | 1350 | 4 | provisioned | 2.51 | 1.11x | 5.84 s | 6.26 s |
+| quiche | 32768 | 1 | | 6.87 | 1.34x | 0.96 s | 0.60 s |
+| quiche | 32768 | 2 | shared | 5.79 | 1.03x | 1.60 s | 0.95 s |
+| quiche | 32768 | 2 | provisioned | 7.19 | 1.15x | 2.06 s | 1.13 s |
+| quiche | 32768 | 4 | shared | 5.21 | 1.05x | 1.73 s | 1.11 s |
+| quiche | 32768 | 4 | provisioned | 8.65 | 1.06x | 2.00 s | 0.96 s |
+
+Provisioned cells carry `rails=provisioned-multi-rail` in `notes`.
+
+- **For quiche the hypothesis holds, at both datagram sizes.** The shared
+  connection loses throughput as workers rise (6.87 to 5.79 to 5.21 at 32768)
+  while rails gain it (6.87 to 7.19 to 8.65); at W=4 rails lead 1.66x at 32768
+  and 1.76x at 1350, with 1.05-1.11x spreads on those four cells, far outside
+  the twenty-percent band ruling 6 set for run variance. Each quiche
+  connection is one socket-owning pump thread (ADR-0024), CPU-bound per
+  packet, so W connections are W pumps, and the CPU columns show the rails
+  buying their throughput with proportional CPU.
+- **For MsQuic it does not hold.** Shared and provisioned differ by 1.2% at
+  W=2 and 6.2% at W=4, inside spreads of 1.07-1.34x: the connection is not
+  what binds, because giving each worker its own moved nothing.
+- **The host is not the ceiling.** The heaviest cell (quiche at 1350, W=4,
+  provisioned) spends 12.1 s of CPU on a 20-CPU host inside a 1.6 s transfer;
+  the flat MsQuic curves are not machine saturation.
+- **The ranged path itself costs.** MsQuic user CPU rises from 0.91 s
+  sequential to 1.59 s ranged on the same object, and every W>1 cell of both
+  backends sits below its backend's W=1 anchor. That is the path's framing and
+  staging cost plus the driver spine, not a connection property, which is why
+  the anchors are context and not a curve point.
+
+Reproducing: the command above, with `VOT_BENCH_WORKERS` set to the cell's W,
+`VOT_BENCH_RAILS=provisioned` for the provisioned cells (absent or `shared`
+otherwise), and `VOT_BENCH_QUICHE_DATAGRAM_BYTES` at the figure's datagram
+size, absent for the 1350 default and for MsQuic.
+
 ## Two-machine confirmation
 
 Labeled and never mixed with the loopback numbers above: this is a different
@@ -182,20 +239,19 @@ VOT_BENCH_ROLE=send VOT_BENCH_CONNECT=192.168.1.131:4433 \
 
 ## What this does not cover
 
-**No default backend is selected here.** That is ADR-0026, and it should not be
-written from this table alone: two of PERF-001's three acceptance criteria are
-still unmeasured, and one of them could move the answer.
+**The default backend is ADR-0026's ruling, not this report's.** All three
+acceptance criteria are now measured here:
+`one_rail_one_worker_and_multi_worker_measured` by the first table and the
+spine matrix, `provisioned_multi_rail_labeled` by the provisioned cells and
+their notes label, and `serialized_spine_hypothesis_tested` by the shared and
+provisioned curves and the per-carrier verdict above. What remains uncovered:
 
-- `one_rail_one_worker_and_multi_worker_measured`: the one-worker half only.
-  Multi-worker needs the driver to send proof-bearing ranges, whose groundwork
-  landed as ADR-0025 and the range-proof entry points in both proof crates.
-- `provisioned_multi_rail_labeled`: not measured. It splits one object across
-  several connections and needs the same range path.
-- `serialized_spine_hypothesis_tested`: not tested, and it is the criterion that
-  could change the choice. It predicts that payload workers sharing one
-  connection top out below independent rails, which is a claim about the
-  connection's packet-number and ACK spine rather than about either engine's
-  single-stream speed.
+- The spine matrix is loopback only. Role mode carries one worker, so the
+  multi-worker curves have no two-machine confirmation; a wire spine run needs
+  a ranged role mode that does not exist yet.
+- Every multi-worker number pays the ranged path's own framing and staging, so
+  cross-path comparisons against the sequential rows conflate path and worker
+  count; only same-W cells are commensurable.
 
 **Nothing here weighs what is not speed.** ADR-0012 isolates MsQuic because it
 is a C FFI dependency that requires unsafe code, is pinned to a git revision,
@@ -207,9 +263,10 @@ five times the throughput was ours to set on quiche, and MsQuic offers no
 equivalent lever. A default chosen on throughput alone is choosing on one axis
 of several.
 
-One further caveat for whoever writes ADR-0026: `TransportAdapter` takes
+One caveat the spine measurement accounted for: `TransportAdapter` takes
 `&mut self`, so several workers cannot submit through one adapter concurrently
 without a lock, while separate connections each have their own adapter. Multi-
-worker and multi-rail therefore differ in more than the connection count, and
-the spine measurement has to account for that or it will attribute the driver's
+worker and multi-rail therefore differ in more than the connection count; the
+spine section reads its curves per carrier at the same W so as not to attribute
+the driver's
 serialization to the carrier's.

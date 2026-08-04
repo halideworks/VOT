@@ -1006,7 +1006,17 @@ fn send_all(
             }
             Err(quiche::Error::Done) => {
                 flush_burst(socket, &out[..filled], segment, destination, gso)?;
-                return Ok(deadline);
+                // Done in a segment-sized slot only says the next packet did
+                // not fit this burst's segment: a burst opened by a lone ACK
+                // pins the segment near thirty bytes, and ending the pass
+                // there would hand the wait floor back one packet at a time.
+                // Reopen at the ceiling; Done with the ceiling on offer is
+                // the connection actually finished.
+                if slot == ceiling {
+                    return Ok(deadline);
+                }
+                filled = 0;
+                destination = None;
             }
             Err(_) => {
                 // The gathered packets are state the connection has already

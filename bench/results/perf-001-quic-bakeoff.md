@@ -285,11 +285,12 @@ handshake floor for its whole life. The burst now opens at the configured
 ceiling and takes its segment size from the first packet written. Ceilings
 at or under 16383, including the 1472 default, were never affected: their
 probes always fit the slot. Confirmed on the wire at the stock config,
-2843 Mbit/s median over five runs against 2769 before, the same band. On
-loopback the stock config now measures 9.3-10.6 Gbit/s over four runs, the
-first time the no-configuration default crosses 10 Gbit/s there; the jumbo
-rows in the loopback table above predate discovery and pinned their sizes,
-so they stand as history.
+2735 Mbit/s median over five runs (1.44x, the familiar cold first run;
+the warm four hold 2679-2777) against 2769 before, the same band. On
+loopback the stock config measures a 9.0 Gbit/s median over five runs
+(1.27x, 8.0-10.2), its first stock measurement there; the jumbo rows in
+the loopback table above predate discovery and pinned their sizes, so
+they stand as history.
 
 ### What the path does without VOT
 

@@ -2151,6 +2151,13 @@ mod tests {
         ));
         variables.insert("VOT_BENCH_WORKERS".to_owned(), "2".to_owned());
         assert_eq!(parse(&variables).unwrap().rails, Rails::Provisioned);
+        // Junk at a worker count that could provision, so the rejection is
+        // the spelling's and not the one-worker rule's.
+        variables.insert("VOT_BENCH_RAILS".to_owned(), "braided".to_owned());
+        assert!(matches!(
+            parse(&variables),
+            Err(Error::Value("VOT_BENCH_RAILS"))
+        ));
     }
 
     #[test]

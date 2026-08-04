@@ -72,12 +72,18 @@ const _: () =
 /// because a partial transfer reported as a measurement is exactly what the
 /// benchmark contract exists to prevent.
 ///
-/// At [`IDLE_WAIT_MAX`] each, this allowance is about twenty seconds of a
-/// carrier delivering nothing, so the count bounds the wall clock as well as
-/// the loop. A healthy transfer stays far inside it: 512 MB over loopback
-/// spends a few thousand, and the per-record term is what carries a larger
-/// object rather than this one growing.
-const STALL_ROUNDS: u64 = 20_000;
+/// Per record, with a floor, rather than a flat allowance. The budget is also
+/// how long a stopped carrier takes to be called stopped, at [`IDLE_WAIT_MAX`]
+/// a round, so a flat allowance made a one-record transfer wait as long as a
+/// gigabyte one. That is invisible in a healthy run and costs twenty seconds
+/// apiece under the mutation gate, where every test's carrier is stopped on
+/// purpose.
+///
+/// Both numbers are about eight times what was measured: 512 MB over loopback
+/// spends a few thousand rounds against a budget of 65,536, and a single record
+/// spends six to eight against 256.
+const ROUNDS_PER_RECORD: u64 = 8;
+const MIN_ROUNDS: u64 = 256;
 
 #[derive(Debug)]
 pub enum Error {
@@ -704,7 +710,7 @@ fn round_budget(config: &Config) -> u64 {
     let records = config
         .object_bytes
         .div_ceil(config.record_bytes.max(1) as u64);
-    records.saturating_add(STALL_ROUNDS)
+    records.saturating_mul(ROUNDS_PER_RECORD).max(MIN_ROUNDS)
 }
 
 /// Whether the carrier was given the receiver's credit, or bounds what it
@@ -1224,27 +1230,28 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_covers_a_delivery_per_record_and_an_allowance_beyond_it() {
+    fn the_budget_is_per_record_above_its_floor_and_the_floor_below_it() {
         // What a real run is given, which no test that names its own budget
-        // exercises. Too small a budget would call a healthy carrier stopped,
-        // and the per-record term is what carries an object larger than the
-        // flat allowance was written for.
+        // exercises. Too small a budget calls a healthy carrier stopped, and
+        // too large a one makes a stopped carrier take as long to report as a
+        // gigabyte takes to carry.
         let config = case(64 * 65_536, Suite::Blake3Bao64);
-        assert_eq!(super::round_budget(&config), 64 + super::STALL_ROUNDS);
+        assert_eq!(super::round_budget(&config), 64 * super::ROUNDS_PER_RECORD);
 
-        // A short final record still needs a delivery of its own.
+        // A short final record still needs deliveries of its own.
         let ragged = case(64 * 65_536 + 1, Suite::Blake3Bao64);
-        assert_eq!(super::round_budget(&ragged), 65 + super::STALL_ROUNDS);
+        assert_eq!(super::round_budget(&ragged), 65 * super::ROUNDS_PER_RECORD);
 
-        // The allowance alone is what a one-record object gets.
+        // Under the floor, the floor. One record over a real socket takes more
+        // deliveries than one, so the per-record term alone would call a
+        // healthy carrier stopped.
         let small = case(1, Suite::Blake3Bao64);
-        assert_eq!(super::round_budget(&small), 1 + super::STALL_ROUNDS);
+        assert_eq!(super::round_budget(&small), super::MIN_ROUNDS);
     }
 
-    /// The allowance is worth more than a couple of deliveries: at the longest
-    /// wait it is about twenty seconds of a carrier delivering nothing, which
-    /// is the wall clock the round budget is standing in for.
-    const _: () = assert!(super::STALL_ROUNDS >= 10_000);
+    /// The floor is a floor: below it the per-record term would decide, and one
+    /// record over a real socket takes more deliveries than that.
+    const _: () = assert!(super::MIN_ROUNDS > super::ROUNDS_PER_RECORD);
 
     #[test]
     fn a_transfer_that_needs_its_whole_budget_is_not_called_stalled() {

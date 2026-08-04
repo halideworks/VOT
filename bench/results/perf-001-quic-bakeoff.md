@@ -221,8 +221,10 @@ segmentation-offload bursts, and the coalesced-receive split landed:
 | quiche | 1252 | 2511 | 1.39x | 0.69 s / 0.25 s | 0.72 s / 0.74 s | 8.00 | 6.27 |
 
 The 6.4x gap of the baseline above is gone: the two engines are the same
-number inside their spreads, and both ride the path's own single-flow UDP
-ceiling, so this path can no longer separate them. What closed it was
+number inside their spreads, both a few percent above the iperf single-flow
+figure below, so this path can no longer separate them. quiche's 1.39x
+spread is one cold first run at 1841 Mbit/s; runs two through five hold
+2499-2557, a 1.02x band tighter than the baseline's. What closed it was
 per-packet cost, not engine work: quiche's sender system time fell from
 7.09 s to 0.74 s and its receiver's from 4.83 s to 0.25 s, into MsQuic's
 territory on both ends. ADR-0026's consequences clause names this result as

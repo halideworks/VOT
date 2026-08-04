@@ -2038,6 +2038,7 @@ dependencies = [
  "vot-codec",
  "vot-scheduler",
  "vot-transport-api",
+ "vot-transport-msquic",
  "vot-transport-quiche",
  "vot-transport-sim",
  "vot-verifier",

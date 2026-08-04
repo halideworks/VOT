@@ -26,6 +26,67 @@ within one machine and one configuration; the report format in
 
 ## Entries
 
+### 2026-08-04: MsQuic carries the same case about seven times faster, and most of the difference is measurable
+
+The first like-for-like measurement, both backends through the same transfer
+loop, framing, and inline verification. One 512 MB object, one lane, one worker,
+64 KiB records, loopback, seven runs each:
+
+- MsQuic: 6070, 8554, 9390, 9426, 9454, 10093, 10377 Mbit/s. Median 9426.
+- quiche: 1199, 1346, 1366, 1372, 1474, 1649, 1707 Mbit/s. Median 1372.
+
+The groups are nowhere near overlapping, so unlike every earlier comparison in
+this file the gap is not a question of run-to-run spread. **It is also not yet a
+statement about the two engines**, for the reasons below.
+
+Where the difference goes, from `/usr/bin/time -v` on the same case:
+
+| | user | system | wall | CPU |
+| --- | --- | --- | --- | --- |
+| MsQuic | 1.51 s | 0.33 s | 0.96 s | 191% |
+| quiche | 3.38 s | 3.85 s | 3.66 s | 197% |
+
+Both are CPU-bound at about two cores, neither is link-bound, and quiche spends
+about four times the CPU per byte. Roughly half of its excess is in the kernel:
+3.85 seconds of system time against 0.33. Syscall counts over a 64 MiB case say
+why, from `strace -c -f`:
+
+- MsQuic: 1,828 `sendmsg` and 2,991 `recvmmsg`, about 4,800 calls.
+- quiche: 290,406 `sendto` and 289,461 `recvfrom`, about 580,000 calls.
+
+A factor of 120. The quiche pump sends one datagram per `send_to` with
+`MAX_DATAGRAM_SIZE` at 1350 and no batching, while MsQuic uses segmentation
+offload and `recvmmsg` on Linux. Note the strace *times* are not usable: tracing
+adds two stops per call and inflates exactly the thing being measured. The
+counts are what the conclusion rests on, together with the untraced system time
+above.
+
+The other half of quiche's excess is in user space, 3.38 seconds against 1.51,
+which is not explained by syscalls at all and has not been investigated.
+
+This partly contradicts the entry below reporting that datagram size changed
+nothing across a 24x range in syscall count. Both can hold: reducing the kernel
+half alone moves the total by less than it seems it should when the user half is
+comparable in size, and that earlier probe was run at a size where the spread
+would have hidden it. It is a reason to re-run that experiment with these
+instruments rather than to trust either result on its own.
+
+**What this does and does not settle for PERF-001.** It is a solid measurement
+of the two backends *as they exist today*, and it is not a measurement of the
+two engines' ceilings. PERF-002 is chartered to add exactly the offload and
+pacing that most of the kernel-side gap consists of, to the quiche path. A
+default-backend ADR written from these numbers would be choosing between one
+implementation with kernel offload and one without, which is a legitimate thing
+to choose between and must be *labelled* as that rather than as an engine
+comparison.
+
+Worth carrying into the report: user and system CPU time settled in one command
+what throughput numbers alone had left ambiguous through several rounds. The
+driver reports `cycles: null` because no cycle counter is wired, but
+`/proc/self/stat` carries user and system time with no new dependency, the same
+way `memory_high_water_bytes` already comes from `/proc/self/status`. Every run
+carrying its own CPU split would have made this diagnosis immediate.
+
 ### 2026-08-03: how long the driver waits changes what the driver measures
 
 The transfer loop waits when a delivery finds nothing, because the carrier's

@@ -385,6 +385,16 @@ jobs:
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
+      - name: Test the benchmark driver over that carrier
+        run: |
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --locked
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --release --locked
+
+      - name: Lint the driver's carrier
+        run: >-
+          cargo +1.88.0 clippy -p vot-bench-driver --all-targets
+          --features msquic --locked -- -D warnings
+
       - name: Test live mutants
         env:
           EVENT_NAME: ${{ github.event_name }}

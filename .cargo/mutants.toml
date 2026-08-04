@@ -29,6 +29,7 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # this gate measures it, and its own loopback tests run in the quiche-live job.
 exclude_globs = [
   "crates/vot-transport-quiche/src/live.rs",
+  "crates/vot-bench-driver/src/backend_msquic.rs",
   "crates/vot-bench-driver/src/backend_quiche.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",

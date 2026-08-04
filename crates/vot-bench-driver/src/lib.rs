@@ -18,6 +18,8 @@ use vot_transport_api::{
 use vot_transport_sim::{Impairment, SimulatorAdapter};
 use vot_verifier::{StreamVerifier, Suite};
 
+#[cfg(feature = "msquic")]
+mod backend_msquic;
 #[cfg(feature = "quiche")]
 mod backend_quiche;
 
@@ -821,6 +823,8 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 
     match config.backend.as_str() {
         "simulator" => transfer(config, SimulatorCarrier::new(config)?),
+        #[cfg(feature = "msquic")]
+        "msquic" => transfer(config, backend_msquic::MsQuicCarrier::connected(config)?),
         #[cfg(feature = "quiche")]
         "quiche" => transfer(config, backend_quiche::QuicheCarrier::connected(config)?),
         other => Err(Error::Unsupported(format!(
@@ -1569,9 +1573,18 @@ mod tests {
 
     #[test]
     fn an_unimplemented_case_is_an_error_not_a_number() {
+        // `tcp` is a backend the result schema allows and this driver has no
+        // carrier for, under any feature. It used to be `msquic`, which stopped
+        // being an example of an unimplemented backend once one was built.
         let mut backend = case(65_536, Suite::Blake3Bao64);
-        backend.backend = "msquic".to_owned();
+        backend.backend = "tcp".to_owned();
         assert!(matches!(measure(&backend), Err(Error::Unsupported(_))));
+
+        // A name no schema allows either, so the arm is what refuses both
+        // rather than a list of known backends that happens to be complete.
+        let mut unknown = case(65_536, Suite::Blake3Bao64);
+        unknown.backend = "carrier-pigeon".to_owned();
+        assert!(matches!(measure(&unknown), Err(Error::Unsupported(_))));
 
         let mut workers = case(65_536, Suite::Blake3Bao64);
         workers.workers = 4;

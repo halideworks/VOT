@@ -35,29 +35,38 @@ default matrix would fail partway through.
 
 ## What the driver implements today
 
-The `simulator` backend always, the `quiche` backend when built with its
-feature, and only `worker_count` 1. Both remaining limits are errors rather
+The `simulator` backend always, the `quiche` and `msquic` backends when built
+with their features, and only `worker_count` 1. Both remaining limits are errors rather
 than silent substitutions: a backend with no carrier in this build cannot be
 measured, and parallel verification of a single object needs the proof-bearing
 range path. Running the full checked-in matrix therefore needs `--workers 1`
 until that lands. The plan that lifts it is `perf-001-plan.md` in this
 directory.
 
-The quiche backend carries the case over a real socket between a loopback pair
-of endpoints, each owning its connection on a driver thread of its own
-(ADR-0024). Build it in, and the handshake and the self-signed loopback
+Both QUIC backends carry the case over a real socket between a loopback pair of
+endpoints. Build them in, and the handshake and the self-signed loopback
 credential both happen before the timed section:
 
 ```sh
-cargo build --release -p vot-bench-driver --features quiche
+cargo build --release -p vot-bench-driver --features quiche,msquic
 python3 tools/run_benchmark.py --backend quiche --seed 42 --workers 1 \
   --output results.jsonl --command target/release/vot-bench-driver
 ```
 
-It needs `openssl` on the path. A loopback result pays for both endpoints on
-one host, so it compares two carriers fairly and understates what either does
-with a machine to itself; that distinction belongs in any report that quotes
-one.
+Both need `openssl` on the path. The `msquic` feature also links MsQuic's
+bundled C library, which the driver binary loads at run time and will not start
+without:
+
+```sh
+export LD_LIBRARY_PATH="$(dirname "$(find target -name libmsquic.so.2 | head -1)")"
+```
+
+A `cargo test` run sets that itself; a benchmark run invoking the built binary
+does not, and fails with `libmsquic.so.2: cannot open shared object file`.
+
+A loopback result pays for both endpoints on one host, so it compares two
+carriers fairly and understates what either does with a machine to itself; that
+distinction belongs in any report that quotes one.
 
 Every backend runs the same transfer loop, so a difference between two results
 is a difference between two carriers rather than between two transfer

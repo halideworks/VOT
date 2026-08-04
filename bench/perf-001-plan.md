@@ -108,12 +108,37 @@ every number in the report is measurable when the report is written.
 ### 5. Four PRs, and the report comes last
 
 1. Carrier seam, quiche wiring, loopback tests. **Landed.**
-2. MsQuic wiring through the same seam.
+2. MsQuic wiring through the same seam. **Landed**, together with a `Config`
+   and two boundary constructors in `vot-transport-msquic::live`, because
+   ADR-0012 forbids an `MsQuic` type crossing that crate's edge and a caller
+   could not otherwise build an endpoint.
 3. The multi-worker path.
 4. Measurements, the report, and ADR-0025.
 
 One seam reviewed once, each backend change small, and no report exists before
 it can be a comparison.
+
+### 6a. What the first measurement already says, and what it does not
+
+Both backends now run the same loop, and MsQuic carries a 512 MB object at a
+median of 9426 Mbit/s against quiche's 1372, groups that do not overlap. It
+costs about a quarter of the CPU per byte, and about half of quiche's excess is
+kernel time from sending one datagram per syscall where MsQuic uses
+segmentation offload: 580,000 syscalls against 4,800 for the same 64 MiB.
+
+This is a real measurement of the two backends **as they exist today**, and it
+is not a measurement of the two engines. PERF-002 is chartered to add exactly
+the offload the kernel-side gap consists of to the quiche path. ADR-0025 may
+still choose MsQuic on these numbers, but it has to say it is choosing between
+an implementation with offload and one without, and say what PERF-002 would have
+to achieve to reopen the question. The full figures are in
+`docs/perf-engineering.md`.
+
+PR 4 should also report each run's user and system CPU time in `notes`.
+`/proc/self/stat` carries both with no new dependency, exactly as
+`memory_high_water_bytes` already comes from `/proc/self/status`. One reading of
+that split settled a mechanism question that throughput numbers alone had left
+open through several rounds of measurement.
 
 ### 6. The serialized-spine measurement is decided before the code
 

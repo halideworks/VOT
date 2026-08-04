@@ -324,6 +324,7 @@ pub mod live {
     //! Narrow ownership helpers around the official `MsQuic` Rust FFI wrapper.
 
     use std::ffi::c_void;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use msquic::ffi::QUIC_STATISTICS_V2;
     use std::collections::btree_map::Entry;
@@ -334,9 +335,10 @@ pub mod live {
     use std::time::Duration;
 
     use msquic::{
-        Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Listener,
-        ListenerEvent, Registration, RegistrationConfig, SendFlags, Settings, Stream, StreamEvent,
-        StreamOpenFlags, StreamRef, StreamStartFlags,
+        Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Credential,
+        CredentialConfig, CredentialFlags, Listener, ListenerEvent, Registration,
+        RegistrationConfig, SendFlags, Settings, Stream, StreamEvent, StreamOpenFlags, StreamRef,
+        StreamStartFlags,
     };
 
     use vot_transport_api::{
@@ -681,6 +683,35 @@ pub mod live {
     }
 
     impl MsQuicTransport {
+        /// Connects to `peer`, naming no `MsQuic` type.
+        ///
+        /// The client half of [`MsQuicServer::bind`], and the same reason:
+        /// ADR-0012 keeps every `MsQuic` type inside this crate, so a caller
+        /// outside it needs a way to connect without building a registration
+        /// and a configuration of its own.
+        ///
+        /// # Errors
+        /// Reports a registration, credential, or configuration failure, and a
+        /// connection that could not be started.
+        pub fn dial(
+            peer: SocketAddr,
+            server_name: &str,
+            connection_id: u64,
+            config: &Config,
+        ) -> Result<Self, Error> {
+            let registration = registration().map_err(|_| Error::Backend)?;
+            let configuration = config.open(&registration)?;
+            Self::connect(
+                configuration,
+                registration,
+                server_name,
+                peer.port(),
+                connection_id,
+                config.limits,
+            )
+            .map_err(|_| Error::Backend)
+        }
+
         /// Connects to `host:port` and returns a transport ready to send.
         ///
         /// `limits` is what this endpoint advertises in `SETTINGS`. Taken here
@@ -1498,6 +1529,90 @@ pub mod live {
         }
     }
 
+    /// What an endpoint needs before it can carry anything.
+    ///
+    /// The same shape the quiche backend takes, so a caller that wants a
+    /// connected pair describes one in the same terms whichever backend it
+    /// asks. It exists mainly so that a caller does not have to: ADR-0012 says
+    /// no `MsQuic` type crosses this crate's boundary, and building a
+    /// `Configuration` by hand means naming several.
+    #[derive(Clone, Debug)]
+    pub struct Config {
+        /// The limits this endpoint advertises and will be held to.
+        pub limits: ReceiveLimits,
+        /// Server certificate chain, in PEM. Required for a server.
+        pub certificate: Option<String>,
+        /// Server private key, in PEM. Required for a server.
+        pub private_key: Option<String>,
+        /// Whether the client validates the server's certificate.
+        pub verify_peer: bool,
+    }
+
+    impl Config {
+        /// A client configuration that validates its peer.
+        #[must_use]
+        pub const fn client(limits: ReceiveLimits) -> Self {
+            Self {
+                limits,
+                certificate: None,
+                private_key: None,
+                verify_peer: true,
+            }
+        }
+
+        /// A server configuration with the credentials it presents.
+        #[must_use]
+        pub const fn server(
+            limits: ReceiveLimits,
+            certificate: String,
+            private_key: String,
+        ) -> Self {
+            Self {
+                limits,
+                certificate: Some(certificate),
+                private_key: Some(private_key),
+                verify_peer: false,
+            }
+        }
+
+        /// Opens the `MsQuic` configuration this describes.
+        ///
+        /// # Errors
+        /// Reports a lane count the carrier cannot express, a server without
+        /// credentials, and any configuration `MsQuic` refuses.
+        fn open(&self, registration: &Registration) -> Result<Arc<Configuration>, Error> {
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            // From the same limits the endpoint advertises, so the carrier can
+            // open every lane the session says it will carry.
+            let settings = peer_stream_settings(self.limits)?;
+            let configuration = Configuration::open(registration, &alpn, Some(&settings))
+                .map_err(|_| Error::Backend)?;
+            let credential = match (&self.certificate, &self.private_key) {
+                (Some(certificate), Some(key)) => CredentialConfig::new()
+                    .set_credential_flags(CredentialFlags::NONE)
+                    .set_credential(Credential::CertificateFile(msquic::CertificateFile::new(
+                        key.clone(),
+                        certificate.clone(),
+                    ))),
+                (None, None) => {
+                    let flags = if self.verify_peer {
+                        CredentialFlags::NONE
+                    } else {
+                        CredentialFlags::NO_CERTIFICATE_VALIDATION
+                    };
+                    CredentialConfig::new_client().set_credential_flags(flags)
+                }
+                // Half a credential is a server that cannot present one or a
+                // client asked to present one it has no key for.
+                _ => return Err(Error::InvalidConfiguration),
+            };
+            configuration
+                .load_credential(&credential)
+                .map_err(|_| Error::InvalidConfiguration)?;
+            Ok(Arc::new(configuration))
+        }
+    }
+
     /// A listening `MsQuic` endpoint that produces assembled connections, so
     /// both directions of a transfer run the same code.
     pub struct MsQuicServer {
@@ -1512,6 +1627,39 @@ pub mod live {
     }
 
     impl MsQuicServer {
+        /// Binds a listener on `address`, naming no `MsQuic` type.
+        ///
+        /// [`MsQuicServer::listen`] takes the registration and configuration a
+        /// caller has already built; this builds them from [`Config`] so a
+        /// caller outside this crate can have a server without one, which
+        /// ADR-0012 requires of anything crossing this boundary.
+        ///
+        /// # Errors
+        /// Reports a registration, credential, or configuration failure, and a
+        /// listener that could not be opened or started.
+        pub fn bind(address: SocketAddr, config: &Config) -> Result<Self, Error> {
+            let registration = Arc::new(registration().map_err(|_| Error::Backend)?);
+            let configuration = config.open(&registration)?;
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            Self::listen(
+                configuration,
+                registration,
+                &alpn,
+                &Addr::from(address),
+                config.limits,
+            )
+            .map_err(|_| Error::Backend)
+        }
+
+        /// The address this listener actually bound.
+        ///
+        /// # Errors
+        /// Propagates a listener that cannot report its port.
+        pub fn local_address(&self) -> Result<SocketAddr, Error> {
+            let port = self.local_port().map_err(|_| Error::Backend)?;
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        }
+
         /// Starts listening on `address` for the given ALPN.
         ///
         /// # Errors

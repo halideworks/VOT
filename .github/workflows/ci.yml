@@ -365,8 +365,10 @@ jobs:
           # shallow clone does not have.
           fetch-depth: 0
 
+      # With clippy, because the driver-carrier lint step below is the only
+      # one that sees that file under the feature that compiles it.
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       - name: Install native build tools
         run: sudo apt-get update && sudo apt-get install -y cmake openssl

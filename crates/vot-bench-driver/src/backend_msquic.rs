@@ -82,7 +82,6 @@ impl MsQuicCarrier {
         client_config.verify_peer = false;
         let mut client = MsQuicTransport::dial(
             server.local_address().map_err(Error::Transport)?,
-            "localhost",
             CONNECTION_ID,
             &client_config,
         )
@@ -102,7 +101,8 @@ impl MsQuicCarrier {
 /// connection it produced.
 ///
 /// # Errors
-/// Reports a pair that did not connect inside [`HANDSHAKE_TIMEOUT`].
+/// Reports [`Error::Handshake`] for a pair that did not connect inside
+/// [`HANDSHAKE_TIMEOUT`].
 fn handshake(
     client: &mut MsQuicTransport,
     server: &mut MsQuicServer,
@@ -120,7 +120,7 @@ fn handshake(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    Err(Error::Stalled)
+    Err(Error::Handshake)
 }
 
 /// Impairment fields this carrier describes but does not shape.

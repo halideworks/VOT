@@ -107,6 +107,12 @@ pub enum Error {
     Stalled,
     /// The carrier reported the connection gone before the object was whole.
     Disconnected,
+    /// The endpoints did not connect, so nothing was carried at all.
+    ///
+    /// Separate from [`Error::Stalled`] because the two are found in different
+    /// places: a transfer that stops is the carrier's business, and a pair that
+    /// never connects is the case's configuration or the address it was given.
+    Handshake,
 }
 
 impl fmt::Display for Error {
@@ -133,6 +139,7 @@ impl fmt::Display for Error {
                 formatter,
                 "the carrier reported the connection gone before the object was whole"
             ),
+            Self::Handshake => write!(formatter, "the endpoints did not connect"),
         }
     }
 }
@@ -1895,6 +1902,14 @@ mod tests {
             Error::Unmeasurable("memory_high_water_bytes").to_string(),
             "memory_high_water_bytes has no measured source on this platform"
         );
+        // A pair that never connected and a carrier that stopped mid-transfer
+        // are found in different places, so they may not read the same.
+        assert_eq!(
+            Error::Handshake.to_string(),
+            "the endpoints did not connect"
+        );
+        assert_eq!(Error::Stalled.to_string(), "the carrier stopped delivering");
+        assert_ne!(Error::Handshake.to_string(), Error::Stalled.to_string());
         assert_eq!(
             Error::from(vot_transport_api::Error::RecordTooLarge).to_string(),
             "transport error: RecordTooLarge"

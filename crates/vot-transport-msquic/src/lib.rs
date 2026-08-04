@@ -690,21 +690,23 @@ pub mod live {
         /// outside it needs a way to connect without building a registration
         /// and a configuration of its own.
         ///
+        /// The address is used literally, not a name that resolves to it.
+        /// [`MsQuicTransport::connect`] takes one host for both the target and
+        /// the name the credential is checked against, so a caller that needs
+        /// those to differ has to use it directly. Connecting by name here
+        /// would mean a listener bound to `127.0.0.1` is unreachable wherever
+        /// `localhost` resolves to `::1` first, which is most places.
+        ///
         /// # Errors
         /// Reports a registration, credential, or configuration failure, and a
         /// connection that could not be started.
-        pub fn dial(
-            peer: SocketAddr,
-            server_name: &str,
-            connection_id: u64,
-            config: &Config,
-        ) -> Result<Self, Error> {
+        pub fn dial(peer: SocketAddr, connection_id: u64, config: &Config) -> Result<Self, Error> {
             let registration = registration().map_err(|_| Error::Backend)?;
             let configuration = config.open(&registration)?;
             Self::connect(
                 configuration,
                 registration,
-                server_name,
+                &peer.ip().to_string(),
                 peer.port(),
                 connection_id,
                 config.limits,

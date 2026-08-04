@@ -93,7 +93,8 @@ impl QuicheCarrier {
 /// Waits for both endpoints to report the connection.
 ///
 /// # Errors
-/// Reports a pair that did not connect inside [`HANDSHAKE_TIMEOUT`].
+/// Reports [`Error::Handshake`] for a pair that did not connect inside
+/// [`HANDSHAKE_TIMEOUT`].
 fn handshake(client: &mut Transport, server: &mut Transport) -> Result<(), Error> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let (mut client_up, mut server_up) = (false, false);
@@ -111,7 +112,7 @@ fn handshake(client: &mut Transport, server: &mut Transport) -> Result<(), Error
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    Err(Error::Stalled)
+    Err(Error::Handshake)
 }
 
 /// Impairment fields this carrier describes but does not shape.

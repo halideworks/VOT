@@ -42,21 +42,32 @@ completing the handshake before the clock starts.
 
 ## Decisions
 
-### 1. The carrier seam is a private `Carrier` enum in the driver
+### 1. The carrier seam is a private `Carrier` trait in the driver
 
-Three variants: `Simulator(SimulatorAdapter)`, and `Quiche { client, server }`
-and `MsQuic { client, server }` behind cargo features named `quiche` and
-`msquic`. All three cases exist today, so the enum is shaped by real code
-rather than speculation. Its methods are exactly what `measure()` needs:
+Built in PR 1 as a trait rather than the enum this plan first called for. The
+reason the plan gave for an enum was that a one-variant abstraction would be
+speculative, and that reason no longer holds: there are four implementors, all
+of them real. Three are backends, and the fourth is a test double that refuses
+submissions, delivers late, stops, and answers the credit call every way a
+backend answers it. Without that double the backpressure, completion, stall,
+and credit paths would be exercised only under a feature the mutation matrix
+does not build, and the gate would report them as untested code in a required
+package.
 
-- `send_record`, returning a distinct would-block signal for a full queue;
-- `deliver`, which flushes the sender, polls the receiver into the
-  `ReliableReceiver`, drains the sender's own events, and for real carriers
-  loops under a deadline until the in-flight batch has landed;
-- `enforced_credit`, which reports what decision 3 defines;
-- `close`.
+The trait's methods are plumbing on purpose: `submit`, `flush`,
+`poll_received`, `drain_sent`, `receiving`, `name`, `unmodelled`. Everything
+that decides a number, including the transfer loop, the framing, the credit
+rule, and the stall bound, is in `lib.rs` where the mutation gate measures it,
+so a backend cannot change what a run means by implementing a method
+differently. Construction performs the handshake, before the timed section.
 
-Construction performs the handshake, before the timed section.
+PR 1 also found something this plan had not accounted for: a real carrier
+carries encoded `DATA_RECORD` frames, while the simulator loops raw bytes back.
+The driver therefore frames every record and strips the envelope on delivery,
+for all backends alike. Doing it uniformly rather than only for real carriers
+keeps that code in the mutation-gated file and makes the simulator exercise the
+same encode and decode path the sockets do. `notes` carries `wire_bytes`
+alongside `bytes_sent` so the envelope is visible rather than assumed away.
 
 ### 2. The mutation gate keeps its arrangement
 
@@ -73,13 +84,19 @@ BoringSSL is never paid per mutant.
 
 ### 3. The report carries the credit that was enforced, never one that was not
 
-The driver calls `set_receive_credit` once. On success, notes carry
-`credit_mode=set` and `credit_bytes` is the value that was set. On
-`Unsupported`, notes carry `credit_mode=constructed` and `credit_bytes` is the
-bound the transport's `receive_limits()` advertised at construction. Any other
-error propagates. Reporting a credit nothing enforced is the failure the
-benchmark contract exists to prevent, so the enforced value is the only one
-that appears.
+The driver calls `set_receive_credit` once, on the endpoint that receives the
+object. On success, notes carry `credit_mode=set`. On `Unsupported`, they carry
+`credit_mode=constructed`. Any other error propagates.
+
+`credit_bytes` means the same thing in both cases and is not the carrier's
+window: it is what the receiver advertised, which the receiver itself enforces
+by refusing staging past it. PR 1 corrected this plan's earlier claim that the
+constructed bound could be read from `receive_limits()`. It cannot.
+`ReceiveLimits` carries a control-frame payload limit and a lane count, not a
+data-byte credit, and quiche's actual inbound bound is a connection flow
+control window computed inside its configuration and extended as the
+application reads. There is no honest number to print for it, so none is
+printed; `credit_mode` says which bound was in force instead.
 
 ### 4. Multi-worker is in scope, as its own PR
 
@@ -90,7 +107,7 @@ every number in the report is measurable when the report is written.
 
 ### 5. Four PRs, and the report comes last
 
-1. Carrier seam, quiche wiring, loopback tests.
+1. Carrier seam, quiche wiring, loopback tests. **Landed.**
 2. MsQuic wiring through the same seam.
 3. The multi-worker path.
 4. Measurements, the report, and ADR-0025.
@@ -134,10 +151,20 @@ never reports `Acknowledged`.
 
 ## Measurement discipline
 
-Learned on the pump, at full price: 512 MB per run minimum, because 64 MB
-varied by a factor of two between identical configurations and 512 MB brings
-that to about twenty percent. Medians over several runs. The two obvious
-explanations for the first slow number were both wrong when measured, and the
-real cost was a copy nobody suspected, so measure before believing any
-explanation. Performance observations made along the way are recorded in
-`docs/perf-engineering.md` as they happen, not reconstructed afterwards.
+512 MB per run minimum. At 64 MB identical configurations vary by a factor of
+two, which PR 1 confirmed the expensive way by believing a 3.5x record-size
+effect that repetition then dissolved.
+
+512 MB is not enough on its own for this path. Measured over the assembled
+driver, the quiche loopback carrier varies 2x run to run at that size, where
+the standalone pump test was steady to about twenty percent. The report
+therefore states medians over enough runs to give a confidence interval, and a
+difference between two backends smaller than about 1.4x at 512 MB is inside one
+configuration's own spread and is not a result. The simulator, on the same
+loop, holds to six percent, so the variance is the carrier's rather than the
+driver's. Whether it comes from inline verification, from the flush every
+sixteen records, or from thread scheduling is measured in PR 4, not assumed
+here.
+
+Measure before believing any explanation. Performance observations are recorded
+in `docs/perf-engineering.md` as they happen, not reconstructed afterwards.

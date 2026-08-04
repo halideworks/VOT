@@ -26,6 +26,53 @@ within one machine and one configuration; the report format in
 
 ## Entries
 
+### 2026-08-03: the benchmark driver is not the ceiling, and the quiche path varies 2x
+
+Wiring both carriers into `vot-bench-driver` made the first like-for-like
+comparison possible: the same transfer loop, the same framing, and the same
+inline verification over an in-process carrier and over a socket. One 512 MB
+object, one lane, one worker, 64 KiB records, on the development host.
+
+- Simulator, five runs: 16878, 18211, 18270, 18495, 19024 Mbit/s. Median
+  18270, spread 1.13x.
+- quiche over loopback, nine runs: 805, 885, 905, 1084, 1117, 1148, 1152,
+  1503, 1595 Mbit/s. Median 1117, spread 2.0x.
+
+Two things follow. The driver's own work is not the ceiling and not the source
+of variance: it carries the same case sixteen times faster and within six
+percent of itself when the carrier is in process, so what PERF-001 measures is
+the engine. And the quiche loopback path varies by a factor of two run to run
+at 512 MB, which is the size chosen precisely because the standalone pump test
+was steady to about twenty percent there.
+
+The difference between those two variance figures is the driver's path doing
+work the pump test does not: BLAKE3 verification inline on the receive side,
+and a flush and drain every sixteen records. Which of those it is has not been
+measured, and neither has the obvious third possibility, that two driver
+threads and a verifying application thread simply schedule differently run to
+run.
+
+The consequence for PERF-001 is concrete and not optional: at this size a
+single run decides nothing, and a difference between two backends smaller than
+about 1.4x is inside one configuration's own spread. The report needs medians
+over enough runs to state a confidence interval, and the plan's earlier
+"±20% at 512 MB" figure does not apply to this path.
+
+### 2026-08-03: a 64 MiB probe invented a record-size effect that does not exist
+
+At 64 MiB per run, quiche appeared to carry 256 KiB records 3.5x faster than
+64 KiB records (1849 against 531 Mbit/s), which is exactly the shape of a real
+per-record overhead. Repeating at 512 MB with three runs each dissolved it:
+64 KiB gave 1241, 1137, 1497; 128 KiB gave 889, 748, 1522; 256 KiB gave 1428,
+1709, 923. The spread within each configuration covers the whole gap between
+them, and the ordering is not even monotonic.
+
+Nothing about record size is established. What is established is that this
+codebase's own rule was right and got skipped anyway: the 64 MiB probe was
+known to vary 2x before it was run, and its number was still convincing enough
+to reach for an explanation. The check that caught it was repetition, not
+insight.
+
 ### 2026-08-03: the adapter was the ceiling, not the engine
 
 One quiche lane over loopback went from about 740 to about 1400 Mbit/s by

@@ -35,11 +35,46 @@ default matrix would fail partway through.
 
 ## What the driver implements today
 
-Only the `simulator` backend, and only `worker_count` 1. Both limits are
-errors, not silent substitutions: there is no assembled QUIC transport yet, and
-parallel verification of a single object needs the proof-bearing range path.
-Running the full checked-in matrix therefore needs `--workers 1` until those
-land. The plan that lifts both limits is `perf-001-plan.md` in this directory.
+The `simulator` backend always, the `quiche` backend when built with its
+feature, and only `worker_count` 1. Both remaining limits are errors rather
+than silent substitutions: a backend with no carrier in this build cannot be
+measured, and parallel verification of a single object needs the proof-bearing
+range path. Running the full checked-in matrix therefore needs `--workers 1`
+until that lands. The plan that lifts it is `perf-001-plan.md` in this
+directory.
+
+The quiche backend carries the case over a real socket between a loopback pair
+of endpoints, each owning its connection on a driver thread of its own
+(ADR-0024). Build it in, and the handshake and the self-signed loopback
+credential both happen before the timed section:
+
+```sh
+cargo build --release -p vot-bench-driver --features quiche
+python3 tools/run_benchmark.py --backend quiche --seed 42 --workers 1 \
+  --output results.jsonl --command target/release/vot-bench-driver
+```
+
+It needs `openssl` on the path. A loopback result pays for both endpoints on
+one host, so it compares two carriers fairly and understates what either does
+with a machine to itself; that distinction belongs in any report that quotes
+one.
+
+Every backend runs the same transfer loop, so a difference between two results
+is a difference between two carriers rather than between two transfer
+strategies. Records are submitted as `DATA_RECORD` frames and the envelope is
+stripped on delivery, which is why `notes` carries `wire_bytes` alongside
+`bytes_sent`: the carrier moved strictly more than the object, and the
+difference is stated rather than assumed away. A full queue is treated as
+backpressure and the record is offered again, counted in `backpressure_waits`;
+a carrier that delivers nothing at all for thirty seconds ends the run with an
+error instead of reporting a partial transfer.
+
+`credit_bytes` is what the receiver advertised, which the receiver enforces by
+refusing staging past it. `credit_mode` says whether the carrier was also given
+that credit (`set`) or fixes its own inbound bound at construction
+(`constructed`), which is what quiche does: it extends connection flow control
+as the application reads, so there is no absolute credit to set, and ADR-0024
+has it report `Unsupported` rather than accept a bound it would not apply.
 
 The transfer uses the sequential reliable path, which reserves and releases
 staging per record, so peak memory follows the receive window rather than the

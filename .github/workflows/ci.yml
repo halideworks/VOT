@@ -208,7 +208,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Test native commit provider
-        run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-resume --locked
+        run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-platform-net -p vot-resume --locked
 
   quiche-live:
     name: quiche live (loopback)
@@ -496,6 +496,7 @@ jobs:
           - { package: vot-commit-object, required: true }
           - { package: vot-receipt, required: true }
           - { package: vot-platform-fs, required: true }
+          - { package: vot-platform-net, required: true }
           - { package: vot-transport-api, required: true }
           - { package: vot-transport-framing, required: true }
           - { package: vot-transport-queue, required: true }

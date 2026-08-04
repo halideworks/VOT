@@ -76,6 +76,13 @@ Wave 6 runtime dependencies:
 the signed note format in `vot-log`. It is already pinned exactly and its
 licence is accepted.
 
+`libc` 0.2.189, already in the tree under `nix`, becomes a direct dependency
+of `vot-platform-net`, which wraps the don't-fragment socket options that path
+MTU discovery needs and that no safe wrapper exposes for Linux IPv4. The
+crate follows the `vot-platform-fs` pattern: crate-level `deny(unsafe_code)`
+with documented, isolated FFI blocks. `windows-sys` gains the
+`Win32_Networking_WinSock` feature there for the same options on Windows.
+
 Test-only dependencies:
 
 - `cap` 0.1.2 wraps the system allocator in the million-entry manifest and fuzz

@@ -30,12 +30,10 @@ use crate::{
 /// What a 1500-byte ethernet frame carries over IPv4. This is a ceiling, not a
 /// claim about the path: discovery settles under it where a tunnel or IPv6
 /// header narrows the way, at the price of a few probe round trips that a
-/// ceiling at or under the path answers in one. What discovery cannot rule
-/// out is a path that fragments instead of dropping, where an oversized
-/// probe reassembles at the peer and reads as success; the socket does not
-/// yet ask the network to refuse fragments, which is what would close that
-/// off. Measured over a 1472-byte path, 1350 here cost 19% of throughput
-/// against a matched-size peer.
+/// ceiling at or under the path answers in one. The socket asks the network
+/// to refuse fragments, so an oversized probe is dropped rather than
+/// reassembled into a false success. Measured over a 1472-byte path, 1350
+/// here cost 19% of throughput against a matched-size peer.
 const MAX_DATAGRAM_SIZE: usize = 1_472;
 
 /// The smallest datagram a caller may ask for.
@@ -329,6 +327,10 @@ impl Transport {
         role: Role,
     ) -> Result<Self, Error> {
         let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
+        // Discovery's probes must be dropped where the path narrows, never
+        // fragmented and reassembled: a reassembled probe reads as success and
+        // locks the connection above the path for good.
+        vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
         let mut quiche_config = config.build(role)?;
 

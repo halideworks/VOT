@@ -1962,7 +1962,7 @@ pub mod live {
         };
 
         use super::{
-            AcceptedTransport, Control, Framing, MsQuicServer, MsQuicTransport, StreamKind,
+            AcceptedTransport, Config, Control, Framing, MsQuicServer, MsQuicTransport, StreamKind,
             allocate_peer_lane,
         };
 
@@ -2768,39 +2768,107 @@ pub mod live {
         /// two paths at once, so one could load a half-written certificate and
         /// fail for reasons that have nothing to do with what it tests.
         fn test_credential() -> Credential {
+            let (key, certificate) = credential_paths();
+            Credential::CertificateFile(msquic::CertificateFile::new(key, certificate))
+        }
+
+        /// The generated key and certificate paths, in that order.
+        fn credential_paths() -> (String, String) {
             static MATERIAL: OnceLock<(String, String)> = OnceLock::new();
-            let (key, certificate) = MATERIAL.get_or_init(|| {
-                let directory =
-                    std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
-                std::fs::create_dir_all(&directory).unwrap();
-                let key = directory.join("key.pem");
-                let certificate = directory.join("cert.pem");
-                let status = Command::new("openssl")
-                    .args([
-                        "req",
-                        "-x509",
-                        "-newkey",
-                        "rsa:2048",
-                        "-keyout",
-                        key.to_str().unwrap(),
-                        "-out",
-                        certificate.to_str().unwrap(),
-                        "-sha256",
-                        "-days",
-                        "1",
-                        "-nodes",
-                        "-subj",
-                        "/CN=localhost",
-                    ])
-                    .status()
+            MATERIAL
+                .get_or_init(|| {
+                    let directory =
+                        std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let key = directory.join("key.pem");
+                    let certificate = directory.join("cert.pem");
+                    let status = Command::new("openssl")
+                        .args([
+                            "req",
+                            "-x509",
+                            "-newkey",
+                            "rsa:2048",
+                            "-keyout",
+                            key.to_str().unwrap(),
+                            "-out",
+                            certificate.to_str().unwrap(),
+                            "-sha256",
+                            "-days",
+                            "1",
+                            "-nodes",
+                            "-subj",
+                            "/CN=localhost",
+                        ])
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                    (key.display().to_string(), certificate.display().to_string())
+                })
+                .clone()
+        }
+
+        #[test]
+        fn a_bound_listener_and_a_dialled_client_connect() {
+            // The boundary ADR-0012 requires: a caller outside this crate gets
+            // a connected pair without naming an MsQuic type. The bench driver
+            // is the caller, and this is where the facade is tested, because a
+            // failure here should not be found in another package.
+            let (key, certificate) = credential_paths();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            let mut server =
+                MsQuicServer::bind(address, &Config::server(server_limits(), certificate, key))
                     .unwrap();
-                assert!(status.success());
-                (key.display().to_string(), certificate.display().to_string())
-            });
-            Credential::CertificateFile(msquic::CertificateFile::new(
-                key.clone(),
-                certificate.clone(),
-            ))
+            let peer = server.local_address().unwrap();
+            assert!(peer.port() != 0, "the listener reports the port it bound");
+
+            let mut client_config = Config::client(test_limits());
+            // The certificate is generated for this test and trusted by
+            // construction; the carrier is what is under test, not the PKI.
+            client_config.verify_peer = false;
+            let mut client = MsQuicTransport::dial(peer, 11, &client_config).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut client, deadline, |event| matches!(
+                event,
+                Event::Connected(_)
+            )));
+            loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if server.accept().is_some() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        #[test]
+        fn a_configuration_takes_both_halves_of_a_credential_or_neither() {
+            // A server presents a certificate and a key, a client presents
+            // neither, and half of one is a server that cannot present a
+            // credential or a client asked to present a key it does not have.
+            let (key, certificate) = credential_paths();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+            for half in [
+                Config {
+                    certificate: Some(certificate.clone()),
+                    private_key: None,
+                    ..Config::client(test_limits())
+                },
+                Config {
+                    certificate: None,
+                    private_key: Some(key.clone()),
+                    ..Config::client(test_limits())
+                },
+            ] {
+                assert!(
+                    matches!(
+                        MsQuicServer::bind(address, &half),
+                        Err(Error::InvalidConfiguration)
+                    ),
+                    "half a credential was accepted"
+                );
+            }
         }
 
         /// Builds a client configuration that trusts the test certificate.

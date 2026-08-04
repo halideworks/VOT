@@ -174,11 +174,11 @@ pub const MAX_ASSEMBLY_BYTES: usize = 16 * vot_transport_framing::MAX_PARTIAL_CO
 pub enum NativeEvent {
     Connected(u64),
     Disconnected(u64),
-    Control(Vec<u8>),
+    Control(Payload),
     Reliable {
         lane: u64,
         sequence: u64,
-        bytes: Vec<u8>,
+        bytes: Payload,
     },
     Acknowledged {
         lane: u64,
@@ -337,7 +337,10 @@ fn translate(event: NativeEvent) -> Event {
     match event {
         NativeEvent::Connected(id) => Event::Connected(ConnectionId(id)),
         NativeEvent::Disconnected(id) => Event::Disconnected(ConnectionId(id)),
-        NativeEvent::Control(bytes) => Event::Control(bytes.into()),
+        // Moved rather than converted. A payload the pump shared once is the same
+        // allocation the caller reads, so a record crosses this boundary without
+        // being copied again.
+        NativeEvent::Control(bytes) => Event::Control(bytes),
         NativeEvent::Reliable {
             lane,
             sequence,
@@ -345,7 +348,7 @@ fn translate(event: NativeEvent) -> Event {
         } => Event::Reliable {
             stream: StreamId(lane),
             sequence,
-            bytes: bytes.into(),
+            bytes,
         },
         NativeEvent::Acknowledged { lane, sequence } => {
             Event::Acknowledged(TransportAck::new(lane, sequence))
@@ -587,11 +590,11 @@ mod tests {
         let mut adapter = QuicheAdapter::default();
         for event in [
             NativeEvent::Connected(7),
-            NativeEvent::Control(vec![0; 8]),
+            NativeEvent::Control(shared_payload(&[0; 8])),
             NativeEvent::Reliable {
                 lane: 3,
                 sequence: 1,
-                bytes: b"record".to_vec(),
+                bytes: shared_payload(b"record"),
             },
             NativeEvent::Acknowledged {
                 lane: 3,
@@ -646,7 +649,7 @@ mod tests {
         let refused = NativeEvent::Reliable {
             lane: 0,
             sequence: 1,
-            bytes: b"record".to_vec(),
+            bytes: shared_payload(b"record"),
         };
         assert_eq!(
             adapter.try_record_native_event(refused.clone()),

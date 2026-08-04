@@ -86,6 +86,13 @@ pub(crate) struct Endpoint {
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
     #[cfg(test)]
     crate::test_guard::arm();
+    // The two-machine halves carry the sequential path only; running a
+    // multi-worker case here would measure that path under the wrong label.
+    if config.workers != 1 {
+        return Err(Error::Unsupported(
+            "role mode carries one worker; the ranged path has no two-machine half".to_owned(),
+        ));
+    }
     let role = crate::variable(&|name| std::env::var(name).ok(), ROLE)?;
     match role.as_str() {
         "send" => {
@@ -400,7 +407,7 @@ fn role_notes(
 #[cfg(test)]
 mod tests {
     use super::{receive, send};
-    use crate::{Config, ImpairmentCase, Measurement};
+    use crate::{Config, ImpairmentCase, Measurement, Rails};
     use std::net::SocketAddr;
     use vot_verifier::Suite;
 
@@ -412,6 +419,7 @@ mod tests {
             seed: 42,
             object_bytes,
             record_bytes: 65_536,
+            rails: Rails::Shared,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,

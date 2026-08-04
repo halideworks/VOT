@@ -182,6 +182,15 @@ pub struct ImpairmentCase {
     pub queue_bytes: u64,
 }
 
+/// How the ranged path reaches the carrier: every worker on one shared
+/// connection, or one connection per worker. The spine hypothesis compares
+/// the two (ruling 6), so the case names its arrangement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rails {
+    Shared,
+    Provisioned,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub backend: String,
@@ -190,6 +199,7 @@ pub struct Config {
     pub seed: u64,
     pub object_bytes: u64,
     pub record_bytes: usize,
+    pub rails: Rails,
     pub impairment: ImpairmentCase,
 }
 
@@ -240,6 +250,19 @@ impl Config {
         if record_bytes == 0 || record_bytes > vot_transport_api::MAX_DATA_RECORD_BYTES {
             return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
         }
+        // Absent is the shared arrangement every landed number was taken on;
+        // the runner only names what it means to vary.
+        let rails = match lookup("VOT_BENCH_RAILS").filter(|value| !value.is_empty()) {
+            None => Rails::Shared,
+            Some(value) if value == "shared" => Rails::Shared,
+            Some(value) if value == "provisioned" => Rails::Provisioned,
+            Some(_) => return Err(Error::Value("VOT_BENCH_RAILS")),
+        };
+        if rails == Rails::Provisioned && workers == 1 {
+            // One worker has nothing to provision; a case that asks anyway is
+            // asking for a number this driver would have to invent.
+            return Err(Error::Value("VOT_BENCH_RAILS"));
+        }
         Ok(Self {
             backend: variable(lookup, "VOT_BENCH_BACKEND")?,
             suite,
@@ -247,6 +270,7 @@ impl Config {
             seed: number(lookup, "VOT_BENCH_SEED")?,
             object_bytes,
             record_bytes,
+            rails,
             impairment: ImpairmentCase {
                 mtu_bytes: number(lookup, "VOT_BENCH_IMPAIRMENT_MTU_BYTES")?,
                 rtt_us: number(lookup, "VOT_BENCH_IMPAIRMENT_RTT_US")?,
@@ -1373,20 +1397,33 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
         };
     }
     let budget = round_budget(config);
+    // One shared connection, or a connection per worker; the spine loop is
+    // the same either way, so the comparison changes only the carrier count.
+    let rail_count = match config.rails {
+        Rails::Shared => 1,
+        Rails::Provisioned => config.workers,
+    };
     match config.backend.as_str() {
-        "simulator" => transfer_ranged(config, vec![SimulatorCarrier::new(config)?], budget),
+        "simulator" => {
+            let carriers = (0..rail_count)
+                .map(|_| SimulatorCarrier::new(config))
+                .collect::<Result<Vec<_>, _>>()?;
+            transfer_ranged(config, carriers, budget)
+        }
         #[cfg(feature = "msquic")]
-        "msquic" => transfer_ranged(
-            config,
-            vec![backend_msquic::MsQuicCarrier::connected(config)?],
-            budget,
-        ),
+        "msquic" => {
+            let carriers = (0..rail_count)
+                .map(|_| backend_msquic::MsQuicCarrier::connected(config))
+                .collect::<Result<Vec<_>, _>>()?;
+            transfer_ranged(config, carriers, budget)
+        }
         #[cfg(feature = "quiche")]
-        "quiche" => transfer_ranged(
-            config,
-            vec![backend_quiche::QuicheCarrier::connected(config)?],
-            budget,
-        ),
+        "quiche" => {
+            let carriers = (0..rail_count)
+                .map(|_| backend_quiche::QuicheCarrier::connected(config))
+                .collect::<Result<Vec<_>, _>>()?;
+            transfer_ranged(config, carriers, budget)
+        }
         other => Err(Error::Unsupported(format!(
             "backend {other} has no assembled transport in this build"
         ))),
@@ -1820,7 +1857,7 @@ mod test_guard {
 #[cfg(test)]
 mod tests {
     use super::{
-        Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload,
+        Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, Rails,
         SimulatorCarrier, StreamId, TransportAdapter, escape, measure, parse_vm_hwm,
         record_lengths, record_payload, shared_payload, transfer_ranged, transfer_within,
     };
@@ -1844,6 +1881,7 @@ mod tests {
             seed: 42,
             object_bytes,
             record_bytes: 65_536,
+            rails: Rails::Shared,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,
@@ -2091,6 +2129,39 @@ mod tests {
             Err(Error::Stalled)
         ));
         assert_eq!(waited.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_rails_variable_names_the_arrangement_and_defaults_to_shared() {
+        assert_eq!(parse(&environment()).unwrap().rails, Rails::Shared);
+        assert_eq!(
+            parse_with("VOT_BENCH_RAILS", "shared").unwrap().rails,
+            Rails::Shared
+        );
+        assert!(matches!(
+            parse_with("VOT_BENCH_RAILS", "braided"),
+            Err(Error::Value("VOT_BENCH_RAILS"))
+        ));
+        // Provisioned rails need workers to provision for.
+        let mut variables = environment();
+        variables.insert("VOT_BENCH_RAILS".to_owned(), "provisioned".to_owned());
+        assert!(matches!(
+            parse(&variables),
+            Err(Error::Value("VOT_BENCH_RAILS"))
+        ));
+        variables.insert("VOT_BENCH_WORKERS".to_owned(), "2".to_owned());
+        assert_eq!(parse(&variables).unwrap().rails, Rails::Provisioned);
+    }
+
+    #[test]
+    fn a_provisioned_case_reaches_measure_with_a_rail_per_worker() {
+        // Through measure() rather than transfer_ranged directly, so the
+        // carrier construction itself is what the test pins.
+        let mut config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
+        config.rails = Rails::Provisioned;
+        let measured = measure(&config).unwrap();
+        assert_eq!(measured.verified_bytes, 4 * 65_536);
+        assert!(measured.notes.contains(";rails=provisioned-multi-rail"));
     }
 
     #[test]

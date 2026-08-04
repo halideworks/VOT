@@ -342,7 +342,7 @@ impl Carrier for MsQuicCarrier {
 #[cfg(test)]
 mod tests {
     use super::MsQuicCarrier;
-    use crate::{Config, ImpairmentCase, measure};
+    use crate::{Config, ImpairmentCase, Rails, measure};
     use vot_verifier::Suite;
 
     fn case(object_bytes: u64) -> Config {
@@ -353,6 +353,7 @@ mod tests {
             seed: 42,
             object_bytes,
             record_bytes: 65_536,
+            rails: Rails::Shared,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,

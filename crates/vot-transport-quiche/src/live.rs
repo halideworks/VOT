@@ -650,7 +650,13 @@ fn drive(
             write_outbox(&mut conn, stream);
         }
         // A socket that will not take a packet is a carrier that has gone.
-        let Ok(paced) = send_all(socket, &mut conn, &mut out, datagram_bytes, offload) else {
+        // The burst slot is the connection's own current packet size, not the
+        // configured ceiling: with path-MTU discovery the connection settles
+        // under the ceiling on a narrow path, and slots cut to the ceiling
+        // would make every settled packet "short", flushing the burst per
+        // packet and quietly giving the offload back.
+        let segment = conn.max_send_udp_payload_size();
+        let Ok(paced) = send_all(socket, &mut conn, &mut out, segment, offload) else {
             return Ok(());
         };
 

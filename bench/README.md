@@ -86,8 +86,10 @@ proportion to what it was carrying.
 `idle_waits` counts the deliveries that found nothing, which the driver waits
 after because the carrier's own thread is what makes progress. How long it
 waits changes what a run reports, so the wait backs off from 16 microseconds to
-a millisecond rather than being one interval, and `docs/perf-engineering.md`
-records what each setting measured. A result quoted against another must have
+a millisecond rather than being one interval. Measured over 512 MB, fixed waits
+of 20 and 200 microseconds reported about 1000 Mbit/s where 1 to 5 milliseconds
+reported about 1500: polling a carrier that has nothing to give contends with
+the thread that would be filling it. A result quoted against another must have
 been taken at the same interval.
 
 `credit_bytes` is what the receiver advertised, which the receiver enforces by

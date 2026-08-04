@@ -157,8 +157,9 @@ is PERF-002's charter.
 state them in every quoted figure.** The report carries the datagram size the
 way it carries the seed, and a run of one backend is never compared against a
 run of the other at a different one. An ADR that picks a default without that
-control is picking a constant in our own pump. Figures in
-`docs/perf-engineering.md`.
+control is picking a constant in our own pump. The figures are in the section
+above, and the report repeats whichever of them it relies on: a number a reader
+cannot see is a number they have to take on trust.
 
 Holding it comparable needs a knob that does not exist: `MAX_DATAGRAM_SIZE` is a
 constant in the pump, not a field on the quiche `Config` beside
@@ -238,5 +239,6 @@ needs its own review rather than being folded into a measurement PR. However it
 is resolved, every published number states the interval it was taken at, and
 both backends are measured at the same one.
 
-Measure before believing any explanation. Performance observations are recorded
-in `docs/perf-engineering.md` as they happen, not reconstructed afterwards.
+Measure before believing any explanation, and write the measurement down when
+it happens rather than reconstructing it afterwards. Anything a published result
+depends on belongs here or in `bench/results`, where a reader can check it.

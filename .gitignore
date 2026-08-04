@@ -4,3 +4,8 @@
 *.profraw
 *.profdata
 mutants.out*/
+
+# Working notes, not a published document. The measurements that a result
+# depends on belong in bench/results and the plan beside it; this is the log of
+# what was tried, including what was wrong, and it is kept locally.
+docs/perf-engineering.md

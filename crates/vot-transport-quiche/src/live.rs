@@ -861,7 +861,12 @@ fn send_all(
                 flush_burst(socket, &out[..filled], segment, destination, gso)?;
                 return Ok(deadline);
             }
-            Err(_) => return Err(Error::Backend),
+            Err(_) => {
+                // The gathered packets are state the connection has already
+                // committed to; they go to the peer even as the driver ends.
+                let _ = flush_burst(socket, &out[..filled], segment, destination, gso);
+                return Err(Error::Backend);
+            }
         }
     }
 }
@@ -875,6 +880,7 @@ fn send_all(
 /// # Errors
 /// Reports any refusal, including a kernel that does not carry the option, so
 /// the caller can fall back to sending the packets one at a time.
+#[cfg(target_os = "linux")]
 fn send_segmented(
     socket: &UdpSocket,
     burst: &[u8],
@@ -896,6 +902,19 @@ fn send_segmented(
     )
     .map_err(|_| Error::Backend)?;
     Ok(())
+}
+
+/// The control message does not exist here; the caller falls back to sending
+/// the packets one at a time. Never reached while `offload_available` says no,
+/// and honest if it somehow were.
+#[cfg(not(target_os = "linux"))]
+fn send_segmented(
+    _socket: &UdpSocket,
+    _burst: &[u8],
+    _segment: usize,
+    _destination: SocketAddr,
+) -> Result<(), Error> {
+    Err(Error::Backend)
 }
 
 /// Whether to try segmentation offload on this platform.

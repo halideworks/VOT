@@ -1202,6 +1202,51 @@ mod tests {
     }
 
     #[test]
+    fn a_backpressured_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
+        // The submission loop keeps its own bound, so its edge has to be pinned
+        // separately from the completion loop's. Four refusals need four
+        // rounds: a budget of four is exactly enough and three is exactly too
+        // little. A bound that fired one round early would fail a transfer
+        // whose carrier was applying backpressure rather than stopping.
+        let config = case(65_536, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.refuse = 4;
+        let measured = transfer_within(&config, carrier, 4).unwrap();
+        assert_eq!(measured.verified_bytes, 65_536);
+        assert_eq!(note_field(&measured.notes, "backpressure_waits"), 4);
+
+        let mut same = TestCarrier::new();
+        same.refuse = 4;
+        assert!(matches!(
+            transfer_within(&config, same, 3),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn the_budget_covers_a_delivery_per_record_and_an_allowance_beyond_it() {
+        // What a real run is given, which no test that names its own budget
+        // exercises. Too small a budget would call a healthy carrier stopped,
+        // and the per-record term is what carries an object larger than the
+        // flat allowance was written for.
+        let config = case(64 * 65_536, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&config), 64 + super::STALL_ROUNDS);
+
+        // A short final record still needs a delivery of its own.
+        let ragged = case(64 * 65_536 + 1, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&ragged), 65 + super::STALL_ROUNDS);
+
+        // The allowance alone is what a one-record object gets.
+        let small = case(1, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&small), 1 + super::STALL_ROUNDS);
+    }
+
+    /// The allowance is worth more than a couple of deliveries: at the longest
+    /// wait it is about twenty seconds of a carrier delivering nothing, which
+    /// is the wall clock the round budget is standing in for.
+    const _: () = assert!(super::STALL_ROUNDS >= 10_000);
+
+    #[test]
     fn a_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
         // One record, and a carrier that releases it one delivery late. The
         // completion loop therefore needs exactly one delivery, so a budget of

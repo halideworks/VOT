@@ -29,9 +29,13 @@ use crate::{
 ///
 /// What a 1500-byte ethernet frame carries over IPv4. This is a ceiling, not a
 /// claim about the path: discovery settles under it where a tunnel or IPv6
-/// header narrows the way, and a lower ceiling only forfeits packet size on
-/// paths that carry the full frame. Measured over a 1472-byte path, 1350 here
-/// cost 19% of throughput against a matched-size peer.
+/// header narrows the way, at the price of a few probe round trips that a
+/// ceiling at or under the path answers in one. What discovery cannot rule
+/// out is a path that fragments instead of dropping, where an oversized
+/// probe reassembles at the peer and reads as success; the socket does not
+/// yet ask the network to refuse fragments, which is what would close that
+/// off. Measured over a 1472-byte path, 1350 here cost 19% of throughput
+/// against a matched-size peer.
 const MAX_DATAGRAM_SIZE: usize = 1_472;
 
 /// The smallest datagram a caller may ask for.
@@ -186,8 +190,9 @@ pub struct Config {
     /// spends both on every datagram. Measured over loopback, whose MTU is
     /// 65536, raising it is worth about four times the throughput.
     ///
-    /// Discovery settles under this ceiling when the path is narrower, so
-    /// raising it costs probes, not the connection.
+    /// Discovery settles under this ceiling when the path is narrower, over
+    /// a few probe round trips that a ceiling at or under the path answers
+    /// in one.
     pub max_datagram_bytes: usize,
 }
 

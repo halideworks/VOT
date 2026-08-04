@@ -253,7 +253,9 @@ pipe with the same cliff. Rerun on the widened path, five runs per arm:
 | quiche | 1350 ceiling, discovered | 2339 | 1.09x | 0.68 s / 0.26 s | 0.65 s / 0.76 s | 8.00 | 5.94 |
 | quiche | 1472 ceiling, discovered | 2769 | 1.31x | 0.66 s / 0.25 s | 0.59 s / 0.70 s | 7.96 | 5.64 |
 
-At matched packets quiche now leads by 12%, outside both spreads. The third
+Pinned at 1472, quiche leads MsQuic's probed arm by 12%, outside both
+spreads; the table does not record what size MsQuic settled at, so the
+comparison is between configurations, not proven-equal packets. The third
 row is the lesson: discovery probes up to `max_send_udp_payload_size`, so
 the old 1350 default was a ceiling the path never asked for, and it priced
 the stock config 9% under MsQuic on a path that carries 1472. The default

@@ -42,8 +42,12 @@ const MAX_DATAGRAM_SIZE: usize = 1_472;
 /// under this cannot complete a handshake.
 const MIN_DATAGRAM_SIZE: usize = 1_200;
 
-/// The largest, which is what a UDP payload can hold at all.
-const LARGEST_DATAGRAM_SIZE: usize = 65_527;
+/// The largest, which is what a UDP payload can hold inside IPv4's 65535-byte
+/// total length once its own and UDP's headers are paid for. IPv6 could carry
+/// 20 more, which is not worth a family-dependent ceiling: a size the socket
+/// refuses with `EMSGSIZE` on one family is not a configuration, and the test
+/// suite sends a record at this exact size to keep the constant honest.
+const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;
@@ -659,13 +663,14 @@ fn drive(
             write_outbox(&mut conn, stream);
         }
         // A socket that will not take a packet is a carrier that has gone.
-        // The burst slot is the connection's own current packet size, not the
-        // configured ceiling: with path-MTU discovery the connection settles
-        // under the ceiling on a narrow path, and slots cut to the ceiling
-        // would make every settled packet "short", flushing the burst per
-        // packet and quietly giving the offload back.
-        let segment = conn.max_send_udp_payload_size();
-        let Ok(paced) = send_all(socket, &mut conn, &mut out, segment, offload) else {
+        // The ceiling goes down whole: a discovery probe is only generated
+        // when the buffer offered could hold one, and the connection's own
+        // packet-size accessor caps its answer at 16383, so a slot sized by
+        // it can never hold the probe for a larger ceiling and discovery
+        // starves at the handshake floor. send_all opens each burst at the
+        // ceiling and lets the first packet written set the burst's segment,
+        // which keeps the offload's equal-sized runs either way.
+        let Ok(paced) = send_all(socket, &mut conn, &mut out, datagram_bytes, offload) else {
             return Ok(());
         };
 
@@ -936,7 +941,7 @@ fn send_all(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
-    segment: usize,
+    ceiling: usize,
     gso: bool,
 ) -> Result<Option<Instant>, Error> {
     // Packets are gathered into one buffer and handed over together, because a
@@ -945,17 +950,21 @@ fn send_all(
     // 1500 bytes carried. Segmentation offload takes the whole burst in one
     // call and lets the kernel cut it up.
     let mut filled = 0_usize;
+    let mut segment = 0_usize;
     let mut destination = None;
     let mut deadline = None;
     loop {
-        // Only ever offered room for one packet, so a burst is a run of equal
-        // sized ones and `filled` always lands on a segment boundary. A burst
-        // ending is not the sending ending: the connection keeps generating
-        // until it is done or paced, and each flush just closes one window.
-        // The first attempt returned after every closed window, which at a
-        // near-cap datagram made every packet its own send_all call and cost
-        // the pass's wait floor per packet: a third of the throughput.
-        let Some(room) = out.get_mut(filled..filled + segment) else {
+        // A burst opens with room for the ceiling and continues at the size
+        // its first packet came out as. The connection only generates a
+        // discovery probe when the room offered could hold one, so the
+        // opening slot has to be the ceiling; every later packet is capped
+        // under it, so the rest of the burst is a run of equal slots and
+        // `filled` stays on a segment boundary. Cutting every slot to the
+        // ceiling instead made each settled packet "short" and flushed the
+        // burst per packet; sizing every slot from the connection's accessor,
+        // which caps at 16383, silenced every probe a jumbo ceiling needs.
+        let slot = if filled == 0 { ceiling } else { segment };
+        let Some(room) = out.get_mut(filled..filled + slot) else {
             // The buffer holds no further packet, so this burst goes now.
             flush_burst(socket, &out[..filled], segment, destination, gso)?;
             filled = 0;
@@ -973,6 +982,9 @@ fn send_all(
                     filled = 0;
                 }
                 destination = Some(info.to);
+                if filled == 0 {
+                    segment = written;
+                }
                 filled += written;
                 // Pacing is the connection's decision, and the first packet
                 // the pacer holds back ends the pass: what was released goes
@@ -1762,17 +1774,18 @@ mod tests {
 
     #[test]
     fn a_pair_carries_records_at_a_datagram_size_the_path_allows() {
-        // Loopback carries 65536, so a larger datagram is a real configuration
-        // here and a first-order cost: one datagram is one syscall and one
-        // packet's worth of header protection and AEAD.
+        // Loopback carries 65536, so the ceiling itself is a real configuration
+        // here: 65507 plus the IP and UDP headers is exactly IPv4's 65535-byte
+        // total length. Sending at it is what proves the constant is a size
+        // the socket carries rather than one validation merely accepts.
         let (certificate, key) = credentials();
         let mut server_config = Config::server(limits(), certificate, key);
-        server_config.max_datagram_bytes = 16_384;
+        server_config.max_datagram_bytes = super::LARGEST_DATAGRAM_SIZE;
         let server = Transport::serve("127.0.0.1:0".parse().expect("an address"), &server_config)
             .expect("a server");
         let mut client_config = Config::client(limits());
         client_config.verify_peer = false;
-        client_config.max_datagram_bytes = 16_384;
+        client_config.max_datagram_bytes = super::LARGEST_DATAGRAM_SIZE;
         let mut client = Transport::connect(
             "127.0.0.1:0".parse().expect("an address"),
             server.local_address(),
@@ -1804,6 +1817,31 @@ mod tests {
             })
             .expect("the record arrived");
         assert_eq!(carried.as_ref(), frame.as_slice());
+
+        // The record can arrive while discovery is still climbing, so carrying
+        // it does not yet prove the ceiling. Discovery's first probe is the
+        // ceiling itself, and on a path that carries it the discovered size
+        // lands there exactly; a ceiling the socket refuses can never be a
+        // discovered size, which is what makes this an assertion and not a
+        // wait. A budget of passes bounds the loop, not a clock.
+        let target = u64::try_from(super::LARGEST_DATAGRAM_SIZE).expect("a size fits");
+        let mut discovered = None;
+        for _ in 0_u32..5_000 {
+            let _ = client.flush();
+            let _ = server.flush();
+            while client.poll().is_some() {}
+            while server.poll().is_some() {}
+            discovered = client.path_stats().and_then(|stats| stats.mtu_bytes);
+            if discovered == Some(target) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            discovered,
+            Some(target),
+            "discovery never reached the ceiling"
+        );
     }
 
     #[test]

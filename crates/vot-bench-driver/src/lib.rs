@@ -2033,6 +2033,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cpu_reading_advances_as_the_process_spends_it() {
+        // A reading that never moves is not a reading. Asserting a positive
+        // number inside one short run cannot say this, because the counter
+        // advances in ten-millisecond ticks and a small run finishes inside
+        // one, which is what made an earlier version of this test fail in CI
+        // for being right about a fast machine. So spend CPU until the counter
+        // moves, and give it long enough that a loaded machine still gets
+        // there.
+        let Some((before, _)) = super::cpu_times_ns() else {
+            assert!(!cfg!(target_os = "linux"), "linux exposes this");
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut sink = 0_u64;
+        let mut after = before;
+        while std::time::Instant::now() < deadline {
+            for _ in 0..200_000 {
+                sink = sink.wrapping_add(std::hint::black_box(1));
+            }
+            std::hint::black_box(sink);
+            if let Some((user, _)) = super::cpu_times_ns()
+                && user > before
+            {
+                after = user;
+                break;
+            }
+        }
+        assert!(
+            after > before,
+            "the user counter did not move while the process spent CPU"
+        );
+    }
+
+    #[test]
     fn a_run_reports_the_cpu_it_spent_rather_than_only_its_duration() {
         // Throughput alone cannot separate a carrier that is slower because it
         // makes more syscalls from one that is slower because it hashes more.
@@ -2040,14 +2074,13 @@ mod tests {
         let user = note_field_text(&measured.notes, "cpu_user_ns");
         let system = note_field_text(&measured.notes, "cpu_sys_ns");
         if cfg!(target_os = "linux") {
-            // Four mebibytes of generating, framing, and verifying is tens of
-            // milliseconds, which is several of this counter's ten-millisecond
-            // ticks even on fast hardware.
-            assert!(
-                user.parse::<u64>().unwrap() > 0,
-                "user cpu was {user} in {}",
-                measured.notes
-            );
+            // A number, and deliberately not a positive one. The counter
+            // advances in ten-millisecond ticks, and a few mebibytes of
+            // generating, framing, and verifying can finish inside one tick on
+            // an idle machine, so zero is a true reading rather than a broken
+            // one. That the fields carry the right values is pinned by the
+            // parser's own test, against known input, where it is exact.
+            assert!(user.parse::<u64>().is_ok(), "user cpu was {user}");
             assert!(system.parse::<u64>().is_ok(), "system cpu was {system}");
         } else {
             assert_eq!(user, "unmeasured");

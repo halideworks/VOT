@@ -814,20 +814,22 @@ fn send_all(
     let mut deadline = None;
     loop {
         // Only ever offered room for one packet, so a burst is a run of equal
-        // sized ones and `filled` always lands on a segment boundary.
-        let room = match out.get_mut(filled..filled + segment) {
-            Some(room) => room,
-            // The buffer holds no further packet, so the burst goes now.
-            None => {
-                flush_burst(socket, &out[..filled], segment, destination, gso)?;
-                return Ok(deadline);
-            }
+        // sized ones and `filled` always lands on a segment boundary. A burst
+        // ending is not the sending ending: the connection keeps generating
+        // until it is done or paced, and each flush just closes one window.
+        // The first attempt returned after every closed window, which at a
+        // near-cap datagram made every packet its own send_all call and cost
+        // the pass's wait floor per packet: a third of the throughput.
+        let Some(room) = out.get_mut(filled..filled + segment) else {
+            // The buffer holds no further packet, so this burst goes now.
+            flush_burst(socket, &out[..filled], segment, destination, gso)?;
+            filled = 0;
+            destination = None;
+            continue;
         };
         match conn.send(room) {
             Ok((written, info)) => {
-                // A different destination cannot share a burst, and neither can
-                // anything after a short packet: the kernel cuts every segment
-                // to the same length but the last.
+                // A different destination cannot share a burst.
                 if destination.is_some_and(|previous| previous != info.to) {
                     flush_burst(socket, &out[..filled], segment, destination, gso)?;
                     // The packet just generated sits at `filled`, so move it to
@@ -837,20 +839,22 @@ fn send_all(
                 }
                 destination = Some(info.to);
                 filled += written;
-                // Pacing is the connection's decision, and it applies to the
-                // burst rather than to each packet in it. Taking the deadline
-                // one packet at a time is what made this loop send one packet
-                // per call: measured, it left offload on 0.3 percent of sends
-                // and the burst never grew past one. The deadline is kept and
-                // honoured once the burst is done.
+                // Pacing is the connection's decision, and the first packet
+                // the pacer holds back ends the pass: what was released goes
+                // as one call, what was not waits for its own release. That
+                // bounds a burst's time by the pacer's clock.
                 if info.at > Instant::now() {
                     deadline = Some(info.at);
-                }
-                // A packet shorter than a segment ends the burst, because the
-                // kernel cuts every segment to the same length but the last.
-                if written < segment {
                     flush_burst(socket, &out[..filled], segment, destination, gso)?;
                     return Ok(deadline);
+                }
+                // A packet shorter than a segment closes the burst, because
+                // the kernel cuts every segment to the same length but the
+                // last; the connection may still have more to say.
+                if written < segment {
+                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    filled = 0;
+                    destination = None;
                 }
             }
             Err(quiche::Error::Done) => {
@@ -864,7 +868,7 @@ fn send_all(
 
 /// Sends a burst as one datagram the kernel cuts into `segment`-sized pieces.
 ///
-/// `UDP_SEGMENT` is what MsQuic reaches for on this platform, and it is the
+/// `UDP_SEGMENT` is what `MsQuic` reaches for on this platform, and it is the
 /// difference between one syscall per packet and one per burst. The unsafe work
 /// is `nix`'s, which is why this crate still forbids unsafe of its own.
 ///
@@ -931,12 +935,10 @@ fn flush_burst(
     if burst.is_empty() {
         return Ok(());
     }
-    if gso && burst.len() > segment {
-        if send_segmented(socket, burst, segment, destination).is_ok() {
-            return Ok(());
-        }
-        // Fall through: a kernel that will not segment still takes the packets
-        // one at a time.
+    // A kernel that will not segment falls through and takes the packets one
+    // at a time.
+    if gso && burst.len() > segment && send_segmented(socket, burst, segment, destination).is_ok() {
+        return Ok(());
     }
     for packet in burst.chunks(segment) {
         if socket.send_to(packet, destination).is_err() {

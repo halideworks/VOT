@@ -4,8 +4,9 @@ Date: 2026-08-04
 
 Both QUIC backends carry one object through the same transfer loop, the same
 framing, and the same inline verification, so a difference between two results
-is a difference between two carriers. This is the one-rail, one-worker half of
-PERF-001. What is not here, and why, is at the bottom.
+is a difference between two carriers. The first table is the one-rail,
+one-worker half of PERF-001; the spine measurement that completes it follows.
+What is not here, and why, is at the bottom.
 
 ## Environment
 
@@ -113,6 +114,49 @@ Each run reports its own `datagram_bytes`, `cpu_user_ns`, and `cpu_sys_ns` in
 `notes`, so a result says which path it describes without a reader having to
 reconstruct the configuration.
 
+## The spine measurement: workers against rails
+
+Ruling 6's hypothesis: one connection with W payload workers retains a
+serialized packet-number, loss-detection, and ACK spine, and tops out below W
+provisioned connections carrying one worker each. Same workload, host, and seed
+as above, 512 MB, three runs per cell, medians, source commit `1c72173`. The
+W=1 row is the sequential path and anchors each curve; every W>1 cell runs the
+ranged path (ADR-0025), which pays its own bundle framing and whole-object
+receive staging, so the comparison the hypothesis is about is shared against
+provisioned at the same W, never W=1 against anything.
+
+| carrier | datagram | W | shared Gbit/s | provisioned Gbit/s |
+| --- | --- | --- | --- | --- |
+| MsQuic | segmented | 1 | 11.07 | |
+| MsQuic | segmented | 2 | 8.94 | 8.83 |
+| MsQuic | segmented | 4 | 8.01 | 7.51 |
+| quiche | 1350 | 1 | 1.74 | |
+| quiche | 1350 | 2 | 1.54 | 1.58 |
+| quiche | 1350 | 4 | 1.43 | 2.51 |
+| quiche | 32768 | 1 | 6.87 | |
+| quiche | 32768 | 2 | 5.79 | 7.19 |
+| quiche | 32768 | 4 | 5.21 | 8.65 |
+
+Spreads run 1.03-1.62x; the quiche W=4 rows, where the claims below live, hold
+1.05-1.11x. Provisioned cells carry `rails=provisioned-multi-rail` in `notes`.
+
+- **For quiche the hypothesis holds, at both datagram sizes.** The shared
+  connection loses throughput as workers rise (6.87 to 5.79 to 5.21 at 32768)
+  while rails gain it (6.87 to 7.19 to 8.65); at W=4 rails lead 1.66x at 32768
+  and 1.75x at 1350, far outside the twenty-percent band ruling 6 set for run
+  variance. Each quiche connection is one socket-owning pump thread
+  (ADR-0024), CPU-bound per packet, so W connections are W pumps.
+- **For MsQuic it does not hold.** Shared and provisioned are the same number
+  inside their spreads at both worker counts, and both sit below the
+  one-worker anchor: MsQuic's single connection was never the ceiling here.
+- **The host is not the ceiling.** The heaviest cell spends about 12 s of CPU
+  on a 20-CPU host inside a 1.6 s transfer; the flat MsQuic curves are not
+  machine saturation.
+- **The ranged path itself costs.** MsQuic user CPU rises from 0.91 s
+  sequential to 1.59 s ranged on the same object, and W=2 throughput drops
+  about 20% with it. The step from W=1 to W=2 changes the path, not just the
+  worker count, which is why the anchors are context and not a curve point.
+
 ## Two-machine confirmation
 
 Labeled and never mixed with the loopback numbers above: this is a different
@@ -182,20 +226,19 @@ VOT_BENCH_ROLE=send VOT_BENCH_CONNECT=192.168.1.131:4433 \
 
 ## What this does not cover
 
-**No default backend is selected here.** That is ADR-0026, and it should not be
-written from this table alone: two of PERF-001's three acceptance criteria are
-still unmeasured, and one of them could move the answer.
+**The default backend is ADR-0026's ruling, not this report's.** All three
+acceptance criteria are now measured here:
+`one_rail_one_worker_and_multi_worker_measured` by the first table and the
+spine matrix, `provisioned_multi_rail_labeled` by the provisioned cells and
+their notes label, and `serialized_spine_hypothesis_tested` by the shared and
+provisioned curves and the per-carrier verdict above. What remains uncovered:
 
-- `one_rail_one_worker_and_multi_worker_measured`: the one-worker half only.
-  Multi-worker needs the driver to send proof-bearing ranges, whose groundwork
-  landed as ADR-0025 and the range-proof entry points in both proof crates.
-- `provisioned_multi_rail_labeled`: not measured. It splits one object across
-  several connections and needs the same range path.
-- `serialized_spine_hypothesis_tested`: not tested, and it is the criterion that
-  could change the choice. It predicts that payload workers sharing one
-  connection top out below independent rails, which is a claim about the
-  connection's packet-number and ACK spine rather than about either engine's
-  single-stream speed.
+- The spine matrix is loopback only. Role mode carries one worker, so the
+  multi-worker curves have no two-machine confirmation; a wire spine run needs
+  a ranged role mode that does not exist yet.
+- Every multi-worker number pays the ranged path's own framing and staging, so
+  cross-path comparisons against the sequential rows conflate path and worker
+  count; only same-W cells are commensurable.
 
 **Nothing here weighs what is not speed.** ADR-0012 isolates MsQuic because it
 is a C FFI dependency that requires unsafe code, is pinned to a git revision,
@@ -207,9 +250,10 @@ five times the throughput was ours to set on quiche, and MsQuic offers no
 equivalent lever. A default chosen on throughput alone is choosing on one axis
 of several.
 
-One further caveat for whoever writes ADR-0026: `TransportAdapter` takes
+One caveat the spine measurement accounted for: `TransportAdapter` takes
 `&mut self`, so several workers cannot submit through one adapter concurrently
 without a lock, while separate connections each have their own adapter. Multi-
-worker and multi-rail therefore differ in more than the connection count, and
-the spine measurement has to account for that or it will attribute the driver's
+worker and multi-rail therefore differ in more than the connection count; the
+spine section reads its curves per carrier at the same W so as not to attribute
+the driver's
 serialization to the carrier's.

@@ -245,6 +245,13 @@ impl Config {
         }
         config.set_max_recv_udp_payload_size(self.max_datagram_bytes);
         config.set_max_send_udp_payload_size(self.max_datagram_bytes);
+        // The configured datagram is a ceiling, not a claim about the path.
+        // Without discovery, a path narrower than the ceiling completes the
+        // handshake at 1200 bytes and then blackholes every data packet, and
+        // only the caller's budget turns the hang into an error; with it, the
+        // connection probes and settles under the ceiling the way MsQuic
+        // does unaided. The bakeoff report records both behaviors.
+        config.discover_pmtu(true);
         // The advertised control-frame bound has to fit in one stream's flow
         // control, or a conforming frame is refused by the carrier after the
         // session promised to accept it.
@@ -643,7 +650,13 @@ fn drive(
             write_outbox(&mut conn, stream);
         }
         // A socket that will not take a packet is a carrier that has gone.
-        let Ok(paced) = send_all(socket, &mut conn, &mut out, datagram_bytes, offload) else {
+        // The burst slot is the connection's own current packet size, not the
+        // configured ceiling: with path-MTU discovery the connection settles
+        // under the ceiling on a narrow path, and slots cut to the ceiling
+        // would make every settled packet "short", flushing the burst per
+        // packet and quietly giving the offload back.
+        let segment = conn.max_send_udp_payload_size();
+        let Ok(paced) = send_all(socket, &mut conn, &mut out, segment, offload) else {
             return Ok(());
         };
 

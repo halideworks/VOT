@@ -228,8 +228,16 @@ spread is one cold first run at 1841 Mbit/s; runs two through five hold
 per-packet cost, not engine work: quiche's sender system time fell from
 7.09 s to 0.74 s and its receiver's from 4.83 s to 0.25 s, into MsQuic's
 territory on both ends. ADR-0026's consequences clause names this result as
-what reopens the default question; the path-MTU blackhole it also names
-remains open, and remains quiche's to answer first.
+what reopens the default question; the path-MTU blackhole it also names is
+closed as of `discover_pmtu` landing in the pump: the 1350-byte default over
+this 1280-byte path, the exact configuration the finding above records as a
+hang, now probes, settles, and carries 512 MB at a 2519 Mbit/s median over
+five runs, even with the pinned-1252 row above. The burst slots follow the
+connection's discovered packet size rather than the configured ceiling,
+because ceiling-cut slots made every settled packet short and gave the
+offload back one flush at a time, which cost 19% until it was caught. The
+first run after the path goes quiet is cold here too (1694; the other four
+hold 2476-2572).
 
 ### What the path does without VOT
 

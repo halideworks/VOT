@@ -22,8 +22,14 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # a free function inside the module is not. The file is named instead. It is
 # measured where it compiles: the quiche-live job runs its tests, and a live
 # mutation run belongs beside the msquic one when its survivors are classified.
+#
+# The bench driver's quiche carrier is the same case as the pump: it compiles
+# only under a feature this configuration does not enable. It is plumbing by
+# design, so that everything a run's numbers depend on stays in `lib.rs` where
+# this gate measures it, and its own loopback tests run in the quiche-live job.
 exclude_globs = [
   "crates/vot-transport-quiche/src/live.rs",
+  "crates/vot-bench-driver/src/backend_quiche.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

@@ -6,9 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# The quiche backend, which carries the case over a real socket. Off by default
+# because it builds BoringSSL through cmake, which costs minutes where the rest
+# of this workspace costs seconds.
+quiche = ["dep:vot-transport-quiche"]
+
 [dependencies]
+vot-codec = { path = "../vot-codec" }
 vot-scheduler = { path = "../vot-scheduler" }
 vot-transport-api = { path = "../vot-transport-api" }
+vot-transport-quiche = { path = "../vot-transport-quiche", features = [
+  "live",
+], optional = true }
 vot-transport-sim = { path = "../vot-transport-sim" }
 vot-verifier = { path = "../vot-verifier" }
 

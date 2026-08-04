@@ -235,10 +235,24 @@ jobs:
           cargo +1.88.0 test -p vot-transport-quiche --features live --locked
           cargo +1.88.0 test -p vot-transport-quiche --features live --release --locked
 
+      # The benchmark driver's quiche carrier compiles only under this feature,
+      # so this job is the only one that sees it. Both profiles for the same
+      # reason the pump runs in both: a threaded carrier fails differently
+      # under a debug assertion and under an optimisation.
+      - name: Test the benchmark driver over that carrier
+        run: |
+          cargo +1.88.0 test -p vot-bench-driver --features quiche --locked
+          cargo +1.88.0 test -p vot-bench-driver --features quiche --release --locked
+
       - name: Lint the pump
         run: >-
           cargo +1.88.0 clippy -p vot-transport-quiche --all-targets
           --features live --locked -- -D warnings
+
+      - name: Lint the driver's carrier
+        run: >-
+          cargo +1.88.0 clippy -p vot-bench-driver --all-targets
+          --features quiche --locked -- -D warnings
 
   s3-live:
     runs-on: ubuntu-24.04

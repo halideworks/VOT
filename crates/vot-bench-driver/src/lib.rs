@@ -9,12 +9,17 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use vot_scheduler::ReliableReceiver;
-use vot_transport_api::{Event, StreamId, SubjectId, TransportAdapter};
+use vot_transport_api::{
+    Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
+};
 use vot_transport_sim::{Impairment, SimulatorAdapter};
 use vot_verifier::{StreamVerifier, Suite};
+
+#[cfg(feature = "quiche")]
+mod backend_quiche;
 
 /// Suite identifiers as the benchmark contract spells them.
 const SUITE_BLAKE3: &str = "blake3-bao64";
@@ -30,6 +35,56 @@ const SUBMIT_BATCH_RECORDS: usize = 16;
 /// Bytes drawn from the generator at a time.
 const WORD_BYTES: usize = 8;
 
+/// The lane the transfer uses.
+///
+/// One lane, because the case describes one object. A second would measure how
+/// the carrier schedules between lanes, which is a different question from the
+/// one the matrix asks.
+const TRANSFER_LANE: StreamId = StreamId(1);
+
+/// The shortest wait after a delivery that moved nothing, and the longest.
+///
+/// How long the driver waits changes what it measures, which is why this backs
+/// off rather than picking one interval. Polling a carrier that has nothing to
+/// give contends with the thread that would be filling it: measured over a
+/// 512 MB object, a fixed 200 microsecond wait reported a median of about 1000
+/// Mbit/s with a 31 percent spread, and fixed waits of 1 to 5 milliseconds
+/// reported about 1500 with a 9 percent spread. Waiting less made the carrier
+/// slower and the result noisier.
+///
+/// A fixed long wait would then distort the small cases, where one wait is most
+/// of the run. Backing off from the short end gives a small object its answer
+/// without a millisecond of padding and a long one the interval where the
+/// driver is out of the carrier's way.
+const IDLE_WAIT_MIN: Duration = Duration::from_micros(16);
+const IDLE_WAIT_MAX: Duration = Duration::from_micros(1024);
+
+/// Doublings from [`IDLE_WAIT_MIN`] that reach [`IDLE_WAIT_MAX`].
+const IDLE_WAIT_DOUBLINGS: u32 = 6;
+const _: () =
+    assert!(IDLE_WAIT_MIN.as_micros() << IDLE_WAIT_DOUBLINGS == IDLE_WAIT_MAX.as_micros());
+
+/// Deliveries a transfer may make beyond one per record before its carrier is
+/// called stopped.
+///
+/// A count rather than a deadline, so the transfer ends by construction rather
+/// than only because a clock advanced. A run that reaches it is an error,
+/// because a partial transfer reported as a measurement is exactly what the
+/// benchmark contract exists to prevent.
+///
+/// Per record, with a floor, rather than a flat allowance. The budget is also
+/// how long a stopped carrier takes to be called stopped, at [`IDLE_WAIT_MAX`]
+/// a round, so a flat allowance made a one-record transfer wait as long as a
+/// gigabyte one. That is invisible in a healthy run and costs twenty seconds
+/// apiece under the mutation gate, where every test's carrier is stopped on
+/// purpose.
+///
+/// Both numbers are about eight times what was measured: 512 MB over loopback
+/// spends a few thousand rounds against a budget of 65,536, and a single record
+/// spends six to eight against 256.
+const ROUNDS_PER_RECORD: u64 = 8;
+const MIN_ROUNDS: u64 = 256;
+
 #[derive(Debug)]
 pub enum Error {
     /// A `VOT_BENCH_*` variable was absent, empty, or not a number.
@@ -43,6 +98,13 @@ pub enum Error {
     Verify(vot_verifier::VerifyError),
     /// No measured source for a required metric on this platform.
     Unmeasurable(&'static str),
+    /// A delivered record was not the frame it was submitted as. Only a carrier
+    /// that changed or truncated it on the way can produce this.
+    Corrupt,
+    /// The carrier used up its delivery budget with the object incomplete.
+    Stalled,
+    /// The carrier reported the connection gone before the object was whole.
+    Disconnected,
 }
 
 impl fmt::Display for Error {
@@ -60,6 +122,15 @@ impl fmt::Display for Error {
                     "{metric} has no measured source on this platform"
                 )
             }
+            Self::Corrupt => write!(
+                formatter,
+                "a delivered record was not the frame it was submitted as"
+            ),
+            Self::Stalled => write!(formatter, "the carrier stopped delivering"),
+            Self::Disconnected => write!(
+                formatter,
+                "the carrier reported the connection gone before the object was whole"
+            ),
         }
     }
 }
@@ -426,19 +497,309 @@ fn generator_nanos(config: &Config) -> Result<u64, Error> {
     Ok(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// What the transfer loop needs from a carrier, whether it loops back inside
+/// this process or crosses a socket to another endpoint.
+///
+/// The methods are plumbing on purpose. Everything that decides a number lives
+/// in this file, where the mutation gate measures it, so a backend cannot
+/// quietly change what a run means by implementing one of these differently.
+trait Carrier {
+    /// How the report names this carrier.
+    fn name(&self) -> &'static str;
+
+    /// Impairment fields this carrier describes but does not shape.
+    fn unmodelled(&self) -> &[&'static str];
+
+    /// The endpoint whose inbound bound the case's credit applies to.
+    ///
+    /// The receiving endpoint is the peer on a real carrier and the same object
+    /// on the simulator, so it is named rather than assumed.
+    fn receiving(&mut self) -> &mut dyn TransportAdapter;
+
+    /// Submits one framed record on the transfer lane.
+    ///
+    /// # Errors
+    /// Reports whatever the backend reports.
+    /// [`vot_transport_api::Error::OutboundQueueFull`] is backpressure rather
+    /// than a failure, and the caller decides what to do about it.
+    fn submit(&mut self, stream: StreamId, frame: &Payload)
+    -> Result<(), vot_transport_api::Error>;
+
+    /// Hands submitted records to the carrier.
+    ///
+    /// # Errors
+    /// Reports whatever the backend reports.
+    fn flush(&mut self) -> Result<(), vot_transport_api::Error>;
+
+    /// The next event the receiving endpoint has already been given.
+    fn poll_received(&mut self) -> Option<Event>;
+
+    /// Discards the sending endpoint's own events.
+    ///
+    /// A sender reports acknowledgements and connection state that this
+    /// transfer does not read. Leaving them queued would make the backend's
+    /// inbound bound the ceiling instead of the carrier.
+    fn drain_sent(&mut self);
+}
+
+/// The object bytes inside a delivered record frame.
+///
+/// A lane carries `DATA_RECORD` frames, and a carrier hands back the whole
+/// frame it was given, envelope included. The receiver verifies object bytes,
+/// so the envelope comes off here. Anything that is not exactly the one frame
+/// that was submitted came back changed, which is a carrier defect rather than
+/// a measurement.
+///
+/// # Errors
+/// Reports [`Error::Corrupt`] for a frame that does not decode, is not a data
+/// record, or does not account for the whole delivery.
+fn record_payload(frame: &[u8]) -> Result<&[u8], Error> {
+    let limits = vot_codec::DecodeLimits {
+        max_unknown_payload: 0,
+        max_frames: 1,
+    };
+    let (decoded, consumed) = vot_codec::decode_one(frame, limits).map_err(|_| Error::Corrupt)?;
+    match decoded {
+        vot_codec::DecodedFrame::Known {
+            frame_type: vot_codec::frame_type::DATA_RECORD,
+            payload,
+        } if consumed == frame.len() => Ok(payload),
+        _ => Err(Error::Corrupt),
+    }
+}
+
 /// Flushes submitted records and feeds every delivered one to the receiver.
-fn deliver(
-    adapter: &mut SimulatorAdapter,
+///
+/// Returns the object bytes delivered, which is what tells a caller whether the
+/// carrier is still making progress. It is not the same as the bytes the
+/// carrier moved: the envelope is not part of the object.
+fn deliver<C: Carrier>(
+    carrier: &mut C,
     receiver: &mut ReliableReceiver,
     subject: SubjectId,
-) -> Result<(), Error> {
-    adapter.flush()?;
-    while let Some(event) = adapter.poll() {
-        if let Event::Reliable { bytes, .. } = event {
-            receiver.receive(subject, &bytes)?;
+) -> Result<u64, Error> {
+    carrier.flush()?;
+    let mut delivered = 0_u64;
+    while let Some(event) = carrier.poll_received() {
+        match event {
+            Event::Reliable { bytes, .. } => {
+                let payload = record_payload(&bytes)?;
+                receiver.receive(subject, payload)?;
+                delivered = delivered.saturating_add(payload.len() as u64);
+            }
+            // The rest of this object is never arriving. Reporting it now is
+            // the difference between a run that fails with the reason and one
+            // that waits out the stall bound and reports a slower carrier.
+            Event::Disconnected(_) => return Err(Error::Disconnected),
+            _ => {}
         }
     }
-    Ok(())
+    carrier.drain_sent();
+    Ok(delivered)
+}
+
+/// Delivers once, and waits if that moved nothing.
+///
+/// The carrier's own thread is what makes progress, so a caller that found
+/// nothing has nothing to do until that thread has run. Waiting rather than
+/// spinning matters here more than it usually would: a benchmark that burns a
+/// core polling takes it from the carrier it is measuring.
+///
+/// The waits are counted, which is worth reporting. A transfer that spent most
+/// of its deliveries finding nothing was waiting on the carrier, and one that
+/// never waited was never ahead of it.
+///
+/// # Errors
+/// Propagates delivery failures.
+fn deliver_or_wait<C: Carrier>(
+    carrier: &mut C,
+    receiver: &mut ReliableReceiver,
+    subject: SubjectId,
+    idle_waits: &mut u64,
+) -> Result<u64, Error> {
+    let progress = deliver(carrier, receiver, subject)?;
+    if progress == 0 {
+        *idle_waits = idle_waits.saturating_add(1);
+        std::thread::sleep(idle_wait(*idle_waits));
+    }
+    Ok(progress)
+}
+
+/// How long to wait once this transfer has had `idle_waits` deliveries that
+/// moved nothing.
+///
+/// Doubling from [`IDLE_WAIT_MIN`], and never past [`IDLE_WAIT_MAX`].
+///
+/// The count is the transfer's total rather than a run of them, so the wait
+/// climbs once and stays. Backing off from a run instead was measured and is
+/// worse on both counts: deliveries that do find data reset it, this workload
+/// arrives in bursts, and the driver spends the transfer in the short waits
+/// that measure a slower and noisier carrier. It also leaves the wait free to
+/// stay short for an unbounded number of deliveries, which is the only reason
+/// the loops' round budget would need a wall clock to go with it.
+fn idle_wait(idle_waits: u64) -> Duration {
+    let doublings = u32::try_from(idle_waits.saturating_sub(1))
+        .unwrap_or(IDLE_WAIT_DOUBLINGS)
+        .min(IDLE_WAIT_DOUBLINGS);
+    IDLE_WAIT_MIN
+        .saturating_mul(1_u32 << doublings)
+        .min(IDLE_WAIT_MAX)
+}
+
+/// What one transfer spent, beyond the bytes it moved.
+///
+/// Every field is observed rather than derived, and each answers a question a
+/// reader of the result would otherwise have to guess at: how often the driver
+/// deliberately handed records over, how often the carrier refused one, how
+/// often the driver had nothing to do but wait, and how much more than the
+/// object went onto the wire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Tally {
+    flushes: u64,
+    backpressure_waits: u64,
+    idle_waits: u64,
+    wire_bytes: u64,
+}
+
+/// Renders what a run measured, in the field order the contract's readers know.
+fn transfer_notes(
+    carrier: &impl Carrier,
+    receiver: &ReliableReceiver,
+    credit: Credit,
+    tally: Tally,
+    generator_ns: u64,
+) -> String {
+    let mut notes = format!(
+        concat!(
+            "backend={};path=sequential-reliable;",
+            "staging_peak_bytes={};credit_bytes={};credit_mode={};",
+            "flushes={};backpressure_waits={};idle_waits={};wire_bytes={};generator_ns={}"
+        ),
+        carrier.name(),
+        receiver.peak_staging(),
+        receiver.advertised_credit(),
+        credit.as_str(),
+        tally.flushes,
+        tally.backpressure_waits,
+        tally.idle_waits,
+        tally.wire_bytes,
+        generator_ns
+    );
+    if !carrier.unmodelled().is_empty() {
+        notes.push_str(";unmodelled_impairment=");
+        notes.push_str(&carrier.unmodelled().join(","));
+    }
+    notes.push_str(";cycles=unmeasured");
+    notes
+}
+
+/// The deliveries a transfer may make in a loop whose end depends on the
+/// carrier, before that carrier is called stopped.
+///
+/// One per record, because a healthy transfer may need that many, plus a flat
+/// allowance for the deliveries that find nothing while the carrier is still
+/// moving bytes. At [`IDLE_WAIT`] each, the allowance is a couple of minutes of
+/// a carrier delivering nothing, which no case on any path this benchmark runs
+/// reaches while healthy.
+///
+/// The budget is spent and counted by the loops themselves rather than by
+/// anything they call. A loop whose bound lives somewhere else is not bounded:
+/// whatever removes the bound leaves a benchmark that hangs, which is worse
+/// than one that fails.
+fn round_budget(config: &Config) -> u64 {
+    let records = config
+        .object_bytes
+        .div_ceil(config.record_bytes.max(1) as u64);
+    records.saturating_mul(ROUNDS_PER_RECORD).max(MIN_ROUNDS)
+}
+
+/// Whether the carrier was given the receiver's credit, or bounds what it
+/// accepts at construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Credit {
+    Set,
+    Constructed,
+}
+
+impl Credit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Constructed => "constructed",
+        }
+    }
+}
+
+/// Applies the receiver's credit to the endpoint that will enforce it.
+///
+/// A carrier that fixes its inbound bound at construction reports
+/// `Unsupported` rather than accepting a credit it would not apply, which
+/// ADR-0024 requires of the quiche backend: accepting the call and doing
+/// nothing would let an endpoint advertise a credit no carrier enforces. Which
+/// of the two happened is recorded, because the report must never present a
+/// bound nothing applied. `credit_bytes` means the same thing either way: what
+/// the receiver advertised, which the receiver itself enforces by refusing
+/// staging beyond it.
+///
+/// # Errors
+/// Propagates any error other than `Unsupported`.
+fn enforced_credit(endpoint: &mut dyn TransportAdapter, credit: u64) -> Result<Credit, Error> {
+    match endpoint.set_receive_credit(credit) {
+        Ok(()) => Ok(Credit::Set),
+        Err(vot_transport_api::Error::Unsupported) => Ok(Credit::Constructed),
+        Err(other) => Err(Error::Transport(other)),
+    }
+}
+
+/// The in-process loopback carrier.
+struct SimulatorCarrier {
+    adapter: SimulatorAdapter,
+    unmodelled: Vec<&'static str>,
+}
+
+impl SimulatorCarrier {
+    fn new(config: &Config) -> Result<Self, Error> {
+        let (impairment, unmodelled) = simulator_impairment(config)?;
+        Ok(Self {
+            adapter: SimulatorAdapter::with_impairment(impairment)?,
+            unmodelled,
+        })
+    }
+}
+
+impl Carrier for SimulatorCarrier {
+    fn name(&self) -> &'static str {
+        "simulator"
+    }
+
+    fn unmodelled(&self) -> &[&'static str] {
+        &self.unmodelled
+    }
+
+    fn receiving(&mut self) -> &mut dyn TransportAdapter {
+        &mut self.adapter
+    }
+
+    fn submit(
+        &mut self,
+        stream: StreamId,
+        frame: &Payload,
+    ) -> Result<(), vot_transport_api::Error> {
+        self.adapter
+            .send_reliable_shared(stream, Payload::clone(frame))
+    }
+
+    fn flush(&mut self) -> Result<(), vot_transport_api::Error> {
+        self.adapter.flush()
+    }
+
+    fn poll_received(&mut self) -> Option<Event> {
+        self.adapter.poll()
+    }
+
+    // The simulator sends and receives through one object, so every event it
+    // has was already offered to `poll_received`.
+    fn drain_sent(&mut self) {}
 }
 
 /// Runs one case and returns what was measured.
@@ -447,12 +808,6 @@ fn deliver(
 /// Propagates transport, receive, and verification failures, and rejects any
 /// case this driver cannot run honestly.
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
-    if config.backend != "simulator" {
-        return Err(Error::Unsupported(format!(
-            "backend {} has no assembled transport yet; only simulator is implemented",
-            config.backend
-        )));
-    }
     if config.workers != 1 {
         // Parallel verification of one object needs the proof-bearing range
         // path, which retains every accepted range. Reporting a worker count
@@ -464,38 +819,126 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
         )));
     }
 
+    match config.backend.as_str() {
+        "simulator" => transfer(config, SimulatorCarrier::new(config)?),
+        #[cfg(feature = "quiche")]
+        "quiche" => transfer(config, backend_quiche::QuicheCarrier::connected(config)?),
+        other => Err(Error::Unsupported(format!(
+            "backend {other} has no assembled transport in this build"
+        ))),
+    }
+}
+
+/// Carries one object over `carrier` and returns what was measured.
+///
+/// Every backend runs this same loop, so a difference between two results is a
+/// difference between two carriers rather than between two transfer
+/// strategies. The carrier is already connected: a handshake inside the timed
+/// section would be reported as transfer time.
+///
+/// # Errors
+/// Propagates transport, receive, and verification failures, and reports a
+/// carrier that stopped delivering rather than returning a partial transfer.
+fn transfer<C: Carrier>(config: &Config, carrier: C) -> Result<Measurement, Error> {
+    transfer_within(config, carrier, round_budget(config))
+}
+
+/// [`transfer`] with the delivery budget named, so a test can drive a carrier
+/// that stops without spending the budget a real run is given.
+fn transfer_within<C: Carrier>(
+    config: &Config,
+    mut carrier: C,
+    budget: u64,
+) -> Result<Measurement, Error> {
     let subject = subject_of(config)?;
     let generator_ns = generator_nanos(config)?;
-    let (impairment, unmodelled) = simulator_impairment(config)?;
-    let mut adapter = SimulatorAdapter::with_impairment(impairment)?;
     let mut receiver = receiver_for(config)?;
     receiver.begin(subject)?;
-    adapter.set_receive_credit(receiver.advertised_credit())?;
+    let credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;
 
     let mut source = ObjectSource::new(config.seed);
     let mut record = Vec::with_capacity(config.record_bytes);
+    let mut frame = Vec::with_capacity(config.record_bytes + MAX_FRAME_ENVELOPE_BYTES);
     let mut bytes_sent = 0_u64;
+    let mut delivered = 0_u64;
     let mut batch = 0_usize;
-    let mut flushes = 0_u64;
+    let mut tally = Tally::default();
+    // The two loops whose end depends on the carrier spend one budget between
+    // them, so both are bounded however the carrier behaves.
+    let mut rounds = 0_u64;
 
     let started = Instant::now();
     for take in record_lengths(config.object_bytes, config.record_bytes)? {
         source.fill(&mut record, take);
-        adapter.send_reliable(StreamId(1), &record)?;
+        frame.clear();
+        vot_codec::encode_frame(vot_codec::frame_type::DATA_RECORD, &record, &mut frame)
+            .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+        // Shared once. The submission contract takes a shared payload precisely
+        // so a record crosses into the backend without being copied again, and
+        // a driver that copied every record would measure itself as much as the
+        // carrier.
+        let shared = shared_payload(&frame);
+        loop {
+            match carrier.submit(TRANSFER_LANE, &shared) {
+                Ok(()) => break,
+                // A full queue is backpressure, not a failure: what is already
+                // submitted has to move before more will fit. Delivering is
+                // what makes room, so the record is offered again after it.
+                Err(vot_transport_api::Error::OutboundQueueFull) => {
+                    // This loop ends only when the carrier takes the record, so
+                    // it keeps its own bound. Spending it here rather than
+                    // inside what it calls is what makes the loop bounded
+                    // whatever that call does.
+                    rounds = rounds.saturating_add(1);
+                    if rounds > budget {
+                        return Err(Error::Stalled);
+                    }
+                    tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
+                    tally.flushes = tally.flushes.saturating_add(1);
+                    delivered = delivered.saturating_add(deliver_or_wait(
+                        &mut carrier,
+                        &mut receiver,
+                        subject,
+                        &mut tally.idle_waits,
+                    )?);
+                }
+                Err(other) => return Err(Error::Transport(other)),
+            }
+        }
         bytes_sent = bytes_sent.saturating_add(record.len() as u64);
+        tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
         batch = batch.saturating_add(1);
-        // Flushing in batches keeps the adapter queue and the receiver's
+        // Flushing in batches keeps the carrier's queue and the receiver's
         // staging bounded, so peak memory does not track object size.
         if batch >= SUBMIT_BATCH_RECORDS {
-            flushes = flushes.saturating_add(1);
-            deliver(&mut adapter, &mut receiver, subject)?;
+            tally.flushes = tally.flushes.saturating_add(1);
+            delivered = delivered.saturating_add(deliver(&mut carrier, &mut receiver, subject)?);
             batch = 0;
         }
     }
     if batch != 0 {
-        flushes = flushes.saturating_add(1);
-        deliver(&mut adapter, &mut receiver, subject)?;
+        tally.flushes = tally.flushes.saturating_add(1);
+        delivered = delivered.saturating_add(deliver(&mut carrier, &mut receiver, subject)?);
     }
+
+    // Every record has been submitted, so whatever has not arrived is in
+    // flight. A carrier that delivers immediately leaves this loop without
+    // entering it; one that crosses a socket stays here until the object is
+    // whole. The budget is what ends it either way, so a slow path is waited
+    // out and a stopped one is an error rather than a partial result.
+    while delivered < config.object_bytes {
+        rounds = rounds.saturating_add(1);
+        if rounds > budget {
+            return Err(Error::Stalled);
+        }
+        delivered = delivered.saturating_add(deliver_or_wait(
+            &mut carrier,
+            &mut receiver,
+            subject,
+            &mut tally.idle_waits,
+        )?);
+    }
+
     receiver.finish(subject)?;
     let elapsed = started.elapsed();
 
@@ -505,21 +948,7 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
         ));
     }
 
-    let mut notes = format!(
-        concat!(
-            "backend=simulator;path=sequential-reliable;",
-            "staging_peak_bytes={};credit_bytes={};flushes={};generator_ns={}"
-        ),
-        receiver.peak_staging(),
-        receiver.advertised_credit(),
-        flushes,
-        generator_ns
-    );
-    if !unmodelled.is_empty() {
-        notes.push_str(";unmodelled_impairment=");
-        notes.push_str(&unmodelled.join(","));
-    }
-    notes.push_str(";cycles=unmeasured");
+    let notes = transfer_notes(&carrier, &receiver, credit, tally, generator_ns);
 
     Ok(Measurement {
         bytes_sent,
@@ -536,10 +965,12 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Error, ImpairmentCase, Measurement, ObjectSource, escape, measure, parse_vm_hwm,
-        record_lengths,
+        Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, StreamId,
+        TRANSFER_LANE, TransportAdapter, escape, measure, parse_vm_hwm, record_lengths,
+        record_payload, shared_payload, transfer_within,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use vot_transport_api::Event;
     use vot_verifier::Suite;
 
     fn hex(bytes: &[u8]) -> String {
@@ -569,6 +1000,460 @@ mod tests {
         }
     }
 
+    /// An endpoint that answers the credit call however a test needs.
+    struct CreditEndpoint(Result<(), vot_transport_api::Error>);
+
+    impl TransportAdapter for CreditEndpoint {
+        fn send_control(&mut self, _frame: &[u8]) -> Result<(), vot_transport_api::Error> {
+            Ok(())
+        }
+
+        fn send_reliable(
+            &mut self,
+            _stream: StreamId,
+            _record: &[u8],
+        ) -> Result<(), vot_transport_api::Error> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Option<Event> {
+            None
+        }
+
+        fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), vot_transport_api::Error> {
+            self.0
+        }
+    }
+
+    /// A carrier that behaves the way one crossing a socket does: a submission
+    /// can be refused, delivery can lag behind submission or stop altogether,
+    /// and the credit call can be answered any of the ways a backend answers
+    /// it.
+    ///
+    /// The simulator does none of those things. It accepts every submission and
+    /// delivers before `flush` returns, so without this double the backpressure,
+    /// completion, stall, and credit paths would be exercised only under a
+    /// feature the mutation matrix does not build, and the gate would report
+    /// them as untested code in a required package.
+    struct TestCarrier {
+        /// Frames submitted and not yet released to the receiving endpoint.
+        inflight: VecDeque<Payload>,
+        /// Frames released and not yet polled.
+        arrived: VecDeque<Payload>,
+        /// Submissions to refuse before accepting one.
+        refuse: usize,
+        /// Deliveries that release nothing before the queue starts moving.
+        lag: usize,
+        /// Whether the carrier has stopped for good.
+        stalled: bool,
+        /// Whether to change the first frame on its way through.
+        corrupt: bool,
+        /// Whether the receiving endpoint reports the connection gone.
+        disconnect: bool,
+        endpoint: CreditEndpoint,
+        /// Events the sending endpoint has raised and the driver has not taken.
+        ///
+        /// A real backend holds these in a bounded queue and refuses
+        /// submissions once it is full, which is how an undrained sender
+        /// becomes the ceiling instead of the carrier.
+        undrained: usize,
+    }
+
+    impl TestCarrier {
+        fn new() -> Self {
+            Self {
+                inflight: VecDeque::new(),
+                arrived: VecDeque::new(),
+                refuse: 0,
+                lag: 0,
+                stalled: false,
+                corrupt: false,
+                disconnect: false,
+                endpoint: CreditEndpoint(Ok(())),
+                undrained: 0,
+            }
+        }
+    }
+
+    /// Sender events this double holds before it refuses to take more.
+    ///
+    /// Smaller than a submission batch, so a driver that never drained its
+    /// sender would reach it inside the first batch rather than only on a long
+    /// object.
+    const SENDER_EVENT_CAPACITY: usize = 4;
+
+    /// Records the draining test sends. More than the sender queue holds, or it
+    /// would pass whether the driver drained or not.
+    const DRAIN_TEST_RECORDS: usize = 8;
+    const _: () = assert!(DRAIN_TEST_RECORDS > SENDER_EVENT_CAPACITY);
+
+    impl Carrier for TestCarrier {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn unmodelled(&self) -> &[&'static str] {
+            &[]
+        }
+
+        fn receiving(&mut self) -> &mut dyn TransportAdapter {
+            &mut self.endpoint
+        }
+
+        fn submit(
+            &mut self,
+            _stream: StreamId,
+            frame: &Payload,
+        ) -> Result<(), vot_transport_api::Error> {
+            if self.refuse != 0 {
+                self.refuse -= 1;
+                return Err(vot_transport_api::Error::OutboundQueueFull);
+            }
+            // Every submission raises an acknowledgement the sender queues for
+            // a caller that never reads it. Once the queue is full the backend
+            // has nowhere to put the next one, so the submission is refused.
+            if self.undrained >= SENDER_EVENT_CAPACITY {
+                return Err(vot_transport_api::Error::OutboundQueueFull);
+            }
+            self.undrained += 1;
+            self.inflight.push_back(Payload::clone(frame));
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), vot_transport_api::Error> {
+            if self.stalled {
+                return Ok(());
+            }
+            if self.lag != 0 {
+                self.lag -= 1;
+                return Ok(());
+            }
+            while let Some(frame) = self.inflight.pop_front() {
+                if self.corrupt {
+                    self.corrupt = false;
+                    let mut changed = frame.to_vec();
+                    // The envelope stays intact and the payload does not, which
+                    // is the corruption a length check alone would miss.
+                    changed.pop();
+                    self.arrived.push_back(shared_payload(&changed));
+                } else {
+                    self.arrived.push_back(frame);
+                }
+            }
+            Ok(())
+        }
+
+        fn poll_received(&mut self) -> Option<Event> {
+            if self.disconnect {
+                self.disconnect = false;
+                return Some(Event::Disconnected(vot_transport_api::ConnectionId(1)));
+            }
+            self.arrived.pop_front().map(|bytes| Event::Reliable {
+                stream: TRANSFER_LANE,
+                sequence: 0,
+                bytes,
+            })
+        }
+
+        fn drain_sent(&mut self) {
+            self.undrained = 0;
+        }
+    }
+
+    /// The delivery budget a test gives a carrier. Generous enough that a
+    /// healthy transfer of the sizes here finishes well inside it, and small
+    /// enough that a carrier which stops is reported at once.
+    const TEST_BUDGET: u64 = 64;
+
+    #[test]
+    fn the_wait_backs_off_from_the_short_end_and_stops_at_the_long_one() {
+        // The first wait is the shortest, so a small object is not padded by a
+        // millisecond it did not need, and the last is the longest, so a long
+        // transfer reaches the interval where the driver is out of the
+        // carrier's way. Both ends are pinned because the measured throughput
+        // of every carrier depends on them.
+        assert_eq!(super::idle_wait(1), super::IDLE_WAIT_MIN);
+        assert_eq!(super::idle_wait(2), super::IDLE_WAIT_MIN * 2);
+        assert_eq!(
+            super::idle_wait(1 + u64::from(super::IDLE_WAIT_DOUBLINGS)),
+            super::IDLE_WAIT_MAX
+        );
+        // Past the last doubling it stays there rather than growing, including
+        // at a count no transfer reaches. The wait is what bounds how long the
+        // round budget can take, so it must have a ceiling at every input.
+        for waits in [2 + u64::from(super::IDLE_WAIT_DOUBLINGS), 1_000, u64::MAX] {
+            assert_eq!(super::idle_wait(waits), super::IDLE_WAIT_MAX);
+        }
+        // A count of zero never reaches the wait, but it must not be longer
+        // than the first one if it ever does.
+        assert_eq!(super::idle_wait(0), super::IDLE_WAIT_MIN);
+    }
+
+    #[test]
+    fn the_wait_does_not_start_over_when_a_delivery_moves_something() {
+        // The count is the transfer's total, so a burst of records does not put
+        // the driver back into the short waits that measure a slower carrier.
+        // A carrier that lags, delivers, and lags again is still waited on at
+        // the interval the transfer has reached.
+        let mut carrier = TestCarrier::new();
+        carrier.lag = 3;
+        let config = case(2 * 65_536, Suite::Blake3Bao64);
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+        // Three lagging deliveries: the batch flush that closes the submission
+        // loop takes the first and is not a wait, and the completion loop takes
+        // the other two before the records are released. Exact rather than a
+        // floor, because the count is what chooses every wait's length.
+        assert_eq!(note_field(&measured.notes, "idle_waits"), 2);
+    }
+
+    #[test]
+    fn a_backpressured_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
+        // The submission loop keeps its own bound, so its edge has to be pinned
+        // separately from the completion loop's. Four refusals need four
+        // rounds: a budget of four is exactly enough and three is exactly too
+        // little. A bound that fired one round early would fail a transfer
+        // whose carrier was applying backpressure rather than stopping.
+        let config = case(65_536, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.refuse = 4;
+        let measured = transfer_within(&config, carrier, 4).unwrap();
+        assert_eq!(measured.verified_bytes, 65_536);
+        assert_eq!(note_field(&measured.notes, "backpressure_waits"), 4);
+
+        let mut same = TestCarrier::new();
+        same.refuse = 4;
+        assert!(matches!(
+            transfer_within(&config, same, 3),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn the_budget_is_per_record_above_its_floor_and_the_floor_below_it() {
+        // What a real run is given, which no test that names its own budget
+        // exercises. Too small a budget calls a healthy carrier stopped, and
+        // too large a one makes a stopped carrier take as long to report as a
+        // gigabyte takes to carry.
+        let config = case(64 * 65_536, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&config), 64 * super::ROUNDS_PER_RECORD);
+
+        // A short final record still needs deliveries of its own.
+        let ragged = case(64 * 65_536 + 1, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&ragged), 65 * super::ROUNDS_PER_RECORD);
+
+        // Under the floor, the floor. One record over a real socket takes more
+        // deliveries than one, so the per-record term alone would call a
+        // healthy carrier stopped.
+        let small = case(1, Suite::Blake3Bao64);
+        assert_eq!(super::round_budget(&small), super::MIN_ROUNDS);
+    }
+
+    /// The floor is a floor: below it the per-record term would decide, and one
+    /// record over a real socket takes more deliveries than that.
+    const _: () = assert!(super::MIN_ROUNDS > super::ROUNDS_PER_RECORD);
+
+    #[test]
+    fn a_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
+        // One record, and a carrier that releases it one delivery late. The
+        // completion loop therefore needs exactly one delivery, so a budget of
+        // one is exactly enough and a budget of none is exactly too little.
+        // Between them they pin the edge: a bound that fired one delivery early
+        // would fail a transfer that had not stopped.
+        let config = case(65_536, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.lag = 1;
+        assert_eq!(
+            transfer_within(&config, carrier, 1).unwrap().verified_bytes,
+            65_536
+        );
+
+        let mut same = TestCarrier::new();
+        same.lag = 1;
+        assert!(matches!(
+            transfer_within(&config, same, 0),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn waiting_on_the_carrier_is_counted_and_not_waiting_is_counted_as_none() {
+        // The simulator delivers before flush returns, so no delivery of a
+        // healthy run finds nothing and the driver never waits. A run that
+        // reported waits here would be waiting on itself.
+        let measured = measure(&case(4 * 65_536, Suite::Blake3Bao64)).unwrap();
+        assert_eq!(note_field(&measured.notes, "idle_waits"), 0);
+
+        // A carrier that releases late is one the driver waits on, and the
+        // difference between the two is what the field is for.
+        let mut lagging = TestCarrier::new();
+        lagging.lag = 3;
+        let waited =
+            transfer_within(&case(65_536, Suite::Blake3Bao64), lagging, TEST_BUDGET).unwrap();
+        assert!(
+            note_field(&waited.notes, "idle_waits") >= 2,
+            "{}",
+            waited.notes
+        );
+    }
+
+    #[test]
+    fn a_refused_submission_is_backpressure_and_the_record_is_offered_again() {
+        let mut carrier = TestCarrier::new();
+        // Every record refused once, so the retry path runs for each of them
+        // and none of them is lost by it.
+        carrier.refuse = 4;
+        let config = case(4 * 65_536, Suite::Blake3Bao64);
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 4 * 65_536);
+        assert_eq!(measured.bytes_sent, 4 * 65_536);
+        assert_eq!(note_field(&measured.notes, "backpressure_waits"), 4);
+    }
+
+    #[test]
+    fn a_carrier_that_delivers_late_is_waited_out() {
+        let mut carrier = TestCarrier::new();
+        // Nothing arrives until well after the last record is submitted, so the
+        // completion loop is what finishes the object.
+        carrier.lag = 8;
+        let config = case(2 * 65_536, Suite::Blake3Bao64);
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+    }
+
+    #[test]
+    fn a_carrier_that_stops_is_an_error_not_a_partial_result() {
+        let mut carrier = TestCarrier::new();
+        carrier.stalled = true;
+        let config = case(65_536, Suite::Blake3Bao64);
+        assert!(matches!(
+            transfer_within(&config, carrier, TEST_BUDGET),
+            Err(Error::Stalled)
+        ));
+
+        // A carrier that refuses every submission and delivers nothing stalls
+        // in the other loop, which has its own bound to reach.
+        let mut refusing = TestCarrier::new();
+        refusing.refuse = usize::MAX;
+        refusing.stalled = true;
+        assert!(matches!(
+            transfer_within(&config, refusing, TEST_BUDGET),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn a_carrier_that_reports_the_connection_gone_says_so_at_once() {
+        // Waiting out the stall bound would report a slow carrier where the
+        // truth is a broken one, and the run would take thirty seconds to say
+        // the wrong thing.
+        let mut carrier = TestCarrier::new();
+        carrier.disconnect = true;
+        let config = case(65_536, Suite::Blake3Bao64);
+        assert!(matches!(
+            transfer_within(&config, carrier, TEST_BUDGET),
+            Err(Error::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn a_record_that_came_back_changed_is_refused() {
+        let mut carrier = TestCarrier::new();
+        carrier.corrupt = true;
+        let config = case(65_536, Suite::Blake3Bao64);
+        // Truncated inside the envelope, so the frame no longer accounts for
+        // what was delivered. Accepting it would verify against bytes the
+        // sender never sent.
+        assert!(matches!(
+            transfer_within(&config, carrier, TEST_BUDGET),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn only_a_frame_that_is_exactly_one_data_record_is_unwrapped() {
+        let mut framed = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::DATA_RECORD, b"payload", &mut framed)
+            .unwrap();
+        assert_eq!(record_payload(&framed).unwrap(), b"payload");
+
+        // Nothing at all, a truncated frame, and a frame with a second one
+        // behind it are all deliveries this transfer never made.
+        assert!(matches!(record_payload(&[]), Err(Error::Corrupt)));
+        assert!(matches!(
+            record_payload(&framed[..framed.len() - 1]),
+            Err(Error::Corrupt)
+        ));
+        let mut two = framed.clone();
+        two.extend_from_slice(&framed);
+        assert!(matches!(record_payload(&two), Err(Error::Corrupt)));
+
+        // A control frame is a frame this lane does not carry.
+        let mut control = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::SETTINGS, b"x", &mut control).unwrap();
+        assert!(matches!(record_payload(&control), Err(Error::Corrupt)));
+    }
+
+    #[test]
+    fn the_credit_the_report_names_is_the_one_that_was_enforced() {
+        let config = case(65_536, Suite::Blake3Bao64);
+
+        // A carrier that applies the credit says so.
+        let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
+        assert_eq!(note_field_text(&measured.notes, "credit_mode"), "set");
+
+        // One that bounds its inbound at construction reports Unsupported
+        // rather than accepting a credit it would not apply, and the report
+        // records which of the two happened rather than implying the first.
+        let mut constructed = TestCarrier::new();
+        constructed.endpoint = CreditEndpoint(Err(vot_transport_api::Error::Unsupported));
+        let measured = transfer_within(&config, constructed, TEST_BUDGET).unwrap();
+        assert_eq!(
+            note_field_text(&measured.notes, "credit_mode"),
+            "constructed"
+        );
+        // Either way the number is the receiver's own advertised credit, which
+        // the receiver enforces by refusing staging past it.
+        assert_eq!(note_field(&measured.notes, "credit_bytes"), 1_250_000);
+
+        // Any other refusal is a backend failure rather than a mode.
+        let mut refused = TestCarrier::new();
+        refused.endpoint = CreditEndpoint(Err(vot_transport_api::Error::InvalidConfiguration));
+        assert!(matches!(
+            transfer_within(&config, refused, TEST_BUDGET),
+            Err(Error::Transport(
+                vot_transport_api::Error::InvalidConfiguration
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_sender_events_are_drained_so_they_cannot_become_the_ceiling() {
+        // A sender reports acknowledgements and connection state this transfer
+        // never reads. Left queued they fill the backend's bound and it starts
+        // refusing submissions, so the run would stop for a reason that has
+        // nothing to do with the object or the carrier. The double refuses once
+        // its sender queue is full and clears it only when the driver drains,
+        // so a transfer that completes is a transfer that drained: more records
+        // than the queue holds went through it.
+        let object_bytes = DRAIN_TEST_RECORDS as u64 * 65_536;
+        let config = case(object_bytes, Suite::Blake3Bao64);
+        let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, object_bytes);
+    }
+
+    #[test]
+    fn what_the_carrier_moved_is_reported_apart_from_the_object() {
+        let config = case(4 * 65_536, Suite::Blake3Bao64);
+        let measured = measure(&config).unwrap();
+        // The envelope is on the wire and is not part of the object, so a
+        // reader can see the difference rather than assuming there is none.
+        let wire = note_field(&measured.notes, "wire_bytes");
+        assert!(wire > 4 * 65_536, "wire was {wire}");
+        assert!(wire < 4 * 65_536 + 4 * 64, "wire was {wire}");
+        assert_eq!(measured.bytes_sent, 4 * 65_536);
+    }
+
     #[test]
     fn a_case_verifies_exactly_the_object_it_was_given() {
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
@@ -579,15 +1464,24 @@ mod tests {
                 assert_eq!(measured.bytes_sent, object_bytes);
                 assert!(measured.elapsed_ns >= 1);
                 assert_eq!(measured.cycles, None);
+                // The carrier names itself in the result. A report that
+                // attributed a run to the wrong backend would be worse than no
+                // report, and this is the only place the name is written.
+                assert_eq!(note_field_text(&measured.notes, "backend"), "simulator");
             }
         }
     }
 
     fn note_field(notes: &str, name: &str) -> u64 {
+        note_field_text(notes, name)
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is not a number in {notes}"))
+    }
+
+    fn note_field_text<'a>(notes: &'a str, name: &str) -> &'a str {
         notes
             .split(';')
             .find_map(|field| field.strip_prefix(&format!("{name}=")))
-            .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("no {name} in {notes}"))
     }
 

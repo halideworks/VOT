@@ -670,7 +670,7 @@ fn drive(
                 // problem: another peer's or a stray one, and dropping it is what
                 // spec/security.md section 7 asks for rather than answering it.
                 let _ = conn.recv(&mut buffer[..len], info);
-                drain_arrivals(socket, &mut conn, local, &mut buffer);
+                drain_arrivals(socket, &mut conn, local, &mut buffer)?;
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -767,9 +767,10 @@ fn drain_arrivals(
     conn: &mut quiche::Connection,
     local: SocketAddr,
     buffer: &mut [u8],
-) {
+) -> Result<(), Error> {
     if socket.set_nonblocking(true).is_err() {
-        return;
+        // Still blocking, so the pass loses nothing but the batch.
+        return Ok(());
     }
     for _ in 0..DRAIN_BUDGET {
         match socket.recv_from(buffer) {
@@ -780,7 +781,9 @@ fn drain_arrivals(
             Err(_) => break,
         }
     }
-    let _ = socket.set_nonblocking(false);
+    // A socket left non-blocking would turn the next pass's bounded wait into
+    // a spin, so failing to restore it ends the driver instead.
+    socket.set_nonblocking(false).map_err(|_| Error::Backend)
 }
 
 /// Sends what the connection has generated, and says when it wants to send more.

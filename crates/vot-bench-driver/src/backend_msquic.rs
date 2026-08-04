@@ -1,50 +1,59 @@
-//! The quiche backend as a benchmark carrier.
+//! The `MsQuic` backend as a benchmark carrier.
 //!
-//! A connected loopback pair: the client submits, the server receives, and each
-//! endpoint owns its socket and its connection on a driver thread of its own
-//! (ADR-0024). The handshake completes here, in the constructor, so no part of
-//! it lands inside the timed section.
+//! A connected loopback pair: the client submits, the accepted connection
+//! receives, and `MsQuic` owns the sockets and the worker threads behind both.
+//! The handshake completes here, in the constructor, so no part of it lands
+//! inside the timed section.
 //!
-//! Nothing in this file decides what a run means. It opens the endpoints and
-//! forwards submissions and events; the transfer loop, the framing, and every
-//! reported number are in `lib.rs`, where the mutation gate measures them. That
-//! division is why this file is named in `.cargo/mutants.toml`: it compiles
-//! only under the `quiche` feature, which the mutation matrix does not enable,
-//! so a mutant here would be reported missed whatever the tests say. It is
-//! measured where it compiles, by the tests at the bottom of this file.
+//! The same division as the quiche carrier. Nothing in this file decides what a
+//! run means; it opens the endpoints and forwards submissions and events, while
+//! the transfer loop, the framing, and every reported number stay in `lib.rs`
+//! where the mutation gate measures them. That is why this file is named in
+//! `.cargo/mutants.toml`: it compiles only under the `msquic` feature, which
+//! the mutation matrix does not enable, so a mutant here would be reported
+//! missed whatever the tests say.
+//!
+//! No `MsQuic` type appears below, which ADR-0012 requires of everything
+//! outside `vot-transport-msquic`. The pair is built from that crate's `Config`
+//! and its two boundary constructors.
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use vot_transport_api::{Event, Payload, ReceiveLimits, StreamId, TransportAdapter};
-use vot_transport_quiche::INBOUND_BYTE_CAPACITY;
-use vot_transport_quiche::live::{Config as QuicheConfig, Transport};
+use vot_transport_msquic::INBOUND_BYTE_CAPACITY;
+use vot_transport_msquic::live::{
+    AcceptedTransport, Config as MsQuicConfig, MsQuicServer, MsQuicTransport,
+};
 
 use crate::{Carrier, Config, Error};
 
-/// How long the pair is given to complete its handshake.
+/// How long the pair is given to connect and be accepted.
 ///
-/// Loopback needs milliseconds. This is long enough that a loaded machine is
-/// not mistaken for a broken one, and short enough that a run which will never
+/// Loopback needs milliseconds. Long enough that a loaded machine is not
+/// mistaken for a broken one, and short enough that a run which will never
 /// connect fails rather than hanging in CI.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lanes the endpoints advertise.
-///
-/// The transfer uses one. The rest are advertised because a benchmark endpoint
-/// should not be configured more tightly than the case it carries, and the
-/// multi-rail work in the same backlog item needs room to open more.
+/// Lanes the endpoints advertise. The transfer uses one; the rest are room for
+/// the multi-rail work in the same backlog item.
 const ADVERTISED_LANES: u64 = 4;
 
-/// A connected pair of quiche endpoints over loopback.
-pub(crate) struct QuicheCarrier {
-    client: Transport,
-    server: Transport,
+/// The connection identifier the client reports its connection under. Arbitrary
+/// and never compared against anything, because one pair carries one transfer.
+const CONNECTION_ID: u64 = 1;
+
+/// A connected pair of `MsQuic` endpoints over loopback.
+pub(crate) struct MsQuicCarrier {
+    client: MsQuicTransport,
+    accepted: AcceptedTransport,
+    /// Held so the listener outlives the connection it produced.
+    _server: MsQuicServer,
     unmodelled: Vec<&'static str>,
 }
 
-impl QuicheCarrier {
+impl MsQuicCarrier {
     /// Connects a loopback pair and waits for both ends to report it.
     ///
     /// # Errors
@@ -65,50 +74,49 @@ impl QuicheCarrier {
             .map_err(|_| Error::Value("VOT_BENCH_BACKEND"))?;
 
         let mut server =
-            Transport::serve(loopback, &QuicheConfig::server(limits, certificate, key))
+            MsQuicServer::bind(loopback, &MsQuicConfig::server(limits, certificate, key))
                 .map_err(Error::Transport)?;
-        let mut client_config = QuicheConfig::client(limits);
-        // The credential is generated for this run and trusted by construction.
-        // What is being measured is the carrier, not the web PKI, and a
-        // benchmark that failed on certificate validation would say nothing
-        // about either.
+        let mut client_config = MsQuicConfig::client(limits);
+        // The credential is generated for this run and trusted by
+        // construction. What is measured is the carrier, not the web PKI.
         client_config.verify_peer = false;
-        let mut client = Transport::connect(
-            loopback,
-            server.local_address(),
-            Some("localhost"),
+        let mut client = MsQuicTransport::dial(
+            server.local_address().map_err(Error::Transport)?,
+            CONNECTION_ID,
             &client_config,
         )
         .map_err(Error::Transport)?;
 
-        handshake(&mut client, &mut server)?;
+        let accepted = handshake(&mut client, &mut server)?;
         Ok(Self {
             client,
-            server,
+            accepted,
+            _server: server,
             unmodelled: unmodelled_for(config),
         })
     }
 }
 
-/// Waits for both endpoints to report the connection.
+/// Waits for the client to connect and the listener to hand over the
+/// connection it produced.
 ///
 /// # Errors
 /// Reports [`Error::Handshake`] for a pair that did not connect inside
 /// [`HANDSHAKE_TIMEOUT`].
-fn handshake(client: &mut Transport, server: &mut Transport) -> Result<(), Error> {
+fn handshake(
+    client: &mut MsQuicTransport,
+    server: &mut MsQuicServer,
+) -> Result<AcceptedTransport, Error> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let (mut client_up, mut server_up) = (false, false);
+    let mut client_up = false;
     while Instant::now() < deadline {
-        client.flush().map_err(Error::Transport)?;
-        server.flush().map_err(Error::Transport)?;
         while let Some(event) = client.poll() {
             client_up |= matches!(event, Event::Connected(_));
         }
-        while let Some(event) = server.poll() {
-            server_up |= matches!(event, Event::Connected(_));
-        }
-        if client_up && server_up {
-            return Ok(());
+        if client_up {
+            if let Some(accepted) = server.accept() {
+                return Ok(accepted);
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -117,13 +125,10 @@ fn handshake(client: &mut Transport, server: &mut Transport) -> Result<(), Error
 
 /// Impairment fields this carrier describes but does not shape.
 ///
-/// Loopback is not the path the file describes and nothing here shapes it to
-/// match. Every field is named rather than left for a reader to assume: the
-/// case's MTU, bandwidth, queue, loss, and reordering are all the loopback
-/// path's own, and its round-trip time is a few microseconds rather than the
-/// one the case asks for. The receive window still comes from the case's
-/// bandwidth-delay product, which is the one effect an impairment field has,
-/// exactly as it has on the simulator.
+/// The same account the quiche carrier gives, and for the same reason: loopback
+/// is not the path the file describes and nothing here shapes it to match. The
+/// receive window still comes from the case's bandwidth-delay product, which is
+/// the one effect an impairment field has.
 fn unmodelled_for(config: &Config) -> Vec<&'static str> {
     let mut unmodelled = vec!["mtu_bytes", "bandwidth_bps", "queue_bytes"];
     for (present, name) in [
@@ -140,11 +145,9 @@ fn unmodelled_for(config: &Config) -> Vec<&'static str> {
 
 /// Generates a self-signed credential once per process.
 ///
-/// The same approach the quiche live tests take: `openssl` into a temporary
-/// directory, so no dependency is added for something that never leaves this
-/// host. Once per process because a run may build more than one pair, and two
-/// of them writing the same two paths at once would let one load a half-written
-/// certificate.
+/// The same approach both live test suites take: `openssl` into a temporary
+/// directory, so nothing is added as a dependency for something that never
+/// leaves this host.
 ///
 /// # Errors
 /// Reports a failure to create the directory or to run `openssl`.
@@ -153,7 +156,7 @@ fn credentials() -> Result<(String, String), Error> {
     MATERIAL
         .get_or_init(|| {
             let directory =
-                std::env::temp_dir().join(format!("vot-bench-quiche-{}", std::process::id()));
+                std::env::temp_dir().join(format!("vot-bench-msquic-{}", std::process::id()));
             std::fs::create_dir_all(&directory).ok()?;
             let key = directory.join("key.pem");
             let certificate = directory.join("cert.pem");
@@ -181,22 +184,22 @@ fn credentials() -> Result<(String, String), Error> {
                 .then(|| (certificate.display().to_string(), key.display().to_string()))
         })
         .clone()
-        .ok_or(Error::Unmeasurable("quiche_credentials"))
+        .ok_or(Error::Unmeasurable("msquic_credentials"))
 }
 
-impl Carrier for QuicheCarrier {
+impl Carrier for MsQuicCarrier {
     fn name(&self) -> &'static str {
-        "quiche"
+        "msquic"
     }
 
     fn unmodelled(&self) -> &[&'static str] {
         &self.unmodelled
     }
 
-    // The server is the endpoint that receives the object, so its inbound bound
-    // is the one the case's credit applies to.
+    // The accepted connection is the endpoint that receives the object, so its
+    // inbound bound is the one the case's credit applies to.
     fn receiving(&mut self) -> &mut dyn TransportAdapter {
-        &mut self.server
+        &mut self.accepted
     }
 
     fn submit(
@@ -208,15 +211,15 @@ impl Carrier for QuicheCarrier {
             .send_reliable_shared(stream, Payload::clone(frame))
     }
 
-    // Both ends. The client has records to hand its driver, and the server has
-    // the acknowledgements and window updates that let the client send more.
+    // Both ends, as on quiche: the client has records to hand over, and the
+    // receiver has the acknowledgements that let the client send more.
     fn flush(&mut self) -> Result<(), vot_transport_api::Error> {
         self.client.flush()?;
-        self.server.flush()
+        self.accepted.flush()
     }
 
     fn poll_received(&mut self) -> Option<Event> {
-        self.server.poll()
+        self.accepted.poll()
     }
 
     // A sender that loses its connection is reported here and discarded with
@@ -229,13 +232,13 @@ impl Carrier for QuicheCarrier {
 
 #[cfg(test)]
 mod tests {
-    use super::QuicheCarrier;
+    use super::MsQuicCarrier;
     use crate::{Config, ImpairmentCase, measure};
     use vot_verifier::Suite;
 
     fn case(object_bytes: u64) -> Config {
         Config {
-            backend: "quiche".to_owned(),
+            backend: "msquic".to_owned(),
             suite: Suite::Blake3Bao64,
             workers: 1,
             seed: 42,
@@ -261,16 +264,13 @@ mod tests {
 
     #[test]
     fn a_case_crosses_a_real_socket_and_verifies() {
-        // Past one batch and past one datagram many times over, so the record
-        // is reassembled from packets rather than arriving whole.
+        // Past one batch and past one datagram many times over, so records are
+        // reassembled from packets rather than arriving whole.
         let object_bytes = 40 * 65_536;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
         assert_eq!(measured.bytes_sent, object_bytes);
-        assert_eq!(note_field(&measured.notes, "backend"), "quiche");
-        // The whole object arrived over a carrier that delivers asynchronously,
-        // which the receiver only reports verified after every byte is in.
-        assert!(measured.elapsed_ns >= 1);
+        assert_eq!(note_field(&measured.notes, "backend"), "msquic");
     }
 
     #[test]
@@ -278,18 +278,16 @@ mod tests {
         let object_bytes = 3 * 65_536 + 17;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
-        // The envelope is on the wire and the object is not, so the carrier
-        // moved strictly more than the object.
+        // The envelope is on the wire and the object is not.
         let wire: u64 = note_field(&measured.notes, "wire_bytes").parse().unwrap();
         assert!(wire > object_bytes, "wire was {wire}");
     }
 
     #[test]
     fn the_carrier_bounds_its_credit_at_construction() {
-        // ADR-0024: quiche extends connection flow control as the application
-        // reads, so there is no absolute credit to set and the transport says
-        // so rather than accepting a bound it would not apply. The report has
-        // to carry which of the two happened.
+        // The assembled MsQuic transport reports Unsupported for a per-call
+        // credit, as the quiche one does, so the report has to say which bound
+        // was in force rather than implying the receiver's was applied.
         let measured = measure(&case(65_536)).unwrap();
         assert_eq!(note_field(&measured.notes, "credit_mode"), "constructed");
     }
@@ -309,12 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn an_endpoint_pair_gives_its_ports_back() {
-        // Each endpoint owns a socket on a driver thread, so a pair that is
-        // dropped without stopping its drivers would leak both. Building
-        // several in one process is what the measurement work does.
+    fn a_pair_can_be_built_more_than_once_in_a_process() {
+        // The measurement work builds one per case, and MsQuic keeps a
+        // registration and worker threads behind each.
         for _ in 0..3 {
-            let carrier = QuicheCarrier::connected(&case(65_536)).unwrap();
+            let carrier = MsQuicCarrier::connected(&case(65_536)).unwrap();
             drop(carrier);
         }
     }

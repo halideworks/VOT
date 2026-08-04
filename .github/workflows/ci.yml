@@ -365,8 +365,10 @@ jobs:
           # shallow clone does not have.
           fetch-depth: 0
 
+      # With clippy, because the driver-carrier lint step below is the only
+      # one that sees that file under the feature that compiles it.
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       - name: Install native build tools
         run: sudo apt-get update && sudo apt-get install -y cmake openssl
@@ -384,6 +386,16 @@ jobs:
         run: >-
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
+
+      - name: Test the benchmark driver over that carrier
+        run: |
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --locked
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --release --locked
+
+      - name: Lint the driver's carrier
+        run: >-
+          cargo +1.88.0 clippy -p vot-bench-driver --all-targets
+          --features msquic --locked -- -D warnings
 
       - name: Test live mutants
         env:

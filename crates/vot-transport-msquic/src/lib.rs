@@ -324,6 +324,7 @@ pub mod live {
     //! Narrow ownership helpers around the official `MsQuic` Rust FFI wrapper.
 
     use std::ffi::c_void;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use msquic::ffi::QUIC_STATISTICS_V2;
     use std::collections::btree_map::Entry;
@@ -334,9 +335,10 @@ pub mod live {
     use std::time::Duration;
 
     use msquic::{
-        Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Listener,
-        ListenerEvent, Registration, RegistrationConfig, SendFlags, Settings, Stream, StreamEvent,
-        StreamOpenFlags, StreamRef, StreamStartFlags,
+        Addr, BufferRef, Configuration, Connection, ConnectionEvent, ConnectionRef, Credential,
+        CredentialConfig, CredentialFlags, Listener, ListenerEvent, Registration,
+        RegistrationConfig, SendFlags, Settings, Stream, StreamEvent, StreamOpenFlags, StreamRef,
+        StreamStartFlags,
     };
 
     use vot_transport_api::{
@@ -681,6 +683,37 @@ pub mod live {
     }
 
     impl MsQuicTransport {
+        /// Connects to `peer`, naming no `MsQuic` type.
+        ///
+        /// The client half of [`MsQuicServer::bind`], and the same reason:
+        /// ADR-0012 keeps every `MsQuic` type inside this crate, so a caller
+        /// outside it needs a way to connect without building a registration
+        /// and a configuration of its own.
+        ///
+        /// The address is used literally, not a name that resolves to it.
+        /// [`MsQuicTransport::connect`] takes one host for both the target and
+        /// the name the credential is checked against, so a caller that needs
+        /// those to differ has to use it directly. Connecting by name here
+        /// would mean a listener bound to `127.0.0.1` is unreachable wherever
+        /// `localhost` resolves to `::1` first, which is most places.
+        ///
+        /// # Errors
+        /// Reports a registration, credential, or configuration failure, and a
+        /// connection that could not be started.
+        pub fn dial(peer: SocketAddr, connection_id: u64, config: &Config) -> Result<Self, Error> {
+            let registration = registration().map_err(|_| Error::Backend)?;
+            let configuration = config.open(&registration)?;
+            Self::connect(
+                configuration,
+                registration,
+                &peer.ip().to_string(),
+                peer.port(),
+                connection_id,
+                config.limits,
+            )
+            .map_err(|_| Error::Backend)
+        }
+
         /// Connects to `host:port` and returns a transport ready to send.
         ///
         /// `limits` is what this endpoint advertises in `SETTINGS`. Taken here
@@ -1498,6 +1531,90 @@ pub mod live {
         }
     }
 
+    /// What an endpoint needs before it can carry anything.
+    ///
+    /// The same shape the quiche backend takes, so a caller that wants a
+    /// connected pair describes one in the same terms whichever backend it
+    /// asks. It exists mainly so that a caller does not have to: ADR-0012 says
+    /// no `MsQuic` type crosses this crate's boundary, and building a
+    /// `Configuration` by hand means naming several.
+    #[derive(Clone, Debug)]
+    pub struct Config {
+        /// The limits this endpoint advertises and will be held to.
+        pub limits: ReceiveLimits,
+        /// Server certificate chain, in PEM. Required for a server.
+        pub certificate: Option<String>,
+        /// Server private key, in PEM. Required for a server.
+        pub private_key: Option<String>,
+        /// Whether the client validates the server's certificate.
+        pub verify_peer: bool,
+    }
+
+    impl Config {
+        /// A client configuration that validates its peer.
+        #[must_use]
+        pub const fn client(limits: ReceiveLimits) -> Self {
+            Self {
+                limits,
+                certificate: None,
+                private_key: None,
+                verify_peer: true,
+            }
+        }
+
+        /// A server configuration with the credentials it presents.
+        #[must_use]
+        pub const fn server(
+            limits: ReceiveLimits,
+            certificate: String,
+            private_key: String,
+        ) -> Self {
+            Self {
+                limits,
+                certificate: Some(certificate),
+                private_key: Some(private_key),
+                verify_peer: false,
+            }
+        }
+
+        /// Opens the `MsQuic` configuration this describes.
+        ///
+        /// # Errors
+        /// Reports a lane count the carrier cannot express, a server without
+        /// credentials, and any configuration `MsQuic` refuses.
+        fn open(&self, registration: &Registration) -> Result<Arc<Configuration>, Error> {
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            // From the same limits the endpoint advertises, so the carrier can
+            // open every lane the session says it will carry.
+            let settings = peer_stream_settings(self.limits)?;
+            let configuration = Configuration::open(registration, &alpn, Some(&settings))
+                .map_err(|_| Error::Backend)?;
+            let credential = match (&self.certificate, &self.private_key) {
+                (Some(certificate), Some(key)) => CredentialConfig::new()
+                    .set_credential_flags(CredentialFlags::NONE)
+                    .set_credential(Credential::CertificateFile(msquic::CertificateFile::new(
+                        key.clone(),
+                        certificate.clone(),
+                    ))),
+                (None, None) => {
+                    let flags = if self.verify_peer {
+                        CredentialFlags::NONE
+                    } else {
+                        CredentialFlags::NO_CERTIFICATE_VALIDATION
+                    };
+                    CredentialConfig::new_client().set_credential_flags(flags)
+                }
+                // Half a credential is a server that cannot present one or a
+                // client asked to present one it has no key for.
+                _ => return Err(Error::InvalidConfiguration),
+            };
+            configuration
+                .load_credential(&credential)
+                .map_err(|_| Error::InvalidConfiguration)?;
+            Ok(Arc::new(configuration))
+        }
+    }
+
     /// A listening `MsQuic` endpoint that produces assembled connections, so
     /// both directions of a transfer run the same code.
     pub struct MsQuicServer {
@@ -1512,6 +1629,39 @@ pub mod live {
     }
 
     impl MsQuicServer {
+        /// Binds a listener on `address`, naming no `MsQuic` type.
+        ///
+        /// [`MsQuicServer::listen`] takes the registration and configuration a
+        /// caller has already built; this builds them from [`Config`] so a
+        /// caller outside this crate can have a server without one, which
+        /// ADR-0012 requires of anything crossing this boundary.
+        ///
+        /// # Errors
+        /// Reports a registration, credential, or configuration failure, and a
+        /// listener that could not be opened or started.
+        pub fn bind(address: SocketAddr, config: &Config) -> Result<Self, Error> {
+            let registration = Arc::new(registration().map_err(|_| Error::Backend)?);
+            let configuration = config.open(&registration)?;
+            let alpn = [BufferRef::from(vot_transport_api::ALPN)];
+            Self::listen(
+                configuration,
+                registration,
+                &alpn,
+                &Addr::from(address),
+                config.limits,
+            )
+            .map_err(|_| Error::Backend)
+        }
+
+        /// The address this listener actually bound.
+        ///
+        /// # Errors
+        /// Propagates a listener that cannot report its port.
+        pub fn local_address(&self) -> Result<SocketAddr, Error> {
+            let port = self.local_port().map_err(|_| Error::Backend)?;
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+        }
+
         /// Starts listening on `address` for the given ALPN.
         ///
         /// # Errors
@@ -1812,7 +1962,7 @@ pub mod live {
         };
 
         use super::{
-            AcceptedTransport, Control, Framing, MsQuicServer, MsQuicTransport, StreamKind,
+            AcceptedTransport, Config, Control, Framing, MsQuicServer, MsQuicTransport, StreamKind,
             allocate_peer_lane,
         };
 
@@ -2618,39 +2768,107 @@ pub mod live {
         /// two paths at once, so one could load a half-written certificate and
         /// fail for reasons that have nothing to do with what it tests.
         fn test_credential() -> Credential {
+            let (key, certificate) = credential_paths();
+            Credential::CertificateFile(msquic::CertificateFile::new(key, certificate))
+        }
+
+        /// The generated key and certificate paths, in that order.
+        fn credential_paths() -> (String, String) {
             static MATERIAL: OnceLock<(String, String)> = OnceLock::new();
-            let (key, certificate) = MATERIAL.get_or_init(|| {
-                let directory =
-                    std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
-                std::fs::create_dir_all(&directory).unwrap();
-                let key = directory.join("key.pem");
-                let certificate = directory.join("cert.pem");
-                let status = Command::new("openssl")
-                    .args([
-                        "req",
-                        "-x509",
-                        "-newkey",
-                        "rsa:2048",
-                        "-keyout",
-                        key.to_str().unwrap(),
-                        "-out",
-                        certificate.to_str().unwrap(),
-                        "-sha256",
-                        "-days",
-                        "1",
-                        "-nodes",
-                        "-subj",
-                        "/CN=localhost",
-                    ])
-                    .status()
+            MATERIAL
+                .get_or_init(|| {
+                    let directory =
+                        std::env::temp_dir().join(format!("vot-msquic-{}", std::process::id()));
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let key = directory.join("key.pem");
+                    let certificate = directory.join("cert.pem");
+                    let status = Command::new("openssl")
+                        .args([
+                            "req",
+                            "-x509",
+                            "-newkey",
+                            "rsa:2048",
+                            "-keyout",
+                            key.to_str().unwrap(),
+                            "-out",
+                            certificate.to_str().unwrap(),
+                            "-sha256",
+                            "-days",
+                            "1",
+                            "-nodes",
+                            "-subj",
+                            "/CN=localhost",
+                        ])
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                    (key.display().to_string(), certificate.display().to_string())
+                })
+                .clone()
+        }
+
+        #[test]
+        fn a_bound_listener_and_a_dialled_client_connect() {
+            // The boundary ADR-0012 requires: a caller outside this crate gets
+            // a connected pair without naming an MsQuic type. The bench driver
+            // is the caller, and this is where the facade is tested, because a
+            // failure here should not be found in another package.
+            let (key, certificate) = credential_paths();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            let mut server =
+                MsQuicServer::bind(address, &Config::server(server_limits(), certificate, key))
                     .unwrap();
-                assert!(status.success());
-                (key.display().to_string(), certificate.display().to_string())
-            });
-            Credential::CertificateFile(msquic::CertificateFile::new(
-                key.clone(),
-                certificate.clone(),
-            ))
+            let peer = server.local_address().unwrap();
+            assert!(peer.port() != 0, "the listener reports the port it bound");
+
+            let mut client_config = Config::client(test_limits());
+            // The certificate is generated for this test and trusted by
+            // construction; the carrier is what is under test, not the PKI.
+            client_config.verify_peer = false;
+            let mut client = MsQuicTransport::dial(peer, 11, &client_config).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut client, deadline, |event| matches!(
+                event,
+                Event::Connected(_)
+            )));
+            loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if server.accept().is_some() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        #[test]
+        fn a_configuration_takes_both_halves_of_a_credential_or_neither() {
+            // A server presents a certificate and a key, a client presents
+            // neither, and half of one is a server that cannot present a
+            // credential or a client asked to present a key it does not have.
+            let (key, certificate) = credential_paths();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+            for half in [
+                Config {
+                    certificate: Some(certificate.clone()),
+                    private_key: None,
+                    ..Config::client(test_limits())
+                },
+                Config {
+                    certificate: None,
+                    private_key: Some(key.clone()),
+                    ..Config::client(test_limits())
+                },
+            ] {
+                assert!(
+                    matches!(
+                        MsQuicServer::bind(address, &half),
+                        Err(Error::InvalidConfiguration)
+                    ),
+                    "half a credential was accepted"
+                );
+            }
         }
 
         /// Builds a client configuration that trusts the test certificate.

@@ -108,12 +108,56 @@ every number in the report is measurable when the report is written.
 ### 5. Four PRs, and the report comes last
 
 1. Carrier seam, quiche wiring, loopback tests. **Landed.**
-2. MsQuic wiring through the same seam.
+2. MsQuic wiring through the same seam. **Landed**, together with a `Config`
+   and two boundary constructors in `vot-transport-msquic::live`, because
+   ADR-0012 forbids an `MsQuic` type crossing that crate's edge and a caller
+   could not otherwise build an endpoint.
 3. The multi-worker path.
 4. Measurements, the report, and ADR-0025.
 
 One seam reviewed once, each backend change small, and no report exists before
 it can be a comparison.
+
+### 6a. What the first measurements say, and the trap they set
+
+Both backends now run the same loop. Measured over 512 MB on loopback, MsQuic
+carried the case at a median of 9426 Mbit/s against quiche's 1372, and the
+groups did not overlap. Read alone, that reads as an engine result and would
+have decided ADR-0025.
+
+It is not one. The quiche pump pins its datagram size at 1350 while the loopback
+MTU is 65536, and that constant is nearly the whole difference. Raising it to
+32768 takes quiche to 1.36 s user and 0.66 s system against MsQuic's 1.51 and
+0.33, on a case where the two are then within about 12 percent of each other on
+wall clock, inside either one's spread. Syscalls for 64 MiB fall 16x, and user
+CPU falls 2.5x because per-packet crypto costs as much as the syscalls did.
+
+The two engines are therefore close at comparable packet sizes, and they get
+there differently: MsQuic amortises syscalls with segmentation offload while
+keeping ordinary packets, and a larger datagram amortises them by sending fewer
+and bigger ones, which only a path with a large MTU allows. 1350 is the right
+default for the internet. quiche needs GSO to win this on a real path, and GSO
+is PERF-002's charter.
+
+**So the bakeoff must hold packet size and syscall amortisation comparable, or
+state them in every quoted figure.** The report carries the datagram size the
+way it carries the seed, and a run of one backend is never compared against a
+run of the other at a different one. An ADR that picks a default without that
+control is picking a constant in our own pump. Figures in
+`docs/perf-engineering.md`.
+
+Holding it comparable needs a knob that does not exist: `MAX_DATAGRAM_SIZE` is a
+constant in the pump, not a field on the quiche `Config` beside
+`idle_timeout_ms`. Moving it there is a small change to that crate and the
+prerequisite for the report being able to sweep it, so it belongs in PR 4 ahead
+of the measurements. The default stays 1350, because that is what a path whose
+MTU is unknown can carry.
+
+PR 4 should also report each run's user and system CPU time in `notes`.
+`/proc/self/stat` carries both with no new dependency, exactly as
+`memory_high_water_bytes` already comes from `/proc/self/status`. The user and
+system split is what separated "the engine is slower" from "our packets are
+small" here, and throughput alone had not.
 
 ### 6. The serialized-spine measurement is decided before the code
 

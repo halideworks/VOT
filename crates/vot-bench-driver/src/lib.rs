@@ -18,6 +18,8 @@ use vot_transport_api::{
 use vot_transport_sim::{Impairment, SimulatorAdapter};
 use vot_verifier::{StreamVerifier, Suite};
 
+#[cfg(feature = "msquic")]
+mod backend_msquic;
 #[cfg(feature = "quiche")]
 mod backend_quiche;
 
@@ -105,6 +107,12 @@ pub enum Error {
     Stalled,
     /// The carrier reported the connection gone before the object was whole.
     Disconnected,
+    /// The endpoints did not connect, so nothing was carried at all.
+    ///
+    /// Separate from [`Error::Stalled`] because the two are found in different
+    /// places: a transfer that stops is the carrier's business, and a pair that
+    /// never connects is the case's configuration or the address it was given.
+    Handshake,
 }
 
 impl fmt::Display for Error {
@@ -131,6 +139,7 @@ impl fmt::Display for Error {
                 formatter,
                 "the carrier reported the connection gone before the object was whole"
             ),
+            Self::Handshake => write!(formatter, "the endpoints did not connect"),
         }
     }
 }
@@ -821,6 +830,8 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 
     match config.backend.as_str() {
         "simulator" => transfer(config, SimulatorCarrier::new(config)?),
+        #[cfg(feature = "msquic")]
+        "msquic" => transfer(config, backend_msquic::MsQuicCarrier::connected(config)?),
         #[cfg(feature = "quiche")]
         "quiche" => transfer(config, backend_quiche::QuicheCarrier::connected(config)?),
         other => Err(Error::Unsupported(format!(
@@ -1569,9 +1580,18 @@ mod tests {
 
     #[test]
     fn an_unimplemented_case_is_an_error_not_a_number() {
+        // `tcp` is a backend the result schema allows and this driver has no
+        // carrier for, under any feature. It used to be `msquic`, which stopped
+        // being an example of an unimplemented backend once one was built.
         let mut backend = case(65_536, Suite::Blake3Bao64);
-        backend.backend = "msquic".to_owned();
+        backend.backend = "tcp".to_owned();
         assert!(matches!(measure(&backend), Err(Error::Unsupported(_))));
+
+        // A name no schema allows either, so the arm is what refuses both
+        // rather than a list of known backends that happens to be complete.
+        let mut unknown = case(65_536, Suite::Blake3Bao64);
+        unknown.backend = "carrier-pigeon".to_owned();
+        assert!(matches!(measure(&unknown), Err(Error::Unsupported(_))));
 
         let mut workers = case(65_536, Suite::Blake3Bao64);
         workers.workers = 4;
@@ -1882,6 +1902,14 @@ mod tests {
             Error::Unmeasurable("memory_high_water_bytes").to_string(),
             "memory_high_water_bytes has no measured source on this platform"
         );
+        // A pair that never connected and a carrier that stopped mid-transfer
+        // are found in different places, so they may not read the same.
+        assert_eq!(
+            Error::Handshake.to_string(),
+            "the endpoints did not connect"
+        );
+        assert_eq!(Error::Stalled.to_string(), "the carrier stopped delivering");
+        assert_ne!(Error::Handshake.to_string(), Error::Stalled.to_string());
         assert_eq!(
             Error::from(vot_transport_api::Error::RecordTooLarge).to_string(),
             "transport error: RecordTooLarge"

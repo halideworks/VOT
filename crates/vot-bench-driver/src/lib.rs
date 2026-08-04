@@ -2033,6 +2033,16 @@ mod tests {
     }
 
     #[test]
+    fn a_prover_refuses_a_cover_wider_than_the_request() {
+        // A group-unaligned length keeps the offset exact while the cover
+        // widens; the widened cover must be refused, not returned.
+        let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
+        let (_, layer) = super::prover_layer_and_subject(&config).unwrap();
+        assert!(super::prove_range(&layer, 0, 100).is_err());
+        assert!(super::prove_range(&layer, 0, 65_536).is_ok());
+    }
+
+    #[test]
     fn a_ranged_case_survives_reordering_and_case_a_multiplexes_lanes() {
         let mut config = ranged_case(6 * 65_536, 3, Suite::Blake3Bao64);
         config.impairment.reorder_window = 4;

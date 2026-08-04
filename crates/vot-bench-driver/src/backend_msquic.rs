@@ -60,14 +60,7 @@ impl MsQuicCarrier {
     /// Reports a socket, credential, or configuration failure, and a pair that
     /// did not connect inside [`HANDSHAKE_TIMEOUT`].
     pub(crate) fn connected(config: &Config) -> Result<Self, Error> {
-        let limits = ReceiveLimits::advertised(
-            &vot_codec::Settings {
-                reliable_lane_limit: ADVERTISED_LANES,
-                ..vot_codec::Settings::default()
-            },
-            INBOUND_BYTE_CAPACITY,
-        )
-        .map_err(Error::Transport)?;
+        let limits = advertised_limits()?;
         let (certificate, key) = credentials()?;
         let loopback: SocketAddr = "127.0.0.1:0"
             .parse()
@@ -94,6 +87,114 @@ impl MsQuicCarrier {
             _server: server,
             unmodelled: unmodelled_for(config),
         })
+    }
+}
+
+/// The limits both loopback endpoints and either role endpoint advertise.
+fn advertised_limits() -> Result<ReceiveLimits, Error> {
+    ReceiveLimits::advertised(
+        &vot_codec::Settings {
+            reliable_lane_limit: ADVERTISED_LANES,
+            ..vot_codec::Settings::default()
+        },
+        INBOUND_BYTE_CAPACITY,
+    )
+    .map_err(Error::Transport)
+}
+
+/// How long a role endpoint waits for its peer, against loopback's
+/// [`HANDSHAKE_TIMEOUT`]: the two halves of a two-machine run are started by
+/// hand on two machines, and a human is slower than a scheduler.
+const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Listens on `address` and waits for the sending half to connect.
+///
+/// # Errors
+/// Reports a socket, credential, or configuration failure, and a peer that did
+/// not connect inside [`ROLE_HANDSHAKE_TIMEOUT`].
+pub(crate) fn role_listen(
+    config: &Config,
+    address: SocketAddr,
+) -> Result<crate::role::Endpoint, Error> {
+    let (certificate, key) = credentials()?;
+    let mut server = MsQuicServer::bind(
+        address,
+        &MsQuicConfig::server(advertised_limits()?, certificate, key),
+    )
+    .map_err(Error::Transport)?;
+    let deadline = Instant::now() + ROLE_HANDSHAKE_TIMEOUT;
+    let accepted = loop {
+        if let Some(accepted) = server.accept() {
+            break accepted;
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Handshake);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    Ok(crate::role::Endpoint {
+        adapter: Box::new(accepted),
+        // The listener produced the connection and MsQuic keeps registration
+        // and worker threads behind it, so it lives as long as the adapter.
+        keepalive: Some(Box::new(server)),
+        backend: "msquic",
+        detail: None,
+        unmodelled: unmodelled_for(config),
+    })
+}
+
+/// How long one dial is given before the next, inside the role deadline.
+///
+/// `MsQuic` reports a refused first flight as a dead connection rather than
+/// retrying it, so a dial that lands before the receiving half listens would
+/// otherwise spend the whole deadline waiting on a connection that already
+/// failed. quiche needs no equivalent because its pump retransmits the flight.
+const ROLE_DIAL_RETRY: Duration = Duration::from_secs(2);
+
+/// Connects to the receiving half at `peer`, dialing again while the deadline
+/// allows, because the halves are started by hand and the receiver may not be
+/// listening yet.
+///
+/// # Errors
+/// Reports a socket or configuration failure, and a handshake that did not
+/// complete inside [`ROLE_HANDSHAKE_TIMEOUT`].
+pub(crate) fn role_connect(
+    config: &Config,
+    peer: SocketAddr,
+) -> Result<crate::role::Endpoint, Error> {
+    let mut client_config = MsQuicConfig::client(advertised_limits()?);
+    // The receiving half's credential is generated for its run and trusted by
+    // construction, exactly as the loopback pair trusts its own.
+    client_config.verify_peer = false;
+    let deadline = Instant::now() + ROLE_HANDSHAKE_TIMEOUT;
+    loop {
+        let mut client =
+            MsQuicTransport::dial(peer, CONNECTION_ID, &client_config).map_err(Error::Transport)?;
+        let attempt = (Instant::now() + ROLE_DIAL_RETRY).min(deadline);
+        let mut refused = false;
+        while !refused && Instant::now() < attempt {
+            while let Some(event) = client.poll() {
+                match event {
+                    Event::Connected(_) => {
+                        return Ok(crate::role::Endpoint {
+                            adapter: Box::new(client),
+                            keepalive: None,
+                            backend: "msquic",
+                            detail: None,
+                            unmodelled: unmodelled_for(config),
+                        });
+                    }
+                    Event::Disconnected(_) => refused = true,
+                    _ => {}
+                }
+            }
+            if !refused {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Handshake);
+        }
     }
 }
 

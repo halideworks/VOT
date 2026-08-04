@@ -31,6 +31,7 @@ exclude_globs = [
   "crates/vot-transport-quiche/src/live.rs",
   "crates/vot-bench-driver/src/backend_msquic.rs",
   "crates/vot-bench-driver/src/backend_quiche.rs",
+  "crates/vot-bench-driver/src/role.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

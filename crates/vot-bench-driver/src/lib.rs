@@ -22,6 +22,8 @@ use vot_verifier::{StreamVerifier, Suite};
 mod backend_msquic;
 #[cfg(feature = "quiche")]
 mod backend_quiche;
+#[cfg(any(feature = "msquic", feature = "quiche"))]
+pub mod role;
 
 /// Suite identifiers as the benchmark contract spells them.
 const SUITE_BLAKE3: &str = "blake3-bao64";

@@ -63,25 +63,13 @@ impl QuicheCarrier {
     /// Reports a socket, credential, or configuration failure, and a pair that
     /// did not connect inside [`HANDSHAKE_TIMEOUT`].
     pub(crate) fn connected(config: &Config) -> Result<Self, Error> {
-        let limits = ReceiveLimits::advertised(
-            &vot_codec::Settings {
-                reliable_lane_limit: ADVERTISED_LANES,
-                ..vot_codec::Settings::default()
-            },
-            INBOUND_BYTE_CAPACITY,
-        )
-        .map_err(Error::Transport)?;
+        let limits = advertised_limits()?;
         let (certificate, key) = credentials()?;
         let loopback: SocketAddr = "127.0.0.1:0"
             .parse()
             .map_err(|_| Error::Value("VOT_BENCH_BACKEND"))?;
 
-        let datagram_bytes = std::env::var(DATAGRAM_BYTES)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| value.parse::<usize>())
-            .transpose()
-            .map_err(|_| Error::Value(DATAGRAM_BYTES))?;
+        let datagram_bytes = datagram_bytes_from_env()?;
 
         let mut server_config = QuicheConfig::server(limits, certificate, key);
         let mut client_config = QuicheConfig::client(limits);
@@ -113,6 +101,118 @@ impl QuicheCarrier {
             datagram_bytes: client_config.max_datagram_bytes,
         })
     }
+}
+
+/// The limits both loopback endpoints and either role endpoint advertise.
+fn advertised_limits() -> Result<ReceiveLimits, Error> {
+    ReceiveLimits::advertised(
+        &vot_codec::Settings {
+            reliable_lane_limit: ADVERTISED_LANES,
+            ..vot_codec::Settings::default()
+        },
+        INBOUND_BYTE_CAPACITY,
+    )
+    .map_err(Error::Transport)
+}
+
+/// Reads the datagram size the case names, when it names one.
+fn datagram_bytes_from_env() -> Result<Option<usize>, Error> {
+    std::env::var(DATAGRAM_BYTES)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| Error::Value(DATAGRAM_BYTES))
+}
+
+/// How long a role endpoint waits for its peer, against loopback's
+/// [`HANDSHAKE_TIMEOUT`]: the two halves of a two-machine run are started by
+/// hand on two machines, and a human is slower than a scheduler.
+const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Listens on `address` and waits for the sending half to connect.
+///
+/// # Errors
+/// Reports a socket, credential, or configuration failure, and a peer that did
+/// not connect inside [`ROLE_HANDSHAKE_TIMEOUT`].
+pub(crate) fn role_listen(
+    config: &Config,
+    address: SocketAddr,
+) -> Result<crate::role::Endpoint, Error> {
+    let (certificate, key) = credentials()?;
+    let mut server_config = QuicheConfig::server(advertised_limits()?, certificate, key);
+    if let Some(bytes) = datagram_bytes_from_env()? {
+        server_config.max_datagram_bytes = bytes;
+    }
+    let mut server = Transport::serve(address, &server_config).map_err(Error::Transport)?;
+    connected_within(&mut server, ROLE_HANDSHAKE_TIMEOUT)?;
+    Ok(crate::role::Endpoint {
+        adapter: Box::new(server),
+        keepalive: None,
+        backend: "quiche",
+        detail: Some(format!(
+            "datagram_bytes={}",
+            server_config.max_datagram_bytes
+        )),
+        unmodelled: unmodelled_for(config),
+    })
+}
+
+/// Connects to the receiving half at `peer`.
+///
+/// # Errors
+/// Reports a socket or configuration failure, and a handshake that did not
+/// complete inside [`ROLE_HANDSHAKE_TIMEOUT`].
+pub(crate) fn role_connect(
+    config: &Config,
+    peer: SocketAddr,
+) -> Result<crate::role::Endpoint, Error> {
+    let mut client_config = QuicheConfig::client(advertised_limits()?);
+    if let Some(bytes) = datagram_bytes_from_env()? {
+        client_config.max_datagram_bytes = bytes;
+    }
+    // The receiving half's credential is generated for its run and trusted by
+    // construction, exactly as the loopback pair trusts its own.
+    client_config.verify_peer = false;
+    let local: SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()
+    .map_err(|_| Error::Value(crate::role::CONNECT))?;
+    let mut client = Transport::connect(local, peer, Some("localhost"), &client_config)
+        .map_err(Error::Transport)?;
+    connected_within(&mut client, ROLE_HANDSHAKE_TIMEOUT)?;
+    Ok(crate::role::Endpoint {
+        adapter: Box::new(client),
+        keepalive: None,
+        backend: "quiche",
+        detail: Some(format!(
+            "datagram_bytes={}",
+            client_config.max_datagram_bytes
+        )),
+        unmodelled: unmodelled_for(config),
+    })
+}
+
+/// Waits for one endpoint to report its connection, where the peer is another
+/// process pumping its own half.
+///
+/// # Errors
+/// Reports [`Error::Handshake`] for an endpoint that did not connect in time.
+fn connected_within(endpoint: &mut Transport, timeout: Duration) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        endpoint.flush().map_err(Error::Transport)?;
+        while let Some(event) = endpoint.poll() {
+            if matches!(event, Event::Connected(_)) {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Err(Error::Handshake)
 }
 
 /// Waits for both endpoints to report the connection.

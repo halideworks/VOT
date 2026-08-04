@@ -2244,6 +2244,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-platform-net"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "vot-proof-blake3"
 version = "0.0.1"
 dependencies = [
@@ -2350,6 +2358,7 @@ dependencies = [
  "nix",
  "quiche",
  "vot-codec",
+ "vot-platform-net",
  "vot-transport-api",
  "vot-transport-framing",
  "vot-transport-queue",

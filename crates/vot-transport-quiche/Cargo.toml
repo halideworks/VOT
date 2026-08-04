@@ -11,7 +11,7 @@ default = []
 # The pump: a UDP socket, a quiche connection, and the timer that drives loss
 # recovery. Off by default because quiche builds BoringSSL through cmake, which
 # costs minutes where the rest of this workspace costs seconds.
-live = ["dep:quiche", "dep:nix"]
+live = ["dep:quiche", "dep:nix", "dep:vot-platform-net"]
 
 [dependencies]
 quiche = { version = "=0.24.9", optional = true }
@@ -19,6 +19,7 @@ vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-transport-framing = { path = "../vot-transport-framing" }
 vot-transport-queue = { path = "../vot-transport-queue" }
+vot-platform-net = { path = "../vot-platform-net", optional = true }
 
 # Safe wrappers for the sendmsg control message that carries segmentation
 # offload. A kernel feature with no portable Rust surface; wrapping it here is

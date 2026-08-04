@@ -2895,8 +2895,11 @@ pub mod live {
             };
 
             // The accepted side's own lifecycle events are taken first, so
-            // the wait below genuinely parks on an empty queue.
+            // the wait below genuinely parks on an empty queue. Their pushes
+            // left the latch raised, and polling never consumes it; one short
+            // wait does, so only the record's own push can end the timed one.
             while accepted.poll().is_some() {}
+            accepted.wait_for_event(Duration::from_millis(50));
 
             // A record is in flight when the accepted side starts a five
             // second wait. The callback's signal must end the wait when the

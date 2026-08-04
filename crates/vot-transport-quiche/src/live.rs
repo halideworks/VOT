@@ -1111,6 +1111,11 @@ mod tests {
             connected(a) && connected(b)
         });
 
+        // The handshake's Connected push left the latch raised, and polling
+        // never consumes it. One short wait does, so the timed wait below
+        // parks on a quiet queue and only the record's own push can end it.
+        server.wait_for_event(Duration::from_millis(50));
+
         // A record is in flight when the server starts a five second wait. The
         // pump's signal must end the wait when the record lands; a wait that
         // sleeps its bound out is the polling interval this contract removes.

@@ -97,9 +97,21 @@ certificate never leaves the test.
 
 The adapter is two pieces: a translation layer with no quiche in it, which the
 mutation gate measures, and the pump, which the live tests drive over loopback.
-The pump lives in its own file behind the `live` feature, and its matrix entry
-carries that feature, because a mutant in a module the tests never compile is
-reported missed whatever the tests say.
+The pump lives in its own file behind the `live` feature, and that file is named
+in the mutation configuration's exclusions, because a mutant in a module the
+tests never compile is reported missed whatever the tests say. The `live::`
+expression already there does not cover it: cargo-mutants prints a free function
+inside the module without that prefix.
+
+Measuring the pump is therefore the `quiche-live` job's business rather than the
+matrix's, and today that job runs its tests in both profiles rather than mutating
+it. A mutation run over the pump belongs beside the MsQuic one, with what survives
+classified as
+`test-vectors/mutants/the_live_transport_is_mutation_tested.md` classifies that
+backend's. Measured once, it reported thirty-seven survivors, most of them in
+places no test can distinguish: a connection identifier whose value is arbitrary,
+a pacing comparison that decides only when a packet leaves, and a socket error
+path a loopback pair does not take.
 
 quiche builds BoringSSL through cmake, so a cold build costs minutes where the
 rest of the workspace costs seconds. The mutation job pays it once per job rather

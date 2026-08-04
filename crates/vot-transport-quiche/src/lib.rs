@@ -18,6 +18,9 @@ use vot_transport_queue::Queue;
 
 pub use vot_transport_queue::Command;
 
+#[cfg(feature = "live")]
+pub mod live;
+
 /// The control stream, which `spec/wire.md` section 7 makes the first
 /// client-initiated bidirectional stream.
 ///
@@ -48,64 +51,95 @@ pub const fn is_reserved_lane(lane: u64) -> bool {
     lane >= PEER_LANE_BASE
 }
 
-/// The QUIC stream an application lane is carried on.
+/// Which side of the connection this endpoint is.
 ///
-/// Client-initiated bidirectional streams are numbered in fours, and the control
-/// stream is the first of them, so lane zero is the second. A lane is never
-/// carried on the control stream and never on a stream the peer initiated.
+/// It decides which streams are this endpoint's to open. QUIC numbers a stream by
+/// its initiator, so the same lane is a different stream on each side, and a
+/// mapping that ignored the role would have one endpoint writing to a stream the
+/// other one opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    Client,
+    Server,
+}
+
+/// The QUIC stream a lane this endpoint opens is carried on.
+///
+/// Both sides open streams: a lane carries the records its opener sends, and the
+/// peer reports them under a peer lane. The client's first bidirectional stream
+/// is the control stream, so its lanes start at the second; the server opens no
+/// control stream, so its lanes start at its first.
 ///
 /// # Errors
-/// Rejects a reserved lane, and a lane whose stream number a QUIC varint could
-/// not carry.
-pub const fn stream_for_lane(lane: u64) -> Result<u64, Error> {
+/// Rejects a reserved lane, and a lane with no stream identifier left.
+pub const fn stream_for_lane(lane: u64, role: Role) -> Result<u64, Error> {
     if is_reserved_lane(lane) {
         return Err(Error::InvalidConfiguration);
     }
-    // The bound is on the lane rather than on the stream it produces. Streams
-    // are multiples of four, so no lane maps to the largest identifier itself and
-    // a bound stated over streams could never be met exactly.
+    // The bound is on the lane rather than on the stream it produces. Streams are
+    // spaced by four, so no lane maps to the largest identifier itself and a
+    // bound stated over streams could never be met exactly.
     if lane > MAX_LANE {
         return Err(Error::ArithmeticOverflow);
     }
-    // Client-initiated bidirectional streams are 0, 4, 8, ..., and the control
-    // stream is the first. Bounded above, so neither step can overflow.
-    Ok((lane + 1) * 4)
+    // Bounded above, so neither step can overflow.
+    Ok(match role {
+        Role::Client => (lane + 1) * 4,
+        Role::Server => lane * 4 + 1,
+    })
 }
 
 /// The largest lane a QUIC stream identifier exists for.
 pub const MAX_LANE: u64 = MAX_STREAM_ID / 4 - 1;
 
+// Both sides' numbering of the last lane fits in a stream identifier, and no
+// lane a caller may name is one the receive path reports under.
 const _: () = assert!((MAX_LANE + 1) * 4 <= MAX_STREAM_ID);
+const _: () = assert!(MAX_LANE * 4 < MAX_STREAM_ID);
 const _: () = assert!(MAX_LANE < PEER_LANE_BASE);
 
 /// The largest stream identifier a QUIC varint carries, from RFC 9000.
 pub const MAX_STREAM_ID: u64 = (1 << 62) - 1;
 
+/// Whether `stream` is one this endpoint opened.
+///
+/// QUIC's two low bits name the initiator and the directionality. This endpoint
+/// opens bidirectional streams only, so a unidirectional one is always the
+/// peer's however it is numbered.
+#[must_use]
+pub const fn locally_initiated(stream: u64, role: Role) -> bool {
+    matches!((role, stream % 4), (Role::Client, 0) | (Role::Server, 1))
+}
+
 /// Which lane a stream's bytes are reported under.
 ///
 /// The control stream is reported under [`CONTROL_LANE`], a stream this endpoint
 /// opened under the lane it was opened for, and anything else under a peer lane.
-/// A peer stream numbered past the peer lane range is refused rather than folded
-/// into it, because folding two streams onto one lane would interleave records
-/// from different transfers.
+/// Two peer streams never share a lane, because records from different transfers
+/// would interleave on it.
 ///
 /// # Errors
-/// Rejects a peer stream whose identifier has no distinct lane.
-pub const fn lane_for_stream(stream: u64, locally_initiated: bool) -> Result<u64, Error> {
+/// Rejects a stream identifier no QUIC varint carries.
+pub const fn lane_for_stream(stream: u64, role: Role) -> Result<u64, Error> {
+    // First, and whatever the role: no QUIC stream is numbered past this, so a
+    // number that is has no lane on either side. Asked after the classification
+    // instead, a number this large would be read as one side's own stream and
+    // answered with a lane outside the range a caller may name.
+    if stream > MAX_STREAM_ID {
+        return Err(Error::LaneLimitExceeded);
+    }
     if stream == CONTROL_STREAM_ID {
         return Ok(CONTROL_LANE);
     }
-    if locally_initiated {
-        // The inverse of stream_for_lane, which only ever produces a multiple of
-        // four above the control stream. Anything else was not opened here,
-        // whatever the caller believes.
-        if stream % 4 != 0 {
-            return Err(Error::InvalidConfiguration);
-        }
-        return Ok(stream / 4 - 1);
-    }
-    if stream > MAX_STREAM_ID {
-        return Err(Error::LaneLimitExceeded);
+    if locally_initiated(stream, role) {
+        // The inverse of stream_for_lane, on this endpoint's own numbering.
+        // Neither arm subtracts anything the division would not absorb. A
+        // server's stream is four times its lane plus one, so dividing by four
+        // is the lane; a client's is four times one more than its lane.
+        return Ok(match role {
+            Role::Client => stream / 4 - 1,
+            Role::Server => stream / 4,
+        });
     }
     // No bound on the lane. Every QUIC stream identifier is at most 2^62 - 1, so
     // the offset lane is at most 2^63 - 1, which the assertion below holds to be
@@ -162,13 +196,41 @@ pub enum NativeEvent {
 
 /// Holds the bounded queue every adapter has and translates what the pump
 /// reports.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct QuicheAdapter {
     queue: Queue,
     path: Option<(ConnectionId, PathStats)>,
+    role: Role,
+}
+
+impl Default for QuicheAdapter {
+    fn default() -> Self {
+        Self {
+            queue: Queue::default(),
+            path: None,
+            // A client until told otherwise: it is the side that opens the
+            // control stream, so it is the side an endpoint is by default.
+            role: Role::Client,
+        }
+    }
 }
 
 impl QuicheAdapter {
+    /// An adapter for the side of the connection this endpoint is on.
+    #[must_use]
+    pub fn for_role(role: Role) -> Self {
+        Self {
+            role,
+            ..Self::default()
+        }
+    }
+
+    /// Which side this endpoint is, which decides the streams it may open.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
     /// Creates an adapter with explicit inbound and outbound queue limits.
     ///
     /// # Errors
@@ -177,6 +239,7 @@ impl QuicheAdapter {
         Ok(Self {
             queue: Queue::with_limits(command_count, command_bytes)?,
             path: None,
+            role: Role::Client,
         })
     }
 
@@ -320,13 +383,14 @@ impl TransportAdapter for QuicheAdapter {
     fn preflight_reliable_batch(&self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
         // The lane has to be one this carrier can open, and that is decided here
         // rather than at the pump: a batch that passes the preflight and fails at
-        // submission would have been accepted only in part.
-        stream_for_lane(stream.0)?;
+        // submission would have been accepted only in part. Either role's
+        // numbering answers the same way, because both refuse the same lanes.
+        stream_for_lane(stream.0, self.role)?;
         self.queue.preflight_reliable_batch(records)
     }
 
     fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
-        stream_for_lane(stream.0)?;
+        stream_for_lane(stream.0, self.role)?;
         self.queue.send_reliable(stream, record)
     }
 
@@ -369,87 +433,125 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lane_is_a_client_initiated_bidirectional_stream_above_the_control_one() {
-        // spec/wire.md section 7: negotiation is the first client-initiated
-        // bidirectional stream, which in QUIC is stream zero. Lanes are the ones
-        // after it, so no lane is ever carried on the control stream.
+    fn each_side_opens_its_own_streams_for_the_records_it_sends() {
+        // QUIC numbers a stream by its initiator, so the same lane is a different
+        // stream on each side. A mapping that ignored the role would have one
+        // endpoint writing to a stream the other one opened.
         assert_eq!(CONTROL_STREAM_ID, 0);
-        assert_eq!(stream_for_lane(0), Ok(4));
-        assert_eq!(stream_for_lane(1), Ok(8));
-        assert_eq!(stream_for_lane(7), Ok(32));
+        // The client's first bidirectional stream is the control stream, so its
+        // lanes start at the second.
+        assert_eq!(stream_for_lane(0, Role::Client), Ok(4));
+        assert_eq!(stream_for_lane(1, Role::Client), Ok(8));
+        // The server opens no control stream, so its lanes start at its first.
+        assert_eq!(stream_for_lane(0, Role::Server), Ok(1));
+        assert_eq!(stream_for_lane(1, Role::Server), Ok(5));
+
         for lane in 0..64 {
-            let stream = stream_for_lane(lane).expect("a lane this carrier can open");
-            assert_ne!(stream, CONTROL_STREAM_ID, "lane {lane}");
-            assert_eq!(stream % 4, 0, "client-initiated and bidirectional");
-            assert_eq!(
-                lane_for_stream(stream, true),
-                Ok(lane),
-                "the lane comes back"
-            );
+            for role in [Role::Client, Role::Server] {
+                let stream = stream_for_lane(lane, role).expect("a lane this side opens");
+                assert_ne!(stream, CONTROL_STREAM_ID, "lane {lane} as {role:?}");
+                assert!(
+                    locally_initiated(stream, role),
+                    "lane {lane} as {role:?} is this side's to open"
+                );
+                assert_eq!(
+                    lane_for_stream(stream, role),
+                    Ok(lane),
+                    "the lane comes back as {role:?}"
+                );
+                // And the same stream is the peer's, reported under a peer lane.
+                let peer = match role {
+                    Role::Client => Role::Server,
+                    Role::Server => Role::Client,
+                };
+                assert!(!locally_initiated(stream, peer));
+                assert!(is_reserved_lane(lane_for_stream(stream, peer).unwrap()));
+            }
         }
 
-        // A reserved lane is not an application's to open, and a lane whose
-        // stream number no varint carries is refused rather than wrapped.
-        assert_eq!(
-            stream_for_lane(PEER_LANE_BASE),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            stream_for_lane(CONTROL_LANE),
-            Err(Error::InvalidConfiguration)
-        );
-        assert_eq!(
-            stream_for_lane(PEER_LANE_BASE - 1),
-            Err(Error::ArithmeticOverflow),
-            "a lane inside the range whose stream is outside it"
-        );
-        assert_eq!(MAX_STREAM_ID, 4_611_686_018_427_387_903);
+        // The two sides never collide: no stream is both sides' to open.
+        for stream in 0..64 {
+            assert!(
+                !(locally_initiated(stream, Role::Client)
+                    && locally_initiated(stream, Role::Server))
+            );
+        }
     }
 
     #[test]
-    fn a_stream_is_reported_under_the_lane_it_belongs_to() {
-        // The control stream is reported under its own lane, not under lane zero,
-        // so a session cannot take a negotiation frame for a record.
-        assert_eq!(lane_for_stream(CONTROL_STREAM_ID, true), Ok(CONTROL_LANE));
-        assert_eq!(lane_for_stream(CONTROL_STREAM_ID, false), Ok(CONTROL_LANE));
+    fn every_stream_identifier_a_peer_may_use_has_a_lane() {
+        // The largest identifier QUIC allows is inside the bound, so a peer using
+        // it is answered rather than refused, and one past it has no lane at all.
+        assert_eq!(MAX_STREAM_ID, 4_611_686_018_427_387_903);
+        assert_eq!(MAX_STREAM_ID, (1 << 62) - 1);
+        for role in [Role::Client, Role::Server] {
+            assert_eq!(
+                lane_for_stream(MAX_STREAM_ID, role),
+                Ok(PEER_LANE_BASE + MAX_STREAM_ID),
+                "the largest identifier, as {role:?}"
+            );
+            assert!(lane_for_stream(MAX_STREAM_ID, role).unwrap() <= PEER_LANE_LAST);
+            assert_ne!(
+                lane_for_stream(MAX_STREAM_ID, role).unwrap(),
+                CONTROL_LANE,
+                "and never the control lane"
+            );
+            assert_eq!(
+                lane_for_stream(MAX_STREAM_ID + 1, role),
+                Err(Error::LaneLimitExceeded),
+                "one past it, as {role:?}"
+            );
+        }
+    }
 
-        // A stream the peer opened is reported under a peer lane. Two peer
-        // streams never share a lane, because records from different transfers
-        // would interleave on it.
-        assert_eq!(lane_for_stream(1, false), Ok(PEER_LANE_BASE + 1));
-        assert_eq!(lane_for_stream(3, false), Ok(PEER_LANE_BASE + 3));
-        assert_ne!(
-            lane_for_stream(1, false).unwrap(),
-            lane_for_stream(3, false).unwrap()
-        );
-        assert!(is_reserved_lane(lane_for_stream(1, false).unwrap()));
+    #[test]
+    fn an_adapter_is_the_side_it_was_built_for() {
+        // The role decides which streams this endpoint may open, so an adapter
+        // that lost it would write to streams the peer owns.
+        assert_eq!(QuicheAdapter::default().role(), Role::Client);
+        assert_eq!(QuicheAdapter::for_role(Role::Server).role(), Role::Server);
+        assert_eq!(QuicheAdapter::for_role(Role::Client).role(), Role::Client);
+    }
 
-        // Every stream identifier QUIC allows has a lane, including the largest,
-        // and it is inside the peer range rather than at the control lane.
-        assert_eq!(
-            lane_for_stream(MAX_STREAM_ID, false),
-            Ok(PEER_LANE_BASE + MAX_STREAM_ID)
-        );
-        assert!(lane_for_stream(MAX_STREAM_ID, false).unwrap() <= PEER_LANE_LAST);
-        assert_ne!(lane_for_stream(MAX_STREAM_ID, false).unwrap(), CONTROL_LANE);
-        // A number no QUIC stream can have is refused rather than folded onto a
-        // lane already in use.
-        assert_eq!(
-            lane_for_stream(MAX_STREAM_ID + 1, false),
-            Err(Error::LaneLimitExceeded)
-        );
+    #[test]
+    fn a_unidirectional_stream_is_always_the_peers() {
+        // This endpoint opens bidirectional streams only, so a unidirectional one
+        // is the peer's however it is numbered. Reading its low bits as an
+        // initiator would report a peer's stream as a reply to this endpoint's own
+        // request.
+        for stream in [2_u64, 3, 6, 7, 4_002, 4_003] {
+            for role in [Role::Client, Role::Server] {
+                assert!(!locally_initiated(stream, role), "{stream} as {role:?}");
+                assert!(
+                    is_reserved_lane(lane_for_stream(stream, role).unwrap()),
+                    "{stream} as {role:?}"
+                );
+            }
+        }
+    }
 
-        // A stream nothing here opened is refused even when the caller says
-        // otherwise, because the inverse mapping would name the wrong lane.
-        assert_eq!(
-            lane_for_stream(6, true),
-            Err(Error::InvalidConfiguration),
-            "not a stream stream_for_lane produces"
-        );
-
-        // A lane this endpoint opened is reported under the lane it asked for,
-        // and never as a peer lane.
-        assert!(!is_reserved_lane(lane_for_stream(4, true).unwrap()));
+    #[test]
+    fn the_largest_lane_that_has_a_stream_has_one() {
+        // The bound is on the lane, so the last lane that fits is inside it. A
+        // bound one lower would refuse a lane this carrier can open.
+        assert_eq!(MAX_LANE, MAX_STREAM_ID / 4 - 1);
+        for role in [Role::Client, Role::Server] {
+            let stream = stream_for_lane(MAX_LANE, role).expect("the last lane");
+            assert!(stream <= MAX_STREAM_ID, "{role:?}");
+            assert_eq!(lane_for_stream(stream, role), Ok(MAX_LANE), "{role:?}");
+            assert_eq!(
+                stream_for_lane(MAX_LANE + 1, role),
+                Err(Error::ArithmeticOverflow),
+                "the first lane whose stream does not fit, as {role:?}"
+            );
+            // A reserved lane is refused for being reserved rather than for being
+            // large, so the two answers stay distinguishable.
+            assert_eq!(
+                stream_for_lane(PEER_LANE_BASE, role),
+                Err(Error::InvalidConfiguration),
+                "{role:?}"
+            );
+        }
     }
 
     #[test]
@@ -679,27 +781,6 @@ mod tests {
         assert!(is_reserved_lane(CONTROL_LANE));
         assert!(is_reserved_lane(PEER_LANE_LAST));
         assert!(!is_reserved_lane(PEER_LANE_BASE - 1));
-    }
-
-    #[test]
-    fn the_largest_lane_that_has_a_stream_has_one() {
-        // The bound is on the stream a lane needs, so the last lane that fits is
-        // inside it. A bound one lower would refuse a lane this carrier can open.
-        assert_eq!(MAX_LANE, MAX_STREAM_ID / 4 - 1);
-        assert_eq!(stream_for_lane(MAX_LANE), Ok(MAX_STREAM_ID - 3));
-        assert!(stream_for_lane(MAX_LANE).unwrap() <= MAX_STREAM_ID);
-        assert_eq!(
-            stream_for_lane(MAX_LANE + 1),
-            Err(Error::ArithmeticOverflow),
-            "and the first lane whose stream does not fit"
-        );
-        assert_eq!(lane_for_stream(MAX_STREAM_ID - 3, true), Ok(MAX_LANE));
-        // A reserved lane is refused for being reserved rather than for being
-        // large, so the two answers stay distinguishable.
-        assert_eq!(
-            stream_for_lane(PEER_LANE_BASE),
-            Err(Error::InvalidConfiguration)
-        );
     }
 
     #[test]

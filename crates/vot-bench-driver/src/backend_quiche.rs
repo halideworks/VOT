@@ -218,6 +218,9 @@ impl Carrier for QuicheCarrier {
         self.server.poll()
     }
 
+    // A sender that loses its connection is reported here and discarded with
+    // the rest. The object stops arriving either way, so the run ends on the
+    // receiver's disconnect or on the budget rather than silently.
     fn drain_sent(&mut self) {
         while self.client.poll().is_some() {}
     }

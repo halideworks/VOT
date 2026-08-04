@@ -563,6 +563,12 @@ trait Carrier {
     /// Impairment fields this carrier describes but does not shape.
     fn unmodelled(&self) -> &[&'static str];
 
+    /// What this carrier was configured with, when a reader needs it to know
+    /// which path the result describes. Appended to `notes` as it is given.
+    fn detail(&self) -> Option<String> {
+        None
+    }
+
     /// The endpoint whose inbound bound the case's credit applies to.
     ///
     /// The receiving endpoint is the peer on a real carrier and the same object
@@ -761,6 +767,10 @@ fn transfer_notes(
             .cpu
             .map_or_else(|| "unmeasured".to_owned(), |(_, system)| system.to_string()),
     );
+    if let Some(detail) = carrier.detail() {
+        notes.push(';');
+        notes.push_str(&detail);
+    }
     if !carrier.unmodelled().is_empty() {
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&carrier.unmodelled().join(","));
@@ -1532,6 +1542,24 @@ mod tests {
         assert!(wire > 4 * 65_536, "wire was {wire}");
         assert!(wire < 4 * 65_536 + 4 * 64, "wire was {wire}");
         assert_eq!(measured.bytes_sent, 4 * 65_536);
+    }
+
+    #[test]
+    fn every_note_is_a_named_value() {
+        // `notes` is read by people and by scripts, and both take it as
+        // semicolon-separated name=value. A carrier that has nothing extra to
+        // say adds nothing, rather than an empty field or a bare word that
+        // neither can interpret.
+        let measured = measure(&case(65_536, Suite::Blake3Bao64)).unwrap();
+        for field in measured.notes.split(';') {
+            assert!(
+                field
+                    .split_once('=')
+                    .is_some_and(|(name, _)| !name.is_empty()),
+                "{field:?} is not a named value in {}",
+                measured.notes
+            );
+        }
     }
 
     #[test]

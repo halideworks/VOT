@@ -53,6 +53,15 @@ python3 tools/run_benchmark.py --backend quiche --seed 42 --workers 1 \
   --output results.jsonl --command target/release/vot-bench-driver
 ```
 
+The quiche pair takes `VOT_BENCH_QUICHE_DATAGRAM_BYTES` when a run needs a
+datagram size other than the default 1350. It is not a `VOT_BENCH_*` contract
+variable, because it describes the path a run was taken on rather than the
+workload, and every run reports the size it used in `notes`. A comparison must
+hold it fixed across backends: one datagram is one syscall and one packet's
+worth of crypto, so it is worth about five times the throughput on loopback and
+would otherwise be reported as a property of an engine. See
+`results/perf-001-quic-bakeoff.md`.
+
 Both need `openssl` on the path. The `msquic` feature also links MsQuic's
 bundled C library, which the driver binary loads at run time and will not start
 without:

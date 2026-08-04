@@ -18,9 +18,31 @@ use std::net::UdpSocket;
 ///
 /// # Errors
 /// Returns the operating-system error when an option cannot be set.
+pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        refuse_fragmentation_linux(socket)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        refuse_fragmentation_macos(socket)
+    }
+    #[cfg(windows)]
+    {
+        refuse_fragmentation_windows(socket)
+    }
+    // A platform with no wrapper here keeps the kernel default, where a
+    // narrow path may fragment; discovery above this socket is advisory.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = socket;
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
+fn refuse_fragmentation_linux(socket: &UdpSocket) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     fn set(fd: i32, level: i32, option: i32, value: libc::c_int) -> io::Result<()> {
@@ -62,13 +84,9 @@ pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// Asks the network to drop this socket's datagrams rather than fragment them.
-///
-/// # Errors
-/// Returns the operating-system error when an option cannot be set.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
+fn refuse_fragmentation_macos(socket: &UdpSocket) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     fn set(fd: i32, level: i32, option: i32) -> io::Result<()> {
@@ -95,13 +113,9 @@ pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// Asks the network to drop this socket's datagrams rather than fragment them.
-///
-/// # Errors
-/// Returns the operating-system error when an option cannot be set.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
+fn refuse_fragmentation_windows(socket: &UdpSocket) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock;
 
@@ -131,18 +145,6 @@ pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
     } else {
         set(handle, WinSock::IPPROTO_IPV6, WinSock::IPV6_DONTFRAG)
     }
-}
-
-/// Asks the network to drop this socket's datagrams rather than fragment them.
-///
-/// This platform has no wrapper here, so the kernel's default stands and a
-/// narrow path may fragment; discovery run above this socket is advisory.
-///
-/// # Errors
-/// Never fails; the signature matches the platforms that can act.
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub fn refuse_fragmentation(_socket: &UdpSocket) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

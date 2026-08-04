@@ -1,0 +1,109 @@
+# PERF-001: MsQuic and quiche on the same workload
+
+Date: 2026-08-04
+
+Both QUIC backends carry one object through the same transfer loop, the same
+framing, and the same inline verification, so a difference between two results
+is a difference between two carriers. This is the one-rail, one-worker half of
+PERF-001. What is not here, and why, is at the bottom.
+
+## Environment
+
+- Linux 6.8.0-110-generic, x86_64
+- 13th Gen Intel Core i5-13500, 20 logical CPUs, 134 GB memory
+- Loopback, MTU 65536. **Both endpoints run on this one host**, so each result
+  pays for the sender and the receiver together and understates what either
+  carrier would do with a machine to itself. It is a fair comparison and an
+  unfair absolute.
+- Source commit: `e332ad4`
+
+## Workload
+
+One 512 MB object, one lane, one worker, 64 KiB records, `blake3-bao64`,
+seed 42, no impairment shaping. Five runs per configuration, medians reported,
+because at this size a single run decides nothing: see the spread column.
+
+## Result
+
+| carrier | datagram | Mbit/s (median) | spread | user CPU | system CPU |
+| --- | --- | --- | --- | --- | --- |
+| MsQuic | segmented | 9984 | 1.28x | 0.99 s | 0.21 s |
+| quiche | 1350 | 1460 | 1.41x | 2.72 s | 3.52 s |
+| quiche | 16384 | 5849 | 1.51x | 0.97 s | 0.82 s |
+| quiche | 32768 | 7190 | 1.60x | 0.90 s | 0.49 s |
+| quiche | 65527 | 7071 | 1.27x | 0.92 s | 0.58 s |
+
+CPU is the median of each column and covers the timed section only, both
+endpoints and the driver together.
+
+## What it says
+
+**At its default the quiche backend is nearly seven times slower, and that is
+almost entirely one constant of ours.** The pump sized every datagram at 1350,
+which is what an endpoint facing an unknown path must assume, against a
+loopback MTU of 65536. One datagram is one syscall and one packet's worth of
+header protection and AEAD, so the default paid both on every 1350 bytes:
+system time falls from 3.52 s to 0.49 s when the datagram is sized to the path,
+and user time falls from 2.72 s to 0.90 s, because per-packet crypto cost about
+as much as the syscalls did.
+
+**At comparable packet sizes the two engines are close.** MsQuic leads by about
+1.4x on throughput and about 1.16x on total CPU. quiche spends *less* user CPU
+than MsQuic (0.90 s against 0.99 s); MsQuic's remaining advantage is system
+time, 0.21 s against 0.49 s, which is what segmentation offload buys. That is
+the gap PERF-002 is chartered to close on this path, and it is the whole of the
+gap that is left.
+
+**More is not always better.** 65527 measured slightly below 32768. Whatever
+the mechanism, the useful reading is that the largest datagram a path allows is
+not automatically the fastest, so the size belongs in the result rather than
+being assumed.
+
+**Neither carrier is hash-bound.** ADR-0020 measures this verifier at 33.6 Gb/s
+for `blake3-bao64` on this host, against a best transport result here of about
+10 Gb/s.
+
+## Reproducing
+
+```sh
+cargo build --release -p vot-bench-driver --features msquic,quiche
+export LD_LIBRARY_PATH="$(dirname "$(find target -name libmsquic.so.2 | head -1)")"
+VOT_BENCH_BACKEND=quiche VOT_BENCH_SUITE=blake3-bao64 VOT_BENCH_WORKERS=1 \
+VOT_BENCH_SEED=42 VOT_BENCH_OBJECT_BYTES=536870912 VOT_BENCH_RECORD_BYTES=65536 \
+VOT_BENCH_IMPAIRMENT_MTU_BYTES=1500 VOT_BENCH_IMPAIRMENT_RTT_US=1000 \
+VOT_BENCH_IMPAIRMENT_LOSS_PPM=0 VOT_BENCH_IMPAIRMENT_REORDER_WINDOW=0 \
+VOT_BENCH_IMPAIRMENT_BANDWIDTH_BPS=10000000000 \
+VOT_BENCH_IMPAIRMENT_QUEUE_BYTES=33554432 \
+VOT_BENCH_QUICHE_DATAGRAM_BYTES=32768 \
+target/release/vot-bench-driver
+```
+
+Each run reports its own `datagram_bytes`, `cpu_user_ns`, and `cpu_sys_ns` in
+`notes`, so a result says which path it describes without a reader having to
+reconstruct the configuration.
+
+## What this does not cover
+
+**No default backend is selected here.** That is ADR-0026, and it should not be
+written from this table alone: two of PERF-001's three acceptance criteria are
+still unmeasured, and one of them could move the answer.
+
+- `one_rail_one_worker_and_multi_worker_measured`: the one-worker half only.
+  Multi-worker needs the driver to send proof-bearing ranges, whose groundwork
+  landed as ADR-0025 and the range-proof entry points in both proof crates.
+- `provisioned_multi_rail_labeled`: not measured. It splits one object across
+  several connections and needs the same range path.
+- `serialized_spine_hypothesis_tested`: not tested, and it is the criterion that
+  could change the choice. It predicts that payload workers sharing one
+  connection top out below independent rails, which is a claim about the
+  connection's packet-number and ACK spine rather than about either engine's
+  single-stream speed.
+
+**No two-machine run.** Loopback numbers do not transfer to a wire.
+
+One further caveat for whoever writes ADR-0026: `TransportAdapter` takes
+`&mut self`, so several workers cannot submit through one adapter concurrently
+without a lock, while separate connections each have their own adapter. Multi-
+worker and multi-rail therefore differ in more than the connection count, and
+the spine measurement has to account for that or it will attribute the driver's
+serialization to the carrier's.

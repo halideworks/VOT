@@ -84,6 +84,8 @@ pub(crate) struct Endpoint {
 /// Rejects a missing or unrecognised role or address, and propagates whatever
 /// the transfer itself reports.
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
+    #[cfg(test)]
+    crate::test_guard::arm();
     let role = crate::variable(&|name| std::env::var(name).ok(), ROLE)?;
     match role.as_str() {
         "send" => {

@@ -36,9 +36,10 @@ use crate::{Carrier, Config, Error};
 /// connect fails rather than hanging in CI.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lanes the endpoints advertise. The transfer uses one; the rest are room for
-/// the multi-rail work in the same backlog item.
-const ADVERTISED_LANES: u64 = 4;
+/// Lanes the endpoints advertise. The sequential transfer uses one, the
+/// ranged path uses one per worker starting at lane 1, and the workload
+/// defines worker counts up to 8, so the endpoint advertises room for that.
+const ADVERTISED_LANES: u64 = 16;
 
 /// The connection identifier the client reports its connection under. Arbitrary
 /// and never compared against anything, because one pair carries one transfer.
@@ -379,6 +380,19 @@ mod tests {
         assert_eq!(measured.verified_bytes, object_bytes);
         assert_eq!(measured.bytes_sent, object_bytes);
         assert_eq!(note_field(&measured.notes, "backend"), "msquic");
+    }
+
+    #[test]
+    fn a_ranged_case_crosses_a_real_socket_and_verifies() {
+        // The multi-worker path over a real socket: disjoint proof-bearing
+        // ranges on one lane per worker, a ragged tail included.
+        for workers in [2_usize, 4] {
+            let mut config = case(6 * 65_536 + 17);
+            config.workers = workers;
+            let measured = measure(&config).unwrap();
+            assert_eq!(measured.verified_bytes, config.object_bytes);
+            assert_eq!(note_field(&measured.notes, "path"), "ranged");
+        }
     }
 
     #[test]

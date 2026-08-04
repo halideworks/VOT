@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use vot_scheduler::ReliableReceiver;
@@ -39,11 +41,12 @@ const SUBMIT_BATCH_RECORDS: usize = 16;
 /// Bytes drawn from the generator at a time.
 const WORD_BYTES: usize = 8;
 
-/// The lane the transfer uses.
+/// The lane the sequential transfer uses.
 ///
 /// One lane, because the case describes one object. A second would measure how
 /// the carrier schedules between lanes, which is a different question from the
-/// one the matrix asks.
+/// one the sequential matrix asks; the ranged path asks exactly that question
+/// and numbers its lanes from here up (ADR-0025).
 const TRANSFER_LANE: StreamId = StreamId(1);
 
 /// The shortest wait after a delivery that moved nothing, and the longest.
@@ -331,10 +334,25 @@ impl ObjectSource {
         }
     }
 
+    /// The source advanced to `byte_offset`, exactly as if every preceding
+    /// byte had been drawn.
+    ///
+    /// Range workers start mid-object, and drawing a gigabyte of prefix
+    /// sequentially would charge the timed section for bytes nobody sends.
+    /// Byte offsets on this path are 64 KiB aligned, so the word alignment
+    /// this needs always holds; it is still checked, because a misaligned
+    /// start would generate a different object than the sequential path.
+    fn at(seed: u64, byte_offset: u64) -> Result<Self, Error> {
+        if byte_offset % WORD_BYTES as u64 != 0 {
+            return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
+        }
+        let mut source = Self::new(seed);
+        source.state = advance(source.state, byte_offset / WORD_BYTES as u64);
+        Ok(source)
+    }
+
     fn draw(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
+        self.state = step(self.state);
         self.state
     }
 
@@ -351,6 +369,430 @@ impl ObjectSource {
         }
         buffer.truncate(take);
     }
+}
+
+/// One worker's contiguous slice of the object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerRange {
+    offset: u64,
+    bytes: u64,
+}
+
+/// Disjoint, 64 KiB-aligned slabs covering the object exactly, one per worker.
+///
+/// Groups are dealt as evenly as they divide, the leading workers taking one
+/// more where they do not, and the last slab also takes the object's ragged
+/// tail. More workers than groups would leave some with nothing to send,
+/// which is a case with nothing honest to measure rather than a smaller one.
+fn worker_ranges(object_bytes: u64, workers: usize) -> Result<Vec<WorkerRange>, Error> {
+    let groups = object_bytes.div_ceil(GROUP_BYTES);
+    let count = workers as u64;
+    if workers == 0 || count > groups {
+        return Err(Error::Unsupported(format!(
+            "worker_count {workers} over a {groups}-group object leaves workers with nothing to send"
+        )));
+    }
+    let per = groups / count;
+    let extra = groups % count;
+    let mut ranges = Vec::with_capacity(workers);
+    let mut offset = 0_u64;
+    for index in 0..count {
+        let slab_groups = per + u64::from(index < extra);
+        let end = offset
+            .saturating_add(slab_groups.saturating_mul(GROUP_BYTES))
+            .min(object_bytes);
+        ranges.push(WorkerRange {
+            offset,
+            bytes: end - offset,
+        });
+        offset = end;
+    }
+    Ok(ranges)
+}
+
+/// Records one bundle carries on the ranged path.
+///
+/// The codec allows 17; 16 keeps a bundle of 64 KiB records at 1 MiB, inside
+/// the 4 MiB requested-range cap with room for the record size below.
+const RECORDS_PER_BUNDLE: usize = 16;
+
+/// The largest record the ranged path accepts.
+///
+/// A `DATA_RECORD`'s whole CBOR payload is bounded at 256 KiB, and the map
+/// around the bytes costs some of it, so the largest 64 KiB multiple that
+/// fits is three groups. The sequential path keeps its own larger bound; the
+/// two paths frame differently and say so in `notes`.
+const MAX_RANGED_RECORD_BYTES: usize = 3 * 65_536;
+
+/// The record size a ranged case runs at.
+///
+/// A multiple of the 64 KiB group, because ranges verify in whole groups and
+/// a record that straddled a group boundary would make every bundle's cover
+/// misaligned. Only a worker slab's final record may be short, so a short
+/// record can sit mid-object where two slabs meet.
+fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
+    let bytes = config.record_bytes;
+    if bytes == 0 || bytes % vot_verifier::GROUP_SIZE != 0 || bytes > MAX_RANGED_RECORD_BYTES {
+        return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
+    }
+    Ok(bytes)
+}
+
+/// The staging the ranged receiver needs: the object it retains until
+/// completion, plus the verifier reservation.
+///
+/// The range path keeps every verified range in memory until the object is
+/// whole, so on this path peak staging tracks object size by design and the
+/// report reads it as retention, not as a leak.
+fn ranged_staging_limit(config: &Config) -> u64 {
+    config.object_bytes.saturating_add(GROUP_BYTES)
+}
+
+/// Builds the receiver for a ranged case.
+fn receiver_for_ranged(config: &Config) -> Result<ReliableReceiver, Error> {
+    let limit = ranged_staging_limit(config);
+    let window = config.bandwidth_delay_bytes().max(limit.min(GROUP_BYTES));
+    Ok(ReliableReceiver::new(limit, window, limit)?)
+}
+
+/// The chaining-value layer ranges are proved from, per suite.
+///
+/// ADR-0025: proving from the object costs a whole-object hash per range, so
+/// the sender streams the object once and keeps 32 bytes per 64 KiB group.
+enum ProverLayer {
+    Blake3(vot_proof_blake3::GroupCvs),
+    Sha256(vot_proof_sha256::PieceHashes),
+}
+
+/// Streams the generated object once, feeding the subject hash and the prover
+/// layer together. Runs before the timed section, as `subject_of` does.
+fn prover_layer_and_subject(config: &Config) -> Result<(SubjectId, ProverLayer), Error> {
+    let mut verifier = StreamVerifier::new(config.suite);
+    let mut layer = match config.suite {
+        Suite::Blake3Bao64 => ProverLayer::Blake3(vot_proof_blake3::GroupCvs::new()),
+        Suite::Sha256Bep52 => ProverLayer::Sha256(vot_proof_sha256::PieceHashes::new()),
+    };
+    let mut source = ObjectSource::new(config.seed);
+    let mut group = Vec::with_capacity(vot_verifier::GROUP_SIZE);
+    for take in record_lengths(config.object_bytes, vot_verifier::GROUP_SIZE)? {
+        source.fill(&mut group, take);
+        verifier.update(&group)?;
+        match &mut layer {
+            ProverLayer::Blake3(cvs) => cvs.push(&group).map_err(|_| layer_error())?,
+            ProverLayer::Sha256(pieces) => pieces.push(&group).map_err(|_| layer_error())?,
+        }
+    }
+    let subject = SubjectId {
+        suite: match config.suite {
+            Suite::Blake3Bao64 => 1,
+            Suite::Sha256Bep52 => 2,
+        },
+        root: verifier.finish()?,
+        length: config.object_bytes,
+    };
+    Ok((subject, layer))
+}
+
+/// A proving failure with a well-formed schedule, which only a driver defect
+/// can produce. Reported rather than panicking, so a run fails with a reason.
+fn layer_error() -> Error {
+    Error::Unsupported("the range prover refused a scheduled range".to_owned())
+}
+
+/// Proves one aligned range from the layer.
+fn prove_range(layer: &ProverLayer, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
+    let (covered_offset, covered_length, proof) = match layer {
+        ProverLayer::Blake3(cvs) => {
+            let cover =
+                vot_proof_blake3::prove_with(cvs, offset, length).map_err(|_| layer_error())?;
+            (cover.covered_offset, cover.covered_length, cover.proof)
+        }
+        ProverLayer::Sha256(pieces) => {
+            let cover =
+                vot_proof_sha256::prove_with(pieces, offset, length).map_err(|_| layer_error())?;
+            (cover.covered_offset, cover.covered_length, cover.proof)
+        }
+    };
+    // The schedule is group aligned, so the cover must be exactly the request;
+    // an expanded cover would desynchronise the receiver's completion count.
+    if covered_offset != offset || covered_length != length {
+        return Err(layer_error());
+    }
+    Ok(proof)
+}
+
+/// The identifier a bundle travels under: seed, worker, and chunk, so it is
+/// unique within a run and reproducible across runs of the same case.
+fn bundle_identifier(seed: u64, worker: u32, chunk: u32) -> [u8; 16] {
+    let mut id = [0_u8; 16];
+    id[..8].copy_from_slice(&seed.to_le_bytes());
+    id[8..12].copy_from_slice(&worker.to_le_bytes());
+    id[12..].copy_from_slice(&chunk.to_le_bytes());
+    id
+}
+
+/// One worker's framing state: walks its slab bundle by bundle, proving and
+/// encoding as it goes, so no more than one bundle of bytes exists at a time.
+struct BundleProducer {
+    subject: SubjectId,
+    layer: Arc<ProverLayer>,
+    source: ObjectSource,
+    record_bytes: usize,
+    /// Absolute offset of the next byte this worker will frame.
+    cursor: u64,
+    /// First byte past this worker's slab.
+    end: u64,
+    seed: u64,
+    worker: u32,
+    chunk: u32,
+}
+
+impl BundleProducer {
+    fn new(
+        config: &Config,
+        layer: Arc<ProverLayer>,
+        subject: SubjectId,
+        range: WorkerRange,
+        worker: u32,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            subject,
+            layer,
+            source: ObjectSource::at(config.seed, range.offset)?,
+            record_bytes: ranged_record_bytes(config)?,
+            cursor: range.offset,
+            end: range.offset.saturating_add(range.bytes),
+            seed: config.seed,
+            worker,
+            chunk: 0,
+        })
+    }
+
+    /// Frames the next bundle: one `PROOF_BUNDLE`, then its records, each a
+    /// whole wire frame. `None` once the slab is spent.
+    fn next_bundle(&mut self) -> Option<Result<Vec<RangedFrame>, Error>> {
+        if self.cursor >= self.end {
+            return None;
+        }
+        let covered_offset = self.cursor;
+        let covered_length = ((self.record_bytes as u64).saturating_mul(RECORDS_PER_BUNDLE as u64))
+            .min(self.end - self.cursor);
+        let result = self.frame_bundle(covered_offset, covered_length);
+        if result.is_ok() {
+            self.cursor += covered_length;
+            self.chunk = self.chunk.saturating_add(1);
+        }
+        Some(result)
+    }
+
+    fn frame_bundle(
+        &mut self,
+        covered_offset: u64,
+        covered_length: u64,
+    ) -> Result<Vec<RangedFrame>, Error> {
+        let identifier = bundle_identifier(self.seed, self.worker, self.chunk);
+        let proof = prove_range(&self.layer, covered_offset, covered_length)?;
+        let mut record = Vec::with_capacity(self.record_bytes);
+        let mut frames = Vec::new();
+        let mut records = Vec::new();
+        let mut offset = covered_offset;
+        let bundle_end = covered_offset + covered_length;
+        // Counted, not steered: the record count is fixed before the loop, so
+        // no arithmetic inside it can keep the loop alive.
+        let bundle_records = covered_length.div_ceil(self.record_bytes as u64);
+        for _ in 0..bundle_records {
+            let take = usize::try_from((self.record_bytes as u64).min(bundle_end - offset))
+                .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+            self.source.fill(&mut record, take);
+            records.push(vot_codec::frames::DataRecord {
+                bundle_id: identifier,
+                record_index: records.len() as u64,
+                plaintext_offset: offset,
+                plaintext_length: take as u64,
+                compression: 0,
+                encoded: record.clone(),
+            });
+            offset += take as u64;
+        }
+        let bundle = vot_codec::frames::ProofBundle {
+            request_id: identifier,
+            bundle_id: identifier,
+            object: vot_codec::frames::ObjectId {
+                suite: self.subject.suite,
+                root: self.subject.root,
+                length: self.subject.length,
+            },
+            requested_offset: covered_offset,
+            requested_length: covered_length,
+            covered_offset,
+            covered_length,
+            data_record_count: records.len() as u64,
+            total_plaintext_length: covered_length,
+            proof,
+        };
+        let mut wire = Vec::new();
+        vot_codec::frames::encode(
+            &vot_codec::frames::TypedFrame::ProofBundle(bundle),
+            &mut wire,
+        )
+        .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+        frames.push((shared_payload(&wire), 0));
+        for data_record in records {
+            let plaintext = data_record.plaintext_length;
+            wire.clear();
+            vot_codec::frames::encode(
+                &vot_codec::frames::TypedFrame::DataRecord(data_record),
+                &mut wire,
+            )
+            .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+            frames.push((shared_payload(&wire), plaintext));
+        }
+        Ok(frames)
+    }
+}
+
+/// A frame ready to submit, with the object bytes it carries, so `bytes_sent`
+/// is observed at submission rather than assumed from completion.
+type RangedFrame = (Payload, u64);
+
+/// Bundles in flight on the receive side.
+///
+/// A lane delivers a bundle's header before its records, but lanes interleave
+/// between workers, so arrivals are keyed by identifier and held until the
+/// bundle's own record count is met. Bounded: per-lane order caps incomplete
+/// bundles at one per lane, so pending past the worker count is a carrier
+/// defect rather than a state to grow into.
+struct BundleReassembly {
+    pending: BTreeMap<[u8; 16], PendingBundle>,
+    limit: usize,
+    /// Bundles verified, for the notes.
+    completed: u64,
+}
+
+struct PendingBundle {
+    bundle: vot_codec::frames::ProofBundle,
+    records: Vec<vot_codec::frames::DataRecord>,
+}
+
+impl BundleReassembly {
+    fn new(limit: usize) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            limit,
+            completed: 0,
+        }
+    }
+
+    /// Feeds one delivered frame, returning the object bytes newly verified.
+    ///
+    /// # Errors
+    /// Reports [`Error::Corrupt`] for a frame that does not decode to this
+    /// path's two types, arrives out of its bundle's order, or overflows the
+    /// pending bound, and propagates the receiver's own verdicts.
+    fn accept(
+        &mut self,
+        receiver: &mut ReliableReceiver,
+        subject: SubjectId,
+        frame: &[u8],
+    ) -> Result<u64, Error> {
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: 0,
+            max_frames: 1,
+        };
+        let (typed, consumed) =
+            vot_codec::frames::decode(frame, limits).map_err(|_| Error::Corrupt)?;
+        if consumed != frame.len() {
+            return Err(Error::Corrupt);
+        }
+        match typed {
+            vot_codec::frames::TypedFrame::ProofBundle(bundle) => {
+                if self.pending.len() >= self.limit {
+                    return Err(Error::Corrupt);
+                }
+                let identifier = bundle.bundle_id;
+                let opened = PendingBundle {
+                    bundle,
+                    records: Vec::new(),
+                };
+                if self.pending.insert(identifier, opened).is_some() {
+                    return Err(Error::Corrupt);
+                }
+                Ok(0)
+            }
+            vot_codec::frames::TypedFrame::DataRecord(record) => {
+                let identifier = record.bundle_id;
+                let Some(pending) = self.pending.get_mut(&identifier) else {
+                    return Err(Error::Corrupt);
+                };
+                pending.records.push(record);
+                if (pending.records.len() as u64) < pending.bundle.data_record_count {
+                    return Ok(0);
+                }
+                let Some(whole) = self.pending.remove(&identifier) else {
+                    return Err(Error::Corrupt);
+                };
+                let covered = whole.bundle.covered_length;
+                receiver.receive_typed_bundle(subject, &whole.bundle, &whole.records)?;
+                self.completed = self.completed.saturating_add(1);
+                Ok(covered)
+            }
+            _ => Err(Error::Corrupt),
+        }
+    }
+}
+
+/// One draw's state transition, named so [`advance`] provably raises the same
+/// map [`ObjectSource::draw`] applies.
+const fn step(mut state: u64) -> u64 {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+}
+
+/// [`step`] applied `draws` times, in logarithmic time.
+///
+/// `step` is linear over GF(2): shifts and xors distribute over xor, so one
+/// draw is a 64x64 bit matrix and `draws` of them are that matrix raised to a
+/// power, by square and multiply. At most 64 squarings whatever the count.
+fn advance(state: u64, draws: u64) -> u64 {
+    // Columns: matrix[i] is the map applied to the basis state 1 << i.
+    let mut matrix = [0_u64; 64];
+    for (bit, column) in matrix.iter_mut().enumerate() {
+        *column = step(1 << bit);
+    }
+    let mut result = state;
+    let mut remaining = draws;
+    // One pass per bit of the count, counted rather than steered, so no
+    // mutation of the body can keep the loop alive.
+    for _ in 0..u64::BITS {
+        if remaining & 1 == 1 {
+            result = apply(&matrix, result);
+        }
+        matrix = square(&matrix);
+        remaining >>= 1;
+    }
+    result
+}
+
+/// The matrix applied to one state: xor of the columns its set bits select.
+fn apply(matrix: &[u64; 64], state: u64) -> u64 {
+    let mut out = 0;
+    for (bit, column) in matrix.iter().enumerate() {
+        if state & (1 << bit) != 0 {
+            out ^= column;
+        }
+    }
+    out
+}
+
+/// The matrix composed with itself.
+fn square(matrix: &[u64; 64]) -> [u64; 64] {
+    let mut out = [0_u64; 64];
+    for (bit, column) in out.iter_mut().enumerate() {
+        *column = apply(matrix, matrix[bit]);
+    }
+    out
 }
 
 /// The record schedule for an object: full records, then a short final one.
@@ -729,6 +1171,9 @@ struct Tally {
     backpressure_waits: u64,
     idle_waits: u64,
     wire_bytes: u64,
+    /// Rounds of the one budget the ranged loop has spent. The sequential
+    /// path counts its own rounds locally and leaves this zero.
+    rounds: u64,
     /// User and system CPU nanoseconds the timed section spent, when the
     /// platform exposes them.
     cpu: Option<(u64, u64)>,
@@ -912,23 +1357,36 @@ impl Carrier for SimulatorCarrier {
 /// Propagates transport, receive, and verification failures, and rejects any
 /// case this driver cannot run honestly.
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
-    if config.workers != 1 {
-        // Parallel verification of one object needs the proof-bearing range
-        // path, which retains every accepted range. Reporting a worker count
-        // this driver did not actually use would be the one thing the benchmark
-        // contract exists to prevent.
-        return Err(Error::Unsupported(format!(
-            "worker_count {} is not implemented; the sequential path verifies with one worker",
-            config.workers
-        )));
+    // One worker keeps the sequential path every landed number was taken on;
+    // more run the ranged path, where workers carry disjoint proof-bearing
+    // ranges of the one object (ADR-0025).
+    if config.workers == 1 {
+        return match config.backend.as_str() {
+            "simulator" => transfer(config, SimulatorCarrier::new(config)?),
+            #[cfg(feature = "msquic")]
+            "msquic" => transfer(config, backend_msquic::MsQuicCarrier::connected(config)?),
+            #[cfg(feature = "quiche")]
+            "quiche" => transfer(config, backend_quiche::QuicheCarrier::connected(config)?),
+            other => Err(Error::Unsupported(format!(
+                "backend {other} has no assembled transport in this build"
+            ))),
+        };
     }
-
+    let budget = round_budget(config);
     match config.backend.as_str() {
-        "simulator" => transfer(config, SimulatorCarrier::new(config)?),
+        "simulator" => transfer_ranged(config, vec![SimulatorCarrier::new(config)?], budget),
         #[cfg(feature = "msquic")]
-        "msquic" => transfer(config, backend_msquic::MsQuicCarrier::connected(config)?),
+        "msquic" => transfer_ranged(
+            config,
+            vec![backend_msquic::MsQuicCarrier::connected(config)?],
+            budget,
+        ),
         #[cfg(feature = "quiche")]
-        "quiche" => transfer(config, backend_quiche::QuicheCarrier::connected(config)?),
+        "quiche" => transfer_ranged(
+            config,
+            vec![backend_quiche::QuicheCarrier::connected(config)?],
+            budget,
+        ),
         other => Err(Error::Unsupported(format!(
             "backend {other} has no assembled transport in this build"
         ))),
@@ -956,6 +1414,8 @@ fn transfer_within<C: Carrier>(
     mut carrier: C,
     budget: u64,
 ) -> Result<Measurement, Error> {
+    #[cfg(test)]
+    test_guard::arm();
     let subject = subject_of(config)?;
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for(config)?;
@@ -1070,12 +1530,299 @@ fn transfer_within<C: Carrier>(
     })
 }
 
+/// Carries one object as proof-bearing ranges over one or more carriers.
+///
+/// W producer threads generate, prove, and frame disjoint slabs; this thread,
+/// the spine, is the only one that touches a carrier: it submits, flushes,
+/// polls, and verifies. The loop is byte-identical whether the carriers are
+/// one connection with a lane per worker or one connection per worker, so the
+/// only difference between those cases is the connection count, which is what
+/// the spine hypothesis asks about.
+///
+/// # Errors
+/// Propagates transport, proving, and verification failures, and reports a
+/// carrier that stopped rather than returning a partial transfer.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loop, kept whole so the budget it spends is visibly its own"
+)]
+fn transfer_ranged<C: Carrier>(
+    config: &Config,
+    mut carriers: Vec<C>,
+    budget: u64,
+) -> Result<Measurement, Error> {
+    #[cfg(test)]
+    test_guard::arm();
+    let workers = config.workers;
+    if carriers.len() != 1 && carriers.len() != workers {
+        return Err(Error::Unsupported(format!(
+            "{} carriers cannot carry {workers} workers; one shared or one each",
+            carriers.len()
+        )));
+    }
+    // Validated before any thread starts, so a bad size is one error rather
+    // than a worker's; each producer reads the same value itself.
+    ranged_record_bytes(config)?;
+    let ranges = worker_ranges(config.object_bytes, workers)?;
+    let (subject, layer) = prover_layer_and_subject(config)?;
+    let layer = Arc::new(layer);
+    let generator_ns = generator_nanos(config)?;
+    let mut receiver = receiver_for_ranged(config)?;
+    receiver.begin_ranges(subject)?;
+    let mut credit = Credit::Constructed;
+    for carrier in &mut carriers {
+        credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;
+    }
+    let provisioned = carriers.len() > 1;
+    // Worker w submits on lane 1 + w of the one connection, or on the transfer
+    // lane of its own. Lane numbering starts where the sequential path's does.
+    let rail_count = carriers.len();
+    let rail_of = move |worker: usize| -> (usize, StreamId) {
+        if rail_count == 1 {
+            (0, StreamId(1 + worker as u64))
+        } else {
+            (worker, TRANSFER_LANE)
+        }
+    };
+    let mut reassembly = BundleReassembly::new(workers);
+    let mut tally = Tally::default();
+    let mut bytes_sent = 0_u64;
+    let mut delivered = 0_u64;
+
+    let cpu_before = cpu_times_ns();
+    let started = Instant::now();
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let mut channels = Vec::with_capacity(workers);
+        for (index, range) in ranges.iter().enumerate() {
+            let (sender, frames) = mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
+            let mut producer = BundleProducer::new(
+                config,
+                Arc::clone(&layer),
+                subject,
+                *range,
+                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
+            )?;
+            channels.push(frames);
+            scope.spawn(move || {
+                while let Some(bundle) = producer.next_bundle() {
+                    let failed = bundle.is_err();
+                    // A closed channel means the spine is gone, taking the
+                    // transfer's verdict with it; there is no one to tell.
+                    if sender.send(bundle).is_err() {
+                        return;
+                    }
+                    // An error is this producer's last word.
+                    if failed {
+                        return;
+                    }
+                }
+            });
+        }
+
+        let mut queued: Vec<VecDeque<RangedFrame>> =
+            (0..workers).map(|_| VecDeque::new()).collect();
+        while delivered < config.object_bytes {
+            // Spent here rather than in anything the loop calls, which is what
+            // keeps the loop bounded whatever those calls do.
+            tally.rounds = tally.rounds.saturating_add(1);
+            if tally.rounds > budget {
+                return Err(Error::Stalled);
+            }
+            let mut progress = false;
+            for worker in 0..workers {
+                if queued[worker].is_empty() {
+                    match channels[worker].try_recv() {
+                        Ok(Ok(frames)) => queued[worker].extend(frames),
+                        Ok(Err(error)) => return Err(error),
+                        // Disconnected is a finished worker; nothing more comes.
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
+                    }
+                }
+                let (carrier_index, lane) = rail_of(worker);
+                while let Some((frame, plaintext)) = queued[worker].front() {
+                    match carriers[carrier_index].submit(lane, frame) {
+                        Ok(()) => {
+                            bytes_sent = bytes_sent.saturating_add(*plaintext);
+                            tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
+                            queued[worker].pop_front();
+                            progress = true;
+                        }
+                        Err(vot_transport_api::Error::OutboundQueueFull) => {
+                            tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
+                            break;
+                        }
+                        Err(other) => return Err(Error::Transport(other)),
+                    }
+                }
+            }
+            let mut arrived_bytes = 0_u64;
+            for carrier in &mut *carriers {
+                tally.flushes = tally.flushes.saturating_add(1);
+                carrier.flush()?;
+                while let Some(event) = carrier.poll_received() {
+                    match event {
+                        Event::Reliable { bytes, .. } => {
+                            arrived_bytes = arrived_bytes.saturating_add(reassembly.accept(
+                                &mut receiver,
+                                subject,
+                                &bytes,
+                            )?);
+                        }
+                        Event::Disconnected(_) => return Err(Error::Disconnected),
+                        _ => {}
+                    }
+                }
+                carrier.drain_sent();
+            }
+            delivered = delivered.saturating_add(arrived_bytes);
+            if arrived_bytes != 0 {
+                progress = true;
+            }
+            if !progress {
+                tally.idle_waits = tally.idle_waits.saturating_add(1);
+                // Rotated across rails: only a carrier's own signal ends its
+                // wait, and any rail's event can end an idle round.
+                let rail = usize::try_from(tally.idle_waits % rail_count as u64).unwrap_or(0);
+                carriers[rail].wait(idle_wait(tally.idle_waits));
+            }
+        }
+        Ok(())
+    })?;
+    receiver.finish_ranges(subject)?;
+    let elapsed = started.elapsed();
+    tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
+
+    if !receiver.is_verified(subject) {
+        return Err(Error::Unsupported(
+            "receiver did not reach a verified state".to_owned(),
+        ));
+    }
+
+    let notes = ranged_notes(
+        &carriers[0],
+        &receiver,
+        credit,
+        tally,
+        generator_ns,
+        workers,
+        reassembly.completed,
+        provisioned,
+    );
+    Ok(Measurement {
+        bytes_sent,
+        verified_bytes: delivered,
+        elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1),
+        memory_high_water_bytes: memory_high_water_bytes()?,
+        cycles: None,
+        notes,
+    })
+}
+
+/// Renders a ranged run's notes: the sequential fields, then what only this
+/// path has, so a reader never mistakes one path's numbers for the other's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one observed field of the one note string"
+)]
+fn ranged_notes(
+    carrier: &impl Carrier,
+    receiver: &ReliableReceiver,
+    credit: Credit,
+    tally: Tally,
+    generator_ns: u64,
+    workers: usize,
+    bundles: u64,
+    provisioned: bool,
+) -> String {
+    let mut notes = format!(
+        concat!(
+            "backend={};path=ranged;workers={};bundles={};",
+            "staging_peak_bytes={};credit_bytes={};credit_mode={};",
+            "flushes={};backpressure_waits={};idle_waits={};wire_bytes={};generator_ns={};",
+            "cpu_user_ns={};cpu_sys_ns={}"
+        ),
+        carrier.name(),
+        workers,
+        bundles,
+        receiver.peak_staging(),
+        receiver.advertised_credit(),
+        credit.as_str(),
+        tally.flushes,
+        tally.backpressure_waits,
+        tally.idle_waits,
+        tally.wire_bytes,
+        generator_ns,
+        tally
+            .cpu
+            .map_or_else(|| "unmeasured".to_owned(), |(user, _)| user.to_string()),
+        tally
+            .cpu
+            .map_or_else(|| "unmeasured".to_owned(), |(_, system)| system.to_string()),
+    );
+    if provisioned {
+        notes.push_str(";rails=provisioned-multi-rail");
+    }
+    if let Some(detail) = carrier.detail() {
+        notes.push(';');
+        notes.push_str(&detail);
+    }
+    if !carrier.unmodelled().is_empty() {
+        notes.push_str(";unmodelled_impairment=");
+        notes.push_str(&carrier.unmodelled().join(","));
+    }
+    notes.push_str(";cycles=unmeasured");
+    notes
+}
+
+/// A mutant that breaks a loop's progress check can turn an allocating loop
+/// into a machine-eater; one reached 96 GiB and the OOM kill took the whole
+/// terminal session with it. Aborting at a cap makes that mutant caught.
+#[cfg(test)]
+mod test_guard {
+    use std::sync::Once;
+
+    /// Far above any honest test, and low enough that two capped binaries
+    /// and their builds fit a CI runner's 16 GiB together.
+    const CAP_BYTES: u64 = 2 << 30;
+
+    static ARM: Once = Once::new();
+
+    /// Spawn the watchdog once per test binary. Every transfer entry calls
+    /// this, so no test has to remember to.
+    pub(crate) fn arm() {
+        ARM.call_once(|| {
+            std::thread::spawn(|| {
+                loop {
+                    if resident_bytes().is_some_and(|rss| rss > CAP_BYTES) {
+                        eprintln!("test_guard: resident set passed {CAP_BYTES} bytes, aborting");
+                        std::process::abort();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        });
+    }
+
+    /// Linux is where these tests and the mutation gates run; without procfs
+    /// there is no watchdog rather than a false abort.
+    fn resident_bytes() -> Option<u64> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
+    }
+
+    #[test]
+    fn the_watchdog_can_read_its_own_resident_set() {
+        assert!(resident_bytes().is_some_and(|rss| rss > 0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload,
-        SimulatorCarrier, StreamId, TRANSFER_LANE, TransportAdapter, escape, measure, parse_vm_hwm,
-        record_lengths, record_payload, shared_payload, transfer_within,
+        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, parse_vm_hwm,
+        record_lengths, record_payload, shared_payload, transfer_ranged, transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
     use vot_transport_api::Event;
@@ -1144,10 +1891,14 @@ mod tests {
     /// feature the mutation matrix does not build, and the gate would report
     /// them as untested code in a required package.
     struct TestCarrier {
-        /// Frames submitted and not yet released to the receiving endpoint.
-        inflight: VecDeque<Payload>,
+        /// Frames submitted and not yet released, with the lane each took, so
+        /// delivery echoes the lane and a test can pin worker routing.
+        inflight: VecDeque<(StreamId, Payload)>,
         /// Frames released and not yet polled.
-        arrived: VecDeque<Payload>,
+        arrived: VecDeque<(StreamId, Payload)>,
+        /// Every lane submitted on, shared so a test reads it after the
+        /// transfer consumes the carrier.
+        lanes: std::sync::Arc<std::sync::Mutex<Vec<StreamId>>>,
         /// Submissions to refuse before accepting one.
         refuse: usize,
         /// Deliveries that release nothing before the queue starts moving.
@@ -1176,6 +1927,7 @@ mod tests {
             Self {
                 inflight: VecDeque::new(),
                 arrived: VecDeque::new(),
+                lanes: std::sync::Arc::default(),
                 refuse: 0,
                 lag: 0,
                 stalled: false,
@@ -1215,7 +1967,7 @@ mod tests {
 
         fn submit(
             &mut self,
-            _stream: StreamId,
+            stream: StreamId,
             frame: &Payload,
         ) -> Result<(), vot_transport_api::Error> {
             if self.refuse != 0 {
@@ -1229,7 +1981,10 @@ mod tests {
                 return Err(vot_transport_api::Error::OutboundQueueFull);
             }
             self.undrained += 1;
-            self.inflight.push_back(Payload::clone(frame));
+            if let Ok(mut lanes) = self.lanes.lock() {
+                lanes.push(stream);
+            }
+            self.inflight.push_back((stream, Payload::clone(frame)));
             Ok(())
         }
 
@@ -1241,16 +1996,16 @@ mod tests {
                 self.lag -= 1;
                 return Ok(());
             }
-            while let Some(frame) = self.inflight.pop_front() {
+            while let Some((lane, frame)) = self.inflight.pop_front() {
                 if self.corrupt {
                     self.corrupt = false;
                     let mut changed = frame.to_vec();
                     // The envelope stays intact and the payload does not, which
                     // is the corruption a length check alone would miss.
                     changed.pop();
-                    self.arrived.push_back(shared_payload(&changed));
+                    self.arrived.push_back((lane, shared_payload(&changed)));
                 } else {
-                    self.arrived.push_back(frame);
+                    self.arrived.push_back((lane, frame));
                 }
             }
             Ok(())
@@ -1261,11 +2016,13 @@ mod tests {
                 self.disconnect = false;
                 return Some(Event::Disconnected(vot_transport_api::ConnectionId(1)));
             }
-            self.arrived.pop_front().map(|bytes| Event::Reliable {
-                stream: TRANSFER_LANE,
-                sequence: 0,
-                bytes,
-            })
+            self.arrived
+                .pop_front()
+                .map(|(lane, bytes)| Event::Reliable {
+                    stream: lane,
+                    sequence: 0,
+                    bytes,
+                })
         }
 
         fn drain_sent(&mut self) {
@@ -1276,6 +2033,11 @@ mod tests {
             if let Ok(mut waited) = self.waited.lock() {
                 waited.push(bound);
             }
+            // The bound is really spent, as on every carrier: the ranged
+            // spine budgets rounds on the assumption that an idle round costs
+            // time, and a free wait would burn the budget before a producer
+            // thread ever ran.
+            std::thread::sleep(bound);
         }
     }
 
@@ -1283,6 +2045,290 @@ mod tests {
     /// healthy transfer of the sizes here finishes well inside it, and small
     /// enough that a carrier which stops is reported at once.
     const TEST_BUDGET: u64 = 64;
+
+    fn ranged_case(object_bytes: u64, workers: usize, suite: Suite) -> Config {
+        let mut config = case(object_bytes, suite);
+        config.workers = workers;
+        config
+    }
+
+    #[test]
+    fn a_ranged_case_verifies_over_the_simulator_for_both_suites() {
+        // Ragged on both edges: a short final record and a short final group,
+        // split across workers whose slabs do not divide evenly. Delivery is
+        // what the case asserts; the object arriving at all proves the frames,
+        // the proofs, and the mid-object sources all agree.
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            for workers in [2_usize, 4] {
+                let object_bytes = 7 * 65_536 + 17;
+                let measured = measure(&ranged_case(object_bytes, workers, suite)).unwrap();
+                assert_eq!(measured.verified_bytes, object_bytes);
+                assert_eq!(measured.bytes_sent, object_bytes);
+                assert_eq!(note_field_text(&measured.notes, "path"), "ranged");
+                assert_eq!(note_field(&measured.notes, "workers"), workers as u64);
+                // The envelope, the CBOR map, and the proof are all on the
+                // wire and none of them is the object.
+                assert!(note_field(&measured.notes, "wire_bytes") > object_bytes);
+                // One shared carrier is not the provisioned arrangement.
+                assert!(!measured.notes.contains(";rails="));
+            }
+        }
+    }
+
+    #[test]
+    fn a_ranged_transfer_spends_its_whole_budget_before_stalling() {
+        // Worker threads make rounds-to-completion timing-dependent, so the
+        // edge is pinned from the stalling side, which is exact: a carrier
+        // that refuses every submission makes every round idle, five budgeted
+        // rounds wait five times, and the sixth check is the stall. A bound
+        // that fired one round early would wait one time fewer.
+        let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.refuse = usize::MAX;
+        let waited = std::sync::Arc::clone(&carrier.waited);
+        assert!(matches!(
+            transfer_ranged(&config, vec![carrier], 5),
+            Err(Error::Stalled)
+        ));
+        assert_eq!(waited.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn a_provisioned_multi_rail_case_carries_each_worker_on_its_own_carrier() {
+        let first = TestCarrier::new();
+        let second = TestCarrier::new();
+        let first_lanes = std::sync::Arc::clone(&first.lanes);
+        let second_lanes = std::sync::Arc::clone(&second.lanes);
+        let config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
+        let measured = transfer_ranged(&config, vec![first, second], TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 4 * 65_536);
+        assert!(measured.notes.contains(";rails=provisioned-multi-rail"));
+        // The test double models everything, so the note must not claim
+        // otherwise.
+        assert!(!measured.notes.contains("unmodelled_impairment"));
+        // Each worker rides the transfer lane of a rail of its own.
+        for lanes in [first_lanes, second_lanes] {
+            let seen: std::collections::BTreeSet<StreamId> =
+                lanes.lock().unwrap().iter().copied().collect();
+            assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![StreamId(1)]);
+        }
+    }
+
+    #[test]
+    fn a_ranged_transfer_reports_every_bundle_it_verified() {
+        // 7 groups over 2 workers is slabs of 4 and 3 groups; at one-group
+        // records and 16-record bundles that is one bundle each. The exact
+        // count pins the schedule, not just its total.
+        let measured = measure(&ranged_case(7 * 65_536, 2, Suite::Blake3Bao64)).unwrap();
+        assert_eq!(note_field(&measured.notes, "bundles"), 2);
+        // 40 groups over 2 workers: 20 groups each is two bundles each.
+        let measured = measure(&ranged_case(40 * 65_536, 2, Suite::Blake3Bao64)).unwrap();
+        assert_eq!(note_field(&measured.notes, "bundles"), 4);
+    }
+
+    #[test]
+    fn a_prover_refuses_a_cover_wider_than_the_request() {
+        // A group-unaligned length keeps the offset exact while the cover
+        // widens; the widened cover must be refused, not returned.
+        let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
+        let (_, layer) = super::prover_layer_and_subject(&config).unwrap();
+        assert!(super::prove_range(&layer, 0, 100).is_err());
+        assert!(super::prove_range(&layer, 0, 65_536).is_ok());
+    }
+
+    #[test]
+    fn a_ranged_case_survives_reordering_and_case_a_multiplexes_lanes() {
+        let mut config = ranged_case(6 * 65_536, 3, Suite::Blake3Bao64);
+        config.impairment.reorder_window = 4;
+        let measured = measure(&config).unwrap();
+        assert_eq!(measured.verified_bytes, 6 * 65_536);
+
+        // The one-connection case puts each worker on its own lane; a
+        // transfer that serialized every worker onto one lane would measure
+        // the driver's queue, not the connection's spine.
+        let carrier = TestCarrier::new();
+        let lanes = std::sync::Arc::clone(&carrier.lanes);
+        let config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
+        transfer_ranged(&config, vec![carrier], TEST_BUDGET).unwrap();
+        let seen: std::collections::BTreeSet<StreamId> =
+            lanes.lock().unwrap().iter().copied().collect();
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec![StreamId(1), StreamId(2)]
+        );
+    }
+
+    #[test]
+    fn ranged_backpressure_lag_and_stall_keep_the_sequential_verdicts() {
+        // A refusal is backpressure and costs rounds, not the transfer.
+        let mut carrier = TestCarrier::new();
+        carrier.refuse = 4;
+        let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
+        let measured = transfer_ranged(&config, vec![carrier], TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+        assert!(note_field(&measured.notes, "backpressure_waits") != 0);
+
+        // Late delivery is waited out.
+        let mut late = TestCarrier::new();
+        late.lag = 3;
+        let measured = transfer_ranged(&config, vec![late], TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+
+        // A carrier that stops is stalled, never a partial number.
+        let mut dead = TestCarrier::new();
+        dead.stalled = true;
+        assert!(matches!(
+            transfer_ranged(&config, vec![dead], TEST_BUDGET),
+            Err(Error::Stalled)
+        ));
+
+        // A disconnect is its own verdict.
+        let mut gone = TestCarrier::new();
+        gone.disconnect = true;
+        assert!(matches!(
+            transfer_ranged(&config, vec![gone], TEST_BUDGET),
+            Err(Error::Disconnected)
+        ));
+
+        // A changed frame is corruption, found at decode rather than trusted.
+        let mut lying = TestCarrier::new();
+        lying.corrupt = true;
+        assert!(matches!(
+            transfer_ranged(&config, vec![lying], TEST_BUDGET),
+            Err(Error::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn the_ranged_paths_carrier_count_must_fit_its_workers() {
+        // Two carriers for three workers is neither one shared nor one each.
+        let config = ranged_case(6 * 65_536, 3, Suite::Blake3Bao64);
+        let carriers = vec![TestCarrier::new(), TestCarrier::new()];
+        assert!(matches!(
+            transfer_ranged(&config, carriers, TEST_BUDGET),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn ranged_record_bytes_takes_whole_groups_only() {
+        let config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
+        assert_eq!(super::ranged_record_bytes(&config).unwrap(), 65_536);
+        for bad in [0_usize, 1_000, 65_535, 65_537, 4 * 65_536] {
+            let mut wrong = config.clone();
+            wrong.record_bytes = bad;
+            assert!(
+                super::ranged_record_bytes(&wrong).is_err(),
+                "{bad} was accepted"
+            );
+        }
+        let mut three = config;
+        three.record_bytes = 3 * 65_536;
+        assert_eq!(super::ranged_record_bytes(&three).unwrap(), 3 * 65_536);
+    }
+
+    #[test]
+    fn ranged_staging_holds_the_object_it_retains() {
+        // The range path keeps every verified range until the object is
+        // whole, so the limit is the object plus the verifier reservation,
+        // exactly. Pinned by value because nothing else observes an
+        // over-generous limit.
+        let config = ranged_case(7 * 65_536 + 17, 2, Suite::Blake3Bao64);
+        assert_eq!(
+            super::ranged_staging_limit(&config),
+            7 * 65_536 + 17 + 65_536
+        );
+    }
+
+    #[test]
+    fn a_bundle_identifier_is_its_inputs_in_order() {
+        let id = super::bundle_identifier(0x0102_0304_0506_0708, 9, 10);
+        assert_eq!(&id[..8], &0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert_eq!(&id[8..12], &9_u32.to_le_bytes());
+        assert_eq!(&id[12..], &10_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_source_started_mid_object_continues_the_same_object() {
+        // A range worker's bytes must be the sequential object's bytes at that
+        // offset, or worker count would change the object and no two runs
+        // would be comparable. Checked word for word against the sequential
+        // source across seeds and offsets, including zero.
+        for seed in [0, 42, u64::MAX] {
+            let mut reference = ObjectSource::new(seed);
+            let words: Vec<u64> = (0..40_960).map(|_| reference.draw()).collect();
+            for offset_words in [0_usize, 1, 3, 8_192, 5 * 65_536 / 8] {
+                let mut jumped =
+                    ObjectSource::at(seed, (offset_words * super::WORD_BYTES) as u64).unwrap();
+                for (index, expected) in words.iter().enumerate().skip(offset_words).take(64) {
+                    assert_eq!(
+                        jumped.draw(),
+                        *expected,
+                        "seed {seed}, offset {offset_words}, word {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_jump_composes_and_a_misaligned_one_is_refused() {
+        // Composition is what pins the high bits of the exponent: two jumps
+        // must land where one jump of their sum does, at counts far past what
+        // a sequential check can reach.
+        for (first, second) in [(1_u64 << 33, 1_u64 << 21), (12_345, 67_890_123)] {
+            let one = super::advance(42, first.wrapping_add(second));
+            let two = super::advance(super::advance(42, first), second);
+            assert_eq!(one, two);
+        }
+        // Zero draws is the identity, which square-and-multiply must not
+        // disturb.
+        assert_eq!(super::advance(97, 0), 97);
+        // A misaligned byte offset would generate a different object than the
+        // sequential path, so it is an error rather than a rounding.
+        assert!(ObjectSource::at(42, 3).is_err());
+    }
+
+    #[test]
+    fn worker_slabs_cover_the_object_exactly_and_stay_aligned() {
+        for (object_bytes, workers) in [
+            (65_536_u64, 1_usize),
+            (2 * 65_536, 2),
+            (7 * 65_536 + 17, 3),
+            (8 * 65_536, 3),
+            (65_537, 1),
+        ] {
+            let ranges = super::worker_ranges(object_bytes, workers).unwrap();
+            assert_eq!(ranges.len(), workers);
+            let mut expected_offset = 0_u64;
+            for range in &ranges {
+                assert_eq!(range.offset, expected_offset, "slabs are contiguous");
+                assert_eq!(range.offset % super::GROUP_BYTES, 0, "slabs stay aligned");
+                assert!(range.bytes > 0, "no worker is left with nothing");
+                expected_offset += range.bytes;
+            }
+            assert_eq!(expected_offset, object_bytes, "slabs cover the object");
+        }
+        // The leading workers take the remainder groups, one each, so the
+        // exact split is pinned rather than only its total.
+        let ranges = super::worker_ranges(7 * 65_536, 3).unwrap();
+        let bytes: Vec<u64> = ranges.iter().map(|range| range.bytes).collect();
+        assert_eq!(bytes, vec![3 * 65_536, 2 * 65_536, 2 * 65_536]);
+    }
+
+    #[test]
+    fn more_workers_than_groups_is_an_error_not_a_smaller_case() {
+        assert!(matches!(
+            super::worker_ranges(2 * 65_536, 3),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            super::worker_ranges(65_536, 0),
+            Err(Error::Unsupported(_))
+        ));
+        // One group, one worker is the smallest honest case.
+        assert!(super::worker_ranges(1, 1).is_ok());
+    }
 
     #[test]
     fn the_wait_backs_off_from_the_short_end_and_stops_at_the_long_one() {

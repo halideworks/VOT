@@ -41,10 +41,11 @@ const DATAGRAM_BYTES: &str = "VOT_BENCH_QUICHE_DATAGRAM_BYTES";
 
 /// Lanes the endpoints advertise.
 ///
-/// The transfer uses one. The rest are advertised because a benchmark endpoint
-/// should not be configured more tightly than the case it carries, and the
-/// multi-rail work in the same backlog item needs room to open more.
-const ADVERTISED_LANES: u64 = 4;
+/// The sequential transfer uses one, the ranged path uses one per worker
+/// starting at lane 1, and the workload defines worker counts up to 8, so the
+/// endpoint advertises room for that rather than being configured more
+/// tightly than the cases it carries.
+const ADVERTISED_LANES: u64 = 16;
 
 /// A connected pair of quiche endpoints over loopback.
 pub(crate) struct QuicheCarrier {
@@ -406,6 +407,19 @@ mod tests {
         // The whole object arrived over a carrier that delivers asynchronously,
         // which the receiver only reports verified after every byte is in.
         assert!(measured.elapsed_ns >= 1);
+    }
+
+    #[test]
+    fn a_ranged_case_crosses_a_real_socket_and_verifies() {
+        // The multi-worker path over a real socket: disjoint proof-bearing
+        // ranges on one lane per worker, a ragged tail included.
+        for workers in [2_usize, 4] {
+            let mut config = case(6 * 65_536 + 17);
+            config.workers = workers;
+            let measured = measure(&config).unwrap();
+            assert_eq!(measured.verified_bytes, config.object_bytes);
+            assert_eq!(note_field(&measured.notes, "path"), "ranged");
+        }
     }
 
     #[test]

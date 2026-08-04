@@ -1,12 +1,15 @@
-# Mutation configuration for the assembled MsQuic transport.
+# Mutation configuration for the assembled live transports, MsQuic and quiche.
 #
-# The same settings as `.cargo/mutants.toml` without its `live::` exclusion,
-# because this one is run with `--features live` and that module is the point.
-# Kept as a second file because a configuration cannot exclude conditionally.
+# The same settings as `.cargo/mutants.toml` without its exclusions of the
+# live modules, because this one is run with `--features live` and those
+# modules are the point. Kept as a second file because a configuration cannot
+# exclude conditionally.
 #
-# Run it as the msquic-mutation job does:
+# Run it as the msquic-mutation and quiche-mutation jobs do:
 #
 #     cargo mutants --package vot-transport-msquic --features live \
+#         --config .cargo/mutants-live.toml --timeout 120
+#     cargo mutants --package vot-transport-quiche --features live \
 #         --config .cargo/mutants-live.toml --timeout 120
 #
 # The count is deliberately not recorded here. A number beside an exclusion is

@@ -437,6 +437,69 @@ jobs:
             "${scope[@]}" 2>&1 | tee mutants.log || true
           python3 tools/check_live_mutants.py "${sweep[@]}" mutants.log
 
+  quiche-mutation:
+    # The quiche pump had the msquic gap exactly: excluded from the default
+    # sweep, measured nowhere, and the default backend as of ADR-0027. Same
+    # remedy: the run happens here, survivors live in
+    # test-vectors/mutants/the_quiche_pump_is_mutation_tested.md, and the
+    # checker fails on anything that file does not account for.
+    runs-on: ubuntu-24.04
+    # The full sweep measured 40 minutes on a quiet 20-core box at 2 jobs; a
+    # loaded 2-core runner needs the headroom.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+          # Both sides of the diff, and the merge base between them, which a
+          # shallow clone does not have.
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      # openssl beside cmake: the suite's credentials() shells out to the
+      # openssl binary for its test certificate, and the baseline run pays for
+      # the whole job if the runner image stops carrying it.
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-mutants-26.0.0
+
+      - name: Install pinned cargo-mutants
+        run: >-
+          cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+          || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
+
+      - name: Test live mutants
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -o pipefail
+          scope=()
+          sweep=(--full)
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git diff "origin/$BASE_REF...HEAD" > changed.diff
+            scope=(--in-diff changed.diff)
+            # A diff run tests a subset, so it cannot say a classified survivor
+            # is gone. Only the sweep can.
+            sweep=()
+          fi
+          cargo +1.88.0 mutants --package vot-transport-quiche --features live \
+            --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
+            "${scope[@]}" 2>&1 | tee mutants.log || true
+          python3 tools/check_live_mutants.py "${sweep[@]}" \
+            --evidence=test-vectors/mutants/the_quiche_pump_is_mutation_tested.md \
+            mutants.log
+
   msquic-sanitizer:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

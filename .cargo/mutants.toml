@@ -27,7 +27,14 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # only under a feature this configuration does not enable. It is plumbing by
 # design, so that everything a run's numbers depend on stays in `lib.rs` where
 # this gate measures it, and its own loopback tests run in the quiche-live job.
+# The cycle counter is excluded for a different reason than the files below:
+# it compiles everywhere, but whether perf_event_open grants a counter is the
+# host's runtime decision, so a mutant in it flips between caught and missed
+# with kernel.perf_event_paranoid. What a Measurement says from the counter's
+# answer is decided by note_cycles and measure in lib.rs, which this gate
+# measures on every host.
 exclude_globs = [
+  "crates/vot-bench-driver/src/cycles.rs",
   "crates/vot-transport-quiche/src/live.rs",
   "crates/vot-bench-driver/src/backend_msquic.rs",
   "crates/vot-bench-driver/src/backend_quiche.rs",

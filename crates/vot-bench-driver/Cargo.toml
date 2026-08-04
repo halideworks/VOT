@@ -31,5 +31,13 @@ vot-transport-quiche = { path = "../vot-transport-quiche", features = [
 vot-transport-sim = { path = "../vot-transport-sim" }
 vot-verifier = { path = "../vot-verifier" }
 
+# Safe wrapper for perf_event_open, which is the only honest cycle counter:
+# a TSC read is wall time at a fixed rate, not work done. The unsafe stays in
+# the wrapper, which is what keeps this crate's forbid true. Linux only,
+# because the syscall is; elsewhere cycles stays null, which the contract
+# allows and the Wave 6 metric does not, so the metric is Linux's to satisfy.
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event2 = { version = "=0.7.4" }
+
 [lints]
 workspace = true

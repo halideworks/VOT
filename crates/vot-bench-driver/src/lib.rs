@@ -27,6 +27,8 @@ mod backend_quiche;
 #[cfg(any(feature = "msquic", feature = "quiche"))]
 pub mod role;
 
+mod cycles;
+
 /// Suite identifiers as the benchmark contract spells them.
 const SUITE_BLAKE3: &str = "blake3-bao64";
 const SUITE_SHA256: &str = "sha256-bep52";
@@ -1255,7 +1257,6 @@ fn transfer_notes(
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&carrier.unmodelled().join(","));
     }
-    notes.push_str(";cycles=unmeasured");
     notes
 }
 
@@ -1381,6 +1382,18 @@ impl Carrier for SimulatorCarrier {
 /// Propagates transport, receive, and verification failures, and rejects any
 /// case this driver cannot run honestly.
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
+    // Opened before any carrier or worker thread exists, so inherit covers
+    // every thread this measurement creates; the counter's span is the whole
+    // case, connection setup included, which is milliseconds against seconds.
+    let counter = cycles::CycleCounter::start();
+    let mut measured = measure_case(config)?;
+    let settled = settle_cycles(counter.and_then(cycles::CycleCounter::read));
+    measured.cycles = settled.map(|(count, _)| count);
+    note_cycles(&mut measured.notes, settled);
+    Ok(measured)
+}
+
+fn measure_case(config: &Config) -> Result<Measurement, Error> {
     // One worker keeps the sequential path every landed number was taken on;
     // more run the ranged path, where workers carry disjoint proof-bearing
     // ranges of the one object (ADR-0025).
@@ -1807,8 +1820,44 @@ fn ranged_notes(
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&carrier.unmodelled().join(","));
     }
-    notes.push_str(";cycles=unmeasured");
     notes
+}
+
+/// Turns a raw counter reading into what the report says, the way perf does:
+/// a counter multiplexed off part of the time is scaled by enabled over
+/// running, and one that never ran is unmeasured rather than zero. The
+/// running share comes back with the count so the notes can disclose a
+/// scaled figure instead of passing an estimate off as a plain one.
+pub(crate) fn settle_cycles(reading: Option<cycles::CycleReading>) -> Option<(u64, u64)> {
+    let reading = reading?;
+    if reading.time_running == 0 {
+        return None;
+    }
+    let scaled = u128::from(reading.count) * u128::from(reading.time_enabled)
+        / u128::from(reading.time_running);
+    let count = u64::try_from(scaled).ok()?;
+    let pct = reading
+        .time_running
+        .saturating_mul(100)
+        .checked_div(reading.time_enabled)?;
+    Some((count, pct.min(100)))
+}
+
+/// Renders the settled count into the notes: the count, unmeasured where the
+/// host refused a counter so a reader never mistakes a null for a zero, and
+/// the running share whenever the count is a scaled figure.
+pub(crate) fn note_cycles(notes: &mut String, settled: Option<(u64, u64)>) {
+    notes.push_str(";cycles=");
+    match settled {
+        Some((count, pct)) => {
+            notes.push_str(&count.to_string());
+            if pct < 100 {
+                notes.push_str(";cycles_running_pct=");
+                notes.push_str(&pct.to_string());
+            }
+        }
+        None => notes.push_str("unmeasured"),
+    }
 }
 
 /// A mutant that breaks a loop's progress check can turn an allocating loop
@@ -1858,7 +1907,7 @@ mod test_guard {
 mod tests {
     use super::{
         Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, Rails,
-        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, parse_vm_hwm,
+        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, note_cycles, parse_vm_hwm,
         record_lengths, record_payload, shared_payload, transfer_ranged, transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
@@ -2109,8 +2158,46 @@ mod tests {
                 assert!(note_field(&measured.notes, "wire_bytes") > object_bytes);
                 // One shared carrier is not the provisioned arrangement.
                 assert!(!measured.notes.contains(";rails="));
+                // Counted or refused, the field is always named.
+                assert!(measured.notes.contains(";cycles="));
             }
         }
+    }
+
+    #[test]
+    fn the_notes_always_name_the_cycle_field() {
+        let mut counted = String::from("x");
+        note_cycles(&mut counted, Some((5, 100)));
+        assert_eq!(counted, "x;cycles=5");
+        let mut scaled = String::from("x");
+        note_cycles(&mut scaled, Some((10, 50)));
+        assert_eq!(scaled, "x;cycles=10;cycles_running_pct=50");
+        let mut refused = String::from("x");
+        note_cycles(&mut refused, None);
+        assert_eq!(refused, "x;cycles=unmeasured");
+    }
+
+    #[test]
+    fn a_reading_settles_the_way_perf_scales_one() {
+        let reading = |count, time_enabled, time_running| super::cycles::CycleReading {
+            count,
+            time_enabled,
+            time_running,
+        };
+        // Fully scheduled is the count as read.
+        assert_eq!(
+            super::settle_cycles(Some(reading(80, 40, 40))),
+            Some((80, 100))
+        );
+        // Half scheduled doubles, and the share is disclosed.
+        assert_eq!(
+            super::settle_cycles(Some(reading(80, 40, 20))),
+            Some((160, 50))
+        );
+        // Never scheduled is unmeasured, not zero.
+        assert_eq!(super::settle_cycles(Some(reading(80, 40, 0))), None);
+        // No reading is no count.
+        assert_eq!(super::settle_cycles(None), None);
     }
 
     #[test]
@@ -2754,7 +2841,12 @@ mod tests {
                 assert_eq!(measured.verified_bytes, object_bytes);
                 assert_eq!(measured.bytes_sent, object_bytes);
                 assert!(measured.elapsed_ns >= 1);
-                assert_eq!(measured.cycles, None);
+                // Counted or refused is the host's call, so neither outcome
+                // can be pinned here; the field and the note must agree.
+                assert_eq!(
+                    measured.cycles.is_none(),
+                    measured.notes.contains(";cycles=unmeasured")
+                );
                 // The carrier names itself in the result. A report that
                 // attributed a run to the wrong backend would be worse than no
                 // report, and this is the only place the name is written.

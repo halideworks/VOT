@@ -94,7 +94,17 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
         ));
     }
     let role = crate::variable(&|name| std::env::var(name).ok(), ROLE)?;
-    match role.as_str() {
+    // Before the endpoint exists, so inherit covers the driver thread too.
+    let counter = crate::cycles::CycleCounter::start();
+    let mut measured = run_role(config, &role)?;
+    let settled = crate::settle_cycles(counter.and_then(crate::cycles::CycleCounter::read));
+    measured.cycles = settled.map(|(count, _)| count);
+    crate::note_cycles(&mut measured.notes, settled);
+    Ok(measured)
+}
+
+fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
+    match role {
         "send" => {
             // Generation is timed before the endpoint exists: the receiver's
             // clock starts at the accepted connection, so everything this
@@ -400,7 +410,6 @@ fn role_notes(
         notes.push_str(";unmodelled_impairment=");
         notes.push_str(&endpoint.unmodelled.join(","));
     }
-    notes.push_str(";cycles=unmeasured");
     notes
 }
 

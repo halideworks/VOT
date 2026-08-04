@@ -239,10 +239,15 @@ jobs:
       # so this job is the only one that sees it. Both profiles for the same
       # reason the pump runs in both: a threaded carrier fails differently
       # under a debug assertion and under an optimisation.
+      #
+      # One test at a time, because each of these tests is a full transfer with
+      # a counted delivery budget sized for a machine to itself. Run in
+      # parallel on a loaded runner they contend, and two of them stalled
+      # together on a shared runner while every one passes alone.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.88.0 test -p vot-bench-driver --features quiche --locked
-          cargo +1.88.0 test -p vot-bench-driver --features quiche --release --locked
+          cargo +1.88.0 test -p vot-bench-driver --features quiche --locked -- --test-threads=1
+          cargo +1.88.0 test -p vot-bench-driver --features quiche --release --locked -- --test-threads=1
 
       - name: Lint the pump
         run: >-
@@ -387,10 +392,13 @@ jobs:
           cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
+      # One test at a time, for the reason the quiche job gives: every driver
+      # test is a full transfer under a counted budget, and parallel transfers
+      # on a loaded runner stall each other.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.88.0 test -p vot-bench-driver --features msquic --locked
-          cargo +1.88.0 test -p vot-bench-driver --features msquic --release --locked
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --locked -- --test-threads=1
+          cargo +1.88.0 test -p vot-bench-driver --features msquic --release --locked -- --test-threads=1
 
       - name: Lint the driver's carrier
         run: >-

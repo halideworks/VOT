@@ -1991,6 +1991,23 @@ mod tests {
         feed_received(&mut conn, local, &mut junk, peer, None);
     }
 
+    /// Carries everything one sans-IO connection has to say to the other.
+    fn shuttle(
+        a: &mut quiche::Connection,
+        a_address: SocketAddr,
+        b: &mut quiche::Connection,
+        b_address: SocketAddr,
+    ) {
+        let mut packet = [0_u8; 2_048];
+        while let Ok((written, _)) = a.send(&mut packet) {
+            let info = quiche::RecvInfo {
+                from: a_address,
+                to: b_address,
+            };
+            let _ = b.recv(&mut packet[..written], info);
+        }
+    }
+
     #[test]
     fn a_record_split_by_flow_control_still_completes() {
         // The live pair above can never split a record: its stream window is
@@ -2036,22 +2053,6 @@ mod tests {
         .expect("a client");
         let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_config)
             .expect("a server");
-
-        fn shuttle(
-            a: &mut quiche::Connection,
-            a_address: SocketAddr,
-            b: &mut quiche::Connection,
-            b_address: SocketAddr,
-        ) {
-            let mut packet = [0_u8; 2_048];
-            while let Ok((written, _)) = a.send(&mut packet) {
-                let info = quiche::RecvInfo {
-                    from: a_address,
-                    to: b_address,
-                };
-                let _ = b.recv(&mut packet[..written], info);
-            }
-        }
 
         for _ in 0_u32..64 {
             shuttle(&mut client, local, &mut server, remote);

@@ -1407,6 +1407,8 @@ fn transfer_within<C: Carrier>(
     mut carrier: C,
     budget: u64,
 ) -> Result<Measurement, Error> {
+    #[cfg(test)]
+    test_guard::arm();
     let subject = subject_of(config)?;
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for(config)?;
@@ -1542,6 +1544,8 @@ fn transfer_ranged<C: Carrier>(
     mut carriers: Vec<C>,
     budget: u64,
 ) -> Result<Measurement, Error> {
+    #[cfg(test)]
+    test_guard::arm();
     let workers = config.workers;
     if carriers.len() != 1 && carriers.len() != workers {
         return Err(Error::Unsupported(format!(
@@ -1762,6 +1766,48 @@ fn ranged_notes(
     }
     notes.push_str(";cycles=unmeasured");
     notes
+}
+
+/// A mutant that breaks a loop's progress check can turn an allocating loop
+/// into a machine-eater; one reached 96 GiB and the OOM kill took the whole
+/// terminal session with it. Aborting at a cap makes that mutant caught.
+#[cfg(test)]
+mod test_guard {
+    use std::sync::Once;
+
+    /// Far above any honest test, far below a CI runner's 16 GiB.
+    const CAP_BYTES: u64 = 6 << 30;
+
+    static ARM: Once = Once::new();
+
+    /// Spawn the watchdog once per test binary. Every transfer entry calls
+    /// this, so no test has to remember to.
+    pub(crate) fn arm() {
+        ARM.call_once(|| {
+            std::thread::spawn(|| {
+                loop {
+                    if resident_bytes().is_some_and(|rss| rss > CAP_BYTES) {
+                        eprintln!("test_guard: resident set passed {CAP_BYTES} bytes, aborting");
+                        std::process::abort();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        });
+    }
+
+    /// Linux is where these tests and the mutation gates run; without procfs
+    /// there is no watchdog rather than a false abort.
+    fn resident_bytes() -> Option<u64> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
+    }
+
+    #[test]
+    fn the_watchdog_can_read_its_own_resident_set() {
+        assert!(resident_bytes().is_some_and(|rss| rss > 0));
+    }
 }
 
 #[cfg(test)]

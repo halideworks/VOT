@@ -427,7 +427,8 @@ const MAX_RANGED_RECORD_BYTES: usize = 3 * 65_536;
 ///
 /// A multiple of the 64 KiB group, because ranges verify in whole groups and
 /// a record that straddled a group boundary would make every bundle's cover
-/// misaligned. Only the object's final record may be short.
+/// misaligned. Only a worker slab's final record may be short, so a short
+/// record can sit mid-object where two slabs meet.
 fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
     let bytes = config.record_bytes;
     if bytes == 0 || bytes % vot_verifier::GROUP_SIZE != 0 || bytes > MAX_RANGED_RECORD_BYTES {
@@ -1577,7 +1578,7 @@ fn transfer_ranged<C: Carrier>(
             (worker, TRANSFER_LANE)
         }
     };
-    let mut reassembly = BundleReassembly::new(workers.saturating_mul(2).max(2));
+    let mut reassembly = BundleReassembly::new(workers);
     let mut tally = Tally::default();
     let mut bytes_sent = 0_u64;
     let mut delivered = 0_u64;
@@ -1601,7 +1602,11 @@ fn transfer_ranged<C: Carrier>(
                     let failed = bundle.is_err();
                     // A closed channel means the spine is gone, taking the
                     // transfer's verdict with it; there is no one to tell.
-                    if sender.send(bundle).is_err() || failed {
+                    if sender.send(bundle).is_err() {
+                        return;
+                    }
+                    // An error is this producer's last word.
+                    if failed {
                         return;
                     }
                 }
@@ -1610,17 +1615,21 @@ fn transfer_ranged<C: Carrier>(
 
         let mut queued: Vec<VecDeque<RangedFrame>> =
             (0..workers).map(|_| VecDeque::new()).collect();
-        let mut live: Vec<bool> = vec![true; workers];
         while delivered < config.object_bytes {
-            rounds_spend(&mut tally, budget)?;
+            // Spent here rather than in anything the loop calls, which is what
+            // keeps the loop bounded whatever those calls do.
+            tally.rounds = tally.rounds.saturating_add(1);
+            if tally.rounds > budget {
+                return Err(Error::Stalled);
+            }
             let mut progress = false;
             for worker in 0..workers {
-                if queued[worker].is_empty() && live[worker] {
+                if queued[worker].is_empty() {
                     match channels[worker].try_recv() {
                         Ok(Ok(frames)) => queued[worker].extend(frames),
                         Ok(Err(error)) => return Err(error),
-                        Err(mpsc::TryRecvError::Empty) => {}
-                        Err(mpsc::TryRecvError::Disconnected) => live[worker] = false,
+                        // Disconnected is a finished worker; nothing more comes.
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
                     }
                 }
                 let (carrier_index, lane) = rail_of(worker);
@@ -1665,7 +1674,10 @@ fn transfer_ranged<C: Carrier>(
             }
             if !progress {
                 tally.idle_waits = tally.idle_waits.saturating_add(1);
-                carriers[0].wait(idle_wait(tally.idle_waits));
+                // Rotated across rails: only a carrier's own signal ends its
+                // wait, and any rail's event can end an idle round.
+                let rail = usize::try_from(tally.idle_waits % rail_count as u64).unwrap_or(0);
+                carriers[rail].wait(idle_wait(tally.idle_waits));
             }
         }
         Ok(())
@@ -1698,18 +1710,6 @@ fn transfer_ranged<C: Carrier>(
         cycles: None,
         notes,
     })
-}
-
-/// Spends one round of the ranged loop's budget, held in the tally's rounds.
-///
-/// # Errors
-/// Reports [`Error::Stalled`] once the budget is gone.
-fn rounds_spend(tally: &mut Tally, budget: u64) -> Result<(), Error> {
-    tally.rounds = tally.rounds.saturating_add(1);
-    if tally.rounds > budget {
-        return Err(Error::Stalled);
-    }
-    Ok(())
 }
 
 /// Renders a ranged run's notes: the sequential fields, then what only this
@@ -2062,7 +2062,50 @@ mod tests {
                 // The envelope, the CBOR map, and the proof are all on the
                 // wire and none of them is the object.
                 assert!(note_field(&measured.notes, "wire_bytes") > object_bytes);
+                // One shared carrier is not the provisioned arrangement.
+                assert!(!measured.notes.contains(";rails="));
             }
+        }
+    }
+
+    #[test]
+    fn a_ranged_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
+        // Four refusals on top of the two rounds a clean 2-worker transfer
+        // spends: six rounds is exactly enough and five is exactly too few. A
+        // bound that fired one round early would call a carrier applying
+        // backpressure stopped.
+        let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.refuse = 4;
+        let measured = transfer_ranged(&config, vec![carrier], 6).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+
+        let mut same = TestCarrier::new();
+        same.refuse = 4;
+        assert!(matches!(
+            transfer_ranged(&config, vec![same], 5),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn a_provisioned_multi_rail_case_carries_each_worker_on_its_own_carrier() {
+        let first = TestCarrier::new();
+        let second = TestCarrier::new();
+        let first_lanes = std::sync::Arc::clone(&first.lanes);
+        let second_lanes = std::sync::Arc::clone(&second.lanes);
+        let config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
+        let measured = transfer_ranged(&config, vec![first, second], TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 4 * 65_536);
+        assert!(measured.notes.contains(";rails=provisioned-multi-rail"));
+        // The test double models everything, so the note must not claim
+        // otherwise.
+        assert!(!measured.notes.contains("unmodelled_impairment"));
+        // Each worker rides the transfer lane of a rail of its own.
+        for lanes in [first_lanes, second_lanes] {
+            let seen: std::collections::BTreeSet<StreamId> =
+                lanes.lock().unwrap().iter().copied().collect();
+            assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![StreamId(1)]);
         }
     }
 

@@ -25,8 +25,21 @@ use crate::{
     lane_for_stream, stream_for_lane,
 };
 
-/// Largest UDP payload either direction, which bounds every read buffer here.
+/// Largest UDP payload either direction when a caller names none.
+///
+/// Small enough to cross a path whose MTU is unknown, which is what an endpoint
+/// facing the internet has to assume: a larger datagram fragments or is dropped
+/// where a tunnel or a VPN sits in the way.
 const MAX_DATAGRAM_SIZE: usize = 1_350;
+
+/// The smallest datagram a caller may ask for.
+///
+/// QUIC requires an endpoint to carry a 1200-byte initial datagram, so anything
+/// under this cannot complete a handshake.
+const MIN_DATAGRAM_SIZE: usize = 1_200;
+
+/// The largest, which is what a UDP payload can hold at all.
+const LARGEST_DATAGRAM_SIZE: usize = 65_527;
 
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;
@@ -145,6 +158,17 @@ pub struct Config {
     pub verify_peer: bool,
     /// Idle timeout in milliseconds.
     pub idle_timeout_ms: u64,
+    /// Largest UDP payload this endpoint sends or expects.
+    ///
+    /// [`MAX_DATAGRAM_SIZE`] unless a caller knows the path. It is a first-order
+    /// cost: one datagram is one syscall here, and one packet's worth of header
+    /// protection and AEAD, so a path that can carry more and is not asked to
+    /// spends both on every 1350 bytes. Measured over loopback, whose MTU is
+    /// 65536, raising it is worth about four times the throughput.
+    ///
+    /// Raising it past what the path carries is not a tuning knob but a broken
+    /// connection, because the datagram fragments or is dropped.
+    pub max_datagram_bytes: usize,
 }
 
 impl Config {
@@ -157,6 +181,7 @@ impl Config {
             private_key: None,
             verify_peer: true,
             idle_timeout_ms: 30_000,
+            max_datagram_bytes: MAX_DATAGRAM_SIZE,
         }
     }
 
@@ -169,6 +194,7 @@ impl Config {
             private_key: Some(private_key),
             verify_peer: false,
             idle_timeout_ms: 30_000,
+            max_datagram_bytes: MAX_DATAGRAM_SIZE,
         }
     }
 
@@ -196,8 +222,11 @@ impl Config {
         }
         config.verify_peer(self.verify_peer);
         config.set_max_idle_timeout(self.idle_timeout_ms);
-        config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-        config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+        if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
+            return Err(Error::InvalidConfiguration);
+        }
+        config.set_max_recv_udp_payload_size(self.max_datagram_bytes);
+        config.set_max_send_udp_payload_size(self.max_datagram_bytes);
         // The advertised control-frame bound has to fit in one stream's flow
         // control, or a conforming frame is refused by the carrier after the
         // session promised to accept it.
@@ -288,6 +317,7 @@ impl Transport {
         let driver_control = Arc::clone(&control_limit);
         let driver_path = Arc::clone(&path);
         let connection = ConnectionId(u64::from(local.port()));
+        let datagram_bytes = config.max_datagram_bytes;
 
         let driver = std::thread::Builder::new()
             .name(format!("vot-quiche-{}", local.port()))
@@ -307,6 +337,7 @@ impl Transport {
                     &driver_control,
                     &driver_path,
                     connection.0,
+                    datagram_bytes,
                 );
                 // A driver that stops for any reason still owes the caller the
                 // disconnect, or the caller waits for a peer that has gone.
@@ -505,6 +536,7 @@ fn drive(
     control_limit: &Arc<AtomicUsize>,
     path: &Arc<Mutex<Option<PathStats>>>,
     connection: u64,
+    datagram_bytes: usize,
 ) -> Result<(), Error> {
     let budget = SharedBudget(Arc::clone(inbound));
     // Heap rather than stack, and as large as the largest frame a lane carries.
@@ -512,7 +544,10 @@ fn drive(
     // reassembly is what happens when a record is split rather than what happens
     // to every record. A driver thread's stack is not the place for it either.
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
-    let mut out = [0_u8; MAX_DATAGRAM_SIZE];
+    // Sized from the configuration and allocated once, because a datagram this
+    // endpoint may send is what it has to hold, and a per-pass allocation in a
+    // driver loop is a cost paid on every packet.
+    let mut out = vec![0_u8; datagram_bytes];
     let scid = scid_for(local);
 
     let (mut conn, mut announced) = match (role, peer) {
@@ -616,7 +651,7 @@ fn drive(
             role,
             &mut buffer,
         );
-        drain_datagrams(&mut conn);
+        drain_datagrams(&mut conn, &mut buffer);
         if let Some(sample) = path_sample(&conn) {
             if let Ok(mut slot) = path.lock() {
                 *slot = Some(sample);
@@ -646,7 +681,9 @@ fn accept_one(
         if !quiche::version_is_supported(header.version) {
             // A version this endpoint does not speak is answered rather than
             // dropped, which is what lets a client try another.
-            let mut out = [0_u8; MAX_DATAGRAM_SIZE];
+            // Version negotiation is a short packet, and the smallest datagram
+            // any endpoint carries is more than enough for it.
+            let mut out = [0_u8; MIN_DATAGRAM_SIZE];
             if let Ok(written) = quiche::negotiate_version(&header.scid, &header.dcid, &mut out) {
                 let _ = socket.send_to(&out[..written], from);
             }
@@ -877,9 +914,8 @@ fn read_streams(
 /// They are dropped rather than delivered: `vot-transport-api` has no inbound
 /// datagram event, so there is nothing to hand a caller. Leaving them queued
 /// would instead stall the connection's datagram credit.
-fn drain_datagrams(conn: &mut quiche::Connection) {
-    let mut buffer = [0_u8; MAX_DATAGRAM_SIZE];
-    while conn.dgram_recv(&mut buffer).is_ok() {}
+fn drain_datagrams(conn: &mut quiche::Connection, buffer: &mut [u8]) {
+    while conn.dgram_recv(buffer).is_ok() {}
 }
 
 /// Reads the active path's measurements, when there is one.
@@ -1315,6 +1351,85 @@ mod tests {
             "one lane, one worker: {received} records, {carried} bytes in {elapsed:?} \
              = {per_second} bytes/s = {megabits_per_second} Mbit/s"
         );
+    }
+
+    #[test]
+    fn a_pair_carries_records_at_a_datagram_size_the_path_allows() {
+        // Loopback carries 65536, so a larger datagram is a real configuration
+        // here and a first-order cost: one datagram is one syscall and one
+        // packet's worth of header protection and AEAD.
+        let (certificate, key) = credentials();
+        let mut server_config = Config::server(limits(), certificate, key);
+        server_config.max_datagram_bytes = 16_384;
+        let server = Transport::serve("127.0.0.1:0".parse().expect("an address"), &server_config)
+            .expect("a server");
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        client_config.max_datagram_bytes = 16_384;
+        let mut client = Transport::connect(
+            "127.0.0.1:0".parse().expect("an address"),
+            server.local_address(),
+            Some("localhost"),
+            &client_config,
+        )
+        .expect("a client");
+        let mut server = server;
+        pump_until(&mut client, &mut server, 10, |a, b| {
+            connected(a) && connected(b)
+        });
+
+        // A record several datagrams long either way, so the size is exercised
+        // rather than merely accepted.
+        let payload = vec![0x27; 200_000];
+        let frame = record(&payload);
+        client
+            .send_reliable(StreamId(0), &frame)
+            .expect("a record the lane carries");
+        let (_, from_server) = pump_until(&mut client, &mut server, 10, |_, b| {
+            b.iter()
+                .any(|event| matches!(event, Event::Reliable { .. }))
+        });
+        let carried = from_server
+            .iter()
+            .find_map(|event| match event {
+                Event::Reliable { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("the record arrived");
+        assert_eq!(carried.as_ref(), frame.as_slice());
+    }
+
+    #[test]
+    fn a_datagram_size_the_protocol_cannot_carry_is_refused() {
+        // Under the QUIC initial-packet floor no handshake can complete, and
+        // past a UDP payload nothing can be sent at all. Both are configuration
+        // errors rather than connections that fail later for no stated reason.
+        let (certificate, key) = credentials();
+        for size in [
+            0,
+            1,
+            super::MIN_DATAGRAM_SIZE - 1,
+            super::LARGEST_DATAGRAM_SIZE + 1,
+        ] {
+            let mut config = Config::server(limits(), certificate.clone(), key.clone());
+            config.max_datagram_bytes = size;
+            assert!(
+                matches!(
+                    Transport::serve("127.0.0.1:0".parse().expect("an address"), &config),
+                    Err(Error::InvalidConfiguration)
+                ),
+                "a datagram size of {size} was accepted"
+            );
+        }
+        // The edges themselves are allowed.
+        for size in [super::MIN_DATAGRAM_SIZE, super::LARGEST_DATAGRAM_SIZE] {
+            let mut config = Config::server(limits(), certificate.clone(), key.clone());
+            config.max_datagram_bytes = size;
+            assert!(
+                Transport::serve("127.0.0.1:0".parse().expect("an address"), &config).is_ok(),
+                "a datagram size of {size} was refused"
+            );
+        }
     }
 
     #[test]

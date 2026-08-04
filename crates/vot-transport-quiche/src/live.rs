@@ -1111,10 +1111,29 @@ mod tests {
             connected(a) && connected(b)
         });
 
-        // The handshake's Connected push left the latch raised, and polling
-        // never consumes it. One short wait does, so the timed wait below
-        // parks on a quiet queue and only the record's own push can end it.
-        server.wait_for_event(Duration::from_millis(50));
+        // Handshake-tail traffic can keep arriving briefly, and every push
+        // leaves the latch raised, which polling never consumes. Settle
+        // first: drain, then require one short wait to pass with nothing
+        // arriving, so the timed wait below parks on a quiet queue and only
+        // the record's own push can end it. This loop is also what pins that
+        // an idle wait costs its bound: a wait that returns at once with
+        // nothing to poll can never settle, and that spin is what the
+        // contract forbids.
+        let quiet = Duration::from_millis(100);
+        let settle_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = server.flush();
+            while server.poll().is_some() {}
+            let quiet_started = Instant::now();
+            server.wait_for_event(quiet);
+            if quiet_started.elapsed() >= quiet {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "the queue never went quiet, or an idle wait returns early"
+            );
+        }
 
         // A record is in flight when the server starts a five second wait. The
         // pump's signal must end the wait when the record lands; a wait that

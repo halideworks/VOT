@@ -2894,12 +2894,28 @@ pub mod live {
                 std::thread::yield_now();
             };
 
-            // The accepted side's own lifecycle events are taken first, so
-            // the wait below genuinely parks on an empty queue. Their pushes
-            // left the latch raised, and polling never consumes it; one short
-            // wait does, so only the record's own push can end the timed one.
-            while accepted.poll().is_some() {}
-            accepted.wait_for_event(Duration::from_millis(50));
+            // Handshake-tail traffic keeps arriving briefly after accept, and
+            // every push leaves the latch raised, which polling never
+            // consumes. Settle first: drain, then require one short wait to
+            // pass with nothing arriving, so the timed wait below parks on a
+            // quiet queue and only the record's own push can end it. This
+            // loop is also what pins that an idle wait costs its bound: a
+            // wait that returns at once with nothing to poll can never
+            // settle, and that spin is what the contract forbids.
+            let quiet = Duration::from_millis(100);
+            let settle_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                while accepted.poll().is_some() {}
+                let quiet_started = Instant::now();
+                accepted.wait_for_event(quiet);
+                if quiet_started.elapsed() >= quiet {
+                    break;
+                }
+                assert!(
+                    Instant::now() < settle_deadline,
+                    "the queue never went quiet, or an idle wait returns early"
+                );
+            }
 
             // A record is in flight when the accepted side starts a five
             // second wait. The callback's signal must end the wait when the

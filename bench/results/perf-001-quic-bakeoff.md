@@ -153,6 +153,24 @@ What it confirms, and one thing it found:
   is consistent with loopback's noise being two endpoints contending for one
   host.
 
+### What the path does without VOT
+
+iperf 3.21, same direction, measured to separate this stack's overhead from
+the path's. TCP reaches 9.2-9.5 Gbit/s from both WSL and native Windows, so
+the wire and both kernel stacks are line rate when segmentation offload
+applies. A single unpaced UDP flow at 1252-byte datagrams tops out at 2.44
+Gbit/s from WSL and 2.24 from native Windows, both limited by the Windows-side
+send path at roughly 240k packets per second; erebus sending the reverse
+direction reaches 5.68 Gbit/s at the same size. Four unpaced flows carried
+3.5 Gbit/s aggregate at 30% loss, so multiple rails can exceed the single-flow
+ceiling. Native Windows also passes 1472-byte payloads (2.77 Gbit/s, 0.05%
+loss), so the 1280-byte MTU is the WSL NAT path's alone.
+
+Read against the table above: **MsQuic's 2480 Mbit/s is the path's own
+single-flow UDP ceiling**, so it leaves nothing on the table here, and
+quiche's 387 is 6.3x under a ceiling the same socket layer serves. On this
+path the whole gap is the engine's per-packet cost, none of it the wire's.
+
 Reproducing, receiver first, then the sender on the other machine:
 
 ```sh

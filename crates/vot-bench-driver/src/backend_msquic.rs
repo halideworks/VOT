@@ -385,14 +385,22 @@ mod tests {
 
     #[test]
     fn a_ranged_case_crosses_a_real_socket_and_verifies() {
-        // The multi-worker path over a real socket: disjoint proof-bearing
-        // ranges on one lane per worker, a ragged tail included.
+        // The multi-worker path over a real socket in both arrangements:
+        // disjoint proof-bearing ranges on one lane per worker of a shared
+        // connection, or on a connection per worker, a ragged tail included.
         for workers in [2_usize, 4] {
-            let mut config = case(6 * 65_536 + 17);
-            config.workers = workers;
-            let measured = measure(&config).unwrap();
-            assert_eq!(measured.verified_bytes, config.object_bytes);
-            assert_eq!(note_field(&measured.notes, "path"), "ranged");
+            for rails in [Rails::Shared, Rails::Provisioned] {
+                let mut config = case(6 * 65_536 + 17);
+                config.workers = workers;
+                config.rails = rails;
+                let measured = measure(&config).unwrap();
+                assert_eq!(measured.verified_bytes, config.object_bytes);
+                assert_eq!(note_field(&measured.notes, "path"), "ranged");
+                assert_eq!(
+                    measured.notes.contains(";rails=provisioned-multi-rail"),
+                    rails == Rails::Provisioned
+                );
+            }
         }
     }
 

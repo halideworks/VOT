@@ -120,42 +120,55 @@ Ruling 6's hypothesis: one connection with W payload workers retains a
 serialized packet-number, loss-detection, and ACK spine, and tops out below W
 provisioned connections carrying one worker each. Same workload, host, and seed
 as above, 512 MB, three runs per cell, medians, source commit `1c72173`. The
-W=1 row is the sequential path and anchors each curve; every W>1 cell runs the
+W=1 rows are the sequential path and anchor each curve; every W>1 cell runs the
 ranged path (ADR-0025), which pays its own bundle framing and whole-object
 receive staging, so the comparison the hypothesis is about is shared against
 provisioned at the same W, never W=1 against anything.
 
-| carrier | datagram | W | shared Gbit/s | provisioned Gbit/s |
-| --- | --- | --- | --- | --- |
-| MsQuic | segmented | 1 | 11.07 | |
-| MsQuic | segmented | 2 | 8.94 | 8.83 |
-| MsQuic | segmented | 4 | 8.01 | 7.51 |
-| quiche | 1350 | 1 | 1.74 | |
-| quiche | 1350 | 2 | 1.54 | 1.58 |
-| quiche | 1350 | 4 | 1.43 | 2.51 |
-| quiche | 32768 | 1 | 6.87 | |
-| quiche | 32768 | 2 | 5.79 | 7.19 |
-| quiche | 32768 | 4 | 5.21 | 8.65 |
+| carrier | datagram | W | rails | Gbit/s (median) | spread | user CPU | system CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MsQuic | segmented | 1 | | 11.07 | 1.13x | 0.91 s | 0.20 s |
+| MsQuic | segmented | 2 | shared | 8.94 | 1.07x | 1.59 s | 0.37 s |
+| MsQuic | segmented | 2 | provisioned | 8.83 | 1.22x | 1.76 s | 0.47 s |
+| MsQuic | segmented | 4 | shared | 8.01 | 1.34x | 1.76 s | 0.38 s |
+| MsQuic | segmented | 4 | provisioned | 7.51 | 1.24x | 1.85 s | 0.42 s |
+| quiche | 1350 | 1 | | 1.74 | 1.05x | 2.23 s | 3.09 s |
+| quiche | 1350 | 2 | shared | 1.54 | 1.21x | 3.00 s | 3.65 s |
+| quiche | 1350 | 2 | provisioned | 1.58 | 1.62x | 5.45 s | 6.14 s |
+| quiche | 1350 | 4 | shared | 1.43 | 1.38x | 3.43 s | 3.84 s |
+| quiche | 1350 | 4 | provisioned | 2.51 | 1.11x | 5.84 s | 6.26 s |
+| quiche | 32768 | 1 | | 6.87 | 1.34x | 0.96 s | 0.60 s |
+| quiche | 32768 | 2 | shared | 5.79 | 1.03x | 1.60 s | 0.95 s |
+| quiche | 32768 | 2 | provisioned | 7.19 | 1.15x | 2.06 s | 1.13 s |
+| quiche | 32768 | 4 | shared | 5.21 | 1.05x | 1.73 s | 1.11 s |
+| quiche | 32768 | 4 | provisioned | 8.65 | 1.06x | 2.00 s | 0.96 s |
 
-Spreads run 1.03-1.62x; the quiche W=4 rows, where the claims below live, hold
-1.05-1.11x. Provisioned cells carry `rails=provisioned-multi-rail` in `notes`.
+Provisioned cells carry `rails=provisioned-multi-rail` in `notes`.
 
 - **For quiche the hypothesis holds, at both datagram sizes.** The shared
   connection loses throughput as workers rise (6.87 to 5.79 to 5.21 at 32768)
   while rails gain it (6.87 to 7.19 to 8.65); at W=4 rails lead 1.66x at 32768
-  and 1.75x at 1350, far outside the twenty-percent band ruling 6 set for run
-  variance. Each quiche connection is one socket-owning pump thread
-  (ADR-0024), CPU-bound per packet, so W connections are W pumps.
-- **For MsQuic it does not hold.** Shared and provisioned are the same number
-  inside their spreads at both worker counts, and both sit below the
-  one-worker anchor: MsQuic's single connection was never the ceiling here.
-- **The host is not the ceiling.** The heaviest cell spends about 12 s of CPU
-  on a 20-CPU host inside a 1.6 s transfer; the flat MsQuic curves are not
-  machine saturation.
+  and 1.76x at 1350, with 1.05-1.11x spreads on those four cells, far outside
+  the twenty-percent band ruling 6 set for run variance. Each quiche
+  connection is one socket-owning pump thread (ADR-0024), CPU-bound per
+  packet, so W connections are W pumps, and the CPU columns show the rails
+  buying their throughput with proportional CPU.
+- **For MsQuic it does not hold.** Shared and provisioned differ by 1.2% at
+  W=2 and 6.2% at W=4, inside spreads of 1.07-1.34x: the connection is not
+  what binds, because giving each worker its own moved nothing.
+- **The host is not the ceiling.** The heaviest cell (quiche at 1350, W=4,
+  provisioned) spends 12.1 s of CPU on a 20-CPU host inside a 1.6 s transfer;
+  the flat MsQuic curves are not machine saturation.
 - **The ranged path itself costs.** MsQuic user CPU rises from 0.91 s
-  sequential to 1.59 s ranged on the same object, and W=2 throughput drops
-  about 20% with it. The step from W=1 to W=2 changes the path, not just the
-  worker count, which is why the anchors are context and not a curve point.
+  sequential to 1.59 s ranged on the same object, and every W>1 cell of both
+  backends sits below its backend's W=1 anchor. That is the path's framing and
+  staging cost plus the driver spine, not a connection property, which is why
+  the anchors are context and not a curve point.
+
+Reproducing: the command above, with `VOT_BENCH_WORKERS` set to the cell's W,
+`VOT_BENCH_RAILS=provisioned` for the provisioned cells (absent or `shared`
+otherwise), and `VOT_BENCH_QUICHE_DATAGRAM_BYTES` at the figure's datagram
+size, absent for the 1350 default and for MsQuic.
 
 ## Two-machine confirmation
 

@@ -514,4 +514,16 @@ mod tests {
         );
         assert_roles_reported(&config, &sent, &received);
     }
+
+    #[test]
+    fn a_multi_worker_case_is_refused_before_any_socket_exists() {
+        // The guard runs before the role lookup, so no environment and no
+        // network are needed to pin it.
+        let mut config = case("quiche", 65_536);
+        config.workers = 2;
+        assert!(matches!(
+            super::measure(&config),
+            Err(crate::Error::Unsupported(_))
+        ));
+    }
 }

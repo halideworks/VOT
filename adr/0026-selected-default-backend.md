@@ -20,10 +20,12 @@ is deliberately not speed.
    path grants jumbo datagrams.
 2. **The spine verdict is per-carrier.** The serialized-spine hypothesis holds
    for quiche and not for MsQuic: at W=4, quiche's provisioned rails beat its
-   shared connection 1.66-1.75x (each quiche connection is one CPU-bound pump
+   shared connection 1.66-1.76x (each quiche connection is one CPU-bound pump
    thread, so rails are pumps), while MsQuic's two arms are equal inside
-   spread and its single connection is not its ceiling. A default that scales
-   without asking the caller to provision connections favors MsQuic.
+   spread, so its connection is not what binds. A default whose one connection
+   already delivers its engine's speed, with nothing left for provisioned
+   rails to buy, favors MsQuic; quiche reaches comparable numbers only when
+   the caller provisions W connections.
 3. **Multi-worker on one connection scales neither backend.** Both lose
    throughput from W=1 to W=2 on the ranged path at this scale; parallelism
    is not a reason to prefer either today.

@@ -399,6 +399,50 @@ fn subject_of(config: &Config) -> Result<SubjectId, Error> {
     })
 }
 
+/// User and system CPU time this process has spent, in nanoseconds.
+///
+/// `None` where the platform exposes no source, which is reported as unmeasured
+/// rather than as zero.
+///
+/// Worth having because throughput alone does not say where the time went. A
+/// carrier that is slower because it makes more syscalls and one that is slower
+/// because it hashes more look identical in bytes per second and are told apart
+/// at a glance by this split.
+#[must_use]
+pub fn cpu_times_ns() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_cpu_times(&std::fs::read_to_string("/proc/self/stat").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Extracts user and system CPU time from `/proc/self/stat`, in nanoseconds.
+///
+/// Fields are counted from the last `)` rather than from the start, because the
+/// second field is the executable name and may itself contain spaces and
+/// parentheses. Splitting the whole line on whitespace reads the wrong fields
+/// for any process whose name has a space in it.
+#[must_use]
+pub fn parse_cpu_times(stat: &str) -> Option<(u64, u64)> {
+    // `/proc` reports these in USER_HZ, which is 100 on Linux regardless of the
+    // kernel's own tick rate, so a tick is ten milliseconds.
+    const NANOS_PER_TICK: u64 = 10_000_000;
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    // The field after the name is `state`, which `/proc/[pid]/stat` numbers 3,
+    // so field n is at index n - 3: utime is 14 and stime is 15.
+    let user: u64 = fields.get(11)?.parse().ok()?;
+    let system: u64 = fields.get(12)?.parse().ok()?;
+    Some((
+        user.checked_mul(NANOS_PER_TICK)?,
+        system.checked_mul(NANOS_PER_TICK)?,
+    ))
+}
+
 /// Reads the process high-water resident set.
 ///
 /// # Errors
@@ -668,6 +712,22 @@ struct Tally {
     backpressure_waits: u64,
     idle_waits: u64,
     wire_bytes: u64,
+    /// User and system CPU nanoseconds the timed section spent, when the
+    /// platform exposes them.
+    cpu: Option<(u64, u64)>,
+}
+
+/// What the timed section spent, from two readings of the process total.
+///
+/// `None` unless both readings were taken, because a difference against a
+/// reading that was never made is not a measurement.
+fn cpu_spent(before: Option<(u64, u64)>, after: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    let (user_before, system_before) = before?;
+    let (user_after, system_after) = after?;
+    Some((
+        user_after.saturating_sub(user_before),
+        system_after.saturating_sub(system_before),
+    ))
 }
 
 /// Renders what a run measured, in the field order the contract's readers know.
@@ -682,7 +742,8 @@ fn transfer_notes(
         concat!(
             "backend={};path=sequential-reliable;",
             "staging_peak_bytes={};credit_bytes={};credit_mode={};",
-            "flushes={};backpressure_waits={};idle_waits={};wire_bytes={};generator_ns={}"
+            "flushes={};backpressure_waits={};idle_waits={};wire_bytes={};generator_ns={};",
+            "cpu_user_ns={};cpu_sys_ns={}"
         ),
         carrier.name(),
         receiver.peak_staging(),
@@ -692,7 +753,13 @@ fn transfer_notes(
         tally.backpressure_waits,
         tally.idle_waits,
         tally.wire_bytes,
-        generator_ns
+        generator_ns,
+        tally
+            .cpu
+            .map_or_else(|| "unmeasured".to_owned(), |(user, _)| user.to_string()),
+        tally
+            .cpu
+            .map_or_else(|| "unmeasured".to_owned(), |(_, system)| system.to_string()),
     );
     if !carrier.unmodelled().is_empty() {
         notes.push_str(";unmodelled_impairment=");
@@ -878,6 +945,7 @@ fn transfer_within<C: Carrier>(
     // them, so both are bounded however the carrier behaves.
     let mut rounds = 0_u64;
 
+    let cpu_before = cpu_times_ns();
     let started = Instant::now();
     for take in record_lengths(config.object_bytes, config.record_bytes)? {
         source.fill(&mut record, take);
@@ -952,6 +1020,7 @@ fn transfer_within<C: Carrier>(
 
     receiver.finish(subject)?;
     let elapsed = started.elapsed();
+    tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
 
     if !receiver.is_verified(subject) {
         return Err(Error::Unsupported(
@@ -1922,6 +1991,101 @@ mod tests {
             Error::from(vot_verifier::VerifyError::GroupOutOfOrder).to_string(),
             "verification error: GroupOutOfOrder"
         );
+    }
+
+    #[test]
+    fn cpu_time_is_read_past_an_executable_name_that_contains_spaces() {
+        // The second field of /proc/[pid]/stat is the executable name in
+        // parentheses and may contain spaces and parentheses of its own.
+        // Counting fields from the start of the line reads the wrong two for
+        // any process named like that, which is a silent wrong number rather
+        // than a failure.
+        let awkward = "42 (vot bench (x) ) S 1 42 42 0 -1 4194304 125 0 0 0 700 300 0 0 20 0 1 0 8";
+        assert_eq!(
+            super::parse_cpu_times(awkward),
+            Some((700 * 10_000_000, 300 * 10_000_000))
+        );
+
+        let plain = "7 (driver) R 1 7 7 0 -1 0 0 0 0 0 11 13 0 0 20 0 1 0 9";
+        assert_eq!(
+            super::parse_cpu_times(plain),
+            Some((11 * 10_000_000, 13 * 10_000_000))
+        );
+
+        // Truncated, and not a stat line at all.
+        assert_eq!(super::parse_cpu_times("7 (driver) R 1 7"), None);
+        assert_eq!(super::parse_cpu_times(""), None);
+        assert_eq!(
+            super::parse_cpu_times("7 (driver) R 1 7 7 0 -1 0 0 0 0 0 x 13 0 0 20 0 1 0 9"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_cpu_a_run_spent_is_a_difference_of_two_readings() {
+        assert_eq!(super::cpu_spent(Some((5, 7)), Some((9, 10))), Some((4, 3)));
+        // A counter that did not advance is zero, not a wrap.
+        assert_eq!(super::cpu_spent(Some((9, 9)), Some((9, 9))), Some((0, 0)));
+        assert_eq!(super::cpu_spent(Some((9, 9)), Some((1, 1))), Some((0, 0)));
+        // A difference against a reading never taken is not a measurement.
+        assert_eq!(super::cpu_spent(None, Some((9, 9))), None);
+        assert_eq!(super::cpu_spent(Some((9, 9)), None), None);
+    }
+
+    #[test]
+    fn the_cpu_reading_advances_as_the_process_spends_it() {
+        // A reading that never moves is not a reading. Asserting a positive
+        // number inside one short run cannot say this, because the counter
+        // advances in ten-millisecond ticks and a small run finishes inside
+        // one, which is what made an earlier version of this test fail in CI
+        // for being right about a fast machine. So spend CPU until the counter
+        // moves, and give it long enough that a loaded machine still gets
+        // there.
+        let Some((before, _)) = super::cpu_times_ns() else {
+            assert!(!cfg!(target_os = "linux"), "linux exposes this");
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut sink = 0_u64;
+        let mut after = before;
+        while std::time::Instant::now() < deadline {
+            for _ in 0..200_000 {
+                sink = sink.wrapping_add(std::hint::black_box(1));
+            }
+            std::hint::black_box(sink);
+            if let Some((user, _)) = super::cpu_times_ns()
+                && user > before
+            {
+                after = user;
+                break;
+            }
+        }
+        assert!(
+            after > before,
+            "the user counter did not move while the process spent CPU"
+        );
+    }
+
+    #[test]
+    fn a_run_reports_the_cpu_it_spent_rather_than_only_its_duration() {
+        // Throughput alone cannot separate a carrier that is slower because it
+        // makes more syscalls from one that is slower because it hashes more.
+        let measured = measure(&case(4 * 1_048_576, Suite::Blake3Bao64)).unwrap();
+        let user = note_field_text(&measured.notes, "cpu_user_ns");
+        let system = note_field_text(&measured.notes, "cpu_sys_ns");
+        if cfg!(target_os = "linux") {
+            // A number, and deliberately not a positive one. The counter
+            // advances in ten-millisecond ticks, and a few mebibytes of
+            // generating, framing, and verifying can finish inside one tick on
+            // an idle machine, so zero is a true reading rather than a broken
+            // one. That the fields carry the right values is pinned by the
+            // parser's own test, against known input, where it is exact.
+            assert!(user.parse::<u64>().is_ok(), "user cpu was {user}");
+            assert!(system.parse::<u64>().is_ok(), "system cpu was {system}");
+        } else {
+            assert_eq!(user, "unmeasured");
+            assert_eq!(system, "unmeasured");
+        }
     }
 
     #[test]

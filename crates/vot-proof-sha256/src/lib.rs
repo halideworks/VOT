@@ -44,6 +44,103 @@ pub fn piece_layer(data: &[u8]) -> Vec<[u8; 32]> {
     }
 }
 
+/// Which bytes a proof covers, and the proof itself.
+///
+/// [`prove`] returns the covered bytes with it because it was given the object.
+/// This is what a caller gets when it supplied only the piece hashes, and it
+/// already has, or can regenerate, the bytes the cover names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeCover {
+    pub covered_offset: u64,
+    pub covered_length: u64,
+    pub proof: Vec<u8>,
+}
+
+/// The hash of every 64 KiB piece, in order.
+///
+/// Enough to prove any range without the object, where [`prove`] rebuilds the
+/// whole piece layer on every call. It is 32 bytes per piece, about 512 KiB for
+/// a gigabyte, which is what lets a sender prove ranges without holding the
+/// object.
+///
+/// Unlike [`piece_layer`] this has no single-piece case, which a reader
+/// comparing the two should not take for an omission. An object of one piece
+/// has no parent to encode, so its proof is empty and the layer is never read;
+/// the root the receiver checks against comes from the range's own bytes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PieceHashes {
+    hashes: Vec<[u8; 32]>,
+    length: u64,
+    ended: bool,
+}
+
+impl PieceHashes {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the next piece, keeping only its hash.
+    ///
+    /// # Errors
+    /// Rejects an empty piece, a piece larger than [`PIECE_SIZE`], and anything
+    /// after a short one, because only the last piece may be short.
+    pub fn push(&mut self, piece: &[u8]) -> Result<(), Error> {
+        if piece.is_empty() || piece.len() as u64 > PIECE_SIZE {
+            return Err(Error::OutOfBounds);
+        }
+        if self.ended {
+            return Err(Error::OutOfBounds);
+        }
+        self.hashes.push(piece_hash(piece));
+        self.length += piece.len() as u64;
+        self.ended = (piece.len() as u64) < PIECE_SIZE;
+        Ok(())
+    }
+
+    /// The object length these cover.
+    #[must_use]
+    pub const fn object_len(&self) -> u64 {
+        self.length
+    }
+
+    #[must_use]
+    pub fn pieces(&self) -> usize {
+        self.hashes.len()
+    }
+}
+
+/// Proves a range from the piece hashes rather than from the object.
+///
+/// The proof is byte-identical to [`prove`]'s for the same range, which its
+/// tests check directly.
+///
+/// # Errors
+/// Rejects an empty range and one that runs past the object.
+pub fn prove_with(pieces: &PieceHashes, offset: u64, length: u64) -> Result<RangeCover, Error> {
+    let object_len = pieces.length;
+    if length == 0 {
+        return Err(Error::EmptyRange);
+    }
+    let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
+    if request_end > object_len {
+        return Err(Error::OutOfBounds);
+    }
+    let covered_offset = offset / PIECE_SIZE * PIECE_SIZE;
+    let covered_end = request_end
+        .div_ceil(PIECE_SIZE)
+        .checked_mul(PIECE_SIZE)
+        .ok_or(Error::LengthOverflow)?
+        .min(object_len);
+    let first = covered_offset / PIECE_SIZE;
+    let end = covered_end.div_ceil(PIECE_SIZE);
+    Ok(RangeCover {
+        covered_offset,
+        covered_length: covered_end - covered_offset,
+        proof: encode_proof(&pieces.hashes, first, end),
+    })
+}
+
 pub fn prove(data: &[u8], offset: u64, length: u64) -> Result<RangeProof, Error> {
     let object_len = data.len() as u64;
     if length == 0 {
@@ -294,6 +391,83 @@ mod tests {
         (0..length)
             .map(|i| (i.wrapping_mul(17) % 251) as u8)
             .collect()
+    }
+
+    /// Streams `data` through the builder one piece at a time, the way a
+    /// sender that never holds the object does.
+    fn pieces_of(data: &[u8]) -> PieceHashes {
+        let mut pieces = PieceHashes::new();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            pieces.push(piece).unwrap();
+        }
+        pieces
+    }
+
+    #[test]
+    fn proving_from_piece_hashes_matches_proving_from_the_object() {
+        // The second path is the first one without the object, including the
+        // single-piece object whose layer is its root rather than its piece
+        // hash, which is the case a streaming builder cannot see coming.
+        for length in [
+            1,
+            PIECE_SIZE as usize,
+            PIECE_SIZE as usize + 1,
+            3 * PIECE_SIZE as usize,
+            5 * PIECE_SIZE as usize + 71,
+        ] {
+            let data = fixture(length);
+            let pieces = pieces_of(&data);
+            assert_eq!(pieces.object_len(), data.len() as u64);
+            for (offset, request) in [(0, 1), (0, length as u64), (length as u64 - 1, 1)] {
+                let whole = prove(&data, offset, request).unwrap();
+                let cover = prove_with(&pieces, offset, request).unwrap();
+                assert_eq!(cover.proof, whole.proof, "length {length} offset {offset}");
+                assert_eq!(cover.covered_offset, whole.covered_offset);
+                assert_eq!(cover.covered_length, whole.data.len() as u64);
+
+                let start = cover.covered_offset as usize;
+                let stop = start + cover.covered_length as usize;
+                verify(
+                    &root(&data),
+                    data.len() as u64,
+                    cover.covered_offset,
+                    &data[start..stop],
+                    &cover.proof,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_builder_takes_full_pieces_until_a_short_last_one() {
+        let mut pieces = PieceHashes::new();
+        assert_eq!(pieces.push(&[]), Err(Error::OutOfBounds));
+        assert_eq!(
+            pieces.push(&fixture(PIECE_SIZE as usize + 1)),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(pieces.object_len(), 0);
+        assert_eq!(pieces.pieces(), 0);
+
+        pieces.push(&fixture(PIECE_SIZE as usize)).unwrap();
+        pieces.push(&fixture(7)).unwrap();
+        assert_eq!(pieces.object_len(), PIECE_SIZE + 7);
+        assert_eq!(pieces.pieces(), 2);
+        assert_eq!(pieces.push(&fixture(1)), Err(Error::OutOfBounds));
+    }
+
+    #[test]
+    fn a_range_past_the_object_is_refused_from_piece_hashes_too() {
+        let data = fixture(2 * PIECE_SIZE as usize);
+        let pieces = pieces_of(&data);
+        assert_eq!(prove_with(&pieces, 0, 0), Err(Error::EmptyRange));
+        assert_eq!(prove_with(&pieces, u64::MAX, 2), Err(Error::LengthOverflow));
+        assert_eq!(
+            prove_with(&pieces, data.len() as u64, 1),
+            Err(Error::OutOfBounds)
+        );
+        assert!(prove_with(&pieces, 0, data.len() as u64).is_ok());
     }
 
     #[test]

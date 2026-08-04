@@ -202,7 +202,7 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
                     adapter.flush()?;
                     if drain_sender(adapter, &mut done)? == 0 {
                         tally.idle_waits = tally.idle_waits.saturating_add(1);
-                        std::thread::sleep(idle_wait(tally.idle_waits));
+                        adapter.wait_for_event(idle_wait(tally.idle_waits));
                     }
                 }
                 Err(other) => return Err(Error::Transport(other)),
@@ -231,7 +231,7 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
         adapter.flush()?;
         if drain_sender(adapter, &mut done)? == 0 && !done {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
-            std::thread::sleep(idle_wait(tally.idle_waits));
+            adapter.wait_for_event(idle_wait(tally.idle_waits));
         }
     }
     let elapsed = started.elapsed();
@@ -293,7 +293,7 @@ fn receive(
         delivered = delivered.saturating_add(progress);
         if progress == 0 {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
-            std::thread::sleep(idle_wait(tally.idle_waits));
+            adapter.wait_for_event(idle_wait(tally.idle_waits));
         }
     }
     staging.finish(subject)?;

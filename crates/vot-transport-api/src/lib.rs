@@ -2,7 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 pub const ALPN: &[u8] = b"vot-draft-04";
 pub const MIN_CONTROL_FRAME_PAYLOAD: usize = vot_codec::MIN_CONTROL_FRAME_PAYLOAD;
@@ -123,6 +124,48 @@ pub struct PathStats {
     pub pacing_rate_bps: Option<u64>,
 }
 
+/// A latched doorbell for [`TransportAdapter::wait_for_event`].
+///
+/// A backend thread that queues an event calls [`EventSignal::raise`]; a
+/// caller with nothing to poll sleeps in [`EventSignal::wait`]. The latch
+/// holds a raise until a wait consumes it, so an event queued between a
+/// caller's last poll and its wait wakes that wait immediately instead of
+/// being slept past. The cost of the latch is an occasional spurious return,
+/// which the `wait_for_event` contract already allows.
+///
+/// Lives here because every backend with a feeding thread needs exactly this
+/// and none should build its own subtly different one.
+#[derive(Debug, Default)]
+pub struct EventSignal {
+    raised: Mutex<bool>,
+    arrived: Condvar,
+}
+
+impl EventSignal {
+    /// Records that an event was queued and wakes any waiter.
+    pub fn raise(&self) {
+        if let Ok(mut raised) = self.raised.lock() {
+            *raised = true;
+        }
+        self.arrived.notify_all();
+    }
+
+    /// Returns once [`EventSignal::raise`] has been called since the last
+    /// wait consumed it, or after `bound`. May return early spuriously.
+    pub fn wait(&self, bound: Duration) {
+        let Ok(mut raised) = self.raised.lock() else {
+            return;
+        };
+        if !*raised {
+            let Ok((woken, _)) = self.arrived.wait_timeout(raised, bound) else {
+                return;
+            };
+            raised = woken;
+        }
+        *raised = false;
+    }
+}
+
 pub trait TransportAdapter {
     /// # Errors
     /// Reports a backend or protocol limit failure.
@@ -200,6 +243,30 @@ pub trait TransportAdapter {
 
     /// Returns the next backend event without blocking.
     fn poll(&mut self) -> Option<Event>;
+
+    /// Blocks until an event may be available for [`TransportAdapter::poll`],
+    /// or for at most `bound`.
+    ///
+    /// Spurious returns are allowed: a caller treats every return as "poll
+    /// again", never as a promise that an event is there. That contract is
+    /// what lets a backend signal arrivals with a latch instead of proving
+    /// emptiness under a lock, and it is why the default, sleeping the bound
+    /// out, is honest for a backend with no wakeup signal: no event is ever
+    /// missed, only time.
+    ///
+    /// Always bounded, never indefinite, so the caller's loop keeps its own
+    /// budget. Exists because a caller that can only poll has to guess a
+    /// polling interval, and the guess changes what a benchmark measures:
+    /// polling a carrier that has nothing contends with the thread filling it.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the default is a sleep by contract; the simulator's ban on \
+                  sleeping guards its own deterministic code, and its adapter \
+                  is never waited on because it delivers before flush returns"
+    )]
+    fn wait_for_event(&mut self, bound: Duration) {
+        std::thread::sleep(bound);
+    }
 
     /// Drains at most limit events without changing their ordering.
     fn poll_batch(&mut self, out: &mut Vec<Event>, limit: usize) -> usize {
@@ -779,5 +846,72 @@ mod tests {
         assert_eq!(staging.advertised_credit(), 800);
         staging.reserve(300).unwrap();
         assert_eq!(staging.advertised_credit(), 724);
+    }
+
+    /// Long enough that an early return is unmistakable on a loaded machine,
+    /// and short enough that the slow paths cost tests only tens of
+    /// milliseconds each.
+    const WAIT_BOUND: Duration = Duration::from_millis(40);
+
+    /// The most a "returns promptly" path may take. Half the long bound used
+    /// in those tests, so a wait that slept the bound out cannot pass.
+    const PROMPT: Duration = Duration::from_secs(2);
+    const LONG_BOUND: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn the_default_wait_sleeps_the_bound_out() {
+        // The contract's floor: a backend with no signal must not spin. A
+        // caller's loop budget is only a bound on wall clock because every
+        // wait costs real time.
+        let mut adapter = ContractAdapter::default();
+        let started = std::time::Instant::now();
+        adapter.wait_for_event(WAIT_BOUND);
+        assert!(started.elapsed() >= WAIT_BOUND);
+    }
+
+    #[test]
+    fn a_raise_before_the_wait_is_not_slept_past() {
+        // The latch is the point: an event queued between a caller's last
+        // poll and its wait must wake that wait, or the caller sleeps a full
+        // bound with work available.
+        let signal = EventSignal::default();
+        signal.raise();
+        let started = std::time::Instant::now();
+        signal.wait(LONG_BOUND);
+        assert!(started.elapsed() < PROMPT);
+    }
+
+    #[test]
+    fn an_unraised_wait_lasts_the_bound_and_a_consumed_latch_does_not_linger() {
+        let signal = EventSignal::default();
+        let started = std::time::Instant::now();
+        signal.wait(WAIT_BOUND);
+        assert!(started.elapsed() >= WAIT_BOUND);
+
+        // One raise satisfies one wait. If the latch survived consumption,
+        // every later wait would return immediately and the caller would be
+        // back to spinning.
+        signal.raise();
+        signal.wait(WAIT_BOUND);
+        let started = std::time::Instant::now();
+        signal.wait(WAIT_BOUND);
+        assert!(started.elapsed() >= WAIT_BOUND);
+    }
+
+    #[test]
+    fn a_raise_wakes_a_parked_waiter() {
+        // The notify half of the latch. Without it a raise during the wait
+        // is only seen when the bound expires, which is the polling the
+        // signal exists to end.
+        let signal = Arc::new(EventSignal::default());
+        let raiser = Arc::clone(&signal);
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            raiser.raise();
+        });
+        let started = std::time::Instant::now();
+        signal.wait(LONG_BOUND);
+        assert!(started.elapsed() < PROMPT);
+        waker.join().unwrap();
     }
 }

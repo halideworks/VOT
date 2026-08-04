@@ -354,6 +354,12 @@ impl Carrier for QuicheCarrier {
     fn drain_sent(&mut self) {
         while self.client.poll().is_some() {}
     }
+
+    // The receiving endpoint, because that is whose events an idle delivery
+    // was short of. The pump's signal ends the wait as soon as one lands.
+    fn wait(&mut self, bound: Duration) {
+        self.server.wait_for_event(bound);
+    }
 }
 
 #[cfg(test)]

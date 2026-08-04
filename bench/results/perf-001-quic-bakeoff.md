@@ -113,6 +113,55 @@ Each run reports its own `datagram_bytes`, `cpu_user_ns`, and `cpu_sys_ns` in
 `notes`, so a result says which path it describes without a reader having to
 reconstruct the configuration.
 
+## Two-machine confirmation
+
+Labeled and never mixed with the loopback numbers above: this is a different
+path with different facts, and each side pays only for its own endpoint.
+
+- Sender: tr-desktop, Windows 11, inside WSL2 (Ubuntu, x86_64, NAT networking).
+  Receiver: this host, native Linux. Wired at 10 Gbit/s, physical MTU 1500.
+- **The effective path MTU is 1280 bytes**, measured by UDP probe: the WSL2
+  NAT path forwards a 1252-byte UDP payload and silently drops 1300. Every
+  number below describes that path. Neither carrier approaches the link rate,
+  so this confirms the engines' relative cost, not the link's capacity.
+- One 512 MB object, one lane, one worker, 64 KiB records, `blake3-bao64`,
+  seed 42. Five runs per configuration; the receiver's clock, from accepted
+  connection to verified object, is the throughput claim.
+
+| carrier | datagram | Mbit/s (median) | spread | recv CPU user/sys | send CPU user/sys |
+| --- | --- | --- | --- | --- | --- |
+| MsQuic | probed | 2480 | 1.19x | 0.92 s / 0.23 s | 0.65 s / 0.81 s |
+| quiche | 1252 | 387 | 1.08x | 3.77 s / 4.83 s | 3.97 s / 7.09 s |
+
+What it confirms, and one thing it found:
+
+- **The per-packet gap widens on a real path.** At matched ~1250-byte packets
+  MsQuic leads 6.4x, against 1.4x on loopback where quiche was allowed jumbo
+  datagrams. The quiche sender spends 11.06 s of CPU carrying an 11.11 s
+  transfer: the path is CPU-bound on per-packet work, and the system-time
+  split (7.09 s against 0.81 s sending, 4.83 s against 0.23 s receiving) is
+  the segmentation-offload difference PERF-002 exists to close.
+- **quiche blackholes on a path narrower than its datagram size.** At the
+  1350-byte default the handshake completes, because handshake packets are
+  1200 bytes, and then every data packet vanishes and the transfer stalls at
+  zero until the round budget calls it stalled. MsQuic probed the path and
+  settled under the ceiling on its own. Whoever writes ADR-0026 should weigh
+  this with the datagram-size lever above: the same control that let quiche
+  win back 4.2x on loopback is, unset, the thing that hangs it on a narrow
+  path, because the backend does no path-MTU discovery.
+- The wire runs hold a 1.08-1.19x spread where loopback held 1.3-1.6x, which
+  is consistent with loopback's noise being two endpoints contending for one
+  host.
+
+Reproducing, receiver first, then the sender on the other machine:
+
+```sh
+VOT_BENCH_ROLE=receive VOT_BENCH_LISTEN=192.168.1.131:4433 \
+  <the loopback command above, with VOT_BENCH_QUICHE_DATAGRAM_BYTES=1252>
+VOT_BENCH_ROLE=send VOT_BENCH_CONNECT=192.168.1.131:4433 \
+  <same case on the sending machine>
+```
+
 ## What this does not cover
 
 **No default backend is selected here.** That is ADR-0026, and it should not be
@@ -129,8 +178,6 @@ still unmeasured, and one of them could move the answer.
   connection top out below independent rails, which is a claim about the
   connection's packet-number and ACK spine rather than about either engine's
   single-stream speed.
-
-**No two-machine run.** Loopback numbers do not transfer to a wire.
 
 **Nothing here weighs what is not speed.** ADR-0012 isolates MsQuic because it
 is a C FFI dependency that requires unsafe code, is pinned to a git revision,

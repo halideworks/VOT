@@ -30,6 +30,15 @@ use crate::{Carrier, Config, Error};
 /// connect fails rather than hanging in CI.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The datagram size the pair is configured with, when the case names one.
+///
+/// Not a `VOT_BENCH_*` variable, because it is not part of the benchmark
+/// contract: it describes the path the run was taken on rather than the
+/// workload. Named here so a comparison can hold packet size fixed across
+/// backends, which it must, since one datagram is one syscall and one packet's
+/// worth of crypto and the default is sized for a path whose MTU is unknown.
+const DATAGRAM_BYTES: &str = "VOT_BENCH_QUICHE_DATAGRAM_BYTES";
+
 /// Lanes the endpoints advertise.
 ///
 /// The transfer uses one. The rest are advertised because a benchmark endpoint
@@ -42,6 +51,9 @@ pub(crate) struct QuicheCarrier {
     client: Transport,
     server: Transport,
     unmodelled: Vec<&'static str>,
+    /// What the pair was configured with, so a result says which path it
+    /// describes rather than leaving a reader to assume the default.
+    datagram_bytes: usize,
 }
 
 impl QuicheCarrier {
@@ -64,10 +76,20 @@ impl QuicheCarrier {
             .parse()
             .map_err(|_| Error::Value("VOT_BENCH_BACKEND"))?;
 
-        let mut server =
-            Transport::serve(loopback, &QuicheConfig::server(limits, certificate, key))
-                .map_err(Error::Transport)?;
+        let datagram_bytes = std::env::var(DATAGRAM_BYTES)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| Error::Value(DATAGRAM_BYTES))?;
+
+        let mut server_config = QuicheConfig::server(limits, certificate, key);
         let mut client_config = QuicheConfig::client(limits);
+        if let Some(bytes) = datagram_bytes {
+            server_config.max_datagram_bytes = bytes;
+            client_config.max_datagram_bytes = bytes;
+        }
+        let mut server = Transport::serve(loopback, &server_config).map_err(Error::Transport)?;
         // The credential is generated for this run and trusted by construction.
         // What is being measured is the carrier, not the web PKI, and a
         // benchmark that failed on certificate validation would say nothing
@@ -86,6 +108,9 @@ impl QuicheCarrier {
             client,
             server,
             unmodelled: unmodelled_for(config),
+            // What was configured, rather than what was asked for, so an
+            // unset case reports the default it actually ran at.
+            datagram_bytes: client_config.max_datagram_bytes,
         })
     }
 }
@@ -187,6 +212,10 @@ fn credentials() -> Result<(String, String), Error> {
 impl Carrier for QuicheCarrier {
     fn name(&self) -> &'static str {
         "quiche"
+    }
+
+    fn detail(&self) -> Option<String> {
+        Some(format!("datagram_bytes={}", self.datagram_bytes))
     }
 
     fn unmodelled(&self) -> &[&'static str] {

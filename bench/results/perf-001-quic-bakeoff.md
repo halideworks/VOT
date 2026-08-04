@@ -239,6 +239,35 @@ offload back one flush at a time, which cost 19% until it was caught. The
 first run after the path goes quiet is cold here too (1694; the other four
 hold 2476-2572).
 
+### The path widened, and the ceiling followed (2026-08-04, `8c0b8b4`)
+
+The WSL NAT path changed under us: a UDP payload sweep now passes every size
+through 1472 bytes, full ethernet framing, where it dropped everything over
+1252 before. Anything needing fragmentation still dies, so it is a wider
+pipe with the same cliff. Rerun on the widened path, five runs per arm:
+
+| carrier | datagram | Mbit/s (median) | spread | recv CPU user/sys | send CPU user/sys | recv cyc/B | send cyc/B |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MsQuic | probed | 2584 | 1.17x | 0.58 s / 0.26 s | 0.64 s / 0.84 s | 7.30 | 5.75 |
+| quiche | 1472 pinned | 2899 | 1.07x | 0.66 s / 0.23 s | 0.66 s / 0.71 s | 7.69 | 5.83 |
+| quiche | 1350 ceiling, discovered | 2339 | 1.09x | 0.68 s / 0.26 s | 0.65 s / 0.76 s | 8.00 | 5.94 |
+| quiche | 1472 ceiling, discovered | 2769 | 1.31x | 0.66 s / 0.25 s | 0.59 s / 0.70 s | 7.96 | 5.64 |
+
+Pinned at 1472, quiche leads MsQuic's probed arm by 12%, outside both
+spreads; the table does not record what size MsQuic settled at, so the
+comparison is between configurations, not proven-equal packets. The third
+row is the lesson: discovery probes up to `max_send_udp_payload_size`, so
+the old 1350 default was a ceiling the path never asked for, and it priced
+the stock config 9% under MsQuic on a path that carries 1472. The default
+ceiling is now 1472, what a 1500-byte ethernet frame carries over IPv4,
+with discovery settling under it where the path is narrower; that is the
+fourth row, taken at the new default with nothing pinned, 7% over MsQuic.
+Its 1.31x spread is the familiar cold first run (2205; the other four hold
+2718-2895). Every arm sits near 240k packets per second, the Windows-side
+send ceiling the iperf section below measured, so the ordering here is
+packets carried, not engine cost: the wider path moved the same pps ceiling
+up by the ratio of the packet sizes.
+
 ### What the path does without VOT
 
 iperf 3.21, same direction, measured to separate this stack's overhead from

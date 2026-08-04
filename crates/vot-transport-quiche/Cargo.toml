@@ -11,7 +11,7 @@ default = []
 # The pump: a UDP socket, a quiche connection, and the timer that drives loss
 # recovery. Off by default because quiche builds BoringSSL through cmake, which
 # costs minutes where the rest of this workspace costs seconds.
-live = ["dep:quiche"]
+live = ["dep:quiche", "dep:nix"]
 
 [dependencies]
 quiche = { version = "=0.24.9", optional = true }
@@ -19,6 +19,13 @@ vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-transport-framing = { path = "../vot-transport-framing" }
 vot-transport-queue = { path = "../vot-transport-queue" }
+
+# Safe wrappers for the sendmsg control message that carries segmentation
+# offload. A kernel feature with no portable Rust surface; wrapping it here is
+# what keeps `unsafe_code = "forbid"` true of this crate. Linux only, because
+# the control message is: elsewhere the pump sends packets one at a time.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "=0.31.3", features = ["socket", "uio", "net"], optional = true }
 
 [lints]
 workspace = true

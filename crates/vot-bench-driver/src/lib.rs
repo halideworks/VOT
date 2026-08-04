@@ -42,14 +42,42 @@ const WORD_BYTES: usize = 8;
 /// one the matrix asks.
 const TRANSFER_LANE: StreamId = StreamId(1);
 
-/// How long a carrier may deliver nothing before the run is called stalled.
+/// The shortest wait after a delivery that moved nothing, and the longest.
 ///
-/// This is not a deadline for the transfer. A real carrier is briefly idle
-/// whenever it waits for a window to open, so only a carrier that delivers
-/// nothing for this long has stopped rather than slowed. A run that reaches it
-/// is an error, because a partial transfer reported as a measurement is exactly
-/// what the benchmark contract exists to prevent.
-const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the driver waits changes what it measures, which is why this backs
+/// off rather than picking one interval. Polling a carrier that has nothing to
+/// give contends with the thread that would be filling it: measured over a
+/// 512 MB object, a fixed 200 microsecond wait reported a median of about 1000
+/// Mbit/s with a 31 percent spread, and fixed waits of 1 to 5 milliseconds
+/// reported about 1500 with a 9 percent spread. Waiting less made the carrier
+/// slower and the result noisier.
+///
+/// A fixed long wait would then distort the small cases, where one wait is most
+/// of the run. Backing off from the short end gives a small object its answer
+/// without a millisecond of padding and a long one the interval where the
+/// driver is out of the carrier's way.
+const IDLE_WAIT_MIN: Duration = Duration::from_micros(16);
+const IDLE_WAIT_MAX: Duration = Duration::from_micros(1024);
+
+/// Doublings from [`IDLE_WAIT_MIN`] that reach [`IDLE_WAIT_MAX`].
+const IDLE_WAIT_DOUBLINGS: u32 = 6;
+const _: () =
+    assert!(IDLE_WAIT_MIN.as_micros() << IDLE_WAIT_DOUBLINGS == IDLE_WAIT_MAX.as_micros());
+
+/// Deliveries a transfer may make beyond one per record before its carrier is
+/// called stopped.
+///
+/// A count rather than a deadline, so the transfer ends by construction rather
+/// than only because a clock advanced. A run that reaches it is an error,
+/// because a partial transfer reported as a measurement is exactly what the
+/// benchmark contract exists to prevent.
+///
+/// At [`IDLE_WAIT_MAX`] each, this allowance is about twenty seconds of a
+/// carrier delivering nothing, so the count bounds the wall clock as well as
+/// the loop. A healthy transfer stays far inside it: 512 MB over loopback
+/// spends a few thousand, and the per-record term is what carries a larger
+/// object rather than this one growing.
+const STALL_ROUNDS: u64 = 20_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -67,8 +95,7 @@ pub enum Error {
     /// A delivered record was not the frame it was submitted as. Only a carrier
     /// that changed or truncated it on the way can produce this.
     Corrupt,
-    /// The carrier delivered nothing for [`STALL_TIMEOUT`] with the object
-    /// incomplete.
+    /// The carrier used up its delivery budget with the object incomplete.
     Stalled,
     /// The carrier reported the connection gone before the object was whole.
     Disconnected,
@@ -565,35 +592,119 @@ fn deliver<C: Carrier>(
     Ok(delivered)
 }
 
-/// Delivers once and reports whether the carrier is still moving.
+/// Delivers once, and waits if that moved nothing.
 ///
-/// A carrier that crosses a socket is briefly idle whenever it waits for a
-/// window to open, so an idle delivery is not a failure until it has been idle
-/// for `stall_timeout`. `idle_since` is reset by progress, which is what makes
-/// the bound "stopped" rather than "slower than expected".
+/// The carrier's own thread is what makes progress, so a caller that found
+/// nothing has nothing to do until that thread has run. Waiting rather than
+/// spinning matters here more than it usually would: a benchmark that burns a
+/// core polling takes it from the carrier it is measuring.
+///
+/// The waits are counted, which is worth reporting. A transfer that spent most
+/// of its deliveries finding nothing was waiting on the carrier, and one that
+/// never waited was never ahead of it.
 ///
 /// # Errors
-/// Propagates delivery failures, and reports [`Error::Stalled`] for a carrier
-/// that has delivered nothing for longer than `stall_timeout`.
-fn deliver_or_stall<C: Carrier>(
+/// Propagates delivery failures.
+fn deliver_or_wait<C: Carrier>(
     carrier: &mut C,
     receiver: &mut ReliableReceiver,
     subject: SubjectId,
-    idle_since: &mut Instant,
-    stall_timeout: Duration,
+    idle_waits: &mut u64,
 ) -> Result<u64, Error> {
     let progress = deliver(carrier, receiver, subject)?;
     if progress == 0 {
-        if idle_since.elapsed() > stall_timeout {
-            return Err(Error::Stalled);
-        }
-        // The carrier's own thread is what makes progress here, so this thread
-        // has nothing to do until it does.
-        std::thread::yield_now();
-    } else {
-        *idle_since = Instant::now();
+        *idle_waits = idle_waits.saturating_add(1);
+        std::thread::sleep(idle_wait(*idle_waits));
     }
     Ok(progress)
+}
+
+/// How long to wait once this transfer has had `idle_waits` deliveries that
+/// moved nothing.
+///
+/// Doubling from [`IDLE_WAIT_MIN`], and never past [`IDLE_WAIT_MAX`].
+///
+/// The count is the transfer's total rather than a run of them, so the wait
+/// climbs once and stays. Backing off from a run instead was measured and is
+/// worse on both counts: deliveries that do find data reset it, this workload
+/// arrives in bursts, and the driver spends the transfer in the short waits
+/// that measure a slower and noisier carrier. It also leaves the wait free to
+/// stay short for an unbounded number of deliveries, which is the only reason
+/// the loops' round budget would need a wall clock to go with it.
+fn idle_wait(idle_waits: u64) -> Duration {
+    let doublings = u32::try_from(idle_waits.saturating_sub(1))
+        .unwrap_or(IDLE_WAIT_DOUBLINGS)
+        .min(IDLE_WAIT_DOUBLINGS);
+    IDLE_WAIT_MIN
+        .saturating_mul(1_u32 << doublings)
+        .min(IDLE_WAIT_MAX)
+}
+
+/// What one transfer spent, beyond the bytes it moved.
+///
+/// Every field is observed rather than derived, and each answers a question a
+/// reader of the result would otherwise have to guess at: how often the driver
+/// deliberately handed records over, how often the carrier refused one, how
+/// often the driver had nothing to do but wait, and how much more than the
+/// object went onto the wire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Tally {
+    flushes: u64,
+    backpressure_waits: u64,
+    idle_waits: u64,
+    wire_bytes: u64,
+}
+
+/// Renders what a run measured, in the field order the contract's readers know.
+fn transfer_notes(
+    carrier: &impl Carrier,
+    receiver: &ReliableReceiver,
+    credit: Credit,
+    tally: Tally,
+    generator_ns: u64,
+) -> String {
+    let mut notes = format!(
+        concat!(
+            "backend={};path=sequential-reliable;",
+            "staging_peak_bytes={};credit_bytes={};credit_mode={};",
+            "flushes={};backpressure_waits={};idle_waits={};wire_bytes={};generator_ns={}"
+        ),
+        carrier.name(),
+        receiver.peak_staging(),
+        receiver.advertised_credit(),
+        credit.as_str(),
+        tally.flushes,
+        tally.backpressure_waits,
+        tally.idle_waits,
+        tally.wire_bytes,
+        generator_ns
+    );
+    if !carrier.unmodelled().is_empty() {
+        notes.push_str(";unmodelled_impairment=");
+        notes.push_str(&carrier.unmodelled().join(","));
+    }
+    notes.push_str(";cycles=unmeasured");
+    notes
+}
+
+/// The deliveries a transfer may make in a loop whose end depends on the
+/// carrier, before that carrier is called stopped.
+///
+/// One per record, because a healthy transfer may need that many, plus a flat
+/// allowance for the deliveries that find nothing while the carrier is still
+/// moving bytes. At [`IDLE_WAIT`] each, the allowance is a couple of minutes of
+/// a carrier delivering nothing, which no case on any path this benchmark runs
+/// reaches while healthy.
+///
+/// The budget is spent and counted by the loops themselves rather than by
+/// anything they call. A loop whose bound lives somewhere else is not bounded:
+/// whatever removes the bound leaves a benchmark that hangs, which is worse
+/// than one that fails.
+fn round_budget(config: &Config) -> u64 {
+    let records = config
+        .object_bytes
+        .div_ceil(config.record_bytes.max(1) as u64);
+    records.saturating_add(STALL_ROUNDS)
 }
 
 /// Whether the carrier was given the receiver's credit, or bounds what it
@@ -723,15 +834,15 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 /// Propagates transport, receive, and verification failures, and reports a
 /// carrier that stopped delivering rather than returning a partial transfer.
 fn transfer<C: Carrier>(config: &Config, carrier: C) -> Result<Measurement, Error> {
-    transfer_within(config, carrier, STALL_TIMEOUT)
+    transfer_within(config, carrier, round_budget(config))
 }
 
-/// [`transfer`] with the stall bound named, so a test can drive a carrier that
-/// stops without waiting out the bound a real run needs.
+/// [`transfer`] with the delivery budget named, so a test can drive a carrier
+/// that stops without spending the budget a real run is given.
 fn transfer_within<C: Carrier>(
     config: &Config,
     mut carrier: C,
-    stall_timeout: Duration,
+    budget: u64,
 ) -> Result<Measurement, Error> {
     let subject = subject_of(config)?;
     let generator_ns = generator_nanos(config)?;
@@ -743,11 +854,12 @@ fn transfer_within<C: Carrier>(
     let mut record = Vec::with_capacity(config.record_bytes);
     let mut frame = Vec::with_capacity(config.record_bytes + MAX_FRAME_ENVELOPE_BYTES);
     let mut bytes_sent = 0_u64;
-    let mut wire_bytes = 0_u64;
     let mut delivered = 0_u64;
     let mut batch = 0_usize;
-    let mut flushes = 0_u64;
-    let mut waits = 0_u64;
+    let mut tally = Tally::default();
+    // The two loops whose end depends on the carrier spend one budget between
+    // them, so both are bounded however the carrier behaves.
+    let mut rounds = 0_u64;
 
     let started = Instant::now();
     for take in record_lengths(config.object_bytes, config.record_bytes)? {
@@ -760,7 +872,6 @@ fn transfer_within<C: Carrier>(
         // a driver that copied every record would measure itself as much as the
         // carrier.
         let shared = shared_payload(&frame);
-        let mut idle_since = Instant::now();
         loop {
             match carrier.submit(TRANSFER_LANE, &shared) {
                 Ok(()) => break,
@@ -768,48 +879,57 @@ fn transfer_within<C: Carrier>(
                 // submitted has to move before more will fit. Delivering is
                 // what makes room, so the record is offered again after it.
                 Err(vot_transport_api::Error::OutboundQueueFull) => {
-                    waits = waits.saturating_add(1);
-                    flushes = flushes.saturating_add(1);
-                    delivered = delivered.saturating_add(deliver_or_stall(
+                    // This loop ends only when the carrier takes the record, so
+                    // it keeps its own bound. Spending it here rather than
+                    // inside what it calls is what makes the loop bounded
+                    // whatever that call does.
+                    rounds = rounds.saturating_add(1);
+                    if rounds > budget {
+                        return Err(Error::Stalled);
+                    }
+                    tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
+                    tally.flushes = tally.flushes.saturating_add(1);
+                    delivered = delivered.saturating_add(deliver_or_wait(
                         &mut carrier,
                         &mut receiver,
                         subject,
-                        &mut idle_since,
-                        stall_timeout,
+                        &mut tally.idle_waits,
                     )?);
                 }
                 Err(other) => return Err(Error::Transport(other)),
             }
         }
         bytes_sent = bytes_sent.saturating_add(record.len() as u64);
-        wire_bytes = wire_bytes.saturating_add(frame.len() as u64);
+        tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
         batch = batch.saturating_add(1);
         // Flushing in batches keeps the carrier's queue and the receiver's
         // staging bounded, so peak memory does not track object size.
         if batch >= SUBMIT_BATCH_RECORDS {
-            flushes = flushes.saturating_add(1);
+            tally.flushes = tally.flushes.saturating_add(1);
             delivered = delivered.saturating_add(deliver(&mut carrier, &mut receiver, subject)?);
             batch = 0;
         }
     }
     if batch != 0 {
-        flushes = flushes.saturating_add(1);
+        tally.flushes = tally.flushes.saturating_add(1);
         delivered = delivered.saturating_add(deliver(&mut carrier, &mut receiver, subject)?);
     }
 
     // Every record has been submitted, so whatever has not arrived is in
     // flight. A carrier that delivers immediately leaves this loop without
     // entering it; one that crosses a socket stays here until the object is
-    // whole. Progress restarts the stall clock, so a slow path is waited out
-    // and a stopped one is an error rather than a partial result.
-    let mut idle_since = Instant::now();
+    // whole. The budget is what ends it either way, so a slow path is waited
+    // out and a stopped one is an error rather than a partial result.
     while delivered < config.object_bytes {
-        delivered = delivered.saturating_add(deliver_or_stall(
+        rounds = rounds.saturating_add(1);
+        if rounds > budget {
+            return Err(Error::Stalled);
+        }
+        delivered = delivered.saturating_add(deliver_or_wait(
             &mut carrier,
             &mut receiver,
             subject,
-            &mut idle_since,
-            stall_timeout,
+            &mut tally.idle_waits,
         )?);
     }
 
@@ -822,26 +942,7 @@ fn transfer_within<C: Carrier>(
         ));
     }
 
-    let mut notes = format!(
-        concat!(
-            "backend={};path=sequential-reliable;",
-            "staging_peak_bytes={};credit_bytes={};credit_mode={};",
-            "flushes={};backpressure_waits={};wire_bytes={};generator_ns={}"
-        ),
-        carrier.name(),
-        receiver.peak_staging(),
-        receiver.advertised_credit(),
-        credit.as_str(),
-        flushes,
-        waits,
-        wire_bytes,
-        generator_ns
-    );
-    if !carrier.unmodelled().is_empty() {
-        notes.push_str(";unmodelled_impairment=");
-        notes.push_str(&carrier.unmodelled().join(","));
-    }
-    notes.push_str(";cycles=unmeasured");
+    let notes = transfer_notes(&carrier, &receiver, credit, tally, generator_ns);
 
     Ok(Measurement {
         bytes_sent,
@@ -863,7 +964,6 @@ mod tests {
         record_payload, shared_payload, transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
-    use std::time::Duration;
     use vot_transport_api::Event;
     use vot_verifier::Suite;
 
@@ -1054,9 +1154,96 @@ mod tests {
         }
     }
 
-    /// The stall bound a test uses, which is long enough that a loaded machine
-    /// does not trip it and short enough that a stalled run fails at once.
-    const TEST_STALL: Duration = Duration::from_millis(200);
+    /// The delivery budget a test gives a carrier. Generous enough that a
+    /// healthy transfer of the sizes here finishes well inside it, and small
+    /// enough that a carrier which stops is reported at once.
+    const TEST_BUDGET: u64 = 64;
+
+    #[test]
+    fn the_wait_backs_off_from_the_short_end_and_stops_at_the_long_one() {
+        // The first wait is the shortest, so a small object is not padded by a
+        // millisecond it did not need, and the last is the longest, so a long
+        // transfer reaches the interval where the driver is out of the
+        // carrier's way. Both ends are pinned because the measured throughput
+        // of every carrier depends on them.
+        assert_eq!(super::idle_wait(1), super::IDLE_WAIT_MIN);
+        assert_eq!(super::idle_wait(2), super::IDLE_WAIT_MIN * 2);
+        assert_eq!(
+            super::idle_wait(1 + u64::from(super::IDLE_WAIT_DOUBLINGS)),
+            super::IDLE_WAIT_MAX
+        );
+        // Past the last doubling it stays there rather than growing, including
+        // at a count no transfer reaches. The wait is what bounds how long the
+        // round budget can take, so it must have a ceiling at every input.
+        for waits in [2 + u64::from(super::IDLE_WAIT_DOUBLINGS), 1_000, u64::MAX] {
+            assert_eq!(super::idle_wait(waits), super::IDLE_WAIT_MAX);
+        }
+        // A count of zero never reaches the wait, but it must not be longer
+        // than the first one if it ever does.
+        assert_eq!(super::idle_wait(0), super::IDLE_WAIT_MIN);
+    }
+
+    #[test]
+    fn the_wait_does_not_start_over_when_a_delivery_moves_something() {
+        // The count is the transfer's total, so a burst of records does not put
+        // the driver back into the short waits that measure a slower carrier.
+        // A carrier that lags, delivers, and lags again is still waited on at
+        // the interval the transfer has reached.
+        let mut carrier = TestCarrier::new();
+        carrier.lag = 3;
+        let config = case(2 * 65_536, Suite::Blake3Bao64);
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
+        assert_eq!(measured.verified_bytes, 2 * 65_536);
+        // Three lagging deliveries: the batch flush that closes the submission
+        // loop takes the first and is not a wait, and the completion loop takes
+        // the other two before the records are released. Exact rather than a
+        // floor, because the count is what chooses every wait's length.
+        assert_eq!(note_field(&measured.notes, "idle_waits"), 2);
+    }
+
+    #[test]
+    fn a_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
+        // One record, and a carrier that releases it one delivery late. The
+        // completion loop therefore needs exactly one delivery, so a budget of
+        // one is exactly enough and a budget of none is exactly too little.
+        // Between them they pin the edge: a bound that fired one delivery early
+        // would fail a transfer that had not stopped.
+        let config = case(65_536, Suite::Blake3Bao64);
+        let mut carrier = TestCarrier::new();
+        carrier.lag = 1;
+        assert_eq!(
+            transfer_within(&config, carrier, 1).unwrap().verified_bytes,
+            65_536
+        );
+
+        let mut same = TestCarrier::new();
+        same.lag = 1;
+        assert!(matches!(
+            transfer_within(&config, same, 0),
+            Err(Error::Stalled)
+        ));
+    }
+
+    #[test]
+    fn waiting_on_the_carrier_is_counted_and_not_waiting_is_counted_as_none() {
+        // The simulator delivers before flush returns, so no delivery of a
+        // healthy run finds nothing and the driver never waits. A run that
+        // reported waits here would be waiting on itself.
+        let measured = measure(&case(4 * 65_536, Suite::Blake3Bao64)).unwrap();
+        assert_eq!(note_field(&measured.notes, "idle_waits"), 0);
+
+        // A carrier that releases late is one the driver waits on, and the
+        // difference between the two is what the field is for.
+        let mut lagging = TestCarrier::new();
+        lagging.lag = 3;
+        let waited =
+            transfer_within(&case(65_536, Suite::Blake3Bao64), lagging, TEST_BUDGET).unwrap();
+        assert!(
+            note_field(&waited.notes, "idle_waits") >= 2,
+            "{}",
+            waited.notes
+        );
+    }
 
     #[test]
     fn a_refused_submission_is_backpressure_and_the_record_is_offered_again() {
@@ -1065,7 +1252,7 @@ mod tests {
         // and none of them is lost by it.
         carrier.refuse = 4;
         let config = case(4 * 65_536, Suite::Blake3Bao64);
-        let measured = transfer_within(&config, carrier, TEST_STALL).unwrap();
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, 4 * 65_536);
         assert_eq!(measured.bytes_sent, 4 * 65_536);
         assert_eq!(note_field(&measured.notes, "backpressure_waits"), 4);
@@ -1078,7 +1265,7 @@ mod tests {
         // completion loop is what finishes the object.
         carrier.lag = 8;
         let config = case(2 * 65_536, Suite::Blake3Bao64);
-        let measured = transfer_within(&config, carrier, TEST_STALL).unwrap();
+        let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, 2 * 65_536);
     }
 
@@ -1088,7 +1275,7 @@ mod tests {
         carrier.stalled = true;
         let config = case(65_536, Suite::Blake3Bao64);
         assert!(matches!(
-            transfer_within(&config, carrier, TEST_STALL),
+            transfer_within(&config, carrier, TEST_BUDGET),
             Err(Error::Stalled)
         ));
 
@@ -1098,7 +1285,7 @@ mod tests {
         refusing.refuse = usize::MAX;
         refusing.stalled = true;
         assert!(matches!(
-            transfer_within(&config, refusing, TEST_STALL),
+            transfer_within(&config, refusing, TEST_BUDGET),
             Err(Error::Stalled)
         ));
     }
@@ -1112,7 +1299,7 @@ mod tests {
         carrier.disconnect = true;
         let config = case(65_536, Suite::Blake3Bao64);
         assert!(matches!(
-            transfer_within(&config, carrier, TEST_STALL),
+            transfer_within(&config, carrier, TEST_BUDGET),
             Err(Error::Disconnected)
         ));
     }
@@ -1126,7 +1313,7 @@ mod tests {
         // what was delivered. Accepting it would verify against bytes the
         // sender never sent.
         assert!(matches!(
-            transfer_within(&config, carrier, TEST_STALL),
+            transfer_within(&config, carrier, TEST_BUDGET),
             Err(Error::Corrupt)
         ));
     }
@@ -1160,7 +1347,7 @@ mod tests {
         let config = case(65_536, Suite::Blake3Bao64);
 
         // A carrier that applies the credit says so.
-        let measured = transfer_within(&config, TestCarrier::new(), TEST_STALL).unwrap();
+        let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
         assert_eq!(note_field_text(&measured.notes, "credit_mode"), "set");
 
         // One that bounds its inbound at construction reports Unsupported
@@ -1168,7 +1355,7 @@ mod tests {
         // records which of the two happened rather than implying the first.
         let mut constructed = TestCarrier::new();
         constructed.endpoint = CreditEndpoint(Err(vot_transport_api::Error::Unsupported));
-        let measured = transfer_within(&config, constructed, TEST_STALL).unwrap();
+        let measured = transfer_within(&config, constructed, TEST_BUDGET).unwrap();
         assert_eq!(
             note_field_text(&measured.notes, "credit_mode"),
             "constructed"
@@ -1181,7 +1368,7 @@ mod tests {
         let mut refused = TestCarrier::new();
         refused.endpoint = CreditEndpoint(Err(vot_transport_api::Error::InvalidConfiguration));
         assert!(matches!(
-            transfer_within(&config, refused, TEST_STALL),
+            transfer_within(&config, refused, TEST_BUDGET),
             Err(Error::Transport(
                 vot_transport_api::Error::InvalidConfiguration
             ))
@@ -1199,7 +1386,7 @@ mod tests {
         // than the queue holds went through it.
         let object_bytes = DRAIN_TEST_RECORDS as u64 * 65_536;
         let config = case(object_bytes, Suite::Blake3Bao64);
-        let measured = transfer_within(&config, TestCarrier::new(), TEST_STALL).unwrap();
+        let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
     }
 

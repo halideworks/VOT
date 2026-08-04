@@ -69,6 +69,13 @@ backpressure and the record is offered again, counted in `backpressure_waits`;
 a carrier that delivers nothing at all for thirty seconds ends the run with an
 error instead of reporting a partial transfer.
 
+`idle_waits` counts the deliveries that found nothing, which the driver waits
+after because the carrier's own thread is what makes progress. How long it
+waits changes what a run reports, so the wait backs off from 16 microseconds to
+a millisecond rather than being one interval, and `docs/perf-engineering.md`
+records what each setting measured. A result quoted against another must have
+been taken at the same interval.
+
 `credit_bytes` is what the receiver advertised, which the receiver enforces by
 refusing staging past it. `credit_mode` says whether the carrier was also given
 that credit (`set`) or fixes its own inbound bound at construction

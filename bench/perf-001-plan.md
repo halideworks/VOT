@@ -161,10 +161,24 @@ the standalone pump test was steady to about twenty percent. The report
 therefore states medians over enough runs to give a confidence interval, and a
 difference between two backends smaller than about 1.4x at 512 MB is inside one
 configuration's own spread and is not a result. The simulator, on the same
-loop, holds to six percent, so the variance is the carrier's rather than the
-driver's. Whether it comes from inline verification, from the flush every
-sixteen records, or from thread scheduling is measured in PR 4, not assumed
-here.
+loop, holds to six percent.
+
+Part of that spread is the harness rather than the carrier. PR 1 measured the
+driver's polling interval changing both the median and the spread of the
+reported throughput: waiting 20 or 200 microseconds between deliveries that
+found nothing reported about 1000 Mbit/s, and waiting 1 to 5 milliseconds
+reported about 1500, with the spread falling from 31 to 9 percent. The groups
+do not overlap. Polling a carrier that has nothing to give contends with the
+thread that would otherwise be filling it.
+
+**PR 4 cannot publish a number until this is settled.** The driver guesses an
+interval because the transport contract offers no way to wait for an event:
+`poll` returns what has already arrived and nothing blocks. A bounded blocking
+wait on the adapter would let the driver sleep until there is something instead
+of guessing how long to sleep. That is a change to the transport contract and
+needs its own review rather than being folded into a measurement PR. However it
+is resolved, every published number states the interval it was taken at, and
+both backends are measured at the same one.
 
 Measure before believing any explanation. Performance observations are recorded
 in `docs/perf-engineering.md` as they happen, not reconstructed afterwards.

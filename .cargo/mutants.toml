@@ -10,15 +10,7 @@ timeout_multiplier = 4.0
 # configuration does not enable, so every mutant in it would be unviable here.
 # `.cargo/mutants-live.toml` is the same configuration without that exclusion,
 # and the msquic-mutation job runs it with the feature on.
-#
-# `replace > with >= in deliver_or_stall` is an equivalent mutant rather than an
-# untested one. It decides whether a carrier that has been idle for exactly the
-# stall bound, to the nanosecond, is called stopped on this delivery or the
-# next. No test can reach that instant, and no restructuring makes a comparison
-# between two continuous quantities observable at its boundary. Every other
-# mutant in that function is killed, including the same operator replaced with
-# `<`, so this is stated exactly rather than by excluding the function.
-exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "replace > with >= in deliver_or_stall"]
+exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)"]
 # Binaries whose correctness a different check establishes. vot-capability's
 # oracle exists to be compared against an independent Python implementation of
 # spec/capability.cddl, which validate_capability_vectors.py does on every run and

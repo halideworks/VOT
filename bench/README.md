@@ -39,7 +39,7 @@ Only the `simulator` backend, and only `worker_count` 1. Both limits are
 errors, not silent substitutions: there is no assembled QUIC transport yet, and
 parallel verification of a single object needs the proof-bearing range path.
 Running the full checked-in matrix therefore needs `--workers 1` until those
-land.
+land. The plan that lifts both limits is `perf-001-plan.md` in this directory.
 
 The transfer uses the sequential reliable path, which reserves and releases
 staging per record, so peak memory follows the receive window rather than the

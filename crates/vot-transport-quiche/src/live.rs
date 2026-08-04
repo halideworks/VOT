@@ -1900,4 +1900,121 @@ mod tests {
             "the port outlived the endpoint"
         );
     }
+
+    #[test]
+    fn the_inbound_budget_counts_charges_and_refunds() {
+        // The queue's byte budget is what keeps a peer from holding this
+        // endpoint's memory; each bound is asserted at its exact edge.
+        let inbound = Inbound {
+            bytes: 2,
+            assembling: 3,
+            ..Inbound::default()
+        };
+        assert_eq!(inbound.charged(), 5);
+
+        let mut inbound = Inbound {
+            assembling: MAX_ASSEMBLY_BYTES - 8,
+            ..Inbound::default()
+        };
+        assert!(
+            inbound.push(NativeEvent::Control(vec![7_u8; 8].into())),
+            "an exact fit was refused"
+        );
+        assert_eq!(inbound.bytes, 8);
+        assert!(
+            !inbound.push(NativeEvent::Control(vec![7_u8; 1].into())),
+            "a byte past the budget was accepted"
+        );
+
+        let mut inbound = Inbound::default();
+        for _ in 0..MAX_INBOUND_EVENTS {
+            assert!(inbound.push(NativeEvent::Control(vec![].into())));
+        }
+        assert!(
+            !inbound.push(NativeEvent::Control(vec![].into())),
+            "an event past the count was accepted"
+        );
+
+        let mut inbound = Inbound::default();
+        assert!(inbound.push(NativeEvent::Control(vec![7_u8; 10].into())));
+        assert_eq!(inbound.bytes, 10);
+        let _ = inbound.pop();
+        assert_eq!(inbound.bytes, 0, "a popped event kept its charge");
+    }
+
+    #[test]
+    fn the_assembly_budget_reserves_to_the_bound_and_releases() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        assert!(
+            budget.reserve(MAX_ASSEMBLY_BYTES),
+            "an exact fit was refused"
+        );
+        assert!(!budget.reserve(1), "a byte past the budget was reserved");
+        budget.release(MAX_ASSEMBLY_BYTES);
+        assert!(budget.reserve(1), "a released budget stayed spent");
+        assert_eq!(inbound.lock().expect("the queue").assembling, 1);
+    }
+
+    #[test]
+    fn a_connection_id_is_full_length_and_keyed_to_the_address() {
+        // The exact bytes for port 4433, written out so a changed derivation
+        // is a changed vector rather than a recomputed one.
+        let id = scid_for("127.0.0.1:4433".parse().expect("an address"));
+        assert_eq!(
+            id.as_ref(),
+            [
+                17, 81, 79, 174, 141, 236, 203, 42, 9, 104, 71, 166, 133, 228, 195, 34, 1, 96, 63,
+                158
+            ]
+        );
+        let other = scid_for("127.0.0.1:4434".parse().expect("an address"));
+        assert_ne!(id.as_ref(), other.as_ref());
+    }
+
+    #[test]
+    fn a_coalesced_read_survives_every_segment_the_kernel_reports() {
+        // A zero segment must fall back to the whole buffer: walking a buffer
+        // in zero-sized steps is a panic, and the kernel owns the value.
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let peer: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
+        config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("a protocol");
+        let scid = scid_for(local);
+        let mut conn =
+            quiche::connect(Some("localhost"), &scid, local, peer, &mut config).expect("a client");
+        let mut junk = [0_u8; 64];
+        feed_received(&mut conn, local, &mut junk, peer, Some(0));
+        feed_received(&mut conn, local, &mut junk, peer, Some(16));
+        feed_received(&mut conn, local, &mut junk, peer, None);
+    }
+
+    #[test]
+    fn the_shared_surface_answers_like_the_direct_one() {
+        // Every passthrough answers with the adapter's judgment; a stub that
+        // says yes to all of these is a carrier lying about its bounds.
+        let (mut client, _server) = pair();
+        let oversized: Payload =
+            vec![7_u8; 2 * vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD + 64].into();
+        assert!(client.send_control_shared(oversized).is_err());
+        let record: Payload = vec![7_u8; 8].into();
+        assert!(
+            client
+                .send_reliable_shared(StreamId(u64::MAX), Arc::clone(&record))
+                .is_err()
+        );
+        assert!(
+            client
+                .preflight_reliable_batch(StreamId(u64::MAX), &[record])
+                .is_err()
+        );
+        assert!(matches!(
+            client.set_receive_credit(1),
+            Err(Error::Unsupported)
+        ));
+        assert!(client.set_control_payload_limit(0).is_err());
+        assert_eq!(client.receive_limits(), Some(limits()));
+    }
 }

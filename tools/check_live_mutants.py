@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
-EVIDENCE = ROOT / "test-vectors/mutants/the_live_transport_is_mutation_tested.md"
+# The msquic file is the default so existing invocations keep their meaning;
+# a second live transport names its own evidence with --evidence=<path>.
+EVIDENCE_DEFAULT = "test-vectors/mutants/the_live_transport_is_mutation_tested.md"
 
 # `MISSED   crates/…/lib.rs:733:13: replace live::Carrier::teardown with () in 1s build + 1s test`
 SURVIVOR = re.compile(r"^(MISSED|TIMEOUT)\b")
@@ -36,16 +38,18 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(f"::error::live mutant check: {message}")
 
 
-def classified() -> list[str]:
+def classified(evidence: Path) -> list[str]:
+    # A mutant holding `||` must write it as `\|\|` or break the table it
+    # sits in; the escape belongs to markdown, not to the mutant.
     rows = [
-        match.group(1)
-        for line in EVIDENCE.read_text(encoding="utf-8").splitlines()
+        match.group(1).replace("\\|", "|")
+        for line in evidence.read_text(encoding="utf-8").splitlines()
         if (match := CLASSIFIED.match(line))
     ]
     if not rows:
         # An unparsed table would classify nothing, which fails every survivor
         # for the wrong reason. Say the real one instead.
-        fail(f"no classified survivors found in {EVIDENCE.name}")
+        fail(f"no classified survivors found in {evidence.name}")
     duplicates = {row for row in rows if rows.count(row) > 1}
     if duplicates:
         fail(f"the classified table repeats {sorted(duplicates)}")
@@ -84,16 +88,25 @@ def survivors(log: Path) -> list[str]:
 def main(argv: list[str]) -> None:
     flags = [argument for argument in argv if argument.startswith("-")]
     paths = [argument for argument in argv if not argument.startswith("-")]
+    evidence = ROOT / EVIDENCE_DEFAULT
+    for flag in list(flags):
+        if flag.startswith("--evidence="):
+            evidence = ROOT / flag.removeprefix("--evidence=")
+            flags.remove(flag)
     # A mistyped flag would otherwise run the weaker check and say nothing, which
     # is the shape of the problem this script exists to remove.
     if set(flags) - {"--full"} or len(paths) != 1:
-        raise SystemExit("usage: check_live_mutants.py [--full] <mutants.log>")
+        raise SystemExit(
+            "usage: check_live_mutants.py [--full] [--evidence=<path>] <mutants.log>"
+        )
     full = "--full" in flags
     log = Path(paths[0])
     if not log.is_file():
         fail(f"{log} does not exist, so the run it should hold said nothing")
+    if not evidence.is_file():
+        fail(f"{evidence} does not exist, so nothing is classified")
 
-    known = classified()
+    known = classified(evidence)
     observed = survivors(log)
     unclassified = sorted({mutant for mutant in observed if mutant not in known})
     if unclassified:
@@ -101,7 +114,7 @@ def main(argv: list[str]) -> None:
             print(f"::error::unclassified live survivor: {mutant}")
         fail(
             f"{len(unclassified)} of {len(observed)} survivors are not in "
-            f"{EVIDENCE.name}. Kill them, or record each with its reason."
+            f"{evidence.name}. Kill them, or record each with its reason."
         )
 
     # Only a full sweep tests every classified mutant, so only a full sweep can
@@ -111,7 +124,7 @@ def main(argv: list[str]) -> None:
             if mutant not in observed:
                 print(
                     f"::notice::classified survivor no longer survives: {mutant}. "
-                    f"Remove its row from {EVIDENCE.name}."
+                    f"Remove its row from {evidence.name}."
                 )
     print(f"live mutant check: PASS ({len(observed)} survivors, all classified)")
 

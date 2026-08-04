@@ -482,10 +482,11 @@ struct StreamState {
     /// mapping is applied once, where the lane was given.
     id: u64,
     sequence: u64,
-    /// Bytes accepted from the caller that the connection has not taken yet.
-    /// A stream's flow control is the peer's, so a record may be written in
-    /// pieces across several loops.
-    outbox: VecDeque<Vec<u8>>,
+    /// What the caller handed over that the connection has not taken yet, with
+    /// how much of each has gone. A stream's flow control is the peer's, so a
+    /// record may be written in pieces across several loops, and holding the
+    /// caller's own allocation means those pieces cost no copy of their own.
+    outbox: VecDeque<(Payload, usize)>,
 }
 
 #[expect(
@@ -506,10 +507,11 @@ fn drive(
     connection: u64,
 ) -> Result<(), Error> {
     let budget = SharedBudget(Arc::clone(inbound));
-    // Heap rather than stack: a QUIC datagram is small, but a stream read is
-    // whatever the connection has buffered, and a driver thread's stack is not
-    // the place for it.
-    let mut buffer = vec![0_u8; 65_535];
+    // Heap rather than stack, and as large as the largest frame a lane carries.
+    // A read that holds a whole record hands it to the parser as one slice, so
+    // reassembly is what happens when a record is split rather than what happens
+    // to every record. A driver thread's stack is not the place for it either.
+    let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
     let mut out = [0_u8; MAX_DATAGRAM_SIZE];
     let scid = scid_for(local);
 
@@ -728,7 +730,7 @@ fn apply(
                 budget,
                 control_limit,
             );
-            state.outbox.push_back(bytes.to_vec());
+            state.outbox.push_back((bytes, 0));
         }
         Command::Reliable { stream, bytes } => {
             // Refused at submission, so this cannot be a lane with no stream.
@@ -742,7 +744,7 @@ fn apply(
                 budget,
                 control_limit,
             );
-            state.outbox.push_back(bytes.to_vec());
+            state.outbox.push_back((bytes, 0));
         }
         Command::Datagram { context, bytes } => {
             let observed = if conn.dgram_send(&bytes).is_ok() {
@@ -779,16 +781,16 @@ fn stream_state<'a>(
 /// Writes what a stream has waiting, as far as flow control allows.
 fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState) {
     let id = stream.id;
-    while let Some(front) = stream.outbox.front_mut() {
-        match conn.stream_send(id, front, false) {
-            Ok(written) if written == front.len() => {
+    while let Some((bytes, sent)) = stream.outbox.front_mut() {
+        match conn.stream_send(id, &bytes[*sent..], false) {
+            Ok(written) if written == bytes.len() - *sent => {
                 stream.outbox.pop_front();
             }
-            // Flow control is the peer's, so a record may go in pieces. What was
-            // taken is dropped and the rest waits for the next pass, which is the
-            // same answer as nothing having been taken at all.
+            // Flow control is the peer's, so a record may go in pieces. The offset
+            // moves and the rest waits for the next pass, which is the same answer
+            // as nothing having been taken at all.
             Ok(written) => {
-                front.drain(..written);
+                *sent += written;
                 return;
             }
             Err(quiche::Error::Done) => return,
@@ -832,12 +834,13 @@ fn read_streams(
             let sequence = &mut state.sequence;
             let outcome = state.framing.accept(&buffer[..len], |frame| {
                 *sequence = sequence.wrapping_add(1);
+                let shared = vot_transport_api::shared_payload(frame);
                 let event = match kind {
-                    StreamKind::Control => NativeEvent::Control(frame.to_vec()),
+                    StreamKind::Control => NativeEvent::Control(shared),
                     StreamKind::Reliable { lane } => NativeEvent::Reliable {
                         lane,
                         sequence: *sequence,
-                        bytes: frame.to_vec(),
+                        bytes: shared,
                     },
                 };
                 let Ok(mut queue) = inbound.lock() else {
@@ -1266,15 +1269,22 @@ mod tests {
 
         let payload = vec![0x5a; vot_transport_api::MAX_DATA_RECORD_BYTES];
         let bytes = record(&payload);
-        let target = 256_usize;
+        // Shared once. The contract has a shared-payload submission for exactly
+        // this reason, and a caller that copies every record is measuring its own
+        // copy as much as the carrier's work.
+        let shared = vot_transport_api::shared_payload(&bytes);
+        // Enough that the handshake and slow start are not most of the run. A
+        // short measurement here varied by a factor of two between identical
+        // runs, which is no basis for judging a change.
+        let target = 2_048_usize;
         let started = Instant::now();
         let mut sent = 0_usize;
         let mut received = 0_usize;
         let mut carried = 0_u64;
-        let deadline = started + Duration::from_secs(30);
+        let deadline = started + Duration::from_secs(120);
         while received < target && Instant::now() < deadline {
             while sent < target {
-                match client.send_reliable(StreamId(0), &bytes) {
+                match client.send_reliable_shared(StreamId(0), Payload::clone(&shared)) {
                     Ok(()) => sent += 1,
                     // The queue is full, which is the backpressure this exists to
                     // measure rather than an error.
@@ -1293,6 +1303,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert_eq!(received, target, "every record arrived in {elapsed:?}");
+        assert_eq!(carried, (target * bytes.len()) as u64, "every byte of them");
         // Integer arithmetic, so the report needs no cast a lint has to forgive.
         // Nanoseconds keep the ratio exact at any rate this carries.
         let nanos = elapsed.as_nanos().max(1);

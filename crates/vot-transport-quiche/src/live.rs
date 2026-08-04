@@ -27,10 +27,12 @@ use crate::{
 
 /// Largest UDP payload either direction when a caller names none.
 ///
-/// Small enough to cross a path whose MTU is unknown, which is what an endpoint
-/// facing the internet has to assume: a larger datagram fragments or is dropped
-/// where a tunnel or a VPN sits in the way.
-const MAX_DATAGRAM_SIZE: usize = 1_350;
+/// What a 1500-byte ethernet frame carries over IPv4. This is a ceiling, not a
+/// claim about the path: discovery settles under it where a tunnel or IPv6
+/// header narrows the way, and a lower ceiling only forfeits packet size on
+/// paths that carry the full frame. Measured over a 1472-byte path, 1350 here
+/// cost 19% of throughput against a matched-size peer.
+const MAX_DATAGRAM_SIZE: usize = 1_472;
 
 /// The smallest datagram a caller may ask for.
 ///
@@ -181,11 +183,11 @@ pub struct Config {
     /// [`MAX_DATAGRAM_SIZE`] unless a caller knows the path. It is a first-order
     /// cost: one datagram is one syscall here, and one packet's worth of header
     /// protection and AEAD, so a path that can carry more and is not asked to
-    /// spends both on every 1350 bytes. Measured over loopback, whose MTU is
+    /// spends both on every datagram. Measured over loopback, whose MTU is
     /// 65536, raising it is worth about four times the throughput.
     ///
-    /// Raising it past what the path carries is not a tuning knob but a broken
-    /// connection, because the datagram fragments or is dropped.
+    /// Discovery settles under this ceiling when the path is narrower, so
+    /// raising it costs probes, not the connection.
     pub max_datagram_bytes: usize,
 }
 
@@ -591,8 +593,8 @@ fn drive(
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
     // A burst rather than a datagram, because packets are gathered and handed
     // over together. One UDP datagram is the most the kernel will segment at a
-    // time, so that bounds it: at a 1350-byte path MTU this holds 48 packets
-    // and costs one syscall instead of 48, which is where the offload pays.
+    // time, so that bounds it: at a 1472-byte path MTU this holds 44 packets
+    // and costs one syscall instead of 44, which is where the offload pays.
     // A datagram already near the cap holds one, and the send is what it was.
     let burst_bytes = LARGEST_DATAGRAM_SIZE.max(datagram_bytes);
     let mut out = vec![0_u8; burst_bytes];

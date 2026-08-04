@@ -613,6 +613,9 @@ fn drive(
     // with the segment size beside it. A kernel that refuses the option
     // leaves each datagram its own read.
     enable_receive_offload(socket);
+    // Allocated once, because a control-message buffer per read is a malloc
+    // per packet, which is the cost this path exists to remove.
+    let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut closing = false;
 
@@ -672,10 +675,10 @@ fn drive(
         socket
             .set_read_timeout(Some(deadline))
             .map_err(|_| Error::Backend)?;
-        match receive_segmented(socket, &mut buffer) {
+        match receive_segmented(socket, &mut buffer, &mut space) {
             Ok((len, from, segment)) => {
                 feed_received(&mut conn, local, &mut buffer[..len], from, segment);
-                drain_arrivals(socket, &mut conn, local, &mut buffer)?;
+                drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -781,18 +784,19 @@ fn enable_receive_offload(_socket: &UdpSocket) {}
 /// message; the socket's read timeout applies the same either way. The unsafe
 /// stays in `nix`, which is why this crate still forbids unsafe of its own.
 #[cfg(target_os = "linux")]
+#[expect(clippy::ptr_arg, reason = "nix's recvmsg takes the Vec itself")]
 fn receive_segmented(
     socket: &UdpSocket,
     buffer: &mut [u8],
+    space: &mut Vec<u8>,
 ) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
     use std::os::fd::AsRawFd as _;
 
     let mut slices = [std::io::IoSliceMut::new(buffer)];
-    let mut space = nix::cmsg_space!(nix::libc::c_int);
     let message = nix::sys::socket::recvmsg::<nix::sys::socket::SockaddrStorage>(
         socket.as_raw_fd(),
         &mut slices,
-        Some(&mut space),
+        Some(space),
         nix::sys::socket::MsgFlags::empty(),
     )
     .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
@@ -817,9 +821,21 @@ fn receive_segmented(
 fn receive_segmented(
     socket: &UdpSocket,
     buffer: &mut [u8],
+    _space: &mut Vec<u8>,
 ) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
     let (len, from) = socket.recv_from(buffer)?;
     Ok((len, from, None))
+}
+
+/// Room for the coalesced-segment control message, made once per driver.
+#[cfg(target_os = "linux")]
+fn receive_space() -> Vec<u8> {
+    nix::cmsg_space!(nix::libc::c_int)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn receive_space() -> Vec<u8> {
+    Vec::new()
 }
 
 /// The peer's address out of what `recvmsg` reports.
@@ -868,13 +884,14 @@ fn drain_arrivals(
     conn: &mut quiche::Connection,
     local: SocketAddr,
     buffer: &mut [u8],
+    space: &mut Vec<u8>,
 ) -> Result<(), Error> {
     if socket.set_nonblocking(true).is_err() {
         // Still blocking, so the pass loses nothing but the batch.
         return Ok(());
     }
     for _ in 0..DRAIN_BUDGET {
-        match receive_segmented(socket, buffer) {
+        match receive_segmented(socket, buffer, space) {
             Ok((len, from, segment)) => {
                 feed_received(conn, local, &mut buffer[..len], from, segment);
             }

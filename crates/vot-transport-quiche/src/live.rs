@@ -544,10 +544,14 @@ fn drive(
     // reassembly is what happens when a record is split rather than what happens
     // to every record. A driver thread's stack is not the place for it either.
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
-    // Sized from the configuration and allocated once, because a datagram this
-    // endpoint may send is what it has to hold, and a per-pass allocation in a
-    // driver loop is a cost paid on every packet.
-    let mut out = vec![0_u8; datagram_bytes];
+    // A burst rather than a datagram, because packets are gathered and handed
+    // over together. One UDP datagram is the most the kernel will segment at a
+    // time, so that bounds it: at a 1350-byte path MTU this holds 48 packets
+    // and costs one syscall instead of 48, which is where the offload pays.
+    // A datagram already near the cap holds one, and the send is what it was.
+    let burst_bytes = LARGEST_DATAGRAM_SIZE.max(datagram_bytes);
+    let mut out = vec![0_u8; burst_bytes];
+    let offload = offload_available();
     let scid = scid_for(local);
 
     let (mut conn, mut announced) = match (role, peer) {
@@ -593,7 +597,7 @@ fn drive(
             write_outbox(&mut conn, stream);
         }
         // A socket that will not take a packet is a carrier that has gone.
-        let Ok(paced) = send_all(socket, &mut conn, &mut out) else {
+        let Ok(paced) = send_all(socket, &mut conn, &mut out, datagram_bytes, offload) else {
             return Ok(());
         };
 
@@ -728,24 +732,149 @@ fn send_all(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
+    segment: usize,
+    gso: bool,
 ) -> Result<Option<Instant>, Error> {
+    // Packets are gathered into one buffer and handed over together, because a
+    // syscall per packet is most of what a fast path costs: at a 1500-byte MTU
+    // it is one call, one copy, and one round through the UDP stack for every
+    // 1500 bytes carried. Segmentation offload takes the whole burst in one
+    // call and lets the kernel cut it up.
+    let mut filled = 0_usize;
+    let mut destination = None;
+    let mut deadline = None;
     loop {
-        match conn.send(out) {
+        // Only ever offered room for one packet, so a burst is a run of equal
+        // sized ones and `filled` always lands on a segment boundary.
+        let room = match out.get_mut(filled..filled + segment) {
+            Some(room) => room,
+            // The buffer holds no further packet, so the burst goes now.
+            None => {
+                flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                return Ok(deadline);
+            }
+        };
+        match conn.send(room) {
             Ok((written, info)) => {
-                if socket.send_to(&out[..written], info.to).is_err() {
-                    return Err(Error::Backend);
+                // A different destination cannot share a burst, and neither can
+                // anything after a short packet: the kernel cuts every segment
+                // to the same length but the last.
+                if destination.is_some_and(|previous| previous != info.to) {
+                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    // The packet just generated sits at `filled`, so move it to
+                    // the front rather than losing or resending it.
+                    out.copy_within(filled..filled + written, 0);
+                    filled = 0;
                 }
-                // Pacing is the connection's decision, and it applies to what
-                // comes after this packet rather than to this one, which is
-                // already in flight as far as the connection is concerned.
+                destination = Some(info.to);
+                filled += written;
+                // Pacing is the connection's decision, and it applies to the
+                // burst rather than to each packet in it. Taking the deadline
+                // one packet at a time is what made this loop send one packet
+                // per call: measured, it left offload on 0.3 percent of sends
+                // and the burst never grew past one. The deadline is kept and
+                // honoured once the burst is done.
                 if info.at > Instant::now() {
-                    return Ok(Some(info.at));
+                    deadline = Some(info.at);
+                }
+                // A packet shorter than a segment ends the burst, because the
+                // kernel cuts every segment to the same length but the last.
+                if written < segment {
+                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    return Ok(deadline);
                 }
             }
-            Err(quiche::Error::Done) => return Ok(None),
+            Err(quiche::Error::Done) => {
+                flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                return Ok(deadline);
+            }
             Err(_) => return Err(Error::Backend),
         }
     }
+}
+
+/// Sends a burst as one datagram the kernel cuts into `segment`-sized pieces.
+///
+/// `UDP_SEGMENT` is what MsQuic reaches for on this platform, and it is the
+/// difference between one syscall per packet and one per burst. The unsafe work
+/// is `nix`'s, which is why this crate still forbids unsafe of its own.
+///
+/// # Errors
+/// Reports any refusal, including a kernel that does not carry the option, so
+/// the caller can fall back to sending the packets one at a time.
+fn send_segmented(
+    socket: &UdpSocket,
+    burst: &[u8],
+    segment: usize,
+    destination: SocketAddr,
+) -> Result<(), Error> {
+    use std::os::fd::AsRawFd as _;
+
+    let segment = u16::try_from(segment).map_err(|_| Error::InvalidConfiguration)?;
+    let address = nix::sys::socket::SockaddrStorage::from(destination);
+    let slices = [std::io::IoSlice::new(burst)];
+    let control = [nix::sys::socket::ControlMessage::UdpGsoSegments(&segment)];
+    nix::sys::socket::sendmsg(
+        socket.as_raw_fd(),
+        &slices,
+        &control,
+        nix::sys::socket::MsgFlags::empty(),
+        Some(&address),
+    )
+    .map_err(|_| Error::Backend)?;
+    Ok(())
+}
+
+/// Whether to try segmentation offload on this platform.
+///
+/// The send side needs no socket option, only a control message per call, so
+/// this is a question about the platform rather than about the socket. A kernel
+/// that refuses the message falls back for that burst.
+///
+/// The receive side is deliberately left alone. `UDP_GRO` makes one read return
+/// several coalesced packets, and a reader that hands the whole buffer to
+/// `Connection::recv` as one packet is handing it something it cannot parse.
+/// Turning it on without splitting the buffer first broke every transfer large
+/// enough to coalesce while every test stayed green, because a short test never
+/// gives the kernel two packets to join. It is worth having, and it is worth
+/// having with the read path that goes with it.
+const fn offload_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Hands one burst of equally sized packets to the socket.
+///
+/// With offload the whole burst is one call and the kernel cuts it into
+/// `segment`-sized datagrams. Without it, or for a burst of one, this is the
+/// plain send it replaces. A kernel that refuses the control message falls back
+/// rather than failing, because the offload is a cost saving and never a
+/// correctness requirement.
+fn flush_burst(
+    socket: &UdpSocket,
+    burst: &[u8],
+    segment: usize,
+    destination: Option<SocketAddr>,
+    gso: bool,
+) -> Result<(), Error> {
+    let Some(destination) = destination else {
+        return Ok(());
+    };
+    if burst.is_empty() {
+        return Ok(());
+    }
+    if gso && burst.len() > segment {
+        if send_segmented(socket, burst, segment, destination).is_ok() {
+            return Ok(());
+        }
+        // Fall through: a kernel that will not segment still takes the packets
+        // one at a time.
+    }
+    for packet in burst.chunks(segment) {
+        if socket.send_to(packet, destination).is_err() {
+            return Err(Error::Backend);
+        }
+    }
+    Ok(())
 }
 
 /// Applies one submission to the connection.

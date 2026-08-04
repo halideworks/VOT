@@ -27,6 +27,7 @@ because at this size a single run decides nothing: see the spread column.
 
 | carrier | datagram | Mbit/s (median) | spread | user CPU | system CPU |
 | --- | --- | --- | --- | --- | --- |
+| simulator | none | 18976 | 1.02x | 0.23 s | 0.00 s |
 | MsQuic | segmented | 9984 | 1.28x | 0.99 s | 0.21 s |
 | quiche | 1350 | 1460 | 1.41x | 2.72 s | 3.52 s |
 | quiche | 16384 | 5849 | 1.51x | 0.97 s | 0.82 s |
@@ -59,9 +60,26 @@ the mechanism, the useful reading is that the largest datagram a path allows is
 not automatically the fastest, so the size belongs in the result rather than
 being assumed.
 
-**Neither carrier is hash-bound.** ADR-0020 measures this verifier at 33.6 Gb/s
-for `blake3-bao64` on this host, against a best transport result here of about
-10 Gb/s.
+**Neither carrier is hash-bound, and the harness is not the ceiling.** The
+costs stack up like this on this host:
+
+| | throughput | CPU for 512 MB |
+| --- | --- | --- |
+| `blake3-bao64` verifier alone (ADR-0020) | 33.6 Gb/s | |
+| driver over the in-process carrier | 19.0 Gb/s | 0.23 s |
+| driver over MsQuic | 10.0 Gb/s | 1.20 s |
+| driver over quiche at 32768 | 7.2 Gb/s | 1.39 s |
+
+The driver's own per-byte work, generating the object, framing it, and
+verifying it, costs 0.23 s of CPU and caps any carrier at about 19 Gb/s here.
+Each real carrier adds roughly a further second, so the transport costs about
+five times what everything else in the run costs together. The in-process
+carrier also holds to a 1.02x spread where both real ones are looser, which is
+worth remembering when reading any single number below it.
+
+**Record size is not a lever.** Measured at 16 KiB, 64 KiB, and 256 KiB records
+with the datagram at 32768, every result sat inside the others' spread for both
+carriers. Datagram size moves this workload; record size does not.
 
 ## Reproducing
 

@@ -65,9 +65,14 @@ strategies. Records are submitted as `DATA_RECORD` frames and the envelope is
 stripped on delivery, which is why `notes` carries `wire_bytes` alongside
 `bytes_sent`: the carrier moved strictly more than the object, and the
 difference is stated rather than assumed away. A full queue is treated as
-backpressure and the record is offered again, counted in `backpressure_waits`;
-a carrier that delivers nothing at all for thirty seconds ends the run with an
-error instead of reporting a partial transfer.
+backpressure and the record is offered again, counted in `backpressure_waits`.
+
+A carrier that stops ends the run with an error instead of reporting a partial
+transfer. The bound is a budget of deliveries, eight per record, rather than a
+deadline: a loop that ends only because a clock advanced has no bound at all
+when its bookkeeping is wrong, and a benchmark that hangs is worse than one that
+fails. Sizing it by the object also means a stopped carrier is reported in
+proportion to what it was carrying.
 
 `idle_waits` counts the deliveries that found nothing, which the driver waits
 after because the carrier's own thread is what makes progress. How long it

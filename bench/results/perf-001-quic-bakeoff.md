@@ -48,12 +48,25 @@ system time falls from 3.52 s to 0.49 s when the datagram is sized to the path,
 and user time falls from 2.72 s to 0.90 s, because per-packet crypto cost about
 as much as the syscalls did.
 
-**At comparable packet sizes the two engines are close.** MsQuic leads by about
-1.4x on throughput and about 1.16x on total CPU. quiche spends *less* user CPU
-than MsQuic (0.90 s against 0.99 s); MsQuic's remaining advantage is system
-time, 0.21 s against 0.49 s, which is what segmentation offload buys. That is
-the gap PERF-002 is chartered to close on this path, and it is the whole of the
-gap that is left.
+**MsQuic is still ahead once packet sizes are sane, on both numbers that decide
+a default.** It carries about 1.4x the throughput and spends about 1.16x less
+total CPU. quiche spends less *user* CPU (0.90 s against 0.99 s), but that is a
+tenth of one component and system time more than cancels it, 0.49 s against
+0.21 s. A reader choosing a backend today should read this row as MsQuic
+winning, not as a tie.
+
+What the split says about *why* is worth separating from the ranking. The whole
+remaining gap is system time, which is what segmentation offload buys, and
+PERF-002 is chartered to bring that to this path. If it lands, quiche's lower
+user CPU would put the two at or past parity. That is a forecast rather than a
+measurement, and two forecasts in this file were already dissolved by repeating
+the experiment.
+
+One caveat on the word "comparable". quiche was handed a datagram size and
+MsQuic used its own offload strategy, so this compares each engine's best
+available amortisation on this path rather than matched amortisation. That is
+the right question for choosing a default today and the wrong one for ranking
+the engines themselves.
 
 **More is not always better.** 65527 measured slightly below 32768. Whatever
 the mechanism, the useful reading is that the largest datagram a path allows is
@@ -118,6 +131,16 @@ still unmeasured, and one of them could move the answer.
   single-stream speed.
 
 **No two-machine run.** Loopback numbers do not transfer to a wire.
+
+**Nothing here weighs what is not speed.** ADR-0012 isolates MsQuic because it
+is a C FFI dependency that requires unsafe code, is pinned to a git revision,
+builds a bundled C library, and leaves the driver binary needing that library at
+run time. quiche is sans-IO Rust with no unsafe in its adapter. ADR-0024 chose a
+second backend for explicit UDP I/O, pacing, and congestion-control control, and
+this report is itself evidence that the control matters: the datagram size worth
+five times the throughput was ours to set on quiche, and MsQuic offers no
+equivalent lever. A default chosen on throughput alone is choosing on one axis
+of several.
 
 One further caveat for whoever writes ADR-0026: `TransportAdapter` takes
 `&mut self`, so several workers cannot submit through one adapter concurrently

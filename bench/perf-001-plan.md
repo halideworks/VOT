@@ -101,9 +101,22 @@ printed; `credit_mode` says which bound was in force instead.
 ### 4. Multi-worker is in scope, as its own PR
 
 The proof-bearing range path is what the worker gate's comment is waiting for.
-It lands as a separate PR after both backends are wired and before the report,
-so `one_rail_one_worker_and_multi_worker_measured` is met across the series and
+It lands after both backends are wired and before the report, so
+`one_rail_one_worker_and_multi_worker_measured` is met across the series and
 every number in the report is measurable when the report is written.
+
+ADR-0025 rules on the shape, amending ADR-0020: verification parallelism is the
+range path, where each range carries a proof and is verified against the root
+independently, rather than the subtree merging ADR-0020 deferred. `worker_count`
+is concurrent payload workers over disjoint ranges of one object, which is the
+only reading the result schema can express and the one the spine hypothesis is
+about. Proving needs a chaining-value layer because proving from the object
+costs a full-object hash per range; both proof crates now build one streaming
+and prove from it, so a sender never holds the object.
+
+Note this also unblocks decision 6: the rails side splits the same object across
+W connections, so it needs the same range path the workers side does. Both were
+gated on this, not just the multi-worker criterion.
 
 ### 5. Four PRs, and the report comes last
 

@@ -458,8 +458,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
+      # openssl beside cmake: the suite's credentials() shells out to the
+      # openssl binary for its test certificate, and the baseline run pays for
+      # the whole job if the runner image stops carrying it.
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake openssl
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0

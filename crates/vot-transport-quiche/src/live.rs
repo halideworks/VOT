@@ -1992,6 +1992,110 @@ mod tests {
     }
 
     #[test]
+    fn a_record_split_by_flow_control_still_completes() {
+        // The live pair above can never split a record: its stream window is
+        // a megabyte and a record's bound is a quarter of that. This pair's
+        // window is smaller than one record, so the outbox has to find the
+        // record's end across passes rather than in the first one.
+        let (certificate, key) = credentials();
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let window = 2_048_u64;
+        let mut client_config =
+            quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
+        client_config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("a protocol");
+        client_config.verify_peer(false);
+        client_config.set_initial_max_data(1_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(window);
+        client_config.set_initial_max_stream_data_bidi_remote(window);
+        client_config.set_initial_max_streams_bidi(16);
+        let mut server_config =
+            quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
+        server_config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("a protocol");
+        server_config
+            .load_cert_chain_from_pem_file(&certificate)
+            .expect("the certificate");
+        server_config
+            .load_priv_key_from_pem_file(&key)
+            .expect("the key");
+        server_config.set_initial_max_data(1_000_000);
+        server_config.set_initial_max_stream_data_bidi_local(window);
+        server_config.set_initial_max_stream_data_bidi_remote(window);
+        server_config.set_initial_max_streams_bidi(16);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &scid_for(local),
+            local,
+            remote,
+            &mut client_config,
+        )
+        .expect("a client");
+        let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_config)
+            .expect("a server");
+
+        fn shuttle(
+            a: &mut quiche::Connection,
+            a_address: SocketAddr,
+            b: &mut quiche::Connection,
+            b_address: SocketAddr,
+        ) {
+            let mut packet = [0_u8; 2_048];
+            while let Ok((written, _)) = a.send(&mut packet) {
+                let info = quiche::RecvInfo {
+                    from: a_address,
+                    to: b_address,
+                };
+                let _ = b.recv(&mut packet[..written], info);
+            }
+        }
+
+        for _ in 0_u32..64 {
+            shuttle(&mut client, local, &mut server, remote);
+            shuttle(&mut server, remote, &mut client, local);
+            if client.is_established() && server.is_established() {
+                break;
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let stream = stream_state(
+            &mut streams,
+            4,
+            StreamKind::Reliable { lane: 0 },
+            &budget,
+            &control_limit,
+        );
+        stream.outbox.push_back((vec![0x27_u8; 8_192].into(), 0));
+
+        let mut drain = [0_u8; 4_096];
+        let mut delivered = 0_usize;
+        for _ in 0_u32..256 {
+            write_outbox(&mut client, stream);
+            shuttle(&mut client, local, &mut server, remote);
+            while let Ok((read, _)) = server.stream_recv(4, &mut drain) {
+                delivered += read;
+            }
+            shuttle(&mut server, remote, &mut client, local);
+            if stream.outbox.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            stream.outbox.is_empty(),
+            "a split record never completed; {delivered} of 8192 bytes arrived"
+        );
+        assert_eq!(delivered, 8_192);
+    }
+
+    #[test]
     fn the_shared_surface_answers_like_the_direct_one() {
         // Every passthrough answers with the adapter's judgment; a stub that
         // says yes to all of these is a carrier lying about its bounds.

@@ -9,8 +9,8 @@ configuration cannot compile it; its own comment said a live mutation run
 belongs beside the msquic one, and until the `quiche-mutation` job nothing ran
 one. The first sweep found 223 mutants with 57 surviving; unit tests for the
 inbound budget, the assembly budget, the connection-id derivation, the
-coalesced-read fallback, and the shared adapter surface killed 24 of them, and
-the 33 that remain are classified below.
+coalesced-read fallback, the shared adapter surface, and a flow-control split
+write killed 25 of them, and the 32 that remain are classified below.
 
 Passing evidence: `.cargo/mutants-live.toml` is the configuration without the
 exclusion, and the `quiche-mutation` job runs it with the feature on, diff-only
@@ -39,7 +39,10 @@ the same function. The reasons fall into five classes:
   kind can reach the flipped branch, and the suite has no way to make the
   kernel do that on loopback.
 - **equivalent behavior**: the mutation changes the path taken, not the
-  outcome, within what any test can observe.
+  outcome, within what any test can observe. The completion check in
+  `write_outbox` sat here wrongly until review showed a split write hangs the
+  stream under it; a small-window sans-IO pair now kills it, which is the
+  fate a row in this table should hope for.
 
 | mutant | class | reason |
 | --- | --- | --- |
@@ -73,5 +76,4 @@ the same function. The reasons fall into five classes:
 | `replace == with != in send_all` | burst geometry | the reopened-burst check; the flip re-runs or ends bursts early, and the slower shape hangs a loaded run, which the timeout records |
 | `replace match guard error.kind() == std::io::ErrorKind::WouldBlock \|\| error.kind() == std::io::ErrorKind::TimedOut with true in drive` | needs fault injection | treats a fatal socket error as an idle timeout; loopback never produces one |
 | `replace == with != in drive` | needs fault injection | swaps which timeout kind matches; this platform reports the other kind, so the guard holds either way |
-| `replace - with + in write_outbox` | equivalent behavior | the completion check misses once, the offset still advances, and the next pass sends an empty tail and completes |
 | `replace drain_datagrams with ()` | equivalent behavior | received datagrams are dropped by design because the API has no inbound datagram event; not draining them stalls only datagram credit, which nothing here extends |

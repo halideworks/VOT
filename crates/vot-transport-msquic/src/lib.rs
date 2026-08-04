@@ -667,6 +667,26 @@ pub mod live {
             self.adapter.poll()
         }
 
+        // The callbacks raise the queue's signal on every push, so a caller
+        // sleeps until there is something rather than guessing an interval.
+        // Checked before sleeping: an event already queued, or one stalled on
+        // a full adapter, is work the caller should poll for now.
+        fn wait_for_event(&mut self, bound: Duration) {
+            if self.stalled.is_some() {
+                return;
+            }
+            let signal = {
+                let Ok(queue) = self.callbacks.inbound.lock() else {
+                    return;
+                };
+                if !queue.events.is_empty() {
+                    return;
+                }
+                Arc::clone(&queue.arrived)
+            };
+            signal.wait(bound);
+        }
+
         fn path_stats(&self) -> Option<PathStats> {
             self.adapter.path_stats()
         }
@@ -1285,6 +1305,9 @@ pub mod live {
         /// per-stream bound can see. Charged to the same budget as queued
         /// events, so `MAX_CALLBACK_BYTES` is what a peer can make this hold.
         assembling: usize,
+        /// Raised on every push, waited on by `wait_for_event`. Shared so a
+        /// waiter holds no lock a backend worker needs while it sleeps.
+        arrived: Arc<vot_transport_api::EventSignal>,
     }
 
     impl CallbackQueue {
@@ -1304,6 +1327,7 @@ pub mod live {
             }
             self.events.push_back(event);
             self.bytes += payload;
+            self.arrived.raise();
             true
         }
 
@@ -1328,6 +1352,7 @@ pub mod live {
         fn push_lifecycle(&mut self, event: NativeEvent) {
             debug_assert_eq!(native_payload_len(&event), 0);
             self.events.push_back(event);
+            self.arrived.raise();
         }
 
         fn pop(&mut self) -> Option<NativeEvent> {
@@ -1451,6 +1476,10 @@ pub mod live {
 
                 fn poll(&mut self) -> Option<Event> {
                     self.carrier.poll()
+                }
+
+                fn wait_for_event(&mut self, bound: Duration) {
+                    self.carrier.wait_for_event(bound);
                 }
 
                 fn path_stats(&self) -> Option<PathStats> {
@@ -2839,6 +2868,59 @@ pub mod live {
                 }
                 std::thread::yield_now();
             }
+        }
+
+        #[test]
+        fn a_wait_ends_on_arrival_rather_than_at_its_bound() {
+            let (key, certificate) = credential_paths();
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            let mut server =
+                MsQuicServer::bind(address, &Config::server(server_limits(), certificate, key))
+                    .unwrap();
+            let peer = server.local_address().unwrap();
+            let mut client_config = Config::client(test_limits());
+            client_config.verify_peer = false;
+            let mut client = MsQuicTransport::dial(peer, 11, &client_config).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert!(drive(&mut client, deadline, |event| matches!(
+                event,
+                Event::Connected(_)
+            )));
+            let mut accepted = loop {
+                assert!(Instant::now() < deadline, "the server never accepted");
+                if let Some(accepted) = server.accept() {
+                    break accepted;
+                }
+                std::thread::yield_now();
+            };
+
+            // The accepted side's own lifecycle events are taken first, so
+            // the wait below genuinely parks on an empty queue.
+            while accepted.poll().is_some() {}
+
+            // A record is in flight when the accepted side starts a five
+            // second wait. The callback's signal must end the wait when the
+            // record lands; a wait that sleeps its bound out is the polling
+            // interval this contract removes. Framed as a lane carries it,
+            // because the assembler holds unframed bytes without delivering.
+            let mut record = Vec::new();
+            vot_codec::encode_frame(vot_codec::frame_type::DATA_RECORD, b"wake", &mut record)
+                .unwrap();
+            client.send_reliable(StreamId(1), &record).unwrap();
+            TransportAdapter::flush(&mut client).unwrap();
+            let started = Instant::now();
+            accepted.wait_for_event(Duration::from_secs(5));
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the wait slept past the arrival: {:?}",
+                started.elapsed()
+            );
+            // What arrived is what was sent, so the early return was the
+            // event rather than a spurious wakeup timed luckily.
+            assert!(drive(&mut accepted, deadline, |event| matches!(
+                event,
+                Event::Reliable { .. }
+            )));
         }
 
         #[test]

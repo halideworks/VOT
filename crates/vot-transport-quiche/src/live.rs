@@ -72,6 +72,9 @@ struct Inbound {
     events: VecDeque<NativeEvent>,
     bytes: usize,
     assembling: usize,
+    /// Raised on every push, waited on by `wait_for_event`. Shared so a
+    /// waiter holds no lock the pump needs while it sleeps.
+    arrived: Arc<vot_transport_api::EventSignal>,
 }
 
 impl Inbound {
@@ -89,6 +92,7 @@ impl Inbound {
         }
         self.events.push_back(event);
         self.bytes += payload;
+        self.arrived.raise();
         true
     }
 
@@ -99,6 +103,7 @@ impl Inbound {
     fn push_lifecycle(&mut self, event: NativeEvent) {
         debug_assert_eq!(native_payload_len(&event), 0);
         self.events.push_back(event);
+        self.arrived.raise();
     }
 
     fn pop(&mut self) -> Option<NativeEvent> {
@@ -472,6 +477,26 @@ impl TransportAdapter for Transport {
     fn poll(&mut self) -> Option<Event> {
         self.take_inbound();
         self.adapter.poll()
+    }
+
+    // The pump raises the queue's signal on every push, so a caller sleeps
+    // until there is something rather than guessing an interval. Checked
+    // before sleeping: an event already queued, or one held back from a full
+    // adapter, is work the caller should poll for now.
+    fn wait_for_event(&mut self, bound: Duration) {
+        if self.held.is_some() {
+            return;
+        }
+        let signal = {
+            let Ok(inbound) = self.inbound.lock() else {
+                return;
+            };
+            if !inbound.events.is_empty() {
+                return;
+            }
+            Arc::clone(&inbound.arrived)
+        };
+        signal.wait(bound);
     }
 
     /// Not applied per call on this carrier. See [`QuicheAdapter`].
@@ -1077,6 +1102,35 @@ mod tests {
         assert!(stats.smoothed_rtt_us.is_some());
         assert!(stats.congestion_window_bytes.unwrap_or(0) > 0);
         assert!(stats.mtu_bytes.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_wait_ends_on_arrival_rather_than_at_its_bound() {
+        let (mut client, mut server) = pair();
+        pump_until(&mut client, &mut server, 10, |a, b| {
+            connected(a) && connected(b)
+        });
+
+        // A record is in flight when the server starts a five second wait. The
+        // pump's signal must end the wait when the record lands; a wait that
+        // sleeps its bound out is the polling interval this contract removes.
+        client
+            .send_reliable(StreamId(1), &record(b"wake"))
+            .expect("a submission");
+        client.flush().expect("a flush");
+        let started = Instant::now();
+        server.wait_for_event(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait slept past the arrival: {:?}",
+            started.elapsed()
+        );
+        // What arrived is what was sent, so the early return was the event
+        // rather than a spurious wakeup timed luckily.
+        pump_until(&mut client, &mut server, 10, |_, b| {
+            b.iter()
+                .any(|event| matches!(event, Event::Reliable { .. }))
+        });
     }
 
     #[test]

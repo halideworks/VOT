@@ -601,6 +601,15 @@ trait Carrier {
     /// transfer does not read. Leaving them queued would make the backend's
     /// inbound bound the ceiling instead of the carrier.
     fn drain_sent(&mut self);
+
+    /// Waits for the receiving endpoint to have something, at most `bound`.
+    ///
+    /// Costs real time whether or not anything arrives, so a loop counting
+    /// rounds still bounds its wall clock. A backend with a wakeup signal
+    /// returns as soon as an event lands, which removes the driver's polling
+    /// interval from what a run measures; one without a signal sleeps the
+    /// bound out, which is exactly the wait this replaced.
+    fn wait(&mut self, bound: Duration);
 }
 
 /// The object bytes inside a delivered record frame.
@@ -681,7 +690,7 @@ fn deliver_or_wait<C: Carrier>(
     let progress = deliver(carrier, receiver, subject)?;
     if progress == 0 {
         *idle_waits = idle_waits.saturating_add(1);
-        std::thread::sleep(idle_wait(*idle_waits));
+        carrier.wait(idle_wait(*idle_waits));
     }
     Ok(progress)
 }
@@ -888,6 +897,13 @@ impl Carrier for SimulatorCarrier {
     // The simulator sends and receives through one object, so every event it
     // has was already offered to `poll_received`.
     fn drain_sent(&mut self) {}
+
+    // The simulator delivers before `flush` returns, so a healthy transfer
+    // never waits on it. Sleeping the bound out keeps the wait a cost when
+    // something is wrong rather than a spin.
+    fn wait(&mut self, bound: Duration) {
+        std::thread::sleep(bound);
+    }
 }
 
 /// Runs one case and returns what was measured.
@@ -1057,9 +1073,9 @@ fn transfer_within<C: Carrier>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, StreamId,
-        TRANSFER_LANE, TransportAdapter, escape, measure, parse_vm_hwm, record_lengths,
-        record_payload, shared_payload, transfer_within,
+        Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload,
+        SimulatorCarrier, StreamId, TRANSFER_LANE, TransportAdapter, escape, measure, parse_vm_hwm,
+        record_lengths, record_payload, shared_payload, transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
     use vot_transport_api::Event;
@@ -1149,6 +1165,10 @@ mod tests {
         /// submissions once it is full, which is how an undrained sender
         /// becomes the ceiling instead of the carrier.
         undrained: usize,
+        /// Every bound the driver waited with, shared so a test can read it
+        /// after the transfer consumes the carrier. Recorded without sleeping,
+        /// because what the tests pin is which waits were taken, not time.
+        waited: std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>>,
     }
 
     impl TestCarrier {
@@ -1163,6 +1183,7 @@ mod tests {
                 disconnect: false,
                 endpoint: CreditEndpoint(Ok(())),
                 undrained: 0,
+                waited: std::sync::Arc::default(),
             }
         }
     }
@@ -1250,6 +1271,12 @@ mod tests {
         fn drain_sent(&mut self) {
             self.undrained = 0;
         }
+
+        fn wait(&mut self, bound: std::time::Duration) {
+            if let Ok(mut waited) = self.waited.lock() {
+                waited.push(bound);
+            }
+        }
     }
 
     /// The delivery budget a test gives a carrier. Generous enough that a
@@ -1279,6 +1306,36 @@ mod tests {
         // A count of zero never reaches the wait, but it must not be longer
         // than the first one if it ever does.
         assert_eq!(super::idle_wait(0), super::IDLE_WAIT_MIN);
+    }
+
+    #[test]
+    fn idle_deliveries_wait_on_the_carrier_at_the_backed_off_bound() {
+        // The wait goes through the carrier, where a backend with a wakeup
+        // signal can end it early, and each bound follows the backoff. A
+        // driver that slept on its own instead would reintroduce the polling
+        // interval as a property of every published number.
+        let mut carrier = TestCarrier::new();
+        carrier.lag = 3;
+        let waited = std::sync::Arc::clone(&carrier.waited);
+        let config = case(2 * 65_536, Suite::Blake3Bao64);
+        transfer_within(&config, carrier, TEST_BUDGET).unwrap();
+        assert_eq!(
+            *waited.lock().unwrap(),
+            vec![super::idle_wait(1), super::idle_wait(2)]
+        );
+    }
+
+    #[test]
+    fn the_simulator_wait_costs_the_bound() {
+        // The simulator never has anything to signal, so its wait must cost
+        // real time: it is what bounds the round budget's wall clock when a
+        // transfer is stalled, and a free wait would turn that budget into a
+        // spin.
+        let mut carrier = SimulatorCarrier::new(&case(65_536, Suite::Blake3Bao64)).unwrap();
+        let bound = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        carrier.wait(bound);
+        assert!(started.elapsed() >= bound);
     }
 
     #[test]

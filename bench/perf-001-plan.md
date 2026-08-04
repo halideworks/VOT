@@ -146,6 +146,13 @@ run of the other at a different one. An ADR that picks a default without that
 control is picking a constant in our own pump. Figures in
 `docs/perf-engineering.md`.
 
+Holding it comparable needs a knob that does not exist: `MAX_DATAGRAM_SIZE` is a
+constant in the pump, not a field on the quiche `Config` beside
+`idle_timeout_ms`. Moving it there is a small change to that crate and the
+prerequisite for the report being able to sweep it, so it belongs in PR 4 ahead
+of the measurements. The default stays 1350, because that is what a path whose
+MTU is unknown can carry.
+
 PR 4 should also report each run's user and system CPU time in `notes`.
 `/proc/self/stat` carries both with no new dependency, exactly as
 `memory_high_water_bytes` already comes from `/proc/self/status`. The user and

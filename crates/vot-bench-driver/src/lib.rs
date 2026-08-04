@@ -41,11 +41,12 @@ const SUBMIT_BATCH_RECORDS: usize = 16;
 /// Bytes drawn from the generator at a time.
 const WORD_BYTES: usize = 8;
 
-/// The lane the transfer uses.
+/// The lane the sequential transfer uses.
 ///
 /// One lane, because the case describes one object. A second would measure how
 /// the carrier schedules between lanes, which is a different question from the
-/// one the matrix asks.
+/// one the sequential matrix asks; the ranged path asks exactly that question
+/// and numbers its lanes from here up (ADR-0025).
 const TRANSFER_LANE: StreamId = StreamId(1);
 
 /// The shortest wait after a delivery that moved nothing, and the longest.

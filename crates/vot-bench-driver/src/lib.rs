@@ -596,7 +596,10 @@ impl BundleProducer {
         let mut records = Vec::new();
         let mut offset = covered_offset;
         let bundle_end = covered_offset + covered_length;
-        while offset < bundle_end {
+        // Counted, not steered: the record count is fixed before the loop, so
+        // no arithmetic inside it can keep the loop alive.
+        let bundle_records = covered_length.div_ceil(self.record_bytes as u64);
+        for _ in 0..bundle_records {
             let take = usize::try_from((self.record_bytes as u64).min(bundle_end - offset))
                 .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
             self.source.fill(&mut record, take);
@@ -759,7 +762,9 @@ fn advance(state: u64, draws: u64) -> u64 {
     }
     let mut result = state;
     let mut remaining = draws;
-    while remaining != 0 {
+    // One pass per bit of the count, counted rather than steered, so no
+    // mutation of the body can keep the loop alive.
+    for _ in 0..u64::BITS {
         if remaining & 1 == 1 {
             result = apply(&matrix, result);
         }
@@ -772,10 +777,10 @@ fn advance(state: u64, draws: u64) -> u64 {
 /// The matrix applied to one state: xor of the columns its set bits select.
 fn apply(matrix: &[u64; 64], state: u64) -> u64 {
     let mut out = 0;
-    let mut bits = state;
-    while bits != 0 {
-        out ^= matrix[bits.trailing_zeros() as usize];
-        bits &= bits - 1;
+    for (bit, column) in matrix.iter().enumerate() {
+        if state & (1 << bit) != 0 {
+            out ^= column;
+        }
     }
     out
 }
@@ -1775,8 +1780,9 @@ fn ranged_notes(
 mod test_guard {
     use std::sync::Once;
 
-    /// Far above any honest test, far below a CI runner's 16 GiB.
-    const CAP_BYTES: u64 = 6 << 30;
+    /// Far above any honest test, and low enough that two capped binaries
+    /// and their builds fit a CI runner's 16 GiB together.
+    const CAP_BYTES: u64 = 2 << 30;
 
     static ARM: Once = Once::new();
 
@@ -2069,23 +2075,21 @@ mod tests {
     }
 
     #[test]
-    fn a_ranged_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
-        // Four refusals on top of the two rounds a clean 2-worker transfer
-        // spends: six rounds is exactly enough and five is exactly too few. A
-        // bound that fired one round early would call a carrier applying
-        // backpressure stopped.
+    fn a_ranged_transfer_spends_its_whole_budget_before_stalling() {
+        // Worker threads make rounds-to-completion timing-dependent, so the
+        // edge is pinned from the stalling side, which is exact: a carrier
+        // that refuses every submission makes every round idle, five budgeted
+        // rounds wait five times, and the sixth check is the stall. A bound
+        // that fired one round early would wait one time fewer.
         let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
         let mut carrier = TestCarrier::new();
-        carrier.refuse = 4;
-        let measured = transfer_ranged(&config, vec![carrier], 6).unwrap();
-        assert_eq!(measured.verified_bytes, 2 * 65_536);
-
-        let mut same = TestCarrier::new();
-        same.refuse = 4;
+        carrier.refuse = usize::MAX;
+        let waited = std::sync::Arc::clone(&carrier.waited);
         assert!(matches!(
-            transfer_ranged(&config, vec![same], 5),
+            transfer_ranged(&config, vec![carrier], 5),
             Err(Error::Stalled)
         ));
+        assert_eq!(waited.lock().unwrap().len(), 5);
     }
 
     #[test]

@@ -10,7 +10,7 @@ and `serialized_spine_hypothesis_tested`.
 The report goes to `bench/results/perf-001-quic-bakeoff.md` in the shape of
 `bench/results/wave2-balanced.md`: date, environment facts, medians, and the
 exact command that reproduces each number. The ADR is
-`adr/0025-selected-default-backend.md`. `bench/public_result_schema.json`
+`adr/0026-selected-default-backend.md`, because 0025 is the range-proof ruling. `bench/public_result_schema.json`
 already accepts backend `msquic` and `quiche`; the contract does not change.
 
 ## Starting position
@@ -101,9 +101,22 @@ printed; `credit_mode` says which bound was in force instead.
 ### 4. Multi-worker is in scope, as its own PR
 
 The proof-bearing range path is what the worker gate's comment is waiting for.
-It lands as a separate PR after both backends are wired and before the report,
-so `one_rail_one_worker_and_multi_worker_measured` is met across the series and
+It lands after both backends are wired and before the report, so
+`one_rail_one_worker_and_multi_worker_measured` is met across the series and
 every number in the report is measurable when the report is written.
+
+ADR-0025 rules on the shape, amending ADR-0020: verification parallelism is the
+range path, where each range carries a proof and is verified against the root
+independently, rather than the subtree merging ADR-0020 deferred. `worker_count`
+is concurrent payload workers over disjoint ranges of one object, which is the
+only reading the result schema can express and the one the spine hypothesis is
+about. Proving needs a chaining-value layer because proving from the object
+costs a full-object hash per range; both proof crates now build one streaming
+and prove from it, so a sender never holds the object.
+
+Note this also unblocks decision 6: the rails side splits the same object across
+W connections, so it needs the same range path the workers side does. Both were
+gated on this, not just the multi-worker criterion.
 
 ### 5. Four PRs, and the report comes last
 
@@ -112,8 +125,9 @@ every number in the report is measurable when the report is written.
    and two boundary constructors in `vot-transport-msquic::live`, because
    ADR-0012 forbids an `MsQuic` type crossing that crate's edge and a caller
    could not otherwise build an endpoint.
-3. The multi-worker path.
-4. Measurements, the report, and ADR-0025.
+3. The multi-worker path, in two parts: range proving without the object
+   (ADR-0025, landed), then the driver sending proof-bearing ranges.
+4. Measurements, the report, and ADR-0026.
 
 One seam reviewed once, each backend change small, and no report exists before
 it can be a comparison.
@@ -123,7 +137,7 @@ it can be a comparison.
 Both backends now run the same loop. Measured over 512 MB on loopback, MsQuic
 carried the case at a median of 9426 Mbit/s against quiche's 1372, and the
 groups did not overlap. Read alone, that reads as an engine result and would
-have decided ADR-0025.
+have decided ADR-0026.
 
 It is not one. The quiche pump pins its datagram size at 1350 while the loopback
 MTU is 65536, and that constant is nearly the whole difference. Raising it to

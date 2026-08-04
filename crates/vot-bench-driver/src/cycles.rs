@@ -7,10 +7,19 @@
 //! platform) yields `None`, which the report renders as the honest null the
 //! contract allows.
 //!
-//! Excluded from the mutation gate like the backend files: whether this host
-//! grants a perf counter is the host's decision, so no test can pin both
-//! outcomes on one machine. Everything that decides what a `Measurement` says
-//! from the counter's answer lives in `lib.rs` under the gate.
+//! Excluded from the mutation gate, though for a different reason than the
+//! backend files: this compiles everywhere, but whether the host grants a
+//! counter is a runtime decision, so a mutant here flips between caught and
+//! missed with `kernel.perf_event_paranoid`. Everything that decides what a
+//! `Measurement` says from the counter's answer lives in `lib.rs` under the
+//! gate.
+
+/// One raw reading: the count and how long the PMU actually kept it on.
+pub(crate) struct CycleReading {
+    pub(crate) count: u64,
+    pub(crate) time_enabled: u64,
+    pub(crate) time_running: u64,
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) struct CycleCounter(perf_event::Counter);
@@ -27,10 +36,16 @@ impl CycleCounter {
         Some(Self(counter))
     }
 
-    /// Stops counting and reports what was spent.
-    pub(crate) fn read(mut self) -> Option<u64> {
+    /// Stops counting and hands back the raw reading; what it means is
+    /// `settle_cycles`'s decision, which lives under the mutation gate.
+    pub(crate) fn read(mut self) -> Option<CycleReading> {
         self.0.disable().ok()?;
-        self.0.read().ok()
+        let value = self.0.read_count_and_time().ok()?;
+        Some(CycleReading {
+            count: value.count,
+            time_enabled: value.time_enabled,
+            time_running: value.time_running,
+        })
     }
 }
 
@@ -44,7 +59,7 @@ impl CycleCounter {
         None
     }
 
-    pub(crate) fn read(self) -> Option<u64> {
+    pub(crate) fn read(self) -> Option<CycleReading> {
         None
     }
 }

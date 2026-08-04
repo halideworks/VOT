@@ -97,8 +97,9 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
     // Before the endpoint exists, so inherit covers the driver thread too.
     let counter = crate::cycles::CycleCounter::start();
     let mut measured = run_role(config, &role)?;
-    measured.cycles = counter.and_then(crate::cycles::CycleCounter::read);
-    crate::note_cycles(&mut measured.notes, measured.cycles);
+    let settled = crate::settle_cycles(counter.and_then(crate::cycles::CycleCounter::read));
+    measured.cycles = settled.map(|(count, _)| count);
+    crate::note_cycles(&mut measured.notes, settled);
     Ok(measured)
 }
 

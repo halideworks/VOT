@@ -11,14 +11,9 @@ default = []
 # The pump: a UDP socket, a quiche connection, and the timer that drives loss
 # recovery. Off by default because quiche builds BoringSSL through cmake, which
 # costs minutes where the rest of this workspace costs seconds.
-live = ["dep:quiche", "dep:nix"]
+live = ["dep:quiche"]
 
 [dependencies]
-# Safe wrappers for the sendmsg control message that carries segmentation
-# offload, and for the socket option that turns on its receive side. Both are
-# kernel features with no portable Rust surface; wrapping them here is what
-# keeps `unsafe_code = "forbid"` true of this crate.
-nix = { version = "=0.31.3", features = ["socket", "uio", "net"], optional = true }
 quiche = { version = "=0.24.9", optional = true }
 vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }

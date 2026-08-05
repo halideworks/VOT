@@ -927,7 +927,11 @@ pub fn memory_high_water_bytes() -> Result<u64, Error> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Err(Error::Unmeasurable("memory_high_water_bytes"))
+        // Peak working set on Windows, peak rusage on macOS; a platform the
+        // proc crate cannot measure answers Unsupported and lands here as
+        // unmeasurable rather than as a zero.
+        vot_platform_proc::peak_resident_bytes()
+            .map_err(|_| Error::Unmeasurable("memory_high_water_bytes"))
     }
 }
 

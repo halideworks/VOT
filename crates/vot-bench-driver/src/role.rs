@@ -32,9 +32,11 @@ use vot_transport_api::{
 };
 
 use crate::{
-    Config, Credit, Error, Measurement, ObjectSource, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally,
-    cpu_spent, cpu_times_ns, enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes,
-    receiver_for, record_lengths, record_payload, round_budget, subject_of,
+    BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource, Rails,
+    RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent, cpu_times_ns,
+    enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes, prover_layer_and_subject,
+    ranged_record_bytes, receiver_for, receiver_for_ranged, record_lengths, record_payload,
+    round_budget, subject_of, worker_ranges,
 };
 
 /// Which half of the transfer this process is.
@@ -86,11 +88,13 @@ pub(crate) struct Endpoint {
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
     #[cfg(test)]
     crate::test_guard::arm();
-    // The two-machine halves carry the sequential path only; running a
-    // multi-worker case here would measure that path under the wrong label.
-    if config.workers != 1 {
+    // A multi-worker case runs the ranged path over provisioned rails, one
+    // connection per worker on consecutive ports. The shared arm stays
+    // rejected: one connection is one pump, so sharing it across two machines
+    // would measure the sequential path under the wrong label.
+    if config.workers != 1 && config.rails != Rails::Provisioned {
         return Err(Error::Unsupported(
-            "role mode carries one worker; the ranged path has no two-machine half".to_owned(),
+            "role mode carries workers above one on provisioned rails only".to_owned(),
         ));
     }
     let role = crate::variable(&|name| std::env::var(name).ok(), ROLE)?;
@@ -105,6 +109,10 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 
 fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
     match role {
+        "send" if config.workers > 1 => {
+            let generator_ns = generator_nanos(config)?;
+            send_ranged(config, generator_ns, address(CONNECT)?)
+        }
         "send" => {
             // Generation is timed before the endpoint exists: the receiver's
             // clock starts at the accepted connection, so everything this
@@ -114,6 +122,7 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
             let endpoint = connect_endpoint(config, address(CONNECT)?)?;
             send(config, endpoint, generator_ns)
         }
+        "receive" if config.workers > 1 => receive_ranged(config, address(LISTEN)?),
         "receive" => {
             // The subject and the staging receiver are built before listening,
             // for the same reason: once the sender connects, its clock is
@@ -126,6 +135,16 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
         }
         _ => Err(Error::Value(ROLE)),
     }
+}
+
+/// The address rail `rail` uses: the configured port plus the rail's index.
+fn rail_address(base: SocketAddr, rail: usize) -> Result<SocketAddr, Error> {
+    let offset = u16::try_from(rail).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?;
+    let port = base
+        .port()
+        .checked_add(offset)
+        .ok_or(Error::Value("VOT_BENCH_WORKERS"))?;
+    Ok(SocketAddr::new(base.ip(), port))
 }
 
 /// Reads one address variable.
@@ -260,6 +279,252 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
     Ok(Measurement {
         bytes_sent,
         verified_bytes: 0,
+        elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1),
+        memory_high_water_bytes: memory_high_water_bytes()?,
+        cycles: None,
+        notes,
+    })
+}
+
+/// Submits the object's ranges over one connection per worker, then waits for
+/// the receiver's done marker.
+///
+/// The spine is `transfer_ranged`'s: producers hash and frame their ranges on
+/// their own threads, the spine submits whatever is ready to whichever rail,
+/// and backpressure on one rail never blocks another's frames. The marker
+/// arrives on rail zero's return lane, and any rail's disconnect before it is
+/// the transfer failing.
+fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<Measurement, Error> {
+    let budget = round_budget(config);
+    let workers = config.workers;
+    ranged_record_bytes(config)?;
+    let ranges = worker_ranges(config.object_bytes, workers)?;
+    let (subject, layer) = prover_layer_and_subject(config)?;
+    let layer = std::sync::Arc::new(layer);
+    let mut endpoints = Vec::with_capacity(workers);
+    for rail in 0..workers {
+        endpoints.push(connect_endpoint(config, rail_address(base, rail)?)?);
+    }
+    let mut tally = Tally::default();
+    let mut bytes_sent = 0_u64;
+    let mut done = false;
+
+    let cpu_before = cpu_times_ns();
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let mut channels = Vec::with_capacity(workers);
+        for (index, range) in ranges.iter().enumerate() {
+            let (sender, frames) =
+                std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
+            let mut producer = BundleProducer::new(
+                config,
+                std::sync::Arc::clone(&layer),
+                subject,
+                *range,
+                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
+            )?;
+            channels.push(frames);
+            scope.spawn(move || {
+                while let Some(bundle) = producer.next_bundle() {
+                    let failed = bundle.is_err();
+                    if sender.send(bundle).is_err() {
+                        return;
+                    }
+                    if failed {
+                        return;
+                    }
+                }
+            });
+        }
+
+        let mut queued: Vec<std::collections::VecDeque<RangedFrame>> = (0..workers)
+            .map(|_| std::collections::VecDeque::new())
+            .collect();
+        let mut submitted = 0_u64;
+        while submitted < config.object_bytes {
+            tally.rounds = tally.rounds.saturating_add(1);
+            if tally.rounds > budget {
+                return Err(Error::Stalled);
+            }
+            let mut progress = false;
+            for worker in 0..workers {
+                if queued[worker].is_empty() {
+                    match channels[worker].try_recv() {
+                        Ok(Ok(frames)) => queued[worker].extend(frames),
+                        Ok(Err(error)) => return Err(error),
+                        Err(
+                            std::sync::mpsc::TryRecvError::Empty
+                            | std::sync::mpsc::TryRecvError::Disconnected,
+                        ) => {}
+                    }
+                }
+                let adapter = endpoints[worker].adapter.as_mut();
+                while let Some((frame, plaintext)) = queued[worker].front() {
+                    match adapter.send_reliable_shared(TRANSFER_LANE, Payload::clone(frame)) {
+                        Ok(()) => {
+                            bytes_sent = bytes_sent.saturating_add(*plaintext);
+                            submitted = submitted.saturating_add(*plaintext);
+                            tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
+                            queued[worker].pop_front();
+                            progress = true;
+                        }
+                        Err(vot_transport_api::Error::OutboundQueueFull) => {
+                            tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
+                            break;
+                        }
+                        Err(other) => return Err(Error::Transport(other)),
+                    }
+                }
+            }
+            for endpoint in &mut endpoints {
+                tally.flushes = tally.flushes.saturating_add(1);
+                endpoint.adapter.flush()?;
+                drain_sender(endpoint.adapter.as_mut(), &mut done)?;
+            }
+            if !progress {
+                tally.idle_waits = tally.idle_waits.saturating_add(1);
+                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
+                endpoints[rail]
+                    .adapter
+                    .wait_for_event(idle_wait(tally.idle_waits));
+            }
+        }
+        Ok(())
+    })?;
+
+    // Every frame is with a carrier. The marker says the far end verified the
+    // whole object across every rail, so the clock runs until it arrives.
+    while !done {
+        tally.rounds = tally.rounds.saturating_add(1);
+        if tally.rounds > budget {
+            return Err(Error::Stalled);
+        }
+        let mut events = 0_u64;
+        for endpoint in &mut endpoints {
+            tally.flushes = tally.flushes.saturating_add(1);
+            endpoint.adapter.flush()?;
+            events = events.saturating_add(drain_sender(endpoint.adapter.as_mut(), &mut done)?);
+        }
+        if events == 0 && !done {
+            tally.idle_waits = tally.idle_waits.saturating_add(1);
+            let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
+            endpoints[rail]
+                .adapter
+                .wait_for_event(idle_wait(tally.idle_waits));
+        }
+    }
+    let elapsed = started.elapsed();
+    tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
+
+    let mut notes = role_notes("send", &endpoints[0], None, tally, Some(generator_ns));
+    notes.push_str(&format!(";workers={workers};rails=provisioned-multi-rail"));
+    Ok(Measurement {
+        bytes_sent,
+        verified_bytes: 0,
+        elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1),
+        memory_high_water_bytes: memory_high_water_bytes()?,
+        cycles: None,
+        notes,
+    })
+}
+
+/// Receives every rail's ranges, verifies the object, reports, then tells the
+/// sender on rail zero.
+///
+/// The clock starts at the first accepted connection, so the sender's later
+/// rails handshake inside the timed window, the same accounting as the
+/// sequential half's single connection.
+fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Error> {
+    let budget = round_budget(config);
+    let workers = config.workers;
+    let subject = subject_of(config)?;
+    let mut receiver = receiver_for_ranged(config)?;
+    receiver.begin_ranges(subject)?;
+    let mut reassembly = BundleReassembly::new(workers);
+
+    let mut endpoints = vec![listen_endpoint(config, base)?];
+    let cpu_before = cpu_times_ns();
+    let started = std::time::Instant::now();
+    for rail in 1..workers {
+        endpoints.push(listen_endpoint(config, rail_address(base, rail)?)?);
+    }
+    let mut credit = Credit::Constructed;
+    for endpoint in &mut endpoints {
+        credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
+    }
+
+    let mut delivered = 0_u64;
+    let mut tally = Tally::default();
+    while delivered < config.object_bytes {
+        tally.rounds = tally.rounds.saturating_add(1);
+        if tally.rounds > budget {
+            return Err(Error::Stalled);
+        }
+        let mut progress = 0_u64;
+        for endpoint in &mut endpoints {
+            tally.flushes = tally.flushes.saturating_add(1);
+            endpoint.adapter.flush()?;
+            while let Some(event) = endpoint.adapter.poll() {
+                match event {
+                    Event::Reliable { bytes, .. } => {
+                        tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
+                        progress = progress.saturating_add(reassembly.accept(
+                            &mut receiver,
+                            subject,
+                            &bytes,
+                        )?);
+                    }
+                    Event::Disconnected(_) => return Err(Error::Disconnected),
+                    _ => {}
+                }
+            }
+        }
+        delivered = delivered.saturating_add(progress);
+        if progress == 0 {
+            tally.idle_waits = tally.idle_waits.saturating_add(1);
+            let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
+            endpoints[rail]
+                .adapter
+                .wait_for_event(idle_wait(tally.idle_waits));
+        }
+    }
+    receiver.finish_ranges(subject)?;
+    let elapsed = started.elapsed();
+    tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
+
+    if !receiver.is_verified(subject) {
+        return Err(Error::Unsupported(
+            "receiver did not reach a verified state".to_owned(),
+        ));
+    }
+
+    let mut marker = Vec::new();
+    vot_codec::encode_frame(
+        vot_codec::frame_type::DATA_RECORD,
+        DONE_PAYLOAD,
+        &mut marker,
+    )
+    .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+    endpoints[0]
+        .adapter
+        .send_reliable_shared(DONE_LANE, shared_payload(&marker))?;
+    endpoints[0].adapter.flush()?;
+    linger(endpoints[0].adapter.as_mut());
+
+    let mut notes = role_notes(
+        "receive",
+        &endpoints[0],
+        Some((&receiver, credit)),
+        tally,
+        None,
+    );
+    notes.push_str(&format!(
+        ";workers={workers};rails=provisioned-multi-rail;bundles={}",
+        reassembly.completed
+    ));
+    Ok(Measurement {
+        bytes_sent: 0,
+        verified_bytes: config.object_bytes,
         elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1),
         memory_high_water_bytes: memory_high_water_bytes()?,
         cycles: None,
@@ -525,14 +790,62 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_worker_case_is_refused_before_any_socket_exists() {
+    fn a_multi_worker_case_on_a_shared_rail_is_refused_before_any_socket_exists() {
         // The guard runs before the role lookup, so no environment and no
-        // network are needed to pin it.
+        // network are needed to pin it. Provisioned rails carry workers above
+        // one; a shared connection would mislabel the sequential path.
         let mut config = case("quiche", 65_536);
         config.workers = 2;
         assert!(matches!(
             super::measure(&config),
             Err(crate::Error::Unsupported(_))
         ));
+    }
+
+    /// A base whose next `extra` ports are also free, so consecutive rails
+    /// can bind. Racy in principle, like `free_address`.
+    fn free_rail_base(extra: u16) -> SocketAddr {
+        loop {
+            let base = free_address();
+            let Some(last) = base.port().checked_add(extra) else {
+                continue;
+            };
+            let all_free = (base.port()..=last)
+                .skip(1)
+                .all(|port| std::net::UdpSocket::bind(SocketAddr::new(base.ip(), port)).is_ok());
+            if all_free {
+                return base;
+            }
+        }
+    }
+
+    #[cfg(feature = "quiche")]
+    #[test]
+    fn a_ranged_role_pair_carries_and_verifies_over_two_rails() {
+        // Two workers on two connections: each rail carries its own range,
+        // the receiver reassembles and verifies the whole object, and the
+        // marker comes back on rail zero.
+        let mut config = case("quiche", 8 * 1024 * 1024);
+        config.workers = 2;
+        config.rails = Rails::Provisioned;
+        let base = free_rail_base(1);
+        let far_config = config.clone();
+        let far_half =
+            std::thread::spawn(move || super::receive_ranged(&far_config, base).unwrap());
+        let generator_ns = crate::generator_nanos(&config).unwrap();
+        let sent = super::send_ranged(&config, generator_ns, base).unwrap();
+        let received = far_half.join().unwrap();
+        assert_eq!(sent.bytes_sent, config.object_bytes);
+        assert_eq!(received.verified_bytes, config.object_bytes);
+        for measurement in [&sent, &received] {
+            assert!(
+                measurement
+                    .notes
+                    .contains("workers=2;rails=provisioned-multi-rail"),
+                "{}",
+                measurement.notes
+            );
+        }
+        assert!(received.notes.contains("bundles="), "{}", received.notes);
     }
 }

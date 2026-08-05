@@ -348,7 +348,8 @@ fn submit_ranges(
         // bundle's frames stay together on one lane, which is the only order
         // the receive side needs. The central stock holds at most one group
         // per worker beyond what the rails are carrying, so producers stay
-        // bounded by their channels.
+        // bounded by their channels; one refill pass can leave the stock a
+        // group per worker past the mark it checks, which is still a bound.
         let mut ready: std::collections::VecDeque<Vec<RangedFrame>> =
             std::collections::VecDeque::new();
         let mut queued: Vec<std::collections::VecDeque<RangedFrame>> = (0..workers)

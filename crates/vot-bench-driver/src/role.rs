@@ -148,6 +148,18 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
     }
 }
 
+/// Raises the shared failure flag on drop unless defused, so a rail that
+/// panics still tells its siblings.
+struct Alarm<'flag>(&'flag std::sync::atomic::AtomicBool, bool);
+
+impl Drop for Alarm<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// The shared source rails pull bundle groups from.
 type GroupSource =
     std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Result<Vec<RangedFrame>, Error>>>>;
@@ -525,7 +537,7 @@ fn drive_rail(
         tally.flushes = tally.flushes.saturating_add(1);
         adapter.flush()?;
         let mut marker = done.load(std::sync::atomic::Ordering::Relaxed);
-        let events = drain_sender(adapter, &mut marker)?;
+        let _ = drain_sender(adapter, &mut marker)?;
         if marker {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -534,7 +546,10 @@ fn drive_rail(
         // verified; until then it keeps flushing, because its own
         // retransmissions may be what the verdict is waiting on.
         rail_done = marker && source_dry && queued.is_empty();
-        if !progress && events == 0 && !rail_done {
+        // Progress means frames handed over; routine acknowledgements are
+        // not it, or the closing wait would spin its budget dry on its own
+        // trailing ACKs.
+        if !progress && !rail_done {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
             adapter.wait_for_event(RAIL_IDLE_WAIT);
         }
@@ -553,19 +568,22 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     for rail in 0..workers {
         endpoints.push(connect_endpoint(config, rail_address(base, rail)?)?);
     }
-    // Producers feed one bounded source and every rail takes from it as fast
-    // as its own adapter drains, so a quick rail carries more of the object
-    // and a slow one delays nothing but its share. The bound is what keeps
-    // producers from running ahead of the wire.
-    let (group_tx, group_rx) =
-        std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(workers * 2);
-    let source: GroupSource = std::sync::Arc::new(std::sync::Mutex::new(group_rx));
     let done = std::sync::atomic::AtomicBool::new(false);
     let failed = std::sync::atomic::AtomicBool::new(false);
 
     let cpu_before = cpu_times_ns();
     let started = std::time::Instant::now();
     let outcome = std::thread::scope(|scope| -> Result<(Tally, u64), Error> {
+        // Producers feed one bounded source and every rail takes from it as
+        // fast as its own adapter drains, so a quick rail carries more of
+        // the object and a slow one delays nothing but its share. The bound
+        // is what keeps producers from running ahead of the wire. The source
+        // lives inside the scope so a failing transfer can drop it: a
+        // producer parked on the full channel unblocks the moment the
+        // receiver dies, rather than holding the join forever.
+        let (group_tx, group_rx) =
+            std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(workers * 2);
+        let source: GroupSource = std::sync::Arc::new(std::sync::Mutex::new(group_rx));
         for (index, range) in ranges.iter().enumerate() {
             let group_tx = group_tx.clone();
             let layer = std::sync::Arc::clone(&layer);
@@ -592,10 +610,9 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
             let done = &done;
             let failed = &failed;
             rails.push(scope.spawn(move || {
+                let mut alarm = Alarm(failed, true);
                 let outcome = drive_rail(endpoint, &source, done, failed, budget);
-                if outcome.is_err() {
-                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                alarm.1 = outcome.is_err();
                 outcome
             }));
         }
@@ -612,6 +629,7 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
                 Err(_) => first_error = first_error.or(Some(Error::Disconnected)),
             }
         }
+        drop(source);
         match first_error {
             Some(error) => Err(error),
             None => Ok((tally, bytes_sent)),
@@ -673,6 +691,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
             let delivered = &delivered;
             let failed = &failed;
             rails.push(scope.spawn(move || {
+                let mut alarm = Alarm(failed, true);
                 let outcome = drive_receive_rail(
                     endpoint,
                     subject,
@@ -682,9 +701,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
                     failed,
                     budget,
                 );
-                if outcome.is_err() {
-                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                alarm.1 = outcome.is_err();
                 outcome
             }));
         }

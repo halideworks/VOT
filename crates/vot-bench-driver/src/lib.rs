@@ -1226,7 +1226,9 @@ struct Tally {
 
 impl Tally {
     /// Folds another tally's counters in; CPU stays the caller's to set,
-    /// because it is a process total rather than a per-thread one.
+    /// because it is a process total rather than a per-thread one. Gated as
+    /// the role module is, because the rails are its only caller.
+    #[cfg(any(feature = "msquic", feature = "quiche"))]
     pub(crate) fn merge(&mut self, other: &Self) {
         self.flushes = self.flushes.saturating_add(other.flushes);
         self.backpressure_waits = self

@@ -33,10 +33,10 @@ use vot_transport_api::{
 
 use crate::{
     BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource, Rails,
-    RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent, cpu_times_ns,
-    enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes, prover_layer_and_subject,
-    ranged_record_bytes, receiver_for, receiver_for_ranged, record_lengths, record_payload,
-    round_budget, subject_of, worker_ranges,
+    RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, WitnessLedger, cpu_spent,
+    cpu_times_ns, enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes,
+    prover_layer_and_subject, ranged_record_bytes, receiver_for, receiver_for_ranged,
+    record_lengths, record_payload, round_budget, subject_of, worker_ranges,
 };
 use vot_scheduler::ReliableReceiver as SchedulerReceiver;
 
@@ -250,35 +250,6 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     adapter.flush()?;
     linger(adapter);
     Ok(())
-}
-
-/// Verified ranges rails hold between proving and admission: transport
-/// memory the receiver's own staging cannot see, reported alongside it so
-/// the note describes everything the transfer held (ADR-0029).
-#[derive(Default)]
-struct WitnessLedger {
-    held: std::sync::atomic::AtomicU64,
-    peak: std::sync::atomic::AtomicU64,
-}
-
-impl WitnessLedger {
-    fn hold(&self, bytes: u64) {
-        let now = self
-            .held
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(bytes);
-        self.peak
-            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn release(&self, bytes: u64) {
-        self.held
-            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn peak(&self) -> u64 {
-        self.peak.load(std::sync::atomic::Ordering::Relaxed)
-    }
 }
 
 /// Drives one receive rail: its own endpoint, its own reassembly, its own

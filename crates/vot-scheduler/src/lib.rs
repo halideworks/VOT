@@ -184,6 +184,25 @@ impl ReliableReceiver {
         proof: &[u8],
         staging_reserved: bool,
     ) -> Result<(), Error> {
+        // The subject gate runs before any proof work, as it always has: an
+        // unknown subject is refused for what it is, not for how its proof
+        // reads.
+        let replay = self.verified.contains(&subject);
+        if !replay && !self.range_active.contains_key(&subject) {
+            return Err(Error::UnknownObject);
+        }
+        check_range_proof(subject, covered_offset, data.as_ref(), proof)?;
+        self.insert_checked_range(subject, covered_offset, data, staging_reserved)
+    }
+
+    /// Books a range whose proof [`check_range_proof`] has already held.
+    fn insert_checked_range(
+        &mut self,
+        subject: SubjectId,
+        covered_offset: u64,
+        data: Cow<'_, [u8]>,
+        staging_reserved: bool,
+    ) -> Result<(), Error> {
         // A subject whose every byte is verified has no range state left, but a
         // peer may still replay a range it already sent. The replay is checked
         // like any other and then changes nothing.
@@ -192,46 +211,9 @@ impl ReliableReceiver {
             return Err(Error::UnknownObject);
         }
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
-        if bytes == 0 || bytes > MAX_PROOF_RANGE_BYTES {
-            return Err(Error::RecordTooLarge);
-        }
         let covered_end = covered_offset
             .checked_add(bytes)
             .ok_or(Error::LengthExceeded)?;
-        if covered_offset % RANGE_UNIT_BYTES != 0 || covered_end > subject.length {
-            return Err(Error::LengthExceeded);
-        }
-        // A range covers whole 64 KiB units unless it ends the object, the same
-        // rule `PROOF_BUNDLE` validation applies on the wire. Both proof suites
-        // enforce it too, but stating it here is what lets completion be decided
-        // from the accepted byte total alone.
-        if covered_end < subject.length && bytes % RANGE_UNIT_BYTES != 0 {
-            return Err(Error::LengthExceeded);
-        }
-        match suite(subject.suite)? {
-            Suite::Blake3Bao64 => {
-                vot_proof_blake3::verify(
-                    &subject.root,
-                    subject.length,
-                    covered_offset,
-                    data.as_ref(),
-                    proof,
-                )
-                .map_err(|_| Error::ProofInvalid)?;
-            }
-            Suite::Sha256Bep52 => {
-                vot_proof_sha256::verify(
-                    &subject.root,
-                    subject.length,
-                    covered_offset,
-                    data.as_ref(),
-                    proof,
-                )
-                .map_err(|_| Error::ProofInvalid)?;
-            }
-        }
-        // Checked after the proof, so a bundle that does not verify against the
-        // subject root is refused rather than accepted as a replay.
         if replay {
             if staging_reserved {
                 self.staging.release(bytes);
@@ -295,6 +277,50 @@ impl ReliableReceiver {
         Ok(())
     }
 
+    /// Checks a decoded proof bundle without touching receiver state.
+    ///
+    /// Pure, which is what lets a caller spread verification across threads:
+    /// the returned witness carries the verified bytes and can only be built
+    /// here, so [`Self::admit_verified_range`] books it without holding the
+    /// proof again. Staging is not consulted; what a caller holds between
+    /// verifying and admitting is that caller's own bound to keep.
+    ///
+    /// # Errors
+    /// Rejects identity conflicts, duplicate or missing records, unsupported
+    /// compression, and proof or range failures.
+    pub fn verify_typed_bundle(
+        subject: SubjectId,
+        bundle: &vot_codec::frames::ProofBundle,
+        records: &[vot_codec::frames::DataRecord],
+    ) -> Result<VerifiedRange, Error> {
+        let ordered = validate_typed_bundle(subject, bundle, records)?;
+        let data = assemble_ordered(bundle, &ordered)?;
+        check_range_proof(subject, bundle.covered_offset, &data, &bundle.proof)?;
+        Ok(VerifiedRange {
+            subject,
+            covered_offset: bundle.covered_offset,
+            data,
+        })
+    }
+
+    /// Books a range [`Self::verify_typed_bundle`] already proved.
+    ///
+    /// # Errors
+    /// Rejects an unknown subject, an overlap with an accepted range, a
+    /// conflicting duplicate, or a staging budget the range does not fit.
+    pub fn admit_verified_range(&mut self, range: VerifiedRange) -> Result<(), Error> {
+        let admitted = self.insert_checked_range(
+            range.subject,
+            range.covered_offset,
+            Cow::Owned(range.data),
+            false,
+        );
+        if admitted.is_ok() {
+            self.peak_staging = self.peak_staging.max(self.staging.used());
+        }
+        admitted
+    }
+
     /// Accepts a decoded proof bundle whose records may arrive out of order.
     ///
     /// The bundle proof authenticates the complete covered range. Records are
@@ -310,47 +336,12 @@ impl ReliableReceiver {
         bundle: &vot_codec::frames::ProofBundle,
         records: &[vot_codec::frames::DataRecord],
     ) -> Result<(), Error> {
-        bundle.validate().map_err(|_| Error::ProofInvalid)?;
-        if bundle.object.suite != subject.suite
-            || bundle.object.root != subject.root
-            || bundle.object.length != subject.length
-            || bundle.data_record_count != records.len() as u64
-        {
-            return Err(Error::LengthMismatch);
-        }
-        let mut ordered = BTreeMap::new();
-        for record in records {
-            record.validate().map_err(|_| Error::ProofInvalid)?;
-            if record.bundle_id != bundle.bundle_id {
-                return Err(Error::ProofInvalid);
-            }
-            if record.compression != 0 {
-                return Err(Error::UnsupportedCompression);
-            }
-            if ordered.insert(record.record_index, record).is_some() {
-                return Err(Error::LengthMismatch);
-            }
-        }
+        let ordered = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = bundle.covered_length;
-        let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
         self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         let result = (|| {
-            let mut data = Vec::with_capacity(capacity);
-            for index in 0..bundle.data_record_count {
-                let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
-                let expected_offset = bundle
-                    .covered_offset
-                    .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
-                    .ok_or(Error::LengthExceeded)?;
-                if record.plaintext_offset != expected_offset {
-                    return Err(Error::LengthMismatch);
-                }
-                data.extend_from_slice(&record.encoded);
-            }
-            if data.len() as u64 != covered_bytes {
-                return Err(Error::LengthMismatch);
-            }
+            let data = assemble_ordered(bundle, &ordered)?;
             self.receive_verified_range_owned(subject, bundle.covered_offset, data, &bundle.proof)
         })();
         if result.is_err() {
@@ -484,6 +475,135 @@ impl ReliableReceiver {
     pub fn connection_count(&self) -> usize {
         self.connections.len()
     }
+}
+
+/// A range whose proof has held against its subject's root.
+///
+/// Only [`ReliableReceiver::verify_typed_bundle`] builds one, so holding a
+/// value of this type is holding the verification itself; admission books
+/// the bytes without seeing the proof again.
+#[derive(Debug)]
+pub struct VerifiedRange {
+    subject: SubjectId,
+    covered_offset: u64,
+    data: Vec<u8>,
+}
+
+impl VerifiedRange {
+    /// The verified bytes this range carries.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    /// Whether the range carries nothing, which verification never produces.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+/// Checks a bundle's identity against its subject and orders its records.
+///
+/// The one place both bundle paths ask these questions, so a drifted check
+/// would drift for both and the same tests hold either.
+fn validate_typed_bundle<'records>(
+    subject: SubjectId,
+    bundle: &vot_codec::frames::ProofBundle,
+    records: &'records [vot_codec::frames::DataRecord],
+) -> Result<BTreeMap<u64, &'records vot_codec::frames::DataRecord>, Error> {
+    bundle.validate().map_err(|_| Error::ProofInvalid)?;
+    if bundle.object.suite != subject.suite
+        || bundle.object.root != subject.root
+        || bundle.object.length != subject.length
+        || bundle.data_record_count != records.len() as u64
+    {
+        return Err(Error::LengthMismatch);
+    }
+    let mut ordered = BTreeMap::new();
+    for record in records {
+        record.validate().map_err(|_| Error::ProofInvalid)?;
+        if record.bundle_id != bundle.bundle_id {
+            return Err(Error::ProofInvalid);
+        }
+        if record.compression != 0 {
+            return Err(Error::UnsupportedCompression);
+        }
+        if ordered.insert(record.record_index, record).is_some() {
+            return Err(Error::LengthMismatch);
+        }
+    }
+    Ok(ordered)
+}
+
+/// Reassembles ordered records into the bundle's covered bytes.
+fn assemble_ordered(
+    bundle: &vot_codec::frames::ProofBundle,
+    ordered: &BTreeMap<u64, &vot_codec::frames::DataRecord>,
+) -> Result<Vec<u8>, Error> {
+    let covered_bytes = bundle.covered_length;
+    let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
+    let mut data = Vec::with_capacity(capacity);
+    for index in 0..bundle.data_record_count {
+        let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
+        let expected_offset = bundle
+            .covered_offset
+            .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
+            .ok_or(Error::LengthExceeded)?;
+        if record.plaintext_offset != expected_offset {
+            return Err(Error::LengthMismatch);
+        }
+        data.extend_from_slice(&record.encoded);
+    }
+    if data.len() as u64 != covered_bytes {
+        return Err(Error::LengthMismatch);
+    }
+    Ok(data)
+}
+
+/// Holds a range's bounds and its proof against the subject's root.
+///
+/// Pure: nothing here reads or writes receiver state, which is what lets a
+/// caller run it on any thread and admit the result on the one that owns
+/// the receiver.
+///
+/// # Errors
+/// Rejects a range outside the subject, off the 64 KiB unit grid other than
+/// at the object's end, oversized or empty, or whose proof does not hold.
+fn check_range_proof(
+    subject: SubjectId,
+    covered_offset: u64,
+    data: &[u8],
+    proof: &[u8],
+) -> Result<(), Error> {
+    let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
+    if bytes == 0 || bytes > MAX_PROOF_RANGE_BYTES {
+        return Err(Error::RecordTooLarge);
+    }
+    let covered_end = covered_offset
+        .checked_add(bytes)
+        .ok_or(Error::LengthExceeded)?;
+    if covered_offset % RANGE_UNIT_BYTES != 0 || covered_end > subject.length {
+        return Err(Error::LengthExceeded);
+    }
+    // A range covers whole 64 KiB units unless it ends the object, the same
+    // rule `PROOF_BUNDLE` validation applies on the wire. Both proof suites
+    // enforce it too, but stating it here is what lets completion be decided
+    // from the accepted byte total alone.
+    if covered_end < subject.length && bytes % RANGE_UNIT_BYTES != 0 {
+        return Err(Error::LengthExceeded);
+    }
+    match suite(subject.suite)? {
+        Suite::Blake3Bao64 => {
+            vot_proof_blake3::verify(&subject.root, subject.length, covered_offset, data, proof)
+                .map_err(|_| Error::ProofInvalid)?;
+        }
+        Suite::Sha256Bep52 => {
+            vot_proof_sha256::verify(&subject.root, subject.length, covered_offset, data, proof)
+                .map_err(|_| Error::ProofInvalid)?;
+        }
+    }
+    Ok(())
 }
 
 fn suite(id: u16) -> Result<Suite, Error> {
@@ -1177,6 +1297,91 @@ mod tests {
             duplicate_receiver.advertised_credit(),
             credit_before_duplicate
         );
+    }
+
+    #[test]
+    fn a_witness_verifies_off_thread_and_admits_on_it() {
+        // The two-phase surface: verification is pure and can run anywhere;
+        // admission books what the witness proves without seeing the proof
+        // again, and refuses what verification never touched.
+        let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
+        let subject = SubjectId {
+            suite: 1,
+            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            length: bytes.len() as u64,
+        };
+        let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
+        let bundle = vot_codec::frames::ProofBundle {
+            request_id: [3; 16],
+            bundle_id: [4; 16],
+            object: vot_codec::frames::ObjectId {
+                suite: subject.suite,
+                root: subject.root,
+                length: subject.length,
+            },
+            requested_offset: 0,
+            requested_length: subject.length,
+            covered_offset: proof.covered_offset,
+            covered_length: proof.data.len() as u64,
+            data_record_count: 1,
+            total_plaintext_length: proof.data.len() as u64,
+            proof: proof.proof,
+        };
+        let records = [vot_codec::frames::DataRecord {
+            bundle_id: [4; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: bytes.len() as u64,
+            compression: 0,
+            encoded: bytes.clone(),
+        }];
+
+        // Verified on another thread, as the parallel receiver runs it.
+        let range = std::thread::scope(|scope| {
+            scope
+                .spawn(|| ReliableReceiver::verify_typed_bundle(subject, &bundle, &records))
+                .join()
+                .expect("a verifier thread")
+        })
+        .expect("a verified range");
+        assert_eq!(range.len(), bytes.len() as u64);
+        assert!(!range.is_empty());
+
+        let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
+        let mut receiver =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        receiver.begin_ranges(subject).unwrap();
+        let credit_before = receiver.advertised_credit();
+        receiver.admit_verified_range(range).unwrap();
+        assert!(
+            receiver.advertised_credit() < credit_before,
+            "admission never charged staging"
+        );
+        receiver.finish_ranges(subject).unwrap();
+        assert!(receiver.is_verified(subject));
+
+        // A corrupt payload never becomes a witness.
+        let mut bad_records = records.to_vec();
+        bad_records[0].encoded[0] ^= 1;
+        assert!(matches!(
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &bad_records),
+            Err(Error::ProofInvalid)
+        ));
+
+        // A witness for a subject no receiver opened is refused at admission.
+        let stray = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+        let mut closed =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        assert!(matches!(
+            closed.admit_verified_range(stray),
+            Err(Error::UnknownObject)
+        ));
+
+        // A replayed witness changes nothing, the duplicate rule ranges keep.
+        let again = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+        let credit_verified = receiver.advertised_credit();
+        receiver.admit_verified_range(again).unwrap();
+        assert_eq!(receiver.advertised_credit(), credit_verified);
     }
 
     #[test]

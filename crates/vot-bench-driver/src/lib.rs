@@ -695,9 +695,9 @@ struct BundleReassembly {
     completed: u64,
 }
 
-struct PendingBundle {
-    bundle: vot_codec::frames::ProofBundle,
-    records: Vec<vot_codec::frames::DataRecord>,
+pub(crate) struct PendingBundle {
+    pub(crate) bundle: vot_codec::frames::ProofBundle,
+    pub(crate) records: Vec<vot_codec::frames::DataRecord>,
 }
 
 impl BundleReassembly {
@@ -721,6 +721,23 @@ impl BundleReassembly {
         subject: SubjectId,
         frame: &[u8],
     ) -> Result<u64, Error> {
+        let Some(whole) = self.take(frame)? else {
+            return Ok(0);
+        };
+        let covered = whole.bundle.covered_length;
+        receiver.receive_typed_bundle(subject, &whole.bundle, &whole.records)?;
+        Ok(covered)
+    }
+
+    /// Feeds one delivered frame, returning the bundle it completed, if any.
+    ///
+    /// The verify half is the caller's: this only reassembles, so a spine
+    /// that spreads verification across threads takes whole bundles here and
+    /// admits what its verifiers prove.
+    ///
+    /// # Errors
+    /// The same refusals as [`Self::accept`], without the receiver's.
+    fn take(&mut self, frame: &[u8]) -> Result<Option<PendingBundle>, Error> {
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: 0,
             max_frames: 1,
@@ -743,7 +760,7 @@ impl BundleReassembly {
                 if self.pending.insert(identifier, opened).is_some() {
                     return Err(Error::Corrupt);
                 }
-                Ok(0)
+                Ok(None)
             }
             vot_codec::frames::TypedFrame::DataRecord(record) => {
                 let identifier = record.bundle_id;
@@ -752,15 +769,13 @@ impl BundleReassembly {
                 };
                 pending.records.push(record);
                 if (pending.records.len() as u64) < pending.bundle.data_record_count {
-                    return Ok(0);
+                    return Ok(None);
                 }
                 let Some(whole) = self.pending.remove(&identifier) else {
                     return Err(Error::Corrupt);
                 };
-                let covered = whole.bundle.covered_length;
-                receiver.receive_typed_bundle(subject, &whole.bundle, &whole.records)?;
                 self.completed = self.completed.saturating_add(1);
-                Ok(covered)
+                Ok(Some(whole))
             }
             _ => Err(Error::Corrupt),
         }

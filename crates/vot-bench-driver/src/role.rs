@@ -147,6 +147,104 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
     }
 }
 
+/// How long a rail's accept may wait once every port is bound.
+const ROLE_RAIL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the backend can bind a listener without waiting on its handshake.
+fn binds_before_accepting(config: &Config) -> bool {
+    config.backend.as_str() == "quiche"
+}
+
+/// Binds a listening endpoint without waiting for its handshake.
+#[cfg(feature = "quiche")]
+fn bound_listener(config: &Config, listen: SocketAddr) -> Result<Endpoint, Error> {
+    crate::backend_quiche::role_listen_bound(config, listen)
+}
+
+#[cfg(not(feature = "quiche"))]
+fn bound_listener(_config: &Config, _listen: SocketAddr) -> Result<Endpoint, Error> {
+    Err(Error::Unsupported(
+        "no backend in this build binds before accepting".to_owned(),
+    ))
+}
+
+/// Waits for a bound endpoint to report its accepted connection.
+///
+/// Anything polled before the connection is discarded, which is safe only
+/// because the sending half submits nothing until every rail is connected;
+/// this wait leans on that gate rather than enforcing one.
+fn wait_connected(
+    adapter: &mut dyn TransportAdapter,
+    timeout: std::time::Duration,
+) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        adapter.flush().map_err(Error::Transport)?;
+        while let Some(event) = adapter.poll() {
+            if matches!(event, Event::Connected(_)) {
+                return Ok(());
+            }
+        }
+        adapter.wait_for_event(std::time::Duration::from_millis(1));
+    }
+    Err(Error::Handshake)
+}
+
+/// Sends the done marker on rail zero and stays reachable while it leaves.
+fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
+    let mut marker = Vec::new();
+    vot_codec::encode_frame(
+        vot_codec::frame_type::DATA_RECORD,
+        DONE_PAYLOAD,
+        &mut marker,
+    )
+    .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
+    adapter.send_reliable_shared(DONE_LANE, shared_payload(&marker))?;
+    adapter.flush()?;
+    linger(adapter);
+    Ok(())
+}
+
+/// Accepts every rail's connection and starts the transfer clock.
+///
+/// Every rail binds before any handshake starts where the backend allows
+/// it, or the sender's next Initial races the next bind and pays a full
+/// no-sample probe timeout when it loses. Either way the clock starts at
+/// the first accepted connection, the sequential half's accounting, and
+/// the sibling rails' handshakes run inside it.
+#[expect(clippy::type_complexity, reason = "the clock rides with what it times")]
+fn accept_rails(
+    config: &Config,
+    base: SocketAddr,
+    workers: usize,
+) -> Result<(Vec<Endpoint>, Option<(u64, u64)>, Instant), Error> {
+    let mut endpoints = Vec::with_capacity(workers);
+    let cpu_before;
+    let started;
+    if binds_before_accepting(config) {
+        for rail in 0..workers {
+            endpoints.push(bound_listener(config, rail_address(base, rail)?)?);
+        }
+        wait_connected(endpoints[0].adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
+        cpu_before = cpu_times_ns();
+        started = Instant::now();
+        for endpoint in endpoints.iter_mut().skip(1) {
+            wait_connected(endpoint.adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
+        }
+    } else {
+        // A backend whose listener accepts inside construction carries the
+        // bind race serially; the race and its cost stay visible here
+        // rather than being hidden outside the clock.
+        endpoints.push(listen_endpoint(config, base)?);
+        cpu_before = cpu_times_ns();
+        started = Instant::now();
+        for rail in 1..workers {
+            endpoints.push(listen_endpoint(config, rail_address(base, rail)?)?);
+        }
+    }
+    Ok((endpoints, cpu_before, started))
+}
+
 /// The address rail `rail` uses: the configured port plus the rail's index.
 fn rail_address(base: SocketAddr, rail: usize) -> Result<SocketAddr, Error> {
     let offset = u16::try_from(rail).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?;
@@ -381,7 +479,12 @@ fn submit_ranges(
                     break;
                 }
             }
-            for rail in 0..workers {
+            // The scan's first rail rotates, because the stock rarely holds
+            // more than a group or two and whoever is scanned first with an
+            // empty queue takes it: a fixed order fed one rail nearly the
+            // whole object while the last never carried a byte.
+            for step in 0..workers {
+                let rail = (usize::try_from(tally.rounds).unwrap_or(0) + step) % workers;
                 if queued[rail].is_empty() {
                     if let Some(group) = ready.pop_front() {
                         queued[rail].extend(group);
@@ -507,12 +610,12 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     receiver.begin_ranges(subject)?;
     let mut reassembly = BundleReassembly::new(workers);
 
-    let mut endpoints = vec![listen_endpoint(config, base)?];
-    let cpu_before = cpu_times_ns();
-    let started = std::time::Instant::now();
-    for rail in 1..workers {
-        endpoints.push(listen_endpoint(config, rail_address(base, rail)?)?);
-    }
+    // Every rail binds before any handshake starts where the backend allows
+    // it, or the sender's next Initial races the next bind and pays a full
+    // no-sample probe timeout when it loses. Either way the clock starts at
+    // the first accepted connection, the sequential half's accounting, and
+    // the sibling rails' handshakes run inside it.
+    let (mut endpoints, cpu_before, started) = accept_rails(config, base, workers)?;
     let mut credit = Credit::Constructed;
     for endpoint in &mut endpoints {
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
@@ -571,18 +674,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         ));
     }
 
-    let mut marker = Vec::new();
-    vot_codec::encode_frame(
-        vot_codec::frame_type::DATA_RECORD,
-        DONE_PAYLOAD,
-        &mut marker,
-    )
-    .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
-    endpoints[0]
-        .adapter
-        .send_reliable_shared(DONE_LANE, shared_payload(&marker))?;
-    endpoints[0].adapter.flush()?;
-    linger(endpoints[0].adapter.as_mut());
+    tell_the_sender(endpoints[0].adapter.as_mut())?;
 
     let mut notes = role_notes(
         "receive",

@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use vot_scheduler::{DiscardSink, ReliableReceiver};
+use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{
     Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
 };
@@ -728,7 +728,8 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let workers = config.workers;
     let subject = subject_of(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
+    let (sink, sink_handle) = crate::sink_for(config)?;
+    receiver.begin_ranges(subject, sink)?;
     let mut reassembly = BundleReassembly::new(workers);
 
     // Every rail binds before any handshake starts where the backend allows
@@ -824,6 +825,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
             witnesses.peak()
         );
     }
+    crate::sink_note(sink_handle.as_deref(), &mut notes)?;
     note_rail_paths(&mut endpoints, &mut notes);
     Ok(Measurement {
         bytes_sent: 0,
@@ -997,6 +999,7 @@ mod tests {
             object_bytes,
             record_bytes: 65_536,
             rails: Rails::Shared,
+            sink: crate::SinkChoice::Discard,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,
@@ -1133,7 +1136,12 @@ mod tests {
         config.workers = 2;
         config.rails = Rails::Provisioned;
         let base = free_rail_base(1);
-        let far_config = config.clone();
+        // The receiving half runs ram-to-disk, so this covers the role
+        // path's sink registration and the sync-after-clock flow.
+        let sink_path =
+            std::env::temp_dir().join(format!("vot-role-sink-{}.bin", std::process::id()));
+        let mut far_config = config.clone();
+        far_config.sink = crate::SinkChoice::File(sink_path.clone());
         let far_half =
             std::thread::spawn(move || super::receive_ranged(&far_config, base).unwrap());
         let generator_ns = crate::generator_nanos(&config).unwrap();
@@ -1158,5 +1166,17 @@ mod tests {
         assert!(sent.notes.contains("rail0_lost="), "{}", sent.notes);
         assert!(sent.notes.contains("rail0_spurious="), "{}", sent.notes);
         assert!(received.notes.contains("bundles="), "{}", received.notes);
+        assert!(
+            received.notes.contains(";sink=file;sync_ns="),
+            "{}",
+            received.notes
+        );
+        // The file is the object, which is the whole point of the sink.
+        let written = std::fs::read(&sink_path).unwrap();
+        let _ = std::fs::remove_file(&sink_path);
+        let mut expected = Vec::new();
+        crate::ObjectSource::new(config.seed)
+            .fill(&mut expected, usize::try_from(config.object_bytes).unwrap());
+        assert!(written == expected, "the sink file is not the object");
     }
 }

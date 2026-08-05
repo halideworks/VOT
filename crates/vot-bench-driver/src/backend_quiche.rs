@@ -406,6 +406,7 @@ mod tests {
             object_bytes,
             record_bytes: 65_536,
             rails: Rails::Shared,
+            sink: crate::SinkChoice::Discard,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,

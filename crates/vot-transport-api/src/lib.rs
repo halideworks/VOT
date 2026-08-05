@@ -122,6 +122,10 @@ pub struct PathStats {
     pub mtu_bytes: Option<u64>,
     /// Current pacing rate in bits per second, when available.
     pub pacing_rate_bps: Option<u64>,
+    /// Packets the sender declared lost over the connection's life, when the
+    /// engine counts them. The congestion story a throughput number needs:
+    /// a low rate with losses is a path problem, without them a source one.
+    pub lost_packets: Option<u64>,
 }
 
 /// A latched doorbell for [`TransportAdapter::wait_for_event`].

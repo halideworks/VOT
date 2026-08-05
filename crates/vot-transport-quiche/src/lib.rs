@@ -676,6 +676,7 @@ mod tests {
             congestion_window_bytes: Some(65_536),
             mtu_bytes: Some(1_350),
             pacing_rate_bps: Some(1_000_000),
+            lost_packets: None,
         };
         adapter.record_path_stats(ConnectionId(1), sample);
         assert_eq!(adapter.path_stats(), Some(sample));

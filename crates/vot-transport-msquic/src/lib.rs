@@ -383,6 +383,7 @@ pub mod live {
             congestion_window_bytes: measured(u64::from(statistics.SendCongestionWindow)),
             mtu_bytes: measured(u64::from(statistics.SendPathMtu)),
             pacing_rate_bps: None,
+            lost_packets: Some(statistics.SendSuspectedLostPackets),
         }
     }
 
@@ -4964,6 +4965,7 @@ mod tests {
             congestion_window_bytes: Some(1_048_576),
             mtu_bytes: Some(1350),
             pacing_rate_bps: None,
+            lost_packets: None,
         };
         adapter.record_path_stats(ConnectionId(7), sample);
         assert_eq!(adapter.path_stats(), Some(sample));

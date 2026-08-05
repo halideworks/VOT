@@ -1224,6 +1224,23 @@ struct Tally {
     cpu: Option<(u64, u64)>,
 }
 
+impl Tally {
+    /// Folds another tally's counters in; CPU stays the caller's to set,
+    /// because it is a process total rather than a per-thread one. The rails
+    /// in the role module are its only caller, but it compiles everywhere so
+    /// the featureless mutation gate measures it.
+    #[cfg_attr(not(any(feature = "msquic", feature = "quiche")), allow(dead_code))]
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.flushes = self.flushes.saturating_add(other.flushes);
+        self.backpressure_waits = self
+            .backpressure_waits
+            .saturating_add(other.backpressure_waits);
+        self.idle_waits = self.idle_waits.saturating_add(other.idle_waits);
+        self.wire_bytes = self.wire_bytes.saturating_add(other.wire_bytes);
+        self.rounds = self.rounds.max(other.rounds);
+    }
+}
+
 /// What the timed section spent, from two readings of the process total.
 ///
 /// `None` unless both readings were taken, because a difference against a
@@ -1926,8 +1943,9 @@ mod test_guard {
 mod tests {
     use super::{
         Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, Rails,
-        SimulatorCarrier, StreamId, TransportAdapter, escape, measure, note_cycles, parse_vm_hwm,
-        record_lengths, record_payload, shared_payload, transfer_ranged, transfer_within,
+        SimulatorCarrier, StreamId, Tally, TransportAdapter, escape, measure, note_cycles,
+        parse_vm_hwm, record_lengths, record_payload, shared_payload, transfer_ranged,
+        transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
     use vot_transport_api::Event;
@@ -3340,6 +3358,39 @@ mod tests {
         assert_eq!(
             super::parse_cpu_times("7 (driver) R 1 7 7 0 -1 0 0 0 0 0 x 13 0 0 20 0 1 0 9"),
             None
+        );
+    }
+
+    #[test]
+    fn a_merged_tally_sums_counters_and_keeps_the_widest_rounds() {
+        let mut tally = Tally {
+            flushes: 1,
+            backpressure_waits: 2,
+            idle_waits: 3,
+            wire_bytes: 4,
+            rounds: 5,
+            cpu: Some((6, 7)),
+        };
+        tally.merge(&Tally {
+            flushes: 10,
+            backpressure_waits: 20,
+            idle_waits: 30,
+            wire_bytes: 40,
+            rounds: 2,
+            cpu: Some((1, 1)),
+        });
+        // Rounds share one budget across rails, so the widest count stands
+        // rather than a sum; CPU is a process total the caller sets.
+        assert_eq!(
+            tally,
+            Tally {
+                flushes: 11,
+                backpressure_waits: 22,
+                idle_waits: 33,
+                wire_bytes: 44,
+                rounds: 5,
+                cpu: Some((6, 7)),
+            }
         );
     }
 

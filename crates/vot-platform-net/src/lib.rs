@@ -147,6 +147,105 @@ fn refuse_fragmentation_windows(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
+/// Asks the kernel for socket buffers of at least these sizes, in bytes.
+///
+/// A datagram socket's default receive buffer is a few burst's worth on
+/// most platforms and one segmentation-offload burst's worth on Windows,
+/// so a receiver descheduled for a scheduling quantum sheds packets it had
+/// room for everywhere but the socket. Loss shed here reads as path
+/// congestion to the peer and halves its window, which is how a 64 KiB
+/// default quietly caps a ten-gigabit flow.
+///
+/// # Errors
+/// Returns the operating-system error when a size cannot be set.
+pub fn size_buffers(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        size_buffers_unix(socket, receive_bytes, send_bytes)
+    }
+    #[cfg(windows)]
+    {
+        size_buffers_windows(socket, receive_bytes, send_bytes)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (socket, receive_bytes, send_bytes);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+fn size_buffers_unix(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    fn set(fd: i32, option: i32, bytes: u32) -> io::Result<()> {
+        let value = libc::c_int::try_from(bytes)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let length = libc::socklen_t::try_from(size_of::<libc::c_int>())
+            .expect("an int's length fits its own kind");
+        // SAFETY: the descriptor is owned by the borrowed socket for the whole
+        // call, and the pointer and length describe the one int this option
+        // takes.
+        let result = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const value).cast(),
+                length,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    let fd = socket.as_raw_fd();
+    set(fd, libc::SO_RCVBUF, receive_bytes)?;
+    set(fd, libc::SO_SNDBUF, send_bytes)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn size_buffers_windows(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock;
+
+    fn set(handle: usize, option: i32, bytes: u32) -> io::Result<()> {
+        let value =
+            i32::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let length = i32::try_from(size_of::<i32>()).expect("an int's length fits its own kind");
+        // SAFETY: the handle is owned by the borrowed socket for the whole
+        // call, and the pointer and length describe the one int this option
+        // takes.
+        let result = unsafe {
+            WinSock::setsockopt(
+                handle,
+                WinSock::SOL_SOCKET,
+                option,
+                (&raw const value).cast(),
+                length,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            // SAFETY: reading the calling thread's last WinSock error takes no
+            // arguments and touches no memory of ours.
+            Err(io::Error::from_raw_os_error(unsafe {
+                WinSock::WSAGetLastError()
+            }))
+        }
+    }
+
+    let handle = usize::try_from(socket.as_raw_socket()).expect("a socket handle is one word");
+    set(handle, WinSock::SO_RCVBUF, receive_bytes)?;
+    set(handle, WinSock::SO_SNDBUF, send_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::refuse_fragmentation;
@@ -173,6 +272,50 @@ mod tests {
         };
         assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
         value
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn sized_buffers_grow_toward_what_was_asked() {
+        // Kernels clamp to their own ceilings rather than erroring, Linux at
+        // net.core.rmem_max, so the honest assertion is strict growth over the
+        // default, or a value already meeting the request, and a floor every
+        // platform grants. Strict, because Linux doubles whatever it accepts
+        // for bookkeeping, so on stock defaults even a clamped request moves
+        // the value and a call that changed nothing did nothing; the request
+        // arm is for a tuned host whose default is already the doubled
+        // request, where an unchanged value is adequacy rather than a stub.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let read = |socket: &UdpSocket, option: i32| read_option(socket, libc::SOL_SOCKET, option);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (receive_option, send_option) = (libc::SO_RCVBUF, libc::SO_SNDBUF);
+        #[cfg(windows)]
+        let read = |socket: &UdpSocket, option: i32| {
+            use windows_sys::Win32::Networking::WinSock;
+            read_option(socket, WinSock::SOL_SOCKET, option)
+        };
+        #[cfg(windows)]
+        let (receive_option, send_option) = {
+            use windows_sys::Win32::Networking::WinSock;
+            (WinSock::SO_RCVBUF, WinSock::SO_SNDBUF)
+        };
+        let (receive_request, send_request) = (4u32 * 1024 * 1024, 2u32 * 1024 * 1024);
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        let receive_before = read(&socket, receive_option);
+        let send_before = read(&socket, send_option);
+        super::size_buffers(&socket, receive_request, send_request).expect("the sizes");
+        let receive = read(&socket, receive_option);
+        let send = read(&socket, send_option);
+        assert!(
+            (receive > receive_before || i64::from(receive) >= i64::from(receive_request))
+                && receive >= 200 * 1024,
+            "receive buffer {receive} from {receive_before}"
+        );
+        assert!(
+            (send > send_before || i64::from(send) >= i64::from(send_request))
+                && send >= 200 * 1024,
+            "send buffer {send} from {send_before}"
+        );
     }
 
     #[cfg(target_os = "linux")]

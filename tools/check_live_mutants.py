@@ -27,8 +27,9 @@ SURVIVOR = re.compile(r"^(MISSED|TIMEOUT)\b")
 TIMING = re.compile(r" in \d+(\.\d+)?s build \+ .*$")
 # A table row whose first cell is the mutant `cargo-mutants` prints.
 CLASSIFIED = re.compile(r"^\|\s*`([^`]+)`\s*\|")
-# `265 mutants tested in 9m: 13 missed, 219 caught, 31 unviable, 2 timeouts`
-SUMMARY = re.compile(r"^\d+ mutants tested\b")
+# `265 mutants tested in 9m: 13 missed, 219 caught, 31 unviable, 2 timeouts`,
+# and a one-mutant run says `1 mutant tested`.
+SUMMARY = re.compile(r"^\d+ mutants? tested\b")
 # What it says instead when the diff selected nothing to run.
 NOTHING_SELECTED = ("No mutants to filter", "Diff changes no Rust source files")
 

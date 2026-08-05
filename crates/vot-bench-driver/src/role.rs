@@ -58,6 +58,16 @@ const DONE_LANE: StreamId = StreamId(2);
 /// What the marker says. The content is never verified; arriving is the signal.
 const DONE_PAYLOAD: &[u8] = b"verified";
 
+/// The bound a multi-rail spine sleeps on when a round makes no progress.
+///
+/// The sequential half escalates its idle wait because its one connection's
+/// signal is the only wake it needs. A spine over W rails can only wait on
+/// one rail's signal while any rail's arrival is progress, so a long bound
+/// turns every wait on the wrong rail into a stall of the whole spine, and
+/// the odds of the wrong rail are (W-1)/W. A small fixed bound caps that
+/// stall; the rounds budget still bounds the loop.
+const RAIL_IDLE_WAIT: std::time::Duration = std::time::Duration::from_micros(250);
+
 /// Rounds the receiver stays reachable after sending the done marker, at
 /// [`LINGER_WAIT`] a round, so the marker and its retransmissions have a live
 /// socket to leave from. The sender's exit usually ends this early as a
@@ -286,6 +296,130 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
     })
 }
 
+/// Drives the producers and the submit spine for [`send_ranged`].
+///
+/// Returns the object bytes handed to the carriers; `done` is raised if the
+/// receiver's marker arrives while frames are still being submitted.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the spine borrows what the send half owns and nothing more"
+)]
+fn submit_ranges(
+    config: &Config,
+    endpoints: &mut [Endpoint],
+    ranges: &[crate::WorkerRange],
+    layer: &std::sync::Arc<crate::ProverLayer>,
+    subject: SubjectId,
+    budget: u64,
+    tally: &mut Tally,
+    done: &mut bool,
+) -> Result<u64, Error> {
+    let workers = config.workers;
+    let mut bytes_sent = 0_u64;
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let mut channels = Vec::with_capacity(workers);
+        for (index, range) in ranges.iter().enumerate() {
+            let (sender, frames) =
+                std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
+            let mut producer = BundleProducer::new(
+                config,
+                std::sync::Arc::clone(layer),
+                subject,
+                *range,
+                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
+            )?;
+            channels.push(frames);
+            scope.spawn(move || {
+                while let Some(bundle) = producer.next_bundle() {
+                    let failed = bundle.is_err();
+                    if sender.send(bundle).is_err() {
+                        return;
+                    }
+                    if failed {
+                        return;
+                    }
+                }
+            });
+        }
+
+        // A rail is not a worker's: any whole bundle rides any rail, so a
+        // fast rail takes more of the object and a slow one bounds nothing
+        // but its own share. The reassembly keys bundles by identifier and a
+        // bundle's frames stay together on one lane, which is the only order
+        // the receive side needs. The central stock holds at most one group
+        // per worker beyond what the rails are carrying, so producers stay
+        // bounded by their channels.
+        let mut ready: std::collections::VecDeque<Vec<RangedFrame>> =
+            std::collections::VecDeque::new();
+        let mut queued: Vec<std::collections::VecDeque<RangedFrame>> = (0..workers)
+            .map(|_| std::collections::VecDeque::new())
+            .collect();
+        let mut submitted = 0_u64;
+        while submitted < config.object_bytes {
+            tally.rounds = tally.rounds.saturating_add(1);
+            if tally.rounds > budget {
+                return Err(Error::Stalled);
+            }
+            let mut progress = false;
+            while ready.len() < workers {
+                let mut pulled = false;
+                for channel in &channels {
+                    match channel.try_recv() {
+                        Ok(Ok(frames)) => {
+                            ready.push_back(frames);
+                            pulled = true;
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(
+                            std::sync::mpsc::TryRecvError::Empty
+                            | std::sync::mpsc::TryRecvError::Disconnected,
+                        ) => {}
+                    }
+                }
+                if !pulled {
+                    break;
+                }
+            }
+            for rail in 0..workers {
+                if queued[rail].is_empty() {
+                    if let Some(group) = ready.pop_front() {
+                        queued[rail].extend(group);
+                    }
+                }
+                let adapter = endpoints[rail].adapter.as_mut();
+                while let Some((frame, plaintext)) = queued[rail].front() {
+                    match adapter.send_reliable_shared(TRANSFER_LANE, Payload::clone(frame)) {
+                        Ok(()) => {
+                            bytes_sent = bytes_sent.saturating_add(*plaintext);
+                            submitted = submitted.saturating_add(*plaintext);
+                            tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
+                            queued[rail].pop_front();
+                            progress = true;
+                        }
+                        Err(vot_transport_api::Error::OutboundQueueFull) => {
+                            tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
+                            break;
+                        }
+                        Err(other) => return Err(Error::Transport(other)),
+                    }
+                }
+            }
+            for endpoint in endpoints.iter_mut() {
+                tally.flushes = tally.flushes.saturating_add(1);
+                endpoint.adapter.flush()?;
+                drain_sender(endpoint.adapter.as_mut(), done)?;
+            }
+            if !progress {
+                tally.idle_waits = tally.idle_waits.saturating_add(1);
+                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
+                endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(bytes_sent)
+}
+
 /// Submits the object's ranges over one connection per worker, then waits for
 /// the receiver's done marker.
 ///
@@ -306,91 +440,20 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
         endpoints.push(connect_endpoint(config, rail_address(base, rail)?)?);
     }
     let mut tally = Tally::default();
-    let mut bytes_sent = 0_u64;
     let mut done = false;
 
     let cpu_before = cpu_times_ns();
     let started = std::time::Instant::now();
-    std::thread::scope(|scope| -> Result<(), Error> {
-        let mut channels = Vec::with_capacity(workers);
-        for (index, range) in ranges.iter().enumerate() {
-            let (sender, frames) =
-                std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
-            let mut producer = BundleProducer::new(
-                config,
-                std::sync::Arc::clone(&layer),
-                subject,
-                *range,
-                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
-            )?;
-            channels.push(frames);
-            scope.spawn(move || {
-                while let Some(bundle) = producer.next_bundle() {
-                    let failed = bundle.is_err();
-                    if sender.send(bundle).is_err() {
-                        return;
-                    }
-                    if failed {
-                        return;
-                    }
-                }
-            });
-        }
-
-        let mut queued: Vec<std::collections::VecDeque<RangedFrame>> = (0..workers)
-            .map(|_| std::collections::VecDeque::new())
-            .collect();
-        let mut submitted = 0_u64;
-        while submitted < config.object_bytes {
-            tally.rounds = tally.rounds.saturating_add(1);
-            if tally.rounds > budget {
-                return Err(Error::Stalled);
-            }
-            let mut progress = false;
-            for worker in 0..workers {
-                if queued[worker].is_empty() {
-                    match channels[worker].try_recv() {
-                        Ok(Ok(frames)) => queued[worker].extend(frames),
-                        Ok(Err(error)) => return Err(error),
-                        Err(
-                            std::sync::mpsc::TryRecvError::Empty
-                            | std::sync::mpsc::TryRecvError::Disconnected,
-                        ) => {}
-                    }
-                }
-                let adapter = endpoints[worker].adapter.as_mut();
-                while let Some((frame, plaintext)) = queued[worker].front() {
-                    match adapter.send_reliable_shared(TRANSFER_LANE, Payload::clone(frame)) {
-                        Ok(()) => {
-                            bytes_sent = bytes_sent.saturating_add(*plaintext);
-                            submitted = submitted.saturating_add(*plaintext);
-                            tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
-                            queued[worker].pop_front();
-                            progress = true;
-                        }
-                        Err(vot_transport_api::Error::OutboundQueueFull) => {
-                            tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
-                            break;
-                        }
-                        Err(other) => return Err(Error::Transport(other)),
-                    }
-                }
-            }
-            for endpoint in &mut endpoints {
-                tally.flushes = tally.flushes.saturating_add(1);
-                endpoint.adapter.flush()?;
-                drain_sender(endpoint.adapter.as_mut(), &mut done)?;
-            }
-            if !progress {
-                tally.idle_waits = tally.idle_waits.saturating_add(1);
-                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-                endpoints[rail]
-                    .adapter
-                    .wait_for_event(idle_wait(tally.idle_waits));
-            }
-        }
-        Ok(())
-    })?;
+    let bytes_sent = submit_ranges(
+        config,
+        &mut endpoints,
+        &ranges,
+        &layer,
+        subject,
+        budget,
+        &mut tally,
+        &mut done,
+    )?;
 
     // Every frame is with a carrier. The marker says the far end verified the
     // whole object across every rail, so the clock runs until it arrives.
@@ -408,16 +471,17 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
         if events == 0 && !done {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
             let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-            endpoints[rail]
-                .adapter
-                .wait_for_event(idle_wait(tally.idle_waits));
+            endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
         }
     }
     let elapsed = started.elapsed();
     tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
 
     let mut notes = role_notes("send", &endpoints[0], None, tally, Some(generator_ns));
-    notes.push_str(&format!(";workers={workers};rails=provisioned-multi-rail"));
+    {
+        use std::fmt::Write as _;
+        let _ = write!(notes, ";workers={workers};rails=provisioned-multi-rail");
+    }
     Ok(Measurement {
         bytes_sent,
         verified_bytes: 0,
@@ -464,7 +528,17 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         for endpoint in &mut endpoints {
             tally.flushes = tally.flushes.saturating_add(1);
             endpoint.adapter.flush()?;
-            while let Some(event) = endpoint.adapter.poll() {
+            // A bounded slice per rail per round, because draining one rail
+            // dry stalls every other: their queues sit full, their pumps
+            // pause reading, and their senders stall on flow control while
+            // this one is served. Interleaving keeps all rails' windows
+            // moving; the budget still bounds the outer loop.
+            let mut slice = 0_u32;
+            while slice < 256 {
+                slice += 1;
+                let Some(event) = endpoint.adapter.poll() else {
+                    break;
+                };
                 match event {
                     Event::Reliable { bytes, .. } => {
                         tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
@@ -483,9 +557,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         if progress == 0 {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
             let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-            endpoints[rail]
-                .adapter
-                .wait_for_event(idle_wait(tally.idle_waits));
+            endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
         }
     }
     receiver.finish_ranges(subject)?;
@@ -518,10 +590,14 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         tally,
         None,
     );
-    notes.push_str(&format!(
-        ";workers={workers};rails=provisioned-multi-rail;bundles={}",
-        reassembly.completed
-    ));
+    {
+        use std::fmt::Write as _;
+        let _ = write!(
+            notes,
+            ";workers={workers};rails=provisioned-multi-rail;bundles={}",
+            reassembly.completed
+        );
+    }
     Ok(Measurement {
         bytes_sent: 0,
         verified_bytes: config.object_bytes,
@@ -804,6 +880,7 @@ mod tests {
 
     /// A base whose next `extra` ports are also free, so consecutive rails
     /// can bind. Racy in principle, like `free_address`.
+    #[cfg(feature = "quiche")]
     fn free_rail_base(extra: u16) -> SocketAddr {
         loop {
             let base = free_address();

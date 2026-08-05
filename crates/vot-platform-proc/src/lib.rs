@@ -11,10 +11,27 @@ use std::io;
 /// platforms whose only source is a native call.
 ///
 /// # Errors
-/// Returns the operating-system error when the measurement cannot be taken.
+/// Returns the operating-system error when the measurement cannot be taken,
+/// and `Unsupported` where no native source exists; the caller owns saying a
+/// metric has no measured source rather than inventing a zero.
+pub fn peak_resident_bytes() -> io::Result<u64> {
+    #[cfg(windows)]
+    {
+        peak_resident_bytes_windows()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        peak_resident_bytes_macos()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub fn peak_resident_bytes() -> io::Result<u64> {
+fn peak_resident_bytes_windows() -> io::Result<u64> {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -45,13 +62,9 @@ pub fn peak_resident_bytes() -> io::Result<u64> {
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
 }
 
-/// Reads this process's peak resident memory, in bytes.
-///
-/// # Errors
-/// Returns the operating-system error when the measurement cannot be taken.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-pub fn peak_resident_bytes() -> io::Result<u64> {
+fn peak_resident_bytes_macos() -> io::Result<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: RUSAGE_SELF asks about this process, and the pointer names one
     // rusage the call fills before the return is inspected.
@@ -63,16 +76,6 @@ pub fn peak_resident_bytes() -> io::Result<u64> {
     let usage = unsafe { usage.assume_init() };
     // ru_maxrss is bytes on this platform, unlike Linux's kilobytes.
     u64::try_from(usage.ru_maxrss).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
-}
-
-/// This platform has no wrapper here; the caller owns saying the metric has no
-/// measured source rather than inventing a zero.
-///
-/// # Errors
-/// Always fails, with `Unsupported`.
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn peak_resident_bytes() -> io::Result<u64> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 #[cfg(test)]

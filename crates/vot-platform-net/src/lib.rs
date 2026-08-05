@@ -278,8 +278,11 @@ mod tests {
     #[test]
     fn sized_buffers_grow_toward_what_was_asked() {
         // Kernels clamp to their own ceilings rather than erroring, Linux at
-        // net.core.rmem_max, so the honest assertion is growth against the
+        // net.core.rmem_max, so the honest assertion is strict growth over the
         // default and a floor every platform grants, not the request itself.
+        // Strict, because Linux doubles whatever it accepts for bookkeeping,
+        // so even a clamped request moves the value; a call that changed
+        // nothing did nothing.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let read = |socket: &UdpSocket, option: i32| read_option(socket, libc::SOL_SOCKET, option);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -301,11 +304,11 @@ mod tests {
         let receive = read(&socket, receive_option);
         let send = read(&socket, send_option);
         assert!(
-            receive >= receive_before && receive >= 200 * 1024,
+            receive > receive_before && receive >= 200 * 1024,
             "receive buffer {receive} from {receive_before}"
         );
         assert!(
-            send >= send_before && send >= 200 * 1024,
+            send > send_before && send >= 200 * 1024,
             "send buffer {send} from {send_before}"
         );
     }

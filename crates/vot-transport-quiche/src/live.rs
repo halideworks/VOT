@@ -44,11 +44,11 @@ const MIN_DATAGRAM_SIZE: usize = 1_200;
 
 /// What the socket asks the kernel to hold in each direction.
 ///
-/// Four megabytes of receive is three milliseconds at ten gigabits, room for
+/// Four mebibytes of receive is three milliseconds at ten gigabits, room for
 /// a scheduling quantum without shedding; send is half that, because the
 /// pump paces its own bursts out.
-const RECEIVE_BUFFER_BYTES: u32 = 4 * 1024 * 1024;
-const SEND_BUFFER_BYTES: u32 = 2 * 1024 * 1024;
+const RECEIVE_BUFFER_BYTES: u32 = 4_194_304;
+const SEND_BUFFER_BYTES: u32 = 2_097_152;
 
 /// The largest, which is what a UDP payload can hold inside IPv4's 65535-byte
 /// total length once its own and UDP's headers are paid for. IPv6 could carry

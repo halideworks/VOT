@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use vot_scheduler::ReliableReceiver;
+use vot_scheduler::{DiscardSink, ReliableReceiver};
 use vot_transport_api::{
     Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
 };
@@ -1654,7 +1654,7 @@ fn transfer_ranged<C: Carrier>(
     let layer = Arc::new(layer);
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject)?;
+    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
     let mut credit = Credit::Constructed;
     for carrier in &mut carriers {
         credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;

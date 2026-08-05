@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use vot_scheduler::ReliableReceiver;
+use vot_scheduler::{DiscardSink, ReliableReceiver};
 use vot_transport_api::{
     Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
 };
@@ -690,7 +690,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let workers = config.workers;
     let subject = subject_of(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject)?;
+    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
     let mut reassembly = BundleReassembly::new(workers);
 
     // Every rail binds before any handshake starts where the backend allows

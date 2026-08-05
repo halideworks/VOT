@@ -465,7 +465,10 @@ impl ReliableReceiver {
     ///
     /// This is what lets a rail place its bytes outside the admission lock:
     /// accepted writes commute, so placement needs no serialization, and the
-    /// lock covers only this booking.
+    /// lock covers only this booking. The cost of that order: a replayed
+    /// range reaches the sink again before admission calls it a replay,
+    /// where the sink path skips the write. The contract already allows it,
+    /// identical bytes at the same offset.
     ///
     /// # Errors
     /// Rejects an unknown subject, an overlap with an accepted range, or a
@@ -914,7 +917,11 @@ mod tests {
     }
 
     /// Retains what it is written, so a test can assert exactly what reached
-    /// the sink and that a replay was not written twice.
+    /// the sink and that a replay was not written twice. That second assert
+    /// is stricter than the RangeSink contract, which allows an identical
+    /// rewrite, so this fixture fits the sink path, where replays are
+    /// skipped before the write, and not the written-range path, where they
+    /// are not.
     #[derive(Default)]
     struct MemorySink(std::sync::Mutex<BTreeMap<u64, Vec<u8>>>);
 

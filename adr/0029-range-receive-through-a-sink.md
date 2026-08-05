@@ -95,12 +95,18 @@ Tests that want the assembled object use a memory-backed sink.
 Multi-worker benchmarking at 1 GiB becomes honest, which is what unblocks
 the workstream the finding came from.
 
-v1 writes inside the admission lock, so rails serialize on the sink. With
-the discarding sink that costs nothing and today's wire numbers stand. If a
-real sink ever prices that lock, the write can move outside it, because
-proven writes are idempotent and commute; a rail would write first and admit
-the extent after. That is a measured change for later, named here so it is
-not rediscovered as a finding.
+v1 wrote inside the admission lock, so rails serialized on the sink. With
+the discarding sink that cost nothing and the wire numbers stood. The move
+this paragraph anticipated happened the same day (PR 100): a rail places
+its bytes through `VerifiedRange::write_to` before taking the lock and
+admits a `WrittenRange` under it, sound because proven writes commute and
+the witness can only be built by writing. Two conditions carry it, and a
+future caller inherits both: the witness proves a write to *a* sink, not
+to the subject's registered one, so handing rails the same sink is the
+caller's discipline; and `finish_ranges` means every byte was proven and
+handed over, not that every write returned, so a caller joins its writers
+before treating the sink as final. The A/B is in the perf log: +4% at
+W=4 loopback role, inside spread, the critical section smaller either way.
 
 `finish_ranges` remains the verification claim and nothing more. Whether the
 sink's bytes are durable, flushed, or committed is its owner's contract; the

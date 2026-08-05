@@ -1645,6 +1645,26 @@ mod tests {
             receiver.range_active[&object].extents[&0],
             2 * RANGE_UNIT_BYTES
         );
+        // The mirror case: a range adjacent from below merges through its
+        // earlier neighbour, so the bound does not refuse that side either.
+        let third =
+            vot_proof_blake3::prove(&bytes, 2 * RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        receiver
+            .receive_range(
+                object,
+                2 * RANGE_UNIT_BYTES,
+                &bytes[unit * 2..],
+                &third.proof,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.range_active[&object].extents.len(),
+            MAX_RANGE_FRAGMENTS
+        );
+        assert_eq!(
+            receiver.range_active[&object].extents[&0],
+            3 * RANGE_UNIT_BYTES
+        );
     }
 
     #[test]

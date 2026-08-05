@@ -1108,6 +1108,13 @@ mod tests {
                 measurement.notes
             );
         }
+        // The sender's rails publish the packet ledger the loss forensics
+        // read; a note that stopped carrying it would break that instrument
+        // silently.
+        assert!(sent.notes.contains("rail0_sent="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_recv="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_lost="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_spurious="), "{}", sent.notes);
         assert!(received.notes.contains("bundles="), "{}", received.notes);
     }
 }

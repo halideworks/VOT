@@ -131,13 +131,16 @@ pub struct PathStats {
     /// error and real drops: spurious losses name the loss detector, the
     /// remainder names the path.
     pub spurious_lost_packets: Option<u64>,
-    /// Packets this endpoint transmitted on the path, when the engine
-    /// counts them. Against the peer's received count this is the wire's
-    /// own ledger: transmissions that never arrived are real drops, no
-    /// matter what the loss detector believed.
+    /// Packets this endpoint transmitted, when the engine counts them.
+    /// Both engines count every retransmission as its own packet, so
+    /// against the peer's received count this approximates the wire's own
+    /// ledger. What "received" means differs: quiche counts a packet after
+    /// decryption and duplicate rejection, `MsQuic` counts arrivals before
+    /// either, so a cross-engine comparison of the residual is not exact,
+    /// and both ends sample on their own clocks a tick apart.
     pub packets_sent: Option<u64>,
-    /// Packets this endpoint received on the path, when the engine counts
-    /// them. The other half of that ledger.
+    /// Packets this endpoint received, when the engine counts them, with
+    /// the same per-engine meaning as [`PathStats::packets_sent`].
     pub packets_received: Option<u64>,
 }
 

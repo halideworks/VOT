@@ -184,6 +184,13 @@ impl ReliableReceiver {
         proof: &[u8],
         staging_reserved: bool,
     ) -> Result<(), Error> {
+        // The subject gate runs before any proof work, as it always has: an
+        // unknown subject is refused for what it is, not for how its proof
+        // reads.
+        let replay = self.verified.contains(&subject);
+        if !replay && !self.range_active.contains_key(&subject) {
+            return Err(Error::UnknownObject);
+        }
         check_range_proof(subject, covered_offset, data.as_ref(), proof)?;
         self.insert_checked_range(subject, covered_offset, data, staging_reserved)
     }
@@ -286,44 +293,8 @@ impl ReliableReceiver {
         bundle: &vot_codec::frames::ProofBundle,
         records: &[vot_codec::frames::DataRecord],
     ) -> Result<VerifiedRange, Error> {
-        bundle.validate().map_err(|_| Error::ProofInvalid)?;
-        if bundle.object.suite != subject.suite
-            || bundle.object.root != subject.root
-            || bundle.object.length != subject.length
-            || bundle.data_record_count != records.len() as u64
-        {
-            return Err(Error::LengthMismatch);
-        }
-        let mut ordered = BTreeMap::new();
-        for record in records {
-            record.validate().map_err(|_| Error::ProofInvalid)?;
-            if record.bundle_id != bundle.bundle_id {
-                return Err(Error::ProofInvalid);
-            }
-            if record.compression != 0 {
-                return Err(Error::UnsupportedCompression);
-            }
-            if ordered.insert(record.record_index, record).is_some() {
-                return Err(Error::LengthMismatch);
-            }
-        }
-        let covered_bytes = bundle.covered_length;
-        let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
-        let mut data = Vec::with_capacity(capacity);
-        for index in 0..bundle.data_record_count {
-            let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
-            let expected_offset = bundle
-                .covered_offset
-                .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
-                .ok_or(Error::LengthExceeded)?;
-            if record.plaintext_offset != expected_offset {
-                return Err(Error::LengthMismatch);
-            }
-            data.extend_from_slice(&record.encoded);
-        }
-        if data.len() as u64 != covered_bytes {
-            return Err(Error::LengthMismatch);
-        }
+        let ordered = validate_typed_bundle(subject, bundle, records)?;
+        let data = assemble_ordered(bundle, &ordered)?;
         check_range_proof(subject, bundle.covered_offset, &data, &bundle.proof)?;
         Ok(VerifiedRange {
             subject,
@@ -365,47 +336,12 @@ impl ReliableReceiver {
         bundle: &vot_codec::frames::ProofBundle,
         records: &[vot_codec::frames::DataRecord],
     ) -> Result<(), Error> {
-        bundle.validate().map_err(|_| Error::ProofInvalid)?;
-        if bundle.object.suite != subject.suite
-            || bundle.object.root != subject.root
-            || bundle.object.length != subject.length
-            || bundle.data_record_count != records.len() as u64
-        {
-            return Err(Error::LengthMismatch);
-        }
-        let mut ordered = BTreeMap::new();
-        for record in records {
-            record.validate().map_err(|_| Error::ProofInvalid)?;
-            if record.bundle_id != bundle.bundle_id {
-                return Err(Error::ProofInvalid);
-            }
-            if record.compression != 0 {
-                return Err(Error::UnsupportedCompression);
-            }
-            if ordered.insert(record.record_index, record).is_some() {
-                return Err(Error::LengthMismatch);
-            }
-        }
+        let ordered = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = bundle.covered_length;
-        let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
         self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         let result = (|| {
-            let mut data = Vec::with_capacity(capacity);
-            for index in 0..bundle.data_record_count {
-                let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
-                let expected_offset = bundle
-                    .covered_offset
-                    .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
-                    .ok_or(Error::LengthExceeded)?;
-                if record.plaintext_offset != expected_offset {
-                    return Err(Error::LengthMismatch);
-                }
-                data.extend_from_slice(&record.encoded);
-            }
-            if data.len() as u64 != covered_bytes {
-                return Err(Error::LengthMismatch);
-            }
+            let data = assemble_ordered(bundle, &ordered)?;
             self.receive_verified_range_owned(subject, bundle.covered_offset, data, &bundle.proof)
         })();
         if result.is_err() {
@@ -565,6 +501,64 @@ impl VerifiedRange {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+}
+
+/// Checks a bundle's identity against its subject and orders its records.
+///
+/// The one place both bundle paths ask these questions, so a drifted check
+/// would drift for both and the same tests hold either.
+fn validate_typed_bundle<'records>(
+    subject: SubjectId,
+    bundle: &vot_codec::frames::ProofBundle,
+    records: &'records [vot_codec::frames::DataRecord],
+) -> Result<BTreeMap<u64, &'records vot_codec::frames::DataRecord>, Error> {
+    bundle.validate().map_err(|_| Error::ProofInvalid)?;
+    if bundle.object.suite != subject.suite
+        || bundle.object.root != subject.root
+        || bundle.object.length != subject.length
+        || bundle.data_record_count != records.len() as u64
+    {
+        return Err(Error::LengthMismatch);
+    }
+    let mut ordered = BTreeMap::new();
+    for record in records {
+        record.validate().map_err(|_| Error::ProofInvalid)?;
+        if record.bundle_id != bundle.bundle_id {
+            return Err(Error::ProofInvalid);
+        }
+        if record.compression != 0 {
+            return Err(Error::UnsupportedCompression);
+        }
+        if ordered.insert(record.record_index, record).is_some() {
+            return Err(Error::LengthMismatch);
+        }
+    }
+    Ok(ordered)
+}
+
+/// Reassembles ordered records into the bundle's covered bytes.
+fn assemble_ordered(
+    bundle: &vot_codec::frames::ProofBundle,
+    ordered: &BTreeMap<u64, &vot_codec::frames::DataRecord>,
+) -> Result<Vec<u8>, Error> {
+    let covered_bytes = bundle.covered_length;
+    let capacity = usize::try_from(covered_bytes).map_err(|_| Error::LengthExceeded)?;
+    let mut data = Vec::with_capacity(capacity);
+    for index in 0..bundle.data_record_count {
+        let record = ordered.get(&index).ok_or(Error::LengthMismatch)?;
+        let expected_offset = bundle
+            .covered_offset
+            .checked_add(u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?)
+            .ok_or(Error::LengthExceeded)?;
+        if record.plaintext_offset != expected_offset {
+            return Err(Error::LengthMismatch);
+        }
+        data.extend_from_slice(&record.encoded);
+    }
+    if data.len() as u64 != covered_bytes {
+        return Err(Error::LengthMismatch);
+    }
+    Ok(data)
 }
 
 /// Holds a range's bounds and its proof against the subject's root.

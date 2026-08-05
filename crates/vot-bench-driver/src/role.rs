@@ -293,6 +293,7 @@ fn drive_receive_rail(
     subject: SubjectId,
     object_bytes: u64,
     receiver: &std::sync::Mutex<ReliableReceiver>,
+    sink: &dyn vot_scheduler::RangeSink,
     witnesses: &WitnessLedger,
     delivered: &std::sync::atomic::AtomicU64,
     failed: &std::sync::atomic::AtomicBool,
@@ -329,15 +330,18 @@ fn drive_receive_rail(
                         )?;
                         let admitted = range.len();
                         witnesses.hold(admitted);
-                        let outcome = {
+                        // Placed before the lock: accepted writes commute,
+                        // so rails serialize only on booking the extent.
+                        let placed = range.write_to(sink);
+                        drop(range);
+                        witnesses.release(admitted);
+                        let written = placed.map_err(vot_scheduler::Error::from)?;
+                        {
                             let Ok(mut shared) = receiver.lock() else {
-                                witnesses.release(admitted);
                                 return Err(Error::Disconnected);
                             };
-                            shared.admit_verified_range(range)
-                        };
-                        witnesses.release(admitted);
-                        outcome?;
+                            shared.admit_written_range(written)?;
+                        }
                         delivered.fetch_add(admitted, std::sync::atomic::Ordering::Relaxed);
                         progress = true;
                     }
@@ -729,7 +733,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let subject = subject_of(config)?;
     let mut receiver = receiver_for_ranged(config)?;
     let (sink, sink_handle) = crate::sink_for(config)?;
-    receiver.begin_ranges(subject, sink)?;
+    receiver.begin_ranges(subject, Box::new(sink.clone()))?;
     let mut reassembly = BundleReassembly::new(workers);
 
     // Every rail binds before any handshake starts where the backend allows
@@ -759,6 +763,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         let mut rails = Vec::with_capacity(workers);
         for endpoint in &mut endpoints {
             let receiver = &receiver;
+            let sink = sink.clone();
             let witnesses = &witnesses;
             let delivered = &delivered;
             let failed = &failed;
@@ -769,6 +774,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
                     subject,
                     config.object_bytes,
                     receiver,
+                    sink.as_ref(),
                     witnesses,
                     delivered,
                     failed,

@@ -507,10 +507,10 @@ fn receiver_for_ranged(config: &Config) -> Result<ReliableReceiver, Error> {
     Ok(ReliableReceiver::new(limit, window, limit)?)
 }
 
-/// The receiver's sink and, for a file, the handle the driver keeps to
-/// sync it through after the clock.
+/// The destination, shareable across rails, and for a file the handle the
+/// driver keeps to sync it through after the clock.
 type BuiltSink = (
-    Box<dyn vot_scheduler::RangeSink>,
+    Arc<dyn vot_scheduler::RangeSink>,
     Option<Arc<vot_scheduler::FileSink>>,
 );
 
@@ -520,13 +520,16 @@ type BuiltSink = (
 /// section pays for placing bytes, not for allocating the destination.
 fn sink_for(config: &Config) -> Result<BuiltSink, Error> {
     match &config.sink {
-        SinkChoice::Discard => Ok((Box::new(DiscardSink), None)),
+        SinkChoice::Discard => Ok((Arc::new(DiscardSink), None)),
         SinkChoice::File(path) => {
             let sink = Arc::new(
                 vot_scheduler::FileSink::create(path, config.object_bytes)
                     .map_err(|error| Error::Unsupported(format!("sink file: {error}")))?,
             );
-            Ok((Box::new(sink.clone()), Some(sink)))
+            Ok((
+                sink.clone() as Arc<dyn vot_scheduler::RangeSink>,
+                Some(sink),
+            ))
         }
     }
 }
@@ -1728,7 +1731,7 @@ fn transfer_ranged<C: Carrier>(
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
     let (sink, sink_handle) = sink_for(config)?;
-    receiver.begin_ranges(subject, sink)?;
+    receiver.begin_ranges(subject, Box::new(sink))?;
     let mut credit = Credit::Constructed;
     for carrier in &mut carriers {
         credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;

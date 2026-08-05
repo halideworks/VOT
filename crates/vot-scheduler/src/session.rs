@@ -15,7 +15,7 @@ use vot_codec::frames::{DataRecord, ProofBundle, TypedFrame};
 use vot_session::Session;
 use vot_transport_api::{Event, SubjectId, TransportAdapter};
 
-use crate::{Error, ReliableReceiver};
+use crate::{Error, RangeSink, ReliableReceiver};
 
 /// The most one admitted bundle can hold: its proof, bounded per frame by the
 /// negotiated control ceiling, plus every record it can declare.
@@ -218,12 +218,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         Ok(())
     }
 
-    /// Authorises a subject and opens range state for it.
+    /// Authorises a subject, opens range state for it, and registers where
+    /// its verified bytes go (ADR-0029).
     ///
     /// # Errors
     /// Propagates a receiver that cannot begin the subject.
-    pub fn admit(&mut self, subject: SubjectId) -> Result<(), Error> {
-        self.receiver.begin_ranges(subject)?;
+    pub fn admit(&mut self, subject: SubjectId, sink: Box<dyn RangeSink>) -> Result<(), Error> {
+        self.receiver.begin_ranges(subject, sink)?;
         self.admitted.insert(subject);
         Ok(())
     }
@@ -552,6 +553,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DiscardSink;
     use std::collections::VecDeque;
     use vot_codec::frames::{ObjectId, encode};
     use vot_transport_api::{Payload, StreamId};
@@ -708,7 +710,7 @@ mod tests {
         // records and verified nothing.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         assert!(!driver.is_verified(subject));
 
         driver
@@ -736,7 +738,7 @@ mod tests {
         // The two are separate frames with no ordering between them.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         for record in &records {
             driver
                 .session_mut()
@@ -782,7 +784,7 @@ mod tests {
     fn held_bundle_state_is_bounded() {
         let (subject, _bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         driver
             .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES)
             .unwrap();
@@ -843,7 +845,7 @@ mod tests {
         let proof = bundle.proof.len();
         assert!(proof > 0);
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         driver
             .session_mut()
             .driver()
@@ -868,7 +870,7 @@ mod tests {
         // still holding.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
 
         let mut stray = records[0].clone();
         stray.bundle_id = [9; 16];
@@ -926,7 +928,7 @@ mod tests {
         let fits = limit / unit;
 
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         // A generous bundle count, so only the byte bound can refuse anything.
         driver.set_orphan_limits(fits + 4, limit).unwrap();
         for index in 0..fits {
@@ -958,7 +960,7 @@ mod tests {
         // authorise one that arrives first. They hold their own budget.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         driver
             .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES)
             .unwrap();
@@ -1011,7 +1013,7 @@ mod tests {
         // conflicting duplicate is an error. A retry is not an attack.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         for frame in [
             TypedFrame::ProofBundle(bundle.clone()),
             TypedFrame::ProofBundle(bundle.clone()),
@@ -1050,7 +1052,7 @@ mod tests {
         let declared = usize::try_from(bundle.data_record_count).unwrap();
         assert_eq!(declared, records.len());
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
 
         // One record past the declared count, before the proof arrives, so the
         // count is not known when it is held.
@@ -1085,7 +1087,7 @@ mod tests {
             refuse_credit: true,
             ..Loopback::default()
         });
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         driver
             .session_mut()
             .driver()
@@ -1146,7 +1148,7 @@ mod tests {
         // state is closed, so a replay is repeated rather than reassembled.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &bundle, &records);
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -1171,8 +1173,8 @@ mod tests {
         let (second_subject, second_bundle, second_records) = object_of(0x17, [3; 16]);
         let mut driver = ready();
         driver.set_remembered_bundles(1).unwrap();
-        driver.admit(first_subject).unwrap();
-        driver.admit(second_subject).unwrap();
+        driver.admit(first_subject, Box::new(DiscardSink)).unwrap();
+        driver.admit(second_subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &first_bundle, &first_records);
         push_object(&mut driver, &second_bundle, &second_records);
         assert_eq!(driver.poll().unwrap(), None);
@@ -1188,7 +1190,7 @@ mod tests {
         let mut broken = records.clone();
         broken[1].encoded[0] ^= 0xff;
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &bundle, &broken);
         assert!(
             driver.poll().is_err(),
@@ -1207,7 +1209,7 @@ mod tests {
         // conflicting identity is rejected, which does not stop at delivery.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &bundle, &records);
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -1239,8 +1241,8 @@ mod tests {
         let (first_subject, first_bundle, first_records) = object();
         let (second_subject, second_bundle, second_records) = object_of(0x17, [3; 16]);
         let mut driver = ready();
-        driver.admit(first_subject).unwrap();
-        driver.admit(second_subject).unwrap();
+        driver.admit(first_subject, Box::new(DiscardSink)).unwrap();
+        driver.admit(second_subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &first_bundle, &first_records);
         push_object(&mut driver, &second_bundle, &second_records);
         assert_eq!(driver.poll().unwrap(), None);
@@ -1259,7 +1261,7 @@ mod tests {
         // reassembled and fails with UnknownObject.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         let frames: Vec<Vec<u8>> = std::iter::once(wire(&TypedFrame::ProofBundle(bundle.clone())))
             .chain(
                 records
@@ -1284,11 +1286,14 @@ mod tests {
         let mut conflicting = bundle;
         conflicting.object.root = [9; 32];
         driver
-            .admit(SubjectId {
-                suite: conflicting.object.suite,
-                root: conflicting.object.root,
-                length: conflicting.object.length,
-            })
+            .admit(
+                SubjectId {
+                    suite: conflicting.object.suite,
+                    root: conflicting.object.root,
+                    length: conflicting.object.length,
+                },
+                Box::new(DiscardSink),
+            )
             .unwrap();
         driver
             .session_mut()
@@ -1305,7 +1310,7 @@ mod tests {
         // even when its subject and covered range match.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &bundle, &records);
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -1328,7 +1333,7 @@ mod tests {
         // delivered.
         let (subject, bundle, records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         push_object(&mut driver, &bundle, &records);
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject));
@@ -1357,7 +1362,7 @@ mod tests {
     fn a_bundle_that_conflicts_with_a_held_one_is_refused() {
         let (subject, bundle, _records) = object();
         let mut driver = ready();
-        driver.admit(subject).unwrap();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
         let mut conflicting = bundle.clone();
         conflicting.proof[0] ^= 0xff;
         for frame in [

@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +12,10 @@ use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
 /// Range granularity a proof covers, from spec/proofs.md.
 pub const RANGE_UNIT_BYTES: u64 = 65_536;
-const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
+/// The most bytes one proof-bearing range may cover, from spec/proofs.md.
+/// Public because it is also the most a single admission can transiently
+/// hold, which is what sizes a receiver's staging under ADR-0029.
+pub const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 
@@ -33,6 +35,10 @@ pub enum Error {
     Session(vot_session::Error),
     /// More incomplete bundle state than this receiver will hold.
     PendingBundlesExhausted,
+    /// The subject's sink refused a verified range; the range stays retryable.
+    Sink,
+    /// More disjoint covered runs than this receiver will track.
+    RangeFragmentsExhausted,
 }
 
 impl From<vot_transport_api::Error> for Error {
@@ -52,18 +58,64 @@ struct ActiveObject {
     received: u64,
 }
 
-/// Accepted ranges for one object.
+/// A sink's refusal. It carries no cause because the receiver's answer is
+/// the same whatever it was: the range is refused and stays retryable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SinkError;
+
+impl From<SinkError> for Error {
+    fn from(_: SinkError) -> Self {
+        Self::Sink
+    }
+}
+
+/// Where a subject's verified bytes go the moment they are admitted (ADR-0029).
 ///
-/// `segments` is kept non-overlapping and every range covers whole 64 KiB
-/// units, so `bytes` alone decides completeness: a set of disjoint ranges
-/// inside `[0, length)` totalling `length` bytes can only be the whole object.
-/// Tracking coverage as an explicit per-unit set would cost one entry per
-/// 64 KiB — sixteen million of them for a terabyte object — to say the same
-/// thing.
-#[derive(Default)]
+/// `write_at` takes `&self` because accepted writes commute: any two are
+/// disjoint or byte-identical, so a sink may be shared across threads and
+/// may see the same range twice.
+pub trait RangeSink: Send + Sync {
+    /// # Errors
+    /// Refuses a write it cannot take; the receiver keeps the range retryable.
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError>;
+}
+
+/// A sink that drops what it is given, for measurements and tests whose
+/// subject is transport and verification rather than the bytes' destination.
+pub struct DiscardSink;
+
+impl RangeSink for DiscardSink {
+    fn write_at(&self, _covered_offset: u64, _data: &[u8]) -> Result<(), SinkError> {
+        Ok(())
+    }
+}
+
+/// A shared sink is a sink, which is what lets a caller keep a handle to
+/// the destination it registered.
+impl<S: RangeSink + ?Sized> RangeSink for std::sync::Arc<S> {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        (**self).write_at(covered_offset, data)
+    }
+}
+
+/// Bounds the extent map so an adversarial arrival order, alternating units
+/// to keep runs from merging, prices its attack at extent entries rather
+/// than being free. Real arrival is near-in-order per rail, so live
+/// fragmentation is on the order of the rail count.
+const MAX_RANGE_FRAGMENTS: usize = 4096;
+
+/// Accepted coverage for one object (ADR-0029).
+///
+/// `extents` maps each disjoint covered run's start to its end, neighbours
+/// merged on insert, so memory tracks fragmentation rather than bytes: the
+/// bytes themselves went to the sink when their range was admitted. Every
+/// range covers whole 64 KiB units, so `bytes` alone decides completeness:
+/// a set of disjoint ranges inside `[0, length)` totalling `length` bytes
+/// can only be the whole object.
 struct RangeState {
-    segments: BTreeMap<u64, Vec<u8>>,
+    extents: BTreeMap<u64, u64>,
     bytes: u64,
+    sink: Box<dyn RangeSink>,
 }
 
 /// Receiver state is keyed by subject identity and outlives connections.
@@ -122,9 +174,15 @@ impl ReliableReceiver {
         Ok(())
     }
 
+    /// Opens range state for a subject and registers where its bytes go.
+    ///
     /// # Errors
     /// Rejects duplicate active objects and invalid suite or empty-object ranges.
-    pub fn begin_ranges(&mut self, subject: SubjectId) -> Result<(), Error> {
+    pub fn begin_ranges(
+        &mut self,
+        subject: SubjectId,
+        sink: Box<dyn RangeSink>,
+    ) -> Result<(), Error> {
         if self.verified.contains(&subject) {
             return Ok(());
         }
@@ -137,7 +195,14 @@ impl ReliableReceiver {
         }
         self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        self.range_active.insert(subject, RangeState::default());
+        self.range_active.insert(
+            subject,
+            RangeState {
+                extents: BTreeMap::new(),
+                bytes: 0,
+                sink,
+            },
+        );
         Ok(())
     }
 
@@ -153,7 +218,7 @@ impl ReliableReceiver {
         data: &[u8],
         proof: &[u8],
     ) -> Result<(), Error> {
-        self.receive_verified_range(subject, covered_offset, data, proof)
+        self.receive_verified_range(subject, covered_offset, data, proof, false)
     }
 
     fn receive_verified_range(
@@ -162,27 +227,7 @@ impl ReliableReceiver {
         covered_offset: u64,
         data: &[u8],
         proof: &[u8],
-    ) -> Result<(), Error> {
-        self.receive_verified_range_impl(subject, covered_offset, Cow::Borrowed(data), proof, false)
-    }
-
-    fn receive_verified_range_owned(
-        &mut self,
-        subject: SubjectId,
-        covered_offset: u64,
-        data: Vec<u8>,
-        proof: &[u8],
-    ) -> Result<(), Error> {
-        self.receive_verified_range_impl(subject, covered_offset, Cow::Owned(data), proof, true)
-    }
-
-    fn receive_verified_range_impl(
-        &mut self,
-        subject: SubjectId,
-        covered_offset: u64,
-        data: Cow<'_, [u8]>,
-        proof: &[u8],
-        staging_reserved: bool,
+        caller_reserved: bool,
     ) -> Result<(), Error> {
         // The subject gate runs before any proof work, as it always has: an
         // unknown subject is refused for what it is, not for how its proof
@@ -191,89 +236,101 @@ impl ReliableReceiver {
         if !replay && !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
         }
-        check_range_proof(subject, covered_offset, data.as_ref(), proof)?;
-        self.insert_checked_range(subject, covered_offset, data, staging_reserved)
+        check_range_proof(subject, covered_offset, data, proof)?;
+        self.insert_checked_range(subject, covered_offset, data, caller_reserved)
     }
 
-    /// Books a range whose proof [`check_range_proof`] has already held.
+    /// Books a range whose proof [`check_range_proof`] has already held:
+    /// writes it to the subject's sink, then records its extent (ADR-0029).
+    ///
+    /// Staging covers the bytes for the span of the write and no longer.
+    /// `caller_reserved` says the caller holds its own reservation for them
+    /// instead and will release it itself.
     fn insert_checked_range(
         &mut self,
         subject: SubjectId,
         covered_offset: u64,
-        data: Cow<'_, [u8]>,
-        staging_reserved: bool,
+        data: &[u8],
+        caller_reserved: bool,
     ) -> Result<(), Error> {
         // A subject whose every byte is verified has no range state left, but a
         // peer may still replay a range it already sent. The replay is checked
         // like any other and then changes nothing.
-        let replay = self.verified.contains(&subject);
-        if !replay && !self.range_active.contains_key(&subject) {
-            return Err(Error::UnknownObject);
+        if self.verified.contains(&subject) {
+            return Ok(());
         }
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
         let covered_end = covered_offset
             .checked_add(bytes)
             .ok_or(Error::LengthExceeded)?;
-        if replay {
-            if staging_reserved {
-                self.staging.release(bytes);
-            }
+        let active = self
+            .range_active
+            .get(&subject)
+            .ok_or(Error::UnknownObject)?;
+        // A range wholly inside the covered extents is a replay. The proof
+        // bound its bytes to the root at this offset before this ran, so
+        // there is nothing to compare: two different byte strings for the
+        // same range cannot both have held.
+        if active
+            .extents
+            .range(..=covered_offset)
+            .next_back()
+            .is_some_and(|(_, end)| *end >= covered_end)
+        {
             return Ok(());
         }
-        let next_bytes = {
-            let active = self
-                .range_active
-                .get(&subject)
-                .ok_or(Error::UnknownObject)?;
-            if let Some(existing) = active.segments.get(&covered_offset) {
-                if existing.as_slice() == data.as_ref() {
-                    if staging_reserved {
-                        self.staging.release(bytes);
-                    }
-                    return Ok(());
-                }
-                return Err(Error::ProofInvalid);
-            }
-            // Accepted segments never overlap, so only the two neighbours of the
-            // new offset can conflict. A linear scan would be quadratic across a
-            // large object's quarter-million segments.
-            let overlaps_earlier = active
-                .segments
-                .range(..covered_offset)
-                .next_back()
-                .is_some_and(|(offset, segment)| {
-                    let end =
-                        offset.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
-                    covered_offset < end
-                });
-            let overlaps_later = active
-                .segments
-                .range(covered_offset..)
-                .next()
-                .is_some_and(|(offset, _)| *offset < covered_end);
-            if overlaps_earlier || overlaps_later {
-                return Err(Error::LengthMismatch);
-            }
-            active
-                .bytes
-                .checked_add(bytes)
-                .ok_or(Error::LengthExceeded)?
-        };
-        let reserved_here = if staging_reserved {
+        // Accepted extents never overlap, so only the two neighbours of the
+        // new offset can conflict.
+        let earlier = active.extents.range(..covered_offset).next_back();
+        let overlaps_earlier = earlier.is_some_and(|(_, end)| covered_offset < *end);
+        let overlaps_later = active
+            .extents
+            .range(covered_offset..)
+            .next()
+            .is_some_and(|(offset, _)| *offset < covered_end);
+        if overlaps_earlier || overlaps_later {
+            return Err(Error::LengthMismatch);
+        }
+        let next_bytes = active
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::LengthExceeded)?;
+        let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
+        let merges_later = active.extents.contains_key(&covered_end);
+        if !merges_earlier && !merges_later && active.extents.len() >= MAX_RANGE_FRAGMENTS {
+            return Err(Error::RangeFragmentsExhausted);
+        }
+        let reserved_here = if caller_reserved {
             false
         } else {
             self.staging.reserve(bytes)?;
-            self.peak_staging = self.peak_staging.max(self.staging.used());
             true
         };
-        let Some(active) = self.range_active.get_mut(&subject) else {
-            if reserved_here {
-                self.staging.release(bytes);
-            }
-            return Err(Error::UnknownObject);
-        };
+        self.peak_staging = self.peak_staging.max(self.staging.used());
+        let written = active.sink.write_at(covered_offset, data);
+        if reserved_here {
+            self.staging.release(bytes);
+        }
+        written?;
+        let active = self
+            .range_active
+            .get_mut(&subject)
+            .ok_or(Error::UnknownObject)?;
         active.bytes = next_bytes;
-        active.segments.insert(covered_offset, data.into_owned());
+        // Merge with either neighbour so the map holds one entry per
+        // contiguous covered run.
+        let mut start = covered_offset;
+        let mut end = covered_end;
+        if merges_earlier {
+            if let Some((&earlier_start, _)) = active.extents.range(..covered_offset).next_back() {
+                active.extents.remove(&earlier_start);
+                start = earlier_start;
+            }
+        }
+        if let Some(later_end) = active.extents.remove(&covered_end) {
+            end = later_end;
+        }
+        active.extents.insert(start, end);
         Ok(())
     }
 
@@ -303,22 +360,18 @@ impl ReliableReceiver {
         })
     }
 
-    /// Books a range [`Self::verify_typed_bundle`] already proved.
+    /// Books a range [`Self::verify_typed_bundle`] already proved: the
+    /// subject's sink takes the bytes and only the extent is kept.
     ///
     /// # Errors
     /// Rejects an unknown subject, an overlap with an accepted range, a
-    /// conflicting duplicate, or a staging budget the range does not fit.
+    /// staging budget the range does not fit, or a sink that refused it.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "admission spends the witness; handing it back would invite re-admitting it"
+    )]
     pub fn admit_verified_range(&mut self, range: VerifiedRange) -> Result<(), Error> {
-        let admitted = self.insert_checked_range(
-            range.subject,
-            range.covered_offset,
-            Cow::Owned(range.data),
-            false,
-        );
-        if admitted.is_ok() {
-            self.peak_staging = self.peak_staging.max(self.staging.used());
-        }
-        admitted
+        self.insert_checked_range(range.subject, range.covered_offset, &range.data, false)
     }
 
     /// Accepts a decoded proof bundle whose records may arrive out of order.
@@ -338,15 +391,16 @@ impl ReliableReceiver {
     ) -> Result<(), Error> {
         let ordered = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = bundle.covered_length;
+        // Reserved for the span of reassembly and the sink write, released
+        // here whatever happened: once admitted the bytes live in the sink,
+        // not the receiver (ADR-0029).
         self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         let result = (|| {
             let data = assemble_ordered(bundle, &ordered)?;
-            self.receive_verified_range_owned(subject, bundle.covered_offset, data, &bundle.proof)
+            self.receive_verified_range(subject, bundle.covered_offset, &data, &bundle.proof, true)
         })();
-        if result.is_err() {
-            self.staging.release(covered_bytes);
-        }
+        self.staging.release(covered_bytes);
         result
     }
     /// Completes a range transfer only after every 64 KiB unit is root verified.
@@ -365,12 +419,12 @@ impl ReliableReceiver {
         if !complete {
             return Err(Error::LengthMismatch);
         }
-        let active = self
-            .range_active
+        self.range_active
             .remove(&subject)
             .ok_or(Error::UnknownObject)?;
-        self.staging
-            .release(active.bytes.saturating_add(VERIFIER_RESERVATION));
+        // Only the verifier reservation is held by now: every range's bytes
+        // went to the sink at admission.
+        self.staging.release(VERIFIER_RESERVATION);
         self.verified.insert(subject);
         Ok(())
     }
@@ -671,6 +725,45 @@ mod tests {
         }
     }
 
+    /// Retains what it is written, so a test can assert exactly what reached
+    /// the sink and that a replay was not written twice.
+    #[derive(Default)]
+    struct MemorySink(std::sync::Mutex<BTreeMap<u64, Vec<u8>>>);
+
+    impl MemorySink {
+        fn assembled(&self) -> Vec<u8> {
+            let writes = self.0.lock().unwrap();
+            let mut assembled = Vec::new();
+            for (offset, data) in writes.iter() {
+                assert_eq!(*offset, assembled.len() as u64, "a gap in sink writes");
+                assembled.extend_from_slice(data);
+            }
+            assembled
+        }
+    }
+
+    impl RangeSink for MemorySink {
+        fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError> {
+            let replaced = self.0.lock().unwrap().insert(covered_offset, data.to_vec());
+            assert!(replaced.is_none(), "a range was written twice");
+            Ok(())
+        }
+    }
+
+    /// Refuses its first write and takes the second, the shape of a
+    /// transient refusal downstream.
+    struct FlakySink(std::sync::atomic::AtomicBool);
+
+    impl RangeSink for FlakySink {
+        fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), SinkError> {
+            if self.0.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                Err(SinkError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn assert_typed_bundle_error(
         subject: SubjectId,
         bundle: &vot_codec::frames::ProofBundle,
@@ -680,7 +773,9 @@ mod tests {
         let staging_limit = VERIFIER_RESERVATION + bundle.covered_length;
         let mut receiver =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
-        receiver.begin_ranges(subject).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(
             receiver.receive_typed_bundle(subject, bundle, records),
             Err(expected)
@@ -747,7 +842,10 @@ mod tests {
 
         let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
         let mut receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
-        receiver.begin_ranges(subject).unwrap();
+        let sink = std::sync::Arc::new(MemorySink::default());
+        receiver
+            .begin_ranges(subject, Box::new(sink.clone()))
+            .unwrap();
         let mut arrivals = Vec::new();
         while let Some(event) = adapter.poll() {
             let Event::Reliable { bytes: record, .. } = event else {
@@ -775,10 +873,14 @@ mod tests {
         );
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
-        // The duplicate was not charged twice against staging.
+        // Every byte reached the sink exactly once: the duplicate was
+        // absorbed without a second write (MemorySink asserts that).
+        assert_eq!(sink.assembled(), bytes);
+        // Staging covered one range at a time, not the object: the peak is
+        // the window, which is what ADR-0029 is for.
         assert_eq!(
             receiver.peak_staging(),
-            3 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION
+            RANGE_UNIT_BYTES + VERIFIER_RESERVATION
         );
     }
 
@@ -792,8 +894,11 @@ mod tests {
 
         let mut ranged =
             ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
-        ranged.begin_ranges(object).unwrap();
-        assert_eq!(ranged.begin_ranges(object), Err(Error::AlreadyReceiving));
+        ranged.begin_ranges(object, Box::new(DiscardSink)).unwrap();
+        assert_eq!(
+            ranged.begin_ranges(object, Box::new(DiscardSink)),
+            Err(Error::AlreadyReceiving)
+        );
     }
 
     #[test]
@@ -808,16 +913,18 @@ mod tests {
         receiver.range_active.insert(
             object,
             RangeState {
-                segments: BTreeMap::new(),
+                extents: BTreeMap::new(),
                 bytes: RANGE_UNIT_BYTES,
+                sink: Box::new(DiscardSink),
             },
         );
         assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
         receiver.range_active.insert(
             object,
             RangeState {
-                segments: BTreeMap::new(),
+                extents: BTreeMap::new(),
                 bytes: 2 * RANGE_UNIT_BYTES,
+                sink: Box::new(DiscardSink),
             },
         );
         receiver.finish_ranges(object).unwrap();
@@ -835,7 +942,9 @@ mod tests {
         let prefix = vot_proof_blake3::prove(&bytes, 0, 1024).unwrap();
         let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
         let mut receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
-        receiver.begin_ranges(object).unwrap();
+        receiver
+            .begin_ranges(object, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(
             receiver.receive_range(object, 0, &bytes[..1024], &prefix.proof),
             Err(Error::LengthExceeded)
@@ -847,7 +956,9 @@ mod tests {
         let tail_offset = RANGE_UNIT_BYTES;
         let tail = vot_proof_blake3::prove(&short, tail_offset, 7).unwrap();
         let mut tail_receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
-        tail_receiver.begin_ranges(short_object).unwrap();
+        tail_receiver
+            .begin_ranges(short_object, Box::new(DiscardSink))
+            .unwrap();
         tail_receiver
             .receive_range(
                 short_object,
@@ -995,7 +1106,9 @@ mod tests {
         };
 
         let mut receiver = make_receiver();
-        receiver.begin_ranges(range_subject).unwrap();
+        receiver
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(
             receiver.receive_range(range_subject, 0, &[], &[]),
             Err(Error::RecordTooLarge)
@@ -1013,7 +1126,9 @@ mod tests {
         };
         let exact_max = vec![0; usize::try_from(MAX_PROOF_RANGE_BYTES).unwrap()];
         let mut exact_receiver = make_receiver();
-        exact_receiver.begin_ranges(large_range_subject).unwrap();
+        exact_receiver
+            .begin_ranges(large_range_subject, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(
             exact_receiver.receive_range(large_range_subject, 0, &exact_max, &[]),
             Err(Error::ProofInvalid)
@@ -1022,7 +1137,9 @@ mod tests {
         let one = &bytes[..unit];
         let first_proof = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
         let mut misaligned = make_receiver();
-        misaligned.begin_ranges(range_subject).unwrap();
+        misaligned
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(
             misaligned.receive_range(range_subject, 1, one, &[]),
             Err(Error::LengthExceeded)
@@ -1031,13 +1148,17 @@ mod tests {
         let exact_range_subject = subject(one);
         let exact_proof = vot_proof_blake3::prove(one, 0, RANGE_UNIT_BYTES).unwrap();
         let mut exact_end = make_receiver();
-        exact_end.begin_ranges(exact_range_subject).unwrap();
+        exact_end
+            .begin_ranges(exact_range_subject, Box::new(DiscardSink))
+            .unwrap();
         exact_end
             .receive_range(exact_range_subject, 0, one, &exact_proof.proof)
             .unwrap();
 
         let mut duplicate = make_receiver();
-        duplicate.begin_ranges(range_subject).unwrap();
+        duplicate
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         duplicate
             .receive_range(range_subject, 0, one, &first_proof.proof)
             .unwrap();
@@ -1051,22 +1172,32 @@ mod tests {
         let overlap_proof =
             vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let mut overlap = make_receiver();
-        overlap.begin_ranges(range_subject).unwrap();
+        overlap
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         overlap
             .receive_range(range_subject, 0, first_two, &first_two_proof.proof)
             .unwrap();
-        assert_eq!(
-            overlap.receive_range(
+        // Wholly inside the covered extent is a replay under ADR-0029's
+        // coverage rule: the proof held, the bytes are already placed, and
+        // nothing changes.
+        overlap
+            .receive_range(
                 range_subject,
                 RANGE_UNIT_BYTES,
                 overlap_data,
-                &overlap_proof.proof
-            ),
-            Err(Error::LengthMismatch)
+                &overlap_proof.proof,
+            )
+            .unwrap();
+        assert_eq!(
+            overlap.range_active[&range_subject].bytes,
+            2 * RANGE_UNIT_BYTES
         );
 
         let mut overlap_from_below = make_receiver();
-        overlap_from_below.begin_ranges(range_subject).unwrap();
+        overlap_from_below
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         overlap_from_below
             .receive_range(
                 range_subject,
@@ -1083,7 +1214,9 @@ mod tests {
         let second_proof =
             vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let mut adjacent = make_receiver();
-        adjacent.begin_ranges(range_subject).unwrap();
+        adjacent
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         adjacent
             .receive_range(range_subject, 0, one, &first_proof.proof)
             .unwrap();
@@ -1097,7 +1230,9 @@ mod tests {
             .unwrap();
 
         let mut middle = make_receiver();
-        middle.begin_ranges(range_subject).unwrap();
+        middle
+            .begin_ranges(range_subject, Box::new(DiscardSink))
+            .unwrap();
         middle
             .receive_range(
                 range_subject,
@@ -1109,15 +1244,161 @@ mod tests {
         assert_eq!(middle.range_active[&range_subject].bytes, RANGE_UNIT_BYTES);
         assert_eq!(
             middle.range_active[&range_subject]
-                .segments
-                .keys()
-                .copied()
+                .extents
+                .iter()
+                .map(|(start, end)| (*start, *end))
                 .collect::<Vec<_>>(),
-            vec![RANGE_UNIT_BYTES]
+            vec![(RANGE_UNIT_BYTES, 2 * RANGE_UNIT_BYTES)]
         );
         assert_eq!(
             middle.finish_ranges(range_subject),
             Err(Error::LengthMismatch)
+        );
+    }
+
+    #[test]
+    fn extents_coalesce_and_a_covered_range_is_a_replay() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x77; unit * 3];
+        let object = subject(&bytes);
+        let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let sink = std::sync::Arc::new(MemorySink::default());
+        let mut receiver = ReliableReceiver::new(staging, RANGE_UNIT_BYTES, staging).unwrap();
+        receiver
+            .begin_ranges(object, Box::new(sink.clone()))
+            .unwrap();
+        let prove = |offset| vot_proof_blake3::prove(&bytes, offset, RANGE_UNIT_BYTES).unwrap();
+        let range = |offset: u64| {
+            let start = usize::try_from(offset).unwrap();
+            &bytes[start..start + unit]
+        };
+        // First and last, then the middle: the bridging insert merges with
+        // both neighbours and the map ends at one entry.
+        receiver
+            .receive_range(object, 0, range(0), &prove(0).proof)
+            .unwrap();
+        receiver
+            .receive_range(
+                object,
+                2 * RANGE_UNIT_BYTES,
+                range(2 * RANGE_UNIT_BYTES),
+                &prove(2 * RANGE_UNIT_BYTES).proof,
+            )
+            .unwrap();
+        assert_eq!(receiver.range_active[&object].extents.len(), 2);
+        receiver
+            .receive_range(
+                object,
+                RANGE_UNIT_BYTES,
+                range(RANGE_UNIT_BYTES),
+                &prove(RANGE_UNIT_BYTES).proof,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver.range_active[&object]
+                .extents
+                .iter()
+                .map(|(start, end)| (*start, *end))
+                .collect::<Vec<_>>(),
+            vec![(0, 3 * RANGE_UNIT_BYTES)]
+        );
+        // A replay of a range inside the coalesced run changes nothing and
+        // is not written again (MemorySink asserts the single write). The
+        // second replay ends exactly at the run's end, the boundary the
+        // coverage rule must still call covered.
+        receiver
+            .receive_range(
+                object,
+                RANGE_UNIT_BYTES,
+                range(RANGE_UNIT_BYTES),
+                &prove(RANGE_UNIT_BYTES).proof,
+            )
+            .unwrap();
+        receiver
+            .receive_range(
+                object,
+                2 * RANGE_UNIT_BYTES,
+                range(2 * RANGE_UNIT_BYTES),
+                &prove(2 * RANGE_UNIT_BYTES).proof,
+            )
+            .unwrap();
+        receiver.finish_ranges(object).unwrap();
+        assert_eq!(sink.assembled(), bytes);
+    }
+
+    #[test]
+    fn a_refused_write_leaves_the_range_retryable() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x88; unit];
+        let object = subject(&bytes);
+        let proof = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
+        let staging = 2 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
+        receiver
+            .begin_ranges(
+                object,
+                Box::new(FlakySink(std::sync::atomic::AtomicBool::new(true))),
+            )
+            .unwrap();
+        let credit = receiver.advertised_credit();
+        assert_eq!(
+            receiver.receive_range(object, 0, &bytes, &proof.proof),
+            Err(Error::Sink)
+        );
+        // Nothing was booked and nothing stayed charged.
+        assert_eq!(receiver.advertised_credit(), credit);
+        assert_eq!(receiver.range_active[&object].bytes, 0);
+        // The same range offered again completes the object.
+        receiver
+            .receive_range(object, 0, &bytes, &proof.proof)
+            .unwrap();
+        receiver.finish_ranges(object).unwrap();
+        assert!(receiver.is_verified(object));
+    }
+
+    #[test]
+    fn fragments_are_bounded_but_a_merging_range_is_not_refused() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x99; unit * 3];
+        let object = subject(&bytes);
+        let staging = 4 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
+        receiver
+            .begin_ranges(object, Box::new(DiscardSink))
+            .unwrap();
+        // Fill the map to its bound with synthetic far-away runs; only the
+        // count matters to the refusal.
+        {
+            let active = receiver.range_active.get_mut(&object).unwrap();
+            for index in 0..u64::try_from(MAX_RANGE_FRAGMENTS).unwrap() {
+                let start = (10 + 2 * index) * RANGE_UNIT_BYTES;
+                active.extents.insert(start, start + RANGE_UNIT_BYTES);
+            }
+        }
+        let first = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
+        assert_eq!(
+            receiver.receive_range(object, 0, &bytes[..unit], &first.proof),
+            Err(Error::RangeFragmentsExhausted)
+        );
+        // Adjacent to an existing run the same range merges rather than
+        // fragments, so the bound does not refuse it.
+        {
+            let active = receiver.range_active.get_mut(&object).unwrap();
+            active.extents.remove(&(10 * RANGE_UNIT_BYTES));
+            active
+                .extents
+                .insert(RANGE_UNIT_BYTES, 2 * RANGE_UNIT_BYTES);
+        }
+        receiver
+            .receive_range(object, 0, &bytes[..unit], &first.proof)
+            .unwrap();
+        assert_eq!(
+            receiver.range_active[&object].extents.len(),
+            MAX_RANGE_FRAGMENTS
+        );
+        assert_eq!(
+            receiver.range_active[&object].extents[&0],
+            2 * RANGE_UNIT_BYTES
         );
     }
 
@@ -1139,7 +1420,9 @@ mod tests {
             4 * VERIFIER_RESERVATION,
         )
         .unwrap();
-        blake_receiver.begin_ranges(blake_subject).unwrap();
+        blake_receiver
+            .begin_ranges(blake_subject, Box::new(DiscardSink))
+            .unwrap();
         blake_receiver
             .receive_range(
                 blake_subject,
@@ -1173,7 +1456,9 @@ mod tests {
             4 * VERIFIER_RESERVATION,
         )
         .unwrap();
-        sha_receiver.begin_ranges(sha_subject).unwrap();
+        sha_receiver
+            .begin_ranges(sha_subject, Box::new(DiscardSink))
+            .unwrap();
         sha_receiver
             .receive_range(
                 sha_subject,
@@ -1271,12 +1556,17 @@ mod tests {
         let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
         let mut receiver =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
-        receiver.begin_ranges(subject).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(DiscardSink))
+            .unwrap();
         assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
         receiver
             .receive_typed_bundle(subject, &bundle, &decoded_records)
             .unwrap();
-        assert_eq!(receiver.advertised_credit(), 0);
+        // The bytes went to the sink, so their credit came back with the
+        // call; only the transient reassembly charge is left to see.
+        assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
+        assert_eq!(receiver.peak_staging(), staging_limit);
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
         assert_eq!(receiver.advertised_credit(), staging_limit);
@@ -1301,7 +1591,9 @@ mod tests {
         let duplicate_limit = VERIFIER_RESERVATION + 2 * bundle.covered_length;
         let mut duplicate_receiver =
             ReliableReceiver::new(duplicate_limit, duplicate_limit, duplicate_limit).unwrap();
-        duplicate_receiver.begin_ranges(subject).unwrap();
+        duplicate_receiver
+            .begin_ranges(subject, Box::new(DiscardSink))
+            .unwrap();
         duplicate_receiver
             .receive_typed_bundle(subject, &bundle, &decoded_records)
             .unwrap();
@@ -1366,13 +1658,15 @@ mod tests {
         let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
         let mut receiver =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
-        receiver.begin_ranges(subject).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(DiscardSink))
+            .unwrap();
         let credit_before = receiver.advertised_credit();
         receiver.admit_verified_range(range).unwrap();
-        assert!(
-            receiver.advertised_credit() < credit_before,
-            "admission never charged staging"
-        );
+        // The write is what staging covered: the charge is transient, so
+        // credit is back but the peak recorded it.
+        assert_eq!(receiver.advertised_credit(), credit_before);
+        assert_eq!(receiver.peak_staging(), staging_limit);
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
 

@@ -4384,7 +4384,9 @@ pub mod live {
 
             // This deployment requires no authentication, so admitting a
             // subject is the caller's decision and nothing else gates it.
-            receiver.admit(subject).unwrap();
+            receiver
+                .admit(subject, Box::new(vot_scheduler::DiscardSink))
+                .unwrap();
             assert!(!receiver.is_verified(subject));
 
             // The proof describes the range and is bounded by the control

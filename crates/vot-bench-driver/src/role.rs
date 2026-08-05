@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use vot_scheduler::ReliableReceiver;
+use vot_scheduler::{DiscardSink, ReliableReceiver};
 use vot_transport_api::{
     Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
 };
@@ -252,14 +252,48 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     Ok(())
 }
 
+/// Verified ranges rails hold between proving and admission: transport
+/// memory the receiver's own staging cannot see, reported alongside it so
+/// the note describes everything the transfer held (ADR-0029).
+#[derive(Default)]
+struct WitnessLedger {
+    held: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl WitnessLedger {
+    fn hold(&self, bytes: u64) {
+        let now = self
+            .held
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        self.peak
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: u64) {
+        self.held
+            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Drives one receive rail: its own endpoint, its own reassembly, its own
 /// proving, and nothing shared with its siblings but the admission lock and
 /// the running total.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one strand of the shared rail state"
+)]
 fn drive_receive_rail(
     endpoint: &mut Endpoint,
     subject: SubjectId,
     object_bytes: u64,
     receiver: &std::sync::Mutex<ReliableReceiver>,
+    witnesses: &WitnessLedger,
     delivered: &std::sync::atomic::AtomicU64,
     failed: &std::sync::atomic::AtomicBool,
     budget: u64,
@@ -294,12 +328,16 @@ fn drive_receive_rail(
                             &whole.records,
                         )?;
                         let admitted = range.len();
-                        {
+                        witnesses.hold(admitted);
+                        let outcome = {
                             let Ok(mut shared) = receiver.lock() else {
+                                witnesses.release(admitted);
                                 return Err(Error::Disconnected);
                             };
-                            shared.admit_verified_range(range)?;
-                        }
+                            shared.admit_verified_range(range)
+                        };
+                        witnesses.release(admitted);
+                        outcome?;
                         delivered.fetch_add(admitted, std::sync::atomic::Ordering::Relaxed);
                         progress = true;
                     }
@@ -690,7 +728,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let workers = config.workers;
     let subject = subject_of(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject)?;
+    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
     let mut reassembly = BundleReassembly::new(workers);
 
     // Every rail binds before any handshake starts where the backend allows
@@ -711,6 +749,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     // a slice rotation asleep on one rail stalls every other through the
     // pump's headroom gate.
     let receiver = std::sync::Mutex::new(receiver);
+    let witnesses = WitnessLedger::default();
     let delivered = std::sync::atomic::AtomicU64::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
     let mut tally = Tally::default();
@@ -719,6 +758,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         let mut rails = Vec::with_capacity(workers);
         for endpoint in &mut endpoints {
             let receiver = &receiver;
+            let witnesses = &witnesses;
             let delivered = &delivered;
             let failed = &failed;
             rails.push(scope.spawn(move || {
@@ -728,6 +768,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
                     subject,
                     config.object_bytes,
                     receiver,
+                    witnesses,
                     delivered,
                     failed,
                     budget,
@@ -778,8 +819,9 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         use std::fmt::Write as _;
         let _ = write!(
             notes,
-            ";workers={workers};rails=provisioned-multi-rail;bundles={}",
-            reassembly.completed
+            ";workers={workers};rails=provisioned-multi-rail;bundles={};witness_peak_bytes={}",
+            reassembly.completed,
+            witnesses.peak()
         );
     }
     note_rail_paths(&mut endpoints, &mut notes);

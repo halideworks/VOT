@@ -118,6 +118,23 @@ struct RangeState {
     sink: Box<dyn RangeSink>,
 }
 
+/// Releases a transient staging hold on every exit, including an unwind.
+///
+/// The sink is caller-supplied code running inside the reserved window, so
+/// the release cannot rely on the line after the write being reached: a
+/// panicking sink would otherwise strand its reservation for the
+/// receiver's remaining life.
+struct StagingHold<'capacity> {
+    staging: &'capacity mut StagingCapacity,
+    bytes: u64,
+}
+
+impl Drop for StagingHold<'_> {
+    fn drop(&mut self) {
+        self.staging.release(self.bytes);
+    }
+}
+
 /// Receiver state is keyed by subject identity and outlives connections.
 pub struct ReliableReceiver {
     staging: StagingCapacity,
@@ -300,18 +317,20 @@ impl ReliableReceiver {
         if !merges_earlier && !merges_later && active.extents.len() >= MAX_RANGE_FRAGMENTS {
             return Err(Error::RangeFragmentsExhausted);
         }
-        let reserved_here = if caller_reserved {
-            false
+        let reserved = if caller_reserved {
+            // The caller holds its own reservation and releases it itself.
+            0
         } else {
             self.staging.reserve(bytes)?;
-            true
+            bytes
         };
-        self.peak_staging = self.peak_staging.max(self.staging.used());
-        let written = active.sink.write_at(covered_offset, data);
-        if reserved_here {
-            self.staging.release(bytes);
-        }
-        written?;
+        let hold = StagingHold {
+            staging: &mut self.staging,
+            bytes: reserved,
+        };
+        self.peak_staging = self.peak_staging.max(hold.staging.used());
+        active.sink.write_at(covered_offset, data)?;
+        drop(hold);
         let active = self
             .range_active
             .get_mut(&subject)
@@ -1354,6 +1373,33 @@ mod tests {
             .unwrap();
         receiver.finish_ranges(object).unwrap();
         assert!(receiver.is_verified(object));
+    }
+
+    #[test]
+    fn a_panicking_sink_does_not_strand_staging() {
+        struct PanickingSink;
+        impl RangeSink for PanickingSink {
+            fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), SinkError> {
+                panic!("a sink is caller code and may do this");
+            }
+        }
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0xaa; unit];
+        let object = subject(&bytes);
+        let proof = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
+        let staging = 2 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
+        receiver
+            .begin_ranges(object, Box::new(PanickingSink))
+            .unwrap();
+        let credit = receiver.advertised_credit();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver.receive_range(object, 0, &bytes, &proof.proof)
+        }));
+        assert!(outcome.is_err(), "the sink's panic reached the caller");
+        // The unwind released the transient reservation, so the receiver's
+        // remaining life is not smaller for the panic.
+        assert_eq!(receiver.advertised_credit(), credit);
     }
 
     #[test]

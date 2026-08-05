@@ -32,12 +32,13 @@ use vot_transport_api::{
 };
 
 use crate::{
-    BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource, Rails,
-    RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent, cpu_times_ns,
-    enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes, prover_layer_and_subject,
-    ranged_record_bytes, receiver_for, receiver_for_ranged, record_lengths, record_payload,
-    round_budget, subject_of, worker_ranges,
+    BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource,
+    PendingBundle, Rails, RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent,
+    cpu_times_ns, enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes,
+    prover_layer_and_subject, ranged_record_bytes, receiver_for, receiver_for_ranged,
+    record_lengths, record_payload, round_budget, subject_of, worker_ranges,
 };
+use vot_scheduler::{ReliableReceiver as SchedulerReceiver, VerifiedRange};
 
 /// Which half of the transfer this process is.
 pub(crate) const ROLE: &str = "VOT_BENCH_ROLE";
@@ -203,6 +204,38 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     adapter.flush()?;
     linger(adapter);
     Ok(())
+}
+
+/// Spawns the verify pool: each worker takes whole bundles, proves them, and
+/// sends the witness back for the spine to admit.
+fn spawn_verifiers<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    workers: usize,
+    subject: SubjectId,
+    work_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<PendingBundle>>>,
+    range_tx: &std::sync::mpsc::Sender<Result<VerifiedRange, Error>>,
+) {
+    for _ in 0..workers {
+        let work_rx = std::sync::Arc::clone(work_rx);
+        let range_tx = range_tx.clone();
+        scope.spawn(move || {
+            loop {
+                let taken = {
+                    let Ok(queue) = work_rx.lock() else { return };
+                    queue.recv()
+                };
+                let Ok(whole) = taken else { return };
+                let verified =
+                    SchedulerReceiver::verify_typed_bundle(subject, &whole.bundle, &whole.records)
+                        .map_err(Error::from);
+                // A closed return channel is the spine gone; the verdict goes
+                // with it.
+                if range_tx.send(verified).is_err() {
+                    return;
+                }
+            }
+        });
+    }
 }
 
 /// Accepts every rail's connection and starts the transfer clock.
@@ -621,49 +654,68 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
     }
 
+    // Verification is the receive half's heaviest work and it is pure, so a
+    // pool the width of the rails carries it while the spine polls, hands
+    // out whole bundles, and admits what the verifiers prove. The channel
+    // bound is what caps unadmitted bytes held between the two halves.
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<PendingBundle>(workers * 2);
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    let (range_tx, range_rx) = std::sync::mpsc::channel::<Result<VerifiedRange, Error>>();
     let mut delivered = 0_u64;
     let mut tally = Tally::default();
-    while delivered < config.object_bytes {
-        tally.rounds = tally.rounds.saturating_add(1);
-        if tally.rounds > budget {
-            return Err(Error::Stalled);
-        }
-        let mut progress = 0_u64;
-        for endpoint in &mut endpoints {
-            tally.flushes = tally.flushes.saturating_add(1);
-            endpoint.adapter.flush()?;
-            // A bounded slice per rail per round, because draining one rail
-            // dry stalls every other: their queues sit full, their pumps
-            // pause reading, and their senders stall on flow control while
-            // this one is served. Interleaving keeps all rails' windows
-            // moving; the budget still bounds the outer loop.
-            let mut slice = 0_u32;
-            while slice < 256 {
-                slice += 1;
-                let Some(event) = endpoint.adapter.poll() else {
-                    break;
-                };
-                match event {
-                    Event::Reliable { bytes, .. } => {
-                        tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
-                        progress = progress.saturating_add(reassembly.accept(
-                            &mut receiver,
-                            subject,
-                            &bytes,
-                        )?);
+    std::thread::scope(|scope| -> Result<(), Error> {
+        spawn_verifiers(scope, workers, subject, &work_rx, &range_tx);
+        while delivered < config.object_bytes {
+            tally.rounds = tally.rounds.saturating_add(1);
+            if tally.rounds > budget {
+                return Err(Error::Stalled);
+            }
+            let mut progress = false;
+            for endpoint in &mut endpoints {
+                tally.flushes = tally.flushes.saturating_add(1);
+                endpoint.adapter.flush()?;
+                // A bounded slice per rail per round, because draining one
+                // rail dry stalls every other: their queues sit full, their
+                // pumps pause reading, and their senders stall on flow
+                // control while this one is served. Interleaving keeps every
+                // rail's window moving; the budget still bounds the loop.
+                let mut slice = 0_u32;
+                while slice < 256 {
+                    slice += 1;
+                    let Some(event) = endpoint.adapter.poll() else {
+                        break;
+                    };
+                    match event {
+                        Event::Reliable { bytes, .. } => {
+                            tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
+                            if let Some(whole) = reassembly.take(&bytes)? {
+                                // A full pool backpressures the spine, and
+                                // through it the pumps and the peer.
+                                work_tx.send(whole).map_err(|_| Error::Disconnected)?;
+                                progress = true;
+                            }
+                        }
+                        Event::Disconnected(_) => return Err(Error::Disconnected),
+                        _ => {}
                     }
-                    Event::Disconnected(_) => return Err(Error::Disconnected),
-                    _ => {}
                 }
             }
+            while let Ok(verified) = range_rx.try_recv() {
+                let range = verified?;
+                let admitted = range.len();
+                receiver.admit_verified_range(range)?;
+                delivered = delivered.saturating_add(admitted);
+                progress = true;
+            }
+            if !progress {
+                tally.idle_waits = tally.idle_waits.saturating_add(1);
+                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
+                endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
+            }
         }
-        delivered = delivered.saturating_add(progress);
-        if progress == 0 {
-            tally.idle_waits = tally.idle_waits.saturating_add(1);
-            let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-            endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
-        }
-    }
+        drop(work_tx);
+        Ok(())
+    })?;
     receiver.finish_ranges(subject)?;
     let elapsed = started.elapsed();
     tally.cpu = cpu_spent(cpu_before, cpu_times_ns());

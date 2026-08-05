@@ -42,6 +42,14 @@ const MAX_DATAGRAM_SIZE: usize = 1_472;
 /// under this cannot complete a handshake.
 const MIN_DATAGRAM_SIZE: usize = 1_200;
 
+/// What the socket asks the kernel to hold in each direction.
+///
+/// Four megabytes of receive is three milliseconds at ten gigabits, room for
+/// a scheduling quantum without shedding; send is half that, because the
+/// pump paces its own bursts out.
+const RECEIVE_BUFFER_BYTES: u32 = 4 * 1024 * 1024;
+const SEND_BUFFER_BYTES: u32 = 2 * 1024 * 1024;
+
 /// The largest, which is what a UDP payload can hold inside IPv4's 65535-byte
 /// total length once its own and UDP's headers are paid for. IPv6 could carry
 /// 20 more, which is not worth a family-dependent ceiling: a size the socket
@@ -336,6 +344,13 @@ impl Transport {
         // fragmented and reassembled: a reassembled probe reads as success and
         // locks the connection above the path for good.
         vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
+        // Best effort, because buffer sizes are throughput and never
+        // correctness: a kernel that grants less sheds more under bursts and
+        // the peer's congestion window pays for it, which is measurable in
+        // the path stats rather than fatal. The defaults are one offload
+        // burst on some platforms, and a receiver descheduled for a quantum
+        // at ten gigabits needs megabytes, not kilobytes.
+        let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
         let mut quiche_config = config.build(role)?;
 
@@ -1357,6 +1372,7 @@ pub fn path_sample(conn: &quiche::Connection) -> Option<PathStats> {
         congestion_window_bytes: u64::try_from(stats.cwnd).ok(),
         mtu_bytes: u64::try_from(stats.pmtu).ok(),
         pacing_rate_bps: Some(stats.delivery_rate.saturating_mul(8)),
+        lost_packets: u64::try_from(conn.stats().lost).ok(),
     })
 }
 

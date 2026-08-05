@@ -207,6 +207,27 @@ fn wait_connected(
     Err(Error::Handshake)
 }
 
+/// Appends each rail's final path measurements to the notes, so a slow run
+/// carries its own congestion story: losses name the path, their absence
+/// names the source.
+fn note_rail_paths(endpoints: &mut [Endpoint], notes: &mut String) {
+    use std::fmt::Write as _;
+    for (rail, endpoint) in endpoints.iter_mut().enumerate() {
+        let Some(stats) = endpoint.adapter.path_stats() else {
+            continue;
+        };
+        if let Some(lost) = stats.lost_packets {
+            let _ = write!(notes, ";rail{rail}_lost={lost}");
+        }
+        if let Some(rtt) = stats.smoothed_rtt_us {
+            let _ = write!(notes, ";rail{rail}_rtt_us={rtt}");
+        }
+        if let Some(cwnd) = stats.congestion_window_bytes {
+            let _ = write!(notes, ";rail{rail}_cwnd={cwnd}");
+        }
+    }
+}
+
 /// Sends the done marker on rail zero and stays reachable while it leaves.
 fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     let mut marker = Vec::new();
@@ -644,6 +665,7 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
         use std::fmt::Write as _;
         let _ = write!(notes, ";workers={workers};rails=provisioned-multi-rail");
     }
+    note_rail_paths(&mut endpoints, &mut notes);
     Ok(Measurement {
         bytes_sent,
         verified_bytes: 0,
@@ -751,6 +773,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
             reassembly.completed
         );
     }
+    note_rail_paths(&mut endpoints, &mut notes);
     Ok(Measurement {
         bytes_sent: 0,
         verified_bytes: config.object_bytes,

@@ -39,6 +39,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// worth of crypto and the default is sized for a path whose MTU is unknown.
 const DATAGRAM_BYTES: &str = "VOT_BENCH_QUICHE_DATAGRAM_BYTES";
 
+/// Whether quiche widens its loss time threshold on proven spurious loss.
+/// `1` or `0`; anything else is refused rather than guessed at.
+const RELAXED_LOSS: &str = "VOT_BENCH_QUICHE_RELAXED_LOSS";
+
 /// Lanes the endpoints advertise.
 ///
 /// The sequential transfer uses one, the ranged path uses one per worker
@@ -55,6 +59,7 @@ pub(crate) struct QuicheCarrier {
     /// What the pair was configured with, so a result says which path it
     /// describes rather than leaving a reader to assume the default.
     datagram_bytes: usize,
+    relaxed_loss: bool,
 }
 
 impl QuicheCarrier {
@@ -71,6 +76,7 @@ impl QuicheCarrier {
             .map_err(|_| Error::Value("VOT_BENCH_BACKEND"))?;
 
         let datagram_bytes = datagram_bytes_from_env()?;
+        let relaxed_loss = relaxed_loss_from_env()?;
 
         let mut server_config = QuicheConfig::server(limits, certificate, key);
         let mut client_config = QuicheConfig::client(limits);
@@ -78,6 +84,8 @@ impl QuicheCarrier {
             server_config.max_datagram_bytes = bytes;
             client_config.max_datagram_bytes = bytes;
         }
+        server_config.relaxed_loss_threshold = relaxed_loss;
+        client_config.relaxed_loss_threshold = relaxed_loss;
         let mut server = Transport::serve(loopback, &server_config).map_err(Error::Transport)?;
         // The credential is generated for this run and trusted by construction.
         // What is being measured is the carrier, not the web PKI, and a
@@ -100,6 +108,7 @@ impl QuicheCarrier {
             // What was configured, rather than what was asked for, so an
             // unset case reports the default it actually ran at.
             datagram_bytes: client_config.max_datagram_bytes,
+            relaxed_loss,
         })
     }
 }
@@ -126,6 +135,16 @@ fn datagram_bytes_from_env() -> Result<Option<usize>, Error> {
         .map_err(|_| Error::Value(DATAGRAM_BYTES))
 }
 
+/// Reads whether the case relaxes quiche's loss time threshold.
+fn relaxed_loss_from_env() -> Result<bool, Error> {
+    match std::env::var(RELAXED_LOSS).ok().filter(|v| !v.is_empty()) {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Err(Error::Value(RELAXED_LOSS)),
+    }
+}
+
 /// How long a role endpoint waits for its peer, against loopback's
 /// [`HANDSHAKE_TIMEOUT`]: the two halves of a two-machine run are started by
 /// hand on two machines, and a human is slower than a scheduler.
@@ -146,17 +165,25 @@ pub(crate) fn role_listen_bound(
     if let Some(bytes) = datagram_bytes_from_env()? {
         server_config.max_datagram_bytes = bytes;
     }
+    server_config.relaxed_loss_threshold = relaxed_loss_from_env()?;
     let server = Transport::serve(address, &server_config).map_err(Error::Transport)?;
     Ok(crate::role::Endpoint {
         adapter: Box::new(server),
         keepalive: None,
         backend: "quiche",
-        detail: Some(format!(
-            "datagram_bytes={}",
-            server_config.max_datagram_bytes
-        )),
+        detail: Some(endpoint_detail(&server_config)),
         unmodelled: unmodelled_for(config),
     })
+}
+
+/// Labels a run with what its endpoint was configured with, so a figure
+/// taken with the relaxed threshold can never pass as a default one.
+fn endpoint_detail(config: &QuicheConfig) -> String {
+    let mut detail = format!("datagram_bytes={}", config.max_datagram_bytes);
+    if config.relaxed_loss_threshold {
+        detail.push_str(";relaxed_loss=1");
+    }
+    detail
 }
 
 /// Listens on `address` and waits for the sending half to connect.
@@ -173,16 +200,14 @@ pub(crate) fn role_listen(
     if let Some(bytes) = datagram_bytes_from_env()? {
         server_config.max_datagram_bytes = bytes;
     }
+    server_config.relaxed_loss_threshold = relaxed_loss_from_env()?;
     let mut server = Transport::serve(address, &server_config).map_err(Error::Transport)?;
     connected_within(&mut server, ROLE_HANDSHAKE_TIMEOUT)?;
     Ok(crate::role::Endpoint {
         adapter: Box::new(server),
         keepalive: None,
         backend: "quiche",
-        detail: Some(format!(
-            "datagram_bytes={}",
-            server_config.max_datagram_bytes
-        )),
+        detail: Some(endpoint_detail(&server_config)),
         unmodelled: unmodelled_for(config),
     })
 }
@@ -200,6 +225,7 @@ pub(crate) fn role_connect(
     if let Some(bytes) = datagram_bytes_from_env()? {
         client_config.max_datagram_bytes = bytes;
     }
+    client_config.relaxed_loss_threshold = relaxed_loss_from_env()?;
     // The receiving half's credential is generated for its run and trusted by
     // construction, exactly as the loopback pair trusts its own.
     client_config.verify_peer = false;
@@ -217,10 +243,7 @@ pub(crate) fn role_connect(
         adapter: Box::new(client),
         keepalive: None,
         backend: "quiche",
-        detail: Some(format!(
-            "datagram_bytes={}",
-            client_config.max_datagram_bytes
-        )),
+        detail: Some(endpoint_detail(&client_config)),
         unmodelled: unmodelled_for(config),
     })
 }
@@ -344,7 +367,11 @@ impl Carrier for QuicheCarrier {
     }
 
     fn detail(&self) -> Option<String> {
-        Some(format!("datagram_bytes={}", self.datagram_bytes))
+        let mut detail = format!("datagram_bytes={}", self.datagram_bytes);
+        if self.relaxed_loss {
+            detail.push_str(";relaxed_loss=1");
+        }
+        Some(detail)
     }
 
     fn unmodelled(&self) -> &[&'static str] {

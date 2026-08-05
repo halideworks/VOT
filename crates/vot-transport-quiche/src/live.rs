@@ -205,6 +205,15 @@ pub struct Config {
     /// a few probe round trips that a ceiling at or under the path answers
     /// in one.
     pub max_datagram_bytes: usize,
+    /// Whether loss detection widens its time threshold each time an
+    /// acknowledgement disproves a declared loss.
+    ///
+    /// quiche floors its loss delay at one millisecond, so on a path whose
+    /// round trip is shorter than that, any acknowledgement a millisecond
+    /// late convicts every older packet in flight. Off by default because
+    /// it is quiche's experiment, not its default, and a measurement should
+    /// say when it was on.
+    pub relaxed_loss_threshold: bool,
 }
 
 impl Config {
@@ -218,6 +227,7 @@ impl Config {
             verify_peer: true,
             idle_timeout_ms: 30_000,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
+            relaxed_loss_threshold: false,
         }
     }
 
@@ -231,6 +241,7 @@ impl Config {
             verify_peer: false,
             idle_timeout_ms: 30_000,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
+            relaxed_loss_threshold: false,
         }
     }
 
@@ -270,6 +281,7 @@ impl Config {
         // connection probes and settles under the ceiling the way MsQuic
         // does unaided. The bakeoff report records both behaviors.
         config.discover_pmtu(true);
+        config.set_enable_relaxed_loss_threshold(self.relaxed_loss_threshold);
         // The advertised control-frame bound has to fit in one stream's flow
         // control, or a conforming frame is refused by the carrier after the
         // session promised to accept it.

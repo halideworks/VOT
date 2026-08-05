@@ -193,6 +193,84 @@ struct RangeState {
     sink: Box<dyn RangeSink>,
 }
 
+/// What checking a range against the accepted extents decided.
+struct Booking {
+    covered_end: u64,
+    next_bytes: u64,
+}
+
+/// Decides whether a range is new, a replay, or a conflict.
+///
+/// `Ok(None)` is a replay: the range sits wholly inside the covered
+/// extents, its proof bound its bytes to the root before this ran, and
+/// there is nothing to compare because two different byte strings for the
+/// same range cannot both have held.
+///
+/// # Errors
+/// Rejects an overlap that straddles covered and uncovered bytes, a byte
+/// total that cannot fit the subject, and a fragment budget exceeded.
+fn check_range(
+    active: &RangeState,
+    covered_offset: u64,
+    bytes: u64,
+) -> Result<Option<Booking>, Error> {
+    let covered_end = covered_offset
+        .checked_add(bytes)
+        .ok_or(Error::LengthExceeded)?;
+    if active
+        .extents
+        .range(..=covered_offset)
+        .next_back()
+        .is_some_and(|(_, end)| *end >= covered_end)
+    {
+        return Ok(None);
+    }
+    // Accepted extents never overlap, so only the two neighbours of the
+    // new offset can conflict.
+    let earlier = active.extents.range(..covered_offset).next_back();
+    let overlaps_earlier = earlier.is_some_and(|(_, end)| covered_offset < *end);
+    let overlaps_later = active
+        .extents
+        .range(covered_offset..)
+        .next()
+        .is_some_and(|(offset, _)| *offset < covered_end);
+    if overlaps_earlier || overlaps_later {
+        return Err(Error::LengthMismatch);
+    }
+    let next_bytes = active
+        .bytes
+        .checked_add(bytes)
+        .ok_or(Error::LengthExceeded)?;
+    let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
+    let merges_later = active.extents.contains_key(&covered_end);
+    if !merges_earlier && !merges_later && active.extents.len() >= MAX_RANGE_FRAGMENTS {
+        return Err(Error::RangeFragmentsExhausted);
+    }
+    Ok(Some(Booking {
+        covered_end,
+        next_bytes,
+    }))
+}
+
+/// Records what [`check_range`] admitted, merging with either neighbour so
+/// the map holds one entry per contiguous covered run.
+fn book_range(active: &mut RangeState, covered_offset: u64, booking: &Booking) {
+    active.bytes = booking.next_bytes;
+    let mut start = covered_offset;
+    let mut end = booking.covered_end;
+    if let Some((&earlier_start, &earlier_end)) = active.extents.range(..covered_offset).next_back()
+    {
+        if earlier_end == covered_offset {
+            active.extents.remove(&earlier_start);
+            start = earlier_start;
+        }
+    }
+    if let Some(later_end) = active.extents.remove(&booking.covered_end) {
+        end = later_end;
+    }
+    active.extents.insert(start, end);
+}
+
 /// Releases a transient staging hold on every exit, including an unwind.
 ///
 /// The sink is caller-supplied code running inside the reserved window, so
@@ -352,46 +430,13 @@ impl ReliableReceiver {
             return Ok(());
         }
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
-        let covered_end = covered_offset
-            .checked_add(bytes)
-            .ok_or(Error::LengthExceeded)?;
         let active = self
             .range_active
             .get(&subject)
             .ok_or(Error::UnknownObject)?;
-        // A range wholly inside the covered extents is a replay. The proof
-        // bound its bytes to the root at this offset before this ran, so
-        // there is nothing to compare: two different byte strings for the
-        // same range cannot both have held.
-        if active
-            .extents
-            .range(..=covered_offset)
-            .next_back()
-            .is_some_and(|(_, end)| *end >= covered_end)
-        {
+        let Some(booking) = check_range(active, covered_offset, bytes)? else {
             return Ok(());
-        }
-        // Accepted extents never overlap, so only the two neighbours of the
-        // new offset can conflict.
-        let earlier = active.extents.range(..covered_offset).next_back();
-        let overlaps_earlier = earlier.is_some_and(|(_, end)| covered_offset < *end);
-        let overlaps_later = active
-            .extents
-            .range(covered_offset..)
-            .next()
-            .is_some_and(|(offset, _)| *offset < covered_end);
-        if overlaps_earlier || overlaps_later {
-            return Err(Error::LengthMismatch);
-        }
-        let next_bytes = active
-            .bytes
-            .checked_add(bytes)
-            .ok_or(Error::LengthExceeded)?;
-        let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
-        let merges_later = active.extents.contains_key(&covered_end);
-        if !merges_earlier && !merges_later && active.extents.len() >= MAX_RANGE_FRAGMENTS {
-            return Err(Error::RangeFragmentsExhausted);
-        }
+        };
         let reserved = if caller_reserved {
             // The caller holds its own reservation and releases it itself.
             0
@@ -410,21 +455,41 @@ impl ReliableReceiver {
             .range_active
             .get_mut(&subject)
             .ok_or(Error::UnknownObject)?;
-        active.bytes = next_bytes;
-        // Merge with either neighbour so the map holds one entry per
-        // contiguous covered run.
-        let mut start = covered_offset;
-        let mut end = covered_end;
-        if merges_earlier {
-            if let Some((&earlier_start, _)) = active.extents.range(..covered_offset).next_back() {
-                active.extents.remove(&earlier_start);
-                start = earlier_start;
-            }
+        book_range(active, covered_offset, &booking);
+        Ok(())
+    }
+
+    /// Books a range whose bytes are already placed: the caller verified it,
+    /// wrote it through [`VerifiedRange::write_to`], and only the extent is
+    /// left to record, so nothing here needs the bytes or touches the sink.
+    ///
+    /// This is what lets a rail place its bytes outside the admission lock:
+    /// accepted writes commute, so placement needs no serialization, and the
+    /// lock covers only this booking.
+    ///
+    /// # Errors
+    /// Rejects an unknown subject, an overlap with an accepted range, or a
+    /// fragment budget the range does not fit.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "admission spends the witness; handing it back would invite re-admitting it"
+    )]
+    pub fn admit_written_range(&mut self, range: WrittenRange) -> Result<(), Error> {
+        if self.verified.contains(&range.subject) {
+            return Ok(());
         }
-        if let Some(later_end) = active.extents.remove(&covered_end) {
-            end = later_end;
-        }
-        active.extents.insert(start, end);
+        let active = self
+            .range_active
+            .get(&range.subject)
+            .ok_or(Error::UnknownObject)?;
+        let Some(booking) = check_range(active, range.covered_offset, range.bytes)? else {
+            return Ok(());
+        };
+        let active = self
+            .range_active
+            .get_mut(&range.subject)
+            .ok_or(Error::UnknownObject)?;
+        book_range(active, range.covered_offset, &booking);
         Ok(())
     }
 
@@ -649,6 +714,35 @@ impl VerifiedRange {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Places the verified bytes and returns the witness admission takes.
+    ///
+    /// Holding a [`WrittenRange`] is holding both the proof and the
+    /// placement, which is what lets a caller write outside the receiver's
+    /// lock and admit under it: accepted writes commute, so placement
+    /// needs no serialization.
+    ///
+    /// # Errors
+    /// Surfaces the sink's refusal; this witness stays usable for a retry.
+    pub fn write_to(&self, sink: &dyn RangeSink) -> Result<WrittenRange, SinkError> {
+        sink.write_at(self.covered_offset, &self.data)?;
+        Ok(WrittenRange {
+            subject: self.subject,
+            covered_offset: self.covered_offset,
+            bytes: self.data.len() as u64,
+        })
+    }
+}
+
+/// A range whose proof has held and whose bytes are already placed.
+///
+/// Only [`VerifiedRange::write_to`] builds one, so holding it is holding
+/// the write itself; admission books the extent without the bytes.
+#[derive(Debug)]
+pub struct WrittenRange {
+    subject: SubjectId,
+    covered_offset: u64,
+    bytes: u64,
 }
 
 /// Checks a bundle's identity against its subject and orders its records.
@@ -1843,6 +1937,105 @@ mod tests {
         let credit_verified = receiver.advertised_credit();
         receiver.admit_verified_range(again).unwrap();
         assert_eq!(receiver.advertised_credit(), credit_verified);
+    }
+
+    #[test]
+    fn a_written_range_admits_without_the_bytes() {
+        let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
+        let subject = SubjectId {
+            suite: 1,
+            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            length: bytes.len() as u64,
+        };
+        let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
+        let bundle = vot_codec::frames::ProofBundle {
+            request_id: [3; 16],
+            bundle_id: [4; 16],
+            object: vot_codec::frames::ObjectId {
+                suite: subject.suite,
+                root: subject.root,
+                length: subject.length,
+            },
+            requested_offset: 0,
+            requested_length: subject.length,
+            covered_offset: proof.covered_offset,
+            covered_length: proof.data.len() as u64,
+            data_record_count: 1,
+            total_plaintext_length: proof.data.len() as u64,
+            proof: proof.proof,
+        };
+        let records = [vot_codec::frames::DataRecord {
+            bundle_id: [4; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: bytes.len() as u64,
+            compression: 0,
+            encoded: bytes.clone(),
+        }];
+        let range = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+
+        let sink = std::sync::Arc::new(MemorySink::default());
+        let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
+        let mut receiver =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(sink.clone()))
+            .unwrap();
+        let credit = receiver.advertised_credit();
+        // Placed outside any lock, admitted without the bytes: the caller
+        // holds the write's witness, so admission needs neither the data
+        // nor the sink.
+        let written = range.write_to(sink.as_ref()).unwrap();
+        drop(range);
+        receiver.admit_written_range(written).unwrap();
+        // The bytes never crossed the receiver, so staging did not move.
+        assert_eq!(receiver.advertised_credit(), credit);
+        assert_eq!(receiver.range_active[&subject].bytes, bytes.len() as u64);
+        receiver.finish_ranges(subject).unwrap();
+        assert!(receiver.is_verified(subject));
+        assert_eq!(sink.assembled(), bytes);
+
+        // A replayed placement of a verified subject changes nothing.
+        receiver
+            .admit_written_range(WrittenRange {
+                subject,
+                covered_offset: 0,
+                bytes: bytes.len() as u64,
+            })
+            .unwrap();
+
+        // A subject no receiver opened is refused at admission.
+        let mut closed =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        assert!(matches!(
+            closed.admit_written_range(WrittenRange {
+                subject,
+                covered_offset: 0,
+                bytes: 1,
+            }),
+            Err(Error::UnknownObject)
+        ));
+
+        // A placement straddling covered and uncovered bytes is a conflict,
+        // the same answer the sink path gives.
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let second = vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let mut straddled =
+            ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
+        straddled
+            .begin_ranges(subject, Box::new(DiscardSink))
+            .unwrap();
+        straddled
+            .receive_range(subject, RANGE_UNIT_BYTES, &bytes[unit..], &second.proof)
+            .unwrap();
+        assert_eq!(
+            straddled.admit_written_range(WrittenRange {
+                subject,
+                covered_offset: 0,
+                bytes: bytes.len() as u64,
+            }),
+            Err(Error::LengthMismatch)
+        );
     }
 
     #[test]

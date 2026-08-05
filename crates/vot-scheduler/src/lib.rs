@@ -12,7 +12,10 @@ use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
 /// Range granularity a proof covers, from spec/proofs.md.
 pub const RANGE_UNIT_BYTES: u64 = 65_536;
-const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
+/// The most bytes one proof-bearing range may cover, from spec/proofs.md.
+/// Public because it is also the most a single admission can transiently
+/// hold, which is what sizes a receiver's staging under ADR-0029.
+pub const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 

@@ -464,14 +464,19 @@ fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
     Ok(bytes)
 }
 
-/// The staging the ranged receiver needs: the object it retains until
-/// completion, plus the verifier reservation.
+/// The staging the ranged receiver needs: one in-flight range per worker,
+/// plus the verifier reservation.
 ///
-/// The range path keeps every verified range in memory until the object is
-/// whole, so on this path peak staging tracks object size by design and the
-/// report reads it as retention, not as a leak.
+/// ADR-0029: a verified range flows to the subject's sink at admission, so
+/// the receiver retains no object bytes and staging covers admissions only.
+/// Admissions serialize on the receiver today, but every worker can hold
+/// one verified range on its way in, so the limit prices that many rather
+/// than the object.
 fn ranged_staging_limit(config: &Config) -> u64 {
-    config.object_bytes.saturating_add(GROUP_BYTES)
+    u64::try_from(config.workers)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(vot_scheduler::MAX_PROOF_RANGE_BYTES)
+        .saturating_add(GROUP_BYTES)
 }
 
 /// Builds the receiver for a ranged case.
@@ -2430,15 +2435,15 @@ mod tests {
     }
 
     #[test]
-    fn ranged_staging_holds_the_object_it_retains() {
-        // The range path keeps every verified range until the object is
-        // whole, so the limit is the object plus the verifier reservation,
+    fn ranged_staging_prices_admissions_not_the_object() {
+        // ADR-0029: the receiver never retains the object, so the limit is
+        // one in-flight range per worker plus the verifier reservation,
         // exactly. Pinned by value because nothing else observes an
         // over-generous limit.
         let config = ranged_case(7 * 65_536 + 17, 2, Suite::Blake3Bao64);
         assert_eq!(
             super::ranged_staging_limit(&config),
-            7 * 65_536 + 17 + 65_536
+            2 * vot_scheduler::MAX_PROOF_RANGE_BYTES + 65_536
         );
     }
 

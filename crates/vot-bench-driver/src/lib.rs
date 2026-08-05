@@ -1766,7 +1766,7 @@ fn transfer_ranged<C: Carrier>(
     // the poll loop (ADR-0029's write-first order, the loopback half).
     let receiver = std::sync::Mutex::new(receiver);
     let witnesses = WitnessLedger::default();
-    let (place, placements) = mpsc::sync_channel::<PendingBundle>(workers * 2);
+    let (place, placements) = mpsc::sync_channel::<PendingBundle>(workers.saturating_mul(2));
     let placements = std::sync::Mutex::new(placements);
 
     let cpu_before = cpu_times_ns();

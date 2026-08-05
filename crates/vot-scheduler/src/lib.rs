@@ -137,7 +137,7 @@ fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Resu
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+fn write_all_at_windows(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt as _;
     let mut offset = offset;
     let mut data = data;
@@ -153,13 +153,23 @@ fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Resu
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_all_at(_file: &std::fs::File, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+fn write_all_at_unsupported(
+    _file: &std::fs::File,
+    _offset: u64,
+    _data: &[u8],
+) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
 impl RangeSink for FileSink {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError> {
-        write_all_at(&self.file, covered_offset, data).map_err(|_| SinkError)
+        #[cfg(unix)]
+        let written = write_all_at(&self.file, covered_offset, data);
+        #[cfg(windows)]
+        let written = write_all_at_windows(&self.file, covered_offset, data);
+        #[cfg(not(any(unix, windows)))]
+        let written = write_all_at_unsupported(&self.file, covered_offset, data);
+        written.map_err(|_| SinkError)
     }
 }
 

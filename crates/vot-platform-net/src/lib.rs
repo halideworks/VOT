@@ -279,10 +279,12 @@ mod tests {
     fn sized_buffers_grow_toward_what_was_asked() {
         // Kernels clamp to their own ceilings rather than erroring, Linux at
         // net.core.rmem_max, so the honest assertion is strict growth over the
-        // default and a floor every platform grants, not the request itself.
-        // Strict, because Linux doubles whatever it accepts for bookkeeping,
-        // so even a clamped request moves the value; a call that changed
-        // nothing did nothing.
+        // default, or a value already meeting the request, and a floor every
+        // platform grants. Strict, because Linux doubles whatever it accepts
+        // for bookkeeping, so on stock defaults even a clamped request moves
+        // the value and a call that changed nothing did nothing; the request
+        // arm is for a tuned host whose default is already the doubled
+        // request, where an unchanged value is adequacy rather than a stub.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let read = |socket: &UdpSocket, option: i32| read_option(socket, libc::SOL_SOCKET, option);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -297,18 +299,21 @@ mod tests {
             use windows_sys::Win32::Networking::WinSock;
             (WinSock::SO_RCVBUF, WinSock::SO_SNDBUF)
         };
+        let (receive_request, send_request) = (4u32 * 1024 * 1024, 2u32 * 1024 * 1024);
         let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
         let receive_before = read(&socket, receive_option);
         let send_before = read(&socket, send_option);
-        super::size_buffers(&socket, 4 * 1024 * 1024, 2 * 1024 * 1024).expect("the sizes");
+        super::size_buffers(&socket, receive_request, send_request).expect("the sizes");
         let receive = read(&socket, receive_option);
         let send = read(&socket, send_option);
         assert!(
-            receive > receive_before && receive >= 200 * 1024,
+            (receive > receive_before || i64::from(receive) >= i64::from(receive_request))
+                && receive >= 200 * 1024,
             "receive buffer {receive} from {receive_before}"
         );
         assert!(
-            send > send_before && send >= 200 * 1024,
+            (send > send_before || i64::from(send) >= i64::from(send_request))
+                && send >= 200 * 1024,
             "send buffer {send} from {send_before}"
         );
     }

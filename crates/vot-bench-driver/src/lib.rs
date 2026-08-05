@@ -1224,6 +1224,20 @@ struct Tally {
     cpu: Option<(u64, u64)>,
 }
 
+impl Tally {
+    /// Folds another tally's counters in; CPU stays the caller's to set,
+    /// because it is a process total rather than a per-thread one.
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.flushes = self.flushes.saturating_add(other.flushes);
+        self.backpressure_waits = self
+            .backpressure_waits
+            .saturating_add(other.backpressure_waits);
+        self.idle_waits = self.idle_waits.saturating_add(other.idle_waits);
+        self.wire_bytes = self.wire_bytes.saturating_add(other.wire_bytes);
+        self.rounds = self.rounds.max(other.rounds);
+    }
+}
+
 /// What the timed section spent, from two readings of the process total.
 ///
 /// `None` unless both readings were taken, because a difference against a

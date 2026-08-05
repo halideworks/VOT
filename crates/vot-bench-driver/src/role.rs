@@ -32,13 +32,13 @@ use vot_transport_api::{
 };
 
 use crate::{
-    BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource,
-    PendingBundle, Rails, RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent,
-    cpu_times_ns, enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes,
-    prover_layer_and_subject, ranged_record_bytes, receiver_for, receiver_for_ranged,
-    record_lengths, record_payload, round_budget, subject_of, worker_ranges,
+    BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource, Rails,
+    RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, cpu_spent, cpu_times_ns,
+    enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes, prover_layer_and_subject,
+    ranged_record_bytes, receiver_for, receiver_for_ranged, record_lengths, record_payload,
+    round_budget, subject_of, worker_ranges,
 };
-use vot_scheduler::{ReliableReceiver as SchedulerReceiver, VerifiedRange};
+use vot_scheduler::ReliableReceiver as SchedulerReceiver;
 
 /// Which half of the transfer this process is.
 pub(crate) const ROLE: &str = "VOT_BENCH_ROLE";
@@ -78,11 +78,11 @@ const LINGER_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// A connected endpoint a backend built for one role.
 pub(crate) struct Endpoint {
-    pub(crate) adapter: Box<dyn TransportAdapter>,
+    pub(crate) adapter: Box<dyn TransportAdapter + Send>,
     /// A listener the connection came from, held so it outlives the adapter.
     /// Dropped after `adapter` by declaration order.
     #[allow(dead_code)]
-    pub(crate) keepalive: Option<Box<dyn std::any::Any>>,
+    pub(crate) keepalive: Option<Box<dyn std::any::Any + Send>>,
     /// How the report names this backend.
     pub(crate) backend: &'static str,
     /// What the endpoint was configured with, appended to `notes` as given.
@@ -148,6 +148,10 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
     }
 }
 
+/// The shared source rails pull bundle groups from.
+type GroupSource =
+    std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Result<Vec<RangedFrame>, Error>>>>;
+
 /// How long a rail's accept may wait once every port is bound.
 const ROLE_RAIL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -206,35 +210,66 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     Ok(())
 }
 
-/// Spawns the verify pool: each worker takes whole bundles, proves them, and
-/// sends the witness back for the spine to admit.
-fn spawn_verifiers<'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
-    workers: usize,
+/// Drives one receive rail: its own endpoint, its own reassembly, its own
+/// proving, and nothing shared with its siblings but the admission lock and
+/// the running total.
+fn drive_receive_rail(
+    endpoint: &mut Endpoint,
     subject: SubjectId,
-    work_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<PendingBundle>>>,
-    range_tx: &std::sync::mpsc::Sender<Result<VerifiedRange, Error>>,
-) {
-    for _ in 0..workers {
-        let work_rx = std::sync::Arc::clone(work_rx);
-        let range_tx = range_tx.clone();
-        scope.spawn(move || {
-            loop {
-                let taken = {
-                    let Ok(queue) = work_rx.lock() else { return };
-                    queue.recv()
-                };
-                let Ok(whole) = taken else { return };
-                let verified =
-                    SchedulerReceiver::verify_typed_bundle(subject, &whole.bundle, &whole.records)
-                        .map_err(Error::from);
-                // A closed return channel is the spine gone; the verdict goes
-                // with it.
-                if range_tx.send(verified).is_err() {
-                    return;
+    object_bytes: u64,
+    receiver: &std::sync::Mutex<ReliableReceiver>,
+    delivered: &std::sync::atomic::AtomicU64,
+    failed: &std::sync::atomic::AtomicBool,
+    budget: u64,
+) -> Result<(Tally, u64), Error> {
+    let mut tally = Tally::default();
+    // A bundle's frames stay together on their lane, so one incomplete
+    // bundle is all a rail can hold.
+    let mut reassembly = BundleReassembly::new(1);
+    let adapter = endpoint.adapter.as_mut();
+    loop {
+        if delivered.load(std::sync::atomic::Ordering::Relaxed) >= object_bytes {
+            return Ok((tally, reassembly.completed));
+        }
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Disconnected);
+        }
+        tally.rounds = tally.rounds.saturating_add(1);
+        if tally.rounds > budget {
+            return Err(Error::Stalled);
+        }
+        tally.flushes = tally.flushes.saturating_add(1);
+        adapter.flush()?;
+        let mut progress = false;
+        while let Some(event) = adapter.poll() {
+            match event {
+                Event::Reliable { bytes, .. } => {
+                    tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
+                    if let Some(whole) = reassembly.take(&bytes)? {
+                        let range = SchedulerReceiver::verify_typed_bundle(
+                            subject,
+                            &whole.bundle,
+                            &whole.records,
+                        )?;
+                        let admitted = range.len();
+                        {
+                            let Ok(mut shared) = receiver.lock() else {
+                                return Err(Error::Disconnected);
+                            };
+                            shared.admit_verified_range(range)?;
+                        }
+                        delivered.fetch_add(admitted, std::sync::atomic::Ordering::Relaxed);
+                        progress = true;
+                    }
                 }
+                Event::Disconnected(_) => return Err(Error::Disconnected),
+                _ => {}
             }
-        });
+        }
+        if !progress {
+            tally.idle_waits = tally.idle_waits.saturating_add(1);
+            adapter.wait_for_event(RAIL_IDLE_WAIT);
+        }
     }
 }
 
@@ -427,144 +462,86 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
     })
 }
 
-/// Drives the producers and the submit spine for [`send_ranged`].
+/// Drives one rail: groups from the shared source, its own adapter's
+/// backpressure, its own flushes and waits, and nothing shared with its
+/// siblings but the source and the done flag.
 ///
-/// Returns the object bytes handed to the carriers; `done` is raised if the
-/// receiver's marker arrives while frames are still being submitted.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the spine borrows what the send half owns and nothing more"
-)]
-fn submit_ranges(
-    config: &Config,
-    endpoints: &mut [Endpoint],
-    ranges: &[crate::WorkerRange],
-    layer: &std::sync::Arc<crate::ProverLayer>,
-    subject: SubjectId,
+/// The rails were once fed by one dealer thread, and its turn-taking
+/// coupled them: a rail ran dry whenever the dealer was busy elsewhere or
+/// asleep on another rail's signal, which measured about a gigabit against
+/// the same flows run as independent processes. Backpressure here is
+/// local: a full adapter parks this thread on this rail's own signal.
+fn drive_rail(
+    endpoint: &mut Endpoint,
+    source: &GroupSource,
+    done: &std::sync::atomic::AtomicBool,
+    failed: &std::sync::atomic::AtomicBool,
     budget: u64,
-    tally: &mut Tally,
-    done: &mut bool,
-) -> Result<u64, Error> {
-    let workers = config.workers;
+) -> Result<(Tally, u64), Error> {
+    let mut tally = Tally::default();
     let mut bytes_sent = 0_u64;
-    std::thread::scope(|scope| -> Result<(), Error> {
-        let mut channels = Vec::with_capacity(workers);
-        for (index, range) in ranges.iter().enumerate() {
-            let (sender, frames) =
-                std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
-            let mut producer = BundleProducer::new(
-                config,
-                std::sync::Arc::clone(layer),
-                subject,
-                *range,
-                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
-            )?;
-            channels.push(frames);
-            scope.spawn(move || {
-                while let Some(bundle) = producer.next_bundle() {
-                    let failed = bundle.is_err();
-                    if sender.send(bundle).is_err() {
-                        return;
-                    }
-                    if failed {
-                        return;
-                    }
-                }
-            });
+    let mut queued: std::collections::VecDeque<RangedFrame> = std::collections::VecDeque::new();
+    let mut source_dry = false;
+    let mut rail_done = false;
+    let adapter = endpoint.adapter.as_mut();
+    while !rail_done {
+        tally.rounds = tally.rounds.saturating_add(1);
+        if tally.rounds > budget {
+            return Err(Error::Stalled);
         }
-
-        // A rail is not a worker's: any whole bundle rides any rail, so a
-        // fast rail takes more of the object and a slow one bounds nothing
-        // but its own share. The reassembly keys bundles by identifier and a
-        // bundle's frames stay together on one lane, which is the only order
-        // the receive side needs. The central stock holds at most one group
-        // per worker beyond what the rails are carrying, so producers stay
-        // bounded by their channels; one refill pass can leave the stock a
-        // group per worker past the mark it checks, which is still a bound.
-        let mut ready: std::collections::VecDeque<Vec<RangedFrame>> =
-            std::collections::VecDeque::new();
-        let mut queued: Vec<std::collections::VecDeque<RangedFrame>> = (0..workers)
-            .map(|_| std::collections::VecDeque::new())
-            .collect();
-        let mut submitted = 0_u64;
-        while submitted < config.object_bytes {
-            tally.rounds = tally.rounds.saturating_add(1);
-            if tally.rounds > budget {
-                return Err(Error::Stalled);
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Disconnected);
+        }
+        let mut progress = false;
+        if queued.is_empty() && !source_dry {
+            let taken = {
+                let Ok(shared) = source.lock() else {
+                    return Err(Error::Disconnected);
+                };
+                shared.try_recv()
+            };
+            match taken {
+                Ok(Ok(frames)) => queued.extend(frames),
+                Ok(Err(error)) => return Err(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => source_dry = true,
             }
-            let mut progress = false;
-            while ready.len() < workers {
-                let mut pulled = false;
-                for channel in &channels {
-                    match channel.try_recv() {
-                        Ok(Ok(frames)) => {
-                            ready.push_back(frames);
-                            pulled = true;
-                        }
-                        Ok(Err(error)) => return Err(error),
-                        Err(
-                            std::sync::mpsc::TryRecvError::Empty
-                            | std::sync::mpsc::TryRecvError::Disconnected,
-                        ) => {}
-                    }
+        }
+        while let Some((frame, plaintext)) = queued.front() {
+            match adapter.send_reliable_shared(TRANSFER_LANE, Payload::clone(frame)) {
+                Ok(()) => {
+                    bytes_sent = bytes_sent.saturating_add(*plaintext);
+                    tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
+                    queued.pop_front();
+                    progress = true;
                 }
-                if !pulled {
+                Err(vot_transport_api::Error::OutboundQueueFull) => {
+                    tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
                     break;
                 }
-            }
-            // The scan's first rail rotates, because the stock rarely holds
-            // more than a group or two and whoever is scanned first with an
-            // empty queue takes it: a fixed order fed one rail nearly the
-            // whole object while the last never carried a byte.
-            for step in 0..workers {
-                let rail = (usize::try_from(tally.rounds).unwrap_or(0) + step) % workers;
-                if queued[rail].is_empty() {
-                    if let Some(group) = ready.pop_front() {
-                        queued[rail].extend(group);
-                    }
-                }
-                let adapter = endpoints[rail].adapter.as_mut();
-                while let Some((frame, plaintext)) = queued[rail].front() {
-                    match adapter.send_reliable_shared(TRANSFER_LANE, Payload::clone(frame)) {
-                        Ok(()) => {
-                            bytes_sent = bytes_sent.saturating_add(*plaintext);
-                            submitted = submitted.saturating_add(*plaintext);
-                            tally.wire_bytes = tally.wire_bytes.saturating_add(frame.len() as u64);
-                            queued[rail].pop_front();
-                            progress = true;
-                        }
-                        Err(vot_transport_api::Error::OutboundQueueFull) => {
-                            tally.backpressure_waits = tally.backpressure_waits.saturating_add(1);
-                            break;
-                        }
-                        Err(other) => return Err(Error::Transport(other)),
-                    }
-                }
-            }
-            for endpoint in endpoints.iter_mut() {
-                tally.flushes = tally.flushes.saturating_add(1);
-                endpoint.adapter.flush()?;
-                drain_sender(endpoint.adapter.as_mut(), done)?;
-            }
-            if !progress {
-                tally.idle_waits = tally.idle_waits.saturating_add(1);
-                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-                endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
+                Err(other) => return Err(Error::Transport(other)),
             }
         }
-        Ok(())
-    })?;
-    Ok(bytes_sent)
+        tally.flushes = tally.flushes.saturating_add(1);
+        adapter.flush()?;
+        let mut marker = done.load(std::sync::atomic::Ordering::Relaxed);
+        let events = drain_sender(adapter, &mut marker)?;
+        if marker {
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // A rail is finished only when everything it will ever carry has
+        // been handed over and the receiver has said the whole object
+        // verified; until then it keeps flushing, because its own
+        // retransmissions may be what the verdict is waiting on.
+        rail_done = marker && source_dry && queued.is_empty();
+        if !progress && events == 0 && !rail_done {
+            tally.idle_waits = tally.idle_waits.saturating_add(1);
+            adapter.wait_for_event(RAIL_IDLE_WAIT);
+        }
+    }
+    Ok((tally, bytes_sent))
 }
 
-/// Submits the object's ranges over one connection per worker, then waits for
-/// the receiver's done marker.
-///
-/// The spine is `transfer_ranged`'s: producers hash and frame their ranges on
-/// their own threads, the spine submits whatever is ready to whichever rail,
-/// and backpressure on one rail never blocks another's frames. The marker
-/// arrives on rail zero's return lane, and any rail's disconnect before it is
-/// the transfer failing.
 fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<Measurement, Error> {
     let budget = round_budget(config);
     let workers = config.workers;
@@ -576,41 +553,71 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     for rail in 0..workers {
         endpoints.push(connect_endpoint(config, rail_address(base, rail)?)?);
     }
-    let mut tally = Tally::default();
-    let mut done = false;
+    // Producers feed one bounded source and every rail takes from it as fast
+    // as its own adapter drains, so a quick rail carries more of the object
+    // and a slow one delays nothing but its share. The bound is what keeps
+    // producers from running ahead of the wire.
+    let (group_tx, group_rx) =
+        std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(workers * 2);
+    let source: GroupSource = std::sync::Arc::new(std::sync::Mutex::new(group_rx));
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let failed = std::sync::atomic::AtomicBool::new(false);
 
     let cpu_before = cpu_times_ns();
     let started = std::time::Instant::now();
-    let bytes_sent = submit_ranges(
-        config,
-        &mut endpoints,
-        &ranges,
-        &layer,
-        subject,
-        budget,
-        &mut tally,
-        &mut done,
-    )?;
-
-    // Every frame is with a carrier. The marker says the far end verified the
-    // whole object across every rail, so the clock runs until it arrives.
-    while !done {
-        tally.rounds = tally.rounds.saturating_add(1);
-        if tally.rounds > budget {
-            return Err(Error::Stalled);
+    let outcome = std::thread::scope(|scope| -> Result<(Tally, u64), Error> {
+        for (index, range) in ranges.iter().enumerate() {
+            let group_tx = group_tx.clone();
+            let layer = std::sync::Arc::clone(&layer);
+            let mut producer = BundleProducer::new(
+                config,
+                layer,
+                subject,
+                *range,
+                u32::try_from(index).map_err(|_| Error::Value("VOT_BENCH_WORKERS"))?,
+            )?;
+            scope.spawn(move || {
+                while let Some(bundle) = producer.next_bundle() {
+                    let last = bundle.is_err();
+                    if group_tx.send(bundle).is_err() || last {
+                        return;
+                    }
+                }
+            });
         }
-        let mut events = 0_u64;
+        drop(group_tx);
+        let mut rails = Vec::with_capacity(workers);
         for endpoint in &mut endpoints {
-            tally.flushes = tally.flushes.saturating_add(1);
-            endpoint.adapter.flush()?;
-            events = events.saturating_add(drain_sender(endpoint.adapter.as_mut(), &mut done)?);
+            let source = std::sync::Arc::clone(&source);
+            let done = &done;
+            let failed = &failed;
+            rails.push(scope.spawn(move || {
+                let outcome = drive_rail(endpoint, &source, done, failed, budget);
+                if outcome.is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                outcome
+            }));
         }
-        if events == 0 && !done {
-            tally.idle_waits = tally.idle_waits.saturating_add(1);
-            let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-            endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
+        let mut tally = Tally::default();
+        let mut bytes_sent = 0_u64;
+        let mut first_error = None;
+        for rail in rails {
+            match rail.join() {
+                Ok(Ok((rail_tally, rail_bytes))) => {
+                    tally.merge(&rail_tally);
+                    bytes_sent = bytes_sent.saturating_add(rail_bytes);
+                }
+                Ok(Err(error)) => first_error = first_error.or(Some(error)),
+                Err(_) => first_error = first_error.or(Some(Error::Disconnected)),
+            }
         }
-    }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok((tally, bytes_sent)),
+        }
+    });
+    let (mut tally, bytes_sent) = outcome?;
     let elapsed = started.elapsed();
     tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
 
@@ -629,12 +636,6 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     })
 }
 
-/// Receives every rail's ranges, verifies the object, reports, then tells the
-/// sender on rail zero.
-///
-/// The clock starts at the first accepted connection, so the sender's later
-/// rails handshake inside the timed window, the same accounting as the
-/// sequential half's single connection.
 fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Error> {
     let budget = round_budget(config);
     let workers = config.workers;
@@ -654,68 +655,58 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
     }
 
-    // Verification is the receive half's heaviest work and it is pure, so a
-    // pool the width of the rails carries it while the spine polls, hands
-    // out whole bundles, and admits what the verifiers prove. The channel
-    // bound is what caps unadmitted bytes held between the two halves.
-    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<PendingBundle>(workers * 2);
-    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-    let (range_tx, range_rx) = std::sync::mpsc::channel::<Result<VerifiedRange, Error>>();
-    let mut delivered = 0_u64;
+    // Every rail is its own thread end to end: it polls its own endpoint,
+    // reassembles its own bundles, proves them itself, and shares nothing
+    // with its siblings but the admission lock and the running total. The
+    // spine shapes this replaced measured a coupling tax twice: a dealer or
+    // a slice rotation asleep on one rail stalls every other through the
+    // pump's headroom gate.
+    let receiver = std::sync::Mutex::new(receiver);
+    let delivered = std::sync::atomic::AtomicU64::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
     let mut tally = Tally::default();
-    std::thread::scope(|scope| -> Result<(), Error> {
-        spawn_verifiers(scope, workers, subject, &work_rx, &range_tx);
-        while delivered < config.object_bytes {
-            tally.rounds = tally.rounds.saturating_add(1);
-            if tally.rounds > budget {
-                return Err(Error::Stalled);
-            }
-            let mut progress = false;
-            for endpoint in &mut endpoints {
-                tally.flushes = tally.flushes.saturating_add(1);
-                endpoint.adapter.flush()?;
-                // A bounded slice per rail per round, because draining one
-                // rail dry stalls every other: their queues sit full, their
-                // pumps pause reading, and their senders stall on flow
-                // control while this one is served. Interleaving keeps every
-                // rail's window moving; the budget still bounds the loop.
-                let mut slice = 0_u32;
-                while slice < 256 {
-                    slice += 1;
-                    let Some(event) = endpoint.adapter.poll() else {
-                        break;
-                    };
-                    match event {
-                        Event::Reliable { bytes, .. } => {
-                            tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
-                            if let Some(whole) = reassembly.take(&bytes)? {
-                                // A full pool backpressures the spine, and
-                                // through it the pumps and the peer.
-                                work_tx.send(whole).map_err(|_| Error::Disconnected)?;
-                                progress = true;
-                            }
-                        }
-                        Event::Disconnected(_) => return Err(Error::Disconnected),
-                        _ => {}
-                    }
+    let mut bundles = 0_u64;
+    let outcome = std::thread::scope(|scope| -> Result<(), Error> {
+        let mut rails = Vec::with_capacity(workers);
+        for endpoint in &mut endpoints {
+            let receiver = &receiver;
+            let delivered = &delivered;
+            let failed = &failed;
+            rails.push(scope.spawn(move || {
+                let outcome = drive_receive_rail(
+                    endpoint,
+                    subject,
+                    config.object_bytes,
+                    receiver,
+                    delivered,
+                    failed,
+                    budget,
+                );
+                if outcome.is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
-            while let Ok(verified) = range_rx.try_recv() {
-                let range = verified?;
-                let admitted = range.len();
-                receiver.admit_verified_range(range)?;
-                delivered = delivered.saturating_add(admitted);
-                progress = true;
-            }
-            if !progress {
-                tally.idle_waits = tally.idle_waits.saturating_add(1);
-                let rail = usize::try_from(tally.idle_waits % workers as u64).unwrap_or(0);
-                endpoints[rail].adapter.wait_for_event(RAIL_IDLE_WAIT);
+                outcome
+            }));
+        }
+        let mut first_error = None;
+        for rail in rails {
+            match rail.join() {
+                Ok(Ok((rail_tally, rail_bundles))) => {
+                    tally.merge(&rail_tally);
+                    bundles = bundles.saturating_add(rail_bundles);
+                }
+                Ok(Err(error)) => first_error = first_error.or(Some(error)),
+                Err(_) => first_error = first_error.or(Some(Error::Disconnected)),
             }
         }
-        drop(work_tx);
-        Ok(())
-    })?;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    });
+    outcome?;
+    let mut receiver = receiver.into_inner().map_err(|_| Error::Disconnected)?;
+    reassembly.completed = bundles;
     receiver.finish_ranges(subject)?;
     let elapsed = started.elapsed();
     tally.cpu = cpu_spent(cpu_before, cpu_times_ns());

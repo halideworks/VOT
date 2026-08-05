@@ -120,6 +120,15 @@ impl FileSink {
         file.set_len(length)?;
         Ok(Self { file })
     }
+
+    /// The handle the writes went through. Sync through this one: it has
+    /// write access, and its error window opened before the first write,
+    /// so a writeback failure between then and the sync must surface. A
+    /// freshly opened handle guarantees neither.
+    #[must_use]
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
 }
 
 #[cfg(unix)]

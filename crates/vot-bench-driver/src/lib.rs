@@ -280,6 +280,11 @@ impl Config {
             None => SinkChoice::Discard,
             Some(path) => SinkChoice::File(std::path::PathBuf::from(path)),
         };
+        if workers == 1 && matches!(sink, SinkChoice::File(_)) {
+            // One worker is the sequential path, which has no sink; a case
+            // that asks anyway would measure ram-to-ram and label nothing.
+            return Err(Error::Value("VOT_BENCH_SINK_FILE"));
+        }
         Ok(Self {
             backend: variable(lookup, "VOT_BENCH_BACKEND")?,
             suite,
@@ -502,17 +507,26 @@ fn receiver_for_ranged(config: &Config) -> Result<ReliableReceiver, Error> {
     Ok(ReliableReceiver::new(limit, window, limit)?)
 }
 
+/// The receiver's sink and, for a file, the handle the driver keeps to
+/// sync it through after the clock.
+type BuiltSink = (
+    Box<dyn vot_scheduler::RangeSink>,
+    Option<Arc<vot_scheduler::FileSink>>,
+);
+
 /// Builds the destination a ranged case's verified bytes flow to.
 ///
 /// The file is created and sized before the clock starts, so the timed
 /// section pays for placing bytes, not for allocating the destination.
-fn sink_for(config: &Config) -> Result<Box<dyn vot_scheduler::RangeSink>, Error> {
+fn sink_for(config: &Config) -> Result<BuiltSink, Error> {
     match &config.sink {
-        SinkChoice::Discard => Ok(Box::new(DiscardSink)),
+        SinkChoice::Discard => Ok((Box::new(DiscardSink), None)),
         SinkChoice::File(path) => {
-            let sink = vot_scheduler::FileSink::create(path, config.object_bytes)
-                .map_err(|error| Error::Unsupported(format!("sink file: {error}")))?;
-            Ok(Box::new(sink))
+            let sink = Arc::new(
+                vot_scheduler::FileSink::create(path, config.object_bytes)
+                    .map_err(|error| Error::Unsupported(format!("sink file: {error}")))?,
+            );
+            Ok((Box::new(sink.clone()), Some(sink)))
         }
     }
 }
@@ -520,14 +534,18 @@ fn sink_for(config: &Config) -> Result<Box<dyn vot_scheduler::RangeSink>, Error>
 /// Names the sink in the notes and, for a file, syncs it after the clock
 /// and reports what the sync cost, so a result's durability story is
 /// explicit either way.
-fn sink_note(config: &Config, notes: &mut String) -> Result<(), Error> {
+///
+/// The sync goes through the handle the writes went through: a fresh
+/// handle lacks write access on Windows and opens its error window after
+/// any writeback failure on Linux, so it can neither sync nor tell.
+fn sink_note(sink: Option<&vot_scheduler::FileSink>, notes: &mut String) -> Result<(), Error> {
     use std::fmt::Write as _;
-    match &config.sink {
-        SinkChoice::Discard => notes.push_str(";sink=discard"),
-        SinkChoice::File(path) => {
+    match sink {
+        None => notes.push_str(";sink=discard"),
+        Some(file) => {
             let started = Instant::now();
-            std::fs::File::open(path)
-                .and_then(|file| file.sync_all())
+            file.file()
+                .sync_all()
                 .map_err(|error| Error::Unsupported(format!("sink file sync: {error}")))?;
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let _ = write!(notes, ";sink=file;sync_ns={nanos}");
@@ -1709,7 +1727,8 @@ fn transfer_ranged<C: Carrier>(
     let layer = Arc::new(layer);
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject, sink_for(config)?)?;
+    let (sink, sink_handle) = sink_for(config)?;
+    receiver.begin_ranges(subject, sink)?;
     let mut credit = Credit::Constructed;
     for carrier in &mut carriers {
         credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;
@@ -1849,7 +1868,7 @@ fn transfer_ranged<C: Carrier>(
         reassembly.completed,
         provisioned,
     );
-    sink_note(config, &mut notes)?;
+    sink_note(sink_handle.as_deref(), &mut notes)?;
     Ok(Measurement {
         bytes_sent,
         verified_bytes: delivered,
@@ -2241,12 +2260,22 @@ mod tests {
             parse_with("VOT_BENCH_SINK_FILE", "").unwrap().sink,
             SinkChoice::Discard
         );
+        let mut ranged = environment();
+        ranged.insert("VOT_BENCH_WORKERS".to_owned(), "2".to_owned());
+        ranged.insert(
+            "VOT_BENCH_SINK_FILE".to_owned(),
+            "/tmp/object.bin".to_owned(),
+        );
         assert_eq!(
-            parse_with("VOT_BENCH_SINK_FILE", "/tmp/object.bin")
-                .unwrap()
-                .sink,
+            parse(&ranged).unwrap().sink,
             SinkChoice::File(std::path::PathBuf::from("/tmp/object.bin"))
         );
+        // The sequential path has no sink, so one worker with a file is
+        // refused rather than silently measured as ram-to-ram.
+        assert!(matches!(
+            parse_with("VOT_BENCH_SINK_FILE", "/tmp/object.bin"),
+            Err(Error::Value("VOT_BENCH_SINK_FILE"))
+        ));
     }
 
     #[test]
@@ -2290,6 +2319,8 @@ mod tests {
                 assert!(!measured.notes.contains(";rails="));
                 // Counted or refused, the field is always named.
                 assert!(measured.notes.contains(";cycles="));
+                // The destination is always labelled, discard included.
+                assert!(measured.notes.contains(";sink=discard"));
             }
         }
     }

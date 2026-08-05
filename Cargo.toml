@@ -21,3 +21,12 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# quiche 0.24.9 plus one recovery change: the loss delay is floored at the
+# ack latency the connection has observed, behind a config flag the pump
+# turns on. Without it the detector declares tens of thousands of delivered
+# packets lost per gigabyte on sub-millisecond paths and holds the wire a
+# gigabit under its ceiling; the full case is ADR-0028. The same change is
+# submitted upstream, and this pin dissolves the day it lands.
+[patch.crates-io]
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "0d2f3542c1edddb1c957ddb6919dd6c61e5acaf5" }

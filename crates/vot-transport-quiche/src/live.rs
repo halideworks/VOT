@@ -270,6 +270,13 @@ impl Config {
         // connection probes and settles under the ceiling the way MsQuic
         // does unaided. The bakeoff report records both behaviors.
         config.discover_pmtu(true);
+        // Only in the pinned fork until upstream takes it (ADR-0028): the
+        // loss delay never undercuts the ack latency the connection has
+        // observed. On a path whose RTT sits at or under the pump's own
+        // ack-processing cadence, stock quiche declares delivered packets
+        // lost by the tens of thousands per gigabyte, and cubic pays for
+        // every one of them.
+        config.set_enable_ack_latency_loss_floor(true);
         // The advertised control-frame bound has to fit in one stream's flow
         // control, or a conforming frame is refused by the carrier after the
         // session promised to accept it.

@@ -2359,7 +2359,10 @@ mod tests {
         let carriers = vec![SimulatorCarrier::new(&config).unwrap()];
         let refusing: std::sync::Arc<dyn vot_scheduler::RangeSink> =
             std::sync::Arc::new(RefusingSink);
-        let outcome = super::transfer_ranged_into(&config, carriers, u64::MAX, &refusing, None);
+        // A finite rounds budget, so a transfer that stops progressing for
+        // any reason stalls out inside the test rather than spinning: the
+        // refusal itself needs only a handful of rounds.
+        let outcome = super::transfer_ranged_into(&config, carriers, 5_000, &refusing, None);
         assert!(
             matches!(outcome, Err(Error::Receive(vot_scheduler::Error::Sink))),
             "{outcome:?}"

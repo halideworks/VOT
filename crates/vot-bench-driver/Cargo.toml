@@ -18,6 +18,7 @@ msquic = ["dep:vot-transport-msquic"]
 
 [dependencies]
 vot-codec = { path = "../vot-codec" }
+vot-platform-proc = { path = "../vot-platform-proc" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-scheduler = { path = "../vot-scheduler" }

@@ -103,18 +103,19 @@ impl Inbound {
         self.bytes + self.assembling
     }
 
-    fn push(&mut self, event: NativeEvent) -> bool {
+    /// Queues one event, or gives it back when either bound is met.
+    fn push(&mut self, event: NativeEvent) -> Result<(), NativeEvent> {
         let payload = native_payload_len(&event);
         let Some(next) = self.charged().checked_add(payload) else {
-            return false;
+            return Err(event);
         };
         if self.events.len() >= MAX_INBOUND_EVENTS || next > MAX_ASSEMBLY_BYTES {
-            return false;
+            return Err(event);
         }
         self.events.push_back(event);
         self.bytes += payload;
         self.arrived.raise();
-        true
+        Ok(())
     }
 
     /// Queues a connection lifecycle event past both bounds.
@@ -576,6 +577,13 @@ struct StreamState {
     /// record may be written in pieces across several loops, and holding the
     /// caller's own allocation means those pieces cost no copy of their own.
     outbox: VecDeque<(Payload, usize)>,
+    /// Frames completed after the event queue refused one, by either of its
+    /// bounds, kept in arrival order until the caller drains the queue.
+    /// Reading the stream stops while this holds anything, so it is bounded
+    /// by what one read chunk and one partial frame can complete, not by the
+    /// peer's appetite; what waits here is charged to neither account, which
+    /// that same bound is what makes safe.
+    overflow: VecDeque<NativeEvent>,
 }
 
 #[expect(
@@ -1166,7 +1174,7 @@ fn apply(
                 NativeEvent::DatagramDropped { context }
             };
             if let Ok(mut queue) = inbound.lock() {
-                queue.push(observed);
+                let _ = queue.push(observed);
             }
         }
         // Refused at submission, so it cannot reach the driver. A silent success
@@ -1187,6 +1195,7 @@ fn stream_state<'a>(
         kind,
         sequence: 0,
         outbox: VecDeque::new(),
+        overflow: VecDeque::new(),
         id,
     })
 }
@@ -1227,6 +1236,19 @@ fn read_streams(
     // sixty-four kilobytes a pass, which at ten gigabits is most of the work.
     buffer: &mut [u8],
 ) {
+    // Overflow drains for every stream that holds any, not only the readable
+    // ones: a stream leaves the readable set for good once its last chunk is
+    // consumed, and what its queue refusal parked here must still deliver.
+    if let Ok(mut queue) = inbound.lock() {
+        for state in streams.values_mut() {
+            while let Some(event) = state.overflow.pop_front() {
+                if let Err(refused) = queue.push(event) {
+                    state.overflow.push_front(refused);
+                    break;
+                }
+            }
+        }
+    }
     let readable: Vec<u64> = conn.readable().collect();
     for id in readable {
         // Which lane a stream's bytes belong to depends on who opened it, so a
@@ -1242,9 +1264,38 @@ fn read_streams(
             StreamKind::Reliable { lane }
         };
         let state = stream_state(streams, id, kind, budget, control_limit);
-        while let Ok((len, fin)) = conn.stream_recv(id, buffer) {
+        // A queue the caller has not drained is backpressure, not a fault:
+        // frames the queue refused wait in `overflow` in order, and the
+        // stream is not read while any wait, so the unread bytes stall the
+        // peer through flow control. The overflow is bounded by what one
+        // read chunk can complete, because reading stops the moment it
+        // holds anything.
+        if !state.overflow.is_empty() {
+            continue;
+        }
+        loop {
+            // The framing reserves assembly room as bytes arrive and treats a
+            // refused reservation as the peer's fault. A queue the caller has
+            // not drained is this endpoint's own lag, so a chunk is not read
+            // unless the budget could hold everything it can assemble: the
+            // chunk itself plus the largest partial a frame can be. Checked
+            // per chunk, because one pass reads until the stream is dry and
+            // the caller drains nothing meanwhile.
+            let headroom = {
+                let Ok(queue) = inbound.lock() else {
+                    break;
+                };
+                MAX_ASSEMBLY_BYTES.saturating_sub(queue.charged())
+            };
+            if headroom < vot_transport_framing::MAX_PARTIAL_FRAME.saturating_add(buffer.len()) {
+                break;
+            }
+            let Ok((len, fin)) = conn.stream_recv(id, buffer) else {
+                break;
+            };
             let kind = state.kind;
             let sequence = &mut state.sequence;
+            let overflow = &mut state.overflow;
             let outcome = state.framing.accept(&buffer[..len], |frame| {
                 *sequence = sequence.wrapping_add(1);
                 let shared = vot_transport_api::shared_payload(frame);
@@ -1259,14 +1310,14 @@ fn read_streams(
                 let Ok(mut queue) = inbound.lock() else {
                     return Err(FrameFault::exhausted());
                 };
-                if queue.push(event) {
-                    Ok(())
+                if overflow.is_empty() {
+                    if let Err(refused) = queue.push(event) {
+                        overflow.push_back(refused);
+                    }
                 } else {
-                    // The driver cannot wait, so a queue the caller has not
-                    // drained fails the connection loudly rather than growing
-                    // without limit.
-                    Err(FrameFault::exhausted())
+                    overflow.push_back(event);
                 }
+                Ok(())
             });
             if let Err(fault) = outcome {
                 let _ = conn.close(true, u64::from(fault.close()), b"");
@@ -1279,6 +1330,9 @@ fn read_streams(
                     // declares the end of the stream.
                     let _ = conn.close(true, u64::from(FrameFault::truncated().close()), b"");
                 }
+                break;
+            }
+            if !state.overflow.is_empty() {
                 break;
             }
         }
@@ -1917,26 +1971,34 @@ mod tests {
             ..Inbound::default()
         };
         assert!(
-            inbound.push(NativeEvent::Control(vec![7_u8; 8].into())),
+            inbound
+                .push(NativeEvent::Control(vec![7_u8; 8].into()))
+                .is_ok(),
             "an exact fit was refused"
         );
         assert_eq!(inbound.bytes, 8);
         assert!(
-            !inbound.push(NativeEvent::Control(vec![7_u8; 1].into())),
+            inbound
+                .push(NativeEvent::Control(vec![7_u8; 1].into()))
+                .is_err(),
             "a byte past the budget was accepted"
         );
 
         let mut inbound = Inbound::default();
         for _ in 0..MAX_INBOUND_EVENTS {
-            assert!(inbound.push(NativeEvent::Control(vec![].into())));
+            assert!(inbound.push(NativeEvent::Control(vec![].into())).is_ok());
         }
         assert!(
-            !inbound.push(NativeEvent::Control(vec![].into())),
+            inbound.push(NativeEvent::Control(vec![].into())).is_err(),
             "an event past the count was accepted"
         );
 
         let mut inbound = Inbound::default();
-        assert!(inbound.push(NativeEvent::Control(vec![7_u8; 10].into())));
+        assert!(
+            inbound
+                .push(NativeEvent::Control(vec![7_u8; 10].into()))
+                .is_ok()
+        );
         assert_eq!(inbound.bytes, 10);
         let _ = inbound.pop();
         assert_eq!(inbound.bytes, 0, "a popped event kept its charge");
@@ -1989,6 +2051,57 @@ mod tests {
         feed_received(&mut conn, local, &mut junk, peer, Some(0));
         feed_received(&mut conn, local, &mut junk, peer, Some(16));
         feed_received(&mut conn, local, &mut junk, peer, None);
+    }
+
+    /// A handshaked sans-IO pair with every stream window at `window`.
+    fn sans_io_pair(window: u64) -> (quiche::Connection, quiche::Connection) {
+        let (certificate, key) = credentials();
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut client_config =
+            quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
+        client_config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("a protocol");
+        client_config.verify_peer(false);
+        client_config.set_initial_max_data(10_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(window);
+        client_config.set_initial_max_stream_data_bidi_remote(window);
+        client_config.set_initial_max_streams_bidi(16);
+        let mut server_config =
+            quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
+        server_config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("a protocol");
+        server_config
+            .load_cert_chain_from_pem_file(&certificate)
+            .expect("the certificate");
+        server_config
+            .load_priv_key_from_pem_file(&key)
+            .expect("the key");
+        server_config.set_initial_max_data(10_000_000);
+        server_config.set_initial_max_stream_data_bidi_local(window);
+        server_config.set_initial_max_stream_data_bidi_remote(window);
+        server_config.set_initial_max_streams_bidi(16);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &scid_for(local),
+            local,
+            remote,
+            &mut client_config,
+        )
+        .expect("a client");
+        let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_config)
+            .expect("a server");
+        for _ in 0_u32..64 {
+            shuttle(&mut client, local, &mut server, remote);
+            shuttle(&mut server, remote, &mut client, local);
+            if client.is_established() && server.is_established() {
+                break;
+            }
+        }
+        assert!(client.is_established() && server.is_established());
+        (client, server)
     }
 
     /// Carries everything one sans-IO connection has to say to the other.
@@ -2094,6 +2207,305 @@ mod tests {
             "a split record never completed; {delivered} of 8192 bytes arrived"
         );
         assert_eq!(delivered, 8_192);
+    }
+
+    /// One SETTINGS frame on the wire toward the server, returned encoded.
+    fn frame_on_the_wire(
+        client: &mut quiche::Connection,
+        server: &mut quiche::Connection,
+    ) -> Vec<u8> {
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::SETTINGS, &[0x27; 64], &mut frame)
+            .expect("a frame");
+        client
+            .stream_send(CONTROL_STREAM_ID, &frame, false)
+            .expect("a stream");
+        shuttle(client, local, server, remote);
+        frame
+    }
+
+    #[test]
+    fn a_spent_byte_budget_pauses_the_stream_instead_of_closing_it() {
+        // A caller that has not drained the queue is this endpoint's own lag.
+        // The connection must wait for it, not close: the fault path here
+        // used to kill the carrier with RESOURCE_LIMIT the moment the spine
+        // fell behind, which took every multi-rail transfer down with it.
+        let (mut client, mut server) = sans_io_pair(1_000_000);
+        frame_on_the_wire(&mut client, &mut server);
+        let inbound = Arc::new(Mutex::new(Inbound {
+            assembling: MAX_ASSEMBLY_BYTES,
+            ..Inbound::default()
+        }));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(!server.is_closed(), "a full queue closed the connection");
+        assert!(
+            server.local_error().is_none(),
+            "a full queue faulted the connection"
+        );
+        assert!(
+            inbound.lock().expect("the queue").events.is_empty(),
+            "a full queue still accepted an event"
+        );
+
+        // Exactly at the gate's threshold the read proceeds: the gate asks
+        // for room to hold one chunk and one partial, not a byte more.
+        inbound.lock().expect("the queue").assembling =
+            MAX_ASSEMBLY_BYTES - (vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len());
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            1,
+            "an exact-threshold headroom refused the read"
+        );
+        assert!(server.local_error().is_none());
+        {
+            let mut queue = inbound.lock().expect("the queue");
+            while queue.events.pop_front().is_some() {}
+            queue.bytes = 0;
+        }
+        frame_on_the_wire(&mut client, &mut server);
+        inbound.lock().expect("the queue").assembling = MAX_ASSEMBLY_BYTES;
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(inbound.lock().expect("the queue").events.is_empty());
+
+        // The caller drains; the paused stream delivers on the next pass.
+        inbound.lock().expect("the queue").assembling = 0;
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(!server.is_closed());
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            1,
+            "the paused frame never arrived"
+        );
+    }
+
+    #[test]
+    fn a_pass_reads_a_stream_dry_rather_than_one_chunk() {
+        // The read loop runs until the stream has nothing more, not once: a
+        // pass that stopped at one chunk would deliver a fraction of what
+        // has already arrived and pay a full pump round for each remainder.
+        let (mut client, mut server) = sans_io_pair(4_000_000);
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut frame = Vec::new();
+        for _ in 0..80 {
+            frame.clear();
+            vot_codec::encode_frame(
+                vot_codec::frame_type::SETTINGS,
+                &vec![0x27_u8; 16_000],
+                &mut frame,
+            )
+            .expect("a frame");
+            // stream_send takes what capacity allows, so the remainder loops
+            // with both shuttle directions between attempts: the reverse leg
+            // is what carries acknowledgements while the server's
+            // application reads nothing.
+            let mut sent = 0_usize;
+            let mut attempts = 0_u32;
+            while sent < frame.len() {
+                attempts += 1;
+                assert!(attempts < 1_000, "the pair stopped moving");
+                match client.stream_send(CONTROL_STREAM_ID, &frame[sent..], false) {
+                    Ok(written) => sent += written,
+                    Err(quiche::Error::Done) => {}
+                    Err(error) => panic!("a stream: {error:?}"),
+                }
+                shuttle(&mut client, local, &mut server, remote);
+                shuttle(&mut server, remote, &mut client, local);
+            }
+            shuttle(&mut client, local, &mut server, remote);
+        }
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            80,
+            "one pass left arrived frames unread"
+        );
+    }
+
+    #[test]
+    fn a_split_frame_waits_for_headroom_rather_than_faulting() {
+        // A frame wider than the read buffer assembles across chunks, and
+        // that assembly is what the headroom gate protects: reading it with
+        // no room would fail the framing's reservation, which is the fault
+        // path this endpoint's own lag must never reach.
+        let (mut client, mut server) = sans_io_pair(1_000_000);
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(
+            vot_codec::frame_type::SETTINGS,
+            &vec![0x27_u8; 16_000],
+            &mut frame,
+        )
+        .expect("a frame");
+        let mut sent = 0_usize;
+        let mut attempts = 0_u32;
+        while sent < frame.len() {
+            attempts += 1;
+            assert!(attempts < 1_000, "the pair stopped moving");
+            match client.stream_send(CONTROL_STREAM_ID, &frame[sent..], false) {
+                Ok(written) => sent += written,
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("a stream: {error:?}"),
+            }
+            shuttle(&mut client, local, &mut server, remote);
+            shuttle(&mut server, remote, &mut client, local);
+        }
+        let inbound = Arc::new(Mutex::new(Inbound {
+            assembling: MAX_ASSEMBLY_BYTES,
+            ..Inbound::default()
+        }));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut buffer = vec![0_u8; 4_096];
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(
+            server.local_error().is_none(),
+            "no headroom faulted the connection"
+        );
+        assert!(inbound.lock().expect("the queue").events.is_empty());
+
+        inbound.lock().expect("the queue").assembling = 0;
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(server.local_error().is_none());
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            1,
+            "the split frame never assembled"
+        );
+    }
+
+    #[test]
+    fn a_spent_event_count_parks_the_frame_and_delivers_it_later() {
+        // The byte gate cannot see a queue full of empty events, so the frame
+        // completes, the queue refuses it, and it waits in the stream's
+        // overflow. The stream may also leave the readable set for good
+        // here, which is why the drain walks every stream and not only the
+        // readable ones.
+        let (mut client, mut server) = sans_io_pair(1_000_000);
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        {
+            let mut queue = inbound.lock().expect("the queue");
+            for _ in 0..MAX_INBOUND_EVENTS {
+                queue
+                    .push(NativeEvent::Control(vec![].into()))
+                    .expect("room for an empty event");
+            }
+        }
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        frame_on_the_wire(&mut client, &mut server);
+        frame_on_the_wire(&mut client, &mut server);
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(
+            !server.is_closed(),
+            "a full event count closed the connection"
+        );
+        assert!(server.local_error().is_none());
+        // Both frames arrived in one read chunk, and a chunk's completions
+        // are the overflow's documented bound: everything it finished parks,
+        // and nothing past the chunk is read.
+        let held: usize = streams.values().map(|state| state.overflow.len()).sum();
+        assert_eq!(held, 2, "the chunk's completions are not all in overflow");
+
+        {
+            let mut queue = inbound.lock().expect("the queue");
+            while queue.events.pop_front().is_some() {}
+        }
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(!server.is_closed());
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            2,
+            "both frames never arrived once the caller drained"
+        );
     }
 
     #[test]

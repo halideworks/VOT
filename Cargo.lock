@@ -2106,6 +2106,7 @@ version = "0.0.1"
 dependencies = [
  "perf-event2",
  "vot-codec",
+ "vot-platform-proc",
  "vot-proof-blake3",
  "vot-proof-sha256",
  "vot-scheduler",
@@ -2245,6 +2246,14 @@ dependencies = [
 
 [[package]]
 name = "vot-platform-net"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "vot-platform-proc"
 version = "0.0.1"
 dependencies = [
  "libc",

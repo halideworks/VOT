@@ -82,6 +82,10 @@ MTU discovery needs and that no safe wrapper exposes for Linux IPv4. The
 crate follows the `vot-platform-fs` pattern: crate-level `deny(unsafe_code)`
 with documented, isolated FFI blocks. `windows-sys` gains the
 `Win32_Networking_WinSock` feature there for the same options on Windows.
+`vot-platform-proc` follows the same pattern for process measurements: peak
+resident memory via `K32GetProcessMemoryInfo` on Windows
+(`Win32_System_ProcessStatus`) and `getrusage` via `libc` on macOS, so the
+bench driver's memory metric has a measured source off Linux.
 
 Test-only dependencies:
 

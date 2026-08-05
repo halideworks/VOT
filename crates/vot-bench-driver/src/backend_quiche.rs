@@ -136,6 +136,34 @@ const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// # Errors
 /// Reports a socket, credential, or configuration failure, and a peer that did
 /// not connect inside [`ROLE_HANDSHAKE_TIMEOUT`].
+/// Binds a listener without waiting for its handshake.
+///
+/// The ranged half binds every rail before any handshake starts: a sender
+/// connects its rails serially the moment the previous one completes, and a
+/// rail whose port is not yet bound loses that first Initial to a closed
+/// port and pays quiche's no-sample probe timeout, a full second, for it.
+pub(crate) fn role_listen_bound(
+    config: &Config,
+    address: SocketAddr,
+) -> Result<crate::role::Endpoint, Error> {
+    let (certificate, key) = credentials()?;
+    let mut server_config = QuicheConfig::server(advertised_limits()?, certificate, key);
+    if let Some(bytes) = datagram_bytes_from_env()? {
+        server_config.max_datagram_bytes = bytes;
+    }
+    let server = Transport::serve(address, &server_config).map_err(Error::Transport)?;
+    Ok(crate::role::Endpoint {
+        adapter: Box::new(server),
+        keepalive: None,
+        backend: "quiche",
+        detail: Some(format!(
+            "datagram_bytes={}",
+            server_config.max_datagram_bytes
+        )),
+        unmodelled: unmodelled_for(config),
+    })
+}
+
 pub(crate) fn role_listen(
     config: &Config,
     address: SocketAddr,

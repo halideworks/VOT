@@ -865,6 +865,7 @@ mod tests {
         receiver.observe_path_stats(PathStats {
             pacing_rate_bps: Some(8_000_000),
             lost_packets: None,
+            spurious_lost_packets: None,
             smoothed_rtt_us: Some(1_000),
             congestion_window_bytes: None,
             mtu_bytes: Some(1500),
@@ -873,6 +874,7 @@ mod tests {
         receiver.observe_path_stats(PathStats {
             pacing_rate_bps: None,
             lost_packets: None,
+            spurious_lost_packets: None,
             smoothed_rtt_us: None,
             congestion_window_bytes: Some(2_048),
             mtu_bytes: Some(1500),
@@ -883,6 +885,7 @@ mod tests {
         zero_bdp.observe_path_stats(PathStats {
             pacing_rate_bps: Some(1),
             lost_packets: None,
+            spurious_lost_packets: None,
             smoothed_rtt_us: Some(1),
             congestion_window_bytes: None,
             mtu_bytes: None,
@@ -891,6 +894,7 @@ mod tests {
         zero_bdp.observe_path_stats(PathStats {
             pacing_rate_bps: None,
             lost_packets: None,
+            spurious_lost_packets: None,
             smoothed_rtt_us: None,
             congestion_window_bytes: Some(0),
             mtu_bytes: None,

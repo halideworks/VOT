@@ -126,6 +126,11 @@ pub struct PathStats {
     /// engine counts them. The congestion story a throughput number needs:
     /// a low rate with losses is a path problem, without them a source one.
     pub lost_packets: Option<u64>,
+    /// Of the declared losses, how many a later acknowledgement disproved,
+    /// when the engine counts them. Splits `lost_packets` into detection
+    /// error and real drops: spurious losses name the loss detector, the
+    /// remainder names the path.
+    pub spurious_lost_packets: Option<u64>,
 }
 
 /// A latched doorbell for [`TransportAdapter::wait_for_event`].

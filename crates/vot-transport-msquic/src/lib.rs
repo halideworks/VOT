@@ -384,6 +384,7 @@ pub mod live {
             mtu_bytes: measured(u64::from(statistics.SendPathMtu)),
             pacing_rate_bps: None,
             lost_packets: Some(statistics.SendSuspectedLostPackets),
+            spurious_lost_packets: Some(statistics.SendSpuriousLostPackets),
         }
     }
 
@@ -4966,6 +4967,7 @@ mod tests {
             mtu_bytes: Some(1350),
             pacing_rate_bps: None,
             lost_packets: None,
+            spurious_lost_packets: None,
         };
         adapter.record_path_stats(ConnectionId(7), sample);
         assert_eq!(adapter.path_stats(), Some(sample));

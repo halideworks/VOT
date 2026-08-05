@@ -3471,8 +3471,16 @@ mod tests {
             "high water was {} bytes",
             measured.memory_high_water_bytes
         );
-        // A high-water mark never falls, so a later read cannot be smaller.
-        assert!(super::memory_high_water_bytes().unwrap() >= measured.memory_high_water_bytes);
+        // A high-water mark never falls, but the value procfs reports is
+        // max(stored peak, current RSS) and the current-RSS half comes from
+        // per-CPU counters that lag a read by their batch size on every CPU,
+        // so two reads of one peak can disagree by a few megabytes. Eight is
+        // past that lag on any runner here and far under the first assert.
+        let counter_slop = 8 << 20;
+        assert!(
+            super::memory_high_water_bytes().unwrap() + counter_slop
+                >= measured.memory_high_water_bytes
+        );
     }
 
     #[test]

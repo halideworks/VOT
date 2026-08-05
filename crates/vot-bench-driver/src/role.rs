@@ -219,6 +219,9 @@ fn note_rail_paths(endpoints: &mut [Endpoint], notes: &mut String) {
         if let Some(lost) = stats.lost_packets {
             let _ = write!(notes, ";rail{rail}_lost={lost}");
         }
+        if let Some(spurious) = stats.spurious_lost_packets {
+            let _ = write!(notes, ";rail{rail}_spurious={spurious}");
+        }
         if let Some(rtt) = stats.smoothed_rtt_us {
             let _ = write!(notes, ";rail{rail}_rtt_us={rtt}");
         }

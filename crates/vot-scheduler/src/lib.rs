@@ -918,7 +918,7 @@ mod tests {
 
     /// Retains what it is written, so a test can assert exactly what reached
     /// the sink and that a replay was not written twice. That second assert
-    /// is stricter than the RangeSink contract, which allows an identical
+    /// is stricter than the [`RangeSink`] contract, which allows an identical
     /// rewrite, so this fixture fits the sink path, where replays are
     /// skipped before the write, and not the written-range path, where they
     /// are not.

@@ -202,7 +202,18 @@ pub struct Config {
     pub object_bytes: u64,
     pub record_bytes: usize,
     pub rails: Rails,
+    pub sink: SinkChoice,
     pub impairment: ImpairmentCase,
+}
+
+/// Where a ranged case's verified bytes go (ADR-0029).
+///
+/// Discard is the ram destination every landed number was taken on; a file
+/// makes the case ram-to-disk and the notes label which one a result paid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SinkChoice {
+    Discard,
+    File(std::path::PathBuf),
 }
 
 /// Reads one case variable. An empty value is as absent as a missing one; the
@@ -265,6 +276,10 @@ impl Config {
             // asking for a number this driver would have to invent.
             return Err(Error::Value("VOT_BENCH_RAILS"));
         }
+        let sink = match lookup("VOT_BENCH_SINK_FILE").filter(|value| !value.is_empty()) {
+            None => SinkChoice::Discard,
+            Some(path) => SinkChoice::File(std::path::PathBuf::from(path)),
+        };
         Ok(Self {
             backend: variable(lookup, "VOT_BENCH_BACKEND")?,
             suite,
@@ -273,6 +288,7 @@ impl Config {
             object_bytes,
             record_bytes,
             rails,
+            sink,
             impairment: ImpairmentCase {
                 mtu_bytes: number(lookup, "VOT_BENCH_IMPAIRMENT_MTU_BYTES")?,
                 rtt_us: number(lookup, "VOT_BENCH_IMPAIRMENT_RTT_US")?,
@@ -484,6 +500,40 @@ fn receiver_for_ranged(config: &Config) -> Result<ReliableReceiver, Error> {
     let limit = ranged_staging_limit(config);
     let window = config.bandwidth_delay_bytes().max(limit.min(GROUP_BYTES));
     Ok(ReliableReceiver::new(limit, window, limit)?)
+}
+
+/// Builds the destination a ranged case's verified bytes flow to.
+///
+/// The file is created and sized before the clock starts, so the timed
+/// section pays for placing bytes, not for allocating the destination.
+fn sink_for(config: &Config) -> Result<Box<dyn vot_scheduler::RangeSink>, Error> {
+    match &config.sink {
+        SinkChoice::Discard => Ok(Box::new(DiscardSink)),
+        SinkChoice::File(path) => {
+            let sink = vot_scheduler::FileSink::create(path, config.object_bytes)
+                .map_err(|error| Error::Unsupported(format!("sink file: {error}")))?;
+            Ok(Box::new(sink))
+        }
+    }
+}
+
+/// Names the sink in the notes and, for a file, syncs it after the clock
+/// and reports what the sync cost, so a result's durability story is
+/// explicit either way.
+fn sink_note(config: &Config, notes: &mut String) -> Result<(), Error> {
+    use std::fmt::Write as _;
+    match &config.sink {
+        SinkChoice::Discard => notes.push_str(";sink=discard"),
+        SinkChoice::File(path) => {
+            let started = Instant::now();
+            std::fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| Error::Unsupported(format!("sink file sync: {error}")))?;
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let _ = write!(notes, ";sink=file;sync_ns={nanos}");
+        }
+    }
+    Ok(())
 }
 
 /// The chaining-value layer ranges are proved from, per suite.
@@ -1659,7 +1709,7 @@ fn transfer_ranged<C: Carrier>(
     let layer = Arc::new(layer);
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
+    receiver.begin_ranges(subject, sink_for(config)?)?;
     let mut credit = Credit::Constructed;
     for carrier in &mut carriers {
         credit = enforced_credit(carrier.receiving(), receiver.advertised_credit())?;
@@ -1789,7 +1839,7 @@ fn transfer_ranged<C: Carrier>(
         ));
     }
 
-    let notes = ranged_notes(
+    let mut notes = ranged_notes(
         &carriers[0],
         &receiver,
         credit,
@@ -1799,6 +1849,7 @@ fn transfer_ranged<C: Carrier>(
         reassembly.completed,
         provisioned,
     );
+    sink_note(config, &mut notes)?;
     Ok(Measurement {
         bytes_sent,
         verified_bytes: delivered,
@@ -1948,8 +1999,8 @@ mod test_guard {
 mod tests {
     use super::{
         Carrier, Config, Error, ImpairmentCase, Measurement, ObjectSource, Payload, Rails,
-        SimulatorCarrier, StreamId, Tally, TransportAdapter, escape, measure, note_cycles,
-        parse_vm_hwm, record_lengths, record_payload, shared_payload, transfer_ranged,
+        SimulatorCarrier, SinkChoice, StreamId, Tally, TransportAdapter, escape, measure,
+        note_cycles, parse_vm_hwm, record_lengths, record_payload, shared_payload, transfer_ranged,
         transfer_within,
     };
     use std::collections::{BTreeMap, VecDeque};
@@ -1973,6 +2024,7 @@ mod tests {
             object_bytes,
             record_bytes: 65_536,
             rails: Rails::Shared,
+            sink: SinkChoice::Discard,
             impairment: ImpairmentCase {
                 mtu_bytes: 1500,
                 rtt_us: 1_000,
@@ -2179,6 +2231,42 @@ mod tests {
         let mut config = case(object_bytes, suite);
         config.workers = workers;
         config
+    }
+
+    #[test]
+    fn the_sink_variable_selects_the_destination() {
+        // Absent or empty is the ram destination every landed number used.
+        assert_eq!(parse(&environment()).unwrap().sink, SinkChoice::Discard);
+        assert_eq!(
+            parse_with("VOT_BENCH_SINK_FILE", "").unwrap().sink,
+            SinkChoice::Discard
+        );
+        assert_eq!(
+            parse_with("VOT_BENCH_SINK_FILE", "/tmp/object.bin")
+                .unwrap()
+                .sink,
+            SinkChoice::File(std::path::PathBuf::from("/tmp/object.bin"))
+        );
+    }
+
+    #[test]
+    fn a_ranged_case_lands_the_verified_object_in_the_sink_file() {
+        // The whole path end to end: generated, framed, carried, proved,
+        // admitted, placed. The file must be the object, byte for byte, and
+        // the notes must label the destination and its sync cost.
+        let path = std::env::temp_dir().join(format!("vot-bench-sink-{}.bin", std::process::id()));
+        let object_bytes = 7 * 65_536 + 17;
+        let mut config = ranged_case(object_bytes, 2, Suite::Blake3Bao64);
+        config.sink = SinkChoice::File(path.clone());
+        let measured = measure(&config).unwrap();
+        assert_eq!(measured.verified_bytes, object_bytes);
+        assert!(measured.notes.contains(";sink=file;sync_ns="));
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut expected = Vec::new();
+        ObjectSource::new(config.seed).fill(&mut expected, usize::try_from(object_bytes).unwrap());
+        assert_eq!(written.len(), expected.len());
+        assert!(written == expected, "the file is not the object");
     }
 
     #[test]

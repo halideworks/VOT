@@ -728,7 +728,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let workers = config.workers;
     let subject = subject_of(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    receiver.begin_ranges(subject, Box::new(DiscardSink))?;
+    receiver.begin_ranges(subject, crate::sink_for(config)?)?;
     let mut reassembly = BundleReassembly::new(workers);
 
     // Every rail binds before any handshake starts where the backend allows
@@ -824,6 +824,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
             witnesses.peak()
         );
     }
+    crate::sink_note(config, &mut notes)?;
     note_rail_paths(&mut endpoints, &mut notes);
     Ok(Measurement {
         bytes_sent: 0,

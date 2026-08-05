@@ -98,6 +98,62 @@ impl<S: RangeSink + ?Sized> RangeSink for std::sync::Arc<S> {
     }
 }
 
+/// A sink that places each verified range at its offset in one file.
+///
+/// Positional writes only, so a shared handle carries no cursor and
+/// concurrent rails cannot interleave through one. Durability stays the
+/// caller's contract, as [`ReliableReceiver::finish_ranges`] documents:
+/// sync the file through its path when the transfer's claim needs to
+/// include the platter.
+pub struct FileSink {
+    file: std::fs::File,
+}
+
+impl FileSink {
+    /// Creates or truncates the destination and sizes it to the object, so
+    /// every verified range writes into place rather than extending.
+    ///
+    /// # Errors
+    /// Surfaces the platform's refusal to create or size the file.
+    pub fn create(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        file.set_len(length)?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+    let mut offset = offset;
+    let mut data = data;
+    while !data.is_empty() {
+        let written = file.seek_write(data, offset)?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        data = &data[written..];
+        offset = offset.saturating_add(written as u64);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(_file: &std::fs::File, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+impl RangeSink for FileSink {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError> {
+        write_all_at(&self.file, covered_offset, data).map_err(|_| SinkError)
+    }
+}
+
 /// Bounds the extent map so an adversarial arrival order, alternating units
 /// to keep runs from merging, prices its attack at extent entries rather
 /// than being free. Real arrival is near-in-order per rail, so live
@@ -1273,6 +1329,36 @@ mod tests {
             middle.finish_ranges(range_subject),
             Err(Error::LengthMismatch)
         );
+    }
+
+    #[test]
+    fn a_file_sink_places_ranges_at_their_offsets() {
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let mut bytes = Vec::with_capacity(unit * 3);
+        for index in 0..3_u8 {
+            bytes.extend(std::iter::repeat_n(index + 1, unit));
+        }
+        let path = std::env::temp_dir().join(format!(
+            "vot-file-sink-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let sink = FileSink::create(&path, bytes.len() as u64).unwrap();
+        // Sized at creation, so a partially covered object still has the
+        // subject's length on disk.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        // Out of order, and one range twice: writes place, never extend or
+        // interleave, so order and repetition cannot show in the bytes.
+        sink.write_at(2 * RANGE_UNIT_BYTES, &bytes[unit * 2..])
+            .unwrap();
+        sink.write_at(0, &bytes[..unit]).unwrap();
+        sink.write_at(RANGE_UNIT_BYTES, &bytes[unit..unit * 2])
+            .unwrap();
+        sink.write_at(0, &bytes[..unit]).unwrap();
+        drop(sink);
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, bytes);
     }
 
     #[test]

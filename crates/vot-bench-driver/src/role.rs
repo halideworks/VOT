@@ -222,6 +222,12 @@ fn note_rail_paths(endpoints: &mut [Endpoint], notes: &mut String) {
         if let Some(spurious) = stats.spurious_lost_packets {
             let _ = write!(notes, ";rail{rail}_spurious={spurious}");
         }
+        if let Some(sent) = stats.packets_sent {
+            let _ = write!(notes, ";rail{rail}_sent={sent}");
+        }
+        if let Some(received) = stats.packets_received {
+            let _ = write!(notes, ";rail{rail}_recv={received}");
+        }
         if let Some(rtt) = stats.smoothed_rtt_us {
             let _ = write!(notes, ";rail{rail}_rtt_us={rtt}");
         }
@@ -1102,6 +1108,13 @@ mod tests {
                 measurement.notes
             );
         }
+        // The sender's rails publish the packet ledger the loss forensics
+        // read; a note that stopped carrying it would break that instrument
+        // silently.
+        assert!(sent.notes.contains("rail0_sent="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_recv="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_lost="), "{}", sent.notes);
+        assert!(sent.notes.contains("rail0_spurious="), "{}", sent.notes);
         assert!(received.notes.contains("bundles="), "{}", received.notes);
     }
 }

@@ -1374,6 +1374,10 @@ pub fn path_sample(conn: &quiche::Connection) -> Option<PathStats> {
         pacing_rate_bps: Some(stats.delivery_rate.saturating_mul(8)),
         lost_packets: u64::try_from(conn.stats().lost).ok(),
         spurious_lost_packets: u64::try_from(conn.stats().spurious_lost).ok(),
+        // Connection scope, like the loss counters above, so all four halves
+        // of the ledger cover the same packets whatever paths existed.
+        packets_sent: u64::try_from(conn.stats().sent).ok(),
+        packets_received: u64::try_from(conn.stats().recv).ok(),
     })
 }
 

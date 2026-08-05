@@ -131,11 +131,6 @@ fn datagram_bytes_from_env() -> Result<Option<usize>, Error> {
 /// hand on two machines, and a human is slower than a scheduler.
 const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Listens on `address` and waits for the sending half to connect.
-///
-/// # Errors
-/// Reports a socket, credential, or configuration failure, and a peer that did
-/// not connect inside [`ROLE_HANDSHAKE_TIMEOUT`].
 /// Binds a listener without waiting for its handshake.
 ///
 /// The ranged half binds every rail before any handshake starts: a sender
@@ -164,6 +159,11 @@ pub(crate) fn role_listen_bound(
     })
 }
 
+/// Listens on `address` and waits for the sending half to connect.
+///
+/// # Errors
+/// Reports a socket, credential, or configuration failure, and a peer that did
+/// not connect inside [`ROLE_HANDSHAKE_TIMEOUT`].
 pub(crate) fn role_listen(
     config: &Config,
     address: SocketAddr,

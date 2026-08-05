@@ -150,18 +150,29 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
 /// How long a rail's accept may wait once every port is bound.
 const ROLE_RAIL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Binds a listening endpoint without waiting for its handshake, where the
-/// backend can; the others accept serially and carry the bind race the
-/// quiche path closes.
+/// Whether the backend can bind a listener without waiting on its handshake.
+fn binds_before_accepting(config: &Config) -> bool {
+    config.backend.as_str() == "quiche"
+}
+
+/// Binds a listening endpoint without waiting for its handshake.
+#[cfg(feature = "quiche")]
 fn bound_listener(config: &Config, listen: SocketAddr) -> Result<Endpoint, Error> {
-    match config.backend.as_str() {
-        #[cfg(feature = "quiche")]
-        "quiche" => crate::backend_quiche::role_listen_bound(config, listen),
-        _ => listen_endpoint(config, listen),
-    }
+    crate::backend_quiche::role_listen_bound(config, listen)
+}
+
+#[cfg(not(feature = "quiche"))]
+fn bound_listener(_config: &Config, _listen: SocketAddr) -> Result<Endpoint, Error> {
+    Err(Error::Unsupported(
+        "no backend in this build binds before accepting".to_owned(),
+    ))
 }
 
 /// Waits for a bound endpoint to report its accepted connection.
+///
+/// Anything polled before the connection is discarded, which is safe only
+/// because the sending half submits nothing until every rail is connected;
+/// this wait leans on that gate rather than enforcing one.
 fn wait_connected(
     adapter: &mut dyn TransportAdapter,
     timeout: std::time::Duration,
@@ -192,6 +203,46 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
     adapter.flush()?;
     linger(adapter);
     Ok(())
+}
+
+/// Accepts every rail's connection and starts the transfer clock.
+///
+/// Every rail binds before any handshake starts where the backend allows
+/// it, or the sender's next Initial races the next bind and pays a full
+/// no-sample probe timeout when it loses. Either way the clock starts at
+/// the first accepted connection, the sequential half's accounting, and
+/// the sibling rails' handshakes run inside it.
+#[expect(clippy::type_complexity, reason = "the clock rides with what it times")]
+fn accept_rails(
+    config: &Config,
+    base: SocketAddr,
+    workers: usize,
+) -> Result<(Vec<Endpoint>, Option<(u64, u64)>, Instant), Error> {
+    let mut endpoints = Vec::with_capacity(workers);
+    let cpu_before;
+    let started;
+    if binds_before_accepting(config) {
+        for rail in 0..workers {
+            endpoints.push(bound_listener(config, rail_address(base, rail)?)?);
+        }
+        wait_connected(endpoints[0].adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
+        cpu_before = cpu_times_ns();
+        started = Instant::now();
+        for endpoint in endpoints.iter_mut().skip(1) {
+            wait_connected(endpoint.adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
+        }
+    } else {
+        // A backend whose listener accepts inside construction carries the
+        // bind race serially; the race and its cost stay visible here
+        // rather than being hidden outside the clock.
+        endpoints.push(listen_endpoint(config, base)?);
+        cpu_before = cpu_times_ns();
+        started = Instant::now();
+        for rail in 1..workers {
+            endpoints.push(listen_endpoint(config, rail_address(base, rail)?)?);
+        }
+    }
+    Ok((endpoints, cpu_before, started))
 }
 
 /// The address rail `rail` uses: the configured port plus the rail's index.
@@ -559,23 +610,12 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     receiver.begin_ranges(subject)?;
     let mut reassembly = BundleReassembly::new(workers);
 
-    // Every rail binds before any handshake starts, or the sender's next
-    // Initial races the next bind and pays a full no-sample probe timeout
-    // when it loses.
-    let mut endpoints = Vec::with_capacity(workers);
-    for rail in 0..workers {
-        endpoints.push(bound_listener(config, rail_address(base, rail)?)?);
-    }
-    // The clock starts at the first accepted connection, the sequential
-    // half's accounting; the sibling rails' handshakes run inside it, and
-    // with every port bound beforehand they cost round trips, not probe
-    // timeouts.
-    wait_connected(endpoints[0].adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
-    let cpu_before = cpu_times_ns();
-    let started = std::time::Instant::now();
-    for endpoint in endpoints.iter_mut().skip(1) {
-        wait_connected(endpoint.adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
-    }
+    // Every rail binds before any handshake starts where the backend allows
+    // it, or the sender's next Initial races the next bind and pays a full
+    // no-sample probe timeout when it loses. Either way the clock starts at
+    // the first accepted connection, the sequential half's accounting, and
+    // the sibling rails' handshakes run inside it.
+    let (mut endpoints, cpu_before, started) = accept_rails(config, base, workers)?;
     let mut credit = Credit::Constructed;
     for endpoint in &mut endpoints {
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;

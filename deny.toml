@@ -26,4 +26,8 @@ highlight = "all"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/microsoft/msquic.git"]
+allow-git = [
+  "https://github.com/microsoft/msquic.git",
+  # The ADR-0028 loss-floor fork; the entry leaves with the pin.
+  "https://github.com/halideworks/quiche.git",
+]

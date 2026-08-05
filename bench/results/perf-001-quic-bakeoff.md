@@ -328,9 +328,14 @@ spine matrix, `provisioned_multi_rail_labeled` by the provisioned cells and
 their notes label, and `serialized_spine_hypothesis_tested` by the shared and
 provisioned curves and the per-carrier verdict above. What remains uncovered:
 
-- The spine matrix is loopback only. Role mode carries one worker, so the
-  multi-worker curves have no two-machine confirmation; a wire spine run needs
-  a ranged role mode that does not exist yet.
+- The spine matrix is loopback only and stands as history at its commit. The
+  ranged multi-rail role mode it lacked was built since (PR 87, 2026-08-05),
+  and wire multi-rail numbers now exist: once the rail startup race was fixed
+  (PR 88), W=4 carried 7.8 and W=6 8.5 Gbit/s with a 1 GB object, and on the
+  pinned quiche of ADR-0028 five W=6 runs hold an 8.83 Gbit/s median against
+  the path's own single-flow TCP ceiling of 9.45. Those runs are provisioned
+  rails only, so the shared arm of the hypothesis still has no two-machine
+  measurement.
 - Every multi-worker number pays the ranged path's own framing and staging, so
   cross-path comparisons against the sequential rows conflate path and worker
   count; only same-W cells are commensurable.

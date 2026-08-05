@@ -385,6 +385,8 @@ pub mod live {
             pacing_rate_bps: None,
             lost_packets: Some(statistics.SendSuspectedLostPackets),
             spurious_lost_packets: Some(statistics.SendSpuriousLostPackets),
+            packets_sent: Some(statistics.SendTotalPackets),
+            packets_received: Some(statistics.RecvTotalPackets),
         }
     }
 
@@ -4968,6 +4970,8 @@ mod tests {
             pacing_rate_bps: None,
             lost_packets: None,
             spurious_lost_packets: None,
+            packets_sent: None,
+            packets_received: None,
         };
         adapter.record_path_stats(ConnectionId(7), sample);
         assert_eq!(adapter.path_stats(), Some(sample));

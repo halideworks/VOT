@@ -131,6 +131,14 @@ pub struct PathStats {
     /// error and real drops: spurious losses name the loss detector, the
     /// remainder names the path.
     pub spurious_lost_packets: Option<u64>,
+    /// Packets this endpoint transmitted on the path, when the engine
+    /// counts them. Against the peer's received count this is the wire's
+    /// own ledger: transmissions that never arrived are real drops, no
+    /// matter what the loss detector believed.
+    pub packets_sent: Option<u64>,
+    /// Packets this endpoint received on the path, when the engine counts
+    /// them. The other half of that ledger.
+    pub packets_received: Option<u64>,
 }
 
 /// A latched doorbell for [`TransportAdapter::wait_for_event`].

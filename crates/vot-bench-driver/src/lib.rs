@@ -1713,14 +1713,27 @@ fn transfer_within<C: Carrier>(
 /// # Errors
 /// Propagates transport, proving, and verification failures, and reports a
 /// carrier that stopped rather than returning a partial transfer.
+fn transfer_ranged<C: Carrier>(
+    config: &Config,
+    carriers: Vec<C>,
+    budget: u64,
+) -> Result<Measurement, Error> {
+    let (sink, sink_handle) = sink_for(config)?;
+    transfer_ranged_into(config, carriers, budget, &sink, sink_handle.as_deref())
+}
+
+/// The ranged transfer with its destination injected, which is what lets a
+/// test drive the placement pool's refusal path with a sink of its own.
 #[expect(
     clippy::too_many_lines,
     reason = "one loop, kept whole so the budget it spends is visibly its own"
 )]
-fn transfer_ranged<C: Carrier>(
+fn transfer_ranged_into<C: Carrier>(
     config: &Config,
     mut carriers: Vec<C>,
     budget: u64,
+    sink: &Arc<dyn vot_scheduler::RangeSink>,
+    sink_handle: Option<&vot_scheduler::FileSink>,
 ) -> Result<Measurement, Error> {
     #[cfg(test)]
     test_guard::arm();
@@ -1739,7 +1752,6 @@ fn transfer_ranged<C: Carrier>(
     let layer = Arc::new(layer);
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
-    let (sink, sink_handle) = sink_for(config)?;
     receiver.begin_ranges(subject, Box::new(sink.clone()))?;
     let mut credit = Credit::Constructed;
     for carrier in &mut carriers {
@@ -1767,14 +1779,20 @@ fn transfer_ranged<C: Carrier>(
     let receiver = std::sync::Mutex::new(receiver);
     let witnesses = WitnessLedger::default();
     let (place, placements) = mpsc::sync_channel::<PendingBundle>(workers.saturating_mul(2));
-    let placements = std::sync::Mutex::new(placements);
 
     let cpu_before = cpu_times_ns();
     let started = Instant::now();
     std::thread::scope(|scope| -> Result<(), Error> {
+        // The pool owns the channel's receiving half: each placer holds one
+        // clone and the spine drops its own before the loop, so the last
+        // placer to exit drops the receiver and a spine parked on the full
+        // channel wakes with the send error instead of holding the join
+        // forever. `send_ranged`'s group source exists for the same reason,
+        // in the mirror direction.
+        let placements = Arc::new(std::sync::Mutex::new(placements));
         let mut placers = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let placements = &placements;
+            let placements = Arc::clone(&placements);
             let receiver = &receiver;
             let witnesses = &witnesses;
             let sink = sink.clone();
@@ -1805,6 +1823,8 @@ fn transfer_ranged<C: Carrier>(
                 }
             }));
         }
+        // The spine keeps no handle to the receiving half; see above.
+        drop(placements);
         let mut channels = Vec::with_capacity(workers);
         for (index, range) in ranges.iter().enumerate() {
             let (sender, frames) = mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(2);
@@ -1939,7 +1959,7 @@ fn transfer_ranged<C: Carrier>(
         use std::fmt::Write as _;
         let _ = write!(notes, ";witness_peak_bytes={}", witnesses.peak());
     }
-    sink_note(sink_handle.as_deref(), &mut notes)?;
+    sink_note(sink_handle, &mut notes)?;
     Ok(Measurement {
         bytes_sent,
         verified_bytes: delivered,
@@ -2324,6 +2344,29 @@ mod tests {
     }
 
     #[test]
+    fn a_refusing_sink_fails_the_ranged_transfer_instead_of_hanging_it() {
+        // Every placer dies within a few bundles when the sink refuses, and
+        // the spine must come back with the pool's verdict rather than park
+        // on the full handoff channel. Written against the pre-fix pool
+        // this test hangs, which is what it pins.
+        struct RefusingSink;
+        impl vot_scheduler::RangeSink for RefusingSink {
+            fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+                Err(vot_scheduler::SinkError)
+            }
+        }
+        let config = ranged_case(64 * 65_536, 2, Suite::Blake3Bao64);
+        let carriers = vec![SimulatorCarrier::new(&config).unwrap()];
+        let refusing: std::sync::Arc<dyn vot_scheduler::RangeSink> =
+            std::sync::Arc::new(RefusingSink);
+        let outcome = super::transfer_ranged_into(&config, carriers, u64::MAX, &refusing, None);
+        assert!(
+            matches!(outcome, Err(Error::Receive(vot_scheduler::Error::Sink))),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn the_witness_ledger_reports_the_peak_of_concurrent_holds() {
         let ledger = super::WitnessLedger::default();
         ledger.hold(100);
@@ -2407,6 +2450,11 @@ mod tests {
                 assert!(measured.notes.contains(";sink=discard"));
                 // The pool held at least one witness on its way in.
                 assert!(note_field(&measured.notes, "witness_peak_bytes") > 0);
+                // With placement pooled, receiver staging is the verifier
+                // reservation alone; the in-flight bytes are the witness
+                // field's. Pinned so the field's meaning cannot drift again
+                // unnoticed.
+                assert_eq!(note_field(&measured.notes, "staging_peak_bytes"), 65_536);
             }
         }
     }

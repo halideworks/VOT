@@ -32,6 +32,51 @@ pub(crate) struct Loopback {
     /// already put there, so a loop that waits for one can only be tested
     /// against a loop that never needed to.
     pub(crate) on_wait: VecDeque<Event>,
+    /// A rendezvous other carriers share, for tests whose subject is
+    /// concurrency itself: a wait blocks until the expected number of
+    /// carriers are waiting at once, so a loop that drives sessions one
+    /// after another deadlocks where a concurrent one passes. Bounded,
+    /// because a deadlock should fail the test rather than hang it.
+    pub(crate) rendezvous: Option<std::sync::Arc<Rendezvous>>,
+}
+
+/// The gate [`Loopback::rendezvous`] carriers meet at.
+pub(crate) struct Rendezvous {
+    pub(crate) expected: usize,
+    state: std::sync::Mutex<usize>,
+    arrived: std::sync::Condvar,
+}
+
+impl Rendezvous {
+    pub(crate) fn expecting(expected: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            expected,
+            state: std::sync::Mutex::new(0),
+            arrived: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Blocks until `expected` waiters have arrived, or panics after a
+    /// bound: the sequential loop this exists to reject would otherwise
+    /// hold the suite forever.
+    fn meet(&self) {
+        let mut waiting = self.state.lock().expect("the gate");
+        *waiting += 1;
+        if *waiting >= self.expected {
+            self.arrived.notify_all();
+            return;
+        }
+        let deadline = std::time::Duration::from_secs(10);
+        let (guard, outcome) = self
+            .arrived
+            .wait_timeout_while(waiting, deadline, |count| *count < self.expected)
+            .expect("the gate");
+        drop(guard);
+        assert!(
+            !outcome.timed_out(),
+            "the rendezvous never filled: sessions were driven one at a time"
+        );
+    }
 }
 
 impl Loopback {
@@ -73,6 +118,9 @@ impl TransportAdapter for Loopback {
     }
 
     fn wait_for_event(&mut self, _bound: std::time::Duration) {
+        if let Some(gate) = self.rendezvous.take() {
+            gate.meet();
+        }
         if let Some(event) = self.on_wait.pop_front() {
             self.events.push_back(event);
         }

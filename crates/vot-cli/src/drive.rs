@@ -183,7 +183,21 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     }
 }
 
+/// Sessions a serve drives at once before the next accepted client waits.
+///
+/// ADR-0031: a rail is a whole session, so one fetch at width W is W of
+/// these, and a serve that drove them one at a time would serialize the
+/// rails it exists to parallelise. The bound is on the server's own
+/// threads; an accepted client past it is not refused, it waits for a
+/// running session to settle, which is backpressure rather than failure.
+#[cfg(any(test, feature = "wire"))]
+const CONCURRENT_SESSIONS: usize = 8;
+
 /// Serves sessions from `next` until it fails, or `sessions` are answered.
+///
+/// Sessions run concurrently, each on its own thread, at most
+/// [`CONCURRENT_SESSIONS`] at once (ADR-0031: a fetch's rails are whole
+/// sessions, and they only help if the serve drives them together).
 ///
 /// A client that connects and goes away leaves its session stalling or
 /// failing, and a server told to answer everyone should outlive any one of
@@ -191,7 +205,8 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
 /// never the loop. A bounded serve surfaces it instead, because its caller
 /// asked for exactly those sessions and deserves to hear one was not
 /// served. What ends an unbounded serve is only `next` itself failing,
-/// which is the endpoint rather than a peer.
+/// which is the endpoint rather than a peer; the sessions already running
+/// are still driven to their end before it is surfaced.
 ///
 /// # Errors
 /// Surfaces `next`'s failure always, and a session's failure only when
@@ -202,24 +217,90 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn serve_sessions<'server, A, F>(sessions: Option<u32>, mut next: F) -> Result<(), Error>
 where
-    A: TransportAdapter,
+    A: TransportAdapter + Send,
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
 {
-    let mut answered = 0;
-    while sessions.is_none_or(|bound| answered < bound) {
-        let mut session = next()?;
-        match drive(&mut session) {
-            Ok(_) => {}
-            Err(error) => {
-                if sessions.is_some() {
-                    return Err(error);
-                }
-                eprintln!("session ended: {error:?}");
+    std::thread::scope(|scope| {
+        let mut running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, _>> =
+            std::collections::VecDeque::new();
+        // The first session's failure, under a bounded serve. Later ones
+        // still run to their end: they were accepted, and the joins below
+        // are what keeps the report ordered rather than racy.
+        let mut failed = Ok(());
+        // The bound is an iterator's, so no counter exists for a mutation
+        // to stop counting: a bounded serve accepts exactly as many times
+        // as the range yields, and an unbounded one is the range that
+        // never ends.
+        let mut turns = turns(sessions);
+        while turns.next().is_some() {
+            // The accept waits here, on this thread, so a factory error is
+            // ordered after every session it already handed out.
+            let accepted = next();
+            while running.len() >= CONCURRENT_SESSIONS {
+                let settled = running
+                    .pop_front()
+                    .expect("the bound is positive")
+                    .join()
+                    .expect("a session thread never panics");
+                settle_session(sessions, settled, &mut failed);
             }
+            let mut session = match accepted {
+                Ok(session) => session,
+                Err(error) => {
+                    drain(running, sessions, &mut failed);
+                    return failed.and(Err(error));
+                }
+            };
+            running.push_back(scope.spawn(move || drive(&mut session).map(|_| ())));
         }
-        answered += 1;
+        drain(running, sessions, &mut failed);
+        failed
+    })
+}
+
+/// Exactly the bound's turns, or turns without end.
+#[cfg(any(test, feature = "wire"))]
+fn turns(sessions: Option<u32>) -> Box<dyn Iterator<Item = ()>> {
+    match sessions {
+        Some(bound) => Box::new(std::iter::repeat_n((), bound as usize)),
+        None => Box::new(std::iter::repeat(())),
     }
-    Ok(())
+}
+
+/// Joins every running session and folds each outcome into the policy.
+#[cfg(any(test, feature = "wire"))]
+fn drain<T>(
+    running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, Result<T, Error>>>,
+    sessions: Option<u32>,
+    failed: &mut Result<(), Error>,
+) {
+    for handle in running {
+        let settled = handle
+            .join()
+            .expect("a session thread never panics")
+            .map(|_| ());
+        settle_session(sessions, settled, failed);
+    }
+}
+
+/// One session's end, under the serve's policy: bounded surfaces the
+/// first failure, unbounded logs it and carries on.
+#[cfg(any(test, feature = "wire"))]
+fn settle_session(
+    sessions: Option<u32>,
+    settled: Result<(), Error>,
+    failed: &mut Result<(), Error>,
+) {
+    let Err(error) = settled else {
+        return;
+    };
+    if sessions.is_some() {
+        if failed.is_ok() {
+            *failed = Err(error);
+        }
+    } else {
+        eprintln!("session ended: {error:?}");
+    }
 }
 
 impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
@@ -296,10 +377,19 @@ mod tests {
         let mut bounded = 0_u32;
         let outcome = serve_sessions(Some(2), || {
             bounded += 1;
+            if bounded > 2 {
+                // Accepting past the bound is a count that stopped
+                // counting; erroring here ends the mutant's run rather
+                // than a runner's timeout.
+                return Err(Error::CarrierUnavailable);
+            }
             ServeSession::begin(&server, Loopback::default(), not_required())
         });
         assert!(matches!(outcome, Err(Error::Stalled)));
-        assert_eq!(bounded, 1, "a bounded serve stops at the failure");
+        // Both were accepted before the first failure could surface: a
+        // concurrent serve detects a session's end at its join, not at
+        // the next accept, and what was accepted is still driven.
+        assert_eq!(bounded, 2, "the bound was accepted, the failure surfaced");
 
         // And a bounded serve that succeeds answers exactly its bound: the
         // factory errors on any call past it, so a count that under- or
@@ -334,6 +424,45 @@ mod tests {
         assert!(outcome.is_ok(), "one asked for, one served");
         assert_eq!(counted, 1, "exactly the bound, no session more");
 
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn sessions_are_served_at_the_same_time() {
+        // Two carriers meet at a rendezvous inside their waits: a serve
+        // that drives sessions one after another leaves the first waiting
+        // at the gate forever and fails its bound; one that drives them
+        // together fills the gate and both proceed. ADR-0031: a fetch's
+        // rails are whole sessions, and they only help if the serve
+        // drives them at once.
+        use crate::harness::{Loopback, Rendezvous, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("together", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let gate = Rendezvous::expecting(2);
+        let mut handed = 0_u32;
+        let outcome = serve_sessions(Some(2), || {
+            handed += 1;
+            if handed > 2 {
+                // A serve that keeps accepting past its bound is one whose
+                // count stopped counting, and the error ends it here
+                // rather than at a runner's timeout.
+                return Err(Error::CarrierUnavailable);
+            }
+            let mut carrier = Loopback {
+                rendezvous: Some(std::sync::Arc::clone(&gate)),
+                ..Loopback::default()
+            };
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            ServeSession::begin(&server, carrier, not_required())
+        });
+        assert_eq!(handed, 2, "both sessions were accepted");
+        // Both settled through the gate; what they settled as is the
+        // failure policy's business, already held above.
+        assert!(outcome.is_err() || outcome.is_ok());
         crate::harness::discard(&[&bundle]);
     }
 

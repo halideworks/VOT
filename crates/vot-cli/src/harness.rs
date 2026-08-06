@@ -90,6 +90,9 @@ pub(crate) fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, P
         fs::write(path, bytes).unwrap();
     }
     let summary = build_bundle(&source, &bundle).unwrap();
+    // The source has served its purpose; only the bundle is answered from,
+    // and what a test leaves behind it leaves behind for every mutant.
+    fs::remove_dir_all(&source).unwrap();
     (bundle, summary)
 }
 
@@ -135,4 +138,16 @@ pub(crate) fn pump(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u
         moved = true;
     }
     moved
+}
+
+/// Removes what a test wrote.
+///
+/// `temporary` paths outlive the process that made them, and a mutation
+/// run is this suite over and over: a bundle left behind per run per
+/// mutant fills a CI runner's disk long before the mutants are through.
+pub(crate) fn discard(paths: &[&std::path::Path]) {
+    for path in paths {
+        let _ = fs::remove_dir_all(path);
+        let _ = fs::remove_file(path);
+    }
 }

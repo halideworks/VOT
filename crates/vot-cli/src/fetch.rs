@@ -687,7 +687,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 mod tests {
     use super::*;
     use crate::harness::{
-        Loopback, built_bundle, control_event, decode_control, not_required, patterned, pump,
+        Loopback, built_bundle, control_event, decode_control, discard, not_required, patterned,
+        pump,
     };
     use crate::tests::temporary;
     use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
@@ -839,7 +840,7 @@ mod tests {
         fs::create_dir_all(source.join("nested")).unwrap();
         fs::write(source.join("a.txt"), patterned(1000)).unwrap();
         fs::write(source.join("nested/b.bin"), patterned(150_000)).unwrap();
-        fs::write(source.join("big.bin"), patterned(12_600_000)).unwrap();
+        fs::write(source.join("big.bin"), patterned(8_500_000)).unwrap();
         fs::write(source.join("empty.txt"), b"").unwrap();
         let bundle = temporary("trip-bundle");
         let built = build_bundle(&source, &bundle).unwrap();
@@ -869,6 +870,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
+        discard(&[&source, &bundle, &output, &destination, &receipt]);
     }
 
     #[test]
@@ -911,6 +913,7 @@ mod tests {
             Some(error_code::PROOF_INVALID)
         );
         assert!(!fetcher.has_backlog(), "a closed fetch owes nothing");
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1370,6 +1373,7 @@ mod tests {
             .map(|(name, bytes)| (name.as_str(), bytes.clone()))
             .collect();
         let (bundle, _) = built_bundle("pageorder", &named);
+        let discarded = bundle.clone();
         let pages: Vec<Vec<u8>> = (0..2)
             .map(|index| {
                 fs::read(crate::manifest_page_path(
@@ -1414,6 +1418,7 @@ mod tests {
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
         assert_eq!(fetcher.pages_received, 1, "the repeat was counted");
         assert!(fetcher.plan.is_none(), "a page short of the manifest");
+        discard(&[&discarded, &early, &twice]);
     }
 
     #[test]
@@ -1467,6 +1472,7 @@ mod tests {
             run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
         assert_eq!(status, FetchStatus::Complete);
         assert!(!fetcher.has_backlog(), "and nothing is owed at the end");
+        discard(&[&bundle, &output]);
     }
 
     #[test]

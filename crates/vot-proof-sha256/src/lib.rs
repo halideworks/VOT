@@ -108,6 +108,25 @@ impl PieceHashes {
     pub fn pieces(&self) -> usize {
         self.hashes.len()
     }
+
+    /// Whether `piece` is still the bytes this layer took at `index`.
+    ///
+    /// A sender that keeps only piece hashes cannot otherwise tell that the
+    /// object it proves from has been rewritten under it, because a rewrite
+    /// that keeps the length reads back at the same offsets. A piece hash
+    /// carries no offset, so unlike the BLAKE3 layer this holds bytes to
+    /// their content alone and two identical pieces are interchangeable,
+    /// which is exactly what the tree already treats them as.
+    #[must_use]
+    pub fn holds(&self, index: usize, piece: &[u8]) -> bool {
+        let Some(hash) = self.hashes.get(index) else {
+            return false;
+        };
+        if piece.is_empty() || piece.len() as u64 > PIECE_SIZE {
+            return false;
+        }
+        piece_hash(piece) == *hash
+    }
 }
 
 /// Proves a range from the piece hashes rather than from the object.
@@ -401,6 +420,39 @@ mod tests {
             pieces.push(piece).unwrap();
         }
         pieces
+    }
+
+    #[test]
+    fn piece_hashes_hold_pieces_to_their_content() {
+        let data = fixture(3 * PIECE_SIZE as usize + 71);
+        let pieces = pieces_of(&data);
+        let chunks: Vec<&[u8]> = data.chunks(PIECE_SIZE as usize).collect();
+        for (index, piece) in chunks.iter().enumerate() {
+            assert!(pieces.holds(index, piece), "piece {index} is its own bytes");
+        }
+
+        // One byte different anywhere is a different piece.
+        let mut altered = chunks[1].to_vec();
+        altered[0] ^= 1;
+        assert!(!pieces.holds(1, &altered));
+        let mut altered = chunks[1].to_vec();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert!(!pieces.holds(1, &altered));
+
+        // A piece hash carries no offset, so the same bytes at another index
+        // are the same piece. That is the tree's own rule, not a gap here.
+        assert!(!pieces.holds(0, chunks[1]));
+        let repeated = vec![7u8; 2 * PIECE_SIZE as usize];
+        let layer = pieces_of(&repeated);
+        assert!(layer.holds(0, &repeated[..PIECE_SIZE as usize]));
+        assert!(layer.holds(1, &repeated[..PIECE_SIZE as usize]));
+
+        // And nothing holds outside the layer, or at an impossible size.
+        assert!(!pieces.holds(chunks.len(), chunks[0]));
+        assert!(!pieces.holds(usize::MAX, chunks[0]));
+        assert!(!pieces.holds(0, &[]));
+        assert!(!pieces.holds(0, &fixture(PIECE_SIZE as usize + 1)));
     }
 
     #[test]

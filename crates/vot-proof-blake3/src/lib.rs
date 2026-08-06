@@ -142,6 +142,35 @@ impl GroupCvs {
     pub fn groups(&self) -> usize {
         self.cvs.len()
     }
+
+    /// Whether `group` is still the bytes this layer took at `index`.
+    ///
+    /// A sender that keeps only chaining values cannot otherwise tell that
+    /// the object it proves from has been rewritten under it, because a
+    /// rewrite that keeps the length reads back at the same offsets. What
+    /// catches the rewrite is the group's content, as it is in the SHA-256
+    /// layer too. The offset is recomputed from the index because a
+    /// chaining value carries the position it was taken at: taken at any
+    /// other offset it would refuse the object's own bytes.
+    #[must_use]
+    pub fn holds(&self, index: usize, group: &[u8]) -> bool {
+        let Some(cv) = self.cvs.get(index) else {
+            return false;
+        };
+        let Ok(offset) = u64::try_from(index) else {
+            return false;
+        };
+        let Some(input_offset) = offset.checked_mul(GROUP_SIZE) else {
+            return false;
+        };
+        if group.is_empty() || group.len() as u64 > GROUP_SIZE {
+            return false;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(input_offset);
+        hasher.update(group);
+        hasher.finalize_non_root() == *cv
+    }
 }
 
 /// Proves a range from the chaining values rather than from the object.
@@ -488,6 +517,45 @@ mod tests {
             cvs.push(group).unwrap();
         }
         cvs
+    }
+
+    #[test]
+    fn chaining_values_hold_groups_to_their_content_and_their_place() {
+        let data = fixture(3 * GROUP_SIZE as usize + 71);
+        let cvs = cvs_of(&data);
+        let groups: Vec<&[u8]> = data.chunks(GROUP_SIZE as usize).collect();
+        for (index, group) in groups.iter().enumerate() {
+            assert!(cvs.holds(index, group), "group {index} is its own bytes");
+        }
+
+        // One byte different anywhere is a different group.
+        let mut altered = groups[1].to_vec();
+        altered[0] ^= 1;
+        assert!(!cvs.holds(1, &altered));
+        let mut altered = groups[1].to_vec();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        assert!(!cvs.holds(1, &altered));
+
+        // A chaining value carries the offset it was taken at, so an object
+        // of three identical groups still gets three different ones. That
+        // is why the loop above passes at every index rather than only the
+        // first: `holds` recomputes at the index's own offset, and at any
+        // other offset it would refuse the object's own bytes.
+        let repeated = vec![7u8; 3 * GROUP_SIZE as usize];
+        let same = cvs_of(&repeated);
+        assert_ne!(same.cvs[0], same.cvs[1]);
+        assert_ne!(same.cvs[1], same.cvs[2]);
+        // Bytes that are not what the layer took at an index are refused
+        // there, which is the content answering, not the offset.
+        assert!(!cvs.holds(0, groups[1]));
+        assert!(!cvs.holds(2, groups[1]));
+
+        // And nothing holds outside the layer, or at an impossible size.
+        assert!(!cvs.holds(groups.len(), groups[0]));
+        assert!(!cvs.holds(usize::MAX, groups[0]));
+        assert!(!cvs.holds(0, &[]));
+        assert!(!cvs.holds(0, &fixture(GROUP_SIZE as usize + 1)));
     }
 
     #[test]

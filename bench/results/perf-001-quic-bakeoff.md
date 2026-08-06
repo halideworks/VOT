@@ -319,6 +319,28 @@ VOT_BENCH_ROLE=send VOT_BENCH_CONNECT=192.168.1.131:4433 \
   <same case on the sending machine>
 ```
 
+## Ram-to-disk, added 2026-08-05
+
+The ranged receiver can now place verified bytes in a file
+(`VOT_BENCH_SINK_FILE`, ADR-0029), which turns the same case ram-to-disk;
+absent, the discard sink is what every number above used. First numbers,
+1 GB, W=4, quiche, provisioned rails, five runs each, same hour:
+
+| path | destination | Gbit/s (median) | spread |
+| --- | --- | --- | --- |
+| loopback | discard | 12.11 | 1.12x |
+| loopback | ZFS NVMe mirror | 11.49 | 1.09x |
+| wire (W=6) | discard | 5.7-5.8 | |
+| wire (W=6) | receiver's NVMe | 5.80 | one run |
+
+On the wire the disk is free: placement runs outside the admission lock
+and the poll loop (PRs 100-101), so the sink's latency prices a pool,
+not the transfer. The post-clock `sync_ns` field carries what making it
+durable cost (~575 ms per GB on the mirror, ~241 ms on the wire
+receiver's NVMe). The wire rows are from the post-update evening whose
+absolute numbers are suspect (see `docs/perf-engineering.md`); the
+loopback rows are same-hour A/B and stand.
+
 ## What this does not cover
 
 **The default backend is ADR-0026's ruling, not this report's.** All three

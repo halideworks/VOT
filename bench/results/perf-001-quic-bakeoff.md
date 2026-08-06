@@ -330,16 +330,22 @@ absent, the discard sink is what every number above used. First numbers,
 | --- | --- | --- | --- |
 | loopback | discard | 12.11 | 1.12x |
 | loopback | ZFS NVMe mirror | 11.49 | 1.09x |
-| wire (W=6) | discard | 5.7-5.8 | |
-| wire (W=6) | receiver's NVMe | 5.80 | one run |
+| wire (W=6) | discard | 9.21 | 9.17-9.30 |
+| wire (W=6) | receiver's NVMe | 7.45 | 6.72-8.67 |
 
-On the wire the disk is free: placement runs outside the admission lock
-and the poll loop (PRs 100-101), so the sink's latency prices a pool,
-not the transfer. The post-clock `sync_ns` field carries what making it
-durable cost (~575 ms per GB on the mirror, ~241 ms on the wire
-receiver's NVMe). The wire rows are from the post-update evening whose
-absolute numbers are suspect (see `docs/perf-engineering.md`); the
-loopback rows are same-hour A/B and stand.
+On loopback the disk is nearly free: placement runs outside the admission
+lock and the poll loop (PRs 100-101), so the sink's latency prices a
+pool, not the transfer. The post-clock `sync_ns` field carries what
+making it durable cost (~575 ms per GB on the mirror).
+
+The wire rows were remeasured on 2026-08-06 and say something different
+from the first attempt, which was taken on an evening when the wire
+itself only carried 5.8 and reported the sink as free. At 9.2 the
+receiver's NVMe is the slower half: 19% off the median, declining
+monotonically across five consecutive runs (8.67 to 6.72) with `sync_ns`
+growing from 229 to 422 ms, while discard runs taken immediately before
+and after the set hold 9.21 and 9.18. The device, not the path: one disk
+run is not a measurement of it.
 
 ## What this does not cover
 
@@ -355,9 +361,12 @@ provisioned curves and the per-carrier verdict above. What remains uncovered:
   and wire multi-rail numbers now exist: once the rail startup race was fixed
   (PR 88), W=4 carried 7.8 and W=6 8.5 Gbit/s with a 1 GB object, and on the
   pinned quiche of ADR-0028 five W=6 runs hold an 8.83 Gbit/s median against
-  the path's own single-flow TCP ceiling of 9.45. Those runs are provisioned
-  rails only, so the shared arm of the hypothesis still has no two-machine
-  measurement.
+  the path's own single-flow TCP ceiling of 9.45. Remeasured on 2026-08-06
+  on a quiet box, the same five-run set holds a 9.21 Gbit/s median of
+  receiver-verified goodput (9.17-9.30), which is 97.5% of that TCP ceiling
+  for a transfer that proves every byte against a chain. Those runs are
+  provisioned rails only, so the shared arm of the hypothesis still has no
+  two-machine measurement.
 - Every multi-worker number pays the ranged path's own framing and staging, so
   cross-path comparisons against the sequential rows conflate path and worker
   count; only same-W cells are commensurable.

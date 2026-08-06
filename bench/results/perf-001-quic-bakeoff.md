@@ -344,8 +344,11 @@ itself only carried 5.8 and reported the sink as free. At 9.2 the
 receiver's NVMe is the slower half: 19% off the median, declining
 monotonically across five consecutive runs (8.67 to 6.72) with `sync_ns`
 growing from 229 to 422 ms, while discard runs taken immediately before
-and after the set hold 9.21 and 9.18. The device, not the path: one disk
-run is not a measurement of it.
+and after the set hold 9.21 and 9.18. The device, not the path, and not
+the target file either: deleting it and running once more gave 7.55
+rather than the cold first run's 8.67, so what recovers the first number
+is idle time and not a fresh allocation. One disk run is not a
+measurement of a disk.
 
 ## What this does not cover
 

@@ -1098,6 +1098,36 @@ mod tests {
     }
 
     #[test]
+    fn a_close_forgets_the_requests_the_carrier_never_took() {
+        // The close finds the queue holding a request, because the carrier
+        // stopped taking them. Left there it would tell a driving loop to
+        // keep servicing a session that has already ended.
+        let (bundle, _) = built_bundle("forget", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("forget-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        announce(&server, &mut session, &mut connection, &mut fetcher);
+
+        fetcher.session_mut().driver().refuse_sends = usize::MAX;
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        assert!(fetcher.has_backlog(), "the manifest request is held");
+
+        let mut conflicting = fetcher.descriptor.clone().expect("announced");
+        conflicting.page_count += 1;
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::PackageDescriptor(conflicting)));
+        assert_eq!(
+            fetcher.service().unwrap(),
+            FetchStatus::Closed(error_code::MANIFEST_INVALID)
+        );
+        assert!(!fetcher.has_backlog(), "a closed fetch holds nothing");
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
     fn a_page_the_seal_never_committed_ends_the_fetch() {
         let (bundle, _) = built_bundle("badpage", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);

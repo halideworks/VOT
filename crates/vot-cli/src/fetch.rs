@@ -14,13 +14,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use vot_codec::frames::{
     self, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestRequest, PackageDescriptor,
     RangeRequest, TypedFrame,
 };
 use vot_codec::{DecodeLimits, Settings, error_code};
-use vot_scheduler::session::SessionReceiver;
+use vot_scheduler::session::{CompletedBundle, SessionReceiver};
 use vot_scheduler::{FileSink, ReliableReceiver};
 use vot_session::{Authentication, Session};
 use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAdapter};
@@ -41,9 +42,17 @@ use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSum
 ///
 /// So a request is issued only while fewer than this many covers are
 /// outstanding, counted as the distance between what has been asked for
-/// and what the sink has placed. Two keeps the next request already at
-/// the server while it answers the current one.
-const OUTSTANDING_COVERS: usize = 2;
+/// and what the sink has placed.
+///
+/// Two was the number while proving ran on the session's own thread,
+/// where it was enough to keep the next request at the server while it
+/// answered the current one, and where raising it bought nothing because
+/// nothing else could be proved at once anyway. With the provers beside
+/// the session it is what decides how many of them can work: at two, two.
+/// Measured on 512 MiB over loopback, four gives 1.50 s against two's
+/// 1.65 and eight's 1.49, so four is where it stops paying. It costs
+/// receive credit and staging in proportion, both of which follow it.
+const OUTSTANDING_COVERS: usize = 4;
 
 /// What may be asked for and not yet placed, in the units a request is
 /// made in: a cover is what comes back, but a request names at most
@@ -62,8 +71,8 @@ const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE a
 // The credit is what it advertises, and the limit clears it by a group: a
 // limit at or under the advertised credit would refuse a conforming answer
 // for want of room rather than for anything wrong with it.
-const _: () = assert!(FETCH_CREDIT_BYTES == 8_519_680);
-const _: () = assert!(FETCH_STAGING_BYTES == 8_585_216);
+const _: () = assert!(FETCH_CREDIT_BYTES == 17_039_360);
+const _: () = assert!(FETCH_STAGING_BYTES == 17_104_896);
 
 /// What one fetch pass left the session as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +135,114 @@ impl vot_scheduler::RangeSink for CountingSink {
     }
 }
 
+/// Threads that prove and place covers, beside the session rather than on
+/// it.
+///
+/// Measured on 2026-08-06: a 512 MiB loopback fetch spent 938 ms of 1.84 s
+/// proving and placing on the session's own thread, and much of the rest
+/// waiting, because one thread cannot receive a cover while it proves the
+/// one before it. Neither step needs the receiver, so both move here and
+/// the witness goes back through `SessionReceiver::settle`.
+const DEFAULT_PROVING_THREADS: usize = 4;
+
+/// What a prover is handed: a bundle to prove and where its bytes go.
+struct Proving {
+    completed: CompletedBundle,
+    sink: Arc<CountingSink>,
+}
+
+/// What comes back: the bundle, and the witness that it is written.
+struct Proved {
+    completed: CompletedBundle,
+    written: vot_scheduler::WrittenRange,
+}
+
+/// The provers and the two channels they sit between.
+struct ProvingPool {
+    work: mpsc::SyncSender<Proving>,
+    proved: mpsc::Receiver<Result<Proved, vot_scheduler::Error>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// Bundles handed out and not yet settled, which is what decides
+    /// whether this end has room to take another.
+    in_flight: usize,
+    width: usize,
+}
+
+impl ProvingPool {
+    /// Starts `width` provers. Each holds a clone of the work channel's
+    /// receiving half behind a lock, so a bundle goes to whichever is free.
+    fn start(width: usize) -> Self {
+        // Bounded at twice the width: enough that no prover waits on the
+        // session thread for its next bundle, small enough that what is in
+        // flight is a few covers rather than an object.
+        let (work, taking) = mpsc::sync_channel::<Proving>(width.saturating_mul(2));
+        let (finished, proved) = mpsc::channel::<Result<Proved, vot_scheduler::Error>>();
+        let taking = Arc::new(std::sync::Mutex::new(taking));
+        let mut threads = Vec::with_capacity(width);
+        for _ in 0..width {
+            let taking = Arc::clone(&taking);
+            let finished = finished.clone();
+            threads.push(std::thread::spawn(move || {
+                loop {
+                    let Ok(queue) = taking.lock() else {
+                        return;
+                    };
+                    let Ok(next) = queue.recv() else {
+                        return;
+                    };
+                    drop(queue);
+                    if finished.send(prove(next)).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        Self {
+            work,
+            proved,
+            threads,
+            in_flight: 0,
+            width,
+        }
+    }
+
+    /// Whether another bundle can be handed over without waiting.
+    const fn has_room(&self) -> bool {
+        self.in_flight < self.width.saturating_mul(2)
+    }
+
+    /// Whether anything is out with a prover.
+    const fn busy(&self) -> bool {
+        self.in_flight > 0
+    }
+}
+
+impl Drop for ProvingPool {
+    fn drop(&mut self) {
+        // The provers end when the work channel closes, which is what
+        // dropping this sender does; the joins then cannot outlive them.
+        let (closed, _) = mpsc::sync_channel::<Proving>(1);
+        drop(std::mem::replace(&mut self.work, closed));
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Proves one bundle and places its bytes. The whole of what a prover does.
+fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
+    let range = ReliableReceiver::verify_typed_bundle(
+        work.completed.subject(),
+        work.completed.bundle(),
+        work.completed.records(),
+    )?;
+    let written = range.write_to(work.sink.as_ref())?;
+    Ok(Proved {
+        completed: work.completed,
+        written,
+    })
+}
+
 /// One stored object the manifest names, in fetch order.
 struct PlannedObject {
     object: frames::ObjectId,
@@ -175,6 +292,11 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// slowly from one that has stopped: the first is what a large object
     /// looks like, and giving up on it would kill the transfer.
     progress: u64,
+    /// The provers, started with the first cover so a fetch that carries
+    /// none starts no threads.
+    pool: Option<ProvingPool>,
+    /// How many provers to start, or none for proving on this thread.
+    proving_threads: usize,
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
@@ -268,8 +390,15 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         session.begin()?;
         let receiver =
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
+        let mut receiver = SessionReceiver::new(session, receiver);
+        if DEFAULT_PROVING_THREADS > 0 {
+            receiver.defer_proving(true);
+            // Room for every prover to hold one and one more to be waiting,
+            // which is what keeps them all fed without holding an object.
+            receiver.set_deferred_limit(DEFAULT_PROVING_THREADS.saturating_add(1))?;
+        }
         Ok(Self {
-            receiver: SessionReceiver::new(session, receiver),
+            receiver,
             bundle: bundle.to_owned(),
             pin,
             descriptor: None,
@@ -285,6 +414,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             disconnected: false,
             stopped: false,
             progress: 0,
+            pool: None,
+            proving_threads: DEFAULT_PROVING_THREADS,
         })
     }
 
@@ -322,7 +453,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// a driving loop to keep servicing a session that cannot progress.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.stopped && !self.pending.is_empty()
+        !self.stopped
+            && (!self.pending.is_empty() || self.pool.as_ref().is_some_and(ProvingPool::busy))
     }
 
     /// Forgets what is owed, because nothing more will be asked or answered.
@@ -363,6 +495,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 Ok(None) => break,
                 Err(error) => return self.receive_failed(error),
             }
+        }
+        // Between taking frames and judging the pass: what the provers
+        // finished is as much a part of this pass's progress as what the
+        // carrier delivered, and the plan advances on placed bytes.
+        if let Err(error) = self.pump_provers() {
+            return self.receive_failed(error);
         }
         // Advanced before the carrier is judged: a pass that takes the last
         // object's bytes and the disconnect together has a whole bundle,
@@ -406,6 +544,66 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         }
         self.close_under(refusal_code(&error));
         Err(Error::Scheduler(error))
+    }
+
+    /// Hands what the receiver completed to the provers, and books what
+    /// they finished.
+    ///
+    /// Nothing here proves anything: the provers do, off this thread, and
+    /// what comes back is a witness the receiver admits the same way the
+    /// inline path does.
+    fn pump_provers(&mut self) -> Result<(), vot_scheduler::Error> {
+        if self.proving_threads == 0 {
+            return Ok(());
+        }
+        let mut pool = self
+            .pool
+            .take()
+            .unwrap_or_else(|| ProvingPool::start(self.proving_threads));
+        // Handed over while there is room, so what is out with a prover is a
+        // few covers rather than an object.
+        while pool.has_room() {
+            let Some(sink) = self.plan.as_ref().and_then(|plan| plan.active.clone()) else {
+                break;
+            };
+            let Some(completed) = self.receiver.take_completed() else {
+                break;
+            };
+            if pool.work.try_send(Proving { completed, sink }).is_err() {
+                break;
+            }
+            pool.in_flight = pool.in_flight.saturating_add(1);
+        }
+        // Every witness already waiting, then one waited for if the pass
+        // would otherwise book nothing. Waiting here is not waiting on a
+        // peer: the work is this end's own and already in hand, and a pass
+        // that returned without it would spin until a prover was scheduled.
+        let mut outcome = Ok(());
+        let mut booked = 0_usize;
+        while let Ok(result) = pool.proved.try_recv().or_else(|_| {
+            if booked == 0 && pool.in_flight > 0 {
+                pool.proved.recv()
+            } else {
+                Err(mpsc::RecvError)
+            }
+        }) {
+            booked += 1;
+            pool.in_flight = pool.in_flight.saturating_sub(1);
+            match result {
+                Ok(proved) => {
+                    if let Err(error) = self.receiver.settle(&proved.completed, proved.written) {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        self.pool = Some(pool);
+        outcome
     }
 
     /// Closes the carrier under `code` and stops asking for anything.

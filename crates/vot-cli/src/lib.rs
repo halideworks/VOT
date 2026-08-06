@@ -22,6 +22,10 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+mod serve;
+
+pub use serve::{BundleServer, ServeConnection, ServeStatus};
+
 const PACKAGE_DOMAIN: &[u8] = b"VOT package v0\0";
 const MANIFEST_DIRECTORY: &str = "manifest";
 const MANIFEST_SEAL: &str = "seal.cbor";
@@ -64,6 +68,9 @@ pub enum Error {
     Scheduler(vot_scheduler::Error),
     Verifier(vot_verifier::VerifyError),
     Receipt(vot_receipt::Error),
+    Session(Box<vot_session::Error>),
+    Codec(vot_codec::frames::Error),
+    Proof,
 }
 
 impl From<io::Error> for Error {
@@ -93,6 +100,18 @@ impl From<vot_verifier::VerifyError> for Error {
 impl From<vot_receipt::Error> for Error {
     fn from(error: vot_receipt::Error) -> Self {
         Self::Receipt(error)
+    }
+}
+
+impl From<vot_session::Error> for Error {
+    fn from(error: vot_session::Error) -> Self {
+        Self::Session(Box::new(error))
+    }
+}
+
+impl From<vot_codec::frames::Error> for Error {
+    fn from(error: vot_codec::frames::Error) -> Self {
+        Self::Codec(error)
     }
 }
 
@@ -1755,7 +1774,7 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    fn temporary(name: &str) -> PathBuf {
+    pub(crate) fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "vot-cli-{}-{}-{name}",
             std::process::id(),

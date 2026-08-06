@@ -10,10 +10,14 @@ publish = false
 blake3.workspace = true
 ed25519-dalek.workspace = true
 getrandom = "=0.4.3"
+vot-codec = { path = "../vot-codec" }
 vot-manifest = { path = "../vot-manifest" }
 vot-pack = { path = "../vot-pack" }
+vot-proof-blake3 = { path = "../vot-proof-blake3" }
+vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-receipt = { path = "../vot-receipt" }
 vot-scheduler = { path = "../vot-scheduler" }
+vot-session = { path = "../vot-session" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-verifier = { path = "../vot-verifier" }
 

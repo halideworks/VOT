@@ -39,7 +39,10 @@ const DATAGRAM_BYTES: &str = "VOT_DATAGRAM_BYTES";
 ///
 /// The carrier's default ceiling is what a 1500-byte ethernet frame
 /// carries, and path discovery only settles below a ceiling, never above
-/// it, so no amount of discovery finds a jumbo path on its own.
+/// it, so no amount of discovery finds a jumbo path on its own. It has
+/// to reach the serving process: packets are made where the bytes are
+/// served, and a fetch-side ceiling alone moves nothing
+/// (docs/perf-engineering.md, 2026-08-06).
 ///
 /// # Errors
 /// Rejects a value that is not a number. The carrier rejects one outside
@@ -48,6 +51,11 @@ fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
     let Ok(value) = std::env::var(DATAGRAM_BYTES) else {
         return Ok(());
     };
+    apply_datagram_value(config, &value)
+}
+
+/// The parse half of the lever, apart from the environment that feeds it.
+fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
     config.max_datagram_bytes = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
     Ok(())
 }
@@ -225,6 +233,33 @@ pub fn fetch_bundle(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn the_datagram_ceiling_is_the_value_given_or_the_default() {
+        // The parse half, apart from the process environment: a test that
+        // set the real variable would race the socket test in this module.
+        let mut config = Config::client(limits().unwrap());
+        let unset = config.max_datagram_bytes;
+        apply_datagram_value(&mut config, " 8972\n").unwrap();
+        assert_eq!(config.max_datagram_bytes, 8972, "given, trimmed, taken");
+        let mut config = Config::client(limits().unwrap());
+        assert!(
+            apply_datagram_value(&mut config, "jumbo").is_err(),
+            "a value that is not a number is refused"
+        );
+        assert_eq!(
+            config.max_datagram_bytes, unset,
+            "a refused value changes nothing"
+        );
+        // And the env half leaves the default alone when nothing is set.
+        assert!(
+            std::env::var(DATAGRAM_BYTES).is_err(),
+            "the suite owns no env"
+        );
+        let mut config = Config::client(limits().unwrap());
+        apply_datagram_bytes(&mut config).unwrap();
+        assert_eq!(config.max_datagram_bytes, unset);
+    }
 
     #[test]
     fn an_ephemeral_certificate_goes_when_the_server_does() {

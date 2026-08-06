@@ -49,8 +49,13 @@ THIRD-PARTY-VERIFIABLE.
 fn main() {
     if let Err(error) = run() {
         eprintln!("vot: {error:?}");
-        eprintln!();
-        eprintln!("{USAGE}");
+        // The usage text answers an argument the caller got wrong. A
+        // carrier that would not bind, a peer that closed, a session that
+        // went nowhere: printing it at those buries the reason.
+        if matches!(error, vot_cli::Error::InvalidArguments) {
+            eprintln!();
+            eprintln!("{USAGE}");
+        }
         std::process::exit(1);
     }
 }

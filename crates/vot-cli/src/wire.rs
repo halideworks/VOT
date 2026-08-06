@@ -125,10 +125,13 @@ pub fn serve_bundle(
         certificate.to_str().ok_or(Error::InvalidPath)?.to_owned(),
         key.to_str().ok_or(Error::InvalidPath)?.to_owned(),
     );
-    // A server waits for a client for as long as it takes. The default
-    // bound exists so a test fails rather than hangs, and giving up would
-    // read here as a carrier that died during the handshake.
-    config.accept_timeout_ms = 0;
+    // A server told to answer every session it gets waits for each of them
+    // for as long as it takes, and the default bound would read as a
+    // carrier that died during the handshake. One told to answer a fixed
+    // number means to stop, so it keeps a bound and stops if nobody comes.
+    if sessions.is_none() {
+        config.accept_timeout_ms = 0;
+    }
 
     // A bounded count is what lets a test serve one session and return;
     // without one the command serves until it is stopped.
@@ -136,7 +139,7 @@ pub fn serve_bundle(
     while sessions.is_none_or(|bound| answered < bound) {
         // `serve` waits for a connection on its own thread, so one
         // endpoint is one session here.
-        let carrier = Transport::serve(address, &config).map_err(|_| Error::InvalidArguments)?;
+        let carrier = Transport::serve(address, &config).map_err(|_| Error::CarrierUnavailable)?;
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
@@ -162,14 +165,16 @@ pub fn fetch_bundle(
     // server can only serve bytes that fail the proofs the fetch checks.
     config.verify_peer = false;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-        .map_err(|_| Error::InvalidArguments)?;
+        .map_err(|_| Error::CarrierUnavailable)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
     let status = drive(&mut fetcher)?;
     match status {
         crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
-        crate::FetchStatus::Closed(_) | crate::FetchStatus::Disconnected => {
-            Err(Error::InvalidBundle)
-        }
+        // The code says what the peer refused, and losing it here would
+        // leave the caller with nothing to tell the difference by.
+        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
+        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
+        // `drive` answers only with a settled status.
         crate::FetchStatus::Active => Err(Error::InvalidBundle),
     }
 }
@@ -178,6 +183,25 @@ pub fn fetch_bundle(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn an_ephemeral_certificate_goes_when_the_server_does() {
+        // The key is worth nothing, but leaving it and its directory behind
+        // on every serve is a temp directory that only grows.
+        let (certificate, key, directory) = {
+            let written = Ephemeral::generate().expect("credentials");
+            assert!(written.certificate.is_file());
+            assert!(written.key.is_file());
+            (
+                written.certificate.clone(),
+                written.key.clone(),
+                written.directory.clone(),
+            )
+        };
+        assert!(!certificate.exists(), "the certificate was left behind");
+        assert!(!key.exists(), "the key was left behind");
+        assert!(!directory.exists(), "the directory was left behind");
+    }
 
     /// The ADR's step-4 test: everything the CLI builds crosses a real
     /// socket and publishes unchanged, both engines driven by the one loop.

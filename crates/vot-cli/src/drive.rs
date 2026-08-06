@@ -21,13 +21,22 @@ use crate::Error;
 /// short enough that a carrier which dies quietly is noticed.
 const IDLE_BOUND: Duration = Duration::from_millis(50);
 
-/// Passes a driving loop may make with neither an event nor progress.
+/// How long a pass waits when the carrier is holding work back.
 ///
-/// A carrier that reports events forever while the engine settles nothing
-/// would otherwise turn a dead session into an endless one. Counted in the
-/// loop's own body rather than measured against a clock, because a slow
-/// machine is not a stuck one.
-const IDLE_PASSES: u32 = 4096;
+/// A backlog is a frame the carrier would not take, so what this end is
+/// waiting for is room to send rather than something to read, and a
+/// carrier does not report room as an event. Waiting the idle bound for
+/// it would pace a transfer at one drain every fifty milliseconds;
+/// waiting not at all would spin a core for the length of the transfer.
+const BUSY_BOUND: Duration = Duration::from_millis(1);
+
+/// Passes a driving loop may make without the engine getting anywhere.
+///
+/// Not a bound on how long a session may take: any progress at all sets
+/// it back, so it only ends a session where nothing is happening. Counted
+/// in the loop's own body rather than measured against a clock, because a
+/// slow machine is not a stuck one.
+const STALLED_PASSES: u32 = 4096;
 
 /// One end of a session: a pass to make, a way to say the pass settled it,
 /// and the carrier to wait on.
@@ -44,8 +53,16 @@ pub trait Engine {
     /// Whether a status means the session is over, however it ended.
     fn settled(status: Self::Status) -> bool;
 
-    /// Whether another pass has work that does not need an event first.
+    /// Whether the carrier is holding work this end has already prepared.
     fn has_backlog(&self) -> bool;
+
+    /// Everything this end has settled, only ever going up.
+    ///
+    /// Any increase is progress, and progress is what tells a session that
+    /// is getting somewhere slowly from one that has stopped. A count that
+    /// stood still while a large object was being fetched would end the
+    /// transfer partway through.
+    fn progress(&self) -> u64;
 
     /// Waits for the carrier to report something, or for `bound`.
     fn wait(&mut self, bound: Duration);
@@ -54,26 +71,35 @@ pub trait Engine {
 /// Drives `engine` until a pass settles it, and answers with that status.
 ///
 /// # Errors
-/// Surfaces the engine's own failure, or [`Error::InvalidBundle`] if the
-/// loop made its whole budget of passes without settling or progressing.
+/// Surfaces the engine's own failure, or [`Error::Stalled`] if the loop
+/// made its whole budget of passes without the engine getting anywhere.
 pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
-    let mut idle = 0;
+    let mut stalled = 0;
+    let mut settled_so_far = engine.progress();
     loop {
         let status = engine.service()?;
         if E::settled(status) {
             return Ok(status);
         }
-        if engine.has_backlog() {
-            // Work this end can do without hearing from the peer, so the
-            // pass that does it is progress and does not spend the budget.
-            idle = 0;
-            continue;
+        let progress = engine.progress();
+        if progress == settled_so_far {
+            stalled += 1;
+            if stalled > STALLED_PASSES {
+                return Err(Error::Stalled);
+            }
+        } else {
+            settled_so_far = progress;
+            stalled = 0;
         }
-        idle += 1;
-        if idle > IDLE_PASSES {
-            return Err(Error::InvalidBundle);
-        }
-        engine.wait(IDLE_BOUND);
+        // Every pass waits, including one with a backlog: a backlog is the
+        // carrier refusing what this end already prepared, so there is
+        // nothing to do but let it drain, and doing it in a tight loop is
+        // a spun core rather than a faster transfer.
+        engine.wait(if engine.has_backlog() {
+            BUSY_BOUND
+        } else {
+            IDLE_BOUND
+        });
     }
 }
 
@@ -91,6 +117,10 @@ impl<A: TransportAdapter> Engine for crate::BundleFetcher<A> {
 
     fn has_backlog(&self) -> bool {
         Self::has_backlog(self)
+    }
+
+    fn progress(&self) -> u64 {
+        Self::progress(self)
     }
 
     fn wait(&mut self, bound: Duration) {
@@ -148,6 +178,10 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
         self.connection.has_backlog()
     }
 
+    fn progress(&self) -> u64 {
+        self.connection.progress()
+    }
+
     fn wait(&mut self, bound: Duration) {
         self.session.driver().wait_for_event(bound);
     }
@@ -163,10 +197,13 @@ mod tests {
     struct Scripted {
         /// Passes still to report as unsettled before settling.
         unsettled: u32,
-        /// Of those, how many report a backlog.
-        with_backlog: u32,
+        /// Passes, of the unsettled ones, that report progress.
+        with_progress: u32,
+        /// Whether every unsettled pass reports a backlog.
+        backlogged: bool,
+        settled: u64,
         passes: u32,
-        waits: u32,
+        waits: Vec<Duration>,
     }
 
     impl Engine for Scripted {
@@ -178,6 +215,10 @@ mod tests {
                 return Ok(true);
             }
             self.unsettled -= 1;
+            if self.with_progress > 0 {
+                self.with_progress -= 1;
+                self.settled += 1;
+            }
             Ok(false)
         }
 
@@ -186,12 +227,44 @@ mod tests {
         }
 
         fn has_backlog(&self) -> bool {
-            self.with_backlog > self.unsettled
+            self.backlogged
         }
 
-        fn wait(&mut self, _bound: Duration) {
-            self.waits += 1;
+        fn progress(&self) -> u64 {
+            self.settled
         }
+
+        fn wait(&mut self, bound: Duration) {
+            self.waits.push(bound);
+        }
+    }
+
+    /// Both engines answer the loop from their own state, and a forwarding
+    /// that reported the wrong thing would spin one and stall the other.
+    #[test]
+    fn the_engines_answer_the_loop_from_their_own_state() {
+        use crate::harness::{Loopback, built_bundle, not_required, patterned};
+
+        let (bundle, _) = built_bundle("engine", &[("a.txt", patterned(1000))]);
+        let output = crate::tests::temporary("engine-fetched");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // Nothing prepared and nothing taken, before a pass.
+        assert!(!Engine::has_backlog(&fetcher));
+        assert_eq!(Engine::progress(&fetcher), 0);
+        // A carrier that takes nothing leaves the handshake in the queue.
+        fetcher.session_mut().driver().refuse_sends = usize::MAX;
+        assert_eq!(fetcher.service().unwrap(), crate::FetchStatus::Active);
+
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let mut serving =
+            ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
+        assert!(!Engine::has_backlog(&serving));
+        assert_eq!(Engine::progress(&serving), 0);
+        // A ready session announces, which is an answer queued and taken.
+        serving.session.driver().refuse_sends = usize::MAX;
+        let _ = Engine::service(&mut serving);
+
+        crate::harness::discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -199,59 +272,75 @@ mod tests {
         let mut engine = Scripted::default();
         assert!(drive(&mut engine).unwrap());
         assert_eq!(engine.passes, 1);
-        assert_eq!(engine.waits, 0);
+        assert!(engine.waits.is_empty());
     }
 
     #[test]
-    fn a_backlog_is_worked_off_rather_than_waited_on() {
-        // Every unsettled pass reports a backlog, so the loop must never
-        // wait: what it is waiting for is already in its own hands.
+    fn every_unsettled_pass_waits_rather_than_spinning() {
+        // Including one with a backlog: the carrier is holding what this
+        // end prepared, and asking again without pause is a spun core for
+        // the length of the transfer rather than a faster one.
         let mut engine = Scripted {
-            unsettled: 5,
-            with_backlog: 5,
+            unsettled: 4,
+            with_progress: 4,
+            backlogged: true,
             ..Scripted::default()
         };
         assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.passes, 6, "five unsettled and the one that ends it");
-        assert_eq!(engine.waits, 0, "a backlog is not a reason to wait");
+        assert_eq!(engine.waits, vec![BUSY_BOUND; 4]);
     }
 
     #[test]
-    fn an_idle_pass_waits_on_the_carrier() {
+    fn a_pass_with_nothing_held_waits_longer_than_one_with_a_backlog() {
         let mut engine = Scripted {
             unsettled: 3,
-            with_backlog: 0,
+            with_progress: 3,
+            backlogged: false,
             ..Scripted::default()
         };
         assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.waits, 3, "one wait for each pass with nothing to do");
+        assert_eq!(engine.waits, vec![IDLE_BOUND; 3]);
+        assert!(BUSY_BOUND < IDLE_BOUND);
     }
 
     #[test]
-    fn a_carrier_that_never_settles_is_given_up_on() {
-        // A peer that keeps a session open and does nothing with it would
+    fn progress_sets_the_budget_back() {
+        // The budget ends a session where nothing is happening, not a long
+        // one. A fetch of a large object makes one pass per answer with no
+        // backlog to show for it, and a budget that counted those would
+        // end the transfer partway through.
+        let mut engine = Scripted {
+            unsettled: 4 * STALLED_PASSES,
+            with_progress: 4 * STALLED_PASSES,
+            ..Scripted::default()
+        };
+        assert!(drive(&mut engine).unwrap());
+        assert_eq!(engine.passes, 4 * STALLED_PASSES + 1);
+    }
+
+    #[test]
+    fn a_session_where_nothing_happens_is_given_up_on() {
+        // A peer that holds a session open and does nothing with it would
         // otherwise hold this end forever.
         let mut engine = Scripted {
             unsettled: u32::MAX,
-            with_backlog: 0,
+            with_progress: 0,
             ..Scripted::default()
         };
-        assert!(matches!(drive(&mut engine), Err(Error::InvalidBundle)));
-        assert_eq!(engine.waits, IDLE_PASSES, "it waited its whole budget");
-        assert_eq!(engine.passes, IDLE_PASSES + 1);
+        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
+        assert_eq!(engine.passes, STALLED_PASSES + 1);
     }
 
     #[test]
-    fn progress_gives_the_budget_back() {
-        // The budget is against a session going nowhere, not against a long
-        // one: a pass with a backlog to work off resets it, so an engine
-        // that keeps making progress is never given up on.
+    fn progress_late_in_a_stall_sets_the_budget_back() {
+        // The counter is consecutive passes, not passes overall.
         let mut engine = Scripted {
-            unsettled: 2 * IDLE_PASSES,
-            with_backlog: 2 * IDLE_PASSES,
+            unsettled: STALLED_PASSES + 10,
+            with_progress: 1,
             ..Scripted::default()
         };
-        assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.passes, 2 * IDLE_PASSES + 1);
+        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
+        // One pass made progress, so the budget started again after it.
+        assert_eq!(engine.passes, STALLED_PASSES + 2);
     }
 }

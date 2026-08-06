@@ -580,7 +580,10 @@ jobs:
           - { package: vot-transport-msquic, required: true }
           - { package: vot-session, required: true }
           - { package: vot-scheduler, required: true }
-          - { package: vot-cli, required: true }
+          # With the wire feature, or the run mutates a file the tests never
+          # compile and calls every one of those mutants missed, which is
+          # the same reasoning as vot-object-store above.
+          - { package: vot-cli, required: true, features: wire }
           - { package: vot-transport-tcp, required: true }
           - { package: vot-resume, required: true }
           - { package: vot-commit-platform, required: true }
@@ -594,6 +597,13 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
+
+      # Only the leg that needs it: the wire feature builds quiche, which
+      # builds BoringSSL through cmake. Every other package in the matrix
+      # would pay for the install and use none of it.
+      - name: Install native build tools
+        if: contains(matrix.features, 'wire')
+        run: sudo apt-get update && sudo apt-get install -y cmake
 
       # Every package in the matrix was building cargo-mutants from source, so
       # one CI run compiled the same tool twenty-three times. The key holds the

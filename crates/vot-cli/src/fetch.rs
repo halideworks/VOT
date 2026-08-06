@@ -126,6 +126,12 @@ pub struct BundleFetcher<A: TransportAdapter> {
     disconnected: bool,
     /// Set once nothing further will be asked for, whatever ended it.
     stopped: bool,
+    /// Everything this end has taken or asked for, only ever going up.
+    ///
+    /// A driving loop reads it to tell a session that is getting somewhere
+    /// slowly from one that has stopped: the first is what a large object
+    /// looks like, and giving up on it would kill the transfer.
+    progress: u64,
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
@@ -235,6 +241,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             closed: None,
             disconnected: false,
             stopped: false,
+            progress: 0,
         })
     }
 
@@ -247,6 +254,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// The session under the fetch, for the loop that waits on its carrier.
     pub fn session_mut(&mut self) -> &mut Session<A> {
         self.receiver.session_mut()
+    }
+
+    /// Everything this end has taken or asked for, only ever going up.
+    #[must_use]
+    pub fn progress(&self) -> u64 {
+        self.progress
     }
 
     /// Whether a request is queued that the carrier would not take, which
@@ -290,6 +303,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         loop {
             match self.receiver.poll() {
                 Ok(Some(Event::Control(bytes))) => {
+                    self.progress = self.progress.saturating_add(1);
                     if let Err(fault) = self.dispatch(&bytes) {
                         return self.fail(fault);
                     }
@@ -298,7 +312,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.disconnected = true;
                     break;
                 }
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => self.progress = self.progress.saturating_add(1),
                 Ok(None) => break,
                 Err(error) => return self.receive_failed(error),
             }
@@ -670,6 +684,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 return Ok(());
             };
             let request_id = Self::request_identifier(&mut self.next_request)?;
+            self.progress = self.progress.saturating_add(1);
             Self::queue_request(
                 &mut self.pending,
                 &TypedFrame::RangeRequest(RangeRequest {

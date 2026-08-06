@@ -784,21 +784,6 @@ fn drive(
 /// that a test whose client never comes fails rather than hangs.
 const ACCEPT_TIMEOUT_MS: u64 = 10_000;
 
-/// How long a server waits for its first packet, or none for as long as
-/// it takes.
-///
-/// Zero is the caller saying it will wait: `vot serve` exists to sit
-/// there until a client comes, and a bound would read to it as a carrier
-/// that died during the handshake. A match rather than a comparison
-/// because the choice is between two meanings of the number, not a
-/// threshold anything can be near.
-const fn accept_bound(timeout_ms: u64) -> Option<Duration> {
-    match timeout_ms {
-        0 => None,
-        bound => Some(Duration::from_millis(bound)),
-    }
-}
-
 /// Waits for the first packet and turns it into a connection.
 fn accept_one(
     socket: &UdpSocket,
@@ -807,9 +792,17 @@ fn accept_one(
     buffer: &mut [u8],
     timeout_ms: u64,
 ) -> Result<Option<quiche::Connection>, Error> {
-    socket
-        .set_read_timeout(accept_bound(timeout_ms))
-        .map_err(|_| Error::Backend)?;
+    // Zero is the caller saying it will wait: `vot serve` exists to sit
+    // there until a client comes, and a bound would read to it as a
+    // carrier that died during the handshake. Written here rather than as
+    // a function of its own, because a function is a thing a mutation run
+    // can replace wholesale with "no bound", and the tests that start a
+    // server nobody connects to rely on the bound to end their driver.
+    let bound = match timeout_ms {
+        0 => None,
+        milliseconds => Some(Duration::from_millis(milliseconds)),
+    };
+    socket.set_read_timeout(bound).map_err(|_| Error::Backend)?;
     loop {
         let Ok((len, from)) = socket.recv_from(buffer) else {
             return Ok(None);
@@ -1568,23 +1561,6 @@ mod tests {
         assert!(
             carried.contains(&hello),
             "the frame sent before the handshake was lost"
-        );
-    }
-
-    #[test]
-    fn a_zero_accept_bound_is_no_bound() {
-        // The server command passes zero and means it: a bound there is a
-        // server that stops listening after ten seconds and reports it as
-        // a carrier that died.
-        assert_eq!(accept_bound(0), None);
-        assert_eq!(accept_bound(1), Some(Duration::from_millis(1)));
-        assert_eq!(
-            accept_bound(ACCEPT_TIMEOUT_MS),
-            Some(Duration::from_millis(ACCEPT_TIMEOUT_MS))
-        );
-        assert_eq!(
-            accept_bound(u64::MAX),
-            Some(Duration::from_millis(u64::MAX))
         );
     }
 

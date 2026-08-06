@@ -81,7 +81,7 @@ pub trait Engine {
 /// Surfaces the engine's own failure, or [`Error::Stalled`] if the loop
 /// made its whole budget of passes without the engine getting anywhere.
 pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
-    let mut stalled = 0;
+    let mut stalled: u32 = 0;
     let mut settled_so_far = engine.progress();
     loop {
         let status = engine.service()?;
@@ -90,7 +90,10 @@ pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
         }
         let progress = engine.progress();
         if progress == settled_so_far {
-            stalled += 1;
+            // Saturating rather than `+=`, so the loop's own end does not
+            // hang on an operator: an increment that stopped incrementing
+            // is a loop with nothing left to stop it.
+            stalled = stalled.saturating_add(1);
             if stalled > STALLED_PASSES {
                 return Err(Error::Stalled);
             }

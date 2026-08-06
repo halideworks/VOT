@@ -213,7 +213,11 @@ mod tests {
         backlogged: bool,
         settled: u64,
         passes: u32,
-        waits: Vec<Duration>,
+        /// Counted rather than collected: a mutant that stops the loop
+        /// ending makes this grow for as long as the process lives, and a
+        /// vector of them is a test that takes the machine with it.
+        busy_waits: u32,
+        idle_waits: u32,
     }
 
     impl Engine for Scripted {
@@ -245,7 +249,11 @@ mod tests {
         }
 
         fn wait(&mut self, bound: Duration) {
-            self.waits.push(bound);
+            if bound == BUSY_BOUND {
+                self.busy_waits = self.busy_waits.saturating_add(1);
+            } else {
+                self.idle_waits = self.idle_waits.saturating_add(1);
+            }
         }
     }
 
@@ -387,7 +395,7 @@ mod tests {
         let mut engine = Scripted::default();
         assert!(drive(&mut engine).unwrap());
         assert_eq!(engine.passes, 1);
-        assert!(engine.waits.is_empty());
+        assert_eq!(engine.busy_waits + engine.idle_waits, 0);
     }
 
     #[test]
@@ -402,7 +410,8 @@ mod tests {
             ..Scripted::default()
         };
         assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.waits, vec![BUSY_BOUND; 4]);
+        assert_eq!(engine.busy_waits, 4, "a held pass waits the short bound");
+        assert_eq!(engine.idle_waits, 0);
     }
 
     #[test]
@@ -414,7 +423,8 @@ mod tests {
             ..Scripted::default()
         };
         assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.waits, vec![IDLE_BOUND; 3]);
+        assert_eq!(engine.idle_waits, 3, "an empty pass waits the long bound");
+        assert_eq!(engine.busy_waits, 0);
         assert!(BUSY_BOUND < IDLE_BOUND);
     }
 
@@ -437,8 +447,11 @@ mod tests {
     fn a_session_where_nothing_happens_is_given_up_on() {
         // A peer that holds a session open and does nothing with it would
         // otherwise hold this end forever.
+        // Enough passes to outlast the budget and no more: a stub that
+        // never settles at all leaves a mutant that stops the budget
+        // counting to run for as long as the numbers allow.
         let mut engine = Scripted {
-            unsettled: u32::MAX,
+            unsettled: 4 * STALLED_PASSES,
             with_progress: 0,
             ..Scripted::default()
         };

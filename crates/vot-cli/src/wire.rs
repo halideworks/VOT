@@ -32,6 +32,26 @@ fn limits() -> Result<ReceiveLimits, Error> {
     .map_err(|_| Error::InvalidArguments)
 }
 
+/// The environment variable that raises the datagram ceiling.
+const DATAGRAM_BYTES: &str = "VOT_DATAGRAM_BYTES";
+
+/// Applies [`DATAGRAM_BYTES`] to a configuration, if it is set.
+///
+/// The carrier's default ceiling is what a 1500-byte ethernet frame
+/// carries, and path discovery only settles below a ceiling, never above
+/// it, so no amount of discovery finds a jumbo path on its own.
+///
+/// # Errors
+/// Rejects a value that is not a number. The carrier rejects one outside
+/// what it can carry.
+fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
+    let Ok(value) = std::env::var(DATAGRAM_BYTES) else {
+        return Ok(());
+    };
+    config.max_datagram_bytes = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    Ok(())
+}
+
 /// Tells one set of credentials from another in the same process.
 ///
 /// Two servers in one process would otherwise write the same two paths:
@@ -152,6 +172,7 @@ pub fn serve_bundle(
     if sessions.is_none() {
         config.accept_timeout_ms = 0;
     }
+    apply_datagram_bytes(&mut config)?;
 
     // A bounded count is what lets a test serve one session and return;
     // without one the command serves until it is stopped.
@@ -184,6 +205,7 @@ pub fn fetch_bundle(
     // ADR-0030: the channel is unauthenticated and says so. A forged
     // server can only serve bytes that fail the proofs the fetch checks.
     config.verify_peer = false;
+    apply_datagram_bytes(&mut config)?;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
         .map_err(|_| Error::CarrierUnavailable)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;

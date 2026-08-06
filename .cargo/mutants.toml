@@ -34,15 +34,16 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # answer is decided by note_cycles and measure in lib.rs, which this gate
 # measures on every host.
 #
-# vot-cli's wire commands are the inverse of the cases above: `nowire.rs`
-# holds what they answer *without* the carrier, so it compiles only when the
-# feature is off, and the vot-cli matrix entry now turns it on to measure
-# `wire.rs` where it compiles. Its two functions return the error naming the
-# feature, and `the_wire_commands_name_the_feature_they_need` holds them to
-# it in the featureless build the validate job runs.
+# vot-cli's carrier is the same case as the pump above and takes the same
+# remedy: `wire.rs` compiles only under the `wire` feature, which this
+# configuration does not enable, so its mutants here would be reported
+# against a file the tests never build. The wire-mutation job measures it
+# with the feature on. `nowire.rs`, which holds what those commands answer
+# without the carrier, is what this configuration does compile, and
+# `the_wire_commands_name_the_feature_they_need` holds it to account.
 exclude_globs = [
   "crates/vot-bench-driver/src/cycles.rs",
-  "crates/vot-cli/src/nowire.rs",
+  "crates/vot-cli/src/wire.rs",
   "crates/vot-transport-quiche/src/live.rs",
   "crates/vot-bench-driver/src/backend_msquic.rs",
   "crates/vot-bench-driver/src/backend_quiche.rs",

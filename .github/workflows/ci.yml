@@ -543,6 +543,63 @@ jobs:
           --features live --target x86_64-unknown-linux-gnu --locked
           -- --test-threads=1
 
+  # The wire commands' carrier compiles only under the `wire` feature, so
+  # the mutation matrix cannot measure it: that job builds every package
+  # featureless, and adding the feature there put a BoringSSL build in front
+  # of sixty-five mutants and took the runner down with it. Its own job
+  # instead, the way the pumps have theirs, with one worker rather than two
+  # because the build is what is heavy here and not the tests.
+  wire-mutation:
+    name: wire-mutation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4.3.1
+        with:
+          persist-credentials: false
+          # Both sides of the diff and the merge base, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      # quiche builds BoringSSL through cmake.
+      - name: Install native build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Restore pinned tool binaries
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-mutants
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-cargo-mutants-26.0.0
+
+      - name: Install pinned cargo-mutants
+        run: >-
+          cargo +1.88.0 install --locked cargo-mutants --version 26.0.0
+          || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
+
+      # Unlike the pumps this has no classified survivors: the engines and
+      # their driving loop are ordinary code and every mutant of them is
+      # killed, so anything surviving here is a gap to close rather than a
+      # list to keep. The run fails on one.
+      - name: Test the wire commands' mutants
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          scope=()
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git diff "origin/$BASE_REF...HEAD" > changed.diff
+            scope=(--in-diff changed.diff)
+          fi
+          cargo +1.88.0 mutants --package vot-cli --features wire \
+            --config .cargo/mutants-live.toml --timeout 120 --jobs 1 \
+            "${scope[@]}"
+
   mutation:
     name: mutation (${{ matrix.package }})
     runs-on: ubuntu-24.04
@@ -580,10 +637,7 @@ jobs:
           - { package: vot-transport-msquic, required: true }
           - { package: vot-session, required: true }
           - { package: vot-scheduler, required: true }
-          # With the wire feature, or the run mutates a file the tests never
-          # compile and calls every one of those mutants missed, which is
-          # the same reasoning as vot-object-store above.
-          - { package: vot-cli, required: true, features: wire }
+          - { package: vot-cli, required: true }
           - { package: vot-transport-tcp, required: true }
           - { package: vot-resume, required: true }
           - { package: vot-commit-platform, required: true }
@@ -597,13 +651,6 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
-
-      # Only the leg that needs it: the wire feature builds quiche, which
-      # builds BoringSSL through cmake. Every other package in the matrix
-      # would pay for the install and use none of it.
-      - name: Install native build tools
-        if: contains(matrix.features, 'wire')
-        run: sudo apt-get update && sudo apt-get install -y cmake
 
       # Every package in the matrix was building cargo-mutants from source, so
       # one CI run compiled the same tool twenty-three times. The key holds the

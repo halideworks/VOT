@@ -26,6 +26,12 @@ pub(crate) struct Loopback {
     pub(crate) refuse_sends: usize,
     pub(crate) fail_sends_with: Option<vot_transport_api::Error>,
     pub(crate) closed: Option<u16>,
+    /// What the carrier reports when a driving loop waits on it.
+    ///
+    /// A fake carrier otherwise never delivers anything a pass did not
+    /// already put there, so a loop that waits for one can only be tested
+    /// against a loop that never needed to.
+    pub(crate) on_wait: VecDeque<Event>,
 }
 
 impl Loopback {
@@ -64,6 +70,12 @@ impl TransportAdapter for Loopback {
 
     fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), vot_transport_api::Error> {
         Ok(())
+    }
+
+    fn wait_for_event(&mut self, _bound: std::time::Duration) {
+        if let Some(event) = self.on_wait.pop_front() {
+            self.events.push_back(event);
+        }
     }
 
     fn close(&mut self, code: u16) -> Result<(), vot_transport_api::Error> {

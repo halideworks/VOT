@@ -21,6 +21,9 @@ gitignore = true
 minimum_test_timeout = 60.0
 timeout_multiplier = 4.0
 exclude_globs = [
+  # This configuration is run with a feature on, so the file holding what
+  # the wire commands answer without it compiles nowhere here.
+  "crates/vot-cli/src/nowire.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

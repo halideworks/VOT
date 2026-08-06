@@ -315,6 +315,71 @@ mod tests {
     }
 
     #[test]
+    fn each_engine_is_driven_until_its_carrier_settles_it() {
+        // The loop is what turns a pass into a transfer, and the two
+        // answers it needs from an engine are whether a status ends it and
+        // how to wait for the next one. Neither is exercised by a pass a
+        // test makes itself.
+        use crate::harness::{Loopback, built_bundle, not_required, patterned, pump};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("driven", &[("a.txt", patterned(1000))]);
+        let output = crate::tests::temporary("driven-fetched");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let mut serving =
+            ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
+
+        // Past the handshake first: a carrier that goes before it is done
+        // is a session that failed, not one the loop settled.
+        let mut sequence = 0;
+        let mut ready = false;
+        for _ in 0..16 {
+            Engine::service(&mut fetcher).unwrap();
+            pump(
+                fetcher.session_mut().driver(),
+                serving.session.driver(),
+                &mut sequence,
+            );
+            Engine::service(&mut serving).unwrap();
+            pump(
+                serving.session.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+            if fetcher.session_mut().is_ready() && serving.session.is_ready() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "the two never finished their handshake");
+
+        // Neither next pass is the last, so each loop has to wait, and what
+        // it waits for is the carrier reporting it has gone.
+        fetcher
+            .session_mut()
+            .driver()
+            .on_wait
+            .push_back(Event::Disconnected(ConnectionId(1)));
+        assert_eq!(
+            drive(&mut fetcher).unwrap(),
+            crate::FetchStatus::Disconnected
+        );
+
+        serving
+            .session
+            .driver()
+            .on_wait
+            .push_back(Event::Disconnected(ConnectionId(1)));
+        assert_eq!(
+            drive(&mut serving).unwrap(),
+            crate::ServeStatus::Disconnected
+        );
+
+        crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
     fn a_settled_pass_ends_the_loop_without_waiting() {
         let mut engine = Scripted::default();
         assert!(drive(&mut engine).unwrap());

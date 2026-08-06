@@ -311,6 +311,31 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.pending.len()
     }
 
+    /// Complete bundles a deferring caller has not yet taken.
+    #[must_use]
+    pub fn completed_bundles(&self) -> usize {
+        self.completed.len()
+    }
+
+    /// The byte bound on admitted bundles that are not complete, so a
+    /// caller that derives it can hold the derivation to account.
+    #[must_use]
+    pub const fn pending_byte_limit(&self) -> usize {
+        self.pending_byte_limit
+    }
+
+    /// The byte bound on records that arrived before their proof.
+    #[must_use]
+    pub const fn orphan_byte_limit(&self) -> usize {
+        self.orphan_byte_limit
+    }
+
+    /// The bound on what [`Self::take_completed`] may owe at once.
+    #[must_use]
+    pub const fn deferred_limit(&self) -> usize {
+        self.deferred_limit
+    }
+
     /// Delivered bundle identities still remembered.
     #[must_use]
     pub fn remembered_bundles(&self) -> usize {
@@ -569,7 +594,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             length: bundle.object.length,
         };
         let delivered = Delivered::of(identity, &pending.records);
-        if self.deferring {
+        // A cover for a subject already verified never goes to the caller:
+        // the caller places what it proves through the sink of the object it
+        // is currently fetching, and a late or replayed cover for a finished
+        // object would land in the wrong file. The inline path below is what
+        // the receiver has always done with one: check its proof, write
+        // nothing, and leave the subject as verified as it was.
+        if self.deferring && !self.receiver.is_verified(subject) {
             // The caller proves and places it, then hands the witness back to
             // [`Self::settle`], which does the bookkeeping below.
             self.completed.push_back(CompletedBundle {
@@ -900,6 +931,67 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_cover_for_a_verified_subject_never_reaches_the_caller() {
+        // The caller places what it proves through the sink of the object
+        // it is currently fetching, so a late cover for a finished object
+        // must take the inline path: proof checked, nothing written,
+        // nothing enqueued. Handed out, it would land in another object's
+        // file.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        driver.defer_proving(true);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
+        for record in &records {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        let completed = driver.take_completed().expect("a bundle to prove");
+        let range = ReliableReceiver::verify_typed_bundle(
+            completed.subject(),
+            completed.bundle(),
+            completed.records(),
+        )
+        .expect("the proof holds");
+        let written = range.write_to(&DiscardSink).expect("the sink takes it");
+        driver.settle(&completed, written).unwrap();
+        assert!(driver.is_verified(subject));
+
+        // The same object again under a fresh bundle identity, which is
+        // what an evicted replay or a retrying server looks like.
+        let (_, again, again_records) = object_of(0x5a, [9; 16]);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(again))));
+        for record in &again_records {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            driver.completed_bundles(),
+            0,
+            "a verified subject's cover is never owed to the caller"
+        );
+        assert!(driver.take_completed().is_none());
+        assert!(driver.is_verified(subject));
+        assert!(driver.credit_applied());
+    }
+
+    #[test]
     fn a_caller_that_owes_proofs_is_not_given_more_to_read() {
         // The pending budget stops holding a bundle the moment it completes,
         // so the handover is what bounds a caller that stops draining.
@@ -907,7 +999,14 @@ mod tests {
         let mut driver = ready();
         driver.admit(subject, Box::new(DiscardSink)).unwrap();
         driver.defer_proving(true);
+        assert_eq!(
+            driver.deferred_limit(),
+            DEFAULT_DEFERRED_BUNDLES,
+            "the default bound, before anyone set one"
+        );
+        assert_eq!(driver.completed_bundles(), 0, "nothing owed yet");
         driver.set_deferred_limit(1).unwrap();
+        assert_eq!(driver.deferred_limit(), 1, "the bound is what was set");
         assert_eq!(
             driver.set_deferred_limit(0),
             Err(Error::PendingBundlesExhausted),
@@ -935,6 +1034,15 @@ mod tests {
             .push_back(carried(&wire(&TypedFrame::DataRecord(records[0].clone()))));
 
         assert_eq!(driver.poll().unwrap(), None);
+        // The first poll stops the moment the owed bundle completes: the
+        // frame behind it is still queued. A gate off by one reads it here,
+        // which on a live carrier is a receiver that runs ahead of the
+        // caller it is owed by.
+        assert_eq!(
+            driver.session_mut().driver().events.len(),
+            1,
+            "the frame behind the completed bundle was read early"
+        );
         let queued = driver.session_mut().driver().events.len();
         assert_eq!(driver.poll().unwrap(), None, "still owed, still not read");
         assert_eq!(
@@ -942,7 +1050,9 @@ mod tests {
             queued,
             "the carrier's queue did not move while a proof was owed"
         );
+        assert_eq!(driver.completed_bundles(), 1, "one bundle owed");
         assert!(driver.take_completed().is_some());
+        assert_eq!(driver.completed_bundles(), 0, "taken, no longer owed");
     }
 
     #[test]
@@ -1020,12 +1130,20 @@ mod tests {
         assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
 
         // The bound itself is allowed, and one below it would refuse a
-        // conforming transfer partway through rather than bound it.
+        // conforming transfer partway through rather than bound it. What
+        // was set is what is held, byte for byte.
         assert!(
             driver
                 .set_pending_limits(1, MAX_PENDING_BUNDLE_BYTES)
                 .is_ok()
         );
+        assert_eq!(driver.pending_byte_limit(), MAX_PENDING_BUNDLE_BYTES);
+        assert!(
+            driver
+                .set_orphan_limits(1, MAX_ORPHAN_BUNDLE_BYTES + 7)
+                .is_ok()
+        );
+        assert_eq!(driver.orphan_byte_limit(), MAX_ORPHAN_BUNDLE_BYTES + 7);
         assert!(
             driver
                 .set_pending_limits(0, MAX_PENDING_BUNDLE_BYTES)

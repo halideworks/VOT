@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use vot_codec::frames::{
     self, DataRecord, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest, TypedFrame,
@@ -77,6 +78,48 @@ struct ServedObject {
     object: frames::ObjectId,
     layer: ProverLayer,
     path: PathBuf,
+    witness: Witness,
+}
+
+/// What a file was before its layer was built, for a stat's worth of cost.
+///
+/// An ordinary write moves the modification time, so a witness that still
+/// matches is almost always a file nothing has written to, and one that
+/// does not match says something touched it, which is not yet a reason to
+/// end a session: the content decides that.
+///
+/// Almost always, not always. Length and modification time are both the
+/// writer's to choose, so a rewrite that restores them is not reported
+/// here, and neither is one that lands inside the same timestamp tick as
+/// the witness. That is what makes this a way to name a mutation cheaply
+/// and not a way to prove there was none. The proof of that is the peer's:
+/// every range it takes is verified against the object root before its
+/// bytes are placed, and `receive` verifies each object again end to end
+/// before publishing it. Mutated bytes cannot reach a destination whatever
+/// this answers, which is why it is worth a stat and not a hash of
+/// everything served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Witness {
+    length: u64,
+    /// `None` where the platform will not report one, which proves nothing
+    /// and so never takes the cheap path.
+    modified: Option<SystemTime>,
+}
+
+impl Witness {
+    fn of(file: &File) -> Result<Self, Error> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    /// Whether this and `current` together report no write since the
+    /// witness was taken.
+    fn reports_untouched(&self, current: &Self) -> bool {
+        self.modified.is_some() && self == current
+    }
 }
 
 /// The chaining-value layer a range is proved from without the object.
@@ -98,6 +141,30 @@ impl ProverLayer {
             Self::Blake3(cvs) => cvs.push(group).map_err(|_| Error::Proof),
             Self::Sha256(pieces) => pieces.push(group).map_err(|_| Error::Proof),
         }
+    }
+
+    /// Whether the cover read back is still the bytes the layer was built
+    /// from, group by group.
+    ///
+    /// The cover starts on a group boundary, so its first group is at
+    /// `covered_offset / GROUP_SIZE` and the rest follow.
+    fn holds(&self, covered_offset: u64, plaintext: &[u8]) -> bool {
+        if covered_offset % GROUP_SIZE as u64 != 0 {
+            return false;
+        }
+        let Ok(first) = usize::try_from(covered_offset / GROUP_SIZE as u64) else {
+            return false;
+        };
+        plaintext
+            .chunks(GROUP_SIZE)
+            .enumerate()
+            .all(|(offset, group)| match first.checked_add(offset) {
+                Some(index) => match self {
+                    Self::Blake3(cvs) => cvs.holds(index, group),
+                    Self::Sha256(pieces) => pieces.holds(index, group),
+                },
+                None => false,
+            })
     }
 
     /// Proves a range, returning the group-aligned cover it is proved under.
@@ -617,6 +684,11 @@ impl ServedObject {
     fn build(objects: &Path, root: [u8; 32], suite: Suite, length: u64) -> Result<Self, Error> {
         let path = objects.join(crate::object_name(&root));
         let mut file = File::open(&path)?;
+        // Taken before a byte is read, not after: a write that lands during
+        // the read would otherwise be stamped into the witness, and every
+        // later stat would match it while the layer held the bytes from
+        // before the write.
+        let witness = Witness::of(&file)?;
         let mut verifier = StreamVerifier::new(suite);
         let mut layer = ProverLayer::empty(suite);
         let mut group = vec![0u8; GROUP_SIZE];
@@ -644,20 +716,43 @@ impl ServedObject {
             },
             layer,
             path,
+            witness,
         })
     }
 
-    /// Reads the cover's bytes from the file the layer was built from.
+    /// Reads the cover's bytes from the file the layer was built from, and
+    /// holds them to what the layer took at open.
     ///
-    /// A file rewritten in place since open is not detected here: the proof
-    /// ships with the bytes, so the peer's verification refuses them. Only a
-    /// shortened file is caught, as a short read.
+    /// A file rewritten in place keeps its length, so it reads back whole
+    /// and only its content gives it away. Without this the bytes ship with
+    /// a proof they do not answer and the peer refuses them, which blames
+    /// the wire for what this end could see: the object under a served
+    /// bundle changed, and no session should continue over it.
+    ///
+    /// Hashing every cover is what shows that, and it is also exactly the
+    /// work the peer does with the same bytes, so a server that always did
+    /// it would spend most of a core at line rate recomputing the peer's
+    /// answer. It is spent only when the file's own metadata does not
+    /// report the file untouched since the layer was built. The stat comes
+    /// after the read and through the handle the bytes came from, so a
+    /// write landing mid-read is one the metadata still reports.
+    ///
+    /// The handle is opened per cover rather than held from open: a bundle
+    /// names as many stored objects as its manifest has entries, and one
+    /// descriptor each would refuse a large bundle at open for no reason a
+    /// peer could see.
     fn read_covered(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         let size = usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
         let mut plaintext = vec![0u8; size];
         file.read_exact(&mut plaintext).map_err(short_read)?;
+        if self.witness.reports_untouched(&Witness::of(&file)?) {
+            return Ok(plaintext);
+        }
+        if !self.layer.holds(offset, &plaintext) {
+            return Err(Error::SourceMutation);
+        }
         Ok(plaintext)
     }
 }
@@ -1696,5 +1791,149 @@ mod tests {
         let outcome = server.service(&mut session, &mut connection);
         assert!(matches!(outcome, Err(Error::SourceMutation)));
         assert_eq!(session.driver().closed, Some(error_code::SOURCE_MUTATED));
+    }
+
+    /// Writes a test may make before a file's modification time reports one.
+    const REWRITE_ATTEMPTS: usize = 1024;
+
+    #[test]
+    fn an_untouched_file_is_served_without_rehashing_it() {
+        // The cheap path is the point: metadata reporting no write to the
+        // file since it was read stands in for hashing every byte served.
+        // A layer that could not possibly hold the file's bytes still
+        // serves, which is what shows the hash was skipped.
+        let (bundle, _) = built_bundle("untouched", &[("big.bin", patterned(150_000))]);
+        let mut server = BundleServer::open(&bundle).unwrap();
+        let stored = server.objects.values_mut().next().unwrap();
+        assert!(
+            stored
+                .witness
+                .reports_untouched(&Witness::of(&File::open(&stored.path).unwrap()).unwrap()),
+            "nothing has touched the file"
+        );
+        stored.layer = ProverLayer::Blake3(vot_proof_blake3::GroupCvs::new());
+
+        let bytes = server
+            .objects
+            .values()
+            .next()
+            .unwrap()
+            .read_covered(0, GROUP_SIZE as u64)
+            .unwrap();
+        assert_eq!(bytes.len(), GROUP_SIZE);
+
+        // And once the metadata cannot vouch for it, the content decides.
+        let stored = server.objects.values_mut().next().unwrap();
+        stored.witness.modified = None;
+        let outcome = server
+            .objects
+            .values()
+            .next()
+            .unwrap()
+            .read_covered(0, GROUP_SIZE as u64);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+    }
+
+    #[test]
+    fn a_witness_reports_a_file_that_changed() {
+        let directory = temporary("witness");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("f.bin");
+        fs::write(&path, patterned(1000)).unwrap();
+        let file = File::open(&path).unwrap();
+        let taken = Witness::of(&file).unwrap();
+        assert!(taken.reports_untouched(&Witness::of(&file).unwrap()));
+
+        fs::write(&path, patterned(2000)).unwrap();
+        let after = Witness::of(&File::open(&path).unwrap()).unwrap();
+        assert_ne!(taken, after);
+        assert!(!taken.reports_untouched(&after));
+
+        // A platform that will not report a modification time proves
+        // nothing, however much else matches.
+        let silent = Witness {
+            length: taken.length,
+            modified: None,
+        };
+        assert!(!silent.reports_untouched(&silent));
+    }
+
+    #[test]
+    fn an_object_rewritten_in_place_after_open_is_reported_and_closed() {
+        // A rewrite that keeps the length reads back whole, so nothing but
+        // the content gives it away. Two groups, and the change is in the
+        // second, so it is not the first bytes read that catch it.
+        let (bundle, _) = built_bundle("rewritten", &[("big.bin", patterned(150_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let path = bundle
+            .join("objects")
+            .join(crate::object_name(&object.root));
+        let mut rewritten = fs::read(&path).unwrap();
+        rewritten[100_000] ^= 1;
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        // A write lands in whatever timestamp tick it lands in, so the test
+        // writes until the file's own metadata reports the change rather
+        // than assuming the first one did. Counted, not timed: a tick is
+        // milliseconds and a write of this file is microseconds.
+        let mut reported = false;
+        for _ in 0..REWRITE_ATTEMPTS {
+            fs::write(&path, &rewritten).unwrap();
+            if fs::metadata(&path).unwrap().modified().unwrap() != before {
+                reported = true;
+                break;
+            }
+        }
+        assert!(reported, "the modification time never moved");
+        assert_eq!(fs::metadata(&path).unwrap().len(), object.length);
+
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [1; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        let outcome = server.service(&mut session, &mut connection);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+        assert_eq!(session.driver().closed, Some(error_code::SOURCE_MUTATED));
+        assert!(
+            session.driver().records.is_empty(),
+            "no byte of the rewritten object was served"
+        );
+    }
+
+    #[test]
+    fn a_cover_is_held_to_the_groups_it_starts_at() {
+        // The check indexes by the cover's own offset, so a cover from the
+        // middle of an object is held to the groups that live there and not
+        // to the ones a zero-based walk would name.
+        let (bundle, _) = built_bundle("indexed", &[("big.bin", patterned(200_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let stored = server.objects.values().next().unwrap();
+        let bytes = fs::read(
+            bundle
+                .join("objects")
+                .join(crate::object_name(&stored.object.root)),
+        )
+        .unwrap();
+        let group = GROUP_SIZE as u64;
+
+        assert!(stored.layer.holds(0, &bytes[..GROUP_SIZE]));
+        assert!(
+            stored
+                .layer
+                .holds(group, &bytes[GROUP_SIZE..2 * GROUP_SIZE])
+        );
+        assert!(stored.layer.holds(2 * group, &bytes[2 * GROUP_SIZE..]));
+        assert!(stored.layer.holds(0, &bytes));
+        // The second group's bytes, offered as the first, are not it.
+        assert!(!stored.layer.holds(0, &bytes[GROUP_SIZE..2 * GROUP_SIZE]));
+        // A cover that does not start on a group boundary names no group.
+        assert!(!stored.layer.holds(1, &bytes[..GROUP_SIZE]));
     }
 }

@@ -28,6 +28,9 @@ Build a deterministic transfer bundle:
 cargo run -p vot-cli -- send SOURCE_DIRECTORY BUNDLE_DIRECTORY
 ```
 
+It prints the package root and the logical length: `ROOT LENGTH`. That root
+is what a fetch can be pinned to, so it is worth keeping.
+
 An explicit logical-object suite can be selected with:
 
 ```sh
@@ -42,7 +45,9 @@ Verify and publish a bundle, then write an authenticated receipt:
 cargo run -p vot-cli -- receive BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor KEY_SOURCE 2026-07-31T20:00:00Z
 ```
 
-The receiver refuses to replace an existing destination or receipt.
+The last argument is when the receiver observed the bundle, as an RFC 3339
+timestamp. It prints `ROOT LENGTH PUBLISHED`, and refuses to replace an
+existing destination or receipt.
 
 Check a receipt without the bundle:
 
@@ -50,16 +55,61 @@ Check a receipt without the bundle:
 cargo run -p vot-cli -- verify-receipt RECEIPT.cbor KEY_SOURCE
 ```
 
-`cargo run -p vot-cli -- help` prints the same reference as below.
+It prints `ROOT LENGTH ASSURANCE` and then either `THIRD-PARTY-VERIFIABLE` or
+`SHARED-SECRET`, which is the difference the [Keys](#keys) section describes.
 
-### Keys
+## Over the wire
+
+The wire commands need a build with the `wire` feature, which carries a QUIC
+endpoint and builds BoringSSL through cmake to get one. Without it they report
+the feature they need rather than failing as though the arguments were wrong:
+
+```sh
+cargo run -p vot-cli --features wire -- serve BUNDLE_DIRECTORY 0.0.0.0:4433
+```
+
+`serve` answers sessions from one bundle, one at a time, until it is stopped.
+It prints `listening ADDRESS` whenever it is ready for the next one, which is
+also how a caller that asked for port zero learns what it got. It presents a
+throwaway certificate; a real one can be given instead:
+
+```sh
+cargo run -p vot-cli --features wire -- serve BUNDLE_DIRECTORY 0.0.0.0:4433 CERT.pem KEY.pem
+```
+
+`fetch` writes a bundle directory that `receive` then consumes unchanged:
+
+```sh
+cargo run -p vot-cli --features wire -- fetch SERVER:4433 BUNDLE_DIRECTORY [PACKAGE_ROOT]
+```
+
+`pull` is the two in one invocation, for the common case:
+
+```sh
+cargo run -p vot-cli --features wire -- pull SERVER:4433 BUNDLE_DIRECTORY DESTINATION_DIRECTORY RECEIPT.cbor KEY_SOURCE 2026-07-31T20:00:00Z [PACKAGE_ROOT]
+```
+
+`fetch` prints `ROOT LENGTH FETCHED` and `pull` prints `ROOT LENGTH PUBLISHED`,
+the same line `receive` gives.
+
+The channel is **not** authenticated. The server presents a throwaway
+certificate and the client does not verify it, so anyone in the middle can see
+what you fetch and can refuse to serve it. What they cannot do is give you
+different bytes: every range proves to its object's root, every root is named
+by the manifest, and the manifest proves to the seal. The optional
+PACKAGE_ROOT, as printed by `send`, says which package you will accept, and a
+fetch given one takes nothing else.
+
+`cargo run -p vot-cli -- help` prints the exhaustive argument reference.
+
+## Keys
 
 KEY_SOURCE says where to read the key from: `env:NAME`, `-` for standard input,
 or a file path. What it reads decides the kind of key:
 
 | Contents | Meaning |
 | --- | --- |
-| `ed25519-secret:HEX` | signs; 64 hex characters. `receive` only |
+| `ed25519-secret:HEX` | signs; 64 hex characters. `receive` and `pull` only |
 | `ed25519-public:HEX` | checks a signature; 64 hex characters |
 | `hex:HEX` | shared secret, 32 to 64 bytes |
 | `raw:TEXT` | shared secret as text |

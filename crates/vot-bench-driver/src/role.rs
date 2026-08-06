@@ -210,10 +210,23 @@ fn wait_connected(
 /// Appends each rail's final path measurements to the notes, so a slow run
 /// carries its own congestion story: losses name the path, their absence
 /// names the source.
-fn note_rail_paths(endpoints: &mut [Endpoint], notes: &mut String) {
+/// Snapshots every rail's ledger while the rails are alive.
+///
+/// Taken as data rather than read at render time because rail zero carries
+/// the done marker after the transfer, and a connection the marker exchange
+/// closed answers with nothing: the ledger sums then lie by one rail, which
+/// is exactly how the 2026-08-05 forensics went wrong first.
+fn rail_path_stats(endpoints: &mut [Endpoint]) -> Vec<Option<vot_transport_api::PathStats>> {
+    endpoints
+        .iter_mut()
+        .map(|endpoint| endpoint.adapter.path_stats())
+        .collect()
+}
+
+fn note_rail_paths(rails: &[Option<vot_transport_api::PathStats>], notes: &mut String) {
     use std::fmt::Write as _;
-    for (rail, endpoint) in endpoints.iter_mut().enumerate() {
-        let Some(stats) = endpoint.adapter.path_stats() else {
+    for (rail, stats) in rails.iter().enumerate() {
+        let Some(stats) = stats else {
             continue;
         };
         if let Some(lost) = stats.lost_packets {
@@ -682,12 +695,13 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     let elapsed = started.elapsed();
     tally.cpu = cpu_spent(cpu_before, cpu_times_ns());
 
+    let rail_stats = rail_path_stats(&mut endpoints);
     let mut notes = role_notes("send", &endpoints[0], None, tally, Some(generator_ns));
     {
         use std::fmt::Write as _;
         let _ = write!(notes, ";workers={workers};rails=provisioned-multi-rail");
     }
-    note_rail_paths(&mut endpoints, &mut notes);
+    note_rail_paths(&rail_stats, &mut notes);
     Ok(Measurement {
         bytes_sent,
         verified_bytes: 0,
@@ -784,6 +798,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         ));
     }
 
+    let rail_stats = rail_path_stats(&mut endpoints);
     tell_the_sender(endpoints[0].adapter.as_mut())?;
 
     let mut notes = role_notes(
@@ -803,7 +818,7 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
         );
     }
     crate::sink_note(sink_handle.as_deref(), &mut notes)?;
-    note_rail_paths(&mut endpoints, &mut notes);
+    note_rail_paths(&rail_stats, &mut notes);
     Ok(Measurement {
         bytes_sent: 0,
         verified_bytes: config.object_bytes,
@@ -1143,6 +1158,11 @@ mod tests {
         assert!(sent.notes.contains("rail0_lost="), "{}", sent.notes);
         assert!(sent.notes.contains("rail0_spurious="), "{}", sent.notes);
         assert!(received.notes.contains("bundles="), "{}", received.notes);
+        // The receiver's rail zero ledger must survive the done marker: the
+        // stats are snapshotted before the marker exchange closes the rail,
+        // or every ledger sum is short one rail.
+        assert!(received.notes.contains("rail0_recv="), "{}", received.notes);
+        assert!(received.notes.contains("rail0_sent="), "{}", received.notes);
         assert!(
             received.notes.contains(";sink=file;sync_ns="),
             "{}",

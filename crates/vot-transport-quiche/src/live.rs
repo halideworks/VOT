@@ -5,7 +5,9 @@
 //! else touches either. The caller's side is [`QuicheAdapter`], which holds the
 //! bounded queue; submissions cross to the driver and events cross back, so a
 //! slow application is backpressure rather than a broken connection and a peer
-//! cannot make either side grow without limit.
+//! cannot make either side grow without limit. Every hop is bounded for that
+//! to hold: the caller's queue, the channel between the two, and what the
+//! driver has taken but the connection has not written yet.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -59,6 +61,28 @@ const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;
+
+/// What the driver holds across every outbox before it stops taking submissions.
+///
+/// The byte bound the caller's own queue keeps, for the same bytes one hop on.
+/// A peer that stops reading fills this once and the refusal travels back the
+/// way the bytes came, ending at the `OutboundQueueFull` the application
+/// already handles.
+///
+/// No size here can starve the pump, which is why it is not measured against
+/// the connection's windows: an outbox holds only what `stream_send` refused,
+/// so a full one means the connection is already blocked on its own congestion
+/// or flow control rather than on anything the caller could hand over. The
+/// windows would be the wrong yardstick anyway, the connection's being eight
+/// stream windows of a size the caller picks.
+const MAX_QUEUED_BYTES: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
+
+/// And how many records, because bytes alone do not bound a flood of small
+/// ones: what grows there is the entry rather than the payload. A kilobyte a
+/// record, so anything larger meets the byte bound first. The caller's queue
+/// counts to 64 instead, which is a different question: what it holds has not
+/// been handed over yet.
+const MAX_QUEUED_RECORDS: usize = MAX_QUEUED_BYTES / 1_024;
 
 /// How long the driver waits on the socket when the connection asks for longer.
 ///
@@ -598,6 +622,76 @@ impl TransportAdapter for Transport {
     }
 }
 
+/// What every outbox is holding, counted so the driver knows when to stop
+/// taking submissions without walking its streams to find out.
+///
+/// Bytes are what is still owed, so one record is charged once and released as
+/// it goes rather than when it finishes.
+#[derive(Debug, Default)]
+struct Queued {
+    bytes: usize,
+    records: usize,
+}
+
+impl Queued {
+    /// Whether the driver has taken as much as it will hold.
+    ///
+    /// Asked before a submission rather than about one, so a record larger than
+    /// the whole bound is still taken: a bound that refuses what it can never
+    /// fit is a stall rather than backpressure. One submission of overshoot is
+    /// the price, and the caller's queue bounds that at one record.
+    const fn is_full(&self) -> bool {
+        self.bytes >= MAX_QUEUED_BYTES || self.records >= MAX_QUEUED_RECORDS
+    }
+
+    /// Charges one record handed to an outbox.
+    fn charge(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.records = self.records.saturating_add(1);
+    }
+
+    /// Releases bytes the connection has taken.
+    fn wrote(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+
+    /// Releases the record itself, once none of it is owed.
+    fn finished(&mut self) {
+        self.records = self.records.saturating_sub(1);
+    }
+
+    /// Releases everything an outbox held, for a stream that will not write
+    /// again. Missing this would leave the driver refusing submissions for a
+    /// connection with nothing left to send.
+    fn discard(&mut self, outbox: &VecDeque<(Payload, usize)>) {
+        for (bytes, sent) in outbox {
+            self.wrote(bytes.len().saturating_sub(*sent));
+            self.finished();
+        }
+    }
+
+    /// Fails a debug build where the count has drifted from what is actually
+    /// waiting, which is the one failure a count kept beside the thing it
+    /// counts can have. Too high and the driver refuses submissions for a
+    /// connection holding nothing; too low and the bound is not one.
+    fn debug_assert_matches(&self, streams: &BTreeMap<u64, StreamState>) {
+        debug_assert_eq!(
+            self.bytes,
+            streams
+                .values()
+                .flat_map(|stream| &stream.outbox)
+                .map(|(bytes, sent)| bytes.len() - sent)
+                .sum::<usize>(),
+            "the charged bytes drifted from what the outboxes hold"
+        );
+        debug_assert_eq!(
+            self.records,
+            streams.values().map(|stream| stream.outbox.len()).sum(),
+            "the charged records drifted from what the outboxes hold"
+        );
+    }
+}
+
 /// Per-stream state the driver keeps.
 struct StreamState {
     framing: Framing<SharedBudget>,
@@ -610,6 +704,8 @@ struct StreamState {
     /// how much of each has gone. A stream's flow control is the peer's, so a
     /// record may be written in pieces across several loops, and holding the
     /// caller's own allocation means those pieces cost no copy of their own.
+    /// Bounded across every stream by [`Queued`], which is what the driver
+    /// checks before it takes another submission.
     outbox: VecDeque<(Payload, usize)>,
     /// Frames completed after the event queue refused one, by either of its
     /// bounds, kept in arrival order until the caller drains the queue.
@@ -681,21 +777,22 @@ fn drive(
     // per packet, which is the cost this path exists to remove.
     let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
+    let mut queued = Queued::default();
     let mut closing = false;
 
     loop {
+        queued.debug_assert_matches(&streams);
         // What the caller asked for, and what the connection has to say about it.
-        while let Ok(command) = commands.try_recv() {
-            apply(
-                &mut conn,
-                &mut streams,
-                &budget,
-                control_limit,
-                command,
-                inbound,
-                role,
-            );
-        }
+        take_submissions(
+            &mut conn,
+            &mut streams,
+            &budget,
+            control_limit,
+            commands,
+            inbound,
+            role,
+            &mut queued,
+        );
         if !closing {
             let requested = close.load(Ordering::Relaxed);
             if requested != NO_CLOSE {
@@ -704,7 +801,7 @@ fn drive(
             }
         }
         for stream in streams.values_mut() {
-            write_outbox(&mut conn, stream);
+            write_outbox(&mut conn, stream, &mut queued);
         }
         // A socket that will not take a packet is a carrier that has gone.
         // The ceiling goes down whole: a discovery probe is only generated
@@ -1183,7 +1280,42 @@ fn flush_burst(
     Ok(())
 }
 
+/// Takes what the caller has handed over, while the driver is under its bound.
+///
+/// A peer that stops reading would otherwise have every submission behind it
+/// pile up in the outboxes, where nothing refuses anything. Leaving them in the
+/// channel is what makes a stalled peer backpressure: the channel fills, the
+/// caller's queue stops draining into it, and the application is told. A
+/// datagram waits behind a stalled stream for the same reason, the channel
+/// being one queue, which is what a datagram does here in any case.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one submission needs what the driver holds, and the driver holds no less"
+)]
+fn take_submissions(
+    conn: &mut quiche::Connection,
+    streams: &mut BTreeMap<u64, StreamState>,
+    budget: &SharedBudget,
+    control_limit: &Arc<AtomicUsize>,
+    commands: &mpsc::Receiver<Command>,
+    inbound: &Arc<Mutex<Inbound>>,
+    role: Role,
+    queued: &mut Queued,
+) {
+    while !queued.is_full() {
+        let Ok(command) = commands.try_recv() else {
+            return;
+        };
+        if let Some(bytes) = apply(conn, streams, budget, control_limit, command, inbound, role) {
+            queued.charge(bytes);
+        }
+    }
+}
+
 /// Applies one submission to the connection.
+///
+/// Reports the bytes it left in an outbox, so the charge is taken where the
+/// record is queued and nowhere else.
 fn apply(
     conn: &mut quiche::Connection,
     streams: &mut BTreeMap<u64, StreamState>,
@@ -1192,7 +1324,7 @@ fn apply(
     command: Command,
     inbound: &Arc<Mutex<Inbound>>,
     role: Role,
-) {
+) -> Option<usize> {
     match command {
         Command::Control(bytes) => {
             let state = stream_state(
@@ -1202,12 +1334,14 @@ fn apply(
                 budget,
                 control_limit,
             );
+            let charge = bytes.len();
             state.outbox.push_back((bytes, 0));
+            Some(charge)
         }
         Command::Reliable { stream, bytes } => {
             // Refused at submission, so this cannot be a lane with no stream.
             let Ok(id) = stream_for_lane(stream.0, role) else {
-                return;
+                return None;
             };
             let state = stream_state(
                 streams,
@@ -1216,8 +1350,12 @@ fn apply(
                 budget,
                 control_limit,
             );
+            let charge = bytes.len();
             state.outbox.push_back((bytes, 0));
+            Some(charge)
         }
+        // Handed to the connection here rather than queued, so there is
+        // nothing for the bound to hold.
         Command::Datagram { context, bytes } => {
             let observed = if conn.dgram_send(&bytes).is_ok() {
                 NativeEvent::DatagramSent { context }
@@ -1227,10 +1365,11 @@ fn apply(
             if let Ok(mut queue) = inbound.lock() {
                 let _ = queue.push(observed);
             }
+            None
         }
         // Refused at submission, so it cannot reach the driver. A silent success
         // here would hide it if that ever changed.
-        Command::ReceiveCredit(_) => {}
+        Command::ReceiveCredit(_) => None,
     }
 }
 
@@ -1251,20 +1390,26 @@ fn stream_state<'a>(
     })
 }
 
-/// Writes what a stream has waiting, as far as flow control allows.
-fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState) {
+/// Writes what a stream has waiting, as far as flow control allows, giving
+/// back what the connection took. The release side of [`apply`]'s charge.
+fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState, queued: &mut Queued) {
     let id = stream.id;
     while let Some((bytes, sent)) = stream.outbox.front_mut() {
+        let owed = bytes.len() - *sent;
         match conn.stream_send(id, &bytes[*sent..], false) {
-            Ok(written) if written == bytes.len() - *sent => {
-                stream.outbox.pop_front();
-            }
-            // Flow control is the peer's, so a record may go in pieces. The offset
-            // moves and the rest waits for the next pass, which is the same answer
-            // as nothing having been taken at all.
             Ok(written) => {
                 *sent += written;
-                return;
+                // One release for both answers, because what the connection
+                // took is what is no longer owed either way.
+                queued.wrote(written);
+                if written < owed {
+                    // Flow control is the peer's, so a record may go in pieces.
+                    // The offset moved and the rest waits for the next pass,
+                    // which is the same answer as nothing having been taken.
+                    return;
+                }
+                stream.outbox.pop_front();
+                queued.finished();
             }
             // Both mean "not yet" rather than "never": Done is flow
             // control, and StreamLimit is the peer's stream allowance,
@@ -1274,6 +1419,7 @@ fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState) {
             // never saw.
             Err(quiche::Error::Done | quiche::Error::StreamLimit) => return,
             Err(_) => {
+                queued.discard(&stream.outbox);
                 stream.outbox.clear();
                 return;
             }
@@ -1858,6 +2004,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_peer_that_stops_reading_is_backpressure_rather_than_growth() {
+        // The server here is held rather than polled: its driver is alive and
+        // its application never reads. So its own inbound bound fills, its
+        // driver stops reading the stream, and its flow control stops opening.
+        // The client's driver then cannot write what it has been handed. With
+        // nothing bounding what it holds it goes on taking submissions anyway,
+        // and the only limit on either side is memory.
+        let (mut client, server) = pair();
+        // Polled alone, because polling the server is what this test must not
+        // do: the driver threads finish the handshake between them.
+        let mut established = false;
+        for _ in 0_u32..1_024 {
+            let _ = client.flush();
+            while let Some(event) = client.poll() {
+                established |= matches!(event, Event::Connected(_));
+            }
+            if established {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(established, "the pair never connected");
+
+        let bytes = record(&vec![0x5a; 64 * 1024]);
+        let shared = vot_transport_api::shared_payload(&bytes);
+        // A refusal on its own is the channel between two passes rather than
+        // the bound; the driver empties that in microseconds. What says the
+        // carrier has stopped taking work is a refusal that outlasts every
+        // chance it is given to clear. Every hop has to fill first: the
+        // server's inbound queue, its flow-control window, the client's
+        // outbox, the channel, and the caller's own queue, which is some tens
+        // of megabytes at this record size.
+        let mut stalled = false;
+        let mut taken = 0_u32;
+        let mut refusals = 0_u32;
+        for _ in 0_u32..8_192 {
+            match client.send_reliable_shared(StreamId(0), Payload::clone(&shared)) {
+                Ok(()) => {
+                    taken += 1;
+                    refusals = 0;
+                    let _ = client.flush();
+                }
+                Err(Error::OutboundQueueFull) => {
+                    refusals += 1;
+                    if refusals >= 256 {
+                        stalled = true;
+                        break;
+                    }
+                    let _ = client.flush();
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(other) => panic!("the carrier failed rather than refusing: {other:?}"),
+            }
+        }
+        assert!(
+            stalled,
+            "a peer that reads nothing took {taken} records and would have taken more"
+        );
+        drop(client);
+        drop(server);
+    }
+
     /// What one lane carries over loopback, in bytes per second.
     ///
     /// Ignored because it is a measurement rather than a rule: a shared machine
@@ -2281,12 +2490,14 @@ mod tests {
             &budget,
             &control_limit,
         );
+        let mut queued = Queued::default();
         stream.outbox.push_back((vec![0x27_u8; 8_192].into(), 0));
+        queued.charge(8_192);
 
         let mut drain = [0_u8; 4_096];
         let mut delivered = 0_usize;
         for _ in 0_u32..256 {
-            write_outbox(&mut client, stream);
+            write_outbox(&mut client, stream, &mut queued);
             shuttle(&mut client, local, &mut server, remote);
             while let Ok((read, _)) = server.stream_recv(4, &mut drain) {
                 delivered += read;
@@ -2301,6 +2512,139 @@ mod tests {
             "a split record never completed; {delivered} of 8192 bytes arrived"
         );
         assert_eq!(delivered, 8_192);
+        // A record written in pieces is released in pieces, so what the driver
+        // counts as waiting is back where it started.
+        assert_eq!(queued.bytes, 0, "a written record still counted as owed");
+        assert_eq!(queued.records, 0, "a written record was still counted");
+    }
+
+    #[test]
+    fn the_outbox_bound_is_met_rather_than_passed() {
+        assert!(!Queued::default().is_full());
+        let under = Queued {
+            bytes: MAX_QUEUED_BYTES - 1,
+            records: MAX_QUEUED_RECORDS - 1,
+        };
+        assert!(!under.is_full(), "a driver under both bounds still takes");
+        let bytes = Queued {
+            bytes: MAX_QUEUED_BYTES,
+            records: 1,
+        };
+        assert!(bytes.is_full(), "the byte bound is met, not passed");
+        // The record bound is the one that answers a flood of small records,
+        // where the bytes alone would let millions of entries through.
+        let records = Queued {
+            bytes: 1,
+            records: MAX_QUEUED_RECORDS,
+        };
+        assert!(records.is_full(), "the record bound is met, not passed");
+        // The values themselves, because every assertion above is written in
+        // terms of them and would hold for any pair of numbers, including a
+        // record bound so large that only the bytes ever bind.
+        assert_eq!(MAX_QUEUED_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_QUEUED_RECORDS, 4_096);
+    }
+
+    /// The drift guard fires, which is what makes it a guard rather than a
+    /// comment. Only in a debug build, because that is the only build a
+    /// `debug_assert` is compiled into.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "drifted")]
+    fn a_charge_that_drifts_from_the_outboxes_says_so() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let stream = stream_state(
+            &mut streams,
+            4,
+            StreamKind::Reliable { lane: 0 },
+            &budget,
+            &control_limit,
+        );
+        stream
+            .outbox
+            .push_back((vot_transport_api::shared_payload(&[0x27; 64]), 0));
+        // A record queued and never charged, which is the drift that would
+        // otherwise leave the bound counting something that is not there.
+        Queued::default().debug_assert_matches(&streams);
+    }
+
+    #[test]
+    fn a_charge_is_taken_where_the_record_is_queued() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut conn = sans_io_pair(2_048).0;
+
+        let mut queued = Queued::default();
+        // What the driver does with each: a queued record is charged, and a
+        // datagram is handed to the connection with nothing left to hold.
+        for command in [
+            Command::Control(vot_transport_api::shared_payload(&[0x27; 16])),
+            Command::Reliable {
+                stream: StreamId(0),
+                bytes: vot_transport_api::shared_payload(&[0x27; 64]),
+            },
+            Command::Datagram {
+                context: 1,
+                bytes: vot_transport_api::shared_payload(&[0x27; 32]),
+            },
+            Command::ReceiveCredit(4_096),
+        ] {
+            if let Some(bytes) = apply(
+                &mut conn,
+                &mut streams,
+                &budget,
+                &control_limit,
+                command,
+                &inbound,
+                Role::Client,
+            ) {
+                queued.charge(bytes);
+            }
+        }
+        assert_eq!(queued.bytes, 16 + 64);
+        assert_eq!(queued.records, 2);
+    }
+
+    #[test]
+    fn a_stream_that_cannot_write_gives_its_whole_charge_back() {
+        // A stream the connection refuses outright, rather than one that is
+        // merely out of flow control: the outbox is dropped, and a charge left
+        // behind for records nobody will ever write would refuse every later
+        // submission on a connection with nothing waiting.
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut client = sans_io_pair(2_048).0;
+        // Server-initiated and unidirectional, so a client writing to it is
+        // not backpressure but an error.
+        let stream = stream_state(
+            &mut streams,
+            3,
+            StreamKind::Reliable { lane: 0 },
+            &budget,
+            &control_limit,
+        );
+        let mut queued = Queued::default();
+        stream
+            .outbox
+            .push_back((vot_transport_api::shared_payload(&[0x27; 128]), 0));
+        queued.charge(128);
+        stream
+            .outbox
+            .push_back((vot_transport_api::shared_payload(&[0x27; 256]), 0));
+        queued.charge(256);
+
+        write_outbox(&mut client, stream, &mut queued);
+
+        assert!(stream.outbox.is_empty(), "the refused outbox was kept");
+        assert_eq!(queued.bytes, 0, "a discarded record still counted as owed");
+        assert_eq!(queued.records, 0, "a discarded record was still counted");
     }
 
     /// One SETTINGS frame on the wire toward the server, returned encoded.

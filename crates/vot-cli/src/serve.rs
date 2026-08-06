@@ -312,7 +312,7 @@ fn fail<A: TransportAdapter>(
 }
 
 /// Whether a session refusal means "retry after the backend drains".
-fn is_backpressure(error: &vot_session::Error) -> bool {
+pub(crate) fn is_backpressure(error: &vot_session::Error) -> bool {
     matches!(
         error.kind(),
         ErrorKind::Transport(vot_transport_api::Error::OutboundQueueFull)
@@ -340,16 +340,7 @@ impl BundleServer {
         let seal_bytes =
             crate::read_bounded_file(&manifest_directory.join(MANIFEST_SEAL), seal_limit)?;
         let seal = vot_manifest::decode_seal(&seal_bytes).map_err(|_| Error::InvalidBundle)?;
-        if seal.pages.len() as u64 != seal.final_page_count {
-            return Err(Error::InvalidBundle);
-        }
-        let mut page_digests = Vec::with_capacity(seal.pages.len());
-        for (index, commitment) in seal.pages.iter().enumerate() {
-            if commitment.index != index as u64 {
-                return Err(Error::InvalidBundle);
-            }
-            page_digests.push(commitment.digest);
-        }
+        let page_digests = crate::seal_page_digests(&seal)?;
 
         // Every stored object the manifest names: the logical object of a
         // direct entry, the pack of a packed one.
@@ -683,77 +674,17 @@ fn short_read(error: io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_bundle_with_suite;
+    use crate::harness::{
+        Loopback, built_bundle, control_event, decode_control, not_required, patterned,
+    };
     use crate::tests::temporary;
-    use crate::{build_bundle, build_bundle_with_suite};
     use std::collections::BTreeSet;
     use std::fs;
     use vot_codec::Settings;
     use vot_manifest::StorageRef;
     use vot_scheduler::ReliableReceiver;
-    use vot_session::Authentication;
     use vot_transport_api::SubjectId;
-
-    /// A recording fake carrier: what the session sends is captured, what a
-    /// test pushes into `events` is what the session receives.
-    #[derive(Default)]
-    struct Loopback {
-        control: Vec<Vec<u8>>,
-        records: Vec<(StreamId, Vec<u8>)>,
-        events: VecDeque<Event>,
-        refuse_sends: usize,
-        fail_sends_with: Option<vot_transport_api::Error>,
-        closed: Option<u16>,
-    }
-
-    impl Loopback {
-        fn refuse_send(&mut self) -> Result<(), vot_transport_api::Error> {
-            if let Some(error) = self.fail_sends_with.take() {
-                return Err(error);
-            }
-            if self.refuse_sends > 0 {
-                self.refuse_sends -= 1;
-                return Err(vot_transport_api::Error::OutboundQueueFull);
-            }
-            Ok(())
-        }
-    }
-
-    impl TransportAdapter for Loopback {
-        fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
-            self.refuse_send()?;
-            self.control.push(frame.to_vec());
-            Ok(())
-        }
-
-        fn send_reliable(
-            &mut self,
-            stream: StreamId,
-            record: &[u8],
-        ) -> Result<(), vot_transport_api::Error> {
-            self.refuse_send()?;
-            self.records.push((stream, record.to_vec()));
-            Ok(())
-        }
-
-        fn poll(&mut self) -> Option<Event> {
-            self.events.pop_front()
-        }
-
-        fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), vot_transport_api::Error> {
-            Ok(())
-        }
-
-        fn close(&mut self, code: u16) -> Result<(), vot_transport_api::Error> {
-            if self.closed.is_none() {
-                self.closed = Some(code);
-            }
-            Ok(())
-        }
-    }
-
-    fn not_required() -> Authentication {
-        Authentication::NotRequired { nonce: [7; 32] }
-    }
 
     /// A server session driven to readiness by a client's handshake frames,
     /// with the handshake replies cleared so tests read only answers.
@@ -792,44 +723,6 @@ mod tests {
                 .events
                 .push_back(Event::Control(shared_payload(&frame)));
         }
-    }
-
-    fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, PackageSummary) {
-        let source = temporary(&format!("{name}-source"));
-        let bundle = temporary(&format!("{name}-bundle"));
-        fs::create_dir_all(&source).unwrap();
-        for (file, bytes) in files {
-            let path = source.join(file);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(path, bytes).unwrap();
-        }
-        let summary = build_bundle(&source, &bundle).unwrap();
-        (bundle, summary)
-    }
-
-    /// Bytes that differ across group boundaries, so a wrong slice is caught.
-    fn patterned(length: usize) -> Vec<u8> {
-        (0..length)
-            .map(|index| u8::try_from((index / 251) % 256).unwrap())
-            .collect()
-    }
-
-    fn control_event(frame: &TypedFrame) -> Event {
-        let mut wire = Vec::new();
-        frames::encode(frame, &mut wire).unwrap();
-        Event::Control(shared_payload(&wire))
-    }
-
-    fn decode_control(bytes: &[u8]) -> TypedFrame {
-        let limits = DecodeLimits {
-            max_unknown_payload: MAX_CONTROL_FRAME_PAYLOAD,
-            max_frames: 1,
-        };
-        let (frame, consumed) = frames::decode(bytes, limits).unwrap();
-        assert_eq!(consumed, bytes.len());
-        frame
     }
 
     /// Pairs every sent proof bundle with the records that carry its bytes.

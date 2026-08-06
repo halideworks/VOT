@@ -1,0 +1,916 @@
+//! Fetching one bundle over a session: the request half of ADR-0030.
+//!
+//! A [`BundleFetcher`] opens a session, takes the announced descriptor and
+//! seal, holds every manifest page to the seal's commitments as it writes
+//! them, validates the written manifest with the same chain walk `receive`
+//! trusts, and then fetches every stored object the manifest names:
+//! sequentially per object, ranges pipelined, each range root-verified by
+//! the receiver before its bytes are placed through a [`FileSink`] into
+//! `objects/`. The output is a bundle directory `receive_bundle` consumes
+//! unchanged; nothing about publication is reimplemented here.
+
+use std::collections::{BTreeSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use vot_codec::frames::{
+    self, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestRequest, PackageDescriptor,
+    RangeRequest, TypedFrame,
+};
+use vot_codec::{DecodeLimits, Settings, error_code};
+use vot_scheduler::session::SessionReceiver;
+use vot_scheduler::{FileSink, ReliableReceiver};
+use vot_session::{Authentication, Session};
+use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAdapter};
+
+use crate::serve::is_backpressure;
+use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
+
+/// Ranges the fetcher keeps in flight per object, priced into staging.
+///
+/// The server answers sequentially under its own budget, so this bounds
+/// what the receiver may hold mid-verification rather than what the wire
+/// carries. Two covers keeps verification busy while one drains to a sink.
+const OUTSTANDING_COVERS: u64 = 2;
+
+/// What the receiver may stage: the outstanding covers plus the verifier's
+/// group reservation.
+const FETCH_STAGING_BYTES: u64 =
+    OUTSTANDING_COVERS * vot_scheduler::MAX_PROOF_RANGE_BYTES + vot_verifier::GROUP_SIZE as u64;
+
+/// What one fetch pass left the session as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FetchStatus {
+    /// The fetch is live; call again once the carrier reports an event.
+    Active,
+    /// The bundle is on disk, synced, and validated.
+    Complete,
+    /// The carrier ended the session before the bundle was whole.
+    Disconnected,
+    /// This end closed the session under a registered code.
+    Closed(u16),
+}
+
+/// Why a frame could not be taken: the server broke protocol under a
+/// registered close code, the package is not the pinned one, or this end
+/// failed on its own.
+enum Fault {
+    Peer(u16),
+    Pin,
+    Local(Error),
+}
+
+impl From<Error> for Fault {
+    fn from(error: Error) -> Self {
+        Self::Local(error)
+    }
+}
+
+/// One stored object the manifest names, in fetch order.
+struct PlannedObject {
+    object: frames::ObjectId,
+}
+
+/// The objects still owed once the manifest is validated.
+struct FetchPlan {
+    summary: PackageSummary,
+    objects: Vec<PlannedObject>,
+    current: usize,
+    /// The sink the current object's verified ranges flow into, kept for
+    /// the sync that makes its bytes durable before the fetch moves on.
+    active: Option<Arc<FileSink>>,
+    finished: bool,
+}
+
+/// One fetch: a client session, the receiver verifying its ranges, and the
+/// bundle directory being written.
+pub struct BundleFetcher<A: TransportAdapter> {
+    receiver: SessionReceiver<A>,
+    bundle: PathBuf,
+    pin: Option<[u8; 32]>,
+    descriptor: Option<PackageDescriptor>,
+    seal_bytes: Option<Vec<u8>>,
+    page_digests: Vec<[u8; 32]>,
+    pages_received: u64,
+    /// Manifest request spans still to issue, and the next one due.
+    spans: Vec<(u64, u64)>,
+    next_span: usize,
+    plan: Option<FetchPlan>,
+    pending: VecDeque<Vec<u8>>,
+    next_request: u64,
+    closed: Option<u16>,
+}
+
+/// Page spans of at most what one `MANIFEST_REQUEST` may name.
+fn manifest_spans(page_count: u64) -> Vec<(u64, u64)> {
+    let mut spans = Vec::new();
+    let mut first = 0;
+    while first < page_count {
+        let count = MAX_MANIFEST_REQUEST_PAGES.min(page_count - first);
+        spans.push((first, count));
+        first += count;
+    }
+    spans
+}
+
+/// Range spans of at most what one `RANGE_REQUEST` may ask for.
+///
+/// The spans start on group-aligned boundaries, so every cover is exactly
+/// its request and nothing is proved or carried twice.
+fn range_spans(length: u64) -> Vec<(u64, u64)> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while offset < length {
+        let take = MAX_REQUESTED_RANGE.min(length - offset);
+        spans.push((offset, take));
+        offset += take;
+    }
+    spans
+}
+
+fn subject_of(planned: &PlannedObject) -> SubjectId {
+    SubjectId {
+        suite: planned.object.suite,
+        root: planned.object.root,
+        length: planned.object.length,
+    }
+}
+
+fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
+    let mut wire = Vec::new();
+    frames::encode(frame, &mut wire)?;
+    Ok(wire)
+}
+
+impl<A: TransportAdapter> BundleFetcher<A> {
+    /// Opens the session and the bundle directory the fetch will fill.
+    ///
+    /// The optional pin is the package root this fetch will accept; without
+    /// it the fetch records what the server announced and the pin lives in
+    /// the receipt step, as ADR-0030 settles.
+    pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
+        if bundle.exists() {
+            return Err(Error::DestinationExists);
+        }
+        fs::create_dir_all(bundle.join(MANIFEST_DIRECTORY))?;
+        fs::create_dir_all(bundle.join("objects"))?;
+        let mut session = Session::client(
+            adapter,
+            Settings::default(),
+            BTreeSet::new(),
+            // The client ignores the nonce; it is the server's freshness.
+            Authentication::NotRequired { nonce: [0; 32] },
+        );
+        session.begin()?;
+        let receiver = ReliableReceiver::new(
+            FETCH_STAGING_BYTES,
+            FETCH_STAGING_BYTES,
+            FETCH_STAGING_BYTES,
+        )?;
+        Ok(Self {
+            receiver: SessionReceiver::new(session, receiver),
+            bundle: bundle.to_owned(),
+            pin,
+            descriptor: None,
+            seal_bytes: None,
+            page_digests: Vec::new(),
+            pages_received: 0,
+            spans: Vec::new(),
+            next_span: 0,
+            plan: None,
+            pending: VecDeque::new(),
+            next_request: 0,
+            closed: None,
+        })
+    }
+
+    /// The validated package, once the manifest has been.
+    #[must_use]
+    pub fn package(&self) -> Option<PackageSummary> {
+        self.plan.as_ref().map(|plan| plan.summary)
+    }
+
+    /// The session under the fetch, for the loop that waits on its carrier.
+    pub fn session_mut(&mut self) -> &mut Session<A> {
+        self.receiver.session_mut()
+    }
+
+    /// Whether requests are still owed to the carrier.
+    #[must_use]
+    pub fn has_backlog(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// One pass over what the carrier holds: drains queued requests, takes
+    /// every event, advances the object plan, and flushes. Never blocks;
+    /// the caller waits on the adapter between passes.
+    pub fn service(&mut self) -> Result<FetchStatus, Error> {
+        if let Some(code) = self.closed {
+            return Ok(FetchStatus::Closed(code));
+        }
+        if self.complete() {
+            return Ok(FetchStatus::Complete);
+        }
+        self.drain()?;
+        loop {
+            match self.receiver.poll() {
+                Ok(Some(Event::Control(bytes))) => {
+                    if let Err(fault) = self.dispatch(&bytes) {
+                        return self.fail(fault);
+                    }
+                }
+                Ok(Some(Event::Disconnected(_))) => return Ok(FetchStatus::Disconnected),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => return self.receive_failed(error),
+            }
+        }
+        self.advance()?;
+        self.drain()?;
+        self.receiver.session_mut().flush()?;
+        if self.complete() {
+            return Ok(FetchStatus::Complete);
+        }
+        Ok(FetchStatus::Active)
+    }
+
+    fn complete(&self) -> bool {
+        self.plan.as_ref().is_some_and(|plan| plan.finished)
+    }
+
+    /// Ends a fetch the receiver refused: the session's own faults keep the
+    /// code the session closed under, everything else is a proof the server
+    /// sent and could not back.
+    fn receive_failed(&mut self, error: vot_scheduler::Error) -> Result<FetchStatus, Error> {
+        if let vot_scheduler::Error::Session(inner) = &error {
+            if inner.kind().is_peer_fault() {
+                let code = inner.close_code();
+                self.closed = Some(code);
+                return Ok(FetchStatus::Closed(code));
+            }
+            return Err(Error::Scheduler(error));
+        }
+        let _ = self
+            .receiver
+            .session_mut()
+            .driver()
+            .close(error_code::PROOF_INVALID);
+        self.closed = Some(error_code::PROOF_INVALID);
+        Err(Error::Scheduler(error))
+    }
+
+    fn fail(&mut self, fault: Fault) -> Result<FetchStatus, Error> {
+        match fault {
+            Fault::Peer(code) => {
+                let _ = self.receiver.session_mut().driver().close(code);
+                self.closed = Some(code);
+                Ok(FetchStatus::Closed(code))
+            }
+            Fault::Pin => {
+                // The server answered for a package this fetch will not
+                // accept; that is a refusal, not a protocol fault.
+                let _ = self
+                    .receiver
+                    .session_mut()
+                    .driver()
+                    .close(error_code::OBJECT_IDENTITY_MISMATCH);
+                self.closed = Some(error_code::OBJECT_IDENTITY_MISMATCH);
+                Err(Error::RootMismatch)
+            }
+            Fault::Local(error) => Err(error),
+        }
+    }
+
+    /// Hands queued requests to the session until the carrier refuses one.
+    fn drain(&mut self) -> Result<(), Error> {
+        while let Some(frame) = self.pending.front() {
+            match self.receiver.session_mut().send_control(frame) {
+                Ok(()) => {
+                    self.pending.pop_front();
+                }
+                Err(error) if is_backpressure(&error) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Queues one request frame, taking the fields rather than `self` so a
+    /// caller holding the plan can still queue.
+    fn queue_request(pending: &mut VecDeque<Vec<u8>>, frame: &TypedFrame) -> Result<(), Error> {
+        pending.push_back(encoded(frame)?);
+        Ok(())
+    }
+
+    /// The next request identifier, from a counter for the same reason.
+    fn request_identifier(counter: &mut u64) -> Result<[u8; 16], Error> {
+        let mut identifier = [0u8; 16];
+        identifier[..8].copy_from_slice(&counter.to_be_bytes());
+        *counter = counter.checked_add(1).ok_or(Error::InvalidBundle)?;
+        Ok(identifier)
+    }
+
+    /// Takes one control frame, or ignores one that is not the fetch's.
+    fn dispatch(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+        let limits = DecodeLimits {
+            max_unknown_payload: MAX_CONTROL_FRAME_PAYLOAD,
+            max_frames: 1,
+        };
+        let (frame, consumed) = match frames::decode(bytes, limits) {
+            Ok(decoded) => decoded,
+            // An unknown optional frame is skipped, per `spec/wire.md`.
+            Err(frames::Error::WrongFrameType(_)) => return Ok(()),
+            Err(frames::Error::Envelope(error)) => {
+                return Err(Fault::Peer(error.protocol_code()));
+            }
+            Err(_) => return Err(Fault::Peer(error_code::MALFORMED_FRAME)),
+        };
+        if consumed != bytes.len() {
+            return Err(Fault::Peer(error_code::MALFORMED_FRAME));
+        }
+        match frame {
+            TypedFrame::PackageDescriptor(descriptor) => self.take_descriptor(descriptor),
+            TypedFrame::Seal(seal) => self.take_seal(seal),
+            TypedFrame::ManifestPage(page) => self.take_page(&page),
+            // A well-formed frame this fetch does not consume.
+            _ => Ok(()),
+        }
+    }
+
+    fn take_descriptor(&mut self, descriptor: PackageDescriptor) -> Result<(), Fault> {
+        if let Some(existing) = &self.descriptor {
+            if *existing == descriptor {
+                // An exact re-announcement is idempotent, per the registry.
+                return Ok(());
+            }
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        if let Some(pin) = self.pin {
+            if pin != descriptor.package.root {
+                return Err(Fault::Pin);
+            }
+        }
+        if descriptor.package.suite != 1 {
+            // The package root is blake3 over the entry sequence; any other
+            // suite is not a package this CLI builds or receives.
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        self.descriptor = Some(descriptor);
+        Ok(())
+    }
+
+    fn take_seal(&mut self, seal_bytes: Vec<u8>) -> Result<(), Fault> {
+        let Some(descriptor) = &self.descriptor else {
+            // The descriptor leads the announcement; a seal without one is
+            // out of sequence.
+            return Err(Fault::Peer(error_code::MALFORMED_FRAME));
+        };
+        if let Some(existing) = &self.seal_bytes {
+            if *existing == seal_bytes {
+                return Ok(());
+            }
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        let seal = vot_manifest::decode_seal(&seal_bytes)
+            .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
+        let package_matches = seal.manifest_id == descriptor.manifest_id
+            && seal.final_page_count == descriptor.page_count
+            && seal.package.suite == descriptor.package.suite
+            && seal.package.root == descriptor.package.root
+            && seal.package.length == descriptor.package.length;
+        if !package_matches {
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        self.page_digests = crate::seal_page_digests(&seal)
+            .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
+        self.spans = manifest_spans(seal.final_page_count);
+        self.seal_bytes = Some(seal_bytes);
+        self.request_pages()?;
+        Ok(())
+    }
+
+    /// Issues the next manifest span, one at a time: page arrival order is
+    /// what indexes the digest check, so spans stay strictly sequential.
+    fn request_pages(&mut self) -> Result<(), Fault> {
+        let Some(descriptor) = &self.descriptor else {
+            return Ok(());
+        };
+        let manifest_id = descriptor.manifest_id;
+        if let Some((first_page, page_count)) = self.spans.get(self.next_span).copied() {
+            if self.pages_received == first_page {
+                let request_id =
+                    Self::request_identifier(&mut self.next_request).map_err(Fault::Local)?;
+                Self::queue_request(
+                    &mut self.pending,
+                    &TypedFrame::ManifestRequest(ManifestRequest {
+                        request_id,
+                        manifest_id,
+                        first_page,
+                        page_count,
+                    }),
+                )
+                .map_err(Fault::Local)?;
+                self.next_span += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_page(&mut self, page_bytes: &[u8]) -> Result<(), Fault> {
+        if self.seal_bytes.is_none() {
+            return Err(Fault::Peer(error_code::MALFORMED_FRAME));
+        }
+        let page = vot_manifest::decode_page(page_bytes)
+            .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
+        let index = page.index;
+        let slot = usize::try_from(index).map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
+        let Some(committed) = self.page_digests.get(slot) else {
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        };
+        if committed != blake3::hash(page_bytes).as_bytes() {
+            // Not the page the seal committed to at this index.
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        if index < self.pages_received {
+            // An exact duplicate of a page already taken is idempotent.
+            return Ok(());
+        }
+        if index > self.pages_received {
+            // The control stream is ordered; a gap is the server's doing.
+            return Err(Fault::Peer(error_code::MANIFEST_INVALID));
+        }
+        crate::write_new_synced(
+            &crate::manifest_page_path(&self.bundle.join(MANIFEST_DIRECTORY), index),
+            page_bytes,
+        )
+        .map_err(Fault::Local)?;
+        self.pages_received = self
+            .pages_received
+            .checked_add(1)
+            .ok_or(Fault::Local(Error::InvalidBundle))?;
+        self.request_pages()?;
+        if Some(self.pages_received) == self.descriptor.as_ref().map(|d| d.page_count) {
+            self.finish_manifest()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the seal, validates the whole manifest the way `receive`
+    /// does, and plans the objects it names.
+    fn finish_manifest(&mut self) -> Result<(), Fault> {
+        let seal_bytes = self
+            .seal_bytes
+            .as_ref()
+            .ok_or(Fault::Local(Error::InvalidBundle))?;
+        crate::write_new_synced(
+            &self.bundle.join(MANIFEST_DIRECTORY).join(MANIFEST_SEAL),
+            seal_bytes,
+        )
+        .map_err(Fault::Local)?;
+        // The independent walk: chain, commitments, and the recomputed
+        // package root. A manifest that passes per-page digests but breaks
+        // here is the server's doing, not this host's.
+        let summary = match crate::scan_manifest(&self.bundle) {
+            Ok(summary) => summary,
+            Err(Error::Io(error)) => return Err(Fault::Local(Error::Io(error))),
+            Err(_) => return Err(Fault::Peer(error_code::MANIFEST_INVALID)),
+        };
+        let mut reader = ManifestReader::open(&self.bundle).map_err(Fault::Local)?;
+        let mut seen = BTreeSet::new();
+        let mut objects = Vec::new();
+        while let Some(record) = reader.next_record().map_err(Fault::Local)? {
+            let (root, length) = match record.storage {
+                Storage::Direct => (record.logical_root, record.logical_length),
+                Storage::Pack { root, length, .. } => (root, length),
+            };
+            if seen.insert(root) {
+                objects.push(PlannedObject {
+                    object: frames::ObjectId {
+                        suite: crate::suite_id(record.suite),
+                        root,
+                        length,
+                    },
+                });
+            }
+        }
+        self.plan = Some(FetchPlan {
+            summary,
+            objects,
+            current: 0,
+            active: None,
+            finished: false,
+        });
+        Ok(())
+    }
+
+    /// Moves the object plan forward: a verified object is synced and left
+    /// behind, the next one is admitted and its ranges requested, and the
+    /// last one seals the bundle with a directory sync.
+    fn advance(&mut self) -> Result<(), Error> {
+        loop {
+            let Some(plan) = &mut self.plan else {
+                return Ok(());
+            };
+            if let Some(sink) = &plan.active {
+                let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
+                if !self.receiver.is_verified(subject_of(planned)) {
+                    return Ok(());
+                }
+                // Durable before the fetch moves on, so a completed fetch
+                // never names bytes that were only in the page cache.
+                sink.file().sync_all()?;
+                plan.active = None;
+                plan.current += 1;
+            }
+            if plan.current == plan.objects.len() {
+                if !plan.finished {
+                    crate::sync_directories(&self.bundle)?;
+                    plan.finished = true;
+                }
+                return Ok(());
+            }
+            let planned = &plan.objects[plan.current];
+            let path = self
+                .bundle
+                .join("objects")
+                .join(crate::object_name(&planned.object.root));
+            if planned.object.length == 0 {
+                // Nothing to fetch or verify; the empty object simply is.
+                crate::write_new_synced(&path, &[])?;
+                plan.current += 1;
+                continue;
+            }
+            let subject = subject_of(planned);
+            let object = planned.object;
+            let sink = Arc::new(FileSink::create(&path, object.length)?);
+            self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
+            for (offset, length) in range_spans(object.length) {
+                let request_id = Self::request_identifier(&mut self.next_request)?;
+                Self::queue_request(
+                    &mut self.pending,
+                    &TypedFrame::RangeRequest(RangeRequest {
+                        request_id,
+                        object,
+                        offset,
+                        length,
+                    }),
+                )?;
+            }
+            plan.active = Some(sink);
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::{Loopback, built_bundle, control_event, not_required, patterned, pump};
+    use crate::tests::temporary;
+    use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
+    use vot_transport_api::ConnectionId;
+
+    /// A served session and its state, ready to answer a fetch.
+    fn serving(bundle: &Path) -> (BundleServer, Session<Loopback>, ServeConnection) {
+        let server = BundleServer::open(bundle).unwrap();
+        let mut session = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            not_required(),
+        );
+        session.begin().unwrap();
+        (server, session, ServeConnection::new())
+    }
+
+    /// Runs both engines and the pump until the fetch reaches a terminal
+    /// status, bounded by rounds rather than a clock.
+    fn run_to_end(
+        server: &BundleServer,
+        serving: &mut Session<Loopback>,
+        connection: &mut ServeConnection,
+        fetcher: &mut BundleFetcher<Loopback>,
+        corrupt_first_record: bool,
+    ) -> Result<FetchStatus, Error> {
+        let mut sequence = 0;
+        let mut corrupted = corrupt_first_record;
+        for _ in 0..10_000 {
+            let status = fetcher.service()?;
+            if status != FetchStatus::Active {
+                return Ok(status);
+            }
+            pump(
+                fetcher.session_mut().driver(),
+                serving.driver(),
+                &mut sequence,
+            );
+            loop {
+                server.service(serving, connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            if corrupted {
+                if let Some((_, bytes)) = serving.driver().records.first_mut() {
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 1;
+                    corrupted = false;
+                }
+            }
+            pump(
+                serving.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+        }
+        panic!("the fetch did not settle within its round budget");
+    }
+
+    /// Recursively compares two directory trees by structure and bytes.
+    fn assert_same_tree(left: &Path, right: &Path) {
+        let names = |root: &Path| {
+            let mut entries: Vec<_> = fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            entries
+        };
+        let left_entries = names(left);
+        assert_eq!(left_entries, names(right), "differs under {left:?}");
+        for name in left_entries {
+            let (a, b) = (left.join(&name), right.join(&name));
+            if a.is_dir() {
+                assert_same_tree(&a, &b);
+            } else {
+                assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap(), "{a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bundle_round_trips_build_serve_fetch_receive() {
+        // The ADR's step-3 test: everything the CLI builds crosses the wire
+        // and publishes unchanged. A packed pair, a direct object big
+        // enough for several range requests, and an empty file.
+        let source = temporary("trip-source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("a.txt"), patterned(1000)).unwrap();
+        fs::write(source.join("nested/b.bin"), patterned(150_000)).unwrap();
+        fs::write(source.join("big.bin"), patterned(12_600_000)).unwrap();
+        fs::write(source.join("empty.txt"), b"").unwrap();
+        let bundle = temporary("trip-bundle");
+        let built = build_bundle(&source, &bundle).unwrap();
+
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("trip-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let status =
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
+        assert_eq!(status, FetchStatus::Complete);
+        assert_eq!(fetcher.package(), Some(built));
+        assert!(!fetcher.has_backlog());
+
+        // The fetched bundle is the built bundle, byte for byte.
+        assert_same_tree(&bundle, &output);
+
+        // And the existing receive publishes it unchanged.
+        let destination = temporary("trip-destination");
+        let receipt = temporary("trip-receipt.cbor");
+        let report = receive_bundle(
+            &output,
+            &destination,
+            &receipt,
+            &KeyMaterial::Shared(vec![7; 32]),
+            "2026-08-06T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(report.package, built);
+        assert_same_tree(&source, &destination);
+    }
+
+    #[test]
+    fn a_pinned_fetch_refuses_another_package() {
+        let (bundle, _) = built_bundle("pinned", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("pinned-fetched");
+        let mut fetcher =
+            BundleFetcher::begin(Loopback::default(), &output, Some([9; 32])).unwrap();
+        let outcome = run_to_end(&server, &mut session, &mut connection, &mut fetcher, false);
+        assert!(matches!(outcome, Err(Error::RootMismatch)));
+        assert_eq!(
+            fetcher.session_mut().driver().closed,
+            Some(error_code::OBJECT_IDENTITY_MISMATCH)
+        );
+        // And the pinned root it wanted is accepted when it matches.
+        let (server, mut session, mut connection) = serving(&bundle);
+        let accepted = temporary("pinned-accepted");
+        let mut fetcher =
+            BundleFetcher::begin(Loopback::default(), &accepted, Some(server.package().root))
+                .unwrap();
+        let status =
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
+        assert_eq!(status, FetchStatus::Complete);
+    }
+
+    #[test]
+    fn a_tampered_record_ends_the_fetch_as_proof_invalid() {
+        let (bundle, _) = built_bundle("tampered", &[("big.bin", patterned(300_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("tampered-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let outcome = run_to_end(&server, &mut session, &mut connection, &mut fetcher, true);
+        assert!(matches!(outcome, Err(Error::Scheduler(_))));
+        assert_eq!(
+            fetcher.session_mut().driver().closed,
+            Some(error_code::PROOF_INVALID)
+        );
+    }
+
+    #[test]
+    fn a_conflicting_announcement_ends_the_fetch() {
+        let (bundle, _) = built_bundle("conflict", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("conflict-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+
+        // Handshake and announcement arrive.
+        let mut sequence = 0;
+        fetcher.service().unwrap();
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        server.service(&mut session, &mut connection).unwrap();
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+        fetcher.service().unwrap();
+        let descriptor = fetcher.descriptor.clone().expect("announced");
+
+        // An exact duplicate descriptor is idempotent.
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::PackageDescriptor(
+                descriptor.clone(),
+            )));
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+
+        // A conflicting one is not.
+        let mut conflicting = descriptor;
+        conflicting.page_count += 1;
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::PackageDescriptor(conflicting)));
+        let status = fetcher.service().unwrap();
+        assert_eq!(status, FetchStatus::Closed(error_code::MANIFEST_INVALID));
+    }
+
+    #[test]
+    fn a_page_the_seal_never_committed_ends_the_fetch() {
+        let (bundle, _) = built_bundle("badpage", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("badpage-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+
+        let mut sequence = 0;
+        fetcher.service().unwrap();
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        server.service(&mut session, &mut connection).unwrap();
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+        fetcher.service().unwrap();
+        assert!(fetcher.seal_bytes.is_some(), "announcement taken");
+
+        // A well-formed page from a different manifest fails the digest.
+        let (other, _) = built_bundle("badpage-other", &[("b.txt", patterned(2000))]);
+        let foreign = fs::read(other.join("manifest").join(format!("{:016}.cbor", 0))).unwrap();
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::ManifestPage(foreign)));
+        let status = fetcher.service().unwrap();
+        assert_eq!(status, FetchStatus::Closed(error_code::MANIFEST_INVALID));
+    }
+
+    #[test]
+    fn a_disconnect_mid_fetch_is_reported() {
+        let (bundle, _) = built_bundle("dropped", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("dropped-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+
+        // Ready and announced, then the carrier goes away.
+        let mut sequence = 0;
+        fetcher.service().unwrap();
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        server.service(&mut session, &mut connection).unwrap();
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+        fetcher.service().unwrap();
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Disconnected(ConnectionId(3)));
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
+    }
+
+    #[test]
+    fn an_existing_destination_is_refused() {
+        let existing = temporary("occupied");
+        fs::create_dir_all(&existing).unwrap();
+        let outcome = BundleFetcher::begin(Loopback::default(), &existing, None);
+        assert!(matches!(outcome, Err(Error::DestinationExists)));
+    }
+
+    #[test]
+    fn a_backpressured_request_is_held_and_sent() {
+        let (bundle, _) = built_bundle("held", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("held-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+
+        let mut sequence = 0;
+        fetcher.service().unwrap();
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        server.service(&mut session, &mut connection).unwrap();
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+
+        // The pass that takes the seal wants to send the manifest request;
+        // a refusing carrier holds it rather than losing it.
+        fetcher.session_mut().driver().refuse_sends = usize::MAX;
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        assert!(fetcher.has_backlog(), "the request is held");
+        assert!(fetcher.session_mut().driver().control.is_empty());
+
+        fetcher.session_mut().driver().refuse_sends = 0;
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        assert!(!fetcher.has_backlog(), "and sent when the carrier takes it");
+        assert!(!fetcher.session_mut().driver().control.is_empty());
+    }
+
+    #[test]
+    fn spans_chunk_by_the_codec_bounds() {
+        assert_eq!(manifest_spans(1), vec![(0, 1)]);
+        assert_eq!(
+            manifest_spans(MAX_MANIFEST_REQUEST_PAGES),
+            vec![(0, MAX_MANIFEST_REQUEST_PAGES)]
+        );
+        assert_eq!(
+            manifest_spans(MAX_MANIFEST_REQUEST_PAGES + 1),
+            vec![
+                (0, MAX_MANIFEST_REQUEST_PAGES),
+                (MAX_MANIFEST_REQUEST_PAGES, 1),
+            ]
+        );
+        assert_eq!(range_spans(1), vec![(0, 1)]);
+        assert_eq!(
+            range_spans(MAX_REQUESTED_RANGE),
+            vec![(0, MAX_REQUESTED_RANGE)]
+        );
+        assert_eq!(
+            range_spans(MAX_REQUESTED_RANGE + 1),
+            vec![(0, MAX_REQUESTED_RANGE), (MAX_REQUESTED_RANGE, 1)]
+        );
+        assert_eq!(
+            range_spans(3 * MAX_REQUESTED_RANGE - 1),
+            vec![
+                (0, MAX_REQUESTED_RANGE),
+                (MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE),
+                (2 * MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE - 1),
+            ]
+        );
+    }
+}

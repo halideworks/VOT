@@ -26,11 +26,17 @@ mod drive;
 mod fetch;
 #[cfg(test)]
 mod harness;
+#[cfg(not(feature = "wire"))]
+mod nowire;
 mod serve;
 #[cfg(feature = "wire")]
 mod wire;
 
 pub use drive::{Engine, ServeSession, drive};
+pub use fetch::{BundleFetcher, FetchStatus};
+#[cfg(not(feature = "wire"))]
+pub use nowire::{fetch_bundle, serve_bundle};
+pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
 pub use wire::{fetch_bundle, serve_bundle};
 
@@ -64,40 +70,6 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
     }
     Ok(root)
 }
-
-/// Without the carrier, a wire command names the feature it needs rather
-/// than failing as though the arguments were wrong.
-#[cfg(not(feature = "wire"))]
-pub fn serve_bundle(
-    _bundle: &Path,
-    _address: std::net::SocketAddr,
-    _credentials: &Credentials,
-    _sessions: Option<u32>,
-    _listening: impl FnMut(std::net::SocketAddr),
-) -> Result<PackageSummary, Error> {
-    Err(Error::WireUnsupported)
-}
-
-/// See [`serve_bundle`].
-#[cfg(not(feature = "wire"))]
-pub fn fetch_bundle(
-    _address: std::net::SocketAddr,
-    _bundle: &Path,
-    _pin: Option<[u8; 32]>,
-) -> Result<PackageSummary, Error> {
-    Err(Error::WireUnsupported)
-}
-
-/// How a wire session authenticates, which is not at all.
-///
-/// ADR-0030: the channel is unauthenticated and the help text says so.
-/// The nonce is the server's freshness for the handshake, not a secret.
-#[cfg(feature = "wire")]
-fn wire_authentication() -> vot_session::Authentication {
-    vot_session::Authentication::NotRequired { nonce: [0; 32] }
-}
-pub use fetch::{BundleFetcher, FetchStatus};
-pub use serve::{BundleServer, ServeConnection, ServeStatus};
 
 /// The seal's page digests by index, refusing a commitment list that does
 /// not name exactly the sealed pages in order. Shared by the serve side,

@@ -36,7 +36,14 @@ const BUSY_BOUND: Duration = Duration::from_millis(1);
 /// it back, so it only ends a session where nothing is happening. Counted
 /// in the loop's own body rather than measured against a clock, because a
 /// slow machine is not a stuck one.
-const STALLED_PASSES: u32 = 4096;
+///
+/// At the idle bound this is about half a minute of silence, which is
+/// already past where a live carrier gives up on its own: quiche's idle
+/// timeout is thirty seconds and reports a disconnect, which settles the
+/// loop. So this is the backstop for a carrier with no timeout of its
+/// own, and a longer one would only make a wedged session take longer to
+/// say so.
+const STALLED_PASSES: u32 = 600;
 
 /// One end of a session: a pass to make, a way to say the pass settled it,
 /// and the carrier to wait on.
@@ -245,24 +252,64 @@ mod tests {
     fn the_engines_answer_the_loop_from_their_own_state() {
         use crate::harness::{Loopback, built_bundle, not_required, patterned};
 
+        use crate::harness::pump;
+
         let (bundle, _) = built_bundle("engine", &[("a.txt", patterned(1000))]);
         let output = crate::tests::temporary("engine-fetched");
         let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         // Nothing prepared and nothing taken, before a pass.
         assert!(!Engine::has_backlog(&fetcher));
         assert_eq!(Engine::progress(&fetcher), 0);
-        // A carrier that takes nothing leaves the handshake in the queue.
-        fetcher.session_mut().driver().refuse_sends = usize::MAX;
-        assert_eq!(fetcher.service().unwrap(), crate::FetchStatus::Active);
 
         let server = crate::BundleServer::open(&bundle).unwrap();
         let mut serving =
             ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
         assert!(!Engine::has_backlog(&serving));
         assert_eq!(Engine::progress(&serving), 0);
-        // A ready session announces, which is an answer queued and taken.
+
+        // One round between them: each end reports what it settled as its
+        // own progress, which is what tells the loop a slow session from a
+        // stopped one.
+        let mut sequence = 0;
+        Engine::service(&mut fetcher).unwrap();
+        pump(
+            fetcher.session_mut().driver(),
+            serving.session.driver(),
+            &mut sequence,
+        );
+        // Its carrier takes nothing on the pass it announces, so what it
+        // prepared stays held: that is the backlog it reports, and queuing
+        // it is the progress it reports.
         serving.session.driver().refuse_sends = usize::MAX;
-        let _ = Engine::service(&mut serving);
+        Engine::service(&mut serving).unwrap();
+        assert!(
+            Engine::progress(&serving) > 0,
+            "the server queued answers and reported none"
+        );
+        assert!(
+            Engine::has_backlog(&serving),
+            "answers the carrier refused are backlog"
+        );
+        serving.session.driver().refuse_sends = 0;
+        Engine::service(&mut serving).unwrap();
+        pump(
+            serving.session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+        // The pass that takes the announcement asks for the manifest, and
+        // a carrier that takes nothing leaves that request held, which is
+        // the backlog this end reports.
+        fetcher.session_mut().driver().refuse_sends = usize::MAX;
+        Engine::service(&mut fetcher).unwrap();
+        assert!(
+            Engine::progress(&fetcher) > 0,
+            "the fetch took frames and reported none"
+        );
+        assert!(
+            Engine::has_backlog(&fetcher),
+            "a request the carrier refused is backlog"
+        );
 
         crate::harness::discard(&[&bundle, &output]);
     }

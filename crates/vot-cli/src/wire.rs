@@ -14,6 +14,14 @@ use vot_transport_quiche::live::{Config, Transport};
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession, drive};
 
+/// How a wire session authenticates, which is not at all.
+///
+/// ADR-0030: the channel is unauthenticated and the help text says so.
+/// The nonce is the server's freshness for the handshake, not a secret.
+fn authentication() -> vot_session::Authentication {
+    vot_session::Authentication::NotRequired { nonce: [0; 32] }
+}
+
 /// What a session may hold inbound, matched to what the codec settings the
 /// engines use will let a peer send.
 fn limits() -> Result<ReceiveLimits, Error> {
@@ -155,7 +163,7 @@ pub fn serve_bundle(
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
-        let mut session = ServeSession::begin(&server, carrier, crate::wire_authentication())?;
+        let mut session = ServeSession::begin(&server, carrier, authentication())?;
         drive(&mut session)?;
         answered += 1;
     }

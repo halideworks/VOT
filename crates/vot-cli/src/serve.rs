@@ -197,6 +197,16 @@ impl ServeConnection {
         !self.pending.is_empty() || self.manifest_cursor.is_some()
     }
 
+    /// Records the close and forgets what was owed: nothing queued goes to a
+    /// carrier that ended, and a lingering backlog would tell a driving loop
+    /// to keep servicing a session that cannot progress.
+    fn close_with(&mut self, code: u16) {
+        self.closed = Some(code);
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.manifest_cursor = None;
+    }
+
     /// Admits a request as new or an exact replay, which is re-answered.
     fn admit_request(
         &mut self,
@@ -264,10 +274,7 @@ impl ServeConnection {
                     // cannot fit; this server does not resize its answers, so
                     // the session ends under the code that names the problem.
                     let _ = session.driver().close(error_code::FRAME_TOO_LARGE);
-                    self.closed = Some(error_code::FRAME_TOO_LARGE);
-                    self.pending.clear();
-                    self.pending_bytes = 0;
-                    self.manifest_cursor = None;
+                    self.close_with(error_code::FRAME_TOO_LARGE);
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -289,7 +296,7 @@ fn fail<A: TransportAdapter>(
             // The session cannot say why, so the carrier does; a simulator
             // records it instead.
             let _ = session.driver().close(code);
-            connection.closed = Some(code);
+            connection.close_with(code);
             Ok(ServeStatus::Closed(code))
         }
         Fault::Local(error) => {
@@ -297,7 +304,7 @@ fn fail<A: TransportAdapter>(
                 // The peer is otherwise left waiting on an answer this
                 // server detected it must not give.
                 let _ = session.driver().close(error_code::SOURCE_MUTATED);
-                connection.closed = Some(error_code::SOURCE_MUTATED);
+                connection.close_with(error_code::SOURCE_MUTATED);
             }
             Err(error)
         }
@@ -1603,6 +1610,132 @@ mod tests {
         assert_eq!(status, ServeStatus::Active);
         assert_eq!(served_answers(&mut session).len(), 1);
         assert!(session.driver().closed.is_none());
+    }
+
+    #[test]
+    fn a_conflict_on_an_older_remembered_request_is_still_caught() {
+        let (bundle, _) = built_bundle("older", &[("a.txt", patterned(1000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+
+        // Two distinct requests, then a conflict on the older one: the
+        // window has to hold more than the newest entry to catch it.
+        for (identifier, length) in [([1; 16], 1u64), ([2; 16], 1), ([1; 16], 2)] {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                    request_id: identifier,
+                    object,
+                    offset: 0,
+                    length,
+                })));
+        }
+        let status = server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(status, ServeStatus::Closed(error_code::REPLAY_REJECTED));
+        assert!(!connection.has_backlog(), "a close forgets what was owed");
+    }
+
+    #[test]
+    fn entries_sharing_one_stored_object_are_served_from_one_layer() {
+        // Identical files name the same direct object; open has to read that
+        // as one served object, not a conflict.
+        let (bundle, _) = built_bundle(
+            "shared",
+            &[
+                ("a.bin", patterned(300_000)),
+                ("copy.bin", patterned(300_000)),
+            ],
+        );
+        let server = BundleServer::open(&bundle).unwrap();
+        let objects: Vec<frames::ObjectId> = server
+            .objects
+            .values()
+            .map(|served| served.object)
+            .collect();
+        let direct: Vec<&frames::ObjectId> = objects
+            .iter()
+            .filter(|object| object.length == 300_000)
+            .collect();
+        assert_eq!(direct.len(), 1, "two identical entries, one stored object");
+
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [1; 16],
+                object: *direct[0],
+                offset: 0,
+                length: direct[0].length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let answers = served_answers(&mut session);
+        assert_eq!(answers.len(), 1);
+        let bytes = verified_bytes(*direct[0], &answers[0].0, &answers[0].1);
+        assert_eq!(bytes, patterned(300_000));
+    }
+
+    #[test]
+    fn a_spilled_manifest_is_served_page_by_page_in_order() {
+        // One entry past the per-page cap spills the manifest to two pages.
+        let files: Vec<(String, Vec<u8>)> = (0..=vot_manifest::MAX_ENTRIES_PER_PAGE)
+            .map(|index| {
+                (
+                    format!("f{index:05}"),
+                    vec![u8::try_from(index % 251).unwrap()],
+                )
+            })
+            .collect();
+        let named: Vec<(&str, Vec<u8>)> = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect();
+        let (bundle, _) = built_bundle("spilled", &named);
+        let server = BundleServer::open(&bundle).unwrap();
+        assert_eq!(server.page_count, 2, "the manifest spilled");
+
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        connection.budget = 1;
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::ManifestRequest(
+                ManifestRequest {
+                    request_id: [1; 16],
+                    manifest_id: server.manifest_id,
+                    first_page: 0,
+                    page_count: 2,
+                },
+            )));
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        assert!(connection.has_backlog(), "both pages are still owed");
+
+        // One page per pass under a one-byte budget, in index order.
+        for index in 0..2u64 {
+            server.service(&mut session, &mut connection).unwrap();
+            let sent = std::mem::take(&mut session.driver().control);
+            assert_eq!(sent.len(), 1, "page {index} arrives alone");
+            let TypedFrame::ManifestPage(bytes) = decode_control(&sent[0]) else {
+                panic!("a page answer that is not a page");
+            };
+            assert_eq!(
+                bytes,
+                fs::read(bundle.join(format!("manifest/{index:016}.cbor"))).unwrap()
+            );
+        }
+        assert!(!connection.has_backlog(), "nothing further is owed");
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(session.driver().control.is_empty(), "and nothing repeats");
     }
 
     #[test]

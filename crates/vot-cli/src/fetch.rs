@@ -369,6 +369,21 @@ fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
 }
 
 impl<A: TransportAdapter> BundleFetcher<A> {
+    /// Sets how many provers this fetch runs, or none to prove on the
+    /// session's own thread.
+    ///
+    /// # Errors
+    /// Surfaces a deferred bound the receiver refuses.
+    pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
+        self.proving_threads = threads;
+        self.receiver.defer_proving(threads > 0);
+        if threads > 0 {
+            self.receiver
+                .set_deferred_limit(threads.saturating_add(1))?;
+        }
+        Ok(())
+    }
+
     /// Opens the session and the bundle directory the fetch will fill.
     ///
     /// The optional pin is the package root this fetch will accept; without

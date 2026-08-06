@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use vot_transport_api::ReceiveLimits;
 use vot_transport_quiche::live::{Config, Transport};
@@ -22,6 +23,13 @@ fn limits() -> Result<ReceiveLimits, Error> {
     )
     .map_err(|_| Error::InvalidArguments)
 }
+
+/// Tells one set of credentials from another in the same process.
+///
+/// Two servers in one process would otherwise write the same two paths:
+/// the second fails to create them, and whichever is dropped first takes
+/// the other's away.
+static EPHEMERAL: AtomicU64 = AtomicU64::new(0);
 
 /// Where an ephemeral certificate and key are written.
 ///
@@ -61,7 +69,11 @@ impl Ephemeral {
             .self_signed(&key)
             .map_err(|_| Error::InvalidArguments)?;
 
-        let directory = std::env::temp_dir().join(format!("vot-serve-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "vot-serve-{}-{}",
+            std::process::id(),
+            EPHEMERAL.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&directory)?;
         let written = Self {
             certificate: directory.join("cert.pem"),

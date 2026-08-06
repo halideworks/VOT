@@ -443,7 +443,7 @@ impl ManifestSpool {
         };
         let encoded = encode_seal(&seal).map_err(|_| Error::InvalidBundle)?;
         write_new_synced(&self.directory.join(MANIFEST_SEAL), &encoded)?;
-        File::open(&self.directory)?.sync_all()?;
+        sync_directory(&self.directory)?;
         Ok(())
     }
 
@@ -752,8 +752,8 @@ pub fn build_bundle_with_suite(
 
     let summary = package.finish()?;
     manifest.finish(summary)?;
-    File::open(&objects)?.sync_all()?;
-    File::open(bundle)?.sync_all()?;
+    sync_directory(&objects)?;
+    sync_directory(bundle)?;
     Ok(summary)
 }
 
@@ -900,7 +900,7 @@ pub fn receive_bundle(
         &mut owned_receipt,
         &mut owned_summary,
         |parent| {
-            File::open(parent)?.sync_all()?;
+            sync_directory(parent)?;
             Ok(())
         },
     )?;
@@ -1269,7 +1269,7 @@ fn sync_directories(root: &Path) -> Result<usize, Error> {
     }
     let count = directories.len();
     for directory in directories.into_iter().rev() {
-        File::open(directory)?.sync_all()?;
+        sync_directory(&directory)?;
     }
     Ok(count)
 }
@@ -1448,7 +1448,7 @@ fn recover_prepared_receipts(
         if summary_prepared {
             remove_preparation(&prepared_summary)?;
         }
-        File::open(parent_directory(receipt))?.sync_all()?;
+        sync_directory(parent_directory(receipt))?;
         return Ok(true);
     }
     match (
@@ -1567,10 +1567,10 @@ fn finalize_prepared_receipts(
 ) -> Result<(), Error> {
     link_or_match(prepared_receipt, receipt, 65_536)?;
     link_or_match(prepared_summary, summary, 4096)?;
-    File::open(parent_directory(receipt))?.sync_all()?;
+    sync_directory(parent_directory(receipt))?;
     fs::remove_file(prepared_receipt)?;
     fs::remove_file(prepared_summary)?;
-    File::open(parent_directory(receipt))?.sync_all()?;
+    sync_directory(parent_directory(receipt))?;
     Ok(())
 }
 
@@ -1639,6 +1639,27 @@ use windows_rename_noreplace as atomic_rename_noreplace;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use unsupported_rename_noreplace as atomic_rename_noreplace;
+
+/// Makes a directory's own entries durable, once the files in it are.
+#[cfg(not(windows))]
+fn sync_directory(directory: &Path) -> Result<(), Error> {
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+/// Windows has no directory fsync, and asking for one is not a no-op that
+/// fails quietly: a directory cannot be opened as a file there without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, so `File::open` returns `PermissionDenied`
+/// and every write path that ends in one of these failed outright. NTFS logs
+/// a directory entry with the data it names, so what the unix call makes
+/// durable is already durable here.
+#[cfg(windows)]
+fn windows_sync_directory(_directory: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(windows)]
+use windows_sync_directory as sync_directory;
 
 fn staging_path(destination: &Path) -> Result<PathBuf, Error> {
     let name = destination
@@ -1851,6 +1872,15 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    /// The call has to reach the filesystem on the platforms that have it.
+    /// An fsync that quietly does nothing reads the same as one that worked,
+    /// right up until the power goes.
+    #[test]
+    #[cfg(not(windows))]
+    fn syncing_a_directory_that_is_not_there_says_so() {
+        assert!(sync_directory(&temporary("absent-directory")).is_err());
     }
 
     #[test]

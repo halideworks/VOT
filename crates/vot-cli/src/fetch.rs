@@ -124,10 +124,14 @@ pub struct BundleFetcher<A: TransportAdapter> {
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
+///
+/// Counted by what the page count needs, not by the cursor: a span that
+/// does not advance would otherwise grow this until the allocator gave up,
+/// and the seal that gave the count is what bounds the answer.
 fn manifest_spans(page_count: u64) -> Vec<(u64, u64)> {
     let mut spans = Vec::new();
     let mut first = 0;
-    while first < page_count {
+    for _ in 0..page_count.div_ceil(MAX_MANIFEST_REQUEST_PAGES) {
         let count = MAX_MANIFEST_REQUEST_PAGES.min(page_count - first);
         spans.push((first, count));
         first += count;
@@ -742,7 +746,7 @@ mod tests {
     ) -> FetchStatus {
         let status = fetcher.service().unwrap();
         pump(fetcher.session_mut().driver(), serving.driver(), sequence);
-        loop {
+        for _ in 0..ROUND_BUDGET {
             server.service(serving, connection).unwrap();
             if !connection.has_backlog() {
                 break;

@@ -145,6 +145,13 @@ impl vot_scheduler::RangeSink for CountingSink {
 /// the witness goes back through `SessionReceiver::settle`.
 const DEFAULT_PROVING_THREADS: usize = 4;
 
+/// How long a pass waits for a prover it is already owed.
+///
+/// Only reached when the pass would otherwise book nothing, and the work
+/// is this end's own and already in hand, so it bounds a wait that is
+/// about to end rather than setting a poll interval.
+const PROVER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// What a prover is handed: a bundle to prove and where its bytes go.
 struct Proving {
     completed: CompletedBundle,
@@ -595,13 +602,19 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // that returned without it would spin until a prover was scheduled.
         let mut outcome = Ok(());
         let mut booked = 0_usize;
-        while let Ok(result) = pool.proved.try_recv().or_else(|_| {
-            if booked == 0 && pool.in_flight > 0 {
-                pool.proved.recv()
+        // Bounded by what is out with a prover, so the walk ends whatever a
+        // mutation does to the condition inside it. An unbounded `recv` here
+        // hung three mutants for three minutes apiece, which on a CI runner
+        // is a killed job rather than a reported survivor.
+        for _ in 0..=pool.in_flight {
+            let result = if booked == 0 && pool.in_flight > 0 {
+                pool.proved.recv_timeout(PROVER_WAIT).ok()
             } else {
-                Err(mpsc::RecvError)
-            }
-        }) {
+                pool.proved.try_recv().ok()
+            };
+            let Some(result) = result else {
+                break;
+            };
             booked += 1;
             pool.in_flight = pool.in_flight.saturating_sub(1);
             match result {

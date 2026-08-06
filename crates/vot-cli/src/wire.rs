@@ -62,9 +62,30 @@ fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
 }
 
 /// The parse half of the pin, apart from the environment that feeds it.
+///
+/// Validated against the carrier's own bounds here, where the refusal can
+/// name the argument: left to the carrier it surfaces as an unavailable
+/// endpoint, which reads as a network problem rather than a typo.
 fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
-    config.max_datagram_bytes = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    let bytes: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    let bounds = vot_transport_quiche::live::MIN_DATAGRAM_SIZE
+        ..=vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+    if !bounds.contains(&bytes) {
+        return Err(Error::InvalidArguments);
+    }
+    config.max_datagram_bytes = bytes;
     Ok(())
+}
+
+/// What a carrier's failure means to the command that asked for it.
+///
+/// A configuration the carrier refuses is an argument problem and says
+/// so; everything else is the endpoint itself.
+fn carrier_failure(error: vot_transport_api::Error) -> Error {
+    match error {
+        vot_transport_api::Error::InvalidConfiguration => Error::InvalidArguments,
+        _ => Error::CarrierUnavailable,
+    }
 }
 
 /// Tells one set of credentials from another in the same process.
@@ -195,7 +216,7 @@ pub fn serve_bundle(
     while sessions.is_none_or(|bound| answered < bound) {
         // `serve` waits for a connection on its own thread, so one
         // endpoint is one session here.
-        let carrier = Transport::serve(address, &config).map_err(|_| Error::CarrierUnavailable)?;
+        let carrier = Transport::serve(address, &config).map_err(carrier_failure)?;
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
@@ -222,7 +243,7 @@ pub fn fetch_bundle(
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-        .map_err(|_| Error::CarrierUnavailable)?;
+        .map_err(carrier_failure)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
     let status = drive(&mut fetcher)?;
     match status {
@@ -242,6 +263,21 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn a_carrier_refusing_its_configuration_names_the_argument() {
+        // The one refusal a user can fix in a command must not read as a
+        // network problem, and everything else must: the map is the whole
+        // difference between "fix the value" and "check the host".
+        assert!(matches!(
+            carrier_failure(vot_transport_api::Error::InvalidConfiguration),
+            Error::InvalidArguments
+        ));
+        assert!(matches!(
+            carrier_failure(vot_transport_api::Error::Backend),
+            Error::CarrierUnavailable
+        ));
+    }
+
+    #[test]
     fn the_datagram_ceiling_is_the_value_given_or_the_default() {
         // The parse half, apart from the process environment: a test that
         // set the real variable would race the socket test in this module.
@@ -258,6 +294,12 @@ mod tests {
             config.max_datagram_bytes, unset,
             "a refused value changes nothing"
         );
+        // Numeric and still wrong: outside what the carrier can carry is
+        // refused here, where the error names the argument, not later as
+        // an unavailable endpoint.
+        assert!(apply_datagram_value(&mut config, "0").is_err());
+        assert!(apply_datagram_value(&mut config, "70000").is_err());
+        assert_eq!(config.max_datagram_bytes, unset);
         // And with nothing set, the ceiling opens all the way for
         // discovery to settle under, which is the seamless default.
         assert!(

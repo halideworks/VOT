@@ -42,7 +42,7 @@ const MAX_DATAGRAM_SIZE: usize = 1_472;
 ///
 /// QUIC requires an endpoint to carry a 1200-byte initial datagram, so anything
 /// under this cannot complete a handshake.
-const MIN_DATAGRAM_SIZE: usize = 1_200;
+pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 
 /// What the socket asks the kernel to hold in each direction.
 ///

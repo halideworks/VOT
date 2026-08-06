@@ -27,17 +27,25 @@ use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAd
 use crate::serve::is_backpressure;
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
-/// Ranges the fetcher keeps in flight per object, priced into staging.
+/// Range requests the fetcher keeps queued, and the covers it prices into
+/// staging for them.
 ///
-/// The server answers sequentially under its own budget, so this bounds
-/// what the receiver may hold mid-verification rather than what the wire
-/// carries. Two covers keeps verification busy while one drains to a sink.
-const OUTSTANDING_COVERS: u64 = 2;
+/// An object has no bound worth queueing whole: at four mebibytes a
+/// request, a large one is hundreds of thousands of frames built before
+/// the first is sent. So the fetcher issues this many and no more, and
+/// refills as the carrier takes them. Two keeps the next request already
+/// at the server while it answers the current one, which is what the wire
+/// needs; the server's own outbound budget paces the answers.
+const OUTSTANDING_COVERS: usize = 2;
 
-/// What the receiver may stage: the outstanding covers plus the verifier's
-/// group reservation.
-const FETCH_STAGING_BYTES: u64 =
-    OUTSTANDING_COVERS * vot_scheduler::MAX_PROOF_RANGE_BYTES + vot_verifier::GROUP_SIZE as u64;
+/// The credit this end advertises: the covers it asked for, which is what
+/// the server may have in flight towards it.
+const FETCH_CREDIT_BYTES: u64 = OUTSTANDING_COVERS as u64 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
+
+/// What the receiver may stage: that credit plus the verifier's group
+/// reservation, so a cover arriving at the advertised limit still has room
+/// to be verified rather than refused.
+const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE as u64;
 
 /// What one fetch pass left the session as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +88,8 @@ struct FetchPlan {
     /// The sink the current object's verified ranges flow into, kept for
     /// the sync that makes its bytes durable before the fetch moves on.
     active: Option<Arc<FileSink>>,
+    /// Where the current object's next range request starts.
+    next_offset: u64,
     finished: bool,
 }
 
@@ -114,19 +124,13 @@ fn manifest_spans(page_count: u64) -> Vec<(u64, u64)> {
     spans
 }
 
-/// Range spans of at most what one `RANGE_REQUEST` may ask for.
+/// The span to ask for at `offset`, at most what one `RANGE_REQUEST` may
+/// carry, or `None` once the object is covered.
 ///
-/// The spans start on group-aligned boundaries, so every cover is exactly
-/// its request and nothing is proved or carried twice.
-fn range_spans(length: u64) -> Vec<(u64, u64)> {
-    let mut spans = Vec::new();
-    let mut offset = 0;
-    while offset < length {
-        let take = MAX_REQUESTED_RANGE.min(length - offset);
-        spans.push((offset, take));
-        offset += take;
-    }
-    spans
+/// Spans start on group-aligned boundaries, so every cover is exactly its
+/// request and nothing is proved or carried twice.
+fn range_span(offset: u64, length: u64) -> Option<(u64, u64)> {
+    (offset < length).then(|| (offset, MAX_REQUESTED_RANGE.min(length - offset)))
 }
 
 fn subject_of(planned: &PlannedObject) -> SubjectId {
@@ -163,11 +167,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             Authentication::NotRequired { nonce: [0; 32] },
         );
         session.begin()?;
-        let receiver = ReliableReceiver::new(
-            FETCH_STAGING_BYTES,
-            FETCH_STAGING_BYTES,
-            FETCH_STAGING_BYTES,
-        )?;
+        let receiver =
+            ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
         Ok(Self {
             receiver: SessionReceiver::new(session, receiver),
             bundle: bundle.to_owned(),
@@ -196,10 +197,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.receiver.session_mut()
     }
 
-    /// Whether requests are still owed to the carrier.
+    /// Whether requests are queued for the carrier or still to be issued,
+    /// either of which is work another pass can do without waiting.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.owes_ranges()
     }
 
     /// One pass over what the carrier holds: drains queued requests, takes
@@ -227,6 +229,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             }
         }
         self.advance()?;
+        self.drain()?;
+        // Refilled after the drain, so what the carrier just took is what
+        // makes room for the next request rather than the queue growing.
+        self.issue_ranges()?;
         self.drain()?;
         self.receiver.session_mut().flush()?;
         if self.complete() {
@@ -499,6 +505,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             objects,
             current: 0,
             active: None,
+            next_offset: 0,
             finished: false,
         });
         Ok(())
@@ -542,24 +549,58 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 continue;
             }
             let subject = subject_of(planned);
-            let object = planned.object;
-            let sink = Arc::new(FileSink::create(&path, object.length)?);
+            let sink = Arc::new(FileSink::create(&path, planned.object.length)?);
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
-            for (offset, length) in range_spans(object.length) {
-                let request_id = Self::request_identifier(&mut self.next_request)?;
-                Self::queue_request(
-                    &mut self.pending,
-                    &TypedFrame::RangeRequest(RangeRequest {
-                        request_id,
-                        object,
-                        offset,
-                        length,
-                    }),
-                )?;
-            }
             plan.active = Some(sink);
+            plan.next_offset = 0;
+            self.issue_ranges()?;
             return Ok(());
         }
+    }
+
+    /// Tops the queue back up to [`OUTSTANDING_COVERS`] requests for the
+    /// object being fetched, so an object of any length is asked for a
+    /// couple of covers at a time rather than all at once.
+    fn issue_ranges(&mut self) -> Result<(), Error> {
+        let Some(plan) = &mut self.plan else {
+            return Ok(());
+        };
+        if plan.active.is_none() {
+            return Ok(());
+        }
+        let object = plan
+            .objects
+            .get(plan.current)
+            .ok_or(Error::InvalidBundle)?
+            .object;
+        while self.pending.len() < OUTSTANDING_COVERS {
+            let Some((offset, length)) = range_span(plan.next_offset, object.length) else {
+                return Ok(());
+            };
+            let request_id = Self::request_identifier(&mut self.next_request)?;
+            Self::queue_request(
+                &mut self.pending,
+                &TypedFrame::RangeRequest(RangeRequest {
+                    request_id,
+                    object,
+                    offset,
+                    length,
+                }),
+            )?;
+            plan.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the object being fetched still has ranges left to ask for.
+    fn owes_ranges(&self) -> bool {
+        self.plan.as_ref().is_some_and(|plan| {
+            plan.active.is_some()
+                && plan
+                    .objects
+                    .get(plan.current)
+                    .is_some_and(|planned| plan.next_offset < planned.object.length)
+        })
     }
 }
 
@@ -597,6 +638,12 @@ mod tests {
         let mut corrupted = corrupt_first_record;
         for _ in 0..10_000 {
             let status = fetcher.service()?;
+            // However long the objects are, the fetch asks for a couple of
+            // covers at a time rather than queueing an object whole.
+            assert!(
+                fetcher.pending.len() <= OUTSTANDING_COVERS,
+                "the request queue outgrew its cap"
+            );
             if status != FetchStatus::Active {
                 return Ok(status);
             }
@@ -895,17 +942,25 @@ mod tests {
                 (MAX_MANIFEST_REQUEST_PAGES, 1),
             ]
         );
-        assert_eq!(range_spans(1), vec![(0, 1)]);
+        // Walking the cursor covers the object exactly once, and stops.
+        let walk = |length| {
+            let mut spans = Vec::new();
+            let mut offset = 0;
+            while let Some((at, take)) = range_span(offset, length) {
+                spans.push((at, take));
+                offset = at + take;
+            }
+            spans
+        };
+        assert_eq!(walk(0), vec![]);
+        assert_eq!(walk(1), vec![(0, 1)]);
+        assert_eq!(walk(MAX_REQUESTED_RANGE), vec![(0, MAX_REQUESTED_RANGE)]);
         assert_eq!(
-            range_spans(MAX_REQUESTED_RANGE),
-            vec![(0, MAX_REQUESTED_RANGE)]
-        );
-        assert_eq!(
-            range_spans(MAX_REQUESTED_RANGE + 1),
+            walk(MAX_REQUESTED_RANGE + 1),
             vec![(0, MAX_REQUESTED_RANGE), (MAX_REQUESTED_RANGE, 1)]
         );
         assert_eq!(
-            range_spans(3 * MAX_REQUESTED_RANGE - 1),
+            walk(3 * MAX_REQUESTED_RANGE - 1),
             vec![
                 (0, MAX_REQUESTED_RANGE),
                 (MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE),

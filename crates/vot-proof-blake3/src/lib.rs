@@ -147,9 +147,11 @@ impl GroupCvs {
     ///
     /// A sender that keeps only chaining values cannot otherwise tell that
     /// the object it proves from has been rewritten under it, because a
-    /// rewrite that keeps the length reads back at the same offsets. The
-    /// chaining value is recomputed at the offset the index puts the group
-    /// at, which is what makes moved bytes a mismatch rather than a match.
+    /// rewrite that keeps the length reads back at the same offsets. What
+    /// catches the rewrite is the group's content, as it is in the SHA-256
+    /// layer too. The offset is recomputed from the index because a
+    /// chaining value carries the position it was taken at: taken at any
+    /// other offset it would refuse the object's own bytes.
     #[must_use]
     pub fn holds(&self, index: usize, group: &[u8]) -> bool {
         let Some(cv) = self.cvs.get(index) else {
@@ -535,17 +537,17 @@ mod tests {
         altered[last] ^= 1;
         assert!(!cvs.holds(1, &altered));
 
-        // A group carries where it is as well as what it says: an object of
-        // three identical groups still gets three different chaining
-        // values. That is the property, and identical bytes are the only
-        // case that shows it, because anywhere the bytes differ content
-        // alone would have answered.
+        // A chaining value carries the offset it was taken at, so an object
+        // of three identical groups still gets three different ones. That
+        // is why the loop above passes at every index rather than only the
+        // first: `holds` recomputes at the index's own offset, and at any
+        // other offset it would refuse the object's own bytes.
         let repeated = vec![7u8; 3 * GROUP_SIZE as usize];
         let same = cvs_of(&repeated);
         assert_ne!(same.cvs[0], same.cvs[1]);
         assert_ne!(same.cvs[1], same.cvs[2]);
-        // So each index holds its own bytes, and a group moved to another
-        // index is a mismatch there.
+        // Bytes that are not what the layer took at an index are refused
+        // there, which is the content answering, not the offset.
         assert!(!cvs.holds(0, groups[1]));
         assert!(!cvs.holds(2, groups[1]));
 

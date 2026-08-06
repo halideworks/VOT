@@ -742,7 +742,7 @@ impl ServedObject {
     /// descriptor each would refuse a large bundle at open for no reason a
     /// peer could see.
     fn read_covered(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
-        let mut file = File::open(&self.path)?;
+        let mut file = File::open(&self.path).map_err(missing_object)?;
         file.seek(SeekFrom::Start(offset))?;
         let size = usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
         let mut plaintext = vec![0u8; size];
@@ -754,6 +754,18 @@ impl ServedObject {
             return Err(Error::SourceMutation);
         }
         Ok(plaintext)
+    }
+}
+
+/// An object that has gone since open changed under the server, the same
+/// answer a shortened one gets, so the peer is told why rather than left
+/// waiting on an answer it will not get. Anything else is this host's own
+/// trouble and keeps its cause.
+fn missing_object(error: io::Error) -> Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        Error::SourceMutation
+    } else {
+        Error::Io(error)
     }
 }
 
@@ -1832,6 +1844,37 @@ mod tests {
             .unwrap()
             .read_covered(0, GROUP_SIZE as u64);
         assert!(matches!(outcome, Err(Error::SourceMutation)));
+    }
+
+    #[test]
+    fn an_object_removed_after_open_is_reported_and_closed() {
+        // Covers are read per answer, so an object can go between open and
+        // the request for it. That is the source changing under the server
+        // as much as a shortened one is, and the peer is owed the reason.
+        let (bundle, _) = built_bundle("removed", &[("big.bin", patterned(150_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        fs::remove_file(
+            bundle
+                .join("objects")
+                .join(crate::object_name(&object.root)),
+        )
+        .unwrap();
+
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [1; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        let outcome = server.service(&mut session, &mut connection);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+        assert_eq!(session.driver().closed, Some(error_code::SOURCE_MUTATED));
     }
 
     #[test]

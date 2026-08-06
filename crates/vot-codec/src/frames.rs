@@ -7,7 +7,9 @@ use super::{DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, f
 const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 const GROUP_BYTES: u64 = 65_536;
 
-const MAX_REQUESTED_RANGE: u64 = 4_194_304;
+/// The most one `RANGE_REQUEST` may ask for, so a requester paces itself
+/// by the same number the decoder holds it to.
+pub const MAX_REQUESTED_RANGE: u64 = 4_194_304;
 
 /// What a covered range can reach, which is not a rule of its own.
 ///
@@ -26,7 +28,9 @@ const MAX_COVERED_RANGE: u64 = MAX_REQUESTED_RANGE + GROUP_BYTES;
 const _: () = assert!(MAX_COVERED_RANGE == 4_259_840);
 const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DATA_BYTES: usize = 256 * 1024;
-const MAX_MANIFEST_REQUEST_PAGES: u64 = 8_192;
+/// The most pages one `MANIFEST_REQUEST` may name, so a requester chunks
+/// by the same number the decoder holds it to.
+pub const MAX_MANIFEST_REQUEST_PAGES: u64 = 8_192;
 const MAX_HAVE_RUNS: u64 = 2_097_152;
 
 /// The most records one bundle can declare, from `spec/proof-bundle.cddl`.

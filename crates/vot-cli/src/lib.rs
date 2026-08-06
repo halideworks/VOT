@@ -22,9 +22,31 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+mod fetch;
+#[cfg(test)]
+mod harness;
 mod serve;
 
+pub use fetch::{BundleFetcher, FetchStatus};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
+
+/// The seal's page digests by index, refusing a commitment list that does
+/// not name exactly the sealed pages in order. Shared by the serve side,
+/// which answers from these digests, and the fetch side, which holds every
+/// received page to them.
+fn seal_page_digests(seal: &Seal) -> Result<Vec<[u8; 32]>, Error> {
+    if seal.pages.len() as u64 != seal.final_page_count {
+        return Err(Error::InvalidBundle);
+    }
+    let mut digests = Vec::with_capacity(seal.pages.len());
+    for (index, commitment) in seal.pages.iter().enumerate() {
+        if commitment.index != index as u64 {
+            return Err(Error::InvalidBundle);
+        }
+        digests.push(commitment.digest);
+    }
+    Ok(digests)
+}
 
 const PACKAGE_DOMAIN: &[u8] = b"VOT package v0\0";
 const MANIFEST_DIRECTORY: &str = "manifest";

@@ -22,11 +22,80 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+mod drive;
 mod fetch;
 #[cfg(test)]
 mod harness;
 mod serve;
+#[cfg(feature = "wire")]
+mod wire;
 
+pub use drive::{Engine, ServeSession, drive};
+#[cfg(feature = "wire")]
+pub use wire::{fetch_bundle, serve_bundle};
+
+/// The certificate and key a server presents.
+///
+/// ADR-0030: the certificate is ephemeral and unverified, and assurance
+/// comes from the proof chain rather than from the channel. It is still a
+/// real certificate because TLS 1.3 has no anonymous mode, so one is
+/// generated per process unless the caller supplies its own.
+pub enum Credentials {
+    /// Generated for this process, thrown away with it.
+    Ephemeral,
+    /// PEM files the caller supplied, for a server behind a name someone
+    /// does verify.
+    Files { certificate: PathBuf, key: PathBuf },
+}
+
+/// A package root as the hex a `send` printed.
+///
+/// # Errors
+/// Rejects anything that is not exactly 32 bytes of hexadecimal.
+pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
+    if value.len() != 64 {
+        return Err(Error::InvalidArguments);
+    }
+    let mut root = [0_u8; 32];
+    for (slot, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = hex(pair[0]).ok_or(Error::InvalidArguments)?;
+        let low = hex(pair[1]).ok_or(Error::InvalidArguments)?;
+        *slot = high * 16 + low;
+    }
+    Ok(root)
+}
+
+/// Without the carrier, a wire command names the feature it needs rather
+/// than failing as though the arguments were wrong.
+#[cfg(not(feature = "wire"))]
+pub fn serve_bundle(
+    _bundle: &Path,
+    _address: std::net::SocketAddr,
+    _credentials: &Credentials,
+    _sessions: Option<u32>,
+    _listening: impl FnMut(std::net::SocketAddr),
+) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// See [`serve_bundle`].
+#[cfg(not(feature = "wire"))]
+pub fn fetch_bundle(
+    _address: std::net::SocketAddr,
+    _bundle: &Path,
+    _pin: Option<[u8; 32]>,
+) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// How a wire session authenticates, which is not at all.
+///
+/// ADR-0030: the channel is unauthenticated and the help text says so.
+/// The nonce is the server's freshness for the handshake, not a secret.
+#[cfg(feature = "wire")]
+fn wire_authentication() -> vot_session::Authentication {
+    vot_session::Authentication::NotRequired { nonce: [0; 32] }
+}
 pub use fetch::{BundleFetcher, FetchStatus};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 
@@ -93,6 +162,8 @@ pub enum Error {
     Session(Box<vot_session::Error>),
     Codec(vot_codec::frames::Error),
     Proof,
+    /// A command that needs the `wire` feature, in a build without it.
+    WireUnsupported,
 }
 
 impl From<io::Error> for Error {

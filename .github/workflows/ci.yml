@@ -237,6 +237,15 @@ jobs:
           cargo +1.88.0 test -p vot-transport-quiche --features live --locked
           cargo +1.88.0 test -p vot-transport-quiche --features live --release --locked
 
+      # The engines over a real socket. The loopback tests run everywhere on a
+      # fake carrier; this is the one job that carries them for real, and it is
+      # the only place the wire feature is compiled at all.
+      - name: Test serve and fetch over a real socket
+        run: |
+          cargo +1.88.0 clippy -p vot-cli --features wire --all-targets --locked -- -D warnings
+          cargo +1.88.0 test -p vot-cli --features wire --locked
+          cargo +1.88.0 test -p vot-cli --features wire --release --locked
+
       # The benchmark driver's quiche carrier compiles only under this feature,
       # so this job is the only one that sees it. Both profiles for the same
       # reason the pump runs in both: a threaded carrier fails differently

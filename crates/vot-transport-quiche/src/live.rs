@@ -193,6 +193,14 @@ pub struct Config {
     pub verify_peer: bool,
     /// Idle timeout in milliseconds.
     pub idle_timeout_ms: u64,
+    /// How long a server waits for its first packet, in milliseconds, or
+    /// zero to wait for as long as it takes.
+    ///
+    /// A bound is what stops a test hanging on a client that never comes.
+    /// A server command is the other case: it exists to sit there until
+    /// one does, and giving up would read to its caller as a carrier that
+    /// died during the handshake.
+    pub accept_timeout_ms: u64,
     /// Largest UDP payload this endpoint sends or expects.
     ///
     /// [`MAX_DATAGRAM_SIZE`] unless a caller knows the path. It is a first-order
@@ -217,6 +225,7 @@ impl Config {
             private_key: None,
             verify_peer: true,
             idle_timeout_ms: 30_000,
+            accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
         }
     }
@@ -230,6 +239,7 @@ impl Config {
             private_key: Some(private_key),
             verify_peer: false,
             idle_timeout_ms: 30_000,
+            accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
         }
     }
@@ -379,6 +389,7 @@ impl Transport {
         let driver_path = Arc::clone(&path);
         let connection = ConnectionId(u64::from(local.port()));
         let datagram_bytes = config.max_datagram_bytes;
+        let accept_timeout_ms = config.accept_timeout_ms;
 
         let driver = std::thread::Builder::new()
             .name(format!("vot-quiche-{}", local.port()))
@@ -399,6 +410,7 @@ impl Transport {
                     &driver_path,
                     connection.0,
                     datagram_bytes,
+                    accept_timeout_ms,
                 );
                 // A driver that stops for any reason still owes the caller the
                 // disconnect, or the caller waits for a peer that has gone.
@@ -625,6 +637,7 @@ fn drive(
     path: &Arc<Mutex<Option<PathStats>>>,
     connection: u64,
     datagram_bytes: usize,
+    accept_timeout_ms: u64,
 ) -> Result<(), Error> {
     let budget = SharedBudget(Arc::clone(inbound));
     // Heap rather than stack, and as large as the largest frame a lane carries.
@@ -650,7 +663,8 @@ fn drive(
         (Role::Server, _) => {
             // A server has nothing to do until a client speaks, and the first
             // packet is what names the connection.
-            let Some(conn) = accept_one(socket, local, config, &mut buffer)? else {
+            let Some(conn) = accept_one(socket, local, config, &mut buffer, accept_timeout_ms)?
+            else {
                 return Ok(());
             };
             (conn, false)
@@ -764,16 +778,24 @@ fn drive(
     }
 }
 
+/// How long a server waits for its first packet unless told otherwise.
+///
+/// Long enough that a test's client is always there by then, short enough
+/// that a test whose client never comes fails rather than hangs.
+const ACCEPT_TIMEOUT_MS: u64 = 10_000;
+
 /// Waits for the first packet and turns it into a connection.
 fn accept_one(
     socket: &UdpSocket,
     local: SocketAddr,
     config: &mut quiche::Config,
     buffer: &mut [u8],
+    timeout_ms: u64,
 ) -> Result<Option<quiche::Connection>, Error> {
-    socket
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|_| Error::Backend)?;
+    // Zero means no bound: a read that never returns is what a server
+    // waiting for its first client is supposed to do.
+    let bound = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+    socket.set_read_timeout(bound).map_err(|_| Error::Backend)?;
     loop {
         let Ok((len, from)) = socket.recv_from(buffer) else {
             return Ok(None);
@@ -1237,7 +1259,13 @@ fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState) {
                 *sent += written;
                 return;
             }
-            Err(quiche::Error::Done) => return,
+            // Both mean "not yet" rather than "never": Done is flow
+            // control, and StreamLimit is the peer's stream allowance,
+            // which arrives with the handshake. A caller that hands over a
+            // frame before the connection is established would otherwise
+            // lose it here and wait on an answer to a request the peer
+            // never saw.
+            Err(quiche::Error::Done | quiche::Error::StreamLimit) => return,
             Err(_) => {
                 stream.outbox.clear();
                 return;
@@ -1495,6 +1523,37 @@ mod tests {
         }
         panic!(
             "the carrier never got there: client saw {from_client:?}, server saw {from_server:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_sent_before_the_handshake_finishes_still_arrives() {
+        // The peer's stream allowance arrives with the handshake, so a
+        // frame handed over before then cannot be written yet and quiche
+        // answers StreamLimit. Treated as fatal, it was dropped and the
+        // peer waited forever on an answer to a request it never saw.
+        // Every caller that opens a session sends its first frame at once.
+        let (mut client, mut server) = pair();
+        let hello = frame(b"before-the-handshake");
+        client
+            .send_control(&hello)
+            .expect("the adapter takes it before the carrier is up");
+
+        let (_, from_server) = pump_until(&mut client, &mut server, 10, |_, server_events| {
+            server_events
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        let carried: Vec<_> = from_server
+            .iter()
+            .filter_map(|event| match event {
+                Event::Control(bytes) => Some(bytes.as_ref().to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            carried.contains(&hello),
+            "the frame sent before the handshake was lost"
         );
     }
 

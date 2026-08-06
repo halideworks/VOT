@@ -64,19 +64,24 @@ const MAX_INBOUND_EVENTS: usize = 1_024;
 
 /// What the driver holds across every outbox before it stops taking submissions.
 ///
-/// The bound the caller's own queue keeps, because the two hold the same thing
-/// on either side of the handover. A peer that stops reading fills this once
-/// and the refusal travels back the way the bytes came: the channel stops
-/// draining, the caller's queue stops draining, and the application is told
-/// `OutboundQueueFull`, which is what it already handles. It sits well above
-/// the connection's own flow-control window, so a transfer that is merely
-/// paced never has the pump idle for want of something to send.
+/// The byte bound the caller's own queue keeps, for the same bytes one hop on.
+/// A peer that stops reading fills this once and the refusal travels back the
+/// way the bytes came, ending at the `OutboundQueueFull` the application
+/// already handles.
+///
+/// No size here can starve the pump, which is why it is not measured against
+/// the connection's windows: an outbox holds only what `stream_send` refused,
+/// so a full one means the connection is already blocked on its own congestion
+/// or flow control rather than on anything the caller could hand over. The
+/// windows would be the wrong yardstick anyway, the connection's being eight
+/// stream windows of a size the caller picks.
 const MAX_QUEUED_BYTES: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
 
 /// And how many records, because bytes alone do not bound a flood of small
-/// ones: what grows there is the entry rather than the payload. Derived from
-/// the byte bound at a kilobyte a record, so anything larger than that meets
-/// the byte bound first and this one is about the small end only.
+/// ones: what grows there is the entry rather than the payload. A kilobyte a
+/// record, so anything larger meets the byte bound first. The caller's queue
+/// counts to 64 instead, which is a different question: what it holds has not
+/// been handed over yet.
 const MAX_QUEUED_RECORDS: usize = MAX_QUEUED_BYTES / 1_024;
 
 /// How long the driver waits on the socket when the connection asks for longer.
@@ -1385,7 +1390,8 @@ fn stream_state<'a>(
     })
 }
 
-/// Writes what a stream has waiting, as far as flow control allows.
+/// Writes what a stream has waiting, as far as flow control allows, giving
+/// back what the connection took. The release side of [`apply`]'s charge.
 fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState, queued: &mut Queued) {
     let id = stream.id;
     while let Some((bytes, sent)) = stream.outbox.front_mut() {

@@ -758,11 +758,12 @@ mod tests {
 
     /// Rounds a fetch in these tests may take before it is not progressing.
     ///
-    /// The longest of them settles in well under a hundred: a round moves
-    /// every frame both ends have, and the largest object is four covers.
-    /// Tight on purpose, so a fetch that stops progressing fails here in a
-    /// second rather than running until something else stops it.
-    const ROUND_BUDGET: usize = 500;
+    /// The longest of them settles in seven: a round moves every frame both
+    /// ends have, and the largest object is three covers. Tight on purpose,
+    /// because a round of a fetch that is not progressing still re-fetches
+    /// an object, so a generous budget is minutes of work before the
+    /// failure and a mutation run times out instead of reporting.
+    const ROUND_BUDGET: usize = 32;
 
     /// Runs both engines and the pump until the fetch reaches a terminal
     /// status, bounded by rounds rather than a clock.

@@ -63,6 +63,10 @@ pub mod error_code {
     pub const AUTHENTICATION_FAILED: u16 = 0x0201;
     pub const AUTHORIZATION_FAILED: u16 = 0x0202;
     pub const REPLAY_REJECTED: u16 = 0x0203;
+    pub const MANIFEST_INVALID: u16 = 0x0301;
+    pub const OBJECT_IDENTITY_MISMATCH: u16 = 0x0302;
+    pub const PROOF_INVALID: u16 = 0x0303;
+    pub const SOURCE_MUTATED: u16 = 0x0304;
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
 }
 

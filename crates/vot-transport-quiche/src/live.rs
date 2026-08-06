@@ -57,12 +57,7 @@ const SEND_BUFFER_BYTES: u32 = 2_097_152;
 /// 20 more, which is not worth a family-dependent ceiling: a size the socket
 /// refuses with `EMSGSIZE` on one family is not a configuration, and the test
 /// suite sends a record at this exact size to keep the constant honest.
-///
-/// Public because a caller that trusts path discovery entirely sets this as
-/// its ceiling: with `discover_pmtu` on and don't-fragment fail-closed, the
-/// connection settles at what the path really carries, and the ceiling only
-/// says where probing may stop.
-pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
+const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;

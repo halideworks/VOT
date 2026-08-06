@@ -32,36 +32,29 @@ fn limits() -> Result<ReceiveLimits, Error> {
     .map_err(|_| Error::InvalidArguments)
 }
 
-/// The environment variable that pins the datagram ceiling.
+/// The environment variable that raises the datagram ceiling.
 const DATAGRAM_BYTES: &str = "VOT_DATAGRAM_BYTES";
 
-/// Opens the datagram ceiling to discovery, then applies
-/// [`DATAGRAM_BYTES`] over it if set.
+/// Applies [`DATAGRAM_BYTES`] to a configuration, if it is set.
 ///
-/// The carrier's own default ceiling is what a 1500-byte ethernet frame
+/// The carrier's default ceiling is what a 1500-byte ethernet frame
 /// carries, and path discovery only settles below a ceiling, never above
-/// it, so no amount of discovery finds a jumbo path under that default.
-/// The commands trust discovery instead: the ceiling opens to the most a
-/// UDP payload can be, `discover_pmtu` probes with don't-fragment set and
-/// fails closed, and the connection settles at what the path really
-/// carries with nothing to configure. It matters on the serving process
-/// most: packets are made where the bytes are served, and a fetch-side
-/// ceiling alone moves nothing (docs/perf-engineering.md, 2026-08-06).
-///
-/// The variable remains as a pin for a path whose discovery misbehaves.
+/// it, so no amount of discovery finds a jumbo path on its own. It has
+/// to reach the serving process: packets are made where the bytes are
+/// served, and a fetch-side ceiling alone moves nothing
+/// (docs/perf-engineering.md, 2026-08-06).
 ///
 /// # Errors
 /// Rejects a value that is not a number. The carrier rejects one outside
 /// what it can carry.
 fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
-    config.max_datagram_bytes = vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
     let Ok(value) = std::env::var(DATAGRAM_BYTES) else {
         return Ok(());
     };
     apply_datagram_value(config, &value)
 }
 
-/// The parse half of the pin, apart from the environment that feeds it.
+/// The parse half of the lever, apart from the environment that feeds it.
 fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
     config.max_datagram_bytes = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
     Ok(())
@@ -258,18 +251,14 @@ mod tests {
             config.max_datagram_bytes, unset,
             "a refused value changes nothing"
         );
-        // And with nothing set, the ceiling opens all the way for
-        // discovery to settle under, which is the seamless default.
+        // And the env half leaves the default alone when nothing is set.
         assert!(
             std::env::var(DATAGRAM_BYTES).is_err(),
             "the suite owns no env"
         );
         let mut config = Config::client(limits().unwrap());
         apply_datagram_bytes(&mut config).unwrap();
-        assert_eq!(
-            config.max_datagram_bytes,
-            vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE
-        );
+        assert_eq!(config.max_datagram_bytes, unset);
     }
 
     #[test]

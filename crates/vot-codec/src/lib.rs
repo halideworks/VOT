@@ -58,6 +58,7 @@ pub mod error_code {
     pub const INVALID_SETTING: u16 = 0x0105;
     pub const DUPLICATE_SETTING: u16 = 0x0106;
     pub const UNSUPPORTED_VERSION: u16 = 0x0104;
+    pub const STORAGE_WRITE_FAILED: u16 = 0x0401;
     pub const RESOURCE_LIMIT: u16 = 0x0502;
     pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
     pub const AUTHENTICATION_FAILED: u16 = 0x0201;

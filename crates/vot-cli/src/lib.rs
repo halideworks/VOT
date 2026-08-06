@@ -22,13 +22,54 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+mod drive;
 mod fetch;
 #[cfg(test)]
 mod harness;
+#[cfg(not(feature = "wire"))]
+mod nowire;
 mod serve;
+#[cfg(feature = "wire")]
+mod wire;
 
+pub use drive::{Engine, ServeSession, drive};
 pub use fetch::{BundleFetcher, FetchStatus};
+#[cfg(not(feature = "wire"))]
+pub use nowire::{fetch_bundle, serve_bundle};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
+#[cfg(feature = "wire")]
+pub use wire::{fetch_bundle, serve_bundle};
+
+/// The certificate and key a server presents.
+///
+/// ADR-0030: the certificate is ephemeral and unverified, and assurance
+/// comes from the proof chain rather than from the channel. It is still a
+/// real certificate because TLS 1.3 has no anonymous mode, so one is
+/// generated per process unless the caller supplies its own.
+pub enum Credentials {
+    /// Generated for this process, thrown away with it.
+    Ephemeral,
+    /// PEM files the caller supplied, for a server behind a name someone
+    /// does verify.
+    Files { certificate: PathBuf, key: PathBuf },
+}
+
+/// A package root as the hex a `send` printed.
+///
+/// # Errors
+/// Rejects anything that is not exactly 32 bytes of hexadecimal.
+pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
+    if value.len() != 64 {
+        return Err(Error::InvalidArguments);
+    }
+    let mut root = [0_u8; 32];
+    for (slot, pair) in root.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let high = hex(pair[0]).ok_or(Error::InvalidArguments)?;
+        let low = hex(pair[1]).ok_or(Error::InvalidArguments)?;
+        *slot = high * 16 + low;
+    }
+    Ok(root)
+}
 
 /// The seal's page digests by index, refusing a commitment list that does
 /// not name exactly the sealed pages in order. Shared by the serve side,
@@ -93,6 +134,14 @@ pub enum Error {
     Session(Box<vot_session::Error>),
     Codec(vot_codec::frames::Error),
     Proof,
+    /// A command that needs the `wire` feature, in a build without it.
+    WireUnsupported,
+    /// A session where nothing happened for as long as this end will wait.
+    Stalled,
+    /// A carrier that would not bind or connect.
+    CarrierUnavailable,
+    /// The peer ended the session under a registered code.
+    PeerClosed(u16),
 }
 
 impl From<io::Error> for Error {
@@ -1802,6 +1851,65 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn a_package_root_is_exactly_its_hex() {
+        let root =
+            parse_package_root("7503bcc1b8fe0bfe100a9d32204f17133de6a6069db7ff27770f9589f142a988")
+                .unwrap();
+        assert_eq!(root[0], 0x75);
+        assert_eq!(root[1], 0x03);
+        assert_eq!(root[31], 0x88);
+        // Round trips through the form send prints.
+        let mut hex = String::new();
+        for byte in &root {
+            use std::fmt::Write as _;
+            write!(&mut hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(parse_package_root(&hex).unwrap(), root);
+
+        // A root of the wrong length is not a root, whatever it says.
+        assert!(matches!(
+            parse_package_root(&hex[..63]),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            parse_package_root(&format!("{hex}0")),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            parse_package_root(""),
+            Err(Error::InvalidArguments)
+        ));
+        // And nor is 64 characters that are not hexadecimal.
+        assert!(matches!(
+            parse_package_root(&"g".repeat(64)),
+            Err(Error::InvalidArguments)
+        ));
+        let mut spoiled = hex.clone();
+        spoiled.replace_range(20..21, "z");
+        assert!(matches!(
+            parse_package_root(&spoiled),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    /// Without the carrier the wire commands say which feature they need,
+    /// rather than failing as though the caller got the arguments wrong.
+    #[cfg(not(feature = "wire"))]
+    #[test]
+    fn the_wire_commands_name_the_feature_they_need() {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let bundle = temporary("unsupported");
+        assert!(matches!(
+            serve_bundle(&bundle, address, &Credentials::Ephemeral, None, |_| {}),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            fetch_bundle(address, &bundle, None),
+            Err(Error::WireUnsupported)
+        ));
     }
 
     #[test]

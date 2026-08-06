@@ -193,6 +193,9 @@ pub struct ServeConnection {
     manifest_cursor: Option<(u64, u64)>,
     budget: u64,
     closed: Option<u16>,
+    /// Every answer this session has queued, only ever going up. A driving
+    /// loop reads it to tell a slow session from a stopped one.
+    progress: u64,
 }
 
 impl Default for ServeConnection {
@@ -205,6 +208,7 @@ impl Default for ServeConnection {
             manifest_cursor: None,
             budget: OUTBOUND_BUDGET_BYTES,
             closed: None,
+            progress: 0,
         }
     }
 }
@@ -305,12 +309,20 @@ impl ServeConnection {
         Ok(())
     }
 
+    /// Every answer this session has queued, only ever going up.
+    #[must_use]
+    pub fn progress(&self) -> u64 {
+        self.progress
+    }
+
     fn queue_control(&mut self, frame: Payload) {
+        self.progress = self.progress.saturating_add(1);
         self.pending_bytes = self.pending_bytes.saturating_add(frame.len() as u64);
         self.pending.push_back(Outbound::Control(frame));
     }
 
     fn queue_record(&mut self, record: Payload) {
+        self.progress = self.progress.saturating_add(1);
         self.pending_bytes = self.pending_bytes.saturating_add(record.len() as u64);
         self.pending.push_back(Outbound::Record(record));
     }

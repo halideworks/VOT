@@ -27,15 +27,20 @@ use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAd
 use crate::serve::is_backpressure;
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
-/// Range requests the fetcher keeps queued, and the covers it prices into
-/// staging for them.
+/// Range requests one pass may issue, and the covers priced into staging
+/// for them.
 ///
 /// An object has no bound worth queueing whole: at four mebibytes a
 /// request, a large one is hundreds of thousands of frames built before
-/// the first is sent. So the fetcher issues this many and no more, and
-/// refills as the carrier takes them. Two keeps the next request already
-/// at the server while it answers the current one, which is what the wire
-/// needs; the server's own outbound budget paces the answers.
+/// the first is sent. A pass builds this many and no more, so what is
+/// held is two frames however long the object is.
+///
+/// It bounds the queue, not the wire. A pass runs when the carrier
+/// reports something, so requests leave at the rate answers arrive, and
+/// what is actually in flight is bounded by the carrier's own window and
+/// by the server refusing to read a request it cannot afford to answer.
+/// Two is enough that the next request is already there when the server
+/// finishes the current one.
 const OUTSTANDING_COVERS: usize = 2;
 
 /// The credit this end advertises: the covers it asked for, which is what
@@ -244,14 +249,20 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.receiver.session_mut()
     }
 
-    /// Whether requests are queued for the carrier or still to be issued,
-    /// either of which is work another pass can do without waiting.
+    /// Whether a request is queued that the carrier would not take, which
+    /// is work another pass can do without waiting on an event.
+    ///
+    /// Ranges not yet asked for are deliberately not backlog. A pass issues
+    /// at most [`OUTSTANDING_COVERS`] and the next pass runs when the
+    /// carrier reports something, so what is on the wire is paced by the
+    /// answers coming back rather than by how fast this end can build
+    /// request frames.
     ///
     /// A fetch that has stopped owes nothing: a lingering backlog would tell
     /// a driving loop to keep servicing a session that cannot progress.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.stopped && (!self.pending.is_empty() || self.owes_ranges())
+        !self.stopped && !self.pending.is_empty()
     }
 
     /// Forgets what is owed, because nothing more will be asked or answered.
@@ -672,19 +683,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         }
         Ok(())
     }
-
-    /// Whether the object being fetched still has ranges left to ask for.
-    ///
-    /// The cursor alone answers it: a plan past its last object has no
-    /// current one, and an object about to be admitted owes every range it
-    /// has, which is what the pass admitting it goes on to issue.
-    fn owes_ranges(&self) -> bool {
-        self.plan.as_ref().is_some_and(|plan| {
-            plan.objects
-                .get(plan.current)
-                .is_some_and(|planned| plan.next_offset < planned.object.length)
-        })
-    }
 }
 
 #[cfg(test)]
@@ -778,12 +776,6 @@ mod tests {
         let mut corrupted = corrupt_first_record;
         for _ in 0..ROUND_BUDGET {
             let status = fetcher.service()?;
-            // However long the objects are, the fetch asks for a couple of
-            // covers at a time rather than queueing an object whole.
-            assert!(
-                fetcher.pending.len() <= OUTSTANDING_COVERS,
-                "the request queue outgrew its cap"
-            );
             if status != FetchStatus::Active {
                 return Ok(status);
             }
@@ -792,7 +784,7 @@ mod tests {
                 serving.driver(),
                 &mut sequence,
             );
-            loop {
+            for _ in 0..ROUND_BUDGET {
                 server.service(serving, connection).unwrap();
                 if !connection.has_backlog() {
                     break;
@@ -900,6 +892,7 @@ mod tests {
         let status =
             run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
         assert_eq!(status, FetchStatus::Complete);
+        discard(&[&bundle, &output, &accepted]);
     }
 
     #[test]
@@ -1009,6 +1002,7 @@ mod tests {
             !fetcher.has_backlog(),
             "nothing was asked for on its account"
         );
+        discard(&[&output]);
     }
 
     #[test]
@@ -1053,6 +1047,7 @@ mod tests {
             fetcher.service().unwrap(),
             FetchStatus::Closed(error_code::MALFORMED_FRAME)
         );
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1099,6 +1094,7 @@ mod tests {
             .push_back(control_event(&TypedFrame::PackageDescriptor(conflicting)));
         let status = fetcher.service().unwrap();
         assert_eq!(status, FetchStatus::Closed(error_code::MANIFEST_INVALID));
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1134,6 +1130,7 @@ mod tests {
             .push_back(control_event(&TypedFrame::ManifestPage(foreign)));
         let status = fetcher.service().unwrap();
         assert_eq!(status, FetchStatus::Closed(error_code::MANIFEST_INVALID));
+        discard(&[&bundle, &output, &other]);
     }
 
     #[test]
@@ -1168,6 +1165,7 @@ mod tests {
         // the one that saw it go.
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
         assert!(!fetcher.has_backlog(), "and nothing is still owed");
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1206,6 +1204,7 @@ mod tests {
             .push_back(Event::Disconnected(ConnectionId(3)));
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Complete);
         assert_same_tree(&bundle, &output);
+        discard(&[&bundle, &output]);
     }
 
     /// The request the fetcher queued, decoded.
@@ -1269,6 +1268,7 @@ mod tests {
             fetcher.pending.is_empty(),
             "the manifest is fully asked for"
         );
+        discard(&[&output]);
     }
 
     #[test]
@@ -1320,6 +1320,7 @@ mod tests {
         fetcher.descriptor = Some(truth);
         assert!(fetcher.take_seal(seal_bytes).is_ok());
         assert!(fetcher.has_backlog(), "the manifest is asked for");
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1359,6 +1360,7 @@ mod tests {
             fetcher.service().unwrap(),
             FetchStatus::Closed(error_code::MANIFEST_INVALID)
         );
+        discard(&[&bundle, &output, &other]);
     }
 
     #[test]
@@ -1438,18 +1440,20 @@ mod tests {
         fetcher.session_mut().driver().fail_sends_with = Some(vot_transport_api::Error::Backend);
         let outcome = fetcher.service();
         assert!(matches!(outcome, Err(Error::Session(_))));
+        discard(&[&bundle, &output]);
     }
 
     #[test]
-    fn ranges_still_to_ask_for_are_backlog() {
-        // Three covers, so after the two the fetch keeps in flight there is
-        // still one owed: that is work the driving loop must not wait on the
-        // carrier for.
-        let (bundle, _) = built_bundle("backlog", &[("big.bin", patterned(8_500_000))]);
+    fn a_pass_builds_no_more_requests_than_its_cap() {
+        // Three covers, and a carrier that takes nothing. A queue the
+        // carrier drains is empty by the time a pass returns, so holding it
+        // is the only way to see the cap at all: watched after an accepted
+        // pass this asserts nothing, whatever the cap is.
+        let (bundle, _) = built_bundle("cap", &[("big.bin", patterned(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
-        let output = temporary("backlog-fetched");
+        let output = temporary("cap-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        assert!(!fetcher.has_backlog(), "nothing is owed before a plan");
+        assert!(!fetcher.has_backlog(), "nothing is held before a plan");
 
         let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
         let mut admitted = false;
@@ -1471,12 +1475,24 @@ mod tests {
             }
         }
         assert!(admitted, "the object was never admitted");
-        assert!(fetcher.has_backlog(), "a third cover is still to ask for");
 
+        fetcher.session_mut().driver().refuse_sends = usize::MAX;
+        for _ in 0..8 {
+            assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+            assert!(
+                fetcher.pending.len() <= OUTSTANDING_COVERS,
+                "the queue reached {} requests",
+                fetcher.pending.len()
+            );
+        }
+        assert!(fetcher.has_backlog(), "held requests are backlog");
+
+        // And a carrier that takes them again finishes the fetch.
+        fetcher.session_mut().driver().refuse_sends = 0;
         let status =
             run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
         assert_eq!(status, FetchStatus::Complete);
-        assert!(!fetcher.has_backlog(), "and nothing is owed at the end");
+        assert!(!fetcher.has_backlog(), "and nothing is held at the end");
         discard(&[&bundle, &output]);
     }
 
@@ -1486,6 +1502,7 @@ mod tests {
         fs::create_dir_all(&existing).unwrap();
         let outcome = BundleFetcher::begin(Loopback::default(), &existing, None);
         assert!(matches!(outcome, Err(Error::DestinationExists)));
+        discard(&[&existing]);
     }
 
     #[test]
@@ -1520,6 +1537,7 @@ mod tests {
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
         assert!(!fetcher.has_backlog(), "and sent when the carrier takes it");
         assert!(!fetcher.session_mut().driver().control.is_empty());
+        discard(&[&bundle, &output]);
     }
 
     #[test]

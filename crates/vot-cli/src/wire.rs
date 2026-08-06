@@ -116,7 +116,10 @@ fn local_for(peer: SocketAddr) -> Result<SocketAddr, Error> {
 /// Serves `bundle` to one session at a time on `address`, forever.
 ///
 /// Each accepted carrier is driven to a settled state and then dropped;
-/// the bundle is opened and proved once, ahead of any of them.
+/// the bundle is opened and proved once, ahead of any of them. The socket
+/// is bound afresh per session, so a port-zero `address` is assigned anew
+/// each time and `listening` reports each one: useful to a test serving a
+/// bounded count, not to an unbounded serve, which wants a fixed port.
 ///
 /// # Errors
 /// Surfaces a bundle that will not open, a socket that will not bind, and
@@ -154,19 +157,17 @@ pub fn serve_bundle(
     }
 
     // A bounded count is what lets a test serve one session and return;
-    // without one the command serves until it is stopped.
-    let mut answered = 0;
-    while sessions.is_none_or(|bound| answered < bound) {
+    // without one the command serves until it is stopped. The loop and its
+    // failure policy live in `drive`, under the gate this file is not.
+    crate::drive::serve_sessions(sessions, || {
         // `serve` waits for a connection on its own thread, so one
         // endpoint is one session here.
         let carrier = Transport::serve(address, &config).map_err(|_| Error::CarrierUnavailable)?;
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
-        let mut session = ServeSession::begin(&server, carrier, authentication())?;
-        drive(&mut session)?;
-        answered += 1;
-    }
+        ServeSession::begin(&server, carrier, authentication())
+    })?;
     Ok(server.package())
 }
 

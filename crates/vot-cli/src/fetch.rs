@@ -47,6 +47,12 @@ const FETCH_CREDIT_BYTES: u64 = OUTSTANDING_COVERS as u64 * vot_scheduler::MAX_P
 /// to be verified rather than refused.
 const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE as u64;
 
+// The credit is what it advertises, and the limit clears it by a group: a
+// limit at or under the advertised credit would refuse a conforming answer
+// for want of room rather than for anything wrong with it.
+const _: () = assert!(FETCH_CREDIT_BYTES == 8_519_680);
+const _: () = assert!(FETCH_STAGING_BYTES == 8_585_216);
+
 /// What one fetch pass left the session as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FetchStatus {
@@ -573,7 +579,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .get(plan.current)
             .ok_or(Error::InvalidBundle)?
             .object;
-        while self.pending.len() < OUTSTANDING_COVERS {
+        // Counted rather than conditioned on the queue length, so the pass
+        // is bounded by the cap itself and no span can spin it.
+        for _ in self.pending.len()..OUTSTANDING_COVERS {
             let Some((offset, length)) = range_span(plan.next_offset, object.length) else {
                 return Ok(());
             };
@@ -607,7 +615,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::{Loopback, built_bundle, control_event, not_required, patterned, pump};
+    use crate::harness::{
+        Loopback, built_bundle, control_event, decode_control, not_required, patterned, pump,
+    };
     use crate::tests::temporary;
     use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
     use vot_transport_api::ConnectionId;
@@ -884,6 +894,69 @@ mod tests {
             .events
             .push_back(Event::Disconnected(ConnectionId(3)));
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
+    }
+
+    /// The request the fetcher queued, decoded.
+    fn queued_manifest_request(fetcher: &mut BundleFetcher<Loopback>) -> ManifestRequest {
+        let frame = fetcher.pending.pop_front().expect("a request was queued");
+        match decode_control(&frame) {
+            TypedFrame::ManifestRequest(request) => request,
+            other => panic!("not a manifest request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_spans_are_requested_one_at_a_time_in_arrival_order() {
+        // A manifest past 8,192 pages takes more than one request, which no
+        // bundle a test can build reaches: that many pages is millions of
+        // entries. The cursor is driven directly instead.
+        let output = temporary("manifest-spans");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.descriptor = Some(PackageDescriptor {
+            package: frames::ObjectId {
+                suite: 1,
+                root: [4; 32],
+                length: 9,
+            },
+            manifest_id: [5; 16],
+            page_count: 2 * MAX_MANIFEST_REQUEST_PAGES + 3,
+        });
+        fetcher.spans = manifest_spans(2 * MAX_MANIFEST_REQUEST_PAGES + 3);
+        assert_eq!(fetcher.spans.len(), 3);
+
+        // The first span is asked for, and nothing beyond it.
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        let first = queued_manifest_request(&mut fetcher);
+        assert_eq!(first.manifest_id, [5; 16]);
+        assert_eq!((first.first_page, first.page_count), fetcher.spans[0]);
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        assert!(
+            fetcher.pending.is_empty(),
+            "the next span waits on the pages of this one"
+        );
+
+        // It is asked for once the pages of the span before it have arrived,
+        // because arrival order is what indexes the digest check.
+        fetcher.pages_received = MAX_MANIFEST_REQUEST_PAGES - 1;
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        assert!(fetcher.pending.is_empty(), "one page short is still short");
+        fetcher.pages_received = MAX_MANIFEST_REQUEST_PAGES;
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        let second = queued_manifest_request(&mut fetcher);
+        assert_eq!((second.first_page, second.page_count), fetcher.spans[1]);
+        assert_ne!(second.request_id, first.request_id, "identities are fresh");
+
+        // And the short final span, after which nothing more is owed.
+        fetcher.pages_received = 2 * MAX_MANIFEST_REQUEST_PAGES;
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        let third = queued_manifest_request(&mut fetcher);
+        assert_eq!((third.first_page, third.page_count), fetcher.spans[2]);
+        fetcher.pages_received = fetcher.descriptor.as_ref().unwrap().page_count;
+        fetcher.request_pages().map_err(|_| ()).unwrap();
+        assert!(
+            fetcher.pending.is_empty(),
+            "the manifest is fully asked for"
+        );
     }
 
     #[test]

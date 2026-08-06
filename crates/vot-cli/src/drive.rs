@@ -173,6 +173,45 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     }
 }
 
+/// Serves sessions from `next` until it fails, or `sessions` are answered.
+///
+/// A client that connects and goes away leaves its session stalling or
+/// failing, and a server told to answer everyone should outlive any one of
+/// them: with no session bound, a session's failure ends the session and
+/// never the loop. A bounded serve surfaces it instead, because its caller
+/// asked for exactly those sessions and deserves to hear one was not
+/// served. What ends an unbounded serve is only `next` itself failing,
+/// which is the endpoint rather than a peer.
+///
+/// # Errors
+/// Surfaces `next`'s failure always, and a session's failure only when
+/// `sessions` is bounded.
+///
+/// Compiled exactly where it is called: the wire commands and the tests
+/// that hold its policy under the mutation gate the wire is not.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn serve_sessions<'server, A, F>(sessions: Option<u32>, mut next: F) -> Result<(), Error>
+where
+    A: TransportAdapter,
+    F: FnMut() -> Result<ServeSession<'server, A>, Error>,
+{
+    let mut answered = 0;
+    while sessions.is_none_or(|bound| answered < bound) {
+        let mut session = next()?;
+        match drive(&mut session) {
+            Ok(_) => {}
+            Err(error) => {
+                if sessions.is_some() {
+                    return Err(error);
+                }
+                eprintln!("session ended: {error:?}");
+            }
+        }
+        answered += 1;
+    }
+    Ok(())
+}
+
 impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
     type Status = crate::ServeStatus;
 
@@ -200,6 +239,87 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unbounded_serve_outlives_a_failed_session() {
+        // A client that connects and goes away leaves its session stalling,
+        // and one dead peer must not take the server from everyone else.
+        // Three sessions: one that stalls, one that settles, and then the
+        // endpoint itself failing, which is the only thing that may end an
+        // unbounded serve.
+        use crate::harness::{Loopback, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("outlives", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let mut sessions = 0_u32;
+        let outcome = serve_sessions(None, || {
+            sessions += 1;
+            match sessions {
+                // An empty carrier: the session makes no progress and the
+                // loop gives up on it, which is the failure to outlive.
+                1 => ServeSession::begin(&server, Loopback::default(), not_required()),
+                2 => {
+                    let mut carrier = Loopback::default();
+                    carrier
+                        .on_wait
+                        .push_back(Event::Disconnected(ConnectionId(1)));
+                    ServeSession::begin(&server, carrier, not_required())
+                }
+                _ => Err(Error::CarrierUnavailable),
+            }
+        });
+        assert!(
+            matches!(outcome, Err(Error::CarrierUnavailable)),
+            "the endpoint's own failure ends the serve, a session's never"
+        );
+        assert_eq!(sessions, 3, "the stalled session was survived");
+
+        // Told to answer exactly these sessions, the same failure surfaces:
+        // the caller asked for them and deserves to hear one was not served.
+        let mut bounded = 0_u32;
+        let outcome = serve_sessions(Some(2), || {
+            bounded += 1;
+            ServeSession::begin(&server, Loopback::default(), not_required())
+        });
+        assert!(matches!(outcome, Err(Error::Stalled)));
+        assert_eq!(bounded, 1, "a bounded serve stops at the failure");
+
+        // And a bounded serve that succeeds answers exactly its bound: the
+        // factory errors on any call past it, so a count that under- or
+        // overshoots surfaces here rather than serving a session too many.
+        // A clean session needs the client's real first flight, because a
+        // carrier that dies mid-handshake settles as the failure above; a
+        // throwaway client session provides the frames.
+        let mut counted = 0_u32;
+        let outcome = serve_sessions(Some(1), || {
+            counted += 1;
+            if counted > 1 {
+                return Err(Error::CarrierUnavailable);
+            }
+            let mut client = vot_session::Session::client(
+                Loopback::default(),
+                vot_codec::Settings::default(),
+                std::collections::BTreeSet::new(),
+                not_required(),
+            );
+            client.begin().unwrap();
+            let mut carrier = Loopback::default();
+            for frame in client.driver().control.drain(..) {
+                carrier
+                    .events
+                    .push_back(Event::Control(vot_transport_api::shared_payload(&frame)));
+            }
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            ServeSession::begin(&server, carrier, not_required())
+        });
+        assert!(outcome.is_ok(), "one asked for, one served");
+        assert_eq!(counted, 1, "exactly the bound, no session more");
+
+        crate::harness::discard(&[&bundle]);
+    }
 
     /// An engine that reports what a test tells it to, and counts what the
     /// loop did to it.

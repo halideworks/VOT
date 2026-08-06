@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use vot_codec::frames::{
     self, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestRequest, PackageDescriptor,
@@ -27,21 +28,27 @@ use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAd
 use crate::serve::is_backpressure;
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
-/// Range requests one pass may issue, and the covers priced into staging
-/// for them.
+/// Covers this fetch will have asked for and not yet been given.
 ///
-/// An object has no bound worth queueing whole: at four mebibytes a
-/// request, a large one is hundreds of thousands of frames built before
-/// the first is sent. A pass builds this many and no more, so what is
-/// held is two frames however long the object is.
+/// The bound is on the wire, not on the queue. Bounding the queue is what
+/// this did first, on the reasoning that a pass runs when the carrier
+/// reports something so requests leave at the rate answers arrive. Over a
+/// real carrier they do not: a pass costs microseconds and an answer
+/// costs a round trip, so an object of any size is asked for in full long
+/// before the first cover lands, the server answers all of it, and the
+/// receiver refuses the fifth incomplete bundle it is holding. A 200 MB
+/// fetch died of `PendingBundlesExhausted` that way.
 ///
-/// It bounds the queue, not the wire. A pass runs when the carrier
-/// reports something, so requests leave at the rate answers arrive, and
-/// what is actually in flight is bounded by the carrier's own window and
-/// by the server refusing to read a request it cannot afford to answer.
-/// Two is enough that the next request is already there when the server
-/// finishes the current one.
+/// So a request is issued only while fewer than this many covers are
+/// outstanding, counted as the distance between what has been asked for
+/// and what the sink has placed. Two keeps the next request already at
+/// the server while it answers the current one.
 const OUTSTANDING_COVERS: usize = 2;
+
+/// What may be asked for and not yet placed, in the units a request is
+/// made in: a cover is what comes back, but a request names at most
+/// [`MAX_REQUESTED_RANGE`] and the two differ by a group.
+const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;
 
 /// The credit this end advertises: the covers it asked for, which is what
 /// the server may have in flight towards it.
@@ -86,6 +93,39 @@ impl From<Error> for Fault {
     }
 }
 
+/// A sink that counts what it places.
+///
+/// The fetch cannot see its answers arrive: the receiver takes proof
+/// bundles and records straight off the session and hands back nothing,
+/// so the only place this end learns that a cover landed is where its
+/// verified bytes are written. That count is what paces the requests and
+/// what tells a driving loop the session is getting somewhere.
+struct CountingSink {
+    file: FileSink,
+    placed: AtomicU64,
+}
+
+impl CountingSink {
+    fn create(path: &Path, length: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            file: FileSink::create(path, length)?,
+            placed: AtomicU64::new(0),
+        })
+    }
+
+    fn placed(&self) -> u64 {
+        self.placed.load(Ordering::Relaxed)
+    }
+}
+
+impl vot_scheduler::RangeSink for CountingSink {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        self.file.write_at(covered_offset, data)?;
+        self.placed.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// One stored object the manifest names, in fetch order.
 struct PlannedObject {
     object: frames::ObjectId,
@@ -98,7 +138,10 @@ struct FetchPlan {
     current: usize,
     /// The sink the current object's verified ranges flow into, kept for
     /// the sync that makes its bytes durable before the fetch moves on.
-    active: Option<Arc<FileSink>>,
+    active: Option<Arc<CountingSink>>,
+    /// Bytes placed for objects already left behind, so what this fetch
+    /// has settled only ever goes up.
+    placed_before: u64,
     /// Where the current object's next range request starts.
     next_offset: u64,
     finished: bool,
@@ -256,10 +299,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.receiver.session_mut()
     }
 
-    /// Everything this end has taken or asked for, only ever going up.
+    /// Everything this end has settled, only ever going up: frames taken,
+    /// requests issued, and every byte placed.
     #[must_use]
     pub fn progress(&self) -> u64 {
-        self.progress
+        let placed = self.plan.as_ref().map_or(0, |plan| {
+            plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
+        });
+        self.progress.saturating_add(placed)
     }
 
     /// Whether a request is queued that the carrier would not take, which
@@ -604,6 +651,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             objects,
             current: 0,
             active: None,
+            placed_before: 0,
             next_offset: 0,
             finished: false,
         });
@@ -629,7 +677,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 // Durable before the fetch moves on, so a completed fetch
                 // never names bytes that were only in the page cache.
-                sink.file().sync_all()?;
+                sink.file.file().sync_all()?;
+                plan.placed_before = plan.placed_before.saturating_add(sink.placed());
                 plan.active = None;
                 plan.current += 1;
             }
@@ -652,7 +701,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 continue;
             }
             let subject = subject_of(planned);
-            let sink = Arc::new(FileSink::create(&path, planned.object.length)?);
+            let sink = Arc::new(CountingSink::create(&path, planned.object.length)?);
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
             plan.active = Some(sink);
             plan.next_offset = 0;
@@ -662,16 +711,19 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Err(Error::InvalidBundle)
     }
 
-    /// Tops the queue back up to [`OUTSTANDING_COVERS`] requests for the
-    /// object being fetched, so an object of any length is asked for a
-    /// couple of covers at a time rather than all at once.
+    /// Asks for as much of the object as may be outstanding at once.
+    ///
+    /// What has been asked for and not yet placed is the measure, so an
+    /// object of any length is asked for a couple of covers at a time
+    /// however fast this end can build the frames.
     fn issue_ranges(&mut self) -> Result<(), Error> {
         let Some(plan) = &mut self.plan else {
             return Ok(());
         };
-        if plan.active.is_none() {
+        let Some(sink) = plan.active.as_ref() else {
             return Ok(());
-        }
+        };
+        let placed = sink.placed();
         let object = plan
             .objects
             .get(plan.current)
@@ -679,7 +731,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .object;
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
-        for _ in self.pending.len()..OUTSTANDING_COVERS {
+        for _ in 0..OUTSTANDING_COVERS {
+            // Everything asked for that has not arrived, which is what the
+            // peer and this end's receiver are holding between them.
+            if plan.next_offset.saturating_sub(placed) >= OUTSTANDING_REQUEST_BYTES {
+                return Ok(());
+            }
             let Some((offset, length)) = range_span(plan.next_offset, object.length) else {
                 return Ok(());
             };
@@ -1005,6 +1062,7 @@ mod tests {
             objects: vec![PlannedObject { object: empty }],
             current: 0,
             active: None,
+            placed_before: 0,
             next_offset: 0,
             finished: false,
         });
@@ -1489,55 +1547,55 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_builds_no_more_requests_than_its_cap() {
-        // Three covers, and a carrier that takes nothing. A queue the
-        // carrier drains is empty by the time a pass returns, so holding it
-        // is the only way to see the cap at all: watched after an accepted
-        // pass this asserts nothing, whatever the cap is.
-        let (bundle, _) = built_bundle("cap", &[("big.bin", patterned(8_500_000))]);
-        let (server, mut session, mut connection) = serving(&bundle);
-        let output = temporary("cap-fetched");
+    fn no_more_is_asked_for_than_may_be_outstanding() {
+        // The bound is what has been asked for and not yet placed, so a
+        // fetch asks for its covers and stops until some arrive, however
+        // many passes it is given and however long the object is. Bounding
+        // the queue instead let an object of any size be asked for in full
+        // before the first cover landed.
+        let (bundle, summary) = built_bundle("inflight", &[("a.txt", patterned(1000))]);
+        let output = temporary("inflight-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        assert!(!fetcher.has_backlog(), "nothing is held before a plan");
+        let object = frames::ObjectId {
+            suite: 1,
+            root: [3; 32],
+            length: 40 * MAX_REQUESTED_RANGE,
+        };
+        let sink =
+            Arc::new(CountingSink::create(&output.join("objects").join("held.obj"), 0).unwrap());
+        fetcher.plan = Some(FetchPlan {
+            summary,
+            objects: vec![PlannedObject { object }],
+            current: 0,
+            active: Some(Arc::clone(&sink)),
+            placed_before: 0,
+            next_offset: 0,
+            finished: false,
+        });
 
-        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
-        let mut admitted = false;
-        for _ in 0..ROUND_BUDGET {
-            round(
-                &server,
-                &mut session,
-                &mut connection,
-                &mut fetcher,
-                &mut sequence,
-            );
-            if fetcher
-                .plan
-                .as_ref()
-                .is_some_and(|plan| plan.active.is_some())
-            {
-                admitted = true;
-                break;
-            }
+        // However many passes, and however readily the carrier takes them.
+        for _ in 0..16 {
+            fetcher.issue_ranges().unwrap();
+            fetcher.pending.clear();
         }
-        assert!(admitted, "the object was never admitted");
+        assert_eq!(
+            fetcher.plan.as_ref().unwrap().next_offset,
+            OUTSTANDING_REQUEST_BYTES,
+            "asked for more than may be outstanding"
+        );
 
-        fetcher.session_mut().driver().refuse_sends = usize::MAX;
-        for _ in 0..8 {
-            assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
-            assert!(
-                fetcher.pending.len() <= OUTSTANDING_COVERS,
-                "the queue reached {} requests",
-                fetcher.pending.len()
-            );
-        }
-        assert!(fetcher.has_backlog(), "held requests are backlog");
+        // What the sink places is what buys the next request.
+        sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        fetcher.issue_ranges().unwrap();
+        assert_eq!(
+            fetcher.plan.as_ref().unwrap().next_offset,
+            OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
+            "a placed cover did not buy the next request"
+        );
+        // And placing counts as progress, which is what keeps a driving
+        // loop from giving up on a transfer that is arriving.
+        assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
 
-        // And a carrier that takes them again finishes the fetch.
-        fetcher.session_mut().driver().refuse_sends = 0;
-        let status =
-            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
-        assert_eq!(status, FetchStatus::Complete);
-        assert!(!fetcher.has_backlog(), "and nothing is held at the end");
         discard(&[&bundle, &output]);
     }
 

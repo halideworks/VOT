@@ -897,10 +897,10 @@ mod tests {
 
     #[test]
     fn a_tampered_record_ends_the_fetch_as_proof_invalid() {
-        // Two covers, so the fetch still has ranges to ask for when the
-        // proof fails: a close that left them owed would tell a driving
-        // loop to keep servicing a session that cannot progress.
-        let (bundle, _) = built_bundle("tampered", &[("big.bin", patterned(5_000_000))]);
+        // Three covers, so the fetch still has one to ask for when the
+        // proof fails: a close that left it owed would tell a driving loop
+        // to keep servicing a session that cannot progress.
+        let (bundle, _) = built_bundle("tampered", &[("big.bin", patterned(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("tampered-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
@@ -1526,10 +1526,16 @@ mod tests {
             ]
         );
         // Walking the cursor covers the object exactly once, and stops.
-        let walk = |length| {
+        // Counted by what the length can need, so a span that does not
+        // advance ends the walk with a wrong answer here rather than
+        // filling memory until something else stops it.
+        let walk = |length: u64| {
             let mut spans = Vec::new();
             let mut offset = 0;
-            while let Some((at, take)) = range_span(offset, length) {
+            for _ in 0..=length.div_ceil(MAX_REQUESTED_RANGE) {
+                let Some((at, take)) = range_span(offset, length) else {
+                    break;
+                };
                 spans.push((at, take));
                 offset = at + take;
             }

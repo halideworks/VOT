@@ -85,11 +85,11 @@ fn durable_units(covered: &BTreeMap<u64, u64>, length: u64) -> UnitRanges {
         }
         // Capped at the object: no arithmetic above can name a unit the
         // object does not have, and the cap is what bounds the extension
-        // below by the object rather than by the arithmetic.
+        // below by the object rather than by the arithmetic. An extent
+        // too small to hold a whole unit makes an empty range here, and
+        // an empty range extends nothing.
         .min(total_units_of(length));
-        if first < past {
-            units.extend_units(first..past);
-        }
+        units.extend_units(first..past);
     }
     units
 }

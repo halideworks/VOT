@@ -387,7 +387,10 @@ where
                         // the channel or never sent it.
                         match endings.try_recv() {
                             Ok(done) => break done,
-                            Err(_) => panic!("{finished} sessions finished without announcing"),
+                            Err(
+                                std::sync::mpsc::TryRecvError::Empty
+                                | std::sync::mpsc::TryRecvError::Disconnected,
+                            ) => panic!("{finished} sessions finished without announcing"),
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

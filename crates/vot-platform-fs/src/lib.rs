@@ -96,6 +96,60 @@ pub fn same_file_regular_windows(source: &Path, destination: &Path) -> io::Resul
 #[cfg(windows)]
 pub use same_file_regular_windows as same_file_regular;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+/// Frees a preallocated file from valid-data tracking, so positional
+/// writes may land at any offset without the filesystem zero-filling
+/// everything below them first.
+///
+/// NTFS keeps a valid data length per file: a write past it zero-fills
+/// the whole gap under the file's resources, which serializes concurrent
+/// out-of-order writers and writes the gap twice. A sparse file has no
+/// gap to fill, because unwritten regions read as zeros by construction.
+///
+/// # Errors
+/// Returns the operating system's refusal, filesystems without the
+/// attribute among them; the caller loses nothing but the saving.
+pub fn allow_unordered_writes_windows(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut returned: u32 = 0;
+    // SAFETY: the raw handle remains owned by `file` and valid for the
+    // call; FSCTL_SET_SPARSE takes no input buffer (null and zero select
+    // setting the attribute), and `returned` points to writable storage.
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub use allow_unordered_writes_windows as allow_unordered_writes;
+
+#[cfg(not(windows))]
+/// Positional writes already land at any offset without penalty here;
+/// the signature stands so callers need no platform of their own.
+///
+/// # Errors
+/// None here; the Windows half surfaces the platform's refusal.
+pub fn allow_unordered_writes(_file: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(any(unix, windows)))]
 /// Reports whether two paths are regular hard links to the same file.
 ///

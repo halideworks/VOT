@@ -82,12 +82,28 @@ fn durable_units(covered: &BTreeMap<u64, u64>, length: u64) -> UnitRanges {
             total_units_of(length)
         } else {
             end / unit
-        };
+        }
+        // Capped at the object: no arithmetic above can name a unit the
+        // object does not have, and the cap is what bounds the extension
+        // below by the object rather than by the arithmetic.
+        .min(total_units_of(length));
         if first < past {
             units.extend_units(first..past);
         }
     }
     units
+}
+
+/// The reservations a plan makes in its store: every stored object that
+/// has units to checkpoint, which zero-length objects do not (the store
+/// refuses a zero-unit reservation, and an empty object is written
+/// directly rather than fetched).
+fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)> {
+    objects
+        .iter()
+        .filter(|planned| planned.object.length > 0)
+        .map(|planned| (subject_of(planned), total_units_of(planned.object.length)))
+        .collect()
 }
 
 /// Covers this fetch will have asked for and not yet been given.
@@ -443,6 +459,7 @@ fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
 }
 
 /// One stored object the manifest names, in fetch order.
+#[derive(Clone)]
 struct PlannedObject {
     object: frames::ObjectId,
     /// Byte extents a previous fetch checkpointed as durable, empty on a
@@ -1561,12 +1578,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let mut locked = store
                 .lock()
                 .map_err(|_| Fault::Local(Error::InvalidBundle))?;
-            let reservations = std::iter::once((package_sentinel(summary.root), 1)).chain(
-                objects
-                    .iter()
-                    .filter(|planned| planned.object.length > 0)
-                    .map(|planned| (subject_of(planned), total_units_of(planned.object.length))),
-            );
+            let reservations = std::iter::once((package_sentinel(summary.root), 1))
+                .chain(reservations_of(&objects));
             locked
                 .reserve_many(reservations)
                 .map_err(|error| Fault::Local(resume_failure(error)))?;
@@ -1702,12 +1715,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.finished = true;
                 return Ok(());
             }
-            let planned = &plan.objects[plan.current];
+            let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
+            let object = planned.object;
+            let whole_from_before = planned.fully_resumed();
             let path = self
                 .bundle
                 .join("objects")
-                .join(crate::object_name(&planned.object.root));
-            if planned.object.length == 0 {
+                .join(crate::object_name(&object.root));
+            if object.length == 0 {
                 // Nothing to fetch or verify; the empty object simply is.
                 // The lock is held, so exactly one rail writes it; a
                 // resumed fetch finds its own earlier write and moves on.
@@ -1717,20 +1732,34 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.current += 1;
                 continue;
             }
-            if planned.fully_resumed() && path.exists() {
+            if whole_from_before && path.exists() {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
-                let length = planned.object.length;
-                plan.placed_before = plan.placed_before.saturating_add(length);
+                plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.current += 1;
                 continue;
             }
-            let subject = subject_of(planned);
+            let subject = SubjectId {
+                suite: object.suite,
+                root: object.root,
+                length: object.length,
+            };
             let resumed = if path.exists() {
                 planned.resumed.clone()
             } else {
-                // The checkpoint outlived its file; whatever claimed it
-                // durable, the object is owed whole again.
+                // The checkpoint outlived its file, so the object is owed
+                // whole again. The store's record is cleared too: left in
+                // place, a later resume would seed from a claim the disk
+                // cannot back and trust bytes nobody placed.
+                let at = plan.current;
+                if !plan.objects[at].resumed.is_empty() {
+                    if let Some(store) = &plan.store {
+                        if let Ok(mut store) = store.lock() {
+                            store.reset(subject).map_err(resume_failure)?;
+                        }
+                    }
+                    plan.objects[at].resumed.clear();
+                }
                 BTreeMap::new()
             };
             let seeded: u64 = resumed.values().sum();
@@ -1740,9 +1769,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 subject,
             });
             let sink = Arc::new(if path.exists() {
-                CountingSink::resume(&path, planned.object.length, seeded, durable)?
+                CountingSink::resume(&path, object.length, seeded, durable)?
             } else {
-                CountingSink::create(&path, planned.object.length, durable)?
+                CountingSink::create(&path, object.length, durable)?
             });
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
             self.admitted = Some((plan.current, subject));
@@ -2519,6 +2548,94 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_whose_file_is_gone_is_cleared_in_the_store_too() {
+        // Discarding the stale claim locally is not enough: left in the
+        // store, a later resume would seed from it against a freshly
+        // created file and trust bytes nobody placed. The clear happens
+        // when the missing file is discovered, and the whole object is
+        // re-requested.
+        let (bundle, built) = built_bundle(
+            "stale",
+            &[("a.bin", patterned(8_500_000)), ("b.bin", noise(8_500_000))],
+        );
+        let output = temporary("stale-fetched");
+        let first_root;
+        {
+            let (server, mut session, mut connection) = serving(&bundle);
+            let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            let mut sequence = 0;
+            let mut first_done = false;
+            for _ in 0..ROUND_BUDGET {
+                round(
+                    &server,
+                    &mut session,
+                    &mut connection,
+                    &mut fetcher,
+                    &mut sequence,
+                );
+                if fetcher
+                    .locked_plan()
+                    .is_some_and(|plan| plan.placed_before > 0)
+                {
+                    first_done = true;
+                    break;
+                }
+            }
+            assert!(first_done, "the first object never completed");
+            first_root = fetcher.locked_plan().unwrap().objects[0].object.root;
+        }
+        // The checkpointed file vanishes between the fetches.
+        fs::remove_file(output.join("objects").join(crate::object_name(&first_root))).unwrap();
+
+        let (server, mut session, mut connection) = serving(&bundle);
+        let mut resumed = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut sequence = 0;
+        for _ in 0..ROUND_BUDGET {
+            round(
+                &server,
+                &mut session,
+                &mut connection,
+                &mut resumed,
+                &mut sequence,
+            );
+            if resumed
+                .locked_plan()
+                .is_some_and(|plan| plan.active.is_some())
+            {
+                break;
+            }
+        }
+        let first_subject = resumed
+            .locked_plan()
+            .map(|plan| subject_of(&plan.objects[0]))
+            .unwrap();
+        assert!(
+            ResumeStore::open(output.join(RESUME_STORE))
+                .unwrap()
+                .checkpointed(first_subject)
+                .is_none_or(vot_resume::UnitRanges::is_empty),
+            "the stale claim was cleared in the store, not only locally"
+        );
+        let status =
+            run_to_end(&server, &mut session, &mut connection, &mut resumed, false).unwrap();
+        assert_eq!(status, FetchStatus::Complete);
+        let total: u64 = resumed
+            .locked_plan()
+            .unwrap()
+            .objects
+            .iter()
+            .map(|planned| planned.object.length)
+            .sum();
+        assert_eq!(
+            resumed.taken_bytes, total,
+            "everything was re-requested, the stale claim bought nothing"
+        );
+        assert_eq!(resumed.package(), Some(built));
+        assert_same_tree(&bundle, &output);
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
     fn a_partial_bundle_without_a_store_is_refused_and_identity_is_held() {
         // Without a store there is nothing safe to continue: the refusal
         // is exactly the one an occupied destination always got. With a
@@ -2549,6 +2666,13 @@ mod tests {
             agreed.pin,
             Some([7; 32]),
             "the store's identity is the pin a resume is held to"
+        );
+        drop(agreed);
+        let matching = BundleFetcher::begin(Loopback::default(), &bound, Some([7; 32])).unwrap();
+        assert_eq!(
+            matching.pin,
+            Some([7; 32]),
+            "a pin that agrees with the store is no refusal"
         );
         discard(&[&occupied, &bound]);
     }
@@ -2585,6 +2709,16 @@ mod tests {
             "the tail unit is whole at the object's end"
         );
 
+        let mut covered = BTreeMap::new();
+        covered.insert(0, 2 * unit + 5);
+        assert_eq!(
+            durable_units(&covered, 4 * unit)
+                .units()
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the boundary is a division, not a remainder"
+        );
+
         let mut units = UnitRanges::new();
         units.extend_units([0, 3]);
         let extents = resumed_extents(&units, length);
@@ -2593,6 +2727,190 @@ mod tests {
             vec![(&0, &unit), (&(3 * unit), &100)],
             "stored units come back clipped to the object"
         );
+        let mut units = UnitRanges::new();
+        units.extend_units([3]);
+        assert!(
+            resumed_extents(&units, 3 * unit).is_empty(),
+            "a unit starting at the object's end stands for no bytes"
+        );
+    }
+
+    #[test]
+    fn store_refusals_map_to_the_fetchs_own_errors() {
+        // The identity refusal is the wrong-pin refusal; a broken store
+        // file is its own I/O; everything else is a bundle problem.
+        assert!(matches!(
+            resume_failure(vot_resume::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            Error::Io(_)
+        ));
+        assert!(matches!(
+            resume_failure(vot_resume::Error::IdentityMismatch),
+            Error::RootMismatch
+        ));
+        assert!(matches!(
+            resume_failure(vot_resume::Error::Corrupt),
+            Error::InvalidBundle
+        ));
+    }
+
+    #[test]
+    fn only_whole_nonempty_objects_reserve_and_resume_whole() {
+        // The reservation list excludes zero-length objects (the store
+        // refuses zero units, and empty objects are written, not
+        // fetched), and fully_resumed holds only for a nonempty object
+        // whose extents sum to its length.
+        let empty = PlannedObject::fresh(frames::ObjectId {
+            suite: 1,
+            root: [1; 32],
+            length: 0,
+        });
+        let stored = PlannedObject::fresh(frames::ObjectId {
+            suite: 1,
+            root: [2; 32],
+            length: 100,
+        });
+        assert_eq!(
+            reservations_of(&[empty.clone(), stored.clone()]),
+            vec![(subject_of(&stored), 1)],
+            "the empty object reserves nothing, the stored one its units"
+        );
+
+        assert!(!empty.fully_resumed(), "an empty object is never resumed");
+        assert!(!stored.fully_resumed(), "nothing placed is not whole");
+        let mut partial = stored.clone();
+        partial.resumed.insert(0, 99);
+        assert!(!partial.fully_resumed(), "one byte short is short");
+        let mut whole = stored;
+        whole.resumed.insert(0, 100);
+        assert!(whole.fully_resumed());
+    }
+
+    #[test]
+    fn a_resumed_sinks_flush_mark_starts_past_what_is_placed() {
+        // The seed arms the next stride above the resumed bytes, so the
+        // first flush is a stride of new work, not a replay of the seed.
+        let output = temporary("resume-seed");
+        fs::create_dir_all(&output).unwrap();
+        let path = output.join("s.obj");
+        drop(CountingSink::create(&path, 4 * FLUSH_STRIDE_BYTES, None).unwrap());
+
+        let mid = CountingSink::resume(&path, 4 * FLUSH_STRIDE_BYTES, 100, None).unwrap();
+        assert_eq!(mid.placed(), 100, "the seed is what was placed");
+        assert_eq!(
+            mid.flush_due.load(Ordering::Relaxed),
+            FLUSH_STRIDE_BYTES,
+            "a seed inside the first stride arms the first mark"
+        );
+        let exact =
+            CountingSink::resume(&path, 4 * FLUSH_STRIDE_BYTES, FLUSH_STRIDE_BYTES, None).unwrap();
+        assert_eq!(
+            exact.flush_due.load(Ordering::Relaxed),
+            2 * FLUSH_STRIDE_BYTES,
+            "a seed on the mark arms the one after it"
+        );
+        let past =
+            CountingSink::resume(&path, 4 * FLUSH_STRIDE_BYTES, FLUSH_STRIDE_BYTES + 5, None)
+                .unwrap();
+        assert_eq!(
+            past.flush_due.load(Ordering::Relaxed),
+            2 * FLUSH_STRIDE_BYTES,
+            "a seed past the mark arms the whole stride above it"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    fn a_stride_flush_checkpoints_the_covered_units_of_its_own_object() {
+        // The hook's whole contract: coverage snapshotted for the
+        // matching object becomes checkpointed units after the sync, and
+        // a sink whose object the plan has moved past checkpoints
+        // nothing.
+        let unit = vot_scheduler::RANGE_UNIT_BYTES;
+        let output = temporary("hook");
+        fs::create_dir_all(&output).unwrap();
+        let object = frames::ObjectId {
+            suite: 1,
+            root: [5; 32],
+            length: 4 * unit,
+        };
+        let planned = PlannedObject::fresh(object);
+        let subject = subject_of(&planned);
+        let store = Arc::new(Mutex::new(
+            ResumeStore::create(output.join(RESUME_STORE)).unwrap(),
+        ));
+        store
+            .lock()
+            .unwrap()
+            .reserve_many([(subject, total_units_of(object.length))])
+            .unwrap();
+        let mut covered = BTreeMap::new();
+        covered.insert(0, 2 * unit + 5);
+        let plan = Arc::new(Mutex::new(FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: vec![planned],
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered,
+            covered_bytes: 2 * unit + 5,
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: Some(Arc::clone(&store)),
+            finished: false,
+        }));
+        let sink = CountingSink::create(
+            &output.join("h.obj"),
+            object.length,
+            Some(DurableHook {
+                plan: Arc::downgrade(&plan),
+                store: Arc::clone(&store),
+                subject,
+            }),
+        )
+        .unwrap();
+
+        sink.durable.as_ref().unwrap().flush(&sink.file);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .checkpointed(subject)
+                .unwrap()
+                .units()
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the whole units inside the snapshot, and no more"
+        );
+
+        // The plan moves on; a late flush of the old sink claims nothing.
+        let other = PlannedObject::fresh(frames::ObjectId {
+            suite: 1,
+            root: [6; 32],
+            length: unit,
+        });
+        {
+            let mut plan = plan.lock().unwrap();
+            plan.objects.push(other);
+            plan.current = 1;
+            plan.covered.clear();
+            plan.covered.insert(0, unit);
+        }
+        let before = store.lock().unwrap().checkpointed(subject).unwrap().count();
+        sink.durable.as_ref().unwrap().flush(&sink.file);
+        assert_eq!(
+            store.lock().unwrap().checkpointed(subject).unwrap().count(),
+            before,
+            "another object's coverage is not this sink's to claim"
+        );
+        discard(&[&output]);
     }
 
     #[test]

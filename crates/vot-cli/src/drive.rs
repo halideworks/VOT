@@ -356,19 +356,22 @@ where
         // are what keeps the report ordered rather than racy.
         let mut failed = Ok(());
         // Takes one finished session's outcome, waiting for a session to
-        // finish if none has: the channel's senders live exactly as long
-        // as the sessions, so a receive with any session running answers.
+        // finish if none has: every session announces as it ends, however
+        // it ends, so a receive with any session running answers.
         let reap = |running: &mut std::collections::VecDeque<(
             u64,
             std::thread::ScopedJoinHandle<'_, _>,
         )>,
                     failed: &mut Result<(), Error>| {
-            let Ok(done) = endings.recv() else {
-                return;
-            };
-            let Some(at) = running.iter().position(|(id, _)| *id == done) else {
-                return;
-            };
+            assert!(
+                !running.is_empty(),
+                "a slot is only reaped from a serve that holds one"
+            );
+            let done = endings.recv().expect("the serve holds a sender");
+            let at = running
+                .iter()
+                .position(|(id, _)| *id == done)
+                .expect("an announced session is still held");
             let (_, handle) = running.remove(at).expect("the position was just found");
             let settled = handle.join().expect("a session thread never panics");
             settle_session(sessions, settled, failed);
@@ -405,21 +408,41 @@ where
             };
             let id = spawned;
             spawned += 1;
-            let announce = ended.clone();
+            let announce = Announcement {
+                id,
+                ended: ended.clone(),
+            };
             running.push_back((
                 id,
                 scope.spawn(move || {
-                    let settled = drive(&mut session).map(|_| ());
-                    // The announcement is the last thing the thread does,
-                    // so a reaped identifier is always joinable at once.
-                    let _ = announce.send(id);
-                    settled
+                    // Held for the whole drive and announced by its drop,
+                    // so the end is announced however the thread ends: a
+                    // panic that skipped the announcement would leave the
+                    // reap waiting on a session that already died.
+                    let _announce = announce;
+                    drive(&mut session).map(|_| ())
                 }),
             ));
         }
         drain(running, sessions, &mut failed);
         failed
     })
+}
+
+/// One session's end, announced by drop: however the session's thread
+/// ends, the announcement goes, so the reap never waits on a session
+/// that already died.
+#[cfg(any(test, feature = "wire"))]
+struct Announcement {
+    id: u64,
+    ended: std::sync::mpsc::Sender<u64>,
+}
+
+#[cfg(any(test, feature = "wire"))]
+impl Drop for Announcement {
+    fn drop(&mut self) {
+        let _ = self.ended.send(self.id);
+    }
 }
 
 /// Exactly the bound's turns, or turns without end.

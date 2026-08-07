@@ -169,13 +169,15 @@ fn local_for(peer: SocketAddr) -> Result<SocketAddr, Error> {
     Ok(local)
 }
 
-/// Serves `bundle` to one session at a time on `address`, forever.
+/// Serves `bundle` on `address` until stopped or `sessions` are answered.
 ///
 /// Each accepted carrier is driven to a settled state and then dropped;
 /// the bundle is opened and proved once, ahead of any of them. The socket
 /// is bound afresh per session, so a port-zero `address` is assigned anew
-/// each time and `listening` reports each one: useful to a test serving a
-/// bounded count, not to an unbounded serve, which wants a fixed port.
+/// each time and `listening` reports each one, and sessions run
+/// concurrently. A fixed port serves them one after another instead: the
+/// next bind is refused until the session holding the port ends, and the
+/// serve waits that refusal out rather than dying of it.
 ///
 /// # Errors
 /// Surfaces a bundle that will not open, a socket that will not bind, and

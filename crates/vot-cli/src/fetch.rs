@@ -270,9 +270,10 @@ struct PlannedObject {
 /// The objects still owed once the manifest is validated, behind a lock.
 ///
 /// ADR-0031 step 2: the plan is the striping point. It hands out range
-/// requests through [`FetchPlan::hand_out`]; one rail takes from it
-/// today exactly as before the split, and W rails take from the same
-/// handout at step 3, which is work stealing by construction.
+/// requests through [`FetchPlan::next_span`] and [`FetchPlan::take`];
+/// one rail takes from it today exactly as before the split, and W
+/// rails take from the same handout at step 3, which is work stealing
+/// by construction.
 type SharedPlan = Arc<Mutex<FetchPlan>>;
 
 /// What a [`SharedPlan`] holds.
@@ -292,13 +293,13 @@ struct FetchPlan {
 }
 
 impl FetchPlan {
-    /// The next range to request, or nothing while enough is out.
+    /// The next range a taker would request, uncommitted.
     ///
     /// What has been asked for and not yet placed is the measure, so an
     /// object of any length is asked for a couple of covers at a time
     /// however fast the taker can build the frames, and a slow taker
     /// simply takes fewer.
-    fn hand_out(&mut self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
+    fn next_span(&self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
         let Some(sink) = self.active.as_ref() else {
             return Ok(None);
         };
@@ -313,11 +314,18 @@ impl FetchPlan {
         if self.next_offset.saturating_sub(placed) >= OUTSTANDING_REQUEST_BYTES {
             return Ok(None);
         }
-        let Some((offset, length)) = range_span(self.next_offset, object.length) else {
-            return Ok(None);
-        };
+        Ok(range_span(self.next_offset, object.length)
+            .map(|(offset, length)| (object, offset, length)))
+    }
+
+    /// Commits the span [`FetchPlan::next_span`] handed out.
+    ///
+    /// Separate from the peek, and called only once the span's frame is
+    /// queued: a span committed before its frame exists is consumed by
+    /// the failure between the two, a hole no rail would ever re-request.
+    fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
         self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
-        Ok(Some((object, offset, length)))
+        Ok(())
     }
 }
 
@@ -1123,7 +1131,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Asks for as much of the object as may be outstanding at once.
     ///
     /// The spans come from the plan's handout; this rail turns each into
-    /// a request frame of its own.
+    /// a request frame of its own, and commits the span only once its
+    /// frame is queued, so a failure between the two leaves the span
+    /// owed rather than consumed. The lock is held across the pair,
+    /// which is what keeps two takers from framing the same span.
     fn issue_ranges(&mut self) -> Result<(), Error> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
@@ -1131,15 +1142,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
         for _ in 0..OUTSTANDING_COVERS {
-            let handed = shared
-                .lock()
-                .map_err(|_| Error::InvalidBundle)?
-                .hand_out()?;
-            let Some((object, offset, length)) = handed else {
+            let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+            let Some((object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
             let request_id = Self::request_identifier(&mut self.next_request)?;
-            self.progress = self.progress.saturating_add(1);
             Self::queue_request(
                 &mut self.pending,
                 &TypedFrame::RangeRequest(RangeRequest {
@@ -1149,6 +1156,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     length,
                 }),
             )?;
+            plan.take(offset, length)?;
+            self.progress = self.progress.saturating_add(1);
         }
         Ok(())
     }
@@ -2270,6 +2279,24 @@ mod tests {
         // And placing counts as progress, which is what keeps a driving
         // loop from giving up on a transfer that is arriving.
         assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
+
+        // A span is committed only once its frame is queued: a failure
+        // between the handout and the frame leaves the span owed. At one
+        // rail this ends the fetch either way; at W rails a span consumed
+        // by a failed frame would be a hole nobody ever re-requests.
+        sink.placed
+            .store(2 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        let owed = fetcher.locked_plan().unwrap().next_offset;
+        fetcher.next_request = u64::MAX;
+        assert!(
+            fetcher.issue_ranges().is_err(),
+            "the identifier space ended"
+        );
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            owed,
+            "a span whose frame never queued was consumed"
+        );
 
         discard(&[&bundle, &output]);
     }

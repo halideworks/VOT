@@ -1,6 +1,6 @@
 # ADR-0031: rails carry the fetch past one thread
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 

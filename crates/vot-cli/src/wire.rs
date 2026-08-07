@@ -247,6 +247,11 @@ pub fn serve_bundle(
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
+        // A session begun before a client arrives spends its stall budget
+        // on the accept and recycles forever on an idle port. The carrier
+        // parks this thread until it has something a session can react to:
+        // a client's handshake, or the driver ending without one.
+        carrier.wait_arrival();
         ServeSession::begin(&server, carrier, authentication())
     })?;
     Ok(server.package())

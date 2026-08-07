@@ -517,6 +517,41 @@ impl Transport {
         self.connection
     }
 
+    /// Parks until this endpoint has something to say, without consuming it.
+    ///
+    /// A server's driver waits for a client's first packet before any
+    /// connection exists, while `serve` returns at the bind so its caller
+    /// can report the address. A session begun in between spends its own
+    /// budgets waiting out the accept; a serving caller parks here instead,
+    /// for as long as the accept allows (`accept_timeout_ms`, where zero is
+    /// forever). The first thing a driver ever queues is a lifecycle event,
+    /// `Connected` for a handshake or `Disconnected` for a driver that
+    /// ended without one, so this returns exactly when a session would have
+    /// something to react to.
+    pub fn wait_arrival(&self) {
+        loop {
+            let signal = {
+                let Ok(inbound) = self.inbound.lock() else {
+                    return;
+                };
+                if !inbound.events.is_empty() {
+                    return;
+                }
+                Arc::clone(&inbound.arrived)
+            };
+            if self.driver.as_ref().is_none_or(JoinHandle::is_finished) {
+                // The driver pushes its disconnect before it finishes, so
+                // the caller finds it on its next poll even if this races
+                // the push itself.
+                return;
+            }
+            // The signal wakes this on the driver's next push; the bound
+            // only covers a driver that exited without ever pushing, which
+            // the check above then sees.
+            signal.wait(ARRIVAL_TICK);
+        }
+    }
+
     /// Moves what the driver has observed into the caller's queue.
     ///
     /// An event the queue cannot hold is kept and offered again before any later
@@ -916,6 +951,13 @@ fn drive(
         }
     }
 }
+
+/// How often an arrival wait rechecks a driver that may have gone.
+///
+/// The wait wakes on the driver's push signal; this bound exists only so
+/// a driver that exited without pushing is noticed, and it prices that
+/// detection, not the arrival itself.
+const ARRIVAL_TICK: Duration = Duration::from_millis(250);
 
 /// How long a server waits for its first packet unless told otherwise.
 ///
@@ -1825,6 +1867,28 @@ mod tests {
         )
         .expect("a client");
         (client, server)
+    }
+
+    #[test]
+    fn an_arrival_wait_parks_through_the_accept() {
+        // A server with no client has nothing to say until its accept
+        // ends, and the wait must hold for all of it: one that returns
+        // early hands a session an empty carrier, whose stall budget then
+        // prices the accept and recycles an idle serve forever.
+        let (certificate, key) = credentials();
+        let mut config = Config::server(limits(), certificate, key);
+        config.accept_timeout_ms = 400;
+        let server = Transport::serve("127.0.0.1:0".parse().expect("an address"), &config)
+            .expect("a server");
+        let began = Instant::now();
+        server.wait_arrival();
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300),
+            "the wait ended at {waited:?}, inside the 400 ms accept"
+        );
+        let queued = server.inbound.lock().expect("the queue").events.len();
+        assert!(queued > 0, "the wait ended with nothing for a session");
     }
 
     /// Polls both endpoints until `ready` says so, or fails after `seconds`.

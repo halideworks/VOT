@@ -120,8 +120,8 @@ impl FileSink {
         file.set_len(length)?;
         // Best effort: a filesystem that refuses costs the write path
         // only the valid-data zero-fill this avoids, which on NTFS
-        // serializes rails writing out of order and writes every gap
-        // twice (docs/perf-engineering.md, 2026-08-07).
+        // serializes writers landing out of order and writes every gap
+        // twice.
         let _ = vot_platform_fs::allow_unordered_writes(&file);
         Ok(Self { file })
     }

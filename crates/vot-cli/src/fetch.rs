@@ -106,13 +106,13 @@ impl From<Error> for Fault {
 /// stride.
 ///
 /// The sync that gates an object's completion is serial: nothing
-/// advances while it runs, and syncing a whole object there cost 220 ms
-/// of every 512 MiB fetch on the rig, a third of the wall at W=6
-/// (docs/perf-engineering.md, 2026-08-07). Flushing every stride from
-/// the prover that crosses it moves that work into the transfer, where
-/// the other provers and every rail keep going; the final sync then
-/// flushes at most a stride. 64 MiB is a few tens of milliseconds on
-/// an `NVMe` and small enough to leave the tail negligible.
+/// advances while it runs, and syncing a whole object there measured
+/// 220 ms of every 512 MiB wire fetch, a quarter of the wall. Flushing
+/// every stride from the writer that crosses it moves that work into
+/// the transfer, where the other provers and every rail keep going;
+/// the final sync then flushes at most a stride. 64 MiB is a few tens
+/// of milliseconds on an `NVMe` and small enough to leave the tail
+/// negligible.
 const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
 
 /// A sink that counts what it places, and keeps durability in stride.

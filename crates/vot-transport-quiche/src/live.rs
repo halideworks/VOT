@@ -561,8 +561,12 @@ impl Drop for Transport {
     fn drop(&mut self) {
         // The driver owns the socket, so it has to stop before this returns or
         // the port outlives the endpoint that bound it. Dropping an endpoint is
-        // not an error, so it closes under no code at all.
+        // not an error, so it closes under no code at all. The command channel
+        // is disconnected as well, so the driver has two ways to hear that its
+        // owner is gone and no single failure of either can strand the join.
         self.close.store(NO_REASON, Ordering::Relaxed);
+        let (dead, _) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.commands, dead));
         if let Some(driver) = self.driver.take() {
             let _ = driver.join();
         }
@@ -822,11 +826,12 @@ fn drive(
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut queued = Queued::default();
     let mut closing = false;
+    let mut sending = Sending::new(datagram_bytes, offload);
 
     loop {
         queued.debug_assert_matches(&streams);
         // What the caller asked for, and what the connection has to say about it.
-        take_submissions(
+        let orphaned = take_submissions(
             &mut conn,
             &mut streams,
             &budget,
@@ -836,25 +841,14 @@ fn drive(
             role,
             &mut queued,
         );
-        if !closing {
-            let requested = close.load(Ordering::Relaxed);
-            if requested != NO_CLOSE {
-                closing = true;
-                let _ = conn.close(true, requested, b"");
-            }
+        note_close_request(&mut conn, close, &mut closing);
+        if orphaned {
+            note_orphaned(&mut conn, &mut closing);
         }
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream, &mut queued);
         }
-        // A socket that will not take a packet is a carrier that has gone.
-        // The ceiling goes down whole: a discovery probe is only generated
-        // when the buffer offered could hold one, and the connection's own
-        // packet-size accessor caps its answer at 16383, so a slot sized by
-        // it can never hold the probe for a larger ceiling and discovery
-        // starves at the handshake floor. send_all opens each burst at the
-        // ceiling and lets the first packet written set the burst's segment,
-        // which keeps the offload's equal-sized runs either way.
-        let Ok(paced) = send_all(socket, &mut conn, &mut out, datagram_bytes, offload) else {
+        let Ok(paced) = send_and_revalidate(socket, &mut conn, &mut out, &mut sending) else {
             return Ok(());
         };
 
@@ -1136,12 +1130,84 @@ fn drain_arrivals(
 /// acknowledgements would queue in the kernel and the window would stop opening.
 /// The deadline goes back to the caller instead, which waits on the socket until
 /// then and keeps reading the whole time.
+/// One send pass, and the remedy when the interface refuses its sizes.
+///
+/// A socket that will not take a packet at all is a carrier that has
+/// gone, and the error says so. The ceiling goes down whole: a discovery
+/// probe is only generated when the buffer offered could hold one, and
+/// the connection's own packet-size accessor caps its answer at 16383,
+/// so a slot sized by it can never hold the probe for a larger ceiling
+/// and discovery starves at the handshake floor. `send_all` opens each
+/// burst at the ceiling and lets the first packet written set the
+/// burst's segment, which keeps the offload's equal-sized runs.
+///
+/// More refusals than probing explains is an interface that narrowed
+/// under the settled PMTU. Revalidation reopens discovery, which settles
+/// under the interface as it now is, and the ledger starts again so the
+/// next narrowing is noticed too.
+fn send_and_revalidate(
+    socket: &UdpSocket,
+    conn: &mut quiche::Connection,
+    out: &mut [u8],
+    sending: &mut Sending,
+) -> Result<Option<Instant>, Error> {
+    let paced = send_all(
+        socket,
+        conn,
+        out,
+        sending.ceiling,
+        sending.gso,
+        &mut sending.refused,
+    )?;
+    if should_revalidate(sending.refused) {
+        conn.revalidate_pmtu();
+        sending.refused = 0;
+    }
+    Ok(paced)
+}
+
+/// Whether the refusals seen are more than probing explains.
+const fn should_revalidate(refused: usize) -> bool {
+    refused >= REVALIDATE_REFUSED_SENDS
+}
+
+/// What a send pass needs beyond the connection: the ceiling, whether
+/// segmentation offload is available, and the size-refusal ledger.
+struct Sending {
+    ceiling: usize,
+    gso: bool,
+    refused: usize,
+}
+
+impl Sending {
+    const fn new(ceiling: usize, gso: bool) -> Self {
+        Self {
+            ceiling,
+            gso,
+            refused: 0,
+        }
+    }
+}
+
+/// Takes the caller's close request to the connection, once.
+fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
+    if *closing {
+        return;
+    }
+    let requested = close.load(Ordering::Relaxed);
+    if requested != NO_CLOSE {
+        *closing = true;
+        let _ = conn.close(true, requested, b"");
+    }
+}
+
 fn send_all(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
     ceiling: usize,
     gso: bool,
+    refused: &mut usize,
 ) -> Result<Option<Instant>, Error> {
     // Packets are gathered into one buffer and handed over together, because a
     // syscall per packet is most of what a fast path costs: at a 1500-byte MTU
@@ -1165,7 +1231,7 @@ fn send_all(
         let slot = if filled == 0 { ceiling } else { segment };
         let Some(room) = out.get_mut(filled..filled + slot) else {
             // The buffer holds no further packet, so this burst goes now.
-            flush_burst(socket, &out[..filled], segment, destination, gso)?;
+            flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
             filled = 0;
             destination = None;
             continue;
@@ -1174,7 +1240,7 @@ fn send_all(
             Ok((written, info)) => {
                 // A different destination cannot share a burst.
                 if destination.is_some_and(|previous| previous != info.to) {
-                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
                     // The packet just generated sits at `filled`, so move it to
                     // the front rather than losing or resending it.
                     out.copy_within(filled..filled + written, 0);
@@ -1191,20 +1257,20 @@ fn send_all(
                 // bounds a burst's time by the pacer's clock.
                 if info.at > Instant::now() {
                     deadline = Some(info.at);
-                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
                     return Ok(deadline);
                 }
                 // A packet shorter than a segment closes the burst, because
                 // the kernel cuts every segment to the same length but the
                 // last; the connection may still have more to say.
                 if written < segment {
-                    flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
                     filled = 0;
                     destination = None;
                 }
             }
             Err(quiche::Error::Done) => {
-                flush_burst(socket, &out[..filled], segment, destination, gso)?;
+                flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
                 // Done in a segment-sized slot only says the next packet did
                 // not fit this burst's segment: a burst opened by a lone ACK
                 // pins the segment near thirty bytes, and ending the pass
@@ -1220,7 +1286,7 @@ fn send_all(
             Err(_) => {
                 // The gathered packets are state the connection has already
                 // committed to; they go to the peer even as the driver ends.
-                let _ = flush_burst(socket, &out[..filled], segment, destination, gso);
+                let _ = flush_burst(socket, &out[..filled], segment, destination, gso, refused);
                 return Err(Error::Backend);
             }
         }
@@ -1303,6 +1369,7 @@ fn flush_burst(
     segment: usize,
     destination: Option<SocketAddr>,
     gso: bool,
+    refused: &mut usize,
 ) -> Result<(), Error> {
     let Some(destination) = destination else {
         return Ok(());
@@ -1316,11 +1383,44 @@ fn flush_burst(
         return Ok(());
     }
     for packet in burst.chunks(segment) {
-        if socket.send_to(packet, destination).is_err() {
-            return Err(Error::Backend);
+        match socket.send_to(packet, destination) {
+            Ok(_) => {}
+            // A datagram the local interface cannot carry is a lost path
+            // probe, and losing it is the probe's answer: discovery asked
+            // whether the path takes this size and the first hop said no.
+            // Ordinary packets never hit this, because the connection sizes
+            // them under the MTU it has validated. Treating it as fatal
+            // killed the connection on the first probe above the NIC, which
+            // is what made any ceiling above the path unusable
+            // (docs/perf-engineering.md, 2026-08-06).
+            Err(error) if datagram_too_large(&error) => {
+                *refused = refused.saturating_add(1);
+            }
+            Err(_) => return Err(Error::Backend),
         }
     }
     Ok(())
+}
+
+/// Size refusals a connection rides out before revalidating its PMTU.
+///
+/// Discovery explains a handful: a probe above the interface is refused
+/// once per size it tries. It cannot explain a run of them, because data
+/// packets are sized under the validated MTU; a run means the interface
+/// narrowed after validation, and every retransmission will be refused at
+/// the same size until discovery is reopened.
+const REVALIDATE_REFUSED_SENDS: usize = 64;
+
+/// Whether a send was refused for the datagram's size against the local
+/// interface, which is `EMSGSIZE` by its per-platform number.
+fn datagram_too_large(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    const MESSAGE_TOO_LONG: i32 = 90;
+    #[cfg(windows)]
+    const MESSAGE_TOO_LONG: i32 = 10040;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    const MESSAGE_TOO_LONG: i32 = 40;
+    error.raw_os_error() == Some(MESSAGE_TOO_LONG)
 }
 
 /// Takes what the caller has handed over, while the driver is under its bound.
@@ -1344,15 +1444,40 @@ fn take_submissions(
     inbound: &Arc<Mutex<Inbound>>,
     role: Role,
     queued: &mut Queued,
-) {
+) -> bool {
     while !queued.is_full() {
-        let Ok(command) = commands.try_recv() else {
-            return;
-        };
-        if let Some(bytes) = apply(conn, streams, budget, control_limit, command, inbound, role) {
-            queued.charge(bytes);
+        match commands.try_recv() {
+            Ok(command) => {
+                if let Some(bytes) =
+                    apply(conn, streams, budget, control_limit, command, inbound, role)
+                {
+                    queued.charge(bytes);
+                }
+            }
+            // The sender is gone: the endpoint was dropped, and nothing
+            // more will ever arrive here.
+            Err(mpsc::TryRecvError::Disconnected) => return true,
+            Err(mpsc::TryRecvError::Empty) => return false,
         }
     }
+    false
+}
+
+/// Closes for an owner that is gone, which the dropped channel says.
+///
+/// The stored-close path runs first on the same pass, so a code the
+/// caller stored is already the connection's by the time this is asked;
+/// what is left is an owner that vanished without one, and a close with
+/// nothing to say says [`NO_REASON`]. The point of a second path is that
+/// neither this nor [`note_close_request`] alone is what lets the driver
+/// end, and no single failure of either strands the drop's join on an
+/// idle timeout.
+fn note_orphaned(conn: &mut quiche::Connection, closing: &mut bool) {
+    if *closing {
+        return;
+    }
+    *closing = true;
+    let _ = conn.close(true, NO_REASON, b"");
 }
 
 /// Applies one submission to the connection.
@@ -1769,6 +1894,163 @@ mod tests {
             })
             .collect();
         assert!(carried.contains(&record), "the frame never crossed");
+    }
+
+    #[test]
+    fn the_refusal_budget_has_an_exact_boundary() {
+        // One under the bound is probing; the bound is a narrowed
+        // interface. The boundary is where every off-by-one lives.
+        assert!(!should_revalidate(REVALIDATE_REFUSED_SENDS - 1));
+        assert!(should_revalidate(REVALIDATE_REFUSED_SENDS));
+        assert!(!should_revalidate(0));
+    }
+
+    #[test]
+    fn a_send_refused_for_any_other_reason_still_fails_the_burst() {
+        // Only a size refusal is a lost probe; everything else is the
+        // carrier gone, and swallowing it would strand the connection
+        // silently. An unspecified destination is refused for a reason
+        // that has nothing to do with size, on every platform.
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let burst = vec![0x53_u8; 1_200];
+        let mut refused = 0;
+        let outcome = flush_burst(
+            &sender,
+            &burst,
+            1_200,
+            Some("0.0.0.0:0".parse().expect("an address")),
+            false,
+            &mut refused,
+        );
+        assert!(outcome.is_err(), "a non-size refusal fails the burst");
+        assert_eq!(refused, 0, "and is no probe's answer");
+    }
+
+    #[test]
+    fn a_close_request_reaches_the_connection_exactly_once() {
+        // The caller's close travels by atomic; a driver that never takes
+        // it leaves the peer holding a session that will only die of idle
+        // timeout, which is what the stubbed version of this did for two
+        // minutes at a time.
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a config");
+        config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("the protocol");
+        let scid = quiche::ConnectionId::from_ref(&[7; 16]);
+        let mut conn = quiche::connect(
+            None,
+            &scid,
+            "127.0.0.1:1".parse().expect("an address"),
+            "127.0.0.1:2".parse().expect("an address"),
+            &mut config,
+        )
+        .expect("a connection");
+
+        // Nothing requested, nothing closed.
+        let close = Arc::new(AtomicU64::new(NO_CLOSE));
+        let mut closing = false;
+        note_close_request(&mut conn, &close, &mut closing);
+        assert!(!closing, "no request, no close");
+        assert!(conn.local_error().is_none());
+
+        // Requested: taken, once, and the connection holds the code.
+        close.store(258, Ordering::Relaxed);
+        note_close_request(&mut conn, &close, &mut closing);
+        assert!(closing, "the request was taken");
+        assert!(conn.local_error().is_some(), "the connection is closing");
+        note_close_request(&mut conn, &close, &mut closing);
+        assert!(closing, "taken once, held thereafter");
+    }
+
+    #[test]
+    fn an_orphaned_connection_closes_under_the_stored_code() {
+        // The second way a driver hears its owner is gone: the dropped
+        // command channel. It has to close on its own, under whatever code
+        // the drop stored, because the stored-close path it is redundant
+        // with may be the very thing a defect took out.
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a config");
+        config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("the protocol");
+        let scid = quiche::ConnectionId::from_ref(&[8; 16]);
+        let connect = |config: &mut quiche::Config| {
+            quiche::connect(
+                None,
+                &scid,
+                "127.0.0.1:1".parse().expect("an address"),
+                "127.0.0.1:2".parse().expect("an address"),
+                config,
+            )
+            .expect("a connection")
+        };
+
+        // An orphan closes without being asked, and only once.
+        let mut conn = connect(&mut config);
+        let mut closing = false;
+        note_orphaned(&mut conn, &mut closing);
+        assert!(closing, "an orphan closes without being asked");
+        assert!(conn.local_error().is_some(), "the connection is closing");
+        note_orphaned(&mut conn, &mut closing);
+        assert!(closing, "noted once, held thereafter");
+
+        // And one already closing is left exactly as it was.
+        let mut conn = connect(&mut config);
+        let mut closing = true;
+        note_orphaned(&mut conn, &mut closing);
+        assert!(
+            conn.local_error().is_none(),
+            "a close already noted is not repeated"
+        );
+    }
+
+    #[test]
+    fn an_oversized_probe_is_lost_and_the_burst_survives_it() {
+        // A DPLPMTUD probe above the local interface's MTU is refused by
+        // the socket with EMSGSIZE. That refusal is the probe's answer,
+        // the same answer a don't-fragment drop gives one hop later, and
+        // the packets around the probe must still go. Treated as fatal it
+        // killed the connection on the first probe above the NIC, which
+        // made any datagram ceiling above the real path unusable
+        // (docs/perf-engineering.md, 2026-08-06). A 65,508-byte payload
+        // plus its IP and UDP headers overflows IPv4's 16-bit total
+        // length, so the refusal is the protocol's on every platform and
+        // interface, not any particular MTU's.
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("a receiver");
+        let destination = receiver.local_addr().expect("its address");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a bounded wait");
+
+        // One oversized "probe" then one ordinary packet: chunks of the
+        // segment size make the first slot the refused one, and the
+        // trailing short chunk is the packet that must survive.
+        let oversized = 65_508;
+        let mut burst = vec![0x51_u8; oversized + 1_200];
+        burst[oversized..].fill(0x52);
+        // Both send paths: the plain per-packet loop, and the offload
+        // fallback, whose kernel rejects an over-sized segment before
+        // queuing anything and so falls through to the same loop.
+        for gso in [false, true] {
+            let mut refused = 0;
+            flush_burst(
+                &sender,
+                &burst,
+                oversized,
+                Some(destination),
+                gso,
+                &mut refused,
+            )
+            .expect("a refused probe does not fail the burst");
+            assert_eq!(refused, 1, "the refusal is counted, once, gso={gso}");
+
+            let mut landed = vec![0_u8; oversized];
+            let (bytes, _) = receiver
+                .recv_from(&mut landed)
+                .expect("the packet behind it");
+            assert_eq!(bytes, 1_200, "only the ordinary packet arrives");
+            assert!(landed[..bytes].iter().all(|byte| *byte == 0x52));
+        }
     }
 
     #[test]

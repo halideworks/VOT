@@ -9,3 +9,7 @@ mutants.out*/
 # depends on belong in bench/results and the plan beside it; this is the log of
 # what was tried, including what was wrong, and it is kept locally.
 docs/perf-engineering.md
+
+# The v0.3 planning pair: working notes like the log above, kept locally.
+VOT_v0.3_Agent_Backlog.yaml
+VOT_v0.3_Baseline_and_Implementation_Plan.md

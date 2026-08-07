@@ -320,6 +320,34 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// outside tests; a test that must see the wait happen sets a bound
     /// that outlasts any load the machine is under.
     prover_wait: std::time::Duration,
+    /// Where placed-byte crossings are reported, if anywhere.
+    placed_report: Option<PlacedReport>,
+}
+
+/// A caller's window onto placed bytes, paced by the bytes themselves.
+struct PlacedReport {
+    quantum: u64,
+    /// The next crossing worth a report. Starts at one quantum: zero is
+    /// where every fetch begins, not news.
+    next_at: u64,
+    observer: Box<dyn FnMut(u64, Option<u64>) + Send>,
+}
+
+/// The crossing after `placed`, if `placed` reached the one due.
+///
+/// A pure mapping, so a test can hold the boundary exactly: reaching
+/// `next_at` is a crossing, and the one after it starts at the next
+/// whole quantum above what is placed, however many quanta one pass
+/// spanned.
+const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<u64> {
+    if placed < next_at {
+        return None;
+    }
+    Some(
+        placed
+            .saturating_sub(placed % quantum)
+            .saturating_add(quantum),
+    )
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
@@ -466,6 +494,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             pool: None,
             proving_threads: 0,
             prover_wait: PROVER_WAIT,
+            placed_report: None,
         };
         // Through the one place the deferred wiring lives, so the default
         // width and a caller's cannot come apart.
@@ -488,10 +517,55 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// requests issued, and every byte placed.
     #[must_use]
     pub fn progress(&self) -> u64 {
-        let placed = self.plan.as_ref().map_or(0, |plan| {
+        self.progress.saturating_add(self.placed_bytes())
+    }
+
+    /// Bytes verified and placed into the bundle, only ever going up.
+    #[must_use]
+    pub fn placed_bytes(&self) -> u64 {
+        self.plan.as_ref().map_or(0, |plan| {
             plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
+        })
+    }
+
+    /// Reports placed bytes to `observer` at every `quantum` crossing.
+    ///
+    /// The cadence is counted in the fetch's own bytes rather than a
+    /// clock: a fast path reports in bursts, a slow one at its own pace,
+    /// and an idle session reports nothing. The observer gets the placed
+    /// count and the package length once the manifest has settled it. A
+    /// pass that placed several quanta is one report, not several.
+    ///
+    /// # Errors
+    /// Rejects a zero quantum, which would ask for a report per pass.
+    pub fn report_placed(
+        &mut self,
+        quantum: u64,
+        observer: Box<dyn FnMut(u64, Option<u64>) + Send>,
+    ) -> Result<(), Error> {
+        if quantum == 0 {
+            return Err(Error::InvalidArguments);
+        }
+        self.placed_report = Some(PlacedReport {
+            quantum,
+            next_at: quantum,
+            observer,
         });
-        self.progress.saturating_add(placed)
+        Ok(())
+    }
+
+    /// One report if placed bytes crossed the next quantum, none otherwise.
+    fn note_placed(&mut self) {
+        let placed = self.placed_bytes();
+        let total = self.plan.as_ref().map(|plan| plan.summary.logical_length);
+        let Some(report) = &mut self.placed_report else {
+            return;
+        };
+        let Some(next) = crossing(placed, report.next_at, report.quantum) else {
+            return;
+        };
+        report.next_at = next;
+        (report.observer)(placed, total);
     }
 
     /// Whether a request is queued that the carrier would not take, which
@@ -561,6 +635,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // and reporting the carrier over it would throw away a finished
         // fetch.
         self.advance()?;
+        // After the advance, so the pass that placed the crossing bytes is
+        // the pass that reports them, however the pass then ends.
+        self.note_placed();
         if self.complete() {
             self.stop();
             return Ok(FetchStatus::Complete);
@@ -1215,6 +1292,87 @@ mod tests {
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
         discard(&[&source, &bundle, &output, &destination, &receipt]);
+    }
+
+    #[test]
+    fn the_crossing_is_the_quantum_after_what_is_placed() {
+        // The boundary exactly: reaching the due crossing reports, one
+        // short of it does not, and the next crossing is the whole
+        // quantum above what is placed however many one pass spanned.
+        assert_eq!(crossing(999_999, 1_000_000, 1_000_000), None);
+        assert_eq!(
+            crossing(1_000_000, 1_000_000, 1_000_000),
+            Some(2_000_000),
+            "reaching the crossing is crossing it"
+        );
+        assert_eq!(crossing(1_200_000, 1_000_000, 1_000_000), Some(2_000_000));
+        assert_eq!(
+            crossing(2_500_000, 1_000_000, 1_000_000),
+            Some(3_000_000),
+            "a pass spanning quanta owes one report and the next whole crossing"
+        );
+        assert_eq!(
+            crossing(u64::MAX, 1, 1),
+            Some(u64::MAX),
+            "the top saturates rather than wraps"
+        );
+    }
+
+    #[test]
+    fn placed_bytes_report_at_their_quantum_and_only_there() {
+        // The observer is paced by the fetch's own bytes: one report per
+        // quantum crossing however the passes are sized, placed only ever
+        // going up, and the total present because a report needs the plan
+        // the manifest settled. A zero quantum is refused where the error
+        // can name it.
+        const QUANTUM: u64 = 1_000_000;
+        type Seen = Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>;
+        let source = temporary("placed-source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("big.bin"), patterned(8_500_000)).unwrap();
+        let bundle = temporary("placed-bundle");
+        let built = build_bundle(&source, &bundle).unwrap();
+
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("placed-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        assert!(
+            fetcher.report_placed(0, Box::new(|_, _| {})).is_err(),
+            "a zero quantum is a report per pass, refused"
+        );
+        let seen: Seen = Seen::default();
+        let observed = Arc::clone(&seen);
+        fetcher
+            .report_placed(
+                QUANTUM,
+                Box::new(move |placed, total| observed.lock().unwrap().push((placed, total))),
+            )
+            .unwrap();
+        let status =
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
+        assert_eq!(status, FetchStatus::Complete);
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "8.5 MB against a 1 MB quantum reports");
+        assert!(
+            seen.len() <= 8,
+            "more reports than crossings: {}",
+            seen.len()
+        );
+        let mut crossed = 0;
+        for (placed, total) in seen.iter() {
+            assert!(
+                *placed >= crossed + QUANTUM,
+                "a report inside an already-reported quantum: {placed} after {crossed}"
+            );
+            crossed = placed - placed % QUANTUM;
+            assert_eq!(
+                *total,
+                Some(built.logical_length),
+                "the total is the manifest's"
+            );
+        }
+        discard(&[&source, &bundle, &output]);
     }
 
     #[test]

@@ -23,6 +23,7 @@ vot-pack = { path = "../vot-pack" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-receipt = { path = "../vot-receipt" }
+vot-resume = { path = "../vot-resume" }
 vot-scheduler = { path = "../vot-scheduler" }
 vot-session = { path = "../vot-session" }
 vot-transport-api = { path = "../vot-transport-api" }

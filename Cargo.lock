@@ -2319,6 +2319,7 @@ dependencies = [
  "vot-proof-blake3",
  "vot-proof-sha256",
  "vot-receipt",
+ "vot-resume",
  "vot-scheduler",
  "vot-session",
  "vot-transport-api",

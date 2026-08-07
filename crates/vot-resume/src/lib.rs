@@ -92,6 +92,62 @@ impl ResumeStore {
             .map(|object| &object.checkpointed)
     }
 
+    /// Every subject the store holds, in key order.
+    pub fn subjects(&self) -> impl Iterator<Item = SubjectId> + '_ {
+        self.objects.keys().copied()
+    }
+
+    /// Records `units` of `subject` as durable, unioned with what the
+    /// store already holds.
+    ///
+    /// # Errors
+    /// Rejects a subject the store never reserved, a unit count that
+    /// disagrees with the reservation, or units past it.
+    pub fn checkpoint_units(
+        &mut self,
+        subject: SubjectId,
+        total_units: u64,
+        units: &UnitRanges,
+    ) -> Result<(), Error> {
+        self.save_object(subject, total_units, units).map(|_| ())
+    }
+
+    /// Opens the store and makes sure it exists on disk, empty if new.
+    ///
+    /// ADR-0032: the store's presence beside a partial bundle is what
+    /// says the bundle may be continued, so it has to exist from the
+    /// first moment a crash could leave the bundle behind, not from the
+    /// first checkpoint.
+    ///
+    /// # Errors
+    /// Surfaces what [`ResumeStore::open`] or the creating write refuses.
+    pub fn create(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let store = Self::open(path)?;
+        if !store.path.exists() {
+            let lock = lock_store(&store.path)?;
+            Self::compact(&store.path, &store.objects)?;
+            drop(lock);
+        }
+        Self::open(store.path)
+    }
+
+    /// Removes the store and its lock file, for a bundle that is whole:
+    /// a completed bundle looks exactly as one fetched without a store.
+    ///
+    /// # Errors
+    /// Surfaces a file that exists and will not go.
+    pub fn remove(self) -> Result<(), Error> {
+        let lock = lock_path(&self.path)?;
+        for path in [self.path, lock] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
+        Ok(())
+    }
+
     /// Reserves a batch of immutable objects in one compacted transaction.
     ///
     /// # Errors
@@ -1173,6 +1229,86 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&encode_record(payload).unwrap());
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn checkpoints_accumulate_under_identity_and_subjects_enumerate() {
+        // The public write path a fetch checkpoints through: unions
+        // accumulate across calls and reopens, identity is held to the
+        // reservation, and the subject listing is what lets a caller find
+        // what a store continues without knowing it beforehand.
+        let path = temp_path("accumulate");
+        let _ = fs::remove_file(&path);
+        let mut store = ResumeStore::create(&path).unwrap();
+        store
+            .reserve_many([(subject(0x31), 4), (subject(0x32), 2)])
+            .unwrap();
+        store
+            .checkpoint_units(subject(0x31), 4, &units([0, 2]))
+            .unwrap();
+        store
+            .checkpoint_units(subject(0x31), 4, &units([1]))
+            .unwrap();
+        drop(store);
+        let mut store = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            store.checkpointed(subject(0x31)).unwrap(),
+            &units([0, 1, 2]),
+            "unions accumulate across calls and reopens"
+        );
+        assert_eq!(
+            store.subjects().collect::<Vec<_>>(),
+            vec![subject(0x31), subject(0x32)],
+            "every reserved subject, in key order"
+        );
+        assert!(matches!(
+            store.checkpoint_units(subject(0x31), 5, &units([3])),
+            Err(Error::IdentityMismatch)
+        ));
+        assert!(matches!(
+            store.checkpoint_units(subject(0x33), 4, &units([0])),
+            Err(Error::IdentityMismatch)
+        ));
+        assert!(matches!(
+            store.checkpoint_units(subject(0x31), 4, &units([4])),
+            Err(Error::InvalidUnit)
+        ));
+        store.remove().unwrap();
+    }
+
+    #[test]
+    fn a_created_store_exists_at_once_and_a_removed_one_is_gone_whole() {
+        // ADR-0032: presence beside a partial bundle is what says the
+        // bundle may be continued, so creation puts the file on disk
+        // before any checkpoint could; removal takes the lock file too,
+        // so a completed bundle looks exactly as one fetched without a
+        // store.
+        let path = temp_path("created");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path).unwrap());
+
+        let store = ResumeStore::create(&path).unwrap();
+        assert!(path.exists(), "created means on disk, empty or not");
+        // Creating over an existing store keeps what it holds.
+        drop(store);
+        let mut store = ResumeStore::create(&path).unwrap();
+        store.reserve_many([(subject(0x21), 4)]).unwrap();
+        drop(store);
+        let store = ResumeStore::create(&path).unwrap();
+        assert!(
+            store.checkpointed(subject(0x21)).is_some(),
+            "creation over an existing store reopened it"
+        );
+
+        store.remove().unwrap();
+        assert!(!path.exists(), "the store is gone");
+        assert!(
+            !lock_path(&path).unwrap().exists(),
+            "and its lock went with it"
+        );
+        // Removing what is already gone is nothing to report.
+        ResumeStore::create(&path).unwrap().remove().unwrap();
+        ResumeStore::open(&path).unwrap().remove().unwrap();
     }
 
     #[test]

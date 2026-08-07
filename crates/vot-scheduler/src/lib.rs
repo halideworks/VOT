@@ -126,6 +126,24 @@ impl FileSink {
         Ok(Self { file })
     }
 
+    /// Opens an existing destination without truncating what it holds,
+    /// sized to the object, so a fetch continuing a partial bundle keeps
+    /// every byte a previous fetch placed (ADR-0032).
+    ///
+    /// # Errors
+    /// Surfaces a destination that does not exist or will not open.
+    pub fn resume(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.set_len(length)?;
+        // Best effort, as in create: refusal costs only the zero-fill
+        // this avoids.
+        let _ = vot_platform_fs::allow_unordered_writes(&file);
+        Ok(Self { file })
+    }
+
     /// The handle the writes went through. Sync through this one: it has
     /// write access, and its error window opened before the first write,
     /// so a writeback failure between then and the sync must surface. A
@@ -1531,6 +1549,40 @@ mod tests {
         let written = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(written, bytes);
+    }
+
+    #[test]
+    fn a_resumed_sink_keeps_what_the_last_fetch_placed() {
+        // ADR-0032: continuing a partial bundle reopens the file, and a
+        // truncating open would throw away exactly the bytes resume
+        // exists to keep. The reopen still sizes the file, so a resumed
+        // object holds the subject's length however the last fetch died.
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "vot-file-sink-resume-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let length = 3 * RANGE_UNIT_BYTES;
+        let first = FileSink::create(&path, length).unwrap();
+        first.write_at(RANGE_UNIT_BYTES, &vec![0x42; unit]).unwrap();
+        drop(first);
+
+        assert!(
+            FileSink::resume(std::path::Path::new("/vot-missing/none"), length).is_err(),
+            "resume opens what exists, never invents it"
+        );
+        let resumed = FileSink::resume(&path, length).unwrap();
+        resumed.write_at(0, &vec![0x41; unit]).unwrap();
+        drop(resumed);
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written.len() as u64, length, "sized on reopen");
+        assert!(
+            written[unit..unit * 2].iter().all(|byte| *byte == 0x42),
+            "the last fetch's bytes survived the reopen"
+        );
+        assert!(written[..unit].iter().all(|byte| *byte == 0x41));
     }
 
     #[test]

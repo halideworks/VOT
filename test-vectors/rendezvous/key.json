@@ -1,0 +1,29 @@
+{
+  "format": "vot-rendezvous-key-v1",
+  "adr": "ADR-0033",
+  "derivation": "BLAKE3 derive_key, with the context string below and the 32-byte package root as key material",
+  "context": "VOT 2026-08 rendezvous key v1",
+  "note": "Both ends derive the rendezvous key from the package root alone, and the service pairs by it without ever learning what it names. A derivation that drifts pairs nobody and reports no error, so these are the pin: an implementation that does not reproduce them cannot rendezvous with this one.",
+  "cases": [
+    {
+      "name": "zero-root",
+      "root_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "key_hex": "7bac9f029f5a2fbacb42e320af524cbf103fbde0d214a8681f401a8037e10276"
+    },
+    {
+      "name": "ones-root",
+      "root_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "key_hex": "cfbeb84d9eb8b66060be57756e03d282718d411cda2bea2932461802e0be0349"
+    },
+    {
+      "name": "saturated-root",
+      "root_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "key_hex": "baaa8a2177c02c21438be33232e47ca153dfc911a01f3c0b0790142d7f01139c"
+    },
+    {
+      "name": "counted-root",
+      "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "key_hex": "1c09a66de50f3082c00632024499b418ebff83e0960bc9de20755d82e6044605"
+    }
+  ]
+}

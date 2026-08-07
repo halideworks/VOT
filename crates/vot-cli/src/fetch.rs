@@ -333,6 +333,23 @@ struct PlacedReport {
     observer: Box<dyn FnMut(u64, Option<u64>) + Send>,
 }
 
+/// The crossing after `placed`, if `placed` reached the one due.
+///
+/// A pure mapping, so a test can hold the boundary exactly: reaching
+/// `next_at` is a crossing, and the one after it starts at the next
+/// whole quantum above what is placed, however many quanta one pass
+/// spanned.
+const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<u64> {
+    if placed < next_at {
+        return None;
+    }
+    Some(
+        placed
+            .saturating_sub(placed % quantum)
+            .saturating_add(quantum),
+    )
+}
+
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
 ///
 /// Counted by what the page count needs, not by the cursor: a span that
@@ -544,12 +561,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let Some(report) = &mut self.placed_report else {
             return;
         };
-        if placed < report.next_at {
+        let Some(next) = crossing(placed, report.next_at, report.quantum) else {
             return;
-        }
-        report.next_at = placed
-            .saturating_sub(placed % report.quantum)
-            .saturating_add(report.quantum);
+        };
+        report.next_at = next;
         (report.observer)(placed, total);
     }
 
@@ -1277,6 +1292,30 @@ mod tests {
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
         discard(&[&source, &bundle, &output, &destination, &receipt]);
+    }
+
+    #[test]
+    fn the_crossing_is_the_quantum_after_what_is_placed() {
+        // The boundary exactly: reaching the due crossing reports, one
+        // short of it does not, and the next crossing is the whole
+        // quantum above what is placed however many one pass spanned.
+        assert_eq!(crossing(999_999, 1_000_000, 1_000_000), None);
+        assert_eq!(
+            crossing(1_000_000, 1_000_000, 1_000_000),
+            Some(2_000_000),
+            "reaching the crossing is crossing it"
+        );
+        assert_eq!(crossing(1_200_000, 1_000_000, 1_000_000), Some(2_000_000));
+        assert_eq!(
+            crossing(2_500_000, 1_000_000, 1_000_000),
+            Some(3_000_000),
+            "a pass spanning quanta owes one report and the next whole crossing"
+        );
+        assert_eq!(
+            crossing(u64::MAX, 1, 1),
+            Some(u64::MAX),
+            "the top saturates rather than wraps"
+        );
     }
 
     #[test]

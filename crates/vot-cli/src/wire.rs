@@ -101,7 +101,7 @@ fn congestion_from(pin: Option<&str>) -> Result<CongestionControl, Error> {
 /// How many placed bytes between progress lines: 256 MiB is a line every
 /// couple of seconds at a gigabit and one every few minutes on a slow
 /// link, either of which reads as movement.
-const PROGRESS_QUANTUM_BYTES: u64 = 256 * 1024 * 1024;
+const PROGRESS_QUANTUM_BYTES: u64 = 268_435_456;
 
 /// What a carrier's failure means to the command that asked for it.
 ///

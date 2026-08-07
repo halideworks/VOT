@@ -2479,7 +2479,7 @@ mod tests {
         // end, so the completed bundle looks fetched-in-one.
         let (bundle, built) = built_bundle(
             "killed",
-            &[("a.bin", patterned(8_500_000)), ("b.bin", noise(8_500_000))],
+            &[("a.bin", patterned(900_000)), ("b.bin", noise(900_000))],
         );
         let output = temporary("killed-fetched");
 
@@ -2556,7 +2556,7 @@ mod tests {
         // re-requested.
         let (bundle, built) = built_bundle(
             "stale",
-            &[("a.bin", patterned(8_500_000)), ("b.bin", noise(8_500_000))],
+            &[("a.bin", patterned(900_000)), ("b.bin", noise(900_000))],
         );
         let output = temporary("stale-fetched");
         let first_root;

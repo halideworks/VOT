@@ -379,18 +379,12 @@ where
                             .iter()
                             .filter(|(_, handle)| handle.is_finished())
                             .count();
-                        if finished == 0 {
-                            continue;
-                        }
-                        // A thread announces before it can finish, so a
-                        // finished one either left its announcement in
-                        // the channel or never sent it.
-                        match endings.try_recv() {
-                            Ok(done) => break done,
-                            Err(
-                                std::sync::mpsc::TryRecvError::Empty
-                                | std::sync::mpsc::TryRecvError::Disconnected,
-                            ) => panic!("{finished} sessions finished without announcing"),
+                        match reap_wake(finished, endings.try_recv().ok()) {
+                            ReapWake::Take(done) => break done,
+                            ReapWake::Wait => {}
+                            ReapWake::Breach => {
+                                panic!("{finished} sessions finished without announcing")
+                            }
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -465,6 +459,34 @@ where
 /// it lands.
 #[cfg(any(test, feature = "wire"))]
 const REAP_TICK: Duration = Duration::from_millis(250);
+
+/// What a reap's wake finds it should do.
+#[cfg(any(test, feature = "wire"))]
+#[derive(Debug, Eq, PartialEq)]
+enum ReapWake {
+    /// An announcement is in hand; take that session.
+    Take(u64),
+    /// Nothing has finished; keep waiting.
+    Wait,
+    /// A session finished and no announcement exists for it, which is the
+    /// contract broken: a thread announces before it can finish, so a
+    /// finished one either left its announcement in the channel or never
+    /// sent it, and waiting on it would wait forever.
+    Breach,
+}
+
+/// Decides one wake of the reap's wait, apart from the channel and the
+/// threads so the whole table is a test's to hold: any announcement is
+/// taken, silence with nothing finished is patience, and silence with a
+/// finished session is the breach the wake exists to catch.
+#[cfg(any(test, feature = "wire"))]
+fn reap_wake(finished: usize, announced: Option<u64>) -> ReapWake {
+    match (finished, announced) {
+        (_, Some(done)) => ReapWake::Take(done),
+        (0, None) => ReapWake::Wait,
+        (_, None) => ReapWake::Breach,
+    }
+}
 
 /// One session's end, announced by drop: however the session's thread
 /// ends, the announcement goes, so the reap never waits on a session
@@ -755,6 +777,19 @@ mod tests {
         assert_eq!(package, built);
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_wake_takes_waits_or_refuses_by_the_whole_table() {
+        // The reap's wake decision, exhaustively: an announcement in hand
+        // is taken whatever the count says (the count may lag the send by
+        // the width of the race), silence with nothing finished waits,
+        // and silence with anything finished is the breach.
+        assert_eq!(reap_wake(0, Some(4)), ReapWake::Take(4));
+        assert_eq!(reap_wake(3, Some(9)), ReapWake::Take(9));
+        assert_eq!(reap_wake(0, None), ReapWake::Wait);
+        assert_eq!(reap_wake(1, None), ReapWake::Breach);
+        assert_eq!(reap_wake(7, None), ReapWake::Breach);
     }
 
     #[test]

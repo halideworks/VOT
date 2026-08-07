@@ -237,6 +237,44 @@ pub struct Config {
     /// a few probe round trips that a ceiling at or under the path answers
     /// in one.
     pub max_datagram_bytes: usize,
+    /// The congestion controller this endpoint runs.
+    pub congestion: CongestionControl,
+}
+
+/// Which congestion controller carries the connection.
+///
+/// Cubic is the default and what every LAN acceptance number was taken
+/// under. Bbr2 is what a lossy wide-area path wants: on an emulated 30 ms
+/// path with 0.5% loss it carried 512 MiB at 995 Mbit/s where cubic's
+/// square-root loss penalty held 300 (docs/perf-engineering.md,
+/// 2026-08-06). The sender's controller is what governs a transfer, so
+/// the serving end's choice is the one that matters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CongestionControl {
+    /// quiche's default controller.
+    #[default]
+    Cubic,
+    /// `BBRv2` by way of quiche's gcongestion implementation, with quiche's
+    /// pacing disabled: gcongestion's release-time schedule never leaves
+    /// its floor rate when a sender complies with it, because compliance
+    /// starves the bandwidth estimator that would raise it. Measured at
+    /// 22 Mbit/s compliant against line rate without, on a clean 80 ms
+    /// path. The congestion window still governs; only the smoothing goes.
+    Bbr2,
+}
+
+/// The controller and whether quiche's pacing runs under it.
+///
+/// A pure mapping, so a test can hold each arm to its exact pair: the
+/// live socket carries traffic identically under either controller, and
+/// only this table says which one it was.
+const fn congestion_config(
+    congestion: CongestionControl,
+) -> (quiche::CongestionControlAlgorithm, bool) {
+    match congestion {
+        CongestionControl::Cubic => (quiche::CongestionControlAlgorithm::CUBIC, true),
+        CongestionControl::Bbr2 => (quiche::CongestionControlAlgorithm::Bbr2Gcongestion, false),
+    }
 }
 
 impl Config {
@@ -251,6 +289,7 @@ impl Config {
             idle_timeout_ms: 30_000,
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
+            congestion: CongestionControl::Cubic,
         }
     }
 
@@ -265,6 +304,7 @@ impl Config {
             idle_timeout_ms: 30_000,
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
+            congestion: CongestionControl::Cubic,
         }
     }
 
@@ -311,6 +351,9 @@ impl Config {
         // lost by the tens of thousands per gigabyte, and cubic pays for
         // every one of them.
         config.set_enable_ack_latency_loss_floor(true);
+        let (algorithm, pacing) = congestion_config(self.congestion);
+        config.set_cc_algorithm(algorithm);
+        config.enable_pacing(pacing);
         // The advertised control-frame bound has to fit in one stream's flow
         // control, or a conforming frame is refused by the carrier after the
         // session promised to accept it.
@@ -1630,13 +1673,17 @@ mod tests {
 
     /// A connected pair over loopback.
     fn pair() -> (Transport, Transport) {
+        pair_with(CongestionControl::Cubic)
+    }
+
+    fn pair_with(congestion: CongestionControl) -> (Transport, Transport) {
         let (certificate, key) = credentials();
-        let server = Transport::serve(
-            "127.0.0.1:0".parse().expect("an address"),
-            &Config::server(limits(), certificate, key),
-        )
-        .expect("a server");
+        let mut server_config = Config::server(limits(), certificate, key);
+        server_config.congestion = congestion;
+        let server = Transport::serve("127.0.0.1:0".parse().expect("an address"), &server_config)
+            .expect("a server");
         let mut client_config = Config::client(limits());
+        client_config.congestion = congestion;
         // The certificate is generated for this test and trusted by construction;
         // what is under test is the carrier, not the web PKI.
         client_config.verify_peer = false;
@@ -1677,6 +1724,51 @@ mod tests {
         panic!(
             "the carrier never got there: client saw {from_client:?}, server saw {from_server:?}"
         );
+    }
+
+    #[test]
+    fn each_controller_maps_to_its_algorithm_and_pacing() {
+        // The socket test cannot tell the controllers apart, because both
+        // carry traffic; this table is the only witness of which
+        // algorithm ran and whether pacing ran with it. Bbr2 without the
+        // pacing-off half is the 22 Mbit/s starvation the enum's doc
+        // records.
+        assert_eq!(
+            congestion_config(CongestionControl::Cubic),
+            (quiche::CongestionControlAlgorithm::CUBIC, true)
+        );
+        assert_eq!(
+            congestion_config(CongestionControl::Bbr2),
+            (quiche::CongestionControlAlgorithm::Bbr2Gcongestion, false)
+        );
+        assert_eq!(CongestionControl::default(), CongestionControl::Cubic);
+    }
+
+    #[test]
+    fn a_bbr2_connection_carries_a_record_across_the_socket() {
+        // The controller choice reaches quiche and the connection still
+        // carries: Bbr2 disables quiche's pacing (its schedule starves a
+        // compliant sender, docs/perf-engineering.md 2026-08-06), and a
+        // wiring that broke the handshake or the send path would show
+        // here before any WAN measurement could.
+        let (mut client, mut server) = pair_with(CongestionControl::Bbr2);
+        let record = frame(b"carried-under-bbr2");
+        client
+            .send_control(&record)
+            .expect("the adapter takes the frame");
+        let (_, from_server) = pump_until(&mut client, &mut server, 10, |_, server_events| {
+            server_events
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        let carried: Vec<_> = from_server
+            .iter()
+            .filter_map(|event| match event {
+                Event::Control(bytes) => Some(bytes.as_ref().to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert!(carried.contains(&record), "the frame never crossed");
     }
 
     #[test]

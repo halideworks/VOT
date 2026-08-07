@@ -340,12 +340,66 @@ where
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
 {
     std::thread::scope(|scope| {
-        let mut running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, _>> =
+        let mut running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, _>)> =
             std::collections::VecDeque::new();
+        // Each session announces its own end here, so a wait for a free
+        // slot is a wait for whichever session finishes first. Waiting on
+        // the oldest instead held every accept behind a session whose
+        // client vanished without a close, which settles only at the
+        // carrier's idle timeout: on the rig that stalled a fetch for 29
+        // of its 30-second budget while five settled sessions sat ready
+        // to be reaped.
+        let (ended, endings) = std::sync::mpsc::channel::<u64>();
+        let mut spawned: u64 = 0;
         // The first session's failure, under a bounded serve. Later ones
         // still run to their end: they were accepted, and the joins below
         // are what keeps the report ordered rather than racy.
         let mut failed = Ok(());
+        // Takes one finished session's outcome, waiting for a session to
+        // finish if none has: every session announces as it ends, however
+        // it ends, so a wait with any session running answers. The wait
+        // wakes at [`REAP_TICK`] only to hold the announcement contract:
+        // a finished session with nothing in the channel is one whose
+        // announcement was lost, and a serve that waited on it would hang
+        // forever, so it panics with the diagnosis instead.
+        let reap = |running: &mut std::collections::VecDeque<(
+            u64,
+            std::thread::ScopedJoinHandle<'_, _>,
+        )>,
+                    failed: &mut Result<(), Error>| {
+            assert!(
+                !running.is_empty(),
+                "a slot is only reaped from a serve that holds one"
+            );
+            let done = loop {
+                match endings.recv_timeout(REAP_TICK) {
+                    Ok(done) => break done,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let finished = running
+                            .iter()
+                            .filter(|(_, handle)| handle.is_finished())
+                            .count();
+                        match reap_wake(finished, endings.try_recv().ok()) {
+                            ReapWake::Take(done) => break done,
+                            ReapWake::Wait => {}
+                            ReapWake::Breach => {
+                                panic!("{finished} sessions finished without announcing")
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        unreachable!("the serve holds a sender")
+                    }
+                }
+            };
+            let at = running
+                .iter()
+                .position(|(id, _)| *id == done)
+                .expect("an announced session is still held");
+            let (_, handle) = running.remove(at).expect("the position was just found");
+            let settled = handle.join().expect("a session thread never panics");
+            settle_session(sessions, settled, failed);
+        };
         // The bound is an iterator's, so no counter exists for a mutation
         // to stop counting: a bounded serve accepts exactly as many times
         // as the range yields, and an unbounded one is the range that
@@ -355,29 +409,19 @@ where
             // The accept waits here, on this thread, so a factory error is
             // ordered after every session it already handed out.
             let mut accepted = next();
-            // A fixed port frees only when the session holding it ends: the
-            // carrier's drop joins its driver, so after the join below the
+            // A fixed port frees only when a session holding it ends: the
+            // carrier's drop joins its driver, so after the reap below the
             // next bind finds the port released. An accept refused while
-            // sessions still run therefore joins the oldest and asks again,
-            // and each retry shrinks `running`, which bounds this loop by
-            // its own body. A factory failing with nothing left running is
+            // sessions still run therefore reaps one and asks again, and
+            // each retry shrinks `running`, which bounds this loop by its
+            // own body. A factory failing with nothing left running is
             // the endpoint itself, and surfaces below.
             while accepted.is_err() && !running.is_empty() {
-                let settled = running
-                    .pop_front()
-                    .expect("emptiness was just checked")
-                    .join()
-                    .expect("a session thread never panics");
-                settle_session(sessions, settled, &mut failed);
+                reap(&mut running, &mut failed);
                 accepted = next();
             }
             while running.len() >= CONCURRENT_SESSIONS {
-                let settled = running
-                    .pop_front()
-                    .expect("the bound is positive")
-                    .join()
-                    .expect("a session thread never panics");
-                settle_session(sessions, settled, &mut failed);
+                reap(&mut running, &mut failed);
             }
             let mut session = match accepted {
                 Ok(session) => session,
@@ -386,11 +430,78 @@ where
                     return failed.and(Err(error));
                 }
             };
-            running.push_back(scope.spawn(move || drive(&mut session).map(|_| ())));
+            let id = spawned;
+            spawned += 1;
+            let announce = Announcement {
+                id,
+                ended: ended.clone(),
+            };
+            running.push_back((
+                id,
+                scope.spawn(move || {
+                    // Held for the whole drive and announced by its drop,
+                    // so the end is announced however the thread ends: a
+                    // panic that skipped the announcement would leave the
+                    // reap waiting on a session that already died.
+                    let _announce = announce;
+                    drive(&mut session).map(|_| ())
+                }),
+            ));
         }
         drain(running, sessions, &mut failed);
         failed
     })
+}
+
+/// How often a reap looks up from its wait to check the announcement
+/// contract. It prices the detection of a lost announcement, never the
+/// reap itself: an announcement that was sent ends the wait the moment
+/// it lands.
+#[cfg(any(test, feature = "wire"))]
+const REAP_TICK: Duration = Duration::from_millis(250);
+
+/// What a reap's wake finds it should do.
+#[cfg(any(test, feature = "wire"))]
+#[derive(Debug, Eq, PartialEq)]
+enum ReapWake {
+    /// An announcement is in hand; take that session.
+    Take(u64),
+    /// Nothing has finished; keep waiting.
+    Wait,
+    /// A session finished and no announcement exists for it, which is the
+    /// contract broken: a thread announces before it can finish, so a
+    /// finished one either left its announcement in the channel or never
+    /// sent it, and waiting on it would wait forever.
+    Breach,
+}
+
+/// Decides one wake of the reap's wait, apart from the channel and the
+/// threads so the whole table is a test's to hold: any announcement is
+/// taken, silence with nothing finished is patience, and silence with a
+/// finished session is the breach the wake exists to catch.
+#[cfg(any(test, feature = "wire"))]
+fn reap_wake(finished: usize, announced: Option<u64>) -> ReapWake {
+    match (finished, announced) {
+        (_, Some(done)) => ReapWake::Take(done),
+        (0, None) => ReapWake::Wait,
+        (_, None) => ReapWake::Breach,
+    }
+}
+
+/// One session's end, announced by drop: however the session's thread
+/// ends, the announcement goes, so the reap never waits on a session
+/// that already died.
+#[cfg(any(test, feature = "wire"))]
+struct Announcement {
+    id: u64,
+    ended: std::sync::mpsc::Sender<u64>,
+}
+
+#[cfg(any(test, feature = "wire"))]
+impl Drop for Announcement {
+    fn drop(&mut self) {
+        let _ = self.ended.send(self.id);
+    }
 }
 
 /// Exactly the bound's turns, or turns without end.
@@ -403,13 +514,16 @@ fn turns(sessions: Option<u32>) -> Box<dyn Iterator<Item = ()>> {
 }
 
 /// Joins every running session and folds each outcome into the policy.
+///
+/// Order stops mattering here: everything left must end before the serve
+/// answers, so each join waits for its own session and no other's.
 #[cfg(any(test, feature = "wire"))]
 fn drain<T>(
-    running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, Result<T, Error>>>,
+    running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, Result<T, Error>>)>,
     sessions: Option<u32>,
     failed: &mut Result<(), Error>,
 ) {
-    for handle in running {
+    for (_, handle) in running {
         let settled = handle
             .join()
             .expect("a session thread never panics")
@@ -663,6 +777,85 @@ mod tests {
         assert_eq!(package, built);
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_wake_takes_waits_or_refuses_by_the_whole_table() {
+        // The reap's wake decision, exhaustively: an announcement in hand
+        // is taken whatever the count says (the count may lag the send by
+        // the width of the race), silence with nothing finished waits,
+        // and silence with anything finished is the breach.
+        assert_eq!(reap_wake(0, Some(4)), ReapWake::Take(4));
+        assert_eq!(reap_wake(3, Some(9)), ReapWake::Take(9));
+        assert_eq!(reap_wake(0, None), ReapWake::Wait);
+        assert_eq!(reap_wake(1, None), ReapWake::Breach);
+        assert_eq!(reap_wake(7, None), ReapWake::Breach);
+    }
+
+    #[test]
+    fn an_announcement_goes_however_its_thread_ends() {
+        // The reap waits on announcements, so one that never went would
+        // block the serve forever: the drop is what sends it, cleanly or
+        // through an unwind alike.
+        let (ended, endings) = std::sync::mpsc::channel();
+        drop(Announcement { id: 7, ended });
+        assert_eq!(endings.recv().expect("the drop announced"), 7);
+
+        let (ended, endings) = std::sync::mpsc::channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _announce = Announcement { id: 9, ended };
+            panic!("the thread dies mid-session");
+        }));
+        assert!(unwound.is_err(), "the panic unwound");
+        assert_eq!(
+            endings.recv().expect("the unwind announced"),
+            9,
+            "a panic that skipped the announcement would hang the reap"
+        );
+    }
+
+    #[test]
+    fn a_slow_session_does_not_hold_the_accepts_behind_it() {
+        // A session whose client vanished without a close settles only at
+        // its carrier's idle timeout. The bound's wait must take whichever
+        // session finishes first, not the oldest: blocked on the oldest,
+        // every later accept waited out that timeout, which stalled a
+        // fetch for 29 of its 30-second budget on the rig. The gate
+        // proves the loop kept accepting: the first session waits at it,
+        // and only the last session accepted can fill it.
+        use crate::harness::{Loopback, Rendezvous, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("slowjoin", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let gate = Rendezvous::expecting(2);
+        let total = u32::try_from(CONCURRENT_SESSIONS).unwrap() + 2;
+        let mut handed = 0_u32;
+        let outcome = serve_sessions(Some(total), || {
+            handed += 1;
+            if handed > total {
+                // Accepting past the bound is a count that stopped
+                // counting; erroring here ends a mutant's run rather
+                // than a runner's timeout.
+                return Err(Error::CarrierUnavailable);
+            }
+            let mut carrier = Loopback::default();
+            if handed == 1 || handed == total {
+                carrier.rendezvous = Some(std::sync::Arc::clone(&gate));
+            }
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            ServeSession::begin(&server, carrier, not_required())
+        });
+        assert_eq!(
+            handed, total,
+            "an accept behind the slow session never happened"
+        );
+        // Every session settled through the drain; what each settled as is
+        // the failure policy's business, already held above.
+        assert!(outcome.is_ok() || outcome.is_err());
+        crate::harness::discard(&[&bundle]);
     }
 
     #[test]

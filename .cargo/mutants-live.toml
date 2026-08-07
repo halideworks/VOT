@@ -24,6 +24,13 @@ exclude_globs = [
   # This configuration is run with a feature on, so the file holding what
   # the wire commands answer without it compiles nowhere here.
   "crates/vot-cli/src/nowire.rs",
+  # The rendezvous protocol is `cfg(any(test, feature = "wire"))`, so the
+  # default `mutation (vot-cli)` job compiles and mutates every line of it
+  # already, and running it here again measures the same code twice at
+  # about a minute a mutant. Anything added to that module that needs the
+  # `wire` feature to compile would be measured nowhere: put such code in
+  # `wire.rs`, which this configuration does measure.
+  "crates/vot-cli/src/rendezvous.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

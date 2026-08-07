@@ -37,3 +37,15 @@ pub fn fetch_bundle(
 ) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }
+
+/// See [`serve_bundle`].
+///
+/// # Errors
+/// Always [`Error::WireUnsupported`].
+pub fn rendezvous_service(
+    _address: SocketAddr,
+    _datagrams: Option<u64>,
+    _listening: impl FnMut(SocketAddr),
+) -> Result<(), Error> {
+    Err(Error::WireUnsupported)
+}

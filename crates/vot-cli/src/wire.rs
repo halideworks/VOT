@@ -98,6 +98,11 @@ fn congestion_from(pin: Option<&str>) -> Result<CongestionControl, Error> {
     }
 }
 
+/// How many placed bytes between progress lines: 256 MiB is a line every
+/// couple of seconds at a gigabit and one every few minutes on a slow
+/// link, either of which reads as movement.
+const PROGRESS_QUANTUM_BYTES: u64 = 256 * 1024 * 1024;
+
 /// What a carrier's failure means to the command that asked for it.
 ///
 /// A configuration the carrier refuses is an argument problem and says
@@ -274,6 +279,17 @@ pub fn fetch_bundle(
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
     }
+    // A wire transfer can run for minutes with nothing to look at, and a
+    // line per placed quantum is what tells a slow path from a stall. On
+    // stderr, so stdout stays the one summary line a script reads. A
+    // fetch smaller than the quantum stays as quiet as today.
+    fetcher.report_placed(
+        PROGRESS_QUANTUM_BYTES,
+        Box::new(|placed, total| match total {
+            Some(total) => eprintln!("{} / {} MiB", placed >> 20, total.div_ceil(1 << 20)),
+            None => eprintln!("{} MiB", placed >> 20),
+        }),
+    )?;
     let status = drive(&mut fetcher)?;
     match status {
         crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),

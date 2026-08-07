@@ -102,7 +102,20 @@ impl From<Error> for Fault {
     }
 }
 
-/// A sink that counts what it places.
+/// Bytes placed between the flushes that keep durability in placement's
+/// stride.
+///
+/// The sync that gates an object's completion is serial: nothing
+/// advances while it runs, and syncing a whole object there cost 220 ms
+/// of every 512 MiB fetch on the rig, a third of the wall at W=6
+/// (docs/perf-engineering.md, 2026-08-07). Flushing every stride from
+/// the prover that crosses it moves that work into the transfer, where
+/// the other provers and every rail keep going; the final sync then
+/// flushes at most a stride. 64 MiB is a few tens of milliseconds on
+/// an `NVMe` and small enough to leave the tail negligible.
+const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
+
+/// A sink that counts what it places, and keeps durability in stride.
 ///
 /// The fetch cannot see its answers arrive: the receiver takes proof
 /// bundles and records straight off the session and hands back nothing,
@@ -112,6 +125,13 @@ impl From<Error> for Fault {
 struct CountingSink {
     file: FileSink,
     placed: AtomicU64,
+    /// The placed-byte crossing at which the next stride flush is due.
+    /// Whichever writer crosses it flushes; the exchange is what keeps
+    /// two writers from paying for the same stride.
+    flush_due: AtomicU64,
+    /// Stride flushes taken, the observable half of a call whose effect
+    /// is the platter's.
+    flushes: AtomicU64,
 }
 
 impl CountingSink {
@@ -119,6 +139,8 @@ impl CountingSink {
         Ok(Self {
             file: FileSink::create(path, length)?,
             placed: AtomicU64::new(0),
+            flush_due: AtomicU64::new(FLUSH_STRIDE_BYTES),
+            flushes: AtomicU64::new(0),
         })
     }
 
@@ -130,7 +152,32 @@ impl CountingSink {
 impl vot_scheduler::RangeSink for CountingSink {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
         self.file.write_at(covered_offset, data)?;
-        self.placed.fetch_add(data.len() as u64, Ordering::Relaxed);
+        let placed = self
+            .placed
+            .fetch_add(data.len() as u64, Ordering::Relaxed)
+            .saturating_add(data.len() as u64);
+        let due = self.flush_due.load(Ordering::Relaxed);
+        if placed >= due
+            && self
+                .flush_due
+                .compare_exchange(
+                    due,
+                    // The crossing after what is placed, however many
+                    // strides this write spanned.
+                    placed
+                        .saturating_sub(placed % FLUSH_STRIDE_BYTES)
+                        .saturating_add(FLUSH_STRIDE_BYTES),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            // Best effort, on this writer's own thread while the others
+            // keep placing: the sync that gates completion still runs,
+            // and a refusal here costs only the tail this spreads out.
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            let _ = self.file.file().sync_data();
+        }
         Ok(())
     }
 }
@@ -2004,6 +2051,50 @@ mod tests {
             .expect("the serving thread")
             .expect("both sessions served");
         discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_stride_crossing_flushes_once_and_arms_the_next() {
+        // Durability in placement's stride: the writer that crosses the
+        // due mark flushes, exactly once however many writers or strides
+        // one write spans, and the next mark is the whole stride above
+        // what is placed. The counter is the observable half; the sync
+        // itself is the platter's business.
+        let output = temporary("stride");
+        fs::create_dir_all(&output).unwrap();
+        let stride = usize::try_from(FLUSH_STRIDE_BYTES).unwrap();
+        let sink = CountingSink::create(&output.join("s.obj"), 4 * FLUSH_STRIDE_BYTES).unwrap();
+        let chunk = vec![7u8; stride - 1];
+        vot_scheduler::RangeSink::write_at(&sink, 0, &chunk).unwrap();
+        assert_eq!(
+            sink.flushes.load(Ordering::Relaxed),
+            0,
+            "one short of the stride flushes nothing"
+        );
+        vot_scheduler::RangeSink::write_at(&sink, FLUSH_STRIDE_BYTES - 1, &[7u8]).unwrap();
+        assert_eq!(
+            sink.flushes.load(Ordering::Relaxed),
+            1,
+            "the crossing flushes"
+        );
+        assert_eq!(
+            sink.flush_due.load(Ordering::Relaxed),
+            2 * FLUSH_STRIDE_BYTES,
+            "and arms the next stride"
+        );
+        let wide = vec![7u8; 2 * stride];
+        vot_scheduler::RangeSink::write_at(&sink, FLUSH_STRIDE_BYTES, &wide).unwrap();
+        assert_eq!(
+            sink.flushes.load(Ordering::Relaxed),
+            2,
+            "a write spanning strides flushes once"
+        );
+        assert_eq!(
+            sink.flush_due.load(Ordering::Relaxed),
+            4 * FLUSH_STRIDE_BYTES,
+            "armed above what is placed, not one stride on"
+        );
+        discard(&[&output]);
     }
 
     #[test]

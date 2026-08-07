@@ -118,6 +118,11 @@ impl FileSink {
     pub fn create(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
         let file = std::fs::File::create(path)?;
         file.set_len(length)?;
+        // Best effort: a filesystem that refuses costs the write path
+        // only the valid-data zero-fill this avoids, which on NTFS
+        // serializes rails writing out of order and writes every gap
+        // twice (docs/perf-engineering.md, 2026-08-07).
+        let _ = vot_platform_fs::allow_unordered_writes(&file);
         Ok(Self { file })
     }
 

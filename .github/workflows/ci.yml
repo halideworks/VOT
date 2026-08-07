@@ -374,7 +374,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           # Both sides of the diff, and the merge base between them, which a
@@ -459,7 +459,7 @@ jobs:
     # loaded 2-core runner needs the headroom.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           # Both sides of the diff, and the merge base between them, which a
@@ -554,7 +554,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           # Both sides of the diff and the merge base, which a shallow clone

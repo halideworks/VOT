@@ -109,20 +109,23 @@ fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error> {
     Ok(rails)
 }
 
-/// The controller [`CONGESTION`] names, or cubic when it is unset.
+/// The controller [`CONGESTION`] names, or bbr2 when it is unset.
 ///
-/// Cubic is what every LAN acceptance number was taken under; bbr2 is
-/// what a lossy wide-area path wants, 3-5x cubic at 0.5-1% loss
-/// (docs/perf-engineering.md, 2026-08-06). A transfer is governed by the
-/// sender's controller, so the pin matters most on the end serving the
-/// bytes, but both commands read it: either end of a session sends.
+/// Measured at width 4 with 4 GiB transfers: bbr2 is 13% faster than
+/// cubic on the 10 gigabit LAN rig (5.1 s vs 5.8 s median), 33% faster at
+/// 68 ms over the real WAN (50.3 s vs 75.5 s), 3-5x faster under
+/// 0.5-1% emulated loss, and ties cubic on clean short paths. A
+/// transfer is governed by the sender's controller, so the pin matters
+/// most on the end serving the bytes, but both commands read it:
+/// either end of a session sends. `cubic` remains the pin for a path
+/// where bbr2 misbehaves.
 ///
 /// # Errors
 /// Rejects a value naming neither controller.
 fn congestion_from(pin: Option<&str>) -> Result<CongestionControl, Error> {
     match pin.map(str::trim) {
-        None | Some("cubic") => Ok(CongestionControl::Cubic),
-        Some("bbr2") => Ok(CongestionControl::Bbr2),
+        None | Some("bbr2") => Ok(CongestionControl::Bbr2),
+        Some("cubic") => Ok(CongestionControl::Cubic),
         Some(_) => Err(Error::InvalidArguments),
     }
 }
@@ -479,10 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn the_congestion_controller_is_the_value_given_or_cubic() {
+    fn the_congestion_controller_is_the_value_given_or_bbr2() {
         // The pin apart from the process environment, like the datagram
         // test above and for the same race.
-        assert_eq!(congestion_from(None).unwrap(), CongestionControl::Cubic);
+        assert_eq!(congestion_from(None).unwrap(), CongestionControl::Bbr2);
         assert_eq!(
             congestion_from(Some("cubic")).unwrap(),
             CongestionControl::Cubic

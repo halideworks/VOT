@@ -357,7 +357,11 @@ where
         let mut failed = Ok(());
         // Takes one finished session's outcome, waiting for a session to
         // finish if none has: every session announces as it ends, however
-        // it ends, so a receive with any session running answers.
+        // it ends, so a wait with any session running answers. The wait
+        // wakes at [`REAP_TICK`] only to hold the announcement contract:
+        // a finished session with nothing in the channel is one whose
+        // announcement was lost, and a serve that waited on it would hang
+        // forever, so it panics with the diagnosis instead.
         let reap = |running: &mut std::collections::VecDeque<(
             u64,
             std::thread::ScopedJoinHandle<'_, _>,
@@ -367,7 +371,30 @@ where
                 !running.is_empty(),
                 "a slot is only reaped from a serve that holds one"
             );
-            let done = endings.recv().expect("the serve holds a sender");
+            let done = loop {
+                match endings.recv_timeout(REAP_TICK) {
+                    Ok(done) => break done,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let finished = running
+                            .iter()
+                            .filter(|(_, handle)| handle.is_finished())
+                            .count();
+                        if finished == 0 {
+                            continue;
+                        }
+                        // A thread announces before it can finish, so a
+                        // finished one either left its announcement in
+                        // the channel or never sent it.
+                        match endings.try_recv() {
+                            Ok(done) => break done,
+                            Err(_) => panic!("{finished} sessions finished without announcing"),
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        unreachable!("the serve holds a sender")
+                    }
+                }
+            };
             let at = running
                 .iter()
                 .position(|(id, _)| *id == done)
@@ -428,6 +455,13 @@ where
         failed
     })
 }
+
+/// How often a reap looks up from its wait to check the announcement
+/// contract. It prices the detection of a lost announcement, never the
+/// reap itself: an announcement that was sent ends the wait the moment
+/// it lands.
+#[cfg(any(test, feature = "wire"))]
+const REAP_TICK: Duration = Duration::from_millis(250);
 
 /// One session's end, announced by drop: however the session's thread
 /// ends, the announcement goes, so the reap never waits on a session

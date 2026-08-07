@@ -721,6 +721,28 @@ mod tests {
     }
 
     #[test]
+    fn an_announcement_goes_however_its_thread_ends() {
+        // The reap waits on announcements, so one that never went would
+        // block the serve forever: the drop is what sends it, cleanly or
+        // through an unwind alike.
+        let (ended, endings) = std::sync::mpsc::channel();
+        drop(Announcement { id: 7, ended });
+        assert_eq!(endings.recv().expect("the drop announced"), 7);
+
+        let (ended, endings) = std::sync::mpsc::channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _announce = Announcement { id: 9, ended };
+            panic!("the thread dies mid-session");
+        }));
+        assert!(unwound.is_err(), "the panic unwound");
+        assert_eq!(
+            endings.recv().expect("the unwind announced"),
+            9,
+            "a panic that skipped the announcement would hang the reap"
+        );
+    }
+
+    #[test]
     fn a_slow_session_does_not_hold_the_accepts_behind_it() {
         // A session whose client vanished without a close settles only at
         // its carrier's idle timeout. The bound's wait must take whichever

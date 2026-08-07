@@ -19,7 +19,8 @@ use crate::Error;
 /// looks up (`docs/perf-engineering.md`, 2026-08-04: the bound stopped
 /// being a result once waits became blocking). Long enough not to spin,
 /// short enough that a carrier which dies quietly is noticed.
-const IDLE_BOUND: Duration = Duration::from_millis(50);
+const IDLE_BOUND_MS: u64 = 50;
+const IDLE_BOUND: Duration = Duration::from_millis(IDLE_BOUND_MS);
 
 /// How long a pass waits when the carrier is holding work back.
 ///
@@ -28,22 +29,30 @@ const IDLE_BOUND: Duration = Duration::from_millis(50);
 /// carrier does not report room as an event. Waiting the idle bound for
 /// it would pace a transfer at one drain every fifty milliseconds;
 /// waiting not at all would spin a core for the length of the transfer.
-const BUSY_BOUND: Duration = Duration::from_millis(1);
+const BUSY_BOUND_MS: u64 = 1;
+const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 
-/// Passes a driving loop may make without the engine getting anywhere.
+/// What a driving loop may wait through without the engine getting
+/// anywhere, in the milliseconds of its own two bounds.
 ///
-/// Not a bound on how long a session may take: any progress at all sets
-/// it back, so it only ends a session where nothing is happening. Counted
-/// in the loop's own body rather than measured against a clock, because a
-/// slow machine is not a stuck one.
+/// Not a bound on how long a session may take: any progress at all sets it
+/// back, so it only ends a session where nothing is happening. Not a clock
+/// either. What a pass spends is the wait it chose, both of them constants
+/// here, so a machine slow enough to take a second inside `service` spends
+/// one millisecond of this and not a second.
 ///
-/// At the idle bound this is about half a minute of silence, which is
-/// already past where a live carrier gives up on its own: quiche's idle
-/// timeout is thirty seconds and reports a disconnect, which settles the
-/// loop. So this is the backstop for a carrier with no timeout of its
-/// own, and a longer one would only make a wedged session take longer to
-/// say so.
-const STALLED_PASSES: u32 = 600;
+/// Counting passes instead made the budget mean two different things. Half
+/// a minute of silence at the idle bound was the number chosen and
+/// documented; the same six hundred passes at the busy bound was 0.6
+/// seconds, so a peer that merely stopped reading for a moment ended the
+/// session. The two now cost what they wait.
+///
+/// Half a minute is already past where a live carrier gives up on its own:
+/// quiche's idle timeout is thirty seconds and reports a disconnect, which
+/// settles the loop. So this is the backstop for a carrier with no timeout
+/// of its own, and a longer one would only make a wedged session take
+/// longer to say so.
+const STALLED_WAIT_MS: u64 = 30_000;
 
 /// One end of a session: a pass to make, a way to say the pass settled it,
 /// and the carrier to wait on.
@@ -81,35 +90,36 @@ pub trait Engine {
 /// Surfaces the engine's own failure, or [`Error::Stalled`] if the loop
 /// made its whole budget of passes without the engine getting anywhere.
 pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
-    let mut stalled: u32 = 0;
+    let mut stalled_ms: u64 = 0;
     let mut settled_so_far = engine.progress();
     loop {
         let status = engine.service()?;
         if E::settled(status) {
             return Ok(status);
         }
+        // Every pass waits, including one with a backlog: a backlog is the
+        // carrier refusing what this end already prepared, so there is
+        // nothing to do but let it drain, and doing it in a tight loop is
+        // a spun core rather than a faster transfer.
+        let (wait, spent) = if engine.has_backlog() {
+            (BUSY_BOUND, BUSY_BOUND_MS)
+        } else {
+            (IDLE_BOUND, IDLE_BOUND_MS)
+        };
         let progress = engine.progress();
         if progress == settled_so_far {
             // Saturating rather than `+=`, so the loop's own end does not
             // hang on an operator: an increment that stopped incrementing
             // is a loop with nothing left to stop it.
-            stalled = stalled.saturating_add(1);
-            if stalled > STALLED_PASSES {
+            stalled_ms = stalled_ms.saturating_add(spent);
+            if stalled_ms > STALLED_WAIT_MS {
                 return Err(Error::Stalled);
             }
         } else {
             settled_so_far = progress;
-            stalled = 0;
+            stalled_ms = 0;
         }
-        // Every pass waits, including one with a backlog: a backlog is the
-        // carrier refusing what this end already prepared, so there is
-        // nothing to do but let it drain, and doing it in a tight loop is
-        // a spun core rather than a faster transfer.
-        engine.wait(if engine.has_backlog() {
-            BUSY_BOUND
-        } else {
-            IDLE_BOUND
-        });
+        engine.wait(wait);
     }
 }
 
@@ -240,6 +250,12 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 mod tests {
     use super::*;
 
+    /// Passes the budget allows at each bound. That these differ by fifty
+    /// while the time they stand for does not is the whole of the change:
+    /// a pass costs what it waits.
+    const IDLE_PASSES: u64 = STALLED_WAIT_MS / IDLE_BOUND_MS;
+    const BUSY_PASSES: u64 = STALLED_WAIT_MS / BUSY_BOUND_MS;
+
     #[test]
     fn an_unbounded_serve_outlives_a_failed_session() {
         // A client that connects and goes away leaves its session stalling,
@@ -326,18 +342,18 @@ mod tests {
     #[derive(Default)]
     struct Scripted {
         /// Passes still to report as unsettled before settling.
-        unsettled: u32,
+        unsettled: u64,
         /// Passes, of the unsettled ones, that report progress.
-        with_progress: u32,
+        with_progress: u64,
         /// Whether every unsettled pass reports a backlog.
         backlogged: bool,
         settled: u64,
-        passes: u32,
+        passes: u64,
         /// Counted rather than collected: a mutant that stops the loop
         /// ending makes this grow for as long as the process lives, and a
         /// vector of them is a test that takes the machine with it.
-        busy_waits: u32,
-        idle_waits: u32,
+        busy_waits: u64,
+        idle_waits: u64,
     }
 
     impl Engine for Scripted {
@@ -555,12 +571,12 @@ mod tests {
         // backlog to show for it, and a budget that counted those would
         // end the transfer partway through.
         let mut engine = Scripted {
-            unsettled: 4 * STALLED_PASSES,
-            with_progress: 4 * STALLED_PASSES,
+            unsettled: 4 * IDLE_PASSES,
+            with_progress: 4 * IDLE_PASSES,
             ..Scripted::default()
         };
         assert!(drive(&mut engine).unwrap());
-        assert_eq!(engine.passes, 4 * STALLED_PASSES + 1);
+        assert_eq!(engine.passes, 4 * IDLE_PASSES + 1);
     }
 
     #[test]
@@ -571,24 +587,46 @@ mod tests {
         // never settles at all leaves a mutant that stops the budget
         // counting to run for as long as the numbers allow.
         let mut engine = Scripted {
-            unsettled: 4 * STALLED_PASSES,
+            unsettled: 4 * IDLE_PASSES,
             with_progress: 0,
             ..Scripted::default()
         };
         assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
-        assert_eq!(engine.passes, STALLED_PASSES + 1);
+        assert_eq!(engine.passes, IDLE_PASSES + 1);
+    }
+
+    #[test]
+    fn a_backlogged_stall_gets_the_same_half_minute_as_an_idle_one() {
+        // Counting passes rather than what they wait made this budget 0.6
+        // seconds where the idle one was thirty, so a peer that stopped
+        // reading for as long as a large sync takes ended the session. The
+        // two bounds now buy the same time.
+        let mut engine = Scripted {
+            unsettled: 2 * BUSY_PASSES,
+            with_progress: 0,
+            backlogged: true,
+            ..Scripted::default()
+        };
+        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
+        assert_eq!(engine.passes, BUSY_PASSES + 1);
+        assert_eq!(engine.busy_waits, BUSY_PASSES);
+        assert_eq!(
+            BUSY_PASSES * BUSY_BOUND_MS,
+            IDLE_PASSES * IDLE_BOUND_MS,
+            "the same half minute either way"
+        );
     }
 
     #[test]
     fn progress_late_in_a_stall_sets_the_budget_back() {
         // The counter is consecutive passes, not passes overall.
         let mut engine = Scripted {
-            unsettled: STALLED_PASSES + 10,
+            unsettled: IDLE_PASSES + 10,
             with_progress: 1,
             ..Scripted::default()
         };
         assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
         // One pass made progress, so the budget started again after it.
-        assert_eq!(engine.passes, STALLED_PASSES + 2);
+        assert_eq!(engine.passes, IDLE_PASSES + 2);
     }
 }

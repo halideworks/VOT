@@ -196,6 +196,9 @@ pub struct ServeConnection {
     /// Every answer this session has queued, only ever going up. A driving
     /// loop reads it to tell a slow session from a stopped one.
     progress: u64,
+    /// And every answer the carrier has taken from it, which is the half of
+    /// that story a full outbound budget hides. See [`Self::progress`].
+    handed_over: u64,
 }
 
 impl Default for ServeConnection {
@@ -209,6 +212,7 @@ impl Default for ServeConnection {
             budget: OUTBOUND_BUDGET_BYTES,
             closed: None,
             progress: 0,
+            handed_over: 0,
         }
     }
 }
@@ -309,10 +313,18 @@ impl ServeConnection {
         Ok(())
     }
 
-    /// Every answer this session has queued, only ever going up.
+    /// Every answer this session has queued and every one the carrier has
+    /// taken, only ever going up.
+    ///
+    /// Both, because either alone stands still through a case the other
+    /// sees. Queuing stops at the outbound budget, so a server whose peer
+    /// reads slowly queues nothing new and hands over what it has one frame
+    /// at a time; counting only what is queued calls that stopped. Counting
+    /// only what is taken would miss a server building answers it has not
+    /// been able to send yet.
     #[must_use]
     pub fn progress(&self) -> u64 {
-        self.progress
+        self.progress.saturating_add(self.handed_over)
     }
 
     fn queue_control(&mut self, frame: Payload) {
@@ -345,6 +357,9 @@ impl ServeConnection {
                         };
                         self.pending_bytes = self.pending_bytes.saturating_sub(bytes as u64);
                     }
+                    // The carrier took one, which is this session getting
+                    // somewhere even when the budget stops it queuing more.
+                    self.handed_over = self.handed_over.saturating_add(1);
                 }
                 // Backpressure: the frame stays queued for the next pass.
                 Err(error) if is_backpressure(&error) => break,
@@ -1271,6 +1286,61 @@ mod tests {
         let status = server.service(&mut session, &mut connection).unwrap();
         assert_eq!(status, ServeStatus::Active);
         assert!(session.driver().closed.is_none());
+    }
+
+    #[test]
+    fn handing_an_answer_to_the_carrier_is_progress() {
+        // A server whose peer reads slowly queues nothing new, because the
+        // outbound budget stops it, and hands over what it has as room
+        // appears. Counting only what is queued calls that stopped, and the
+        // driving loop ends a session that is moving.
+        let (bundle, _) = built_bundle("slow-peer", &[("big.bin", patterned(4_300_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+
+        for identifier in 0..4u8 {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                    request_id: [identifier; 16],
+                    object,
+                    offset: 0,
+                    length: 4_194_304,
+                })));
+        }
+        session.driver().refuse_sends = usize::MAX;
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(connection.pending_answer_bytes() >= OUTBOUND_BUDGET_BYTES);
+        // Nothing left to read, so anything the count does from here is the
+        // handover and not the queuing.
+        session.driver().events.clear();
+
+        let stalled = connection.progress();
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            connection.progress(),
+            stalled,
+            "a carrier that takes nothing is not progress"
+        );
+
+        let taken = |session: &mut Session<Loopback>| {
+            session.driver().records.len() + session.driver().control.len()
+        };
+        let before = taken(&mut session);
+        session.driver().refuse_sends = 0;
+        server.service(&mut session, &mut connection).unwrap();
+        let moved = taken(&mut session) - before;
+        assert!(moved > 0, "the carrier took answers");
+        assert_eq!(
+            connection.progress() - stalled,
+            moved as u64,
+            "every answer handed over counts once"
+        );
     }
 
     #[test]

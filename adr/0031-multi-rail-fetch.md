@@ -52,6 +52,13 @@ settled stands.
   accept loop moves to a thread per accepted session with a bound on
   how many run at once. The per-session engine, budget, and failure
   policy (a session's failure ends the session, PR 111) do not change.
+  The carrier is one socket, one session, so this concurrency is real
+  only where every session gets its own port: on a fixed port the next
+  bind waits for the session holding it (PR 118), which serializes
+  exactly the rails this ADR wants together. Step 3 therefore includes
+  a demultiplexing listener: one socket on the served address, routing
+  datagrams to per-session pumps by connection ID. A carrier change,
+  not an engine one, and the engines cannot tell.
 - **Width is chosen at the fetch, bounded by the machine.** Default
   `min(4, available cores)` rails, `VOT_FETCH_RAILS` to override, 1
   restoring today's shape exactly. The server bounds concurrent
@@ -86,7 +93,8 @@ settled stands.
    zero-missed.
 3. Rails: W sessions over the shared plan and sink, provers per rail
    or pooled, `VOT_FETCH_RAILS`, sim test at W=2 with interleaved
-   pumps.
+   pumps. The serve side grows the demultiplexing listener here, so W
+   rails reach one fixed address.
 4. Wire runs on the rig at W=1,2,4,6 against the bench's 9.21, logged
    in the perf log; the acceptance target is parity with the bench at
    the same W within its spread.

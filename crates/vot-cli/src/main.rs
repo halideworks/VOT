@@ -34,7 +34,7 @@ KEY_SOURCE says where to read the key from:
 What it reads decides the kind of key. An Ed25519 key is labelled, because a
 secret and a public key are both 32 bytes and using one as the other would
 either leak the secret or produce receipts nobody can check:
-  ed25519-secret:HEX   signs, 64 hex characters. receive only.
+  ed25519-secret:HEX   signs, 64 hex characters. receive and pull only.
   ed25519-public:HEX   checks a signature, 64 hex characters
   hex:HEX              shared secret, 32 to 64 bytes
   raw:TEXT             shared secret as text

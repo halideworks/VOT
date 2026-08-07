@@ -822,7 +822,6 @@ fn drive(
     datagram_bytes: usize,
     accept_timeout_ms: u64,
 ) -> Result<(), Error> {
-    let budget = SharedBudget(Arc::clone(inbound));
     // Heap rather than stack, and as large as the largest frame a lane carries.
     // A read that holds a whole record hands it to the parser as one slice, so
     // reassembly is what happens when a record is split rather than what happens
@@ -834,15 +833,14 @@ fn drive(
     // and costs one syscall instead of 44, which is where the offload pays.
     // A datagram already near the cap holds one, and the send is what it was.
     let burst_bytes = LARGEST_DATAGRAM_SIZE.max(datagram_bytes);
-    let mut out = vec![0_u8; burst_bytes];
+    let out = vec![0_u8; burst_bytes];
     let offload = offload_available();
     let scid = scid_for(local);
 
-    let (mut conn, mut announced) = match (role, peer) {
-        (Role::Client, Some((address, name))) => (
-            quiche::connect(name, &scid, local, address, config).map_err(|_| Error::Backend)?,
-            false,
-        ),
+    let conn = match (role, peer) {
+        (Role::Client, Some((address, name))) => {
+            quiche::connect(name, &scid, local, address, config).map_err(|_| Error::Backend)?
+        }
         (Role::Server, _) => {
             // A server has nothing to do until a client speaks, and the first
             // packet is what names the connection.
@@ -850,7 +848,7 @@ fn drive(
             else {
                 return Ok(());
             };
-            (conn, false)
+            conn
         }
         (Role::Client, None) => return Err(Error::InvalidConfiguration),
     };
@@ -860,12 +858,80 @@ fn drive(
     // with the segment size beside it. A kernel that refuses the option
     // leaves each datagram its own read.
     enable_receive_offload(socket);
+    run(
+        socket,
+        Intake::Socket,
+        conn,
+        local,
+        role,
+        commands,
+        inbound,
+        close,
+        control_limit,
+        path,
+        connection,
+        datagram_bytes,
+        buffer,
+        out,
+        offload,
+    )
+}
+
+/// Where a pump's datagrams come from: the socket it owns alone, or a
+/// listener routing one socket's arrivals to many pumps (ADR-0031).
+#[derive(Clone, Copy)]
+enum Intake<'a> {
+    /// The pump owns the socket and reads it directly.
+    Socket,
+    /// A listener owns the socket; what arrives is routed by connection.
+    Routed(&'a mpsc::Receiver<Arrived>),
+}
+
+/// One read a listener routed to a pump: the datagrams as one buffer, who
+/// sent them, and the segment size when the kernel coalesced them.
+struct Arrived {
+    bytes: Vec<u8>,
+    from: SocketAddr,
+    segment: Option<usize>,
+}
+
+/// The pump's loop over one connection, whichever way its packets arrive.
+///
+/// Sends go to `socket` directly either way: the kernel serializes
+/// concurrent sends, so pumps sharing a listener's socket need no lock.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pump takes what the caller owns and nothing more"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass of the pump is one piece, and splitting it would scatter its order"
+)]
+fn run(
+    socket: &UdpSocket,
+    intake: Intake<'_>,
+    mut conn: quiche::Connection,
+    local: SocketAddr,
+    role: Role,
+    commands: &mpsc::Receiver<Command>,
+    inbound: &Arc<Mutex<Inbound>>,
+    close: &Arc<AtomicU64>,
+    control_limit: &Arc<AtomicUsize>,
+    path: &Arc<Mutex<Option<PathStats>>>,
+    connection: u64,
+    datagram_bytes: usize,
+    mut buffer: Vec<u8>,
+    mut out: Vec<u8>,
+    offload: bool,
+) -> Result<(), Error> {
+    let budget = SharedBudget(Arc::clone(inbound));
     // Allocated once, because a control-message buffer per read is a malloc
     // per packet, which is the cost this path exists to remove.
     let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut queued = Queued::default();
     let mut closing = false;
+    let mut announced = false;
     let mut sending = Sending::new(datagram_bytes, offload);
 
     loop {
@@ -917,21 +983,54 @@ fn drive(
                 // and gets it on the next pass either way.
                 Duration::from_micros(200),
             );
-        socket
-            .set_read_timeout(Some(deadline))
-            .map_err(|_| Error::Backend)?;
-        match receive_segmented(socket, &mut buffer, &mut space) {
-            Ok((len, from, segment)) => {
-                feed_received(&mut conn, local, &mut buffer[..len], from, segment);
-                drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
+        match &intake {
+            Intake::Socket => {
+                socket
+                    .set_read_timeout(Some(deadline))
+                    .map_err(|_| Error::Backend)?;
+                match receive_segmented(socket, &mut buffer, &mut space) {
+                    Ok((len, from, segment)) => {
+                        feed_received(&mut conn, local, &mut buffer[..len], from, segment);
+                        drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        conn.on_timeout();
+                    }
+                    Err(_) => return Ok(()),
+                }
             }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                conn.on_timeout();
-            }
-            Err(_) => return Ok(()),
+            Intake::Routed(packets) => match packets.recv_timeout(deadline) {
+                Ok(mut routed) => {
+                    feed_received(
+                        &mut conn,
+                        local,
+                        &mut routed.bytes,
+                        routed.from,
+                        routed.segment,
+                    );
+                    // The wait was paid on the first read; what else has
+                    // already been routed is a batch, up to the same budget
+                    // the socket drain keeps.
+                    for _ in 0..DRAIN_BUDGET {
+                        let Ok(mut routed) = packets.try_recv() else {
+                            break;
+                        };
+                        feed_received(
+                            &mut conn,
+                            local,
+                            &mut routed.bytes,
+                            routed.from,
+                            routed.segment,
+                        );
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
+                // The router is gone, so nothing further can ever arrive.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            },
         }
 
         read_streams(
@@ -958,6 +1057,356 @@ fn drive(
 /// a driver that exited without pushing is noticed, and it prices that
 /// detection, not the arrival itself.
 const ARRIVAL_TICK: Duration = Duration::from_millis(250);
+
+/// Reads a router holds for a pump that has not drained them.
+///
+/// The elasticity the kernel's receive buffer gives a pump that owns its
+/// socket, restated as a bound: a pump this far behind sheds arrivals the
+/// way a full kernel buffer would, and the connection recovers them.
+const ROUTED_READS: usize = 512;
+
+/// Connections one listener carries at most.
+///
+/// The router accepts what it can route and no more: an Initial past the
+/// bound is dropped, the client retransmits it, and room appears when a
+/// session ends, which is backpressure rather than failure.
+const MAX_LISTENER_CONNECTIONS: usize = 64;
+
+/// Accepted connections a listener holds for a caller that has not taken
+/// them. Small, because a caller at its own session bound wants arrivals
+/// waiting in the socket, where dropping them costs nothing.
+const ACCEPT_BACKLOG: usize = 8;
+
+/// How often the router looks up from an idle socket to notice its owner
+/// is gone.
+const ROUTER_TICK: Duration = Duration::from_millis(50);
+
+/// Tells one routed connection from another in this process, because a
+/// listener's connections share one local address and port.
+static ROUTED: AtomicU64 = AtomicU64::new(0);
+
+/// One socket serving many connections: the demultiplexing listener of
+/// ADR-0031, so W rails reach one fixed address.
+///
+/// A router thread owns the socket's receive side, routes each datagram
+/// to its connection's pump by connection ID, and turns an unknown
+/// Initial into a new connection. Every accepted connection is an
+/// ordinary [`Transport`]; its pump sends on the shared socket directly,
+/// which the kernel serializes. Dropping the listener stops the router;
+/// accepted connections outlive it on their own pumps, going quiet only
+/// when their peers do.
+pub struct Listener {
+    local: SocketAddr,
+    arrivals: mpsc::Receiver<Transport>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    accept_timeout_ms: u64,
+    router: Option<JoinHandle<()>>,
+}
+
+impl Listener {
+    /// Binds one socket for every session a serve will carry.
+    ///
+    /// # Errors
+    /// Reports a socket, credential, or configuration failure.
+    pub fn bind(address: SocketAddr, config: &Config) -> Result<Self, Error> {
+        let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
+        vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
+        let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
+        enable_receive_offload(&socket);
+        let local = socket.local_addr().map_err(|_| Error::Backend)?;
+        // Built here once to surface a bad configuration at the bind, and
+        // rebuilt per connection because a `quiche::Config` serves one.
+        let _ = config.build(Role::Server)?;
+        let socket = Arc::new(socket);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (arrived, arrivals) = mpsc::sync_channel(ACCEPT_BACKLOG);
+        let router_socket = Arc::clone(&socket);
+        let router_stop = Arc::clone(&stop);
+        let router_config = config.clone();
+        let router = std::thread::Builder::new()
+            .name(format!("vot-quiche-listen-{}", local.port()))
+            .spawn(move || {
+                route(
+                    &router_socket,
+                    local,
+                    &router_config,
+                    &arrived,
+                    &router_stop,
+                );
+            })
+            .map_err(|_| Error::Backend)?;
+        drop(socket);
+        Ok(Self {
+            local,
+            arrivals,
+            stop,
+            accept_timeout_ms: config.accept_timeout_ms,
+            router: Some(router),
+        })
+    }
+
+    /// The address this listener is bound to.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// Waits for the next connection, as long as the accept allows
+    /// (`accept_timeout_ms`, where zero is forever).
+    ///
+    /// # Errors
+    /// Reports a wait that ended without a connection.
+    pub fn accept(&self) -> Result<Transport, Error> {
+        let accepted = match self.accept_timeout_ms {
+            0 => self.arrivals.recv().ok(),
+            bound => self
+                .arrivals
+                .recv_timeout(Duration::from_millis(bound))
+                .ok(),
+        };
+        accepted.ok_or(Error::Backend)
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(router) = self.router.take() {
+            let _ = router.join();
+        }
+        // Connections still waiting to be accepted die here: their pumps
+        // are joined one at a time as each `Transport` drops.
+        while self.arrivals.try_recv().is_ok() {}
+    }
+}
+
+/// Where a routed connection's datagrams go, and how the router learns
+/// the pump is gone.
+struct Route {
+    pump: mpsc::SyncSender<Arrived>,
+    /// Set by the pump as it ends, so the router can sweep the route
+    /// without a packet having to bounce off it first.
+    done: Arc<std::sync::atomic::AtomicBool>,
+    /// The other identifier this connection is routed under.
+    sibling: Vec<u8>,
+}
+
+/// The listener's receive loop: reads the socket, routes by connection
+/// ID, and accepts what no route claims.
+fn route(
+    socket: &Arc<UdpSocket>,
+    local: SocketAddr,
+    config: &Config,
+    arrived: &mpsc::SyncSender<Transport>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+    let mut space = receive_space();
+    let mut routes: std::collections::HashMap<Vec<u8>, Route> = std::collections::HashMap::new();
+    if socket.set_read_timeout(Some(ROUTER_TICK)).is_err() {
+        return;
+    }
+    while !stop.load(Ordering::Relaxed) {
+        let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space) {
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        // The header wants only the first datagram of a coalesced read,
+        // and the kernel only coalesces one flow, so its identifier
+        // stands for the batch.
+        let first = segment.map_or(len, |step| step.min(len)).min(len);
+        let Ok(header) = quiche::Header::from_slice(&mut buffer[..first], quiche::MAX_CONN_ID_LEN)
+        else {
+            continue;
+        };
+        let key = header.dcid.to_vec();
+        if let Some(row) = routes.get(&key) {
+            if row.done.load(Ordering::Relaxed) {
+                // The pump ended; the route and its sibling go with it.
+                let sibling = row.sibling.clone();
+                routes.remove(&key);
+                routes.remove(&sibling);
+                continue;
+            }
+            // A full queue sheds this read the way a full kernel receive
+            // buffer would, and the connection recovers it.
+            let _ = row.pump.try_send(Arrived {
+                bytes: buffer[..len].to_vec(),
+                from,
+                segment,
+            });
+            continue;
+        }
+        if !quiche::version_is_supported(header.version) {
+            // Answered rather than dropped, which is what lets a client
+            // try another version.
+            let mut out = [0_u8; MIN_DATAGRAM_SIZE];
+            if let Ok(written) = quiche::negotiate_version(&header.scid, &header.dcid, &mut out) {
+                let _ = socket.send_to(&out[..written], from);
+            }
+            continue;
+        }
+        if header.ty != quiche::Type::Initial {
+            // Not the opening of a connection: a stray, or a straggler of
+            // a session already gone. Dropped, per spec/security.md
+            // section 7, rather than grown a connection for.
+            continue;
+        }
+        routes.retain(|_, row| !row.done.load(Ordering::Relaxed));
+        if routes.len() >= MAX_LISTENER_CONNECTIONS.saturating_mul(2) {
+            // Past the bound the Initial is shed; the client retransmits
+            // it, and room appears when a session ends.
+            continue;
+        }
+        let Some((transport, route)) = accept_routed(
+            socket,
+            local,
+            config,
+            &mut buffer[..len],
+            from,
+            segment,
+            &key,
+        ) else {
+            continue;
+        };
+        if arrived.try_send(transport).is_ok() {
+            routes.insert(
+                route.sibling.clone(),
+                Route {
+                    pump: route.pump.clone(),
+                    done: Arc::clone(&route.done),
+                    sibling: key.clone(),
+                },
+            );
+            routes.insert(key, route);
+        }
+        // A transport nobody could take is dropped where it was made: the
+        // backlog is full, and the client's retransmission will find room
+        // or the same answer.
+    }
+}
+
+/// Turns an unclaimed Initial into a connection on its own pump.
+///
+/// Answers the transport for the caller and the route for the router, or
+/// nothing for a packet that was not a usable Initial after all.
+fn accept_routed(
+    socket: &Arc<UdpSocket>,
+    local: SocketAddr,
+    config: &Config,
+    received: &mut [u8],
+    from: SocketAddr,
+    segment: Option<usize>,
+    original: &[u8],
+) -> Option<(Transport, Route)> {
+    let mut quiche_config = config.build(Role::Server).ok()?;
+    let index = ROUTED.fetch_add(1, Ordering::Relaxed);
+    let scid = scid_routed(local, index);
+    let scid_key = scid.as_ref().to_vec();
+    if scid_key == original {
+        // A client naming this end's own identifier before it exists is
+        // not a connection this listener will route two ways.
+        return None;
+    }
+    let mut conn = quiche::accept(&scid, None, local, from, &mut quiche_config).ok()?;
+    feed_received(&mut conn, local, received, from, segment);
+
+    let mut adapter = QuicheAdapter::for_role(Role::Server);
+    adapter.set_receive_limits(config.limits);
+    let inbound = Arc::new(Mutex::new(Inbound::default()));
+    let close = Arc::new(AtomicU64::new(NO_CLOSE));
+    let control_limit = Arc::new(AtomicUsize::new(config.limits.control_payload()));
+    let (commands, submissions) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
+    let (router_side, packets) = mpsc::sync_channel(ROUTED_READS);
+    let path = Arc::new(Mutex::new(None));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The listener's port would name every connection alike; the index
+    // tells them apart in events.
+    let connection = ConnectionId((u64::from(local.port()) << 32) | index);
+    let datagram_bytes = config.max_datagram_bytes;
+
+    let pump_socket = Arc::clone(socket);
+    let pump_inbound = Arc::clone(&inbound);
+    let pump_close = Arc::clone(&close);
+    let pump_control = Arc::clone(&control_limit);
+    let pump_path = Arc::clone(&path);
+    let pump_done = Arc::clone(&done);
+    let driver = std::thread::Builder::new()
+        .name(format!("vot-quiche-{}-{index}", local.port()))
+        .spawn(move || {
+            let buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+            let out = vec![0_u8; LARGEST_DATAGRAM_SIZE.max(datagram_bytes)];
+            let _ = run(
+                &pump_socket,
+                Intake::Routed(&packets),
+                conn,
+                local,
+                Role::Server,
+                &submissions,
+                &pump_inbound,
+                &pump_close,
+                &pump_control,
+                &pump_path,
+                connection.0,
+                datagram_bytes,
+                buffer,
+                out,
+                offload_available(),
+            );
+            // However the pump ends, the router stops routing to it and
+            // the caller still hears the disconnect.
+            pump_done.store(true, Ordering::Relaxed);
+            if let Ok(mut inbound) = pump_inbound.lock() {
+                inbound.push_lifecycle(NativeEvent::Disconnected(connection.0));
+            }
+        })
+        .ok()?;
+
+    Some((
+        Transport {
+            adapter,
+            commands,
+            inbound,
+            path,
+            close,
+            held: None,
+            local,
+            connection,
+            driver: Some(driver),
+        },
+        Route {
+            pump: router_side,
+            done,
+            sibling: scid_key,
+        },
+    ))
+}
+
+/// A connection identifier for one of a listener's connections.
+///
+/// The port alone names the endpoint, as [`scid_for`] derives it; the
+/// index is what tells a listener's connections apart, every one of them
+/// sharing the port.
+fn scid_routed(local: SocketAddr, index: u64) -> quiche::ConnectionId<'static> {
+    let mut bytes = [0_u8; quiche::MAX_CONN_ID_LEN];
+    let port = local.port().to_be_bytes();
+    bytes[..2].copy_from_slice(&port);
+    bytes[2..10].copy_from_slice(&index.to_be_bytes());
+    for (at, byte) in bytes.iter_mut().enumerate().skip(10) {
+        let step = u8::try_from(at % 251).unwrap_or(0);
+        *byte = step
+            .wrapping_mul(37)
+            .wrapping_add(port[at % 2])
+            .wrapping_add(u8::try_from(index % 251).unwrap_or(0));
+    }
+    quiche::ConnectionId::from_vec(bytes.to_vec())
+}
 
 /// How long a server waits for its first packet unless told otherwise.
 ///
@@ -1917,6 +2366,102 @@ mod tests {
         }
         panic!(
             "the carrier never got there: client saw {from_client:?}, server saw {from_server:?}"
+        );
+    }
+
+    #[test]
+    fn a_listener_carries_two_connections_through_one_socket() {
+        // ADR-0031's demultiplexing listener: one socket on the served
+        // address, W rails reaching it as W whole connections at once.
+        // Isolation is the property worth the test: each rail's frames
+        // surface on its own session and nobody else's, both directions,
+        // both connections live at the same time.
+        let (certificate, key) = credentials();
+        let config = Config::server(limits(), certificate, key);
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let address = listener.local_address();
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        let connect = || {
+            Transport::connect(
+                "127.0.0.1:0".parse().expect("an address"),
+                address,
+                Some("localhost"),
+                &client_config,
+            )
+            .expect("a client")
+        };
+        let mut client1 = connect();
+        let mut server1 = listener.accept().expect("the first connection");
+        let mut client2 = connect();
+        let mut server2 = listener.accept().expect("the second connection");
+
+        client1
+            .send_control(&frame(b"first-rail"))
+            .expect("a frame");
+        client2
+            .send_control(&frame(b"second-rail"))
+            .expect("a frame");
+        let (_, on_server1) = pump_until(&mut client1, &mut server1, 15, |_, server| {
+            server
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        let (_, on_server2) = pump_until(&mut client2, &mut server2, 15, |_, server| {
+            server
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        let carried = |events: &[Event]| -> Vec<Vec<u8>> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Control(bytes) => Some(bytes.as_ref().to_vec()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(carried(&on_server1), vec![frame(b"first-rail")]);
+        assert_eq!(carried(&on_server2), vec![frame(b"second-rail")]);
+
+        // And each pump answers over the shared socket to its own peer.
+        server1
+            .send_control(&frame(b"first-answer"))
+            .expect("a frame");
+        server2
+            .send_control(&frame(b"second-answer"))
+            .expect("a frame");
+        let (on_client1, _) = pump_until(&mut client1, &mut server1, 15, |client, _| {
+            client
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        let (on_client2, _) = pump_until(&mut client2, &mut server2, 15, |client, _| {
+            client
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        assert_eq!(carried(&on_client1), vec![frame(b"first-answer")]);
+        assert_eq!(carried(&on_client2), vec![frame(b"second-answer")]);
+    }
+
+    #[test]
+    fn a_listener_accept_ends_at_its_bound_without_a_client() {
+        // Zero is a server that waits forever; a bound is what lets a
+        // bounded serve stop when nobody comes, and it has to hold for
+        // its whole length rather than return early with nothing.
+        let (certificate, key) = credentials();
+        let mut config = Config::server(limits(), certificate, key);
+        config.accept_timeout_ms = 400;
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let began = Instant::now();
+        assert!(listener.accept().is_err(), "nobody came");
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300),
+            "the accept gave up early, at {waited:?}"
         );
     }
 

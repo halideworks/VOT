@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vot_transport_api::ReceiveLimits;
-use vot_transport_quiche::live::{Config, CongestionControl, Transport};
+use vot_transport_quiche::live::{Config, CongestionControl, Listener, Transport};
 
-use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession, drive};
+use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession};
 
 /// How a wire session authenticates, which is not at all.
 ///
@@ -79,6 +79,35 @@ fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
 
 /// The environment variable that picks the congestion controller.
 const CONGESTION: &str = "VOT_CONGESTION";
+
+/// The environment variable that sets how many rails a fetch runs.
+const FETCH_RAILS: &str = "VOT_FETCH_RAILS";
+
+/// Rails a fetch may run at most.
+///
+/// The serve side drives this many sessions at once and backpressures the
+/// rest by not accepting them, and a rail waiting at the accept is a rail
+/// holding spans nobody answers, which stalls the whole fetch. So the cap
+/// is the serve bound, stated once over both.
+const MAX_FETCH_RAILS: usize = crate::drive::CONCURRENT_SESSIONS;
+
+/// The width [`FETCH_RAILS`] names, or the machine's own when it is unset.
+///
+/// ADR-0031: default `min(4, available cores)`, 1 restoring the one-rail
+/// shape exactly, bounded by [`MAX_FETCH_RAILS`].
+///
+/// # Errors
+/// Rejects a value that is not a number, zero, or a width past the bound.
+fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error> {
+    let Some(value) = pin else {
+        return Ok(4.min(cores.max(1)));
+    };
+    let rails: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    if !(1..=MAX_FETCH_RAILS).contains(&rails) {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(rails)
+}
 
 /// The controller [`CONGESTION`] names, or cubic when it is unset.
 ///
@@ -198,12 +227,11 @@ fn local_for(peer: SocketAddr) -> Result<SocketAddr, Error> {
 /// Serves `bundle` on `address` until stopped or `sessions` are answered.
 ///
 /// Each accepted carrier is driven to a settled state and then dropped;
-/// the bundle is opened and proved once, ahead of any of them. The socket
-/// is bound afresh per session, so a port-zero `address` is assigned anew
-/// each time and `listening` reports each one, and sessions run
-/// concurrently. A fixed port serves them one after another instead: the
-/// next bind is refused until the session holding the port ends, and the
-/// serve waits that refusal out rather than dying of it.
+/// the bundle is opened and proved once, ahead of any of them. One socket
+/// carries every session (ADR-0031): the listener routes arrivals to
+/// per-session pumps by connection ID, so a fetch's rails reach one fixed
+/// address as concurrent sessions, and `listening` reports the bound
+/// address once.
 ///
 /// # Errors
 /// Surfaces a bundle that will not open, a socket that will not bind, and
@@ -242,21 +270,19 @@ pub fn serve_bundle(
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
 
-    // A bounded count is what lets a test serve one session and return;
-    // without one the command serves until it is stopped. The loop and its
-    // failure policy live in `drive`, under the gate this file is not.
+    // One socket for every session, and the address reported once: a
+    // caller that asked for port zero cannot connect until it knows what
+    // it got. A bounded count is what lets a test serve its sessions and
+    // return; without one the command serves until it is stopped. The
+    // loop and its failure policy live in `drive`, under the gate this
+    // file is not.
+    let listener = Listener::bind(address, &config).map_err(carrier_failure)?;
+    listening(listener.local_address());
     crate::drive::serve_sessions(sessions, || {
-        // `serve` waits for a connection on its own thread, so one
-        // endpoint is one session here.
-        let carrier = Transport::serve(address, &config).map_err(carrier_failure)?;
-        // Reported before the session starts, because a caller that asked
-        // for port zero cannot connect until it knows what it got.
-        listening(carrier.local_address());
-        // A session begun before a client arrives spends its stall budget
-        // on the accept and recycles forever on an idle port. The carrier
-        // parks this thread until it has something a session can react to:
-        // a client's handshake, or the driver ending without one.
-        carrier.wait_arrival();
+        // The accept parks this thread until a client's first packet
+        // names a connection, so a session never spends its stall budget
+        // waiting for one to exist.
+        let carrier = listener.accept().map_err(carrier_failure)?;
         ServeSession::begin(&server, carrier, authentication())
     })?;
     Ok(server.package())
@@ -272,22 +298,40 @@ pub fn fetch_bundle(
     bundle: &Path,
     pin: Option<[u8; 32]>,
 ) -> Result<PackageSummary, Error> {
+    let rails = rails_from(
+        std::env::var(FETCH_RAILS).ok().as_deref(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )?;
+    fetch_railed(address, bundle, pin, rails)
+}
+
+/// The fetch at an explicit width, apart from the environment that picks
+/// one.
+fn fetch_railed(
+    address: SocketAddr,
+    bundle: &Path,
+    pin: Option<[u8; 32]>,
+    rails: usize,
+) -> Result<PackageSummary, Error> {
     let mut config = Config::client(limits()?);
     // ADR-0030: the channel is unauthenticated and says so. A forged
     // server can only serve bytes that fail the proofs the fetch checks.
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
-    let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-        .map_err(carrier_failure)?;
-    let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
+    let connect = || {
+        Transport::connect(local_for(address)?, address, Some("localhost"), &config)
+            .map_err(carrier_failure)
+    };
+    let mut fetcher = BundleFetcher::begin(connect()?, bundle, pin)?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
     }
     // A wire transfer can run for minutes with nothing to look at, and a
     // line per placed quantum is what tells a slow path from a stall. On
     // stderr, so stdout stays the one summary line a script reads. A
-    // fetch smaller than the quantum stays as quiet as today.
+    // fetch smaller than the quantum stays as quiet as today. The placed
+    // count is the shared sink's, so one report covers every rail.
     fetcher.report_placed(
         PROGRESS_QUANTUM_BYTES,
         Box::new(|placed, total| match total {
@@ -295,16 +339,7 @@ pub fn fetch_bundle(
             None => eprintln!("{} MiB", placed >> 20),
         }),
     )?;
-    let status = drive(&mut fetcher)?;
-    match status {
-        crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
-        // The code says what the peer refused, and losing it here would
-        // leave the caller with nothing to tell the difference by.
-        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
-        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-        // `drive` answers only with a settled status.
-        crate::FetchStatus::Active => Err(Error::InvalidBundle),
-    }
+    crate::drive::fetch_striped(fetcher, rails, connect)
 }
 
 #[cfg(test)]
@@ -362,6 +397,86 @@ mod tests {
             config.max_datagram_bytes,
             vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE
         );
+    }
+
+    #[test]
+    fn the_width_is_the_value_given_or_the_machines_own() {
+        // The pin apart from the process environment, like the datagram
+        // test above and for the same race. ADR-0031: default
+        // min(4, available cores), 1 restoring today's shape, bounded by
+        // what the serve drives at once.
+        assert_eq!(rails_from(None, 1).unwrap(), 1);
+        assert_eq!(rails_from(None, 3).unwrap(), 3);
+        assert_eq!(rails_from(None, 4).unwrap(), 4);
+        assert_eq!(rails_from(None, 64).unwrap(), 4, "the default caps at 4");
+        assert_eq!(rails_from(None, 0).unwrap(), 1, "no cores is still one");
+        assert_eq!(
+            rails_from(Some(" 2\n"), 1).unwrap(),
+            2,
+            "given, trimmed, taken"
+        );
+        assert_eq!(
+            rails_from(Some("8"), 1).unwrap(),
+            MAX_FETCH_RAILS,
+            "the bound itself is allowed"
+        );
+        // Zero rails is no fetch, and past the serve bound the excess
+        // rails would hold spans nobody answers; both are refused where
+        // the error names the argument.
+        assert!(rails_from(Some("0"), 4).is_err());
+        assert!(rails_from(Some("9"), 4).is_err());
+        assert!(rails_from(Some("wide"), 4).is_err());
+        assert!(std::env::var(FETCH_RAILS).is_err(), "the suite owns no env");
+    }
+
+    #[test]
+    fn a_fetch_at_width_two_crosses_one_serve_socket() {
+        // ADR-0031 on the wire: two whole sessions from one fetch, one
+        // serve socket, the listener routing both. The object spans more
+        // than one rail's window, so the second rail carries real spans;
+        // the serve is bounded at exactly two sessions, so a fetch that
+        // quietly stayed at width one would strand the bound and fail.
+        let length = 5 * usize::try_from(vot_codec::frames::MAX_REQUESTED_RANGE).unwrap();
+        let source = crate::tests::temporary("railwire-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::noise(length)).unwrap();
+        let bundle = crate::tests::temporary("railwire-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        let (listening, address) = mpsc::channel();
+        let serving_bundle = bundle.clone();
+        let serving = std::thread::spawn(move || {
+            serve_bundle(
+                &serving_bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(2),
+                |at| {
+                    let _ = listening.send(at);
+                },
+            )
+        });
+
+        let at = address.recv().expect("the server reported its address");
+        let fetched = crate::tests::temporary("railwire-fetched");
+        let package = fetch_railed(at, &fetched, Some(built.root), 2).expect("a striped fetch");
+        assert_eq!(package, built);
+        let served = serving.join().expect("the serving thread").expect("served");
+        assert_eq!(served, built);
+        // The striped bytes are the built bytes, object for object.
+        let objects = |root: &Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
+            let mut all: Vec<_> = std::fs::read_dir(root.join("objects"))
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            all.sort();
+            all
+        };
+        assert_eq!(objects(&bundle), objects(&fetched));
+        crate::harness::discard(&[&source, &bundle, &fetched]);
     }
 
     #[test]

@@ -286,6 +286,15 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.receiver.is_verified(subject)
     }
 
+    /// Forgets an incomplete range transfer whose object is whole elsewhere
+    /// (ADR-0031: the shared plan's coverage completes it, not any one
+    /// rail's receiver). The subject stays admitted, so a straggling replay
+    /// drains as a replay rather than ending the session as an unknown
+    /// object. Answers whether there was anything to forget.
+    pub fn abandon(&mut self, subject: SubjectId) -> bool {
+        self.receiver.abandon_ranges(subject)
+    }
+
     /// Whether the receiver's credit reached the backend.
     ///
     /// False on a backend with no dynamic receive credit, which is every one

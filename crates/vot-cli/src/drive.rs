@@ -340,12 +340,39 @@ where
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
 {
     std::thread::scope(|scope| {
-        let mut running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, _>> =
+        let mut running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, _>)> =
             std::collections::VecDeque::new();
+        // Each session announces its own end here, so a wait for a free
+        // slot is a wait for whichever session finishes first. Waiting on
+        // the oldest instead held every accept behind a session whose
+        // client vanished without a close, which settles only at the
+        // carrier's idle timeout: on the rig that stalled a fetch for 29
+        // of its 30-second budget while five settled sessions sat ready
+        // to be reaped.
+        let (ended, endings) = std::sync::mpsc::channel::<u64>();
+        let mut spawned: u64 = 0;
         // The first session's failure, under a bounded serve. Later ones
         // still run to their end: they were accepted, and the joins below
         // are what keeps the report ordered rather than racy.
         let mut failed = Ok(());
+        // Takes one finished session's outcome, waiting for a session to
+        // finish if none has: the channel's senders live exactly as long
+        // as the sessions, so a receive with any session running answers.
+        let reap = |running: &mut std::collections::VecDeque<(
+            u64,
+            std::thread::ScopedJoinHandle<'_, _>,
+        )>,
+                    failed: &mut Result<(), Error>| {
+            let Ok(done) = endings.recv() else {
+                return;
+            };
+            let Some(at) = running.iter().position(|(id, _)| *id == done) else {
+                return;
+            };
+            let (_, handle) = running.remove(at).expect("the position was just found");
+            let settled = handle.join().expect("a session thread never panics");
+            settle_session(sessions, settled, failed);
+        };
         // The bound is an iterator's, so no counter exists for a mutation
         // to stop counting: a bounded serve accepts exactly as many times
         // as the range yields, and an unbounded one is the range that
@@ -355,29 +382,19 @@ where
             // The accept waits here, on this thread, so a factory error is
             // ordered after every session it already handed out.
             let mut accepted = next();
-            // A fixed port frees only when the session holding it ends: the
-            // carrier's drop joins its driver, so after the join below the
+            // A fixed port frees only when a session holding it ends: the
+            // carrier's drop joins its driver, so after the reap below the
             // next bind finds the port released. An accept refused while
-            // sessions still run therefore joins the oldest and asks again,
-            // and each retry shrinks `running`, which bounds this loop by
-            // its own body. A factory failing with nothing left running is
+            // sessions still run therefore reaps one and asks again, and
+            // each retry shrinks `running`, which bounds this loop by its
+            // own body. A factory failing with nothing left running is
             // the endpoint itself, and surfaces below.
             while accepted.is_err() && !running.is_empty() {
-                let settled = running
-                    .pop_front()
-                    .expect("emptiness was just checked")
-                    .join()
-                    .expect("a session thread never panics");
-                settle_session(sessions, settled, &mut failed);
+                reap(&mut running, &mut failed);
                 accepted = next();
             }
             while running.len() >= CONCURRENT_SESSIONS {
-                let settled = running
-                    .pop_front()
-                    .expect("the bound is positive")
-                    .join()
-                    .expect("a session thread never panics");
-                settle_session(sessions, settled, &mut failed);
+                reap(&mut running, &mut failed);
             }
             let mut session = match accepted {
                 Ok(session) => session,
@@ -386,7 +403,19 @@ where
                     return failed.and(Err(error));
                 }
             };
-            running.push_back(scope.spawn(move || drive(&mut session).map(|_| ())));
+            let id = spawned;
+            spawned += 1;
+            let announce = ended.clone();
+            running.push_back((
+                id,
+                scope.spawn(move || {
+                    let settled = drive(&mut session).map(|_| ());
+                    // The announcement is the last thing the thread does,
+                    // so a reaped identifier is always joinable at once.
+                    let _ = announce.send(id);
+                    settled
+                }),
+            ));
         }
         drain(running, sessions, &mut failed);
         failed
@@ -403,13 +432,16 @@ fn turns(sessions: Option<u32>) -> Box<dyn Iterator<Item = ()>> {
 }
 
 /// Joins every running session and folds each outcome into the policy.
+///
+/// Order stops mattering here: everything left must end before the serve
+/// answers, so each join waits for its own session and no other's.
 #[cfg(any(test, feature = "wire"))]
 fn drain<T>(
-    running: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, Result<T, Error>>>,
+    running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, Result<T, Error>>)>,
     sessions: Option<u32>,
     failed: &mut Result<(), Error>,
 ) {
-    for handle in running {
+    for (_, handle) in running {
         let settled = handle
             .join()
             .expect("a session thread never panics")
@@ -663,6 +695,50 @@ mod tests {
         assert_eq!(package, built);
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_slow_session_does_not_hold_the_accepts_behind_it() {
+        // A session whose client vanished without a close settles only at
+        // its carrier's idle timeout. The bound's wait must take whichever
+        // session finishes first, not the oldest: blocked on the oldest,
+        // every later accept waited out that timeout, which stalled a
+        // fetch for 29 of its 30-second budget on the rig. The gate
+        // proves the loop kept accepting: the first session waits at it,
+        // and only the last session accepted can fill it.
+        use crate::harness::{Loopback, Rendezvous, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("slowjoin", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let gate = Rendezvous::expecting(2);
+        let total = u32::try_from(CONCURRENT_SESSIONS).unwrap() + 2;
+        let mut handed = 0_u32;
+        let outcome = serve_sessions(Some(total), || {
+            handed += 1;
+            if handed > total {
+                // Accepting past the bound is a count that stopped
+                // counting; erroring here ends a mutant's run rather
+                // than a runner's timeout.
+                return Err(Error::CarrierUnavailable);
+            }
+            let mut carrier = Loopback::default();
+            if handed == 1 || handed == total {
+                carrier.rendezvous = Some(std::sync::Arc::clone(&gate));
+            }
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            ServeSession::begin(&server, carrier, not_required())
+        });
+        assert_eq!(
+            handed, total,
+            "an accept behind the slow session never happened"
+        );
+        // Every session settled through the drain; what each settled as is
+        // the failure policy's business, already held above.
+        assert!(outcome.is_ok() || outcome.is_err());
+        crate::harness::discard(&[&bundle]);
     }
 
     #[test]

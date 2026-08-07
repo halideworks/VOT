@@ -1,6 +1,6 @@
 # ADR-0032: a fetch resumes from what it already placed
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 

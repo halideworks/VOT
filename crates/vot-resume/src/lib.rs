@@ -92,6 +92,99 @@ impl ResumeStore {
             .map(|object| &object.checkpointed)
     }
 
+    /// Every subject the store holds, in key order.
+    pub fn subjects(&self) -> impl Iterator<Item = SubjectId> + '_ {
+        self.objects.keys().copied()
+    }
+
+    /// Records `units` of `subject` as durable, unioned with what the
+    /// store already holds.
+    ///
+    /// # Errors
+    /// Rejects a subject the store never reserved, a unit count that
+    /// disagrees with the reservation, or units past it.
+    pub fn checkpoint_units(
+        &mut self,
+        subject: SubjectId,
+        total_units: u64,
+        units: &UnitRanges,
+    ) -> Result<(), Error> {
+        self.save_object(subject, total_units, units).map(|_| ())
+    }
+
+    /// Clears a subject's checkpointed units, keeping its reservation.
+    ///
+    /// For a checkpoint whose file no longer exists: the record claims
+    /// durability the disk cannot back, and a later resume seeded from it
+    /// would trust bytes nobody placed. Checkpoints only ever union, so
+    /// clearing needs a snapshot rewrite; a subject with nothing recorded
+    /// is left as it is.
+    ///
+    /// # Errors
+    /// Surfaces the snapshot rewrite's failure.
+    pub fn reset(&mut self, subject: SubjectId) -> Result<(), Error> {
+        let lock = lock_store(&self.path)?;
+        self.refresh_locked()?;
+        let Some(existing) = self.objects.get(&subject) else {
+            drop(lock);
+            return Ok(());
+        };
+        if existing.checkpointed.is_empty() {
+            drop(lock);
+            return Ok(());
+        }
+        let mut candidate = self.objects.clone();
+        candidate.insert(
+            subject,
+            StoredObject {
+                total_units: existing.total_units,
+                checkpointed: UnitRanges::new(),
+            },
+        );
+        Self::compact(&self.path, &candidate)?;
+        self.objects = candidate;
+        self.signature = file_signature(&self.path)?;
+        drop(lock);
+        Ok(())
+    }
+
+    /// Opens the store and makes sure it exists on disk, empty if new.
+    ///
+    /// ADR-0032: the store's presence beside a partial bundle is what
+    /// says the bundle may be continued, so it has to exist from the
+    /// first moment a crash could leave the bundle behind, not from the
+    /// first checkpoint.
+    ///
+    /// # Errors
+    /// Surfaces what [`ResumeStore::open`] or the creating write refuses.
+    pub fn create(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let store = Self::open(path)?;
+        if !store.path.exists() {
+            let lock = lock_store(&store.path)?;
+            Self::compact(&store.path, &store.objects)?;
+            drop(lock);
+        }
+        Self::open(store.path)
+    }
+
+    /// Removes the store and its lock file, for a bundle that is whole:
+    /// a completed bundle looks exactly as one fetched without a store.
+    ///
+    /// # Errors
+    /// Surfaces a file that exists and will not go.
+    pub fn remove(self) -> Result<(), Error> {
+        let lock = lock_path(&self.path)?;
+        let temporary = temporary_path(&self.path)?;
+        for path in [self.path, lock, temporary] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
+        Ok(())
+    }
+
     /// Reserves a batch of immutable objects in one compacted transaction.
     ///
     /// # Errors
@@ -1173,6 +1266,135 @@ mod tests {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(&encode_record(payload).unwrap());
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn checkpoints_accumulate_under_identity_and_subjects_enumerate() {
+        // The public write path a fetch checkpoints through: unions
+        // accumulate across calls and reopens, identity is held to the
+        // reservation, and the subject listing is what lets a caller find
+        // what a store continues without knowing it beforehand.
+        let path = temp_path("accumulate");
+        let _ = fs::remove_file(&path);
+        let mut store = ResumeStore::create(&path).unwrap();
+        store
+            .reserve_many([(subject(0x31), 4), (subject(0x32), 2)])
+            .unwrap();
+        store
+            .checkpoint_units(subject(0x31), 4, &units([0, 2]))
+            .unwrap();
+        store
+            .checkpoint_units(subject(0x31), 4, &units([1]))
+            .unwrap();
+        drop(store);
+        let mut store = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            store.checkpointed(subject(0x31)).unwrap(),
+            &units([0, 1, 2]),
+            "unions accumulate across calls and reopens"
+        );
+        assert_eq!(
+            store.subjects().collect::<Vec<_>>(),
+            vec![subject(0x31), subject(0x32)],
+            "every reserved subject, in key order"
+        );
+        assert!(matches!(
+            store.checkpoint_units(subject(0x31), 5, &units([3])),
+            Err(Error::IdentityMismatch)
+        ));
+        assert!(matches!(
+            store.checkpoint_units(subject(0x33), 4, &units([0])),
+            Err(Error::IdentityMismatch)
+        ));
+        assert!(matches!(
+            store.checkpoint_units(subject(0x31), 4, &units([4])),
+            Err(Error::InvalidUnit)
+        ));
+        store.remove().unwrap();
+    }
+
+    #[test]
+    fn a_reset_clears_the_checkpoint_and_keeps_the_reservation() {
+        // For a checkpoint whose file is gone: the record must shrink,
+        // which only a snapshot rewrite can do, and the reservation must
+        // survive so the object can checkpoint again as it re-fetches.
+        let path = temp_path("reset");
+        let _ = fs::remove_file(&path);
+        let mut store = ResumeStore::create(&path).unwrap();
+        store.reserve_many([(subject(0x41), 4)]).unwrap();
+        store
+            .checkpoint_units(subject(0x41), 4, &units([0, 1, 2, 3]))
+            .unwrap();
+        store.reset(subject(0x41)).unwrap();
+        drop(store);
+        let mut store = ResumeStore::open(&path).unwrap();
+        assert!(
+            store.checkpointed(subject(0x41)).unwrap().is_empty(),
+            "the claim is gone across a reopen"
+        );
+        store
+            .checkpoint_units(subject(0x41), 4, &units([1]))
+            .unwrap();
+        assert_eq!(
+            store.checkpointed(subject(0x41)).unwrap(),
+            &units([1]),
+            "the reservation survived and checkpoints again"
+        );
+        // A subject never reserved, or one with nothing recorded, resets
+        // to exactly what it was.
+        store.reset(subject(0x42)).unwrap();
+        store.reset(subject(0x41)).unwrap();
+        store.reset(subject(0x41)).unwrap();
+        assert!(store.checkpointed(subject(0x41)).unwrap().is_empty());
+        store.remove().unwrap();
+    }
+
+    #[test]
+    fn a_created_store_exists_at_once_and_a_removed_one_is_gone_whole() {
+        // ADR-0032: presence beside a partial bundle is what says the
+        // bundle may be continued, so creation puts the file on disk
+        // before any checkpoint could; removal takes the lock file too,
+        // so a completed bundle looks exactly as one fetched without a
+        // store.
+        let path = temp_path("created");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path).unwrap());
+
+        let store = ResumeStore::create(&path).unwrap();
+        assert!(path.exists(), "created means on disk, empty or not");
+        // Creating over an existing store keeps what it holds.
+        drop(store);
+        let mut store = ResumeStore::create(&path).unwrap();
+        store.reserve_many([(subject(0x21), 4)]).unwrap();
+        drop(store);
+        let store = ResumeStore::create(&path).unwrap();
+        assert!(
+            store.checkpointed(subject(0x21)).is_some(),
+            "creation over an existing store reopened it"
+        );
+
+        store.remove().unwrap();
+        assert!(!path.exists(), "the store is gone");
+        assert!(
+            !lock_path(&path).unwrap().exists(),
+            "and its lock went with it"
+        );
+        // Removing what is already gone is nothing to report.
+        ResumeStore::create(&path).unwrap().remove().unwrap();
+        ResumeStore::open(&path).unwrap().remove().unwrap();
+
+        // A leftover temporary goes too, and a removal that actually
+        // fails says so rather than reporting a store gone that is not.
+        let store = ResumeStore::create(&path).unwrap();
+        fs::create_dir(temporary_path(&path).unwrap()).unwrap();
+        fs::write(temporary_path(&path).unwrap().join("held"), b"x").unwrap();
+        assert!(
+            store.remove().is_err(),
+            "a temporary that will not go is not swallowed"
+        );
+        fs::remove_dir_all(temporary_path(&path).unwrap()).unwrap();
+        ResumeStore::open(&path).unwrap().remove().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -1275,20 +1275,31 @@ fn route(
         ) else {
             continue;
         };
-        if arrived.try_send(transport).is_ok() {
-            routes.insert(
-                route.sibling.clone(),
-                Route {
-                    pump: route.pump.clone(),
-                    done: Arc::clone(&route.done),
-                    sibling: key.clone(),
-                },
-            );
-            routes.insert(key, route);
+        match arrived.try_send(transport) {
+            Ok(()) => {
+                routes.insert(
+                    route.sibling.clone(),
+                    Route {
+                        pump: route.pump.clone(),
+                        done: Arc::clone(&route.done),
+                        sibling: key.clone(),
+                    },
+                );
+                routes.insert(key, route);
+            }
+            Err(refused) => {
+                // The backlog is full, so the connection dies where it was
+                // made; the client's retransmission will find room or the
+                // same answer. The route goes first: its channel is what
+                // the pump waits on, so the pump ends within a tick and
+                // the transport's drop joins it promptly. Dropped the
+                // other way round, the join waits out a close handshake
+                // with this thread not reading the socket, which stalls
+                // every connection the listener carries.
+                drop(route);
+                drop(refused);
+            }
         }
-        // A transport nobody could take is dropped where it was made: the
-        // backlog is full, and the client's retransmission will find room
-        // or the same answer.
     }
 }
 

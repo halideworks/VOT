@@ -90,12 +90,32 @@ pub trait Engine {
 /// Surfaces the engine's own failure, or [`Error::Stalled`] if the loop
 /// made its whole budget of passes without the engine getting anywhere.
 pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
+    // The predicate that never holds, so the loop runs to its settled end.
+    drive_until(engine, |_| false)?.ok_or(Error::Stalled)
+}
+
+/// Drives `engine` until a pass settles it or `done` holds, whichever is
+/// first: the settled status, or `None` for a loop `done` ended.
+///
+/// This is how a fetch grows rails (ADR-0031): the primary is driven here
+/// until its plan exists, the rails are spawned onto that plan, and the
+/// same loop then drives the primary to its end.
+///
+/// # Errors
+/// Surfaces the engine's own failure, or [`Error::Stalled`] as [`drive`].
+pub fn drive_until<E: Engine>(
+    engine: &mut E,
+    mut done: impl FnMut(&E) -> bool,
+) -> Result<Option<E::Status>, Error> {
     let mut stalled_ms: u64 = 0;
     let mut settled_so_far = engine.progress();
     loop {
         let status = engine.service()?;
         if E::settled(status) {
-            return Ok(status);
+            return Ok(Some(status));
+        }
+        if done(engine) {
+            return Ok(None);
         }
         // Every pass waits, including one with a backlog: a backlog is the
         // carrier refusing what this end already prepared, so there is
@@ -121,6 +141,105 @@ pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
         }
         engine.wait(wait);
     }
+}
+
+/// Ends whatever the loop answered as this end's own outcome: the package
+/// for a complete fetch, and the error that names why for anything else.
+#[cfg(any(test, feature = "wire"))]
+fn fetched<A: TransportAdapter>(
+    fetcher: &crate::BundleFetcher<A>,
+    status: crate::FetchStatus,
+) -> Result<crate::PackageSummary, Error> {
+    match status {
+        crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
+        // The code says what the peer refused, and losing it here would
+        // leave the caller with nothing to tell the difference by.
+        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
+        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
+        // The loops above answer only with a settled status.
+        crate::FetchStatus::Active => Err(Error::InvalidBundle),
+    }
+}
+
+/// Fetches at `rails` width: the primary is driven until its plan exists,
+/// every further rail joins that plan on a fresh connection from
+/// `connect`, and the plan striping the requests is what makes W rails
+/// one fetch (ADR-0031).
+///
+/// A rail that fails marks the plan abandoned, so the others end at their
+/// next pass instead of waiting out their stall budgets on spans nobody
+/// will answer; the failure that started it is what surfaces.
+///
+/// # Errors
+/// Rejects a width of zero, and a width past one with inline proving,
+/// which could not pace itself. Surfaces the primary's failure, or the
+/// rail failure that explains a primary that only stalled or stopped.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn fetch_striped<A, F>(
+    mut primary: crate::BundleFetcher<A>,
+    rails: usize,
+    connect: F,
+) -> Result<crate::PackageSummary, Error>
+where
+    A: TransportAdapter + Send,
+    F: Fn() -> Result<A, Error> + Sync,
+{
+    if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
+        return Err(Error::InvalidArguments);
+    }
+    // The manifest is one rail's work; the rest join once it is a plan.
+    if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
+        return fetched(&primary, status);
+    }
+    let Some(plan) = primary.shared_plan() else {
+        return Err(Error::InvalidBundle);
+    };
+    let bundle = primary.bundle().to_owned();
+    let provers = primary.proving_threads();
+    std::thread::scope(|scope| {
+        let mut spawned = Vec::new();
+        for _ in 1..rails {
+            let plan = crate::fetch::SharedPlan::clone(&plan);
+            let connect = &connect;
+            let bundle = bundle.clone();
+            spawned.push(scope.spawn(move || {
+                let outcome = (|| {
+                    let carrier = connect()?;
+                    let mut rail = crate::BundleFetcher::join(carrier, &bundle, plan.clone())?;
+                    rail.set_proving_threads(provers)?;
+                    match drive(&mut rail)? {
+                        crate::FetchStatus::Complete => Ok(()),
+                        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
+                        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
+                        crate::FetchStatus::Active => Err(Error::InvalidBundle),
+                    }
+                })();
+                if outcome.is_err() {
+                    crate::fetch::abandon_plan(&plan);
+                }
+                outcome
+            }));
+        }
+        let outcome = drive(&mut primary).and_then(|status| fetched(&primary, status));
+        if outcome.is_err() {
+            crate::fetch::abandon_plan(&plan);
+        }
+        let mut rail_failure = None;
+        for rail in spawned {
+            if let Err(error) = rail.join().expect("a rail thread never panics") {
+                rail_failure.get_or_insert(error);
+            }
+        }
+        match outcome {
+            Ok(package) => Ok(package),
+            // A primary that stalled or lost its carrier because a rail
+            // died is reported as the rail's failure, which is the cause.
+            Err(Error::Stalled | Error::CarrierUnavailable) => {
+                Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
+            }
+            Err(error) => Err(error),
+        }
+    })
 }
 
 /// The fetch side is an engine: it owns its session, so it is one already.
@@ -191,7 +310,7 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
 /// threads; an accepted client past it is not refused, it waits for a
 /// running session to settle, which is backpressure rather than failure.
 #[cfg(any(test, feature = "wire"))]
-const CONCURRENT_SESSIONS: usize = 8;
+pub(crate) const CONCURRENT_SESSIONS: usize = 8;
 
 /// Serves sessions from `next` until it fails, or `sessions` are answered.
 ///
@@ -491,6 +610,59 @@ mod tests {
         assert_eq!(accepts, 3, "one refusal, retried once, no accept more");
 
         crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn the_width_guard_refuses_what_cannot_pace() {
+        use crate::harness::Loopback;
+
+        // Zero rails is no fetch at all.
+        let output = crate::tests::temporary("widthguard-zero");
+        let fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let outcome = fetch_striped(fetcher, 0, || Err::<Loopback, _>(Error::CarrierUnavailable));
+        assert!(matches!(outcome, Err(Error::InvalidArguments)));
+        crate::harness::discard(&[&output]);
+
+        // Rails past one pace on settled witnesses, which inline proving
+        // never books: the width and the mode are refused together.
+        let output = crate::tests::temporary("widthguard-inline");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_proving_threads(0).unwrap();
+        let outcome = fetch_striped(fetcher, 2, || Err::<Loopback, _>(Error::CarrierUnavailable));
+        assert!(matches!(outcome, Err(Error::InvalidArguments)));
+        crate::harness::discard(&[&output]);
+    }
+
+    #[test]
+    fn one_rail_proving_inline_is_still_a_fetch() {
+        // Width one restores today's shape exactly, inline proving
+        // included; a guard that caught it would take a working
+        // configuration away.
+        use crate::harness::{built_bundle, duplex_pair, not_required, patterned};
+
+        let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
+        let (client, half) = duplex_pair();
+        let serving_bundle = bundle.clone();
+        let serving = std::thread::spawn(move || {
+            let server = crate::BundleServer::open(&serving_bundle)?;
+            let mut half = Some(half);
+            serve_sessions(Some(1), || {
+                half.take()
+                    .map_or(Err(Error::CarrierUnavailable), |carrier| {
+                        ServeSession::begin(&server, carrier, not_required())
+                    })
+            })
+        });
+        let output = crate::tests::temporary("inlinewidth-fetched");
+        let mut fetcher = crate::BundleFetcher::begin(client, &output, None).unwrap();
+        fetcher.set_proving_threads(0).unwrap();
+        let package = fetch_striped(fetcher, 1, || {
+            Err::<crate::harness::Duplex, _>(Error::CarrierUnavailable)
+        })
+        .expect("one rail, no provers, a whole fetch");
+        assert_eq!(package, built);
+        serving.join().expect("the serving thread").expect("served");
+        crate::harness::discard(&[&bundle, &output]);
     }
 
     #[test]

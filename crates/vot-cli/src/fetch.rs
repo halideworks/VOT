@@ -9,7 +9,7 @@
 //! `objects/`. The output is a bundle directory `receive_bundle` consumes
 //! unchanged; nothing about publication is reimplemented here.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,15 +269,23 @@ struct PlannedObject {
 
 /// The objects still owed once the manifest is validated, behind a lock.
 ///
-/// ADR-0031 step 2: the plan is the striping point. It hands out range
-/// requests through [`FetchPlan::next_span`] and [`FetchPlan::take`];
-/// one rail takes from it today exactly as before the split, and W
-/// rails take from the same handout at step 3, which is work stealing
-/// by construction.
-type SharedPlan = Arc<Mutex<FetchPlan>>;
+/// ADR-0031: the plan is the striping point. It hands out range requests
+/// through [`FetchPlan::next_span`] and [`FetchPlan::take`], and W rails
+/// taking from the same handout is work stealing by construction: a slow
+/// rail simply takes fewer.
+pub(crate) type SharedPlan = Arc<Mutex<FetchPlan>>;
+
+/// Marks a plan abandoned, so every rail on it stops at its next pass
+/// rather than waiting out a stall budget on spans nobody will answer.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn abandon_plan(plan: &SharedPlan) {
+    if let Ok(mut plan) = plan.lock() {
+        plan.abandoned = true;
+    }
+}
 
 /// What a [`SharedPlan`] holds.
-struct FetchPlan {
+pub(crate) struct FetchPlan {
     summary: PackageSummary,
     objects: Vec<PlannedObject>,
     current: usize,
@@ -289,31 +297,34 @@ struct FetchPlan {
     placed_before: u64,
     /// Where the current object's next range request starts.
     next_offset: u64,
+    /// Settled extents of the current object, coalesced. Kept by the plan
+    /// rather than any rail's receiver because no one rail sees the whole
+    /// object: the object is done when this covers it (ADR-0031).
+    covered: BTreeMap<u64, u64>,
+    /// Bytes [`FetchPlan::covered`] spans, each counted once however many
+    /// rails a misbehaving server answers with the same range.
+    covered_bytes: u64,
+    /// Raised by the rail that saw the current object whole and is syncing
+    /// it outside this lock, so no second rail syncs or advances over it.
+    syncing: bool,
+    /// Raised by a rail that failed, so the others stop instead of waiting
+    /// out their stall budgets on spans nobody will answer.
+    abandoned: bool,
     finished: bool,
 }
 
 impl FetchPlan {
-    /// The next range a taker would request, uncommitted.
-    ///
-    /// What has been asked for and not yet placed is the measure, so an
-    /// object of any length is asked for a couple of covers at a time
-    /// however fast the taker can build the frames, and a slow taker
-    /// simply takes fewer.
+    /// The next range a taker would request, uncommitted and unpaced: how
+    /// much a rail may have outstanding is the rail's own account.
     fn next_span(&self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
-        let Some(sink) = self.active.as_ref() else {
+        if self.active.is_none() {
             return Ok(None);
-        };
-        // Everything asked for that has not arrived, which is what the
-        // peer and this end's receiver are holding between them.
-        let placed = sink.placed();
+        }
         let object = self
             .objects
             .get(self.current)
             .ok_or(Error::InvalidBundle)?
             .object;
-        if self.next_offset.saturating_sub(placed) >= OUTSTANDING_REQUEST_BYTES {
-            return Ok(None);
-        }
         Ok(range_span(self.next_offset, object.length)
             .map(|(offset, length)| (object, offset, length)))
     }
@@ -326,6 +337,44 @@ impl FetchPlan {
     fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
         self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
         Ok(())
+    }
+
+    /// Books a settled cover into the current object's coverage.
+    ///
+    /// Coalescing counts every byte once, so a server that answers two
+    /// rails with the same range cannot complete an object it left a hole
+    /// in: the bytes are identical either way, proved against the root,
+    /// but only coverage of every offset is completion.
+    fn cover(&mut self, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let Some(mut end) = offset.checked_add(length) else {
+            return;
+        };
+        let mut start = offset;
+        let mut absorbed: u64 = 0;
+        // Walked right to left from the last extent starting at or before
+        // `end`; everything that reaches back to `start` merges, and the
+        // first extent that falls short ends the walk, extents being
+        // disjoint and sorted.
+        let overlapping: Vec<(u64, u64)> = self
+            .covered
+            .range(..=end)
+            .rev()
+            .take_while(|(at, len)| at.saturating_add(**len) >= start)
+            .map(|(at, len)| (*at, *len))
+            .collect();
+        for (at, len) in overlapping {
+            self.covered.remove(&at);
+            absorbed = absorbed.saturating_add(len);
+            start = start.min(at);
+            end = end.max(at.saturating_add(len));
+        }
+        self.covered.insert(start, end - start);
+        self.covered_bytes = self
+            .covered_bytes
+            .saturating_add((end - start).saturating_sub(absorbed));
     }
 }
 
@@ -343,6 +392,24 @@ pub struct BundleFetcher<A: TransportAdapter> {
     spans: Vec<(u64, u64)>,
     next_span: usize,
     plan: Option<SharedPlan>,
+    /// Whether this fetcher is a rail joined to another fetch's plan: it
+    /// reads the announcement and requests ranges, and the manifest is the
+    /// primary's work alone (ADR-0031).
+    secondary: bool,
+    /// The object this rail has admitted to its own receiver, by plan
+    /// index. Admission is per rail; the plan cannot do it.
+    admitted: Option<(usize, SubjectId)>,
+    /// Range bytes this rail has committed to spans, only ever going up.
+    taken_bytes: u64,
+    /// Range bytes this rail has settled witnesses for, only ever going
+    /// up. The distance between the two is this rail's outstanding, which
+    /// is what paces its requests: pacing on the shared sink would let one
+    /// rail ask past its own receiver's budgets on the others' arrivals.
+    settled_bytes: u64,
+    /// The most this rail keeps outstanding:
+    /// [`OUTSTANDING_REQUEST_BYTES`] always, narrowed only by tests so a
+    /// small object stripes without a window's worth of data.
+    window_bytes: u64,
     pending: VecDeque<Vec<u8>>,
     next_request: u64,
     closed: Option<u16>,
@@ -472,6 +539,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// # Errors
     /// Surfaces a deferred bound the receiver refuses.
     pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
+        if self.secondary && threads == 0 {
+            // A rail paces on settled witnesses, and inline proving books
+            // none: it would take its window and never earn it back.
+            return Err(Error::InvalidArguments);
+        }
         self.proving_threads = threads;
         self.receiver.defer_proving(threads > 0);
         if threads > 0 {
@@ -531,6 +603,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             spans: Vec::new(),
             next_span: 0,
             plan: None,
+            secondary: false,
+            admitted: None,
+            taken_bytes: 0,
+            settled_bytes: 0,
+            window_bytes: OUTSTANDING_REQUEST_BYTES,
             pending: VecDeque::new(),
             next_request: 0,
             closed: None,
@@ -548,6 +625,73 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(fetcher)
     }
 
+    /// Opens a rail onto a fetch already planned: a whole session against
+    /// the same server, striping range requests over the shared plan into
+    /// the shared sink (ADR-0031).
+    ///
+    /// The rail pins the plan's package root, so a server answering for
+    /// anything else is refused the way a pinned fetch refuses it. The
+    /// manifest is not fetched again in full: the rail reads the
+    /// announcement and requests ranges, nothing else.
+    ///
+    /// # Errors
+    /// Surfaces a session that could not begin, and a receiver that
+    /// refuses its bounds.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn join(adapter: A, bundle: &Path, plan: SharedPlan) -> Result<Self, Error> {
+        let root = plan.lock().map_err(|_| Error::InvalidBundle)?.summary.root;
+        let mut session = Session::client(
+            adapter,
+            Settings::default(),
+            BTreeSet::new(),
+            // The client ignores the nonce; it is the server's freshness.
+            Authentication::NotRequired { nonce: [0; 32] },
+        );
+        session.begin()?;
+        let receiver =
+            ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
+        let mut receiver = SessionReceiver::new(session, receiver);
+        // The same pipeline budgets as the primary: each rail carries the
+        // whole depth on its own session (ADR-0031).
+        receiver.set_pending_limits(
+            OUTSTANDING_COVERS,
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
+        )?;
+        receiver.set_orphan_limits(
+            OUTSTANDING_COVERS,
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES,
+        )?;
+        let mut fetcher = Self {
+            receiver,
+            bundle: bundle.to_owned(),
+            pin: Some(root),
+            descriptor: None,
+            seal_bytes: None,
+            page_digests: Vec::new(),
+            pages_received: 0,
+            spans: Vec::new(),
+            next_span: 0,
+            plan: Some(plan),
+            secondary: true,
+            admitted: None,
+            taken_bytes: 0,
+            settled_bytes: 0,
+            window_bytes: OUTSTANDING_REQUEST_BYTES,
+            pending: VecDeque::new(),
+            next_request: 0,
+            closed: None,
+            disconnected: false,
+            stopped: false,
+            progress: 0,
+            pool: None,
+            proving_threads: 0,
+            prover_wait: PROVER_WAIT,
+            placed_report: None,
+        };
+        fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
+        Ok(fetcher)
+    }
+
     /// The validated package, once the manifest has been.
     #[must_use]
     pub fn package(&self) -> Option<PackageSummary> {
@@ -557,6 +701,25 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// The session under the fetch, for the loop that waits on its carrier.
     pub fn session_mut(&mut self) -> &mut Session<A> {
         self.receiver.session_mut()
+    }
+
+    /// The plan this fetch stripes over, once the manifest has settled it,
+    /// which is what a rail joins (ADR-0031).
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn shared_plan(&self) -> Option<SharedPlan> {
+        self.plan.clone()
+    }
+
+    /// The bundle directory this fetch writes.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+
+    /// How many provers this fetch runs.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) const fn proving_threads(&self) -> usize {
+        self.proving_threads
     }
 
     /// Everything this end has settled, only ever going up: frames taken,
@@ -661,6 +824,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // pass rather than only the one that saw it go.
             return Ok(FetchStatus::Disconnected);
         }
+        if self.locked_plan().is_some_and(|plan| plan.abandoned) {
+            // Another rail failed, so the spans it took will never arrive
+            // and the plan cannot finish: ending now is what spares every
+            // remaining rail its whole stall budget (ADR-0031).
+            self.stop();
+            return Ok(FetchStatus::Disconnected);
+        }
         self.drain()?;
         loop {
             match self.receiver.poll() {
@@ -749,22 +919,26 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Handed over while there is room, so what is out with a prover is a
         // few covers rather than an object.
         while pool.has_room() {
-            let Some(sink) = self.locked_plan().and_then(|plan| plan.active.clone()) else {
+            // The sink and the subject it is for, under one hold of the
+            // lock: taken apart, another rail can advance the plan between
+            // the two and the pair no longer describes one object.
+            let Some((sink, subject)) = self.locked_plan().and_then(|plan| {
+                let sink = plan.active.clone()?;
+                let subject = plan.objects.get(plan.current).map(subject_of)?;
+                Some((sink, subject))
+            }) else {
                 break;
             };
             let Some(completed) = self.receiver.take_completed() else {
                 break;
             };
-            // The sink is the active object's because admitted-and-not-
-            // verified is the object being fetched: the receiver holds
-            // covers for verified subjects back from this handover, and the
-            // fetch admits one object at a time. Named here because the
-            // sink is chosen by that coupling.
-            debug_assert_eq!(
-                Some(completed.subject()),
-                self.locked_plan()
-                    .and_then(|plan| plan.objects.get(plan.current).map(subject_of))
-            );
+            if completed.subject() != subject {
+                // A cover for an object the plan has already left behind:
+                // the plan only advances over complete coverage, so every
+                // byte it names is settled and it is a duplicate. Dropped,
+                // because the active sink is another object's file.
+                continue;
+            }
             if pool.work.try_send(Proving { completed, sink }).is_err() {
                 break;
             }
@@ -802,6 +976,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                         break;
                     }
                     pool.witnesses = pool.witnesses.saturating_add(1);
+                    let bundle = proved.completed.bundle();
+                    // Earned back against this rail's window: what was
+                    // taken is settled, so the next span may be asked for.
+                    self.settled_bytes = self.settled_bytes.saturating_add(bundle.covered_length);
+                    // And booked into the shared coverage, which is what
+                    // completes the object (ADR-0031). The subject check
+                    // keeps a straggling replay of a finished object out
+                    // of the current one's account.
+                    if let Some(mut plan) = self.locked_plan() {
+                        if plan.objects.get(plan.current).map(subject_of)
+                            == Some(proved.completed.subject())
+                        {
+                            plan.cover(bundle.covered_offset, bundle.covered_length);
+                        }
+                    }
                 }
                 Err(error) => {
                     outcome = Err(error);
@@ -939,6 +1128,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if !package_matches {
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
+        if self.secondary {
+            // A rail has the manifest already, through the plan it joined:
+            // the announcement was held to the pin and the descriptor, and
+            // nothing further is asked for (ADR-0031).
+            self.seal_bytes = Some(seal_bytes);
+            return Ok(());
+        }
         self.page_digests = crate::seal_page_digests(&seal)
             .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
         self.spans = manifest_spans(seal.final_page_count);
@@ -975,6 +1171,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     fn take_page(&mut self, page_bytes: &[u8]) -> Result<(), Fault> {
+        if self.secondary {
+            // A page this rail never asked for; the manifest on disk is
+            // the primary's and already validated.
+            return Ok(());
+        }
         if self.seal_bytes.is_none() {
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
         }
@@ -1058,20 +1259,34 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             active: None,
             placed_before: 0,
             next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
             finished: false,
         })));
         Ok(())
     }
 
-    /// Moves the object plan forward: a verified object is synced and left
+    /// Moves the object plan forward: a covered object is synced and left
     /// behind, the next one is admitted and its ranges requested, and the
     /// last one seals the bundle with a directory sync.
+    ///
+    /// Every rail runs this over the shared plan. Admission and
+    /// abandonment are this rail's own; the transition belongs to
+    /// whichever rail sees the coverage whole first, and `syncing` keeps
+    /// the file work outside the lock without a second rail repeating it.
     fn advance(&mut self) -> Result<(), Error> {
         // The handle apart from self, so the receiver and the bundle stay
         // reachable while the plan is held under its lock.
         let Some(shared) = self.plan.clone() else {
             return Ok(());
         };
+        if self.secondary && self.descriptor.is_none() {
+            // A rail admits and asks only once the server has answered
+            // for the pinned package.
+            return Ok(());
+        }
         // Counted by the plan itself: every pass either returns or leaves
         // one more object behind, so needing more passes than the plan
         // names objects means the cursor is not moving.
@@ -1082,24 +1297,62 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .len();
         for _ in 0..=objects {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            if let Some(sink) = &plan.active {
+            // What this rail still holds for an object the plan has left
+            // behind is a partial account of an object already whole on
+            // disk: forgotten, so the receiver is bounded by what is being
+            // fetched rather than everything this rail ever touched.
+            if let Some((index, subject)) = self.admitted {
+                if index != plan.current {
+                    if !self.receiver.is_verified(subject) {
+                        self.receiver.abandon(subject);
+                    }
+                    self.admitted = None;
+                }
+            }
+            if let Some(sink) = plan.active.clone() {
                 let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
-                if !self.receiver.is_verified(subject_of(planned)) {
+                let subject = subject_of(planned);
+                let length = planned.object.length;
+                if self.admitted != Some((plan.current, subject)) {
+                    self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
+                    self.admitted = Some((plan.current, subject));
+                }
+                // Complete when the shared coverage spans the object; this
+                // rail's own receiver saying so is the same fact stated
+                // for the fetch every cover went through one receiver.
+                let whole = plan.covered_bytes == length || self.receiver.is_verified(subject);
+                if !whole || plan.syncing {
                     return Ok(());
                 }
                 // Durable before the fetch moves on, so a completed fetch
                 // never names bytes that were only in the page cache.
-                sink.file.file().sync_all()?;
-                let placed = sink.placed();
-                plan.placed_before = plan.placed_before.saturating_add(placed);
+                // Synced outside the lock: the other rails keep booking
+                // and asking while the file flushes.
+                plan.syncing = true;
+                drop(plan);
+                let synced = sink.file.file().sync_all();
+                let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.syncing = false;
+                synced?;
+                plan.placed_before = plan.placed_before.saturating_add(length);
                 plan.active = None;
+                plan.covered.clear();
+                plan.covered_bytes = 0;
                 plan.current += 1;
+                continue;
             }
             if plan.current == plan.objects.len() {
-                if !plan.finished {
-                    crate::sync_directories(&self.bundle)?;
-                    plan.finished = true;
+                if plan.finished || plan.syncing {
+                    return Ok(());
                 }
+                // The seal on the bundle, outside the lock like any sync.
+                plan.syncing = true;
+                drop(plan);
+                let synced = crate::sync_directories(&self.bundle);
+                let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.syncing = false;
+                synced?;
+                plan.finished = true;
                 return Ok(());
             }
             let planned = &plan.objects[plan.current];
@@ -1109,6 +1362,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 .join(crate::object_name(&planned.object.root));
             if planned.object.length == 0 {
                 // Nothing to fetch or verify; the empty object simply is.
+                // The lock is held, so exactly one rail writes it.
                 crate::write_new_synced(&path, &[])?;
                 plan.current += 1;
                 continue;
@@ -1116,11 +1370,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let subject = subject_of(planned);
             let sink = Arc::new(CountingSink::create(&path, planned.object.length)?);
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
+            self.admitted = Some((plan.current, subject));
             plan.active = Some(sink);
             plan.next_offset = 0;
             // Released before the requests are issued: the handout takes
-            // the same lock, and holding it here would deadlock the one
-            // thread the fetch has today.
+            // the same lock, and holding it here would deadlock this
+            // rail's own thread.
             drop(plan);
             self.issue_ranges()?;
             return Ok(());
@@ -1128,21 +1383,40 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Err(Error::InvalidBundle)
     }
 
-    /// Asks for as much of the object as may be outstanding at once.
+    /// Asks for as much of the object as this rail may have outstanding.
     ///
     /// The spans come from the plan's handout; this rail turns each into
     /// a request frame of its own, and commits the span only once its
     /// frame is queued, so a failure between the two leaves the span
     /// owed rather than consumed. The lock is held across the pair,
     /// which is what keeps two takers from framing the same span.
+    ///
+    /// What has been taken and not yet settled is the pace, per rail:
+    /// each session advertises its own credit and holds its own budgets,
+    /// so a rail asking on the strength of another's arrivals would ask
+    /// past what its receiver can hold. With provers, settled witnesses
+    /// are the account; proving inline, the sink is this rail's alone
+    /// (a rail cannot prove inline) and what it placed is the same fact.
     fn issue_ranges(&mut self) -> Result<(), Error> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
         };
+        if self.secondary && self.descriptor.is_none() {
+            return Ok(());
+        }
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
         for _ in 0..OUTSTANDING_COVERS {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+            let outstanding = if self.proving_threads == 0 {
+                plan.next_offset
+                    .saturating_sub(plan.active.as_ref().map_or(0, |sink| sink.placed()))
+            } else {
+                self.taken_bytes.saturating_sub(self.settled_bytes)
+            };
+            if outstanding >= self.window_bytes {
+                return Ok(());
+            }
             let Some((object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
@@ -1157,6 +1431,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }),
             )?;
             plan.take(offset, length)?;
+            self.taken_bytes = self.taken_bytes.saturating_add(length);
             self.progress = self.progress.saturating_add(1);
         }
         Ok(())
@@ -1346,6 +1621,389 @@ mod tests {
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
         discard(&[&source, &bundle, &output, &destination, &receipt]);
+    }
+
+    /// Rounds one rail until its plan exists, which is where rails join.
+    fn planned(
+        server: &BundleServer,
+        session: &mut Session<Loopback>,
+        connection: &mut ServeConnection,
+        fetcher: &mut BundleFetcher<Loopback>,
+    ) -> SharedPlan {
+        let mut sequence = 0;
+        for _ in 0..ROUND_BUDGET {
+            round(server, session, connection, fetcher, &mut sequence);
+            if let Some(plan) = fetcher.plan.clone() {
+                return plan;
+            }
+        }
+        panic!("the fetch never planned");
+    }
+
+    #[test]
+    fn two_rails_stripe_one_object_over_a_shared_plan() {
+        // The ADR's step-3 sim test: two whole sessions against one
+        // server, striping one object's spans over the shared plan into
+        // the shared sink, pumps interleaved so the handout is
+        // deterministic. The primary's window is narrowed to one span so
+        // a two-span object stripes: the primary takes its window in its
+        // first pass, the second rail takes exactly the span left over,
+        // which is work stealing doing the striping. Narrow rather than
+        // large because this test rides every mutant of the crate, and a
+        // window's worth of data per run is most of the suite's time.
+        let length = 2 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
+        let (bundle, built) = built_bundle("striped", &[("big.bin", patterned(length))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut session1 = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            crate::harness::not_required(),
+        );
+        session1.begin().unwrap();
+        let mut connection1 = ServeConnection::new();
+        let mut session2 = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            crate::harness::not_required(),
+        );
+        session2.begin().unwrap();
+        let mut connection2 = ServeConnection::new();
+
+        let output = temporary("striped-fetched");
+        let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        primary.window_bytes = MAX_REQUESTED_RANGE;
+        let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
+        let mut secondary =
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+
+        let (mut seq1, mut seq2) = (0, 0);
+        // The rail is handshaken, announced, and admitted before the
+        // primary settles anything, so the handout is deterministic: the
+        // primary's whole window is already out, and the rail's first ask
+        // takes the one span that remains.
+        for _ in 0..ROUND_BUDGET {
+            round(
+                &server,
+                &mut session2,
+                &mut connection2,
+                &mut secondary,
+                &mut seq2,
+            );
+            if secondary.taken_bytes > 0 {
+                break;
+            }
+        }
+        let mut settled = false;
+        for _ in 0..ROUND_BUDGET {
+            let one = round(
+                &server,
+                &mut session1,
+                &mut connection1,
+                &mut primary,
+                &mut seq1,
+            );
+            let two = round(
+                &server,
+                &mut session2,
+                &mut connection2,
+                &mut secondary,
+                &mut seq2,
+            );
+            if one == FetchStatus::Complete && two == FetchStatus::Complete {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the rails never finished the fetch");
+        // The handout striped: the primary filled its narrowed window, and
+        // the rail took exactly the object's last span from the same plan.
+        assert_eq!(primary.taken_bytes, MAX_REQUESTED_RANGE);
+        assert_eq!(secondary.taken_bytes, MAX_REQUESTED_RANGE);
+        assert!(!primary.has_backlog());
+        assert!(!secondary.has_backlog());
+        assert_eq!(primary.package(), Some(built));
+        assert_eq!(secondary.package(), Some(built));
+        assert_same_tree(&bundle, &output);
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn an_abandoned_plan_ends_every_rail_without_its_stall_budget() {
+        // A rail that fails marks the plan, and the others end at their
+        // next pass: waiting out a stall budget per rail would turn one
+        // dead rail into half a minute of silence for each of the rest.
+        let (bundle, _) = built_bundle("abandoned", &[("big.bin", patterned(8_500_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("abandoned-fetched");
+        let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let plan = planned(&server, &mut session, &mut connection, &mut primary);
+        let mut secondary =
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+
+        abandon_plan(&plan);
+        assert_eq!(primary.service().unwrap(), FetchStatus::Disconnected);
+        assert!(!primary.has_backlog(), "an ended rail owes nothing");
+        assert_eq!(secondary.service().unwrap(), FetchStatus::Disconnected);
+        assert!(!secondary.has_backlog());
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_rail_paces_itself_and_refuses_inline_proving() {
+        // A rail's window is its own account (the shared sink fills with
+        // every rail's arrivals), and proving inline would never earn the
+        // window back: the wiring that keeps both is the join itself.
+        let (bundle, _) = built_bundle("railpace", &[("a.txt", patterned(1000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("railpace-fetched");
+        let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let plan = planned(&server, &mut session, &mut connection, &mut primary);
+        let mut secondary =
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+        assert!(secondary.secondary, "a joined fetcher is a rail");
+        assert_eq!(
+            secondary.pin,
+            Some(server.package().root),
+            "the rail pins the plan's package"
+        );
+        assert!(
+            secondary.set_proving_threads(0).is_err(),
+            "a rail cannot prove inline"
+        );
+        assert!(
+            secondary.set_proving_threads(2).is_ok(),
+            "a narrower pool is the rail's to choose"
+        );
+        // The rail's budgets are the pipeline depth in whole bundles, byte
+        // for byte, exactly as the primary's: a sum where a product
+        // belongs is one bundle wide and fails a conforming transfer.
+        assert_eq!(
+            secondary.receiver.pending_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+        );
+        assert_eq!(
+            secondary.receiver.orphan_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
+        );
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_rail_forgets_the_object_the_plan_moved_past() {
+        // A rail admits the current object to its own receiver; when the
+        // plan moves past one the rail only partly received, the partial
+        // account is forgotten, or the receiver holds a reservation per
+        // object it ever touched.
+        let output = temporary("railforget");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let first = PlannedObject {
+            object: frames::ObjectId {
+                suite: 1,
+                root: [1; 32],
+                length: 1000,
+            },
+        };
+        let second = PlannedObject {
+            object: frames::ObjectId {
+                suite: 1,
+                root: [2; 32],
+                length: 2000,
+            },
+        };
+        let (s0, s1) = (subject_of(&first), subject_of(&second));
+        let sink0 = Arc::new(
+            CountingSink::create(&output.join("objects").join("a.obj"), first.object.length)
+                .unwrap(),
+        );
+        let sink1 = Arc::new(
+            CountingSink::create(&output.join("objects").join("b.obj"), second.object.length)
+                .unwrap(),
+        );
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: vec![first, second],
+            current: 0,
+            active: Some(sink0),
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            finished: false,
+        })));
+        fetcher.advance().unwrap();
+        assert_eq!(
+            fetcher.admitted,
+            Some((0, s0)),
+            "the first object is this rail's"
+        );
+
+        // Another rail saw the first object whole and moved the plan on.
+        {
+            let mut plan = fetcher.locked_plan().unwrap();
+            plan.current = 1;
+            plan.active = Some(sink1);
+        }
+        fetcher.advance().unwrap();
+        assert_eq!(
+            fetcher.admitted,
+            Some((1, s1)),
+            "the current object is admitted"
+        );
+        assert!(
+            !fetcher.receiver.abandon(s0),
+            "the partial first object was already forgotten"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    fn a_finished_plan_is_left_exactly_as_it_is() {
+        // A pass over a finished plan changes nothing and touches no file:
+        // re-running the closing directory sync would make every pass
+        // after completion an I/O ritual, and here the directory is gone
+        // to prove nothing reaches for it.
+        let output = temporary("finished-left");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: Vec::new(),
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            finished: true,
+        })));
+        fs::remove_dir_all(&output).unwrap();
+        fetcher.advance().unwrap();
+        assert!(fetcher.complete());
+    }
+
+    #[test]
+    fn coverage_counts_every_byte_once() {
+        // The object completes when the plan's coverage spans it, and the
+        // plan cannot trust any rail's receiver to have seen the whole
+        // object. Coalescing counts a byte once however it arrives, so a
+        // server answering two rails with the same range cannot complete
+        // an object it left a hole in.
+        let mut plan = FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: Vec::new(),
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            finished: false,
+        };
+        plan.cover(0, 10);
+        assert_eq!(plan.covered_bytes, 10);
+        plan.cover(5, 10);
+        assert_eq!(plan.covered_bytes, 15, "the overlap counts once");
+        plan.cover(5, 5);
+        assert_eq!(plan.covered_bytes, 15, "a duplicate counts never");
+        plan.cover(20, 5);
+        assert_eq!(plan.covered_bytes, 20, "a gap stays a gap");
+        plan.cover(15, 5);
+        assert_eq!(plan.covered_bytes, 25, "the gap filled exactly");
+        assert_eq!(
+            plan.covered.iter().collect::<Vec<_>>(),
+            vec![(&0, &25)],
+            "adjacent extents coalesce to one"
+        );
+        plan.cover(0, 25);
+        assert_eq!(plan.covered_bytes, 25, "the whole again changes nothing");
+        plan.cover(30, 0);
+        assert_eq!(plan.covered_bytes, 25, "an empty cover covers nothing");
+        plan.cover(u64::MAX, 2);
+        assert_eq!(plan.covered_bytes, 25, "an overflowing cover is refused");
+    }
+
+    #[test]
+    fn a_striped_fetch_over_threads_completes_and_spawns_its_rails() {
+        // The whole arrangement with real concurrency: the primary is
+        // driven until its plan exists, one rail joins over its own
+        // session, the server serves both sessions at once, and the
+        // fetched tree is the built tree. The connect count pins that the
+        // rail was actually spawned: a fetch that quietly completed at
+        // width one would pass every other assertion here.
+        use std::sync::Condvar;
+        use std::sync::atomic::AtomicUsize;
+
+        type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
+
+        // Small on purpose: the striping distribution is the interleaved
+        // test's subject, and this one rides every mutant of the crate.
+        let (bundle, built) = built_bundle("threaded", &[("big.bin", patterned(300_000))]);
+        let output = temporary("threaded-fetched");
+        let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let serving_halves = Arc::clone(&halves);
+        let serving_bundle = bundle.clone();
+        let serving = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            crate::drive::serve_sessions(Some(2), || {
+                let (queue, arrived) = &*serving_halves;
+                let queue = queue.lock().expect("the accept queue");
+                // Bounded, so a fetch that never spawned its rail fails
+                // this thread rather than hanging the suite on its join.
+                let (mut queue, waited) = arrived
+                    .wait_timeout_while(queue, std::time::Duration::from_secs(20), |waiting| {
+                        waiting.is_empty()
+                    })
+                    .expect("the accept queue");
+                if waited.timed_out() {
+                    return Err(Error::CarrierUnavailable);
+                }
+                let carrier = queue.pop_front().expect("the wait held until one came");
+                crate::drive::ServeSession::begin(&server, carrier, crate::harness::not_required())
+            })
+        });
+
+        let connects = AtomicUsize::new(0);
+        let connect = || {
+            connects.fetch_add(1, Ordering::Relaxed);
+            let (client, serving) = crate::harness::duplex_pair();
+            let (queue, arrived) = &*halves;
+            queue.lock().expect("the accept queue").push_back(serving);
+            arrived.notify_all();
+            Ok(client)
+        };
+        let fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        let package = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
+        assert_eq!(package, built);
+        assert_eq!(
+            connects.load(Ordering::Relaxed),
+            2,
+            "width two is the primary and exactly one spawned rail"
+        );
+        assert_same_tree(&bundle, &output);
+        serving
+            .join()
+            .expect("the serving thread")
+            .expect("both sessions served");
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1748,6 +2406,10 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
             finished: false,
         })));
         fetcher.advance().unwrap();
@@ -2254,6 +2916,10 @@ mod tests {
             active: Some(Arc::clone(&sink)),
             placed_before: 0,
             next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
             finished: false,
         })));
 
@@ -2268,13 +2934,17 @@ mod tests {
             "asked for more than may be outstanding"
         );
 
-        // What the sink places is what buys the next request.
+        // What this rail settles is what buys its next request: the pace
+        // is per rail, because each session advertises its own credit and
+        // holds its own budgets, and asking on the strength of another
+        // rail's arrivals would ask past both.
         sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        fetcher.settled_bytes = MAX_REQUESTED_RANGE;
         fetcher.issue_ranges().unwrap();
         assert_eq!(
             fetcher.locked_plan().unwrap().next_offset,
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
-            "a placed cover did not buy the next request"
+            "a settled cover did not buy the next request"
         );
         // And placing counts as progress, which is what keeps a driving
         // loop from giving up on a transfer that is arriving.
@@ -2284,8 +2954,7 @@ mod tests {
         // between the handout and the frame leaves the span owed. At one
         // rail this ends the fetch either way; at W rails a span consumed
         // by a failed frame would be a hole nobody ever re-requests.
-        sink.placed
-            .store(2 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        fetcher.settled_bytes = 2 * MAX_REQUESTED_RANGE;
         let owed = fetcher.locked_plan().unwrap().next_offset;
         fetcher.next_request = u64::MAX;
         assert!(
@@ -2296,6 +2965,31 @@ mod tests {
             fetcher.locked_plan().unwrap().next_offset,
             owed,
             "a span whose frame never queued was consumed"
+        );
+
+        // The shared sink is not this rail's account: every rail's
+        // arrivals land there, and a rail asking on their strength would
+        // ask past its own receiver's budgets. With this rail's window
+        // exactly full, no amount placed buys it a span.
+        fetcher.next_request = 0;
+        fetcher.settled_bytes = MAX_REQUESTED_RANGE;
+        sink.placed
+            .store(40 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        fetcher.issue_ranges().unwrap();
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            owed,
+            "the shared sink paid for a rail's spans"
+        );
+
+        // Proving inline there are no witnesses and no other rails, so
+        // what the sink placed is the same account and the pace.
+        fetcher.set_proving_threads(0).unwrap();
+        fetcher.issue_ranges().unwrap();
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            owed + OUTSTANDING_REQUEST_BYTES,
+            "an inline fetch paces on what its own sink placed"
         );
 
         discard(&[&bundle, &output]);

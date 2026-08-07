@@ -591,6 +591,23 @@ impl ReliableReceiver {
         Ok(())
     }
 
+    /// Forgets an incomplete range transfer, releasing what it reserved.
+    ///
+    /// ADR-0031: W rails fetch one object through W receivers, and the
+    /// object completes when the shared plan's coverage does, so a rail's
+    /// own receiver is left holding a partial extent map for an object that
+    /// is already whole on disk. Dropping that state is what bounds a rail's
+    /// receiver by the objects it is fetching rather than by every object it
+    /// ever touched. Answers whether there was anything to forget; a
+    /// verified subject stays verified.
+    pub fn abandon_ranges(&mut self, subject: SubjectId) -> bool {
+        if self.range_active.remove(&subject).is_none() {
+            return false;
+        }
+        self.staging.release(VERIFIER_RESERVATION);
+        true
+    }
+
     /// # Errors
     /// Rejects oversized records, unknown objects, bounds violations, or hash errors.
     pub fn receive(&mut self, subject: SubjectId, record: &[u8]) -> Result<(), Error> {
@@ -1094,6 +1111,36 @@ mod tests {
             ranged.begin_ranges(object, Box::new(DiscardSink)),
             Err(Error::AlreadyReceiving)
         );
+    }
+
+    #[test]
+    fn an_abandoned_range_transfer_releases_its_room_and_can_begin_again() {
+        // ADR-0031: a rail abandons an object the shared plan completed
+        // elsewhere. The reservation has to come back, or a rail's receiver
+        // is bounded by every object it ever touched rather than the ones it
+        // is fetching; the room is sized to hold exactly one transfer so the
+        // release is what admits the next.
+        let object = subject(b"abandoned");
+        let other = subject(b"another");
+        let mut receiver =
+            ReliableReceiver::new(VERIFIER_RESERVATION, 1, VERIFIER_RESERVATION).unwrap();
+        assert!(!receiver.abandon_ranges(object), "nothing to forget yet");
+        receiver
+            .begin_ranges(object, Box::new(DiscardSink))
+            .unwrap();
+        assert!(
+            receiver.begin_ranges(other, Box::new(DiscardSink)).is_err(),
+            "the one reservation of room is held"
+        );
+        assert!(receiver.abandon_ranges(object));
+        assert!(!receiver.abandon_ranges(object), "forgotten once");
+        receiver.begin_ranges(other, Box::new(DiscardSink)).unwrap();
+        // The forgotten subject may begin again: abandoning is not a verdict
+        // on the object, only on this receiver's part in it.
+        receiver.abandon_ranges(other);
+        receiver
+            .begin_ranges(object, Box::new(DiscardSink))
+            .unwrap();
     }
 
     #[test]

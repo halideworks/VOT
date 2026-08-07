@@ -286,6 +286,15 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.receiver.is_verified(subject)
     }
 
+    /// Forgets an incomplete range transfer whose object is whole elsewhere
+    /// (ADR-0031: the shared plan's coverage completes it, not any one
+    /// rail's receiver). The subject stays admitted, so a straggling replay
+    /// drains as a replay rather than ending the session as an unknown
+    /// object. Answers whether there was anything to forget.
+    pub fn abandon(&mut self, subject: SubjectId) -> bool {
+        self.receiver.abandon_ranges(subject)
+    }
+
     /// Whether the receiver's credit reached the backend.
     ///
     /// False on a backend with no dynamic receive credit, which is every one
@@ -856,6 +865,20 @@ mod tests {
             session,
             ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
         )
+    }
+
+    #[test]
+    fn an_abandoned_subject_is_forgotten_once_and_admissible_again() {
+        // ADR-0031: a rail forgets an object the shared plan completed
+        // elsewhere. The answer says whether there was anything to forget,
+        // and the freed state is what lets the subject be admitted again.
+        let (subject, _, _) = object();
+        let mut driver = ready();
+        assert!(!driver.abandon(subject), "nothing admitted, nothing owed");
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        assert!(driver.abandon(subject));
+        assert!(!driver.abandon(subject), "forgotten once");
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
     }
 
     #[test]

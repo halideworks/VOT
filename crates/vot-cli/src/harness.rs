@@ -138,6 +138,118 @@ pub(crate) fn not_required() -> Authentication {
     Authentication::NotRequired { nonce: [7; 32] }
 }
 
+/// One end's inbox of a [`Duplex`]: the events, and the signal a waiting
+/// end parks on.
+pub(crate) struct DuplexQueue {
+    events: std::sync::Mutex<VecDeque<Event>>,
+    arrived: std::sync::Condvar,
+}
+
+impl DuplexQueue {
+    fn push(&self, event: Event) {
+        let mut events = self.events.lock().expect("the inbox");
+        events.push_back(event);
+        drop(events);
+        self.arrived.notify_all();
+    }
+}
+
+/// A thread-safe carrier pair: what one end sends is what the other end
+/// polls, and a wait parks on arrival rather than an interval.
+///
+/// The cross-thread counterpart of [`Loopback`], for tests whose subject
+/// is rails (ADR-0031): whole sessions driven on their own threads, with
+/// no pump to interleave them. Dropping an end hangs up, so a session
+/// whose peer is done hears a disconnect rather than stalling out.
+pub(crate) struct Duplex {
+    inbox: std::sync::Arc<DuplexQueue>,
+    outbox: std::sync::Arc<DuplexQueue>,
+    sequence: u64,
+    closed: bool,
+}
+
+/// A connected pair of [`Duplex`] ends.
+pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
+    let queue = || {
+        std::sync::Arc::new(DuplexQueue {
+            events: std::sync::Mutex::new(VecDeque::new()),
+            arrived: std::sync::Condvar::new(),
+        })
+    };
+    let (left, right) = (queue(), queue());
+    (
+        Duplex {
+            inbox: std::sync::Arc::clone(&left),
+            outbox: std::sync::Arc::clone(&right),
+            sequence: 0,
+            closed: false,
+        },
+        Duplex {
+            inbox: right,
+            outbox: left,
+            sequence: 0,
+            closed: false,
+        },
+    )
+}
+
+impl Duplex {
+    fn hang_up(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.outbox
+                .push(Event::Disconnected(vot_transport_api::ConnectionId(1)));
+        }
+    }
+}
+
+impl Drop for Duplex {
+    fn drop(&mut self) {
+        self.hang_up();
+    }
+}
+
+impl TransportAdapter for Duplex {
+    fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
+        self.outbox.push(Event::Control(shared_payload(frame)));
+        Ok(())
+    }
+
+    fn send_reliable(
+        &mut self,
+        stream: StreamId,
+        record: &[u8],
+    ) -> Result<(), vot_transport_api::Error> {
+        self.sequence += 1;
+        self.outbox.push(Event::Reliable {
+            stream,
+            sequence: self.sequence,
+            bytes: shared_payload(record),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Event> {
+        self.inbox.events.lock().expect("the inbox").pop_front()
+    }
+
+    fn set_receive_credit(&mut self, _bytes: u64) -> Result<(), vot_transport_api::Error> {
+        Ok(())
+    }
+
+    fn wait_for_event(&mut self, bound: std::time::Duration) {
+        let events = self.inbox.events.lock().expect("the inbox");
+        if events.is_empty() {
+            let _ = self.inbox.arrived.wait_timeout(events, bound);
+        }
+    }
+
+    fn close(&mut self, _code: u16) -> Result<(), vot_transport_api::Error> {
+        self.hang_up();
+        Ok(())
+    }
+}
+
 pub(crate) fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, PackageSummary) {
     let source = temporary(&format!("{name}-source"));
     let bundle = temporary(&format!("{name}-bundle"));

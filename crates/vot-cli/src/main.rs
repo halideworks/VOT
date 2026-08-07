@@ -8,6 +8,7 @@ Usage:
   vot receive BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE OBSERVED_AT
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
+  vot rendezvous LISTEN_ADDR
   vot fetch CONNECT_ADDR BUNDLE_DIR [PACKAGE_ROOT]
   vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
            OBSERVED_AT [PACKAGE_ROOT]
@@ -121,6 +122,7 @@ fn run() -> Result<(), vot_cli::Error> {
 /// directory this host already has, the other opens a session.
 fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
     match arguments {
+        [_, command, address] if command == "rendezvous" => rendezvous(address),
         [_, command, bundle, address] if command == "serve" => {
             serve(bundle, address, &vot_cli::Credentials::Ephemeral)
         }
@@ -175,6 +177,16 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
         ),
         _ => Err(vot_cli::Error::InvalidArguments),
     }
+}
+
+/// Runs the rendezvous service of ADR-0033 until it is stopped.
+fn rendezvous(address: &str) -> Result<(), vot_cli::Error> {
+    let address = address
+        .parse()
+        .map_err(|_| vot_cli::Error::InvalidArguments)?;
+    vot_cli::rendezvous_service(address, None, |at| {
+        println!("rendezvous {at}");
+    })
 }
 
 /// Answers sessions from one bundle until it is stopped.

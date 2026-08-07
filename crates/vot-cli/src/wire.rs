@@ -291,6 +291,67 @@ pub fn serve_bundle(
     Ok(server.package())
 }
 
+/// Runs the rendezvous service of ADR-0033 on `address` until stopped,
+/// or until `datagrams` arrivals when bounded (which is what lets a test
+/// serve an exchange and return).
+///
+/// One socket, the bounded pairing table, and nothing sent anywhere but
+/// to an observed source or a registered mapping. Malformed arrivals
+/// are shed; socket-level failures that are not timeouts end the
+/// service, which is the endpoint itself failing.
+///
+/// # Errors
+/// Surfaces a socket that will not bind, and the endpoint's own failure.
+pub fn rendezvous_service(
+    address: SocketAddr,
+    datagrams: Option<u64>,
+    mut listening: impl FnMut(SocketAddr),
+) -> Result<(), Error> {
+    let socket = std::net::UdpSocket::bind(address).map_err(|_| Error::CarrierUnavailable)?;
+    listening(socket.local_addr().map_err(|_| Error::CarrierUnavailable)?);
+    let began = std::time::Instant::now();
+    let mut pairings = crate::rendezvous::Pairings::default();
+    let mut buffer = [0_u8; 128];
+    // The bound is an iterator's, as the serve's is: a bounded service
+    // takes exactly as many arrivals as the range yields.
+    let mut turns: Box<dyn Iterator<Item = ()>> = match datagrams {
+        Some(bound) => Box::new(std::iter::repeat_n((), usize::try_from(bound).unwrap_or(0))),
+        None => Box::new(std::iter::repeat(())),
+    };
+    while turns.next().is_some() {
+        let (length, source) = match socket.recv_from(&mut buffer) {
+            Ok(arrival) => arrival,
+            Err(error) => {
+                if waited_out(&error) {
+                    continue;
+                }
+                return Err(Error::Io(error));
+            }
+        };
+        let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) else {
+            continue;
+        };
+        let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let answer = pairings.take(datagram, source, now_ms);
+        if let Some(reply) = answer.reply {
+            let _ = socket.send_to(&crate::rendezvous::encode(&reply), source);
+        }
+        if let Some((mapping, notice)) = answer.notify {
+            let _ = socket.send_to(&crate::rendezvous::encode(&notice), mapping);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a socket read failed only for want of a datagram, which is
+/// the service waiting; anything else is the socket itself failing.
+fn waited_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Fetches a bundle from `address` into `bundle`.
 ///
 /// # Errors
@@ -348,7 +409,9 @@ fn fetch_railed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn a_carrier_refusing_its_configuration_names_the_argument() {
@@ -400,6 +463,102 @@ mod tests {
             config.max_datagram_bytes,
             vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE
         );
+    }
+
+    #[test]
+    fn the_service_pairs_a_register_with_a_resolve_across_real_sockets() {
+        // The whole exchange over loopback: a serve-side socket
+        // registers, a fetch-side socket resolves, the fetch learns the
+        // serve's observed mapping, and the serve hears the fetch is
+        // coming at its own observed mapping. Six datagrams bound the
+        // service: register, resolve, and four strays it must shed
+        // without answering.
+        use crate::rendezvous::{Datagram, decode, encode};
+
+        let (addressed, address) = mpsc::channel();
+        let service = std::thread::spawn(move || {
+            rendezvous_service("127.0.0.1:0".parse().unwrap(), Some(6), |at| {
+                let _ = addressed.send(at);
+            })
+        });
+        let at = address.recv().expect("the service reported its address");
+        let key = [5; 32];
+
+        let serve = UdpSocket::bind("127.0.0.1:0").expect("a serve socket");
+        serve
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        serve
+            .send_to(&encode(&Datagram::Register { key }), at)
+            .expect("a register");
+        let mut buffer = [0_u8; 128];
+        let (length, _) = serve.recv_from(&mut buffer).expect("an acknowledgement");
+        assert_eq!(
+            decode(&buffer[..length]),
+            Some(Datagram::Registered { key })
+        );
+
+        let fetch = UdpSocket::bind("127.0.0.1:0").expect("a fetch socket");
+        fetch
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        // Strays first: garbage, another protocol's lead byte, and a
+        // truncated request are shed without a reply, so the resolve
+        // after them is answered first.
+        fetch.send_to(&[], at).expect("an empty stray");
+        fetch
+            .send_to(&[0xC0, 1, 2, 3], at)
+            .expect("a QUIC-shaped stray");
+        fetch
+            .send_to(&[0x1F, 1, 3, 9], at)
+            .expect("a truncated stray");
+        fetch
+            .send_to(&encode(&Datagram::Warming), at)
+            .expect("a service-shaped stray");
+        fetch
+            .send_to(&encode(&Datagram::Resolve { key }), at)
+            .expect("a resolve");
+        let (length, _) = fetch.recv_from(&mut buffer).expect("an answer");
+        let Some(Datagram::Resolved {
+            serve: Some(mapping),
+            ..
+        }) = decode(&buffer[..length])
+        else {
+            panic!("the resolve was not answered with the serve's mapping");
+        };
+        assert_eq!(
+            mapping.port(),
+            serve.local_addr().expect("the socket").port(),
+            "the mapping is the register's observed source"
+        );
+
+        // And the serve hears the fetch is coming, at the fetch's own
+        // observed mapping.
+        let (length, _) = serve.recv_from(&mut buffer).expect("the notification");
+        let Some(Datagram::Coming { fetch: coming, .. }) = decode(&buffer[..length]) else {
+            panic!("the serve was not told the fetch is coming");
+        };
+        assert_eq!(
+            coming.port(),
+            fetch.local_addr().expect("the socket").port()
+        );
+        service
+            .join()
+            .expect("the service thread")
+            .expect("the service served its bound");
+    }
+
+    #[test]
+    fn only_a_read_without_a_datagram_is_waited_out() {
+        // The service rides out a read that found nothing and ends on
+        // anything else; this table is the whole of that decision.
+        use std::io::ErrorKind;
+        assert!(waited_out(&std::io::Error::from(ErrorKind::WouldBlock)));
+        assert!(waited_out(&std::io::Error::from(ErrorKind::TimedOut)));
+        assert!(!waited_out(&std::io::Error::from(
+            ErrorKind::ConnectionReset
+        )));
+        assert!(!waited_out(&std::io::Error::from(ErrorKind::Other)));
     }
 
     #[test]

@@ -152,6 +152,44 @@ pub(crate) fn pump(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u
     moved
 }
 
+/// Bytes that do not compress, for a test whose point is how much the
+/// carrier and the receiver actually hold: patterned data shrinks to
+/// almost nothing in a record, and a byte budget several bundles wide
+/// then never fills.
+pub(crate) fn noise(length: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = Vec::with_capacity(length);
+    while bytes.len() < length {
+        // xorshift64*, whose output does not repeat within any record.
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.truncate(length);
+    bytes
+}
+
+/// Moves everything `from` sent into `to`'s inbound events with every
+/// record ahead of every control frame, which is what a real wire does
+/// when the data lane outruns the control stream: whole bundles of
+/// records arrive before the proofs that name them. Relative order
+/// within each kind is preserved, as each stream's is on the wire.
+pub(crate) fn pump_records_first(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u64) {
+    for (stream, bytes) in std::mem::take(&mut from.records) {
+        *next_sequence += 1;
+        to.events.push_back(Event::Reliable {
+            stream,
+            sequence: *next_sequence,
+            bytes: shared_payload(&bytes),
+        });
+    }
+    for frame in std::mem::take(&mut from.control) {
+        to.events.push_back(Event::Control(shared_payload(&frame)));
+    }
+}
+
 /// Removes what a test wrote.
 ///
 /// `temporary` paths outlive the process that made them, and a mutation

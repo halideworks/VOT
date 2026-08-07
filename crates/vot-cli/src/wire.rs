@@ -188,6 +188,9 @@ pub fn fetch_bundle(
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
         .map_err(|_| Error::CarrierUnavailable)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
+    if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
+        fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
+    }
     let status = drive(&mut fetcher)?;
     match status {
         crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),

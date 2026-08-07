@@ -14,13 +14,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use vot_codec::frames::{
     self, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestRequest, PackageDescriptor,
     RangeRequest, TypedFrame,
 };
 use vot_codec::{DecodeLimits, Settings, error_code};
-use vot_scheduler::session::SessionReceiver;
+use vot_scheduler::session::{CompletedBundle, SessionReceiver};
 use vot_scheduler::{FileSink, ReliableReceiver};
 use vot_session::{Authentication, Session};
 use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAdapter};
@@ -41,9 +42,17 @@ use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSum
 ///
 /// So a request is issued only while fewer than this many covers are
 /// outstanding, counted as the distance between what has been asked for
-/// and what the sink has placed. Two keeps the next request already at
-/// the server while it answers the current one.
-const OUTSTANDING_COVERS: usize = 2;
+/// and what the sink has placed.
+///
+/// Two was the number while proving ran on the session's own thread,
+/// where it was enough to keep the next request at the server while it
+/// answered the current one, and where raising it bought nothing because
+/// nothing else could be proved at once anyway. With the provers beside
+/// the session it is what decides how many of them can work: at two, two.
+/// Measured on 512 MiB over loopback, four gives 1.50 s against two's
+/// 1.65 and eight's 1.49, so four is where it stops paying. It costs
+/// receive credit and staging in proportion, both of which follow it.
+const OUTSTANDING_COVERS: usize = 4;
 
 /// What may be asked for and not yet placed, in the units a request is
 /// made in: a cover is what comes back, but a request names at most
@@ -62,8 +71,8 @@ const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE a
 // The credit is what it advertises, and the limit clears it by a group: a
 // limit at or under the advertised credit would refuse a conforming answer
 // for want of room rather than for anything wrong with it.
-const _: () = assert!(FETCH_CREDIT_BYTES == 8_519_680);
-const _: () = assert!(FETCH_STAGING_BYTES == 8_585_216);
+const _: () = assert!(FETCH_CREDIT_BYTES == 17_039_360);
+const _: () = assert!(FETCH_STAGING_BYTES == 17_104_896);
 
 /// What one fetch pass left the session as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +135,133 @@ impl vot_scheduler::RangeSink for CountingSink {
     }
 }
 
+/// Threads that prove and place covers, beside the session rather than on
+/// it.
+///
+/// Measured on 2026-08-06: a 512 MiB loopback fetch spent 938 ms of 1.84 s
+/// proving and placing on the session's own thread, and much of the rest
+/// waiting, because one thread cannot receive a cover while it proves the
+/// one before it. Neither step needs the receiver, so both move here and
+/// the witness goes back through `SessionReceiver::settle`.
+const DEFAULT_PROVING_THREADS: usize = 4;
+
+/// How long a pass waits for a prover it is already owed.
+///
+/// Only reached when the pass would otherwise book nothing, and the work
+/// is this end's own and already in hand, so it bounds a wait that is
+/// about to end rather than setting a poll interval.
+const PROVER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What a prover is handed: a bundle to prove and where its bytes go.
+struct Proving {
+    completed: CompletedBundle,
+    sink: Arc<CountingSink>,
+}
+
+/// What comes back: the bundle, and the witness that it is written.
+struct Proved {
+    completed: CompletedBundle,
+    written: vot_scheduler::WrittenRange,
+}
+
+/// The provers and the two channels they sit between.
+struct ProvingPool {
+    work: mpsc::SyncSender<Proving>,
+    proved: mpsc::Receiver<Result<Proved, vot_scheduler::Error>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// The receiving half the provers share. Held here too, so a probe of
+    /// this handle can tell provers that were joined from provers merely
+    /// abandoned: after a drop, no other owner may remain.
+    taking: Arc<std::sync::Mutex<mpsc::Receiver<Proving>>>,
+    /// Bundles handed out and not yet settled, which is what decides
+    /// whether this end has room to take another.
+    in_flight: usize,
+    /// Witnesses booked over the pool's life: the ledger that says the
+    /// provers, not the session thread, did the proving.
+    witnesses: u64,
+    width: usize,
+}
+
+impl ProvingPool {
+    /// Starts `width` provers. Each holds a clone of the work channel's
+    /// receiving half behind a lock, so a bundle goes to whichever is free.
+    fn start(width: usize) -> Self {
+        // Bounded at twice the width: enough that no prover waits on the
+        // session thread for its next bundle, small enough that what is in
+        // flight is a few covers rather than an object.
+        let (work, taking) = mpsc::sync_channel::<Proving>(width.saturating_mul(2));
+        let (finished, proved) = mpsc::channel::<Result<Proved, vot_scheduler::Error>>();
+        let taking = Arc::new(std::sync::Mutex::new(taking));
+        let mut threads = Vec::with_capacity(width);
+        for _ in 0..width {
+            let taking = Arc::clone(&taking);
+            let finished = finished.clone();
+            threads.push(std::thread::spawn(move || {
+                loop {
+                    let Ok(queue) = taking.lock() else {
+                        return;
+                    };
+                    let Ok(next) = queue.recv() else {
+                        return;
+                    };
+                    drop(queue);
+                    if finished.send(prove(next)).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        Self {
+            work,
+            proved,
+            threads,
+            taking,
+            in_flight: 0,
+            witnesses: 0,
+            width,
+        }
+    }
+
+    /// Whether another bundle can be handed over without waiting.
+    const fn has_room(&self) -> bool {
+        self.in_flight < self.width.saturating_mul(2)
+    }
+
+    /// Whether anything is out with a prover.
+    const fn busy(&self) -> bool {
+        self.in_flight > 0
+    }
+}
+
+impl Drop for ProvingPool {
+    fn drop(&mut self) {
+        // The provers end when the work channel closes, which is what
+        // dropping this sender does; the joins then cannot outlive them.
+        let (closed, _) = mpsc::sync_channel::<Proving>(1);
+        drop(std::mem::replace(&mut self.work, closed));
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+        // Every prover has been joined, so no other owner of the work
+        // queue can remain.
+        debug_assert_eq!(std::sync::Arc::strong_count(&self.taking), 1);
+    }
+}
+
+/// Proves one bundle and places its bytes. The whole of what a prover does.
+fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
+    let range = ReliableReceiver::verify_typed_bundle(
+        work.completed.subject(),
+        work.completed.bundle(),
+        work.completed.records(),
+    )?;
+    let written = range.write_to(work.sink.as_ref())?;
+    Ok(Proved {
+        completed: work.completed,
+        written,
+    })
+}
+
 /// One stored object the manifest names, in fetch order.
 struct PlannedObject {
     object: frames::ObjectId,
@@ -175,6 +311,15 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// slowly from one that has stopped: the first is what a large object
     /// looks like, and giving up on it would kill the transfer.
     progress: u64,
+    /// The provers, started with the first cover so a fetch that carries
+    /// none starts no threads.
+    pool: Option<ProvingPool>,
+    /// How many provers to start, or none for proving on this thread.
+    proving_threads: usize,
+    /// How long a pass waits for a witness it is owed. [`PROVER_WAIT`]
+    /// outside tests; a test that must see the wait happen sets a bound
+    /// that outlasts any load the machine is under.
+    prover_wait: std::time::Duration,
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
@@ -247,6 +392,23 @@ fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
 }
 
 impl<A: TransportAdapter> BundleFetcher<A> {
+    /// Sets how many provers this fetch runs, or none to prove on the
+    /// session's own thread.
+    ///
+    /// # Errors
+    /// Surfaces a deferred bound the receiver refuses.
+    pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
+        self.proving_threads = threads;
+        self.receiver.defer_proving(threads > 0);
+        if threads > 0 {
+            // Room for every prover to hold one and one more to be waiting,
+            // which is what keeps them all fed without holding an object.
+            self.receiver
+                .set_deferred_limit(threads.saturating_add(1))?;
+        }
+        Ok(())
+    }
+
     /// Opens the session and the bundle directory the fetch will fill.
     ///
     /// The optional pin is the package root this fetch will accept; without
@@ -268,8 +430,24 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         session.begin()?;
         let receiver =
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
-        Ok(Self {
-            receiver: SessionReceiver::new(session, receiver),
+        let mut receiver = SessionReceiver::new(session, receiver);
+        // Every outstanding cover must be holdable in whichever state it
+        // arrives: admitted and incomplete, or records ahead of their proof.
+        // The receiver's defaults are sized for a shallower pipeline, and on
+        // a real wire the lane outruns the control stream by whole bundles,
+        // so a budget below the pipeline depth fails a conforming transfer
+        // with `PendingBundlesExhausted`. Derived, so a depth change cannot
+        // outgrow the buffers again.
+        receiver.set_pending_limits(
+            OUTSTANDING_COVERS,
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
+        )?;
+        receiver.set_orphan_limits(
+            OUTSTANDING_COVERS,
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES,
+        )?;
+        let mut fetcher = Self {
+            receiver,
             bundle: bundle.to_owned(),
             pin,
             descriptor: None,
@@ -285,7 +463,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             disconnected: false,
             stopped: false,
             progress: 0,
-        })
+            pool: None,
+            proving_threads: 0,
+            prover_wait: PROVER_WAIT,
+        };
+        // Through the one place the deferred wiring lives, so the default
+        // width and a caller's cannot come apart.
+        fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
+        Ok(fetcher)
     }
 
     /// The validated package, once the manifest has been.
@@ -322,7 +507,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// a driving loop to keep servicing a session that cannot progress.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.stopped && !self.pending.is_empty()
+        !self.stopped
+            && (!self.pending.is_empty() || self.pool.as_ref().is_some_and(ProvingPool::busy))
     }
 
     /// Forgets what is owed, because nothing more will be asked or answered.
@@ -363,6 +549,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 Ok(None) => break,
                 Err(error) => return self.receive_failed(error),
             }
+        }
+        // Between taking frames and judging the pass: what the provers
+        // finished is as much a part of this pass's progress as what the
+        // carrier delivered, and the plan advances on placed bytes.
+        if let Err(error) = self.pump_provers() {
+            return self.receive_failed(error);
         }
         // Advanced before the carrier is judged: a pass that takes the last
         // object's bytes and the disconnect together has a whole bundle,
@@ -406,6 +598,89 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         }
         self.close_under(refusal_code(&error));
         Err(Error::Scheduler(error))
+    }
+
+    /// Hands what the receiver completed to the provers, and books what
+    /// they finished.
+    ///
+    /// Nothing here proves anything: the provers do, off this thread, and
+    /// what comes back is a witness the receiver admits the same way the
+    /// inline path does.
+    fn pump_provers(&mut self) -> Result<(), vot_scheduler::Error> {
+        if self.proving_threads == 0 {
+            return Ok(());
+        }
+        let mut pool = self
+            .pool
+            .take()
+            .unwrap_or_else(|| ProvingPool::start(self.proving_threads));
+        // Handed over while there is room, so what is out with a prover is a
+        // few covers rather than an object.
+        while pool.has_room() {
+            let Some(sink) = self.plan.as_ref().and_then(|plan| plan.active.clone()) else {
+                break;
+            };
+            let Some(completed) = self.receiver.take_completed() else {
+                break;
+            };
+            // The sink is the active object's because admitted-and-not-
+            // verified is the object being fetched: the receiver holds
+            // covers for verified subjects back from this handover, and the
+            // fetch admits one object at a time. Named here because the
+            // sink is chosen by that coupling.
+            debug_assert_eq!(
+                Some(completed.subject()),
+                self.plan
+                    .as_ref()
+                    .and_then(|plan| plan.objects.get(plan.current))
+                    .map(subject_of)
+            );
+            if pool.work.try_send(Proving { completed, sink }).is_err() {
+                break;
+            }
+            pool.in_flight = pool.in_flight.saturating_add(1);
+        }
+        // Every witness already waiting, then one waited for if the pass
+        // would otherwise book nothing. Waiting here is not waiting on a
+        // peer: the work is this end's own and already in hand, and a pass
+        // that returned without it would spin until a prover was scheduled.
+        if pool.in_flight == 0 {
+            // Nothing is out, so there is nothing to wait for or book.
+            self.pool = Some(pool);
+            return Ok(());
+        }
+        let mut outcome = Ok(());
+        // The first witness is waited for, because the work is this end's
+        // own and already in hand, and a pass that returned without it
+        // would spin until a prover was scheduled; the rest are taken as
+        // found. Structurally bounded: the chain is one bounded wait and
+        // then at most what is out with a prover, so the walk ends
+        // whatever a mutation does to any count inside it, and there is
+        // no branch here for one to turn into an unbounded wait.
+        let first = pool.proved.recv_timeout(self.prover_wait).ok();
+        let ready: Vec<_> = first
+            .into_iter()
+            .chain(pool.proved.try_iter())
+            .take(pool.in_flight)
+            .collect();
+        for result in ready {
+            pool.in_flight = pool.in_flight.saturating_sub(1);
+            match result {
+                Ok(proved) => {
+                    if let Err(error) = self.receiver.settle(&proved.completed, proved.written) {
+                        outcome = Err(error);
+                        break;
+                    }
+                    pool.witnesses = pool.witnesses.saturating_add(1);
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        self.pool = Some(pool);
+        outcome
     }
 
     /// Closes the carrier under `code` and stops asking for anything.
@@ -761,8 +1036,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 mod tests {
     use super::*;
     use crate::harness::{
-        Loopback, built_bundle, control_event, decode_control, discard, not_required, patterned,
-        pump,
+        Loopback, built_bundle, control_event, decode_control, discard, noise, not_required,
+        patterned, pump, pump_records_first,
     };
     use crate::tests::temporary;
     use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
@@ -940,6 +1215,203 @@ mod tests {
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
         discard(&[&source, &bundle, &output, &destination, &receipt]);
+    }
+
+    #[test]
+    fn the_pool_reports_room_and_business_from_what_is_out() {
+        // has_room is what stops the session thread handing out more than
+        // the provers can hold, and busy is what keeps the driving loop on
+        // the short wait while witnesses are owed. Both read `in_flight`,
+        // and each has an off-by-one that only shows at the bound.
+        let mut pool = ProvingPool::start(2);
+        assert!(!pool.busy(), "an idle pool owes nothing");
+        assert!(pool.has_room(), "an idle pool can take work");
+        pool.in_flight = 3;
+        assert!(pool.has_room(), "one below the bound still has room");
+        assert!(pool.busy(), "anything out with a prover is busy");
+        pool.in_flight = 4;
+        assert!(!pool.has_room(), "twice the width is the bound");
+        assert!(pool.busy());
+        pool.in_flight = 0;
+    }
+
+    #[test]
+    fn dropping_the_pool_ends_its_provers() {
+        // The drop joins every prover, so nothing of the pool survives it.
+        // A drop that skips the join leaves provers holding their half of
+        // the work channel past the fetch that spawned them.
+        let pool = ProvingPool::start(2);
+        let probe = std::sync::Arc::downgrade(&pool.taking);
+        drop(pool);
+        assert!(
+            probe.upgrade().is_none(),
+            "a prover outlived the pool that owned it"
+        );
+    }
+
+    #[test]
+    fn a_pass_with_a_witness_owed_books_it_before_returning() {
+        // The handover counts what is out, and the booking loop waits for
+        // the first witness rather than spinning past it: a pass that hands
+        // a bundle to a prover settles it in the same pass. If the count
+        // never rises the wait is skipped, and every witness is left to a
+        // later pass that happens to look, which is a fetch that goes idle
+        // between covers.
+        let (bundle, _) = built_bundle("witness", &[("big.bin", patterned(8_500_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("witness-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+
+        // Rounds until the fetch has planned and asked, because until then
+        // every control frame is one `service` has to dispatch itself.
+        let mut sequence = 0;
+        for _ in 0..ROUND_BUDGET {
+            fetcher.service().unwrap();
+            pump(
+                fetcher.session_mut().driver(),
+                session.driver(),
+                &mut sequence,
+            );
+            for _ in 0..ROUND_BUDGET {
+                server.service(&mut session, &mut connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            pump(
+                session.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+            if fetcher.plan.is_some() && fetcher.next_request > 0 {
+                break;
+            }
+        }
+        assert!(fetcher.plan.is_some(), "the fetch never planned");
+
+        // Then answers only, polled outside `service`, so a completed
+        // bundle is parked for the pump below to be the first to see.
+        for _ in 0..ROUND_BUDGET {
+            for _ in 0..ROUND_BUDGET {
+                server.service(&mut session, &mut connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            pump(
+                session.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+            while fetcher.receiver.poll().unwrap().is_some() {}
+            if fetcher.receiver.completed_bundles() > 0 {
+                break;
+            }
+        }
+        assert!(
+            fetcher.receiver.completed_bundles() > 0,
+            "no cover completed within the round budget"
+        );
+
+        // The decisive pass must wait, not spin, and its wait has to cover
+        // a cold pool proving one cover under whatever load the suite runs
+        // at; the mutant this test exists for books nothing however long
+        // it is given. Set only now, so a mutant that reroutes an empty
+        // pool into the wait costs the earlier rounds nothing.
+        fetcher.prover_wait = std::time::Duration::from_secs(5);
+        fetcher.pump_provers().unwrap();
+        let pool = fetcher.pool.as_ref().expect("the pass started the pool");
+        assert!(
+            pool.witnesses >= 1,
+            "the pass that handed a bundle out did not book its witness"
+        );
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn the_proving_width_sets_the_deferred_bound_and_nothing_else_does() {
+        let (bundle, _) = built_bundle("width", &[("a.txt", patterned(1000))]);
+        let output = temporary("width-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // The default width, wired through the same call a caller uses.
+        assert_eq!(fetcher.proving_threads, DEFAULT_PROVING_THREADS);
+        assert_eq!(
+            fetcher.receiver.deferred_limit(),
+            DEFAULT_PROVING_THREADS + 1
+        );
+        // The receiver's budgets are the pipeline depth in whole bundles,
+        // byte for byte: a sum where a product belongs is one bundle wide
+        // and fails a conforming transfer on a real wire.
+        assert_eq!(
+            fetcher.receiver.pending_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+        );
+        assert_eq!(
+            fetcher.receiver.orphan_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
+        );
+        // A narrower pool: the bound follows the width.
+        fetcher.set_proving_threads(2).unwrap();
+        assert_eq!(fetcher.proving_threads, 2);
+        assert_eq!(fetcher.receiver.deferred_limit(), 3);
+        // Inline: the width is recorded and the bound is left alone, since
+        // nothing is deferred to be bounded.
+        fetcher.set_proving_threads(0).unwrap();
+        assert_eq!(fetcher.proving_threads, 0);
+        assert_eq!(fetcher.receiver.deferred_limit(), 3, "no width, no change");
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn records_arriving_before_their_proofs_do_not_exhaust_the_receiver() {
+        // What a real wire does that the in-order pump never shows: the
+        // data lane outruns the control stream by whole bundles, so every
+        // outstanding cover's records can land before any of their proofs.
+        // Each proof-less bundle occupies the receiver's orphan budget, and
+        // a budget below the request pipeline's depth fails a conforming
+        // transfer with PendingBundlesExhausted, which is how an inline
+        // 512 MiB wire fetch died on 2026-08-06. Three covers is enough:
+        // the third orphan is the one a limit of two refuses. Noise rather
+        // than a pattern, so the held records weigh what wire records
+        // weigh and the byte budget is exercised along with the count.
+        let (bundle, built) = built_bundle("orphans", &[("big.bin", noise(8_500_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("orphans-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // Inline proving is the slower poll, which is what lets a real
+        // carrier queue this deep; the reordering itself is the pump's.
+        fetcher.set_proving_threads(0).unwrap();
+
+        let mut sequence = 0;
+        let mut status = FetchStatus::Active;
+        for _ in 0..ROUND_BUDGET {
+            status = fetcher.service().unwrap();
+            if status != FetchStatus::Active {
+                break;
+            }
+            pump(
+                fetcher.session_mut().driver(),
+                session.driver(),
+                &mut sequence,
+            );
+            // Drained fully, so every answered cover is queued at once and
+            // the reordering below moves all their records ahead of all
+            // their proofs.
+            for _ in 0..ROUND_BUDGET {
+                server.service(&mut session, &mut connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            pump_records_first(
+                session.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+        }
+        assert_eq!(status, FetchStatus::Complete);
+        assert_eq!(fetcher.package(), Some(built));
+        discard(&[&bundle, &output]);
     }
 
     #[test]

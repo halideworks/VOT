@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vot_transport_api::ReceiveLimits;
-use vot_transport_quiche::live::{Config, Transport};
+use vot_transport_quiche::live::{Config, CongestionControl, Transport};
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession, drive};
 
@@ -75,6 +75,27 @@ fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
     }
     config.max_datagram_bytes = bytes;
     Ok(())
+}
+
+/// The environment variable that picks the congestion controller.
+const CONGESTION: &str = "VOT_CONGESTION";
+
+/// The controller [`CONGESTION`] names, or cubic when it is unset.
+///
+/// Cubic is what every LAN acceptance number was taken under; bbr2 is
+/// what a lossy wide-area path wants, 3-5x cubic at 0.5-1% loss
+/// (docs/perf-engineering.md, 2026-08-06). A transfer is governed by the
+/// sender's controller, so the pin matters most on the end serving the
+/// bytes, but both commands read it: either end of a session sends.
+///
+/// # Errors
+/// Rejects a value naming neither controller.
+fn congestion_from(pin: Option<&str>) -> Result<CongestionControl, Error> {
+    match pin.map(str::trim) {
+        None | Some("cubic") => Ok(CongestionControl::Cubic),
+        Some("bbr2") => Ok(CongestionControl::Bbr2),
+        Some(_) => Err(Error::InvalidArguments),
+    }
 }
 
 /// What a carrier's failure means to the command that asked for it.
@@ -212,6 +233,7 @@ pub fn serve_bundle(
         config.accept_timeout_ms = 0;
     }
     apply_datagram_bytes(&mut config)?;
+    config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
 
     // A bounded count is what lets a test serve one session and return;
     // without one the command serves until it is stopped. The loop and its
@@ -243,6 +265,7 @@ pub fn fetch_bundle(
     // server can only serve bytes that fail the proofs the fetch checks.
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
+    config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
         .map_err(carrier_failure)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
@@ -316,6 +339,26 @@ mod tests {
             config.max_datagram_bytes,
             vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE
         );
+    }
+
+    #[test]
+    fn the_congestion_controller_is_the_value_given_or_cubic() {
+        // The pin apart from the process environment, like the datagram
+        // test above and for the same race.
+        assert_eq!(congestion_from(None).unwrap(), CongestionControl::Cubic);
+        assert_eq!(
+            congestion_from(Some("cubic")).unwrap(),
+            CongestionControl::Cubic
+        );
+        assert_eq!(
+            congestion_from(Some(" bbr2\n")).unwrap(),
+            CongestionControl::Bbr2,
+            "given, trimmed, taken"
+        );
+        // A controller neither end has is refused here, where the error
+        // names the argument, not as an unavailable endpoint.
+        assert!(congestion_from(Some("reno")).is_err());
+        assert!(std::env::var(CONGESTION).is_err(), "the suite owns no env");
     }
 
     #[test]

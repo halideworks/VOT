@@ -406,6 +406,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// is what paces its requests: pacing on the shared sink would let one
     /// rail ask past its own receiver's budgets on the others' arrivals.
     settled_bytes: u64,
+    /// The most this rail keeps outstanding:
+    /// [`OUTSTANDING_REQUEST_BYTES`] always, narrowed only by tests so a
+    /// small object stripes without a window's worth of data.
+    window_bytes: u64,
     pending: VecDeque<Vec<u8>>,
     next_request: u64,
     closed: Option<u16>,
@@ -603,6 +607,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
+            window_bytes: OUTSTANDING_REQUEST_BYTES,
             pending: VecDeque::new(),
             next_request: 0,
             closed: None,
@@ -671,6 +676,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
+            window_bytes: OUTSTANDING_REQUEST_BYTES,
             pending: VecDeque::new(),
             next_request: 0,
             closed: None,
@@ -1408,7 +1414,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             } else {
                 self.taken_bytes.saturating_sub(self.settled_bytes)
             };
-            if outstanding >= OUTSTANDING_REQUEST_BYTES {
+            if outstanding >= self.window_bytes {
                 return Ok(());
             }
             let Some((object, offset, length)) = plan.next_span()? else {
@@ -1639,12 +1645,14 @@ mod tests {
         // The ADR's step-3 sim test: two whole sessions against one
         // server, striping one object's spans over the shared plan into
         // the shared sink, pumps interleaved so the handout is
-        // deterministic. Five spans and a four-span window: the primary
-        // takes its whole window in its first pass, the second rail takes
-        // exactly the span left over, which is work stealing doing the
-        // striping.
-        let length = 5 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
-        let (bundle, built) = built_bundle("striped", &[("big.bin", noise(length))]);
+        // deterministic. The primary's window is narrowed to one span so
+        // a two-span object stripes: the primary takes its window in its
+        // first pass, the second rail takes exactly the span left over,
+        // which is work stealing doing the striping. Narrow rather than
+        // large because this test rides every mutant of the crate, and a
+        // window's worth of data per run is most of the suite's time.
+        let length = 2 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
+        let (bundle, built) = built_bundle("striped", &[("big.bin", patterned(length))]);
         let server = BundleServer::open(&bundle).unwrap();
         let mut session1 = Session::server(
             Loopback::default(),
@@ -1665,6 +1673,7 @@ mod tests {
 
         let output = temporary("striped-fetched");
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        primary.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         let mut secondary =
             BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
@@ -1708,9 +1717,9 @@ mod tests {
             }
         }
         assert!(settled, "the rails never finished the fetch");
-        // The handout striped: the primary filled its window, and the rail
-        // took exactly the object's last span from the same plan.
-        assert_eq!(primary.taken_bytes, OUTSTANDING_REQUEST_BYTES);
+        // The handout striped: the primary filled its narrowed window, and
+        // the rail took exactly the object's last span from the same plan.
+        assert_eq!(primary.taken_bytes, MAX_REQUESTED_RANGE);
         assert_eq!(secondary.taken_bytes, MAX_REQUESTED_RANGE);
         assert!(!primary.has_backlog());
         assert!(!secondary.has_backlog());

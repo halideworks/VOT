@@ -1215,7 +1215,10 @@ fn route(
     if socket.set_read_timeout(Some(ROUTER_TICK)).is_err() {
         return;
     }
-    while !stop.load(Ordering::Relaxed) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space) {
             Ok(read) => read,
             Err(error) => {
@@ -2401,6 +2404,10 @@ mod tests {
         let address = listener.local_address();
         let mut client_config = Config::client(limits());
         client_config.verify_peer = false;
+        // Short, so a mutant that kills the router costs its failing
+        // clients seconds of drop-side draining rather than the default
+        // half minute each, which is a runner timeout.
+        client_config.idle_timeout_ms = 3_000;
         let connect = || {
             Transport::connect(
                 "127.0.0.1:0".parse().expect("an address"),

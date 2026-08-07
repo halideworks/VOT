@@ -235,7 +235,23 @@ where
         while turns.next().is_some() {
             // The accept waits here, on this thread, so a factory error is
             // ordered after every session it already handed out.
-            let accepted = next();
+            let mut accepted = next();
+            // A fixed port frees only when the session holding it ends: the
+            // carrier's drop joins its driver, so after the join below the
+            // next bind finds the port released. An accept refused while
+            // sessions still run therefore joins the oldest and asks again,
+            // and each retry shrinks `running`, which bounds this loop by
+            // its own body. A factory failing with nothing left running is
+            // the endpoint itself, and surfaces below.
+            while accepted.is_err() && !running.is_empty() {
+                let settled = running
+                    .pop_front()
+                    .expect("emptiness was just checked")
+                    .join()
+                    .expect("a session thread never panics");
+                settle_session(sessions, settled, &mut failed);
+                accepted = next();
+            }
             while running.len() >= CONCURRENT_SESSIONS {
                 let settled = running
                     .pop_front()
@@ -370,7 +386,10 @@ mod tests {
             matches!(outcome, Err(Error::CarrierUnavailable)),
             "the endpoint's own failure ends the serve, a session's never"
         );
-        assert_eq!(sessions, 3, "the stalled session was survived");
+        // Five accepts, not three: each refused accept joined one of the
+        // two running sessions and asked again, and only with nothing left
+        // running did the failure surface as the endpoint's own.
+        assert_eq!(sessions, 5, "the stalled session was survived");
 
         // Told to answer exactly these sessions, the same failure surfaces:
         // the caller asked for them and deserves to hear one was not served.
@@ -423,6 +442,53 @@ mod tests {
         });
         assert!(outcome.is_ok(), "one asked for, one served");
         assert_eq!(counted, 1, "exactly the bound, no session more");
+
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn a_refused_accept_waits_for_a_running_session_and_asks_again() {
+        // The fixed-port shape: binding the next session's socket fails
+        // while the previous session still holds the port, and frees the
+        // moment that session ends. A serve that surfaced the first refusal
+        // would die after every first session; one that joins a running
+        // session and asks again serves them one after another.
+        use crate::harness::{Loopback, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        let (bundle, _) = built_bundle("retries", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let clean = || {
+            let mut client = vot_session::Session::client(
+                Loopback::default(),
+                vot_codec::Settings::default(),
+                std::collections::BTreeSet::new(),
+                not_required(),
+            );
+            client.begin().unwrap();
+            let mut carrier = Loopback::default();
+            for frame in client.driver().control.drain(..) {
+                carrier
+                    .events
+                    .push_back(Event::Control(vot_transport_api::shared_payload(&frame)));
+            }
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            carrier
+        };
+        let mut accepts = 0_u32;
+        let outcome = serve_sessions(Some(2), || {
+            accepts += 1;
+            match accepts {
+                1 | 3 => ServeSession::begin(&server, clean(), not_required()),
+                // Accept two is the port still held by session one; any
+                // accept past three would be a count that kept counting.
+                _ => Err(Error::CarrierUnavailable),
+            }
+        });
+        assert!(outcome.is_ok(), "the refusal was waited out, both served");
+        assert_eq!(accepts, 3, "one refusal, retried once, no accept more");
 
         crate::harness::discard(&[&bundle]);
     }

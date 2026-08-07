@@ -32,6 +32,62 @@ fn limits() -> Result<ReceiveLimits, Error> {
     .map_err(|_| Error::InvalidArguments)
 }
 
+/// The environment variable that pins the datagram ceiling.
+const DATAGRAM_BYTES: &str = "VOT_DATAGRAM_BYTES";
+
+/// Opens the datagram ceiling to discovery, then applies
+/// [`DATAGRAM_BYTES`] over it if set.
+///
+/// The carrier's own default ceiling is what a 1500-byte ethernet frame
+/// carries, and path discovery only settles below a ceiling, never above
+/// it, so no amount of discovery finds a jumbo path under that default.
+/// The commands trust discovery instead: the ceiling opens to the most a
+/// UDP payload can be, `discover_pmtu` probes with don't-fragment set and
+/// fails closed, and the connection settles at what the path really
+/// carries with nothing to configure. It matters on the serving process
+/// most: packets are made where the bytes are served, and a fetch-side
+/// ceiling alone moves nothing (docs/perf-engineering.md, 2026-08-06).
+///
+/// The variable remains as a pin for a path whose discovery misbehaves.
+///
+/// # Errors
+/// Rejects a value that is not a number. The carrier rejects one outside
+/// what it can carry.
+fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
+    config.max_datagram_bytes = vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+    let Ok(value) = std::env::var(DATAGRAM_BYTES) else {
+        return Ok(());
+    };
+    apply_datagram_value(config, &value)
+}
+
+/// The parse half of the pin, apart from the environment that feeds it.
+///
+/// Validated against the carrier's own bounds here, where the refusal can
+/// name the argument: left to the carrier it surfaces as an unavailable
+/// endpoint, which reads as a network problem rather than a typo.
+fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
+    let bytes: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    let bounds = vot_transport_quiche::live::MIN_DATAGRAM_SIZE
+        ..=vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+    if !bounds.contains(&bytes) {
+        return Err(Error::InvalidArguments);
+    }
+    config.max_datagram_bytes = bytes;
+    Ok(())
+}
+
+/// What a carrier's failure means to the command that asked for it.
+///
+/// A configuration the carrier refuses is an argument problem and says
+/// so; everything else is the endpoint itself.
+fn carrier_failure(error: vot_transport_api::Error) -> Error {
+    match error {
+        vot_transport_api::Error::InvalidConfiguration => Error::InvalidArguments,
+        _ => Error::CarrierUnavailable,
+    }
+}
+
 /// Tells one set of credentials from another in the same process.
 ///
 /// Two servers in one process would otherwise write the same two paths:
@@ -155,6 +211,7 @@ pub fn serve_bundle(
     if sessions.is_none() {
         config.accept_timeout_ms = 0;
     }
+    apply_datagram_bytes(&mut config)?;
 
     // A bounded count is what lets a test serve one session and return;
     // without one the command serves until it is stopped. The loop and its
@@ -162,7 +219,7 @@ pub fn serve_bundle(
     crate::drive::serve_sessions(sessions, || {
         // `serve` waits for a connection on its own thread, so one
         // endpoint is one session here.
-        let carrier = Transport::serve(address, &config).map_err(|_| Error::CarrierUnavailable)?;
+        let carrier = Transport::serve(address, &config).map_err(carrier_failure)?;
         // Reported before the session starts, because a caller that asked
         // for port zero cannot connect until it knows what it got.
         listening(carrier.local_address());
@@ -185,8 +242,9 @@ pub fn fetch_bundle(
     // ADR-0030: the channel is unauthenticated and says so. A forged
     // server can only serve bytes that fail the proofs the fetch checks.
     config.verify_peer = false;
+    apply_datagram_bytes(&mut config)?;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-        .map_err(|_| Error::CarrierUnavailable)?;
+        .map_err(carrier_failure)?;
     let mut fetcher = BundleFetcher::begin(carrier, bundle, pin)?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
@@ -207,6 +265,58 @@ pub fn fetch_bundle(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn a_carrier_refusing_its_configuration_names_the_argument() {
+        // The one refusal a user can fix in a command must not read as a
+        // network problem, and everything else must: the map is the whole
+        // difference between "fix the value" and "check the host".
+        assert!(matches!(
+            carrier_failure(vot_transport_api::Error::InvalidConfiguration),
+            Error::InvalidArguments
+        ));
+        assert!(matches!(
+            carrier_failure(vot_transport_api::Error::Backend),
+            Error::CarrierUnavailable
+        ));
+    }
+
+    #[test]
+    fn the_datagram_ceiling_is_the_value_given_or_the_default() {
+        // The parse half, apart from the process environment: a test that
+        // set the real variable would race the socket test in this module.
+        let mut config = Config::client(limits().unwrap());
+        let unset = config.max_datagram_bytes;
+        apply_datagram_value(&mut config, " 8972\n").unwrap();
+        assert_eq!(config.max_datagram_bytes, 8972, "given, trimmed, taken");
+        let mut config = Config::client(limits().unwrap());
+        assert!(
+            apply_datagram_value(&mut config, "jumbo").is_err(),
+            "a value that is not a number is refused"
+        );
+        assert_eq!(
+            config.max_datagram_bytes, unset,
+            "a refused value changes nothing"
+        );
+        // Numeric and still wrong: outside what the carrier can carry is
+        // refused here, where the error names the argument, not later as
+        // an unavailable endpoint.
+        assert!(apply_datagram_value(&mut config, "0").is_err());
+        assert!(apply_datagram_value(&mut config, "70000").is_err());
+        assert_eq!(config.max_datagram_bytes, unset);
+        // And with nothing set, the ceiling opens all the way for
+        // discovery to settle under, which is the seamless default.
+        assert!(
+            std::env::var(DATAGRAM_BYTES).is_err(),
+            "the suite owns no env"
+        );
+        let mut config = Config::client(limits().unwrap());
+        apply_datagram_bytes(&mut config).unwrap();
+        assert_eq!(
+            config.max_datagram_bytes,
+            vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE
+        );
+    }
 
     #[test]
     fn an_ephemeral_certificate_goes_when_the_server_does() {

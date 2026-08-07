@@ -42,7 +42,7 @@ const MAX_DATAGRAM_SIZE: usize = 1_472;
 ///
 /// QUIC requires an endpoint to carry a 1200-byte initial datagram, so anything
 /// under this cannot complete a handshake.
-const MIN_DATAGRAM_SIZE: usize = 1_200;
+pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 
 /// What the socket asks the kernel to hold in each direction.
 ///
@@ -57,7 +57,12 @@ const SEND_BUFFER_BYTES: u32 = 2_097_152;
 /// 20 more, which is not worth a family-dependent ceiling: a size the socket
 /// refuses with `EMSGSIZE` on one family is not a configuration, and the test
 /// suite sends a record at this exact size to keep the constant honest.
-const LARGEST_DATAGRAM_SIZE: usize = 65_507;
+///
+/// Public because a caller that trusts path discovery entirely sets this as
+/// its ceiling: with `discover_pmtu` on and don't-fragment fail-closed, the
+/// connection settles at what the path really carries, and the ceiling only
+/// says where probing may stop.
+pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;

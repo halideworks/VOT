@@ -12,9 +12,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use vot_codec::frames::{
     self, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestRequest, PackageDescriptor,
@@ -267,7 +267,16 @@ struct PlannedObject {
     object: frames::ObjectId,
 }
 
-/// The objects still owed once the manifest is validated.
+/// The objects still owed once the manifest is validated, behind a lock.
+///
+/// ADR-0031 step 2: the plan is the striping point. It hands out range
+/// requests through [`FetchPlan::next_span`] and [`FetchPlan::take`];
+/// one rail takes from it today exactly as before the split, and W
+/// rails take from the same handout at step 3, which is work stealing
+/// by construction.
+type SharedPlan = Arc<Mutex<FetchPlan>>;
+
+/// What a [`SharedPlan`] holds.
 struct FetchPlan {
     summary: PackageSummary,
     objects: Vec<PlannedObject>,
@@ -283,6 +292,43 @@ struct FetchPlan {
     finished: bool,
 }
 
+impl FetchPlan {
+    /// The next range a taker would request, uncommitted.
+    ///
+    /// What has been asked for and not yet placed is the measure, so an
+    /// object of any length is asked for a couple of covers at a time
+    /// however fast the taker can build the frames, and a slow taker
+    /// simply takes fewer.
+    fn next_span(&self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
+        let Some(sink) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        // Everything asked for that has not arrived, which is what the
+        // peer and this end's receiver are holding between them.
+        let placed = sink.placed();
+        let object = self
+            .objects
+            .get(self.current)
+            .ok_or(Error::InvalidBundle)?
+            .object;
+        if self.next_offset.saturating_sub(placed) >= OUTSTANDING_REQUEST_BYTES {
+            return Ok(None);
+        }
+        Ok(range_span(self.next_offset, object.length)
+            .map(|(offset, length)| (object, offset, length)))
+    }
+
+    /// Commits the span [`FetchPlan::next_span`] handed out.
+    ///
+    /// Separate from the peek, and called only once the span's frame is
+    /// queued: a span committed before its frame exists is consumed by
+    /// the failure between the two, a hole no rail would ever re-request.
+    fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
+        self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
+        Ok(())
+    }
+}
+
 /// One fetch: a client session, the receiver verifying its ranges, and the
 /// bundle directory being written.
 pub struct BundleFetcher<A: TransportAdapter> {
@@ -296,7 +342,7 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// Manifest request spans still to issue, and the next one due.
     spans: Vec<(u64, u64)>,
     next_span: usize,
-    plan: Option<FetchPlan>,
+    plan: Option<SharedPlan>,
     pending: VecDeque<Vec<u8>>,
     next_request: u64,
     closed: Option<u16>,
@@ -505,7 +551,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// The validated package, once the manifest has been.
     #[must_use]
     pub fn package(&self) -> Option<PackageSummary> {
-        self.plan.as_ref().map(|plan| plan.summary)
+        self.locked_plan().map(|plan| plan.summary)
     }
 
     /// The session under the fetch, for the loop that waits on its carrier.
@@ -523,9 +569,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Bytes verified and placed into the bundle, only ever going up.
     #[must_use]
     pub fn placed_bytes(&self) -> u64 {
-        self.plan.as_ref().map_or(0, |plan| {
+        self.locked_plan().map_or(0, |plan| {
             plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
         })
+    }
+
+    /// The plan under its lock, or nothing before the manifest settles it.
+    ///
+    /// A poisoned lock reads as no plan: the thread that poisoned it took
+    /// the fetch down with it, and every caller of this has a conservative
+    /// answer for a plan that is not there.
+    fn locked_plan(&self) -> Option<std::sync::MutexGuard<'_, FetchPlan>> {
+        self.plan.as_ref().and_then(|plan| plan.lock().ok())
     }
 
     /// Reports placed bytes to `observer` at every `quantum` crossing.
@@ -557,7 +612,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// One report if placed bytes crossed the next quantum, none otherwise.
     fn note_placed(&mut self) {
         let placed = self.placed_bytes();
-        let total = self.plan.as_ref().map(|plan| plan.summary.logical_length);
+        let total = self.locked_plan().map(|plan| plan.summary.logical_length);
         let Some(report) = &mut self.placed_report else {
             return;
         };
@@ -657,7 +712,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     fn complete(&self) -> bool {
-        self.plan.as_ref().is_some_and(|plan| plan.finished)
+        self.locked_plan().is_some_and(|plan| plan.finished)
     }
 
     /// Ends a fetch the receiver refused: the session's own faults keep the
@@ -694,7 +749,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Handed over while there is room, so what is out with a prover is a
         // few covers rather than an object.
         while pool.has_room() {
-            let Some(sink) = self.plan.as_ref().and_then(|plan| plan.active.clone()) else {
+            let Some(sink) = self.locked_plan().and_then(|plan| plan.active.clone()) else {
                 break;
             };
             let Some(completed) = self.receiver.take_completed() else {
@@ -707,10 +762,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // sink is chosen by that coupling.
             debug_assert_eq!(
                 Some(completed.subject()),
-                self.plan
-                    .as_ref()
-                    .and_then(|plan| plan.objects.get(plan.current))
-                    .map(subject_of)
+                self.locked_plan()
+                    .and_then(|plan| plan.objects.get(plan.current).map(subject_of))
             );
             if pool.work.try_send(Proving { completed, sink }).is_err() {
                 break;
@@ -998,7 +1051,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 });
             }
         }
-        self.plan = Some(FetchPlan {
+        self.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects,
             current: 0,
@@ -1006,7 +1059,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             placed_before: 0,
             next_offset: 0,
             finished: false,
-        });
+        })));
         Ok(())
     }
 
@@ -1014,14 +1067,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// behind, the next one is admitted and its ranges requested, and the
     /// last one seals the bundle with a directory sync.
     fn advance(&mut self) -> Result<(), Error> {
+        // The handle apart from self, so the receiver and the bundle stay
+        // reachable while the plan is held under its lock.
+        let Some(shared) = self.plan.clone() else {
+            return Ok(());
+        };
         // Counted by the plan itself: every pass either returns or leaves
         // one more object behind, so needing more passes than the plan
         // names objects means the cursor is not moving.
-        let objects = self.plan.as_ref().map_or(0, |plan| plan.objects.len());
+        let objects = shared
+            .lock()
+            .map_err(|_| Error::InvalidBundle)?
+            .objects
+            .len();
         for _ in 0..=objects {
-            let Some(plan) = &mut self.plan else {
-                return Ok(());
-            };
+            let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
             if let Some(sink) = &plan.active {
                 let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
                 if !self.receiver.is_verified(subject_of(planned)) {
@@ -1030,7 +1090,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // Durable before the fetch moves on, so a completed fetch
                 // never names bytes that were only in the page cache.
                 sink.file.file().sync_all()?;
-                plan.placed_before = plan.placed_before.saturating_add(sink.placed());
+                let placed = sink.placed();
+                plan.placed_before = plan.placed_before.saturating_add(placed);
                 plan.active = None;
                 plan.current += 1;
             }
@@ -1057,6 +1118,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
             plan.active = Some(sink);
             plan.next_offset = 0;
+            // Released before the requests are issued: the handout takes
+            // the same lock, and holding it here would deadlock the one
+            // thread the fetch has today.
+            drop(plan);
             self.issue_ranges()?;
             return Ok(());
         }
@@ -1065,35 +1130,23 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// Asks for as much of the object as may be outstanding at once.
     ///
-    /// What has been asked for and not yet placed is the measure, so an
-    /// object of any length is asked for a couple of covers at a time
-    /// however fast this end can build the frames.
+    /// The spans come from the plan's handout; this rail turns each into
+    /// a request frame of its own, and commits the span only once its
+    /// frame is queued, so a failure between the two leaves the span
+    /// owed rather than consumed. The lock is held across the pair,
+    /// which is what keeps two takers from framing the same span.
     fn issue_ranges(&mut self) -> Result<(), Error> {
-        let Some(plan) = &mut self.plan else {
+        let Some(shared) = self.plan.clone() else {
             return Ok(());
         };
-        let Some(sink) = plan.active.as_ref() else {
-            return Ok(());
-        };
-        let placed = sink.placed();
-        let object = plan
-            .objects
-            .get(plan.current)
-            .ok_or(Error::InvalidBundle)?
-            .object;
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
         for _ in 0..OUTSTANDING_COVERS {
-            // Everything asked for that has not arrived, which is what the
-            // peer and this end's receiver are holding between them.
-            if plan.next_offset.saturating_sub(placed) >= OUTSTANDING_REQUEST_BYTES {
-                return Ok(());
-            }
-            let Some((offset, length)) = range_span(plan.next_offset, object.length) else {
+            let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+            let Some((object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
             let request_id = Self::request_identifier(&mut self.next_request)?;
-            self.progress = self.progress.saturating_add(1);
             Self::queue_request(
                 &mut self.pending,
                 &TypedFrame::RangeRequest(RangeRequest {
@@ -1103,7 +1156,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     length,
                 }),
             )?;
-            plan.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
+            plan.take(offset, length)?;
+            self.progress = self.progress.saturating_add(1);
         }
         Ok(())
     }
@@ -1687,7 +1741,7 @@ mod tests {
             root: *blake3::hash(&[]).as_bytes(),
             length: 0,
         };
-        fetcher.plan = Some(FetchPlan {
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject { object: empty }],
             current: 0,
@@ -1695,7 +1749,7 @@ mod tests {
             placed_before: 0,
             next_offset: 0,
             finished: false,
-        });
+        })));
         fetcher.advance().unwrap();
 
         let path = output.join("objects").join(crate::object_name(&empty.root));
@@ -1923,7 +1977,7 @@ mod tests {
             );
             assert_eq!(status, FetchStatus::Active);
             // Everything asked for, and its answer waiting to be taken.
-            if !fetcher.has_backlog() && fetcher.plan.as_ref().is_some_and(|p| p.active.is_some()) {
+            if !fetcher.has_backlog() && fetcher.locked_plan().is_some_and(|p| p.active.is_some()) {
                 answered = true;
                 break;
             }
@@ -2193,7 +2247,7 @@ mod tests {
         };
         let sink =
             Arc::new(CountingSink::create(&output.join("objects").join("held.obj"), 0).unwrap());
-        fetcher.plan = Some(FetchPlan {
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject { object }],
             current: 0,
@@ -2201,7 +2255,7 @@ mod tests {
             placed_before: 0,
             next_offset: 0,
             finished: false,
-        });
+        })));
 
         // However many passes, and however readily the carrier takes them.
         for _ in 0..16 {
@@ -2209,7 +2263,7 @@ mod tests {
             fetcher.pending.clear();
         }
         assert_eq!(
-            fetcher.plan.as_ref().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().next_offset,
             OUTSTANDING_REQUEST_BYTES,
             "asked for more than may be outstanding"
         );
@@ -2218,13 +2272,31 @@ mod tests {
         sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.plan.as_ref().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().next_offset,
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
             "a placed cover did not buy the next request"
         );
         // And placing counts as progress, which is what keeps a driving
         // loop from giving up on a transfer that is arriving.
         assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
+
+        // A span is committed only once its frame is queued: a failure
+        // between the handout and the frame leaves the span owed. At one
+        // rail this ends the fetch either way; at W rails a span consumed
+        // by a failed frame would be a hole nobody ever re-requests.
+        sink.placed
+            .store(2 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        let owed = fetcher.locked_plan().unwrap().next_offset;
+        fetcher.next_request = u64::MAX;
+        assert!(
+            fetcher.issue_ranges().is_err(),
+            "the identifier space ended"
+        );
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            owed,
+            "a span whose frame never queued was consumed"
+        );
 
         discard(&[&bundle, &output]);
     }

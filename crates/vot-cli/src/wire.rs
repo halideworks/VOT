@@ -432,14 +432,13 @@ mod tests {
     #[test]
     fn a_fetch_at_width_two_crosses_one_serve_socket() {
         // ADR-0031 on the wire: two whole sessions from one fetch, one
-        // serve socket, the listener routing both. The object spans more
-        // than one rail's window, so the second rail carries real spans;
-        // the serve is bounded at exactly two sessions, so a fetch that
-        // quietly stayed at width one would strand the bound and fail.
-        let length = 5 * usize::try_from(vot_codec::frames::MAX_REQUESTED_RANGE).unwrap();
+        // serve socket, the listener routing both. The serve is bounded at
+        // exactly two sessions, so a fetch that quietly stayed at width
+        // one would strand the bound and fail. Striping distribution is
+        // the sim test's subject; the rig's W sweep is step 4.
         let source = crate::tests::temporary("railwire-source");
         std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("big.bin"), crate::harness::noise(length)).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(2_000_000)).unwrap();
         let bundle = crate::tests::temporary("railwire-bundle");
         let built = crate::build_bundle(&source, &bundle).unwrap();
 

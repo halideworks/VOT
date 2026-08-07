@@ -1767,7 +1767,122 @@ mod tests {
             secondary.set_proving_threads(2).is_ok(),
             "a narrower pool is the rail's to choose"
         );
+        // The rail's budgets are the pipeline depth in whole bundles, byte
+        // for byte, exactly as the primary's: a sum where a product
+        // belongs is one bundle wide and fails a conforming transfer.
+        assert_eq!(
+            secondary.receiver.pending_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+        );
+        assert_eq!(
+            secondary.receiver.orphan_byte_limit(),
+            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
+        );
         discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_rail_forgets_the_object_the_plan_moved_past() {
+        // A rail admits the current object to its own receiver; when the
+        // plan moves past one the rail only partly received, the partial
+        // account is forgotten, or the receiver holds a reservation per
+        // object it ever touched.
+        let output = temporary("railforget");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let first = PlannedObject {
+            object: frames::ObjectId {
+                suite: 1,
+                root: [1; 32],
+                length: 1000,
+            },
+        };
+        let second = PlannedObject {
+            object: frames::ObjectId {
+                suite: 1,
+                root: [2; 32],
+                length: 2000,
+            },
+        };
+        let (s0, s1) = (subject_of(&first), subject_of(&second));
+        let sink0 = Arc::new(
+            CountingSink::create(&output.join("objects").join("a.obj"), first.object.length)
+                .unwrap(),
+        );
+        let sink1 = Arc::new(
+            CountingSink::create(&output.join("objects").join("b.obj"), second.object.length)
+                .unwrap(),
+        );
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: vec![first, second],
+            current: 0,
+            active: Some(sink0),
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            finished: false,
+        })));
+        fetcher.advance().unwrap();
+        assert_eq!(
+            fetcher.admitted,
+            Some((0, s0)),
+            "the first object is this rail's"
+        );
+
+        // Another rail saw the first object whole and moved the plan on.
+        {
+            let mut plan = fetcher.locked_plan().unwrap();
+            plan.current = 1;
+            plan.active = Some(sink1);
+        }
+        fetcher.advance().unwrap();
+        assert_eq!(
+            fetcher.admitted,
+            Some((1, s1)),
+            "the current object is admitted"
+        );
+        assert!(
+            !fetcher.receiver.abandon(s0),
+            "the partial first object was already forgotten"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    fn a_finished_plan_is_left_exactly_as_it_is() {
+        // A pass over a finished plan changes nothing and touches no file:
+        // re-running the closing directory sync would make every pass
+        // after completion an I/O ritual, and here the directory is gone
+        // to prove nothing reaches for it.
+        let output = temporary("finished-left");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: Vec::new(),
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            finished: true,
+        })));
+        fs::remove_dir_all(&output).unwrap();
+        fetcher.advance().unwrap();
+        assert!(fetcher.complete());
     }
 
     #[test]
@@ -1830,8 +1945,9 @@ mod tests {
 
         type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
 
-        let length = 5 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
-        let (bundle, built) = built_bundle("threaded", &[("big.bin", noise(length))]);
+        // Small on purpose: the striping distribution is the interleaved
+        // test's subject, and this one rides every mutant of the crate.
+        let (bundle, built) = built_bundle("threaded", &[("big.bin", patterned(300_000))]);
         let output = temporary("threaded-fetched");
         let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let serving_halves = Arc::clone(&halves);

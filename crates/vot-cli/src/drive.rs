@@ -613,6 +613,59 @@ mod tests {
     }
 
     #[test]
+    fn the_width_guard_refuses_what_cannot_pace() {
+        use crate::harness::Loopback;
+
+        // Zero rails is no fetch at all.
+        let output = crate::tests::temporary("widthguard-zero");
+        let fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let outcome = fetch_striped(fetcher, 0, || Err::<Loopback, _>(Error::CarrierUnavailable));
+        assert!(matches!(outcome, Err(Error::InvalidArguments)));
+        crate::harness::discard(&[&output]);
+
+        // Rails past one pace on settled witnesses, which inline proving
+        // never books: the width and the mode are refused together.
+        let output = crate::tests::temporary("widthguard-inline");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_proving_threads(0).unwrap();
+        let outcome = fetch_striped(fetcher, 2, || Err::<Loopback, _>(Error::CarrierUnavailable));
+        assert!(matches!(outcome, Err(Error::InvalidArguments)));
+        crate::harness::discard(&[&output]);
+    }
+
+    #[test]
+    fn one_rail_proving_inline_is_still_a_fetch() {
+        // Width one restores today's shape exactly, inline proving
+        // included; a guard that caught it would take a working
+        // configuration away.
+        use crate::harness::{built_bundle, duplex_pair, not_required, patterned};
+
+        let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
+        let (client, half) = duplex_pair();
+        let serving_bundle = bundle.clone();
+        let serving = std::thread::spawn(move || {
+            let server = crate::BundleServer::open(&serving_bundle)?;
+            let mut half = Some(half);
+            serve_sessions(Some(1), || {
+                half.take()
+                    .map_or(Err(Error::CarrierUnavailable), |carrier| {
+                        ServeSession::begin(&server, carrier, not_required())
+                    })
+            })
+        });
+        let output = crate::tests::temporary("inlinewidth-fetched");
+        let mut fetcher = crate::BundleFetcher::begin(client, &output, None).unwrap();
+        fetcher.set_proving_threads(0).unwrap();
+        let package = fetch_striped(fetcher, 1, || {
+            Err::<crate::harness::Duplex, _>(Error::CarrierUnavailable)
+        })
+        .expect("one rail, no provers, a whole fetch");
+        assert_eq!(package, built);
+        serving.join().expect("the serving thread").expect("served");
+        crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
     fn sessions_are_served_at_the_same_time() {
         // Two carriers meet at a rendezvous inside their waits: a serve
         // that drives sessions one after another leaves the first waiting

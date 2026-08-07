@@ -993,13 +993,12 @@ fn run(
                         feed_received(&mut conn, local, &mut buffer[..len], from, segment);
                         drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
                     }
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::TimedOut =>
-                    {
+                    Err(error) => {
+                        if !read_ran_out(&error) {
+                            return Ok(());
+                        }
                         conn.on_timeout();
                     }
-                    Err(_) => return Ok(()),
                 }
             }
             Intake::Routed(packets) => match packets.recv_timeout(deadline) {
@@ -1049,6 +1048,16 @@ fn run(
             }
         }
     }
+}
+
+/// Whether a socket read failed only for want of a packet within its
+/// timeout, which is the wait the deadline priced; anything else is the
+/// carrier failing.
+fn read_ran_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// How often an arrival wait rechecks a driver that may have gone.
@@ -1209,13 +1218,12 @@ fn route(
     while !stop.load(Ordering::Relaxed) {
         let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space) {
             Ok(read) => read,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
+            Err(error) => {
+                if read_ran_out(&error) {
+                    continue;
+                }
+                return;
             }
-            Err(_) => return,
         };
         // The header wants only the first datagram of a coalesced read,
         // and the kernel only coalesces one flow, so its identifier
@@ -1337,9 +1345,7 @@ fn accept_routed(
     let (router_side, packets) = mpsc::sync_channel(ROUTED_READS);
     let path = Arc::new(Mutex::new(None));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // The listener's port would name every connection alike; the index
-    // tells them apart in events.
-    let connection = ConnectionId((u64::from(local.port()) << 32) | index);
+    let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
 
     let pump_socket = Arc::clone(socket);
@@ -1399,23 +1405,24 @@ fn accept_routed(
     ))
 }
 
+/// What a listener's connection reports itself as: the port names the
+/// endpoint, the index tells its connections apart, every one of them
+/// sharing the port.
+fn routed_connection_id(port: u16, index: u64) -> u64 {
+    (u64::from(port) << 32) | index
+}
+
 /// A connection identifier for one of a listener's connections.
 ///
-/// The port alone names the endpoint, as [`scid_for`] derives it; the
-/// index is what tells a listener's connections apart, every one of them
-/// sharing the port.
+/// Port and index twice over, once in each byte order: nothing here is a
+/// secret (the header only routes; the crypto rejects a forgery), it only
+/// has to differ per connection and fill the length a peer expects.
 fn scid_routed(local: SocketAddr, index: u64) -> quiche::ConnectionId<'static> {
     let mut bytes = [0_u8; quiche::MAX_CONN_ID_LEN];
-    let port = local.port().to_be_bytes();
-    bytes[..2].copy_from_slice(&port);
+    bytes[..2].copy_from_slice(&local.port().to_be_bytes());
     bytes[2..10].copy_from_slice(&index.to_be_bytes());
-    for (at, byte) in bytes.iter_mut().enumerate().skip(10) {
-        let step = u8::try_from(at % 251).unwrap_or(0);
-        *byte = step
-            .wrapping_mul(37)
-            .wrapping_add(port[at % 2])
-            .wrapping_add(u8::try_from(index % 251).unwrap_or(0));
-    }
+    bytes[10..12].copy_from_slice(&local.port().to_le_bytes());
+    bytes[12..20].copy_from_slice(&index.to_le_bytes());
     quiche::ConnectionId::from_vec(bytes.to_vec())
 }
 
@@ -2455,6 +2462,58 @@ mod tests {
         });
         assert_eq!(carried(&on_client1), vec![frame(b"first-answer")]);
         assert_eq!(carried(&on_client2), vec![frame(b"second-answer")]);
+    }
+
+    #[test]
+    fn only_a_timeout_is_a_read_that_ran_out() {
+        // The pump rides out a read that merely timed out and ends on
+        // anything else; this table is the whole of that decision.
+        use std::io::ErrorKind;
+        assert!(read_ran_out(&std::io::Error::from(ErrorKind::WouldBlock)));
+        assert!(read_ran_out(&std::io::Error::from(ErrorKind::TimedOut)));
+        assert!(!read_ran_out(&std::io::Error::from(ErrorKind::BrokenPipe)));
+        assert!(!read_ran_out(&std::io::Error::from(ErrorKind::Other)));
+    }
+
+    #[test]
+    fn a_routed_connection_is_named_by_port_and_index() {
+        // The exact composition: the port in the high bits, the index in
+        // the low, so a listener's connections never collide with each
+        // other or with a port-named single-socket endpoint.
+        assert_eq!(routed_connection_id(4433, 7), (4433 << 32) | 7);
+        assert_eq!(routed_connection_id(0, 9), 9);
+        // An index reaching into the port's bits still combines as bits,
+        // not arithmetic.
+        let overlapping = (3_u64 << 32) | 1;
+        assert_eq!(
+            routed_connection_id(3, overlapping),
+            (3 << 32) | overlapping
+        );
+    }
+
+    #[test]
+    fn routed_identifiers_differ_by_index_and_fill_the_length() {
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let (one, two) = (scid_routed(local, 1), scid_routed(local, 2));
+        assert_ne!(one, two, "two connections, two identifiers");
+        assert_eq!(one.len(), quiche::MAX_CONN_ID_LEN);
+        let other: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        assert_ne!(scid_routed(other, 1), one, "another port, another name");
+    }
+
+    #[test]
+    fn a_dropped_listener_releases_its_socket() {
+        // The drop stops the router and joins it, which is what lets the
+        // port be bound again: a router left running holds the socket for
+        // as long as the process lives.
+        let (certificate, key) = credentials();
+        let config = Config::server(limits(), certificate, key);
+        let local = {
+            let listener = Listener::bind("127.0.0.1:0".parse().expect("an address"), &config)
+                .expect("a bind");
+            listener.local_address()
+        };
+        UdpSocket::bind(local).expect("the dropped listener released its port");
     }
 
     #[test]

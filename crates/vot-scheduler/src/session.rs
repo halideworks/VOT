@@ -868,6 +868,20 @@ mod tests {
     }
 
     #[test]
+    fn an_abandoned_subject_is_forgotten_once_and_admissible_again() {
+        // ADR-0031: a rail forgets an object the shared plan completed
+        // elsewhere. The answer says whether there was anything to forget,
+        // and the freed state is what lets the subject be admitted again.
+        let (subject, _, _) = object();
+        let mut driver = ready();
+        assert!(!driver.abandon(subject), "nothing admitted, nothing owed");
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        assert!(driver.abandon(subject));
+        assert!(!driver.abandon(subject), "forgotten once");
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+    }
+
+    #[test]
     fn a_bundle_and_its_records_become_verified_state() {
         // Nothing joined a session to a receiver, so a live carrier moved
         // records and verified nothing.

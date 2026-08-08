@@ -102,7 +102,7 @@ one router namespace and puts the router's WAN on the internet. A new flavour
 is a new arm of the `case` in `site`. Double NAT is two chained routers and is
 not built yet.
 
-The lab found one defect that has nothing to do with NAT: a serve writes its
+The lab found one defect that has nothing to do with NAT: a serve wrote its
 ephemeral credentials to a directory named from its process ID, and inside a
-PID namespace that number repeats every run, so the second run fails to start.
-The lab gives each run its own `TMPDIR` to work around it.
+PID namespace that number repeats every run, so the second run failed to
+start. The name is 128 random bits now, and the lab needs no workaround.

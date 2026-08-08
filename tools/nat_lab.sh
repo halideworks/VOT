@@ -187,12 +187,6 @@ run() {
 
     work=$(mktemp -d)
     service="192.168.1.1:$SERVICE_PORT"
-    # A serve writes its ephemeral credentials to a name built from its PID,
-    # and inside a PID namespace that number repeats every run. Its own
-    # temporary directory keeps one run from colliding with the last.
-    mkdir -p "$work/tmp"
-    TMPDIR=$work/tmp
-    export TMPDIR
 
     "$BINARY" rendezvous "$service" > "$work/service.log" 2>&1 &
     SERVICE_PID=$!

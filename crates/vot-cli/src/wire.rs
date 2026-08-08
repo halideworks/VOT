@@ -1208,7 +1208,21 @@ mod tests {
         // The mapping the service observes is what the serve opens its NAT
         // for, so it has to be the session's own socket. Loopback cannot
         // filter by port, so the identity itself is the assertion.
-        let serve: SocketAddr = "203.0.113.7:4433".parse().expect("an address");
+        //
+        // The rail also has to send toward the serve before it waits: a
+        // warming that arrives before this end sent anything is unsolicited,
+        // and a NAT that tracks it takes the mapping the session wanted.
+        // Loopback cannot show that either, so what is asserted is that the
+        // datagrams go, and go from the session's socket.
+        use crate::rendezvous::{Datagram, decode};
+
+        let at_serve = UdpSocket::bind("127.0.0.1:0").expect("a socket at the serve's mapping");
+        // The warmings are queued before the punch returns, so this bound only
+        // prices a mutant that sends none.
+        at_serve
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a bounded wait");
+        let serve = at_serve.local_addr().expect("the serve's mapping");
         let elsewhere: SocketAddr = "198.51.100.9:4433".parse().expect("an address");
         let (service, observed) = one_resolve(serve, elsewhere);
         let punched = punch_within(
@@ -1222,11 +1236,24 @@ mod tests {
             punched.serve, serve,
             "the mapping the service holds under this key, not another"
         );
+        let announced = punched.socket.local_addr().expect("the socket");
         assert_eq!(
-            punched.socket.local_addr().expect("the socket"),
+            announced,
             observed.join().expect("the service thread"),
             "the announced mapping is the socket the session connects on"
         );
+
+        let mut buffer = [0_u8; 128];
+        for datagram in 0..crate::rendezvous::WARMING_DATAGRAMS {
+            let (length, from) = at_serve
+                .recv_from(&mut buffer)
+                .unwrap_or_else(|_| panic!("warming {datagram} never reached the serve"));
+            assert_eq!(decode(&buffer[..length]), Some(Datagram::Warming));
+            assert_eq!(
+                from, announced,
+                "the rail opened its own side from the session's socket"
+            );
+        }
     }
 
     #[test]

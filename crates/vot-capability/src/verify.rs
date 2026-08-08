@@ -140,10 +140,24 @@ impl Denial {
 }
 
 /// What a request asks a capability to authorize.
+///
+/// A raw identifier cannot be one, which is the whole point:
+///
+/// ```compile_fail
+/// use vot_capability::verify::Request;
+///
+/// let request = Request {
+///     operation: 0x0004,
+///     suite: 1,
+///     root: [0; 32],
+///     range: None,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Request {
-    /// An operation identifier from `spec/registries.md` section 12.
-    pub operation: u64,
+    /// What is being asked for. Closed, so an identifier this revision
+    /// cannot name has no way to reach the grant below.
+    pub operation: vot_codec::Operation,
     /// The suite and root the request is about.
     pub suite: u16,
     pub root: [u8; 32],
@@ -170,8 +184,8 @@ impl Authorized {
     /// Reports an operation the capability does not allow, another object, and a
     /// range outside its scope.
     pub fn allows(&self, request: Request) -> Result<(), Denial> {
-        if !self.capability.allows(request.operation) {
-            return Err(Denial::OperationNotAllowed(request.operation));
+        if !self.capability.allows(request.operation.identifier()) {
+            return Err(Denial::OperationNotAllowed(request.operation.identifier()));
         }
         if request.suite != self.capability.scope.suite
             || request.root != self.capability.scope.root
@@ -429,7 +443,7 @@ mod tests {
         assert_eq!(authorized.limit(1), Some(4));
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::PUBLISH,
+                operation: vot_codec::Operation::Publish,
                 suite: 1,
                 root: [7; 32],
                 range: Some(Range {
@@ -713,6 +727,44 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_operation_in_a_valid_capability_grants_nothing() {
+        // A capability issued by a later revision, holding one value this one
+        // cannot name alongside one it can. The registry says such a token
+        // stays valid and the unknown value grants nothing.
+        let mut value = capability();
+        value.operations = vec![vot_codec::operation::PUBLISH, 0x0004];
+        let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
+        let proof = proof_for(&value);
+        let authorized = authorize(
+            &signed,
+            presented(&proof),
+            &anchors(),
+            policy(&limits(), &[]),
+        )
+        .expect("an unknown operation does not invalidate the token");
+
+        assert!(
+            authorized.capability().allows(0x0004),
+            "the value survived the round trip, so the denial below is the type's doing"
+        );
+        assert_eq!(
+            vot_codec::Operation::try_from(0x0004_u64),
+            Err(vot_codec::UnknownOperation(0x0004)),
+            "and no request can name it"
+        );
+
+        assert_eq!(
+            authorized.allows(Request {
+                operation: vot_codec::Operation::Publish,
+                suite: 1,
+                root: [7; 32],
+                range: None,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn token_scope_rejected() {
         let value = capability();
         let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
@@ -727,7 +779,7 @@ mod tests {
 
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::READ_MANIFEST,
+                operation: vot_codec::Operation::ReadManifest,
                 suite: 1,
                 root: [7; 32],
                 range: None,
@@ -739,7 +791,7 @@ mod tests {
 
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::PUBLISH,
+                operation: vot_codec::Operation::Publish,
                 suite: 1,
                 root: [8; 32],
                 range: None,
@@ -748,7 +800,7 @@ mod tests {
         );
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::PUBLISH,
+                operation: vot_codec::Operation::Publish,
                 suite: 2,
                 root: [7; 32],
                 range: None,
@@ -758,7 +810,7 @@ mod tests {
 
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::READ_RANGES,
+                operation: vot_codec::Operation::ReadRanges,
                 suite: 1,
                 root: [7; 32],
                 range: Some(Range {
@@ -770,7 +822,7 @@ mod tests {
         );
         assert_eq!(
             authorized.allows(Request {
-                operation: vot_codec::operation::READ_RANGES,
+                operation: vot_codec::Operation::ReadRanges,
                 suite: 1,
                 root: [7; 32],
                 range: Some(Range {

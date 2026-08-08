@@ -3576,7 +3576,7 @@ pub mod live {
             );
             assert_eq!(
                 authorized.allows(vot_capability::verify::Request {
-                    operation: vot_codec::operation::PUBLISH,
+                    operation: vot_codec::Operation::Publish,
                     suite: 1,
                     root: [7; 32],
                     range: Some(vot_capability::Range {

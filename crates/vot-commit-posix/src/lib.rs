@@ -74,6 +74,7 @@ pub enum Error {
     Poisoned,
     MissingObservation,
     DestinationIdentityMismatch,
+    StagingIdentityMismatch,
     StrictIdentityMismatch,
 }
 
@@ -95,11 +96,76 @@ impl From<vot_commit_model::Error> for Error {
     }
 }
 
+/// A filesystem object, as `(device, inode, length)`. The length is there
+/// because an unlinked inode number can be handed straight back to the next
+/// file created in the same directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Identity([u8; 24]);
+
+impl Identity {
+    fn of_path(path: &Path) -> Result<Self, Error> {
+        Ok(Self::of_metadata(&fs::metadata(path)?))
+    }
+
+    fn of_file(file: &File) -> Result<Self, Error> {
+        Ok(Self::of_metadata(&file.metadata()?))
+    }
+
+    fn of_metadata(metadata: &fs::Metadata) -> Self {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&metadata.dev().to_le_bytes());
+        bytes[8..16].copy_from_slice(&metadata.ino().to_le_bytes());
+        bytes[16..].copy_from_slice(&metadata.len().to_le_bytes());
+        Self(bytes)
+    }
+
+    fn from_payload(payload: &[u8]) -> Option<Self> {
+        payload.try_into().ok().map(Self)
+    }
+}
+
+/// The staging object. Sealing drops the write capability, so no writable
+/// handle reaches publication.
+enum Staging {
+    Open(File),
+    Sealed(File),
+}
+
+impl Staging {
+    const fn handle(&self) -> &File {
+        match self {
+            Self::Open(file) | Self::Sealed(file) => file,
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Open(file) => file.write_all(bytes),
+            Self::Sealed(_) => Err(io::Error::other("staging is sealed")),
+        }
+    }
+
+    /// Reopens `path` read only and proves it is the inode this staging
+    /// already holds, then drops the writable handle. Sealing claims nothing
+    /// about durability, so the Fast profile can seal without a sync.
+    fn seal(&mut self, path: &Path) -> Result<(), Error> {
+        if matches!(self, Self::Sealed(_)) {
+            return Ok(());
+        }
+        let read_only = File::open(path)?;
+        if Identity::of_file(&read_only)? != Identity::of_file(self.handle())? {
+            return Err(Error::StagingIdentityMismatch);
+        }
+        *self = Self::Sealed(read_only);
+        Ok(())
+    }
+}
+
 pub struct PosixCommit<F> {
     profile: Profile,
     incarnation: [u8; 16],
     machine: Machine,
-    staging: File,
+    staging: Staging,
     staging_path: PathBuf,
     destination: PathBuf,
     journal: Journal,
@@ -126,7 +192,7 @@ impl<F: FaultInjector> PosixCommit<F> {
             profile,
             incarnation,
             machine: Machine::new(profile),
-            staging,
+            staging: Staging::Open(staging),
             staging_path,
             destination,
             journal,
@@ -172,6 +238,7 @@ impl<F: FaultInjector> PosixCommit<F> {
         if self.profile == Profile::Balanced {
             self.prepare_durable()?;
         }
+        self.staging.seal(&self.staging_path)?;
         self.publish_namespace()
     }
 
@@ -185,10 +252,14 @@ impl<F: FaultInjector> PosixCommit<F> {
             return Err(Error::UnsupportedProfile);
         }
         self.prepare_durable()?;
-        let logical_length = self.staging.metadata()?.len();
+        self.staging.seal(&self.staging_path)?;
+        let logical_length = self.staging.handle().metadata()?.len();
         let reader = LinuxDirectReader::open(&self.staging_path, logical_length, alignment)
             .map_err(Error::Strict)?;
-        match reader.identity(&self.staging).map_err(Error::Strict)? {
+        match reader
+            .identity(self.staging.handle())
+            .map_err(Error::Strict)?
+        {
             vot_commit_strict::DirectIdentity::Match
             | vot_commit_strict::DirectIdentity::Unsupported => {}
             vot_commit_strict::DirectIdentity::Mismatch => {
@@ -237,6 +308,7 @@ impl<F: FaultInjector> PosixCommit<F> {
             return Err(Error::UnsupportedProfile);
         }
         self.prepare_durable()?;
+        self.staging.seal(&self.staging_path)?;
         self.finish_strict(reader, suite, expected)
     }
 
@@ -244,7 +316,7 @@ impl<F: FaultInjector> PosixCommit<F> {
         if let Err(error) = self
             .faults
             .check(FaultPoint::DataFlush)
-            .and_then(|()| self.staging.sync_all())
+            .and_then(|()| self.staging.handle().sync_all())
         {
             self.machine.apply(Event::DataFlushFailed)?;
             self.trace.push(TraceEvent::Poisoned);
@@ -278,34 +350,38 @@ impl<F: FaultInjector> PosixCommit<F> {
             return Err(Error::Io(error));
         }
         self.machine.apply(Event::NamespaceLinked)?;
-        if let Err(error) = self.journal.append_durable(JOURNAL_NAMESPACE_LINKED, &[]) {
+        // Recovery compares this against the destination it finds, so it never
+        // has to infer identity from a staging name that publication removes.
+        let identity = match Identity::of_path(&self.destination) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.machine.apply(Event::NamespaceFlushFailed)?;
+                self.trace.push(TraceEvent::RecoveryRequired);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .journal
+            .append_durable(JOURNAL_NAMESPACE_LINKED, &identity.0)
+        {
             self.machine.apply(Event::NamespaceFlushFailed)?;
             self.trace.push(TraceEvent::RecoveryRequired);
             return Err(Error::Journal(error));
         }
         self.trace.push(TraceEvent::NamespaceLinked);
 
-        let parent = self.destination.parent().ok_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "destination has no parent",
-            ))
-        })?;
-        if let Err(error) = self
-            .faults
-            .check(FaultPoint::DirectoryFlush)
-            .and_then(|()| File::open(parent)?.sync_all())
-        {
+        if let Err(error) = self.seal_namespace() {
             self.machine.apply(Event::NamespaceFlushFailed)?;
             self.trace.push(TraceEvent::RecoveryRequired);
-            return Err(Error::Io(error));
+            return Err(error);
         }
         self.trace.push(TraceEvent::DirectoryFlushed);
         let observation = self
             .machine
             .apply(Event::NamespaceDurable)?
             .ok_or(Error::MissingObservation)?;
-        self.journal.append_durable(JOURNAL_PUBLISHED, &[])?;
+        self.journal
+            .append_durable(JOURNAL_PUBLISHED, &identity.0)?;
         self.trace.push(TraceEvent::ReceiptEmitted);
         Ok(Receipt {
             level: observation.level,
@@ -313,6 +389,24 @@ impl<F: FaultInjector> PosixCommit<F> {
             incarnation: self.incarnation,
             sequence: observation.sequence,
         })
+    }
+
+    /// Makes the destination link durable, then removes the staging name so
+    /// nothing can reach the published inode through it, then makes that
+    /// removal durable too. The order never leaves the object unreachable:
+    /// a crash before the unlink finds both names, a crash after it finds the
+    /// destination.
+    fn seal_namespace(&mut self) -> Result<(), Error> {
+        let (destination_parent, staging_parent) =
+            flushed_directories(&self.destination, &self.staging_path)?;
+        self.faults
+            .check(FaultPoint::DirectoryFlush)
+            .and_then(|()| File::open(destination_parent)?.sync_all())?;
+        remove_alias(&self.staging_path)?;
+        if let Some(staging_parent) = staging_parent {
+            File::open(staging_parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -340,15 +434,25 @@ pub fn recover(
     destination: &Path,
 ) -> Result<RecoveryDisposition, Error> {
     let replay = vot_journal::replay(journal_path, incarnation)?;
-    let last = replay.records.last().map(|record| record.state);
+    let last = replay.records.last();
     if destination.exists() {
-        if last == Some(JOURNAL_PUBLISHED) {
-            return Ok(RecoveryDisposition::AlreadyPublished);
-        }
-        if !same_file(staging_path, destination)? {
+        // A destination this incarnation never linked is somebody else's
+        // file. That is a definite conflict, not something to recover.
+        let Some(record) = last
+            .filter(|record| matches!(record.state, JOURNAL_NAMESPACE_LINKED | JOURNAL_PUBLISHED))
+        else {
+            return Err(Error::DestinationIdentityMismatch);
+        };
+        let recorded =
+            Identity::from_payload(&record.payload).ok_or(Error::DestinationIdentityMismatch)?;
+        if recorded != Identity::of_path(destination)? {
             return Err(Error::DestinationIdentityMismatch);
         }
-        return Ok(RecoveryDisposition::FinishDirectoryFlush);
+        return Ok(if record.state == JOURNAL_PUBLISHED {
+            RecoveryDisposition::AlreadyPublished
+        } else {
+            RecoveryDisposition::FinishDirectoryFlush
+        });
     }
     if staging_path.exists() {
         return Ok(RecoveryDisposition::ResumeStaging);
@@ -359,10 +463,38 @@ pub fn recover(
     )))
 }
 
-fn same_file(left: &Path, right: &Path) -> Result<bool, Error> {
-    let left = fs::metadata(left)?;
-    let right = fs::metadata(right)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+/// The destination's parent, and the staging parent when it is a different
+/// directory. Publication changes the names in both, and one sync covers both
+/// only when they are one directory.
+fn flushed_directories<'a>(
+    destination: &'a Path,
+    staging: &'a Path,
+) -> Result<(&'a Path, Option<&'a Path>), Error> {
+    let destination_parent = parent_of(destination)?;
+    let staging_parent = parent_of(staging)?;
+    Ok((
+        destination_parent,
+        (staging_parent != destination_parent).then_some(staging_parent),
+    ))
+}
+
+fn parent_of(path: &Path) -> Result<&Path, Error> {
+    path.parent().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path has no parent",
+        ))
+    })
+}
+
+/// Removes a name that is already published under another. A name somebody
+/// else removed first is the outcome this wanted.
+fn remove_alias(path: &Path) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +640,156 @@ mod tests {
             ),
             Err(Error::DestinationIdentityMismatch)
         ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_a_separate_staging_directory_is_flushed_twice() {
+        assert_eq!(
+            flushed_directories(Path::new("/a/object"), Path::new("/a/stage")).unwrap(),
+            (Path::new("/a"), None)
+        );
+        assert_eq!(
+            flushed_directories(Path::new("/a/object"), Path::new("/b/stage")).unwrap(),
+            (Path::new("/a"), Some(Path::new("/b")))
+        );
+        assert!(matches!(
+            flushed_directories(Path::new("/"), Path::new("/a/stage")),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            flushed_directories(Path::new("/a/object"), Path::new("/")),
+            Err(Error::Io(_))
+        ));
+    }
+
+    #[test]
+    fn removing_an_alias_tolerates_absence_but_not_failure() {
+        let directory = directory("remove-alias");
+        remove_alias(&directory.join("never-existed")).unwrap();
+        let name = directory.join("present");
+        fs::write(&name, b"gone soon").unwrap();
+        remove_alias(&name).unwrap();
+        assert!(!name.exists());
+        // A directory is not an alias, and the failure must surface.
+        assert!(matches!(remove_alias(&directory), Err(Error::Io(_))));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn published_object_has_no_writable_staging_alias() {
+        let directory = directory("no-alias");
+        let mut commit = provider(&directory, Profile::Balanced, None);
+        commit.write_transit_verified(b"published bytes").unwrap();
+        commit.publish().unwrap();
+
+        let staging = directory.join("stage");
+        assert!(!staging.exists(), "the staging name outlived publication");
+        assert!(matches!(commit.staging, Staging::Sealed(_)));
+        assert_eq!(
+            commit.staging.write_all(b"more").unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+
+        // The staging name is claimable again, and what lands there is a
+        // different inode that cannot reach the published object.
+        fs::write(&staging, b"impostor").unwrap();
+        assert_eq!(
+            fs::read(directory.join("object")).unwrap(),
+            b"published bytes"
+        );
+        assert_ne!(
+            Identity::of_path(&staging).unwrap(),
+            Identity::of_path(&directory.join("object")).unwrap()
+        );
+        drop(commit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_across_directories_removes_the_alias() {
+        let directory = directory("cross-directory");
+        let staging_directory = directory.join("staging");
+        let namespace = directory.join("namespace");
+        fs::create_dir(&staging_directory).unwrap();
+        fs::create_dir(&namespace).unwrap();
+        let mut commit = PosixCommit::create(
+            Profile::Balanced,
+            [4; 16],
+            staging_directory.join("stage"),
+            namespace.join("object"),
+            &directory.join("journal"),
+            OneFault(None),
+        )
+        .unwrap();
+        commit.write_transit_verified(b"crossing").unwrap();
+        commit.publish().unwrap();
+        assert!(!staging_directory.join("stage").exists());
+        assert_eq!(fs::read(namespace.join("object")).unwrap(), b"crossing");
+        drop(commit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_a_published_marker_for_an_unrelated_destination() {
+        let directory = directory("forged-published");
+        let mut commit = provider(&directory, Profile::Balanced, None);
+        commit.write_transit_verified(b"published bytes").unwrap();
+        commit.publish().unwrap();
+        drop(commit);
+
+        // The journal still ends in PUBLISHED, but this destination holds a
+        // file the incarnation never linked. Visibility is not publication.
+        let unrelated = directory.join("unrelated");
+        fs::write(&unrelated, b"someone else").unwrap();
+        assert!(matches!(
+            recover(
+                &directory.join("journal"),
+                [4; 16],
+                &directory.join("stage"),
+                &unrelated
+            ),
+            Err(Error::DestinationIdentityMismatch)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_finishes_a_link_whose_alias_is_already_gone() {
+        let directory = directory("alias-gone");
+        let mut commit = provider(&directory, Profile::Fast, Some(FaultPoint::DirectoryFlush));
+        commit.write_transit_verified(b"linked").unwrap();
+        assert!(commit.publish().is_err());
+        drop(commit);
+        // The crash cut between the destination flush and the staging flush:
+        // the alias is unlinked but the journal has not reached PUBLISHED.
+        fs::remove_file(directory.join("stage")).unwrap();
+        assert_eq!(
+            recover(
+                &directory.join("journal"),
+                [4; 16],
+                &directory.join("stage"),
+                &directory.join("object")
+            )
+            .unwrap(),
+            RecoveryDisposition::FinishDirectoryFlush
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sealing_refuses_a_staging_name_that_was_swapped() {
+        let directory = directory("swapped-staging");
+        let mut commit = provider(&directory, Profile::Fast, None);
+        commit.write_transit_verified(b"staged").unwrap();
+        fs::remove_file(directory.join("stage")).unwrap();
+        fs::write(directory.join("stage"), b"substitute").unwrap();
+        assert!(matches!(
+            commit.publish(),
+            Err(Error::StagingIdentityMismatch)
+        ));
+        assert!(!directory.join("object").exists());
+        drop(commit);
         fs::remove_dir_all(directory).unwrap();
     }
 

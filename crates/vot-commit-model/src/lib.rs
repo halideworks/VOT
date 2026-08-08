@@ -2,7 +2,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Profile {
     Fast,
     Balanced,
@@ -18,7 +18,7 @@ pub enum Assurance {
     Published,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum State {
     New,
     Admitted,
@@ -246,31 +246,216 @@ impl Machine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EVENTS: [Event; 15] = [
-        Event::Admit,
-        Event::TransitVerified,
-        Event::DataFlushSucceeded,
-        Event::DataFlushFailed,
-        Event::JournalFlushSucceeded,
-        Event::JournalFlushFailed,
-        Event::AtRestVerified,
-        Event::AtRestVerificationFailed,
-        Event::NamespaceLinked,
-        Event::NamespaceLinkAmbiguous,
-        Event::NamespaceDurable,
-        Event::NamespaceFlushFailed,
-        Event::Crash,
-        Event::Recover,
-        Event::Abort,
+impl Event {
+    /// Every event, so a walk over the relation cannot miss one by omission.
+    pub const ALL: [Self; 15] = [
+        Self::Admit,
+        Self::TransitVerified,
+        Self::DataFlushSucceeded,
+        Self::DataFlushFailed,
+        Self::JournalFlushSucceeded,
+        Self::JournalFlushFailed,
+        Self::AtRestVerified,
+        Self::AtRestVerificationFailed,
+        Self::NamespaceLinked,
+        Self::NamespaceLinkAmbiguous,
+        Self::NamespaceDurable,
+        Self::NamespaceFlushFailed,
+        Self::Crash,
+        Self::Recover,
+        Self::Abort,
     ];
+}
 
-    /// Two machines behave alike when everything but the sequence agrees, so
-    /// the search dedupes on that and terminates.
-    fn shape(machine: &Machine) -> (Profile, State, bool, Option<State>, Vec<Assurance>) {
+impl Profile {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Strict => "Strict",
+        }
+    }
+}
+
+impl Assurance {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Admitted => "Admitted",
+            Self::TransitVerified => "TransitVerified",
+            Self::Durable => "Durable",
+            Self::AtRestVerified => "AtRestVerified",
+            Self::Published => "Published",
+        }
+    }
+}
+
+impl State {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::New => "New",
+            Self::Admitted => "Admitted",
+            Self::TransitVerified => "TransitVerified",
+            Self::DataFlushed => "DataFlushed",
+            Self::Durable => "Durable",
+            Self::AtRestVerified => "AtRestVerified",
+            Self::NamespaceLinked => "NamespaceLinked",
+            Self::Published => "Published",
+            Self::RecoveryRequired => "RecoveryRequired",
+            Self::Poisoned => "Poisoned",
+            Self::Aborted => "Aborted",
+        }
+    }
+}
+
+impl Event {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Admit => "Admit",
+            Self::TransitVerified => "TransitVerified",
+            Self::DataFlushSucceeded => "DataFlushSucceeded",
+            Self::DataFlushFailed => "DataFlushFailed",
+            Self::JournalFlushSucceeded => "JournalFlushSucceeded",
+            Self::JournalFlushFailed => "JournalFlushFailed",
+            Self::AtRestVerified => "AtRestVerified",
+            Self::AtRestVerificationFailed => "AtRestVerificationFailed",
+            Self::NamespaceLinked => "NamespaceLinked",
+            Self::NamespaceLinkAmbiguous => "NamespaceLinkAmbiguous",
+            Self::NamespaceDurable => "NamespaceDurable",
+            Self::NamespaceFlushFailed => "NamespaceFlushFailed",
+            Self::Crash => "Crash",
+            Self::Recover => "Recover",
+            Self::Abort => "Abort",
+        }
+    }
+}
+
+impl Error {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StaleIncarnation => "StaleIncarnation",
+            Self::Terminal => "Terminal",
+            Self::InvalidTransition => "InvalidTransition",
+            Self::MissingPredecessor => "MissingPredecessor",
+        }
+    }
+}
+
+/// One row of the transition relation: a machine, an event, and what the
+/// machine did with it. The sequence is left out; it counts accepted
+/// transitions and says nothing a second implementation could disagree about.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransitionRow {
+    pub profile: Profile,
+    pub state: State,
+    pub current_incarnation: bool,
+    pub recovery_state: Option<State>,
+    pub performed: Vec<Assurance>,
+    pub event: Event,
+    pub error: Option<Error>,
+    pub next_state: State,
+    pub next_recovery_state: Option<State>,
+    pub observation: Option<Assurance>,
+}
+
+impl std::fmt::Display for TransitionRow {
+    /// One JSON object per row, on one line, so a diff points at a
+    /// transition rather than at a reflowed document.
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quoted = |value: Option<&'static str>| {
+            value.map_or_else(|| "null".to_owned(), |name| format!("\"{name}\""))
+        };
+        let performed: Vec<String> = self
+            .performed
+            .iter()
+            .map(|level| format!("\"{}\"", level.name()))
+            .collect();
+        write!(
+            out,
+            concat!(
+                "{{\"profile\": \"{}\", \"state\": \"{}\", \"current\": {}, ",
+                "\"recovery_state\": {}, \"performed\": [{}], \"event\": \"{}\", ",
+                "\"error\": {}, \"next_state\": \"{}\", \"next_recovery_state\": {}, ",
+                "\"observation\": {}}}"
+            ),
+            self.profile.name(),
+            self.state.name(),
+            self.current_incarnation,
+            quoted(self.recovery_state.map(State::name)),
+            performed.join(", "),
+            self.event.name(),
+            quoted(self.error.map(Error::name)),
+            self.next_state.name(),
+            quoted(self.next_recovery_state.map(State::name)),
+            quoted(self.observation.map(Assurance::name)),
+        )
+    }
+}
+
+/// Every machine an accepted event sequence can reach, stale variants
+/// included, crossed with every event. This is the whole relation over the
+/// bounded state space, which is what a second implementation has to agree
+/// with to be a refinement rather than a vocabulary match.
+#[must_use]
+pub fn transition_corpus() -> Vec<TransitionRow> {
+    let mut rows = Vec::new();
+    for machine in corpus_machines() {
+        for event in Event::ALL {
+            let mut candidate = machine.clone();
+            let outcome = candidate.apply(event);
+            rows.push(TransitionRow {
+                profile: machine.profile,
+                state: machine.state,
+                current_incarnation: machine.current_incarnation,
+                recovery_state: machine.recovery_state,
+                performed: machine.performed.clone(),
+                event,
+                error: outcome.as_ref().err().copied(),
+                next_state: candidate.state,
+                next_recovery_state: candidate.recovery_state,
+                observation: outcome.ok().flatten().map(|seen| seen.level),
+            });
+        }
+    }
+    rows
+}
+
+/// Every machine the walk reaches, and every one of those with a recorded
+/// assurance taken away.
+///
+/// The weakened ones are not reachable through accepted events, which is the
+/// point: a machine standing at `NamespaceLinked` with no predecessor
+/// recorded is what the publication defense exists for, and a walk over
+/// accepted sequences alone would never present it.
+fn corpus_machines() -> Vec<Machine> {
+    let reachable = reachable_machines();
+    let mut weakened = Vec::new();
+    for machine in &reachable {
+        for dropped in 0..machine.performed.len() {
+            let mut thinner = machine.clone();
+            thinner.performed.remove(dropped);
+            weakened.push(thinner);
+        }
+    }
+    let mut all = reachable;
+    all.append(&mut weakened);
+    all
+}
+
+/// A ceiling on the walk, well above the couple of hundred shapes it reaches.
+/// It is here so a walk that lost its deduplication stops rather than growing
+/// by a factor of the event count every round.
+const MAX_MACHINES: usize = 2048;
+
+/// Machines differing only in their sequence behave alike, so the search
+/// dedupes on everything else and terminates. No path needs more steps than
+/// there are events, which bounds it.
+fn reachable_machines() -> Vec<Machine> {
+    let shape = |machine: &Machine| {
         (
             machine.profile,
             machine.state,
@@ -278,47 +463,60 @@ mod tests {
             machine.recovery_state,
             machine.performed.clone(),
         )
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut frontier: Vec<Machine> = Vec::new();
+    let mut found = Vec::new();
+    for profile in [Profile::Fast, Profile::Balanced, Profile::Strict] {
+        let machine = Machine::new(profile);
+        seen.insert(shape(&machine));
+        found.push(machine.clone());
+        frontier.push(machine);
     }
-
-    /// Every machine an accepted event sequence can produce, stale variants
-    /// included. No path is longer than the number of events, which bounds
-    /// the search.
-    fn every_reachable_machine() -> Vec<Machine> {
-        let mut frontier: Vec<Machine> = [Profile::Fast, Profile::Balanced, Profile::Strict]
-            .into_iter()
-            .map(Machine::new)
-            .collect();
-        let mut found = frontier.clone();
-        for _ in 0..EVENTS.len() {
-            let mut next = Vec::new();
-            for machine in &frontier {
-                for event in EVENTS {
-                    let mut candidate = machine.clone();
-                    if candidate.apply(event).is_ok()
-                        && !found.iter().any(|seen| shape(seen) == shape(&candidate))
-                    {
-                        found.push(candidate.clone());
-                        next.push(candidate);
-                    }
+    for _ in 0..Event::ALL.len() {
+        let mut next = Vec::new();
+        for machine in &frontier {
+            for event in Event::ALL {
+                // Counted in the loop's own body, so a walk that stopped
+                // deduplicating would stop rather than run away.
+                if found.len() >= MAX_MACHINES {
+                    return found;
                 }
+                let mut candidate = machine.clone();
+                if candidate.apply(event).is_err() {
+                    continue;
+                }
+                if !seen.insert(shape(&candidate)) {
+                    continue;
+                }
+                found.push(candidate.clone());
+                next.push(candidate);
             }
-            frontier = next;
         }
-        let stale: Vec<Machine> = found
-            .iter()
-            .map(|machine| {
-                let mut stale = machine.clone();
-                stale.mark_stale();
-                stale
-            })
-            .collect();
-        found.extend(stale);
-        found
+        frontier = next;
     }
+    let stale: Vec<Machine> = found
+        .iter()
+        .map(|machine| {
+            let mut stale = machine.clone();
+            stale.mark_stale();
+            stale
+        })
+        .collect();
+    found.extend(stale);
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The library's own list, so a test cannot walk a stale one.
+    const EVENTS: [Event; 15] = Event::ALL;
 
     #[test]
     fn a_rejected_event_leaves_the_machine_untouched() {
-        let machines = every_reachable_machine();
+        let machines = corpus_machines();
         assert!(
             machines.len() > 20,
             "the search found only {} machines",
@@ -339,6 +537,175 @@ mod tests {
             }
         }
         assert!(rejections > 100, "only {rejections} events were rejected");
+    }
+
+    #[test]
+    fn every_name_is_the_variant_it_belongs_to() {
+        let names = |values: &[&'static str]| values.to_vec();
+        assert_eq!(
+            [Profile::Fast, Profile::Balanced, Profile::Strict]
+                .map(Profile::name)
+                .to_vec(),
+            names(&["Fast", "Balanced", "Strict"])
+        );
+        assert_eq!(
+            [
+                Assurance::Admitted,
+                Assurance::TransitVerified,
+                Assurance::Durable,
+                Assurance::AtRestVerified,
+                Assurance::Published,
+            ]
+            .map(Assurance::name)
+            .to_vec(),
+            names(&[
+                "Admitted",
+                "TransitVerified",
+                "Durable",
+                "AtRestVerified",
+                "Published"
+            ])
+        );
+        assert_eq!(
+            [
+                State::New,
+                State::Admitted,
+                State::TransitVerified,
+                State::DataFlushed,
+                State::Durable,
+                State::AtRestVerified,
+                State::NamespaceLinked,
+                State::Published,
+                State::RecoveryRequired,
+                State::Poisoned,
+                State::Aborted,
+            ]
+            .map(State::name)
+            .to_vec(),
+            names(&[
+                "New",
+                "Admitted",
+                "TransitVerified",
+                "DataFlushed",
+                "Durable",
+                "AtRestVerified",
+                "NamespaceLinked",
+                "Published",
+                "RecoveryRequired",
+                "Poisoned",
+                "Aborted",
+            ])
+        );
+        assert_eq!(
+            Event::ALL.map(Event::name).to_vec(),
+            names(&[
+                "Admit",
+                "TransitVerified",
+                "DataFlushSucceeded",
+                "DataFlushFailed",
+                "JournalFlushSucceeded",
+                "JournalFlushFailed",
+                "AtRestVerified",
+                "AtRestVerificationFailed",
+                "NamespaceLinked",
+                "NamespaceLinkAmbiguous",
+                "NamespaceDurable",
+                "NamespaceFlushFailed",
+                "Crash",
+                "Recover",
+                "Abort",
+            ])
+        );
+        assert_eq!(
+            [
+                Error::StaleIncarnation,
+                Error::Terminal,
+                Error::InvalidTransition,
+                Error::MissingPredecessor,
+            ]
+            .map(Error::name)
+            .to_vec(),
+            names(&[
+                "StaleIncarnation",
+                "Terminal",
+                "InvalidTransition",
+                "MissingPredecessor"
+            ])
+        );
+    }
+
+    #[test]
+    fn the_corpus_holds_the_whole_relation() {
+        let rows = transition_corpus();
+        // Every event against every machine, so the count divides.
+        assert_eq!(rows.len() % EVENTS.len(), 0);
+        assert!(rows.len() > 5_000, "the corpus shrank to {}", rows.len());
+
+        for event in EVENTS {
+            assert!(
+                rows.iter().any(|row| row.event == event),
+                "{event:?} is in no row"
+            );
+        }
+        for state in [
+            State::New,
+            State::Admitted,
+            State::TransitVerified,
+            State::DataFlushed,
+            State::Durable,
+            State::AtRestVerified,
+            State::NamespaceLinked,
+            State::Published,
+            State::RecoveryRequired,
+            State::Poisoned,
+            State::Aborted,
+        ] {
+            assert!(
+                rows.iter().any(|row| row.state == state),
+                "no machine stands at {state:?}"
+            );
+        }
+
+        // The machines a walk over accepted events cannot reach are what the
+        // corpus adds by hand, and the predecessor defense needs them.
+        assert!(
+            rows.iter()
+                .any(|row| row.error == Some(Error::MissingPredecessor)),
+            "no row reaches the publication defense"
+        );
+        assert!(rows.iter().any(|row| !row.current_incarnation));
+
+        for row in &rows {
+            if row.error.is_some() {
+                assert_eq!(row.next_state, row.state, "{row}");
+                assert_eq!(row.next_recovery_state, row.recovery_state, "{row}");
+                assert!(row.observation.is_none(), "{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_renders_the_transition_it_describes() {
+        let mut machine = Machine::new(Profile::Balanced);
+        machine.apply(Event::Admit).unwrap();
+        machine.apply(Event::Crash).unwrap();
+        let row = transition_corpus()
+            .into_iter()
+            .find(|row| {
+                row.profile == Profile::Balanced
+                    && row.state == State::RecoveryRequired
+                    && row.recovery_state == Some(State::Admitted)
+                    && row.current_incarnation
+                    && row.event == Event::Recover
+            })
+            .expect("a recovery row");
+        assert_eq!(
+            row.to_string(),
+            "{\"profile\": \"Balanced\", \"state\": \"RecoveryRequired\", \"current\": true, \
+             \"recovery_state\": \"Admitted\", \"performed\": [\"Admitted\"], \
+             \"event\": \"Recover\", \"error\": null, \"next_state\": \"Admitted\", \
+             \"next_recovery_state\": null, \"observation\": null}"
+        );
     }
 
     #[test]

@@ -17,6 +17,11 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 # cargo-mutants does not; its vector writer produces the committed file that
 # comparison reads. Mutating either measures the wrong thing.
 #
+# vot-commit-model's transition writer is the same case. It prints what
+# `transition_corpus` returns, and validate_commit_transitions.py checks every
+# row of that against an independent relation. The corpus itself is in lib.rs
+# where this gate measures it; the printing is not what either check is about.
+#
 # The quiche pump is a file rather than an inline module, and the `live::`
 # expression above only matches what cargo-mutants prints with that prefix, which
 # a free function inside the module is not. The file is named instead. It is
@@ -51,4 +56,5 @@ exclude_globs = [
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",
+  "crates/vot-commit-model/src/bin/*",
 ]

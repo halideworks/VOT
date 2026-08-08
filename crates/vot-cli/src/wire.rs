@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use vot_transport_api::ReceiveLimits;
@@ -104,9 +104,6 @@ fn carrier_failure(error: vot_transport_api::Error) -> Error {
     }
 }
 
-/// Counter for unique ephemeral credential paths within a process.
-static EPHEMERAL: AtomicU64 = AtomicU64::new(0);
-
 /// Temp files for an ephemeral certificate and key. quiche requires file paths.
 struct Ephemeral {
     directory: PathBuf,
@@ -138,21 +135,67 @@ impl Ephemeral {
             .self_signed(&key)
             .map_err(|_| Error::InvalidArguments)?;
 
-        let directory = std::env::temp_dir().join(format!(
-            "vot-serve-{}-{}",
-            std::process::id(),
-            EPHEMERAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&directory)?;
+        // The name is unguessable rather than merely unique. A private key
+        // at a path another local user can work out is one they can wait
+        // for, and a process ID is neither secret nor unique: inside a PID
+        // namespace it repeats every run, and the second serve cannot start.
+        let mut suffix = [0_u8; 16];
+        getrandom::fill(&mut suffix).map_err(|_| Error::Randomness)?;
+        let mut name = String::from("vot-serve-");
+        for byte in suffix {
+            use std::fmt::Write;
+            let _ = write!(name, "{byte:02x}");
+        }
+        let directory = std::env::temp_dir().join(name);
+        create_private_directory(&directory)?;
         let written = Self {
             certificate: directory.join("cert.pem"),
             key: directory.join("key.pem"),
             directory,
         };
-        crate::write_new_synced(&written.certificate, certificate.pem().as_bytes())?;
-        crate::write_new_synced(&written.key, key.serialize_pem().as_bytes())?;
+        write_private_synced(&written.certificate, certificate.pem().as_bytes())?;
+        write_private_synced(&written.key, key.serialize_pem().as_bytes())?;
         Ok(written)
     }
+}
+
+/// Creates a directory only this user can enter. A directory that takes the
+/// umask leaves the key inside it readable by anyone on the host.
+fn create_private_directory(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    return create_private_directory_unix(path);
+    #[cfg(not(unix))]
+    return create_private_directory_other(path);
+}
+
+#[cfg(unix)]
+fn create_private_directory_unix(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(())
+}
+
+/// Windows has no mode bits here. The per-user temp directory is the
+/// protection, and the unguessable name is the rest of it.
+#[cfg(not(unix))]
+fn create_private_directory_other(path: &Path) -> Result<(), Error> {
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+
+/// Writes a new file only this user can read, and syncs it.
+fn write_private_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Finds the local source address for reaching `peer`. quiche rejects
@@ -852,6 +895,47 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn ephemeral_credentials_are_unguessable_and_unreadable_by_others() {
+        let first = Ephemeral::generate().expect("credentials");
+        let second = Ephemeral::generate().expect("a second set");
+        assert_ne!(
+            first.directory, second.directory,
+            "two serves in one process shared a directory"
+        );
+        let name = first
+            .directory
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name.len(), "vot-serve-".len() + 32);
+        assert!(
+            !name.contains(&std::process::id().to_string()),
+            "the name still says which process wrote it: {name}"
+        );
+        assert!(first.certificate.exists() && first.key.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&first.directory), 0o700);
+            assert_eq!(mode(&first.key), 0o600);
+            assert_eq!(mode(&first.certificate), 0o600);
+        }
+
+        let directory = first.directory.clone();
+        drop(first);
+        assert!(!directory.exists(), "the key outlived its serve");
+    }
 
     #[test]
     fn a_carrier_refusing_its_configuration_names_the_argument() {

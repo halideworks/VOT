@@ -4471,6 +4471,7 @@ pub mod live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vot_transport_api::BatchFailure;
 
     #[test]
     fn queue_adapter_preserves_transport_contract() {
@@ -4749,7 +4750,10 @@ mod tests {
         let records = [shared_payload(b"second"), shared_payload(b"third")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(Error::OutboundQueueFull)
+            Err(BatchFailure {
+                accepted: 0,
+                error: Error::OutboundQueueFull
+            })
         );
         assert_eq!(
             adapter.next_command(),
@@ -4782,7 +4786,10 @@ mod tests {
         let records = [shared_payload(b"two"), shared_payload(b"three")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(Error::OutboundQueueFull)
+            Err(BatchFailure {
+                accepted: 0,
+                error: Error::OutboundQueueFull
+            })
         );
         assert_eq!(
             adapter.next_command(),

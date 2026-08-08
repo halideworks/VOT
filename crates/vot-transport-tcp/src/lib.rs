@@ -373,6 +373,7 @@ mod tests {
     use super::*;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use vot_transport_api::BatchFailure;
 
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::{RootCertStore, ServerConfig, ServerConnection};
@@ -570,7 +571,10 @@ mod tests {
         let records = [shared_payload(b"second"), shared_payload(b"third")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(Error::OutboundQueueFull)
+            Err(BatchFailure {
+                accepted: 0,
+                error: Error::OutboundQueueFull
+            })
         );
         assert_eq!(
             adapter.next_command(),
@@ -603,7 +607,10 @@ mod tests {
         let records = [shared_payload(b"two"), shared_payload(b"three")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(Error::OutboundQueueFull)
+            Err(BatchFailure {
+                accepted: 0,
+                error: Error::OutboundQueueFull
+            })
         );
         assert_eq!(
             adapter.next_command(),

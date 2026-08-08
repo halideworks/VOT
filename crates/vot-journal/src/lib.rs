@@ -4,13 +4,16 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: [u8; 4] = *b"VOTJ";
 const VERSION: u8 = 0;
 const HEADER_LEN: usize = 4 + 1 + 16 + 8 + 1 + 4;
 const MAX_PAYLOAD: usize = 1_048_576;
+/// Largest journal a replay will read. Replay holds the whole file, so this
+/// is the ceiling on that, not a limit the format needs.
+const MAX_JOURNAL_BYTES: u64 = 67_108_864;
 const CHECKPOINT_FLAG: u8 = 0x80;
 static NEXT_CHECKPOINT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -35,6 +38,10 @@ pub enum Error {
     StaleIncarnation,
     InvalidState,
     Empty,
+    /// Another writer holds this journal's lease.
+    Locked,
+    /// The journal is larger than a replay will hold.
+    TooLarge,
 }
 
 impl From<io::Error> for Error {
@@ -52,9 +59,48 @@ pub struct Replay {
 
 pub struct Journal {
     file: File,
+    path: PathBuf,
+    /// The writer lease, held for as long as this journal exists. It is a
+    /// separate file because compaction replaces the journal's inode, and a
+    /// lock on an inode that a rename retired protects nothing.
+    _lease: Lease,
     incarnation: [u8; 16],
     next_sequence: u64,
     poisoned: bool,
+}
+
+/// An exclusive claim on one journal. Closing the file releases the lock, so
+/// the lease lasts exactly as long as the journal that holds it.
+struct Lease(#[expect(dead_code, reason = "held for the lock, not for reading")] File);
+
+impl Lease {
+    /// Claims the journal at `path`. Refuses rather than waits: a second
+    /// writer is a caller mistake, and blocking would hide it.
+    fn take(path: &Path) -> Result<Self, Error> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lease_path(path)?)?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(Self(file)),
+            Err(fs4::TryLockError::WouldBlock) => Err(Error::Locked),
+            Err(fs4::TryLockError::Error(error)) => Err(Error::Io(error)),
+        }
+    }
+}
+
+fn lease_path(path: &Path) -> Result<PathBuf, Error> {
+    let name = path.file_name().ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journal has no file name",
+        ))
+    })?;
+    let mut lease = name.to_os_string();
+    lease.push(".lease");
+    Ok(path.with_file_name(lease))
 }
 
 #[derive(Debug)]
@@ -62,6 +108,7 @@ pub struct DurableWitness(());
 
 impl Journal {
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
+        let lease = Lease::take(path)?;
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -70,6 +117,8 @@ impl Journal {
         File::open(parent_directory(path))?.sync_all()?;
         Ok(Self {
             file,
+            path: path.to_path_buf(),
+            _lease: lease,
             incarnation,
             next_sequence: 0,
             poisoned: false,
@@ -77,20 +126,23 @@ impl Journal {
     }
 
     pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
+        let lease = Lease::take(path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let replay = replay_reader(&mut file, incarnation)?;
+        // The next sequence has to exist before anything is written under it,
+        // so a journal that ends at the last sequence is refused rather than
+        // wrapped to zero.
+        let next_sequence = next_sequence_after(replay.records.last())?;
         if replay.torn_tail {
             file.set_len(replay.valid_bytes)?;
             file.sync_data()?;
         }
         file.seek(SeekFrom::End(0))?;
-        let next_sequence = replay
-            .records
-            .last()
-            .map_or(0, |record| record.sequence + 1);
         Ok((
             Self {
                 file,
+                path: path.to_path_buf(),
+                _lease: lease,
                 incarnation,
                 next_sequence,
                 poisoned: false,
@@ -110,6 +162,10 @@ impl Journal {
             return Err(Error::InvalidState);
         }
         let sequence = self.next_sequence;
+        // The sequence after this one is proved to exist before this one is
+        // written, so the last sequence is never durably spent on a record
+        // whose successor cannot be numbered.
+        let following = sequence.checked_add(1).ok_or(Error::SequenceGap)?;
         let record = Record {
             incarnation: self.incarnation,
             sequence,
@@ -126,10 +182,7 @@ impl Journal {
             self.poisoned = true;
             return Err(Error::Io(error));
         }
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(Error::SequenceGap)?;
+        self.next_sequence = following;
         Ok(sequence)
     }
 
@@ -147,23 +200,25 @@ impl Journal {
         self.poisoned
     }
 
-    /// Replaces a journal with one durable checkpoint at its latest sequence.
-    pub fn compact_checkpoint(
-        path: &Path,
-        incarnation: [u8; 16],
-        state: u8,
-        payload: &[u8],
-    ) -> Result<Self, Error> {
+    /// Replaces this journal with one durable checkpoint at its latest
+    /// sequence, and goes on writing after it.
+    ///
+    /// Takes `&mut self` so the writer lease spans the replacement. The
+    /// rename retires the journal's inode, and a compaction that released
+    /// the lease in between would let a second writer open the new one. A
+    /// rejected compaction changes nothing.
+    pub fn compact_checkpoint(&mut self, state: u8, payload: &[u8]) -> Result<(), Error> {
         if state & CHECKPOINT_FLAG != 0 {
             return Err(Error::InvalidState);
         }
         if payload.len() > MAX_PAYLOAD {
             return Err(Error::PayloadTooLarge);
         }
-        let replayed = replay(path, incarnation)?;
+        let replayed = replay(&self.path, self.incarnation)?;
         let sequence = replayed.records.last().ok_or(Error::Empty)?.sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(Error::SequenceGap)?;
         let record = Record {
-            incarnation,
+            incarnation: self.incarnation,
             sequence,
             state,
             payload: payload.to_vec(),
@@ -171,13 +226,13 @@ impl Journal {
         };
         let encoded = encode(&record)?;
         let suffix = NEXT_CHECKPOINT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let file_name = path.file_name().ok_or_else(|| {
+        let file_name = self.path.file_name().ok_or_else(|| {
             Error::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "journal has no file name",
             ))
         })?;
-        let temporary = path.with_file_name(format!(
+        let temporary = self.path.with_file_name(format!(
             "{}.checkpoint-{}-{suffix}",
             file_name.to_string_lossy(),
             std::process::id()
@@ -189,11 +244,23 @@ impl Journal {
         file.write_all(&encoded)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)?;
-        File::open(parent_directory(path))?.sync_all()?;
-        let (journal, _) = Self::open_current(path, incarnation)?;
-        Ok(journal)
+        fs::rename(&temporary, &self.path)?;
+        File::open(parent_directory(&self.path))?.sync_all()?;
+        let mut replacement = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        replacement.seek(SeekFrom::End(0))?;
+        self.file = replacement;
+        self.next_sequence = next_sequence;
+        self.poisoned = false;
+        Ok(())
     }
+}
+
+/// The sequence a journal ending at `last` writes next, or [`Error::SequenceGap`]
+/// when there is no such number.
+fn next_sequence_after(last: Option<&Record>) -> Result<u64, Error> {
+    last.map_or(Ok(0), |record| {
+        record.sequence.checked_add(1).ok_or(Error::SequenceGap)
+    })
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -244,8 +311,13 @@ pub fn replay(path: &Path, current_incarnation: [u8; 16]) -> Result<Replay, Erro
 }
 
 fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Result<Replay, Error> {
+    // Bounded before the allocation, not after: a journal grown past the
+    // ceiling is refused rather than read into memory.
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
+    let read = reader.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)? as u64;
+    if read > MAX_JOURNAL_BYTES {
+        return Err(Error::TooLarge);
+    }
     let mut offset = 0;
     let mut records: Vec<Record> = Vec::new();
     let mut torn_tail = false;
@@ -295,7 +367,7 @@ fn replay_reader(reader: &mut impl Read, current_incarnation: [u8; 16]) -> Resul
                 if record != *previous {
                     return Err(Error::SequenceConflict);
                 }
-            } else if sequence != previous.sequence + 1 {
+            } else if Some(sequence) != previous.sequence.checked_add(1) {
                 return Err(Error::SequenceGap);
             } else {
                 records.push(record);
@@ -410,9 +482,7 @@ mod tests {
         for sequence in 0..100 {
             journal.append_durable(1, &[sequence]).unwrap();
         }
-        drop(journal);
-        let mut journal =
-            Journal::compact_checkpoint(&path, incarnation, 2, b"sealed-through=99").unwrap();
+        journal.compact_checkpoint(2, b"sealed-through=99").unwrap();
         journal.append_durable(3, b"active-100").unwrap();
         journal.append_durable(3, b"active-101").unwrap();
         drop(journal);
@@ -473,7 +543,6 @@ mod tests {
             journal.append_durable(1, &oversized),
             Err(Error::PayloadTooLarge)
         ));
-        drop(journal);
 
         assert!(encode(&record(0, 1, maximum.clone(), false)).is_ok());
         assert!(matches!(
@@ -485,12 +554,91 @@ mod tests {
             Err(Error::InvalidState)
         ));
 
-        let compacted = Journal::compact_checkpoint(&path, [2; 16], 2, &maximum).unwrap();
-        drop(compacted);
+        journal.compact_checkpoint(2, &maximum).unwrap();
         assert!(matches!(
-            Journal::compact_checkpoint(&path, [2; 16], 2, &oversized),
+            journal.compact_checkpoint(2, &oversized),
             Err(Error::PayloadTooLarge)
         ));
+        // A rejected compaction leaves a journal that still writes.
+        assert_eq!(journal.append_durable(1, b"after").unwrap(), 1);
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn one_writer_holds_the_journal_and_the_next_is_refused() {
+        let path = temp_path("one-writer");
+        let held = Journal::create(&path, [3; 16]).unwrap();
+        assert!(matches!(
+            Journal::open_current(&path, [3; 16]),
+            Err(Error::Locked)
+        ));
+        assert!(matches!(
+            Journal::create(&path, [3; 16]),
+            Err(Error::Locked)
+        ));
+        drop(held);
+        let (reopened, _) = Journal::open_current(&path, [3; 16]).unwrap();
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(lease_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_last_sequence_is_refused_before_anything_is_written() {
+        let path = temp_path("last-sequence");
+        // A checkpoint is the one record that may open a journal at a
+        // sequence other than zero.
+        std::fs::write(
+            &path,
+            encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Journal::open_current(&path, [2; 16]),
+            Err(Error::SequenceGap)
+        ));
+
+        // And a record after it is a gap, not an overflow.
+        let mut bytes = encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap();
+        bytes.extend_from_slice(&encode(&record(0, 1, Vec::new(), false)).unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(replay(&path, [2; 16]), Err(Error::SequenceGap)));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(lease_path(&path).unwrap());
+    }
+
+    #[test]
+    fn an_append_at_the_last_sequence_writes_nothing() {
+        let path = temp_path("append-last-sequence");
+        let mut journal = Journal::create(&path, [3; 16]).unwrap();
+        journal.next_sequence = u64::MAX;
+        assert!(matches!(
+            journal.append_durable(1, b"never"),
+            Err(Error::SequenceGap)
+        ));
+        assert!(!journal.is_poisoned());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "nothing landed");
+        drop(journal);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(lease_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_journal_past_the_ceiling_is_refused_rather_than_read() {
+        let path = temp_path("oversized");
+        let mut bytes = encode(&record(0, 1, vec![0; MAX_PAYLOAD], false)).unwrap();
+        bytes.resize(usize::try_from(MAX_JOURNAL_BYTES).unwrap() + 1, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(replay(&path, [2; 16]), Err(Error::TooLarge)));
+
+        bytes.truncate(usize::try_from(MAX_JOURNAL_BYTES).unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            !matches!(replay(&path, [2; 16]), Err(Error::TooLarge)),
+            "exactly the ceiling is inside it"
+        );
         std::fs::remove_file(path).unwrap();
     }
 

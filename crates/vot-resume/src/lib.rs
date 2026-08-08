@@ -150,19 +150,42 @@ impl ResumeStore {
         Self::open(store.path)
     }
 
-    /// Removes the store and its lock file. A completed bundle looks like
+    /// Removes the store and its temporary. A completed bundle looks like
     /// one fetched without a store.
+    ///
+    /// Removal takes the store lock like every other transaction, so it
+    /// cannot run beside a reserve or a checkpoint. The lock file itself
+    /// stays. Unlinking a locked name does not release the lock held on the
+    /// old inode, so the next process to create that name would take an
+    /// independent lock and two writers would believe they were alone. An
+    /// empty lock file beside no store is the cost of the name meaning one
+    /// thing.
     pub fn remove(self) -> Result<(), Error> {
-        let lock = lock_path(&self.path)?;
-        let temporary = temporary_path(&self.path)?;
-        for path in [self.path, lock, temporary] {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Error::Io(error)),
-            }
+        self.remove_within(false)
+    }
+
+    /// [`Self::remove`], and the lock file with it.
+    ///
+    /// Only for a caller that owns the containing directory and knows no
+    /// other process has this store open, such as a fetch tidying up its own
+    /// finished output. The unlink happens under the lock, so no transaction
+    /// is in flight, but a process that opened the lock file and has not yet
+    /// acquired it would go on to hold an inode with no name while the next
+    /// process takes a fresh one.
+    pub fn remove_unshared(self) -> Result<(), Error> {
+        self.remove_within(true)
+    }
+
+    fn remove_within(self, lock_file_too: bool) -> Result<(), Error> {
+        let lock_file = lock_path(&self.path)?;
+        let lock = lock_store(&self.path)?;
+        let mut removal = remove_if_present(&self.path)
+            .and_then(|()| remove_if_present(&temporary_path(&self.path)?));
+        if lock_file_too && removal.is_ok() {
+            removal = remove_if_present(&lock_file);
         }
-        Ok(())
+        drop(lock);
+        removal
     }
 
     /// Reserves a batch of immutable objects in one compacted transaction.
@@ -1179,6 +1202,16 @@ fn lock_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(path.with_file_name(lock))
 }
 
+/// Removes a name, treating one that is already gone as the outcome wanted.
+/// Every other failure surfaces.
+fn remove_if_present(path: &Path) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn lock_store(path: &Path) -> Result<File, Error> {
     let lock = OpenOptions::new()
         .create(true)
@@ -1324,8 +1357,16 @@ mod tests {
         store.remove().unwrap();
         assert!(!path.exists(), "the store is gone");
         assert!(
+            lock_path(&path).unwrap().exists(),
+            "and its lock stayed, so the name keeps meaning one inode"
+        );
+        ResumeStore::create(&path)
+            .unwrap()
+            .remove_unshared()
+            .unwrap();
+        assert!(
             !lock_path(&path).unwrap().exists(),
-            "and its lock went with it"
+            "a sole user takes the lock file too"
         );
         ResumeStore::create(&path).unwrap().remove().unwrap();
         ResumeStore::open(&path).unwrap().remove().unwrap();
@@ -1543,6 +1584,59 @@ mod tests {
             .unwrap();
         writer.join().unwrap();
         fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn removal_waits_for_the_store_transaction_lock() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let path = temp_path("remove-lock");
+        let mut store = ResumeStore::open(&path).unwrap();
+        store.reserve_many([(subject(10), 1)]).unwrap();
+        let held = lock_store(&path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let remover = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(store.remove()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(
+                finished_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "removal ran while a transaction held the lock"
+        );
+        drop(held);
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        remover.join().unwrap();
+        assert!(!path.exists());
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn removal_keeps_the_lock_inode_so_two_writers_cannot_split() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = temp_path("remove-lock-inode");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path(&path).unwrap());
+
+        let store = ResumeStore::create(&path).unwrap();
+        let before = fs::metadata(lock_path(&path).unwrap()).unwrap().ino();
+        store.remove().unwrap();
+        let after = fs::metadata(lock_path(&path).unwrap()).unwrap().ino();
+        assert_eq!(
+            before, after,
+            "removal replaced the lock, so a writer holding the old inode would not block the next one"
+        );
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 

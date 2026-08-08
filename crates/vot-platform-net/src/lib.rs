@@ -5,19 +5,11 @@
 use std::io;
 use std::net::UdpSocket;
 
-/// Asks the network to drop this socket's datagrams rather than fragment them.
-///
-/// Path MTU discovery run above UDP is only sound when an oversized probe is
-/// refused: a path that fragments the probe instead delivers it reassembled,
-/// the probe reads as a success, and every packet after it silently rides as
-/// fragments. On Linux this selects `IP_PMTUDISC_PROBE`, which sets the
-/// don't-fragment flag and ignores the kernel's own path MTU cache, because
-/// the caller owns discovery; macOS and Windows carry a plain don't-fragment
-/// flag. A socket bound to IPv6 on Linux also covers the IPv4 side, which is
-/// what its mapped-address traffic rides on.
+/// Sets the don't-fragment flag for PMTU discovery. Required for sound path
+/// probing above UDP.
 ///
 /// # Errors
-/// Returns the operating-system error when an option cannot be set.
+/// Returns the OS error when the option cannot be set.
 pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -31,8 +23,6 @@ pub fn refuse_fragmentation(socket: &UdpSocket) -> io::Result<()> {
     {
         refuse_fragmentation_windows(socket)
     }
-    // A platform with no wrapper here keeps the kernel default, where a
-    // narrow path may fragment; discovery above this socket is advisory.
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = socket;
@@ -147,17 +137,10 @@ fn refuse_fragmentation_windows(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// Asks the kernel for socket buffers of at least these sizes, in bytes.
-///
-/// A datagram socket's default receive buffer is a few burst's worth on
-/// most platforms and one segmentation-offload burst's worth on Windows,
-/// so a receiver descheduled for a scheduling quantum sheds packets it had
-/// room for everywhere but the socket. Loss shed here reads as path
-/// congestion to the peer and halves its window, which is how a 64 KiB
-/// default quietly caps a ten-gigabit flow.
+/// Requests socket buffer sizes of at least `send` and `receive` bytes.
 ///
 /// # Errors
-/// Returns the operating-system error when a size cannot be set.
+/// Returns the OS error when a size cannot be set.
 pub fn size_buffers(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -277,14 +260,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn sized_buffers_grow_toward_what_was_asked() {
-        // Kernels clamp to their own ceilings rather than erroring, Linux at
-        // net.core.rmem_max, so the honest assertion is strict growth over the
-        // default, or a value already meeting the request, and a floor every
-        // platform grants. Strict, because Linux doubles whatever it accepts
-        // for bookkeeping, so on stock defaults even a clamped request moves
-        // the value and a call that changed nothing did nothing; the request
-        // arm is for a tuned host whose default is already the doubled
-        // request, where an unchanged value is adequacy rather than a stub.
+        // Kernels clamp silently; assert strict growth or adequacy.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let read = |socket: &UdpSocket, option: i32| read_option(socket, libc::SOL_SOCKET, option);
         #[cfg(any(target_os = "linux", target_os = "macos"))]

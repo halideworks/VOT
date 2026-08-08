@@ -1,38 +1,21 @@
-//! The rendezvous of ADR-0033: pairing a serve and a fetch by the root.
-//!
-//! This module is the protocol apart from any socket: the datagrams, the
-//! key both ends derive from the root, and the pairing table the service
-//! keeps. Time reaches the table as an argument, so every expiry branch
-//! is a test's to hold. The socket halves live with the commands that
-//! own the sockets.
+//! Rendezvous protocol: pairing serve and fetch by the package root.
+//! Socket-independent; time is injected so expiry is testable.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// The lead byte of every rendezvous datagram.
-///
-/// QUIC packets carry the fixed bit: a long header leads 0xC0..=0xFF and
-/// a short header 0x40..=0x7F, so 0x00..=0x3F can never open a QUIC
-/// packet and the serve's router tells the two apart by one byte.
+/// Lead byte for rendezvous datagrams. Below QUIC range (0x00..=0x3F) so
+/// the router distinguishes them by one byte.
 pub(crate) const MAGIC: u8 = 0x1F;
 
 /// The version after the magic, so the exchange can change shape later
 /// without a flag day at the service.
 const VERSION: u8 = 1;
 
-/// Every request is padded to the widest reply, so no reply outgrows
-/// the request that earned it and the service cannot amplify: magic,
-/// version, kind, key, and the widest address encoding.
+/// Every request is padded to the widest reply so the service amplifies nothing.
 const REQUEST_BYTES: usize = 3 + 32 + 1 + 16 + 2;
 
-/// What one rendezvous datagram says.
-///
-/// The whole exchange: a serve registers under its key and keeps doing
-/// so (which is also its NAT keepalive), a fetch resolves the key, the
-/// service answers the fetch with the serve's mapping and notifies the
-/// serve of the fetch's, and the serve warms the path. Replies are never
-/// larger than the requests that earn them, so the service amplifies
-/// nothing.
+/// What one rendezvous datagram says. Replies are never larger than requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Datagram {
     /// A serve's mapping claim: the source address the service observes
@@ -205,23 +188,14 @@ fn pull_address(bytes: &[u8]) -> AddressSlot {
 /// keeps that derivation from colliding with any other use of the root.
 const KEY_CONTEXT: &str = "VOT 2026-08 rendezvous key v1";
 
-/// The rendezvous key for a package root.
-///
-/// A derived key rather than the root: the service pairs by it and never
-/// learns what it names, and holding it is the same thing as holding the
-/// root, which is already the capability to fetch (ADR-0033). Both ends
-/// derive it from the string the humans exchanged, so it has to stay
-/// exactly this derivation forever.
+/// Derives the rendezvous key from a package root. Must stay this exact
+/// derivation forever (protocol identity).
 pub(crate) fn key_of(root: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(KEY_CONTEXT, root)
 }
 
-/// How long a registration stands without being refreshed.
-///
-/// The serve re-registers every [`REGISTER_CADENCE_MS`], so a live serve
-/// refreshes several times inside its TTL and a dead one ages out in
-/// about a minute, which is also as long as any pairing metadata exists
-/// anywhere.
+/// How long a registration stands without refresh. A dead serve ages out
+/// in about a minute.
 pub(crate) const REGISTRATION_TTL_MS: u64 = 90_000;
 
 /// Registrations one service holds at most, which bounds its memory by
@@ -233,37 +207,17 @@ pub(crate) const MAX_REGISTRATIONS: usize = 65_536;
 /// so a lost datagram costs findability for one cadence and no more.
 pub(crate) const REGISTER_CADENCE_MS: u64 = 20_000;
 
-/// Warming datagrams the serve sends toward a fetch it has been told is
-/// coming. More than one because any of them may be the one a NAT drops,
-/// and few because they are sent before anything has been verified.
-///
-/// They go one per pass rather than together: three that leave in the
-/// same microsecond down the same path share the fate the redundancy
-/// exists to cover.
+/// Warming datagrams per Coming. Sent one per pass to avoid sharing a
+/// single path's fate.
 pub(crate) const WARMING_DATAGRAMS: usize = 3;
 
-/// Warming datagrams a serve will send between registrations, however
-/// many fetches the service says are coming.
-///
-/// This is the whole amplification story of the serving end. One Coming
-/// of 54 bytes earns at most [`WARMING_DATAGRAMS`] warmings of 3 bytes,
-/// which shrinks bytes and multiplies packets by three, and this bound
-/// caps the packets a cadence can be made to emit at 24 no matter how
-/// many Comings arrive. The key is what an abuser needs to get one at
-/// all, and holding the key is already holding the root.
+/// Total warming datagrams per cadence. Caps amplification: one Coming earns
+/// at most [`WARMING_DATAGRAMS`], and this bounds the total regardless of
+/// how many Comings arrive.
 pub(crate) const WARMINGS_PER_CADENCE: usize = 24;
 
-/// Whether this end will send unprompted datagrams at `fetch`, having
-/// been told about it by the service at `service`.
-///
-/// A Coming names where the serve sends with nothing yet verified, so
-/// what cannot be an observed mapping is refused here: the wildcard, a
-/// multicast group, a broadcast address, and port zero are nobody's
-/// source address. Loopback is refused by the same test rather than
-/// listed apart: a service out on the network cannot have observed one,
-/// so the mapping is forged, while a service on loopback is this
-/// machine's own and a loopback mapping from it is the only kind there
-/// is.
+/// Whether to warm `fetch` based on a Coming from `service`. Rejects
+/// addresses that cannot be an observed source mapping.
 fn warmable(fetch: SocketAddr, service: SocketAddr) -> bool {
     if fetch.port() == 0 {
         return false;
@@ -280,11 +234,7 @@ fn warmable(fetch: SocketAddr, service: SocketAddr) -> bool {
     }
 }
 
-/// The serve's side of the rendezvous: what it sends and when.
-///
-/// The whole policy with time as an argument, so every branch is a
-/// test's. It owns no socket; the caller sends what this hands back on
-/// the listener's own socket, which is the mapping being registered.
+/// The serve-side rendezvous state: what to send and when. Owns no socket.
 pub(crate) struct Registrar {
     key: [u8; 32],
     service: SocketAddr,
@@ -324,22 +274,13 @@ impl Registrar {
         sends
     }
 
-    /// What a datagram that arrived from `source` earns.
-    ///
-    /// Only the service is heard, and only about this serve's own key: a
-    /// Coming names an address this end will send to unprompted, so an
-    /// arrival from anywhere else would make the serve a reflector. What
-    /// it earns is queued rather than returned, because the warmings go
-    /// one per pass.
+    /// Processes a datagram from `source`. Only the service is heard, and
+    /// only about this serve's key. Earned warmings are queued.
     pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr) {
         if source != self.service {
             return;
         }
         let Datagram::Coming { key, fetch } = datagram else {
-            // The cadence is unconditional, so a Registered gates
-            // nothing: a serve that never hears one registers exactly as
-            // often as one that does, and the rest of the shapes are not
-            // the service's to send.
             return;
         };
         if key != self.key || !warmable(fetch, self.service) {
@@ -360,15 +301,14 @@ struct Registration {
     expires_at_ms: u64,
 }
 
-/// The service's pairing table, time injected in milliseconds so expiry
-/// is arithmetic a test holds rather than a clock it waits on.
+/// Service-side pairing table. Time is injected so expiry is testable.
 #[derive(Default)]
 pub(crate) struct Pairings {
     registered: HashMap<[u8; 32], Registration>,
 }
 
-/// What the service answers one datagram with: replies to the observed
-/// source only, plus at most one notification toward a registered serve.
+/// Service reply: zero or one reply to the source, plus at most one
+/// notification to a registered serve.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct Answer {
     /// Sent back to the datagram's own source.
@@ -390,8 +330,6 @@ impl Pairings {
             Datagram::Register { key } => {
                 if self.registered.len() >= MAX_REGISTRATIONS && !self.registered.contains_key(&key)
                 {
-                    // Full is shed, not an error: the serve retries on
-                    // its cadence and room appears as others expire.
                     return Answer::default();
                 }
                 self.registered.insert(
@@ -410,12 +348,9 @@ impl Pairings {
                 let serve = self.registered.get(&key).map(|entry| entry.mapping);
                 Answer {
                     reply: Some(Datagram::Resolved { key, serve }),
-                    // The serve hears the fetch is coming, so it can
-                    // open its own NAT toward it before the Initial.
                     notify: serve.map(|mapping| (mapping, Datagram::Coming { key, fetch: source })),
                 }
             }
-            // The service sends these; receiving one is weather.
             Datagram::Registered { .. }
             | Datagram::Resolved { .. }
             | Datagram::Coming { .. }
@@ -442,9 +377,6 @@ mod tests {
 
     #[test]
     fn every_datagram_round_trips_and_no_reply_outgrows_its_request() {
-        // The wire shapes exactly, and the amplification bound held by
-        // construction: each reply the table can produce is no larger
-        // than the request that earned it.
         let key = [7; 32];
         let cases = [
             Datagram::Register { key },
@@ -518,10 +450,6 @@ mod tests {
 
     #[test]
     fn an_address_slot_is_the_length_its_family_names() {
-        // A family byte is a claim about how many bytes follow, and a
-        // slot that does not hold exactly that many is no address: the
-        // width has to be read off the family rather than trusted from
-        // whatever arrived behind it.
         let key = [7; 32];
         let widths = [
             Datagram::Resolved {
@@ -558,17 +486,14 @@ mod tests {
         let serve = v4("198.51.100.1:4433");
         let fetch = v4("203.0.113.9:60123");
 
-        // Unknown first: a resolve answers with nothing and tells nobody.
         let miss = pairings.take(Datagram::Resolve { key }, fetch, 1_000);
         assert_eq!(miss.reply, Some(Datagram::Resolved { key, serve: None }));
         assert_eq!(miss.notify, None);
 
-        // Registered: the serve is acknowledged at its observed source.
         let ack = pairings.take(Datagram::Register { key }, serve, 1_000);
         assert_eq!(ack.reply, Some(Datagram::Registered { key }));
         assert_eq!(ack.notify, None);
 
-        // Paired: the fetch learns the serve, the serve learns the fetch.
         let hit = pairings.take(Datagram::Resolve { key }, fetch, 2_000);
         assert_eq!(
             hit.reply,
@@ -579,7 +504,6 @@ mod tests {
         );
         assert_eq!(hit.notify, Some((serve, Datagram::Coming { key, fetch })));
 
-        // A refresh moves the mapping with the serve.
         let moved = v4("198.51.100.1:4500");
         pairings.take(Datagram::Register { key }, moved, 3_000);
         let refreshed = pairings.take(Datagram::Resolve { key }, fetch, 4_000);
@@ -591,7 +515,6 @@ mod tests {
             })
         );
 
-        // The TTL boundary exactly: alive one instant before, gone at it.
         let last = pairings.take(
             Datagram::Resolve { key },
             fetch,
@@ -615,7 +538,6 @@ mod tests {
             "a registration is believed for its TTL and no longer"
         );
 
-        // Service-sent shapes arriving at the service are weather.
         assert_eq!(
             pairings.take(Datagram::Warming, fetch, 5_000),
             Answer::default()
@@ -624,11 +546,6 @@ mod tests {
 
     #[test]
     fn the_key_is_this_derivation_of_the_root_and_no_other() {
-        // Both ends derive the key from the root alone, so a derivation
-        // that drifts pairs nobody and says nothing about why. The
-        // committed vectors are the pin, and they are a file rather than
-        // a literal here because a second implementation has to be able
-        // to build against them: changing them is changing the protocol.
         let vectors = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../test-vectors/rendezvous/key.json"),
@@ -665,7 +582,6 @@ mod tests {
         let mut registrar = Registrar::new(&root, service);
         let key = key_of(&root);
 
-        // Due immediately, then not again until the cadence has run.
         assert_eq!(
             registrar.due(0),
             vec![(service, Datagram::Register { key })],
@@ -677,8 +593,6 @@ mod tests {
             vec![(service, Datagram::Register { key })]
         );
 
-        // A Coming from the service warms the fetch's mapping, one
-        // datagram a pass so the three do not share one path's fate.
         registrar.take(Datagram::Coming { key, fetch }, service);
         let now = REGISTER_CADENCE_MS;
         for pass in 0..WARMING_DATAGRAMS {
@@ -690,11 +604,6 @@ mod tests {
         }
         assert_eq!(registrar.due(now), Vec::new(), "and no more than it owes");
 
-        // What earns nothing at all: an arrival from anywhere but the
-        // service, since obeying it would make this end send unprompted
-        // datagrams wherever a stranger named; another key's fetch; an
-        // address that is nobody's mapping; and the shapes this end is
-        // the one that sends.
         let refused = [
             (Datagram::Coming { key, fetch }, fetch),
             (
@@ -748,11 +657,6 @@ mod tests {
 
     #[test]
     fn only_what_could_be_an_observed_mapping_is_warmed() {
-        // A Coming names where this end sends with nothing verified, so
-        // this table is the whole of what it will aim at. Loopback turns
-        // on where the service is: one out on the network cannot have
-        // observed a loopback source, and one on loopback observes
-        // nothing else.
         let far = v4("198.51.100.7:9000");
         let near = v4("127.0.0.1:9000");
         assert!(warmable(v4("203.0.113.9:60123"), far));
@@ -787,10 +691,6 @@ mod tests {
 
     #[test]
     fn a_cadence_of_warmings_is_bounded_however_many_fetches_come() {
-        // The serving end's whole amplification story: a Coming is three
-        // warmings, and a cadence emits no more than the bound however
-        // many Comings arrive, so a key holder cannot turn the serve into
-        // a packet multiplier at someone else's address.
         let service = v4("198.51.100.7:9000");
         let root = [9; 32];
         let mut registrar = Registrar::new(&root, service);
@@ -801,7 +701,6 @@ mod tests {
             registrar.take(Datagram::Coming { key, fetch }, service);
         }
         let mut warmings = 0;
-        // Bounded by its own count: the queue cannot outlive the bound.
         for _ in 0..WARMINGS_PER_CADENCE * 4 {
             warmings += registrar
                 .due(1)
@@ -811,7 +710,6 @@ mod tests {
         }
         assert_eq!(warmings, WARMINGS_PER_CADENCE);
 
-        // The next cadence opens the allowance again, and no sooner.
         registrar.take(
             Datagram::Coming {
                 key,
@@ -848,8 +746,6 @@ mod tests {
             pairings.take(Datagram::Register { key }, v4("192.0.2.1:1000"), 0);
         }
         assert_eq!(pairings.registered.len(), MAX_REGISTRATIONS);
-        // One more is shed without evicting anyone: eviction would let
-        // a flood of registrations push a live serve out of the table.
         let extra = pairings.take(
             Datagram::Register { key: [0xFF; 32] },
             v4("192.0.2.2:2000"),
@@ -857,7 +753,6 @@ mod tests {
         );
         assert_eq!(extra, Answer::default());
         assert_eq!(pairings.registered.len(), MAX_REGISTRATIONS);
-        // A key already held refreshes even at the bound.
         let mut held = [0; 32];
         held[..8].copy_from_slice(&0_u64.to_be_bytes());
         let refreshed = pairings.take(Datagram::Register { key: held }, v4("192.0.2.3:3000"), 1);

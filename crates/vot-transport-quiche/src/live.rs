@@ -1,13 +1,8 @@
-//! The pump: a socket, a connection, and the timer that drives loss recovery.
+//! The pump: a driver thread owns the socket, connection, and loss recovery
+//! timer. quiche does no I/O of its own.
 //!
-//! ADR-0024 decided this arrangement. quiche does no I/O and keeps no time of
-//! its own, so a driver thread owns the socket and the connection and nothing
-//! else touches either. The caller's side is [`QuicheAdapter`], which holds the
-//! bounded queue; submissions cross to the driver and events cross back, so a
-//! slow application is backpressure rather than a broken connection and a peer
-//! cannot make either side grow without limit. Every hop is bounded for that
-//! to hold: the caller's queue, the channel between the two, and what the
-//! driver has taken but the connection has not written yet.
+//! Every hop is bounded so a slow application is backpressure, not a broken
+//! connection.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -29,13 +24,9 @@ use crate::{
 
 /// Largest UDP payload either direction when a caller names none.
 ///
-/// What a 1500-byte ethernet frame carries over IPv4. This is a ceiling, not a
-/// claim about the path: discovery settles under it where a tunnel or IPv6
-/// header narrows the way, at the price of a few probe round trips that a
-/// ceiling at or under the path answers in one. The socket asks the network
-/// to refuse fragments, so an oversized probe is dropped rather than
-/// reassembled into a false success. Measured over a 1472-byte path, 1350
-/// here cost 19% of throughput against a matched-size peer.
+/// A ceiling, not a path claim: discovery settles under it where a tunnel or
+/// IPv6 header narrows the way. The socket refuses fragments so an oversized
+/// probe is dropped rather than reassembled into a false success.
 const MAX_DATAGRAM_SIZE: usize = 1_472;
 
 /// The smallest datagram a caller may ask for.
@@ -46,22 +37,16 @@ pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 
 /// What the socket asks the kernel to hold in each direction.
 ///
-/// Four mebibytes of receive is three milliseconds at ten gigabits, room for
-/// a scheduling quantum without shedding; send is half that, because the
-/// pump paces its own bursts out.
+/// Send is half receive because the pump paces its own bursts out.
 const RECEIVE_BUFFER_BYTES: u32 = 4_194_304;
 const SEND_BUFFER_BYTES: u32 = 2_097_152;
 
-/// The largest, which is what a UDP payload can hold inside IPv4's 65535-byte
-/// total length once its own and UDP's headers are paid for. IPv6 could carry
-/// 20 more, which is not worth a family-dependent ceiling: a size the socket
-/// refuses with `EMSGSIZE` on one family is not a configuration, and the test
-/// suite sends a record at this exact size to keep the constant honest.
+/// Largest UDP payload: IPv4's 65535-byte total length minus its own and
+/// UDP's headers. Not worth a family-dependent ceiling for IPv6's extra 20
+/// bytes.
 ///
-/// Public because a caller that trusts path discovery entirely sets this as
-/// its ceiling: with `discover_pmtu` on and don't-fragment fail-closed, the
-/// connection settles at what the path really carries, and the ceiling only
-/// says where probing may stop.
+/// Public so a caller that trusts discovery entirely can set it as the
+/// ceiling where probing stops.
 pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
@@ -69,45 +54,28 @@ const MAX_INBOUND_EVENTS: usize = 1_024;
 
 /// What the driver holds across every outbox before it stops taking submissions.
 ///
-/// The byte bound the caller's own queue keeps, for the same bytes one hop on.
-/// A peer that stops reading fills this once and the refusal travels back the
-/// way the bytes came, ending at the `OutboundQueueFull` the application
-/// already handles.
+/// Matches the caller's own queue byte bound. A peer that stops reading fills
+/// this and the refusal travels back as `OutboundQueueFull`.
 ///
-/// No size here can starve the pump, which is why it is not measured against
-/// the connection's windows: an outbox holds only what `stream_send` refused,
-/// so a full one means the connection is already blocked on its own congestion
-/// or flow control rather than on anything the caller could hand over. The
-/// windows would be the wrong yardstick anyway, the connection's being eight
-/// stream windows of a size the caller picks.
+/// Not measured against the connection's windows: an outbox holds only what
+/// `stream_send` refused, so a full one means the connection is already
+/// blocked on congestion or flow control.
 const MAX_QUEUED_BYTES: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
 
-/// And how many records, because bytes alone do not bound a flood of small
-/// ones: what grows there is the entry rather than the payload. A kilobyte a
-/// record, so anything larger meets the byte bound first. The caller's queue
-/// counts to 64 instead, which is a different question: what it holds has not
-/// been handed over yet.
+/// Record count bound, because bytes alone do not bound a flood of small ones.
+/// A kilobyte a record, so anything larger meets the byte bound first.
 const MAX_QUEUED_RECORDS: usize = MAX_QUEUED_BYTES / 1_024;
 
 /// How long the driver waits on the socket when the connection asks for longer.
 ///
-/// The connection's own timeout is the deadline that matters; this caps it so a
-/// submission or a close request handed over between packets is noticed rather
-/// than waiting on the peer. It is the latency a caller pays for the driver
-/// owning the socket, and it is why this is a bound rather than a poll interval.
+/// Caps the connection's timeout so a submission or close request handed over
+/// between packets is noticed rather than waiting on the peer.
 const TICK: Duration = Duration::from_millis(1);
 
-/// Datagrams taken from the kernel in one pass beyond the first, counted so
-/// the drain is bounded by its own body rather than by the queue's depth.
+/// Datagrams taken from the kernel in one pass beyond the first.
 ///
-/// One read per pass made the loop lockstep: the connection never held more
-/// than a packet of sendable data, so every data packet cost a send syscall,
-/// and the receive side acknowledged every packet because each one was the
-/// only one the connection had seen when it next wrote. Draining what has
-/// already arrived lets the connection see arrivals as a batch, coalesce its
-/// acknowledgements, and generate sends in bursts. Measured over 512 MB on
-/// loopback this alone moved quiche from 1.74 to 2.71 Gbit/s at 1350-byte
-/// datagrams and from 6.87 to 13.73 at 32768, with user CPU down a third.
+/// Draining arrivals as a batch lets the connection coalesce acknowledgements
+/// and generate sends in bursts rather than lockstep one syscall per packet.
 const DRAIN_BUDGET: usize = 64;
 
 /// No close has been requested. `u64` because an atomic is how the caller's
@@ -225,61 +193,45 @@ pub struct Config {
     /// How long a server waits for its first packet, in milliseconds, or
     /// zero to wait for as long as it takes.
     ///
-    /// A bound is what stops a test hanging on a client that never comes.
-    /// A server command is the other case: it exists to sit there until
-    /// one does, and giving up would read to its caller as a carrier that
-    /// died during the handshake.
+    /// Zero suits a server that exists to wait; a bound suits tests and
+    /// callers that must fail rather than hang.
     pub accept_timeout_ms: u64,
     /// Largest UDP payload this endpoint sends or expects.
     ///
-    /// [`MAX_DATAGRAM_SIZE`] unless a caller knows the path. It is a first-order
-    /// cost: one datagram is one syscall here, and one packet's worth of header
-    /// protection and AEAD, so a path that can carry more and is not asked to
-    /// spends both on every datagram. Measured over loopback, whose MTU is
-    /// 65536, raising it is worth about four times the throughput.
+    /// [`MAX_DATAGRAM_SIZE`] unless a caller knows the path. One datagram is
+    /// one syscall plus header protection and AEAD, so a path that can carry
+    /// more and is not asked to wastes both per datagram.
     ///
-    /// Discovery settles under this ceiling when the path is narrower, over
-    /// a few probe round trips that a ceiling at or under the path answers
-    /// in one.
+    /// Discovery settles under this ceiling when the path is narrower.
     pub max_datagram_bytes: usize,
     /// The congestion controller this endpoint runs.
     pub congestion: CongestionControl,
     /// A lead byte whose datagrams are not this transport's, handed to
     /// the listener's side channel instead of routed.
     ///
-    /// The transport knows nothing of what such a datagram says. A caller
-    /// sharing the socket with another protocol names the byte that tells
-    /// them apart; without one every arrival is routed as QUIC.
+    /// A caller sharing the socket with another protocol names the byte that
+    /// tells them apart; without one every arrival is routed as QUIC.
     pub side_channel_lead: Option<u8>,
 }
 
 /// Which congestion controller carries the connection.
 ///
-/// Cubic is the default and what every LAN acceptance number was taken
-/// under. Bbr2 is what a lossy wide-area path wants: on an emulated 30 ms
-/// path with 0.5% loss it carried 512 MiB at 995 Mbit/s where cubic's
-/// square-root loss penalty held 300 (docs/perf-engineering.md,
-/// 2026-08-06). The sender's controller is what governs a transfer, so
-/// the serving end's choice is the one that matters.
+/// The sender's controller governs a transfer, so the serving end's choice
+/// is the one that matters. Bbr2 suits lossy wide-area paths; Cubic is the
+/// default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CongestionControl {
     /// quiche's default controller.
     #[default]
     Cubic,
-    /// `BBRv2` by way of quiche's gcongestion implementation, with quiche's
-    /// pacing disabled: gcongestion's release-time schedule never leaves
-    /// its floor rate when a sender complies with it, because compliance
-    /// starves the bandwidth estimator that would raise it. Measured at
-    /// 22 Mbit/s compliant against line rate without, on a clean 80 ms
-    /// path. The congestion window still governs; only the smoothing goes.
+    /// `BBRv2` via quiche's gcongestion implementation, with quiche's pacing
+    /// disabled: gcongestion's release-time schedule starves its own bandwidth
+    /// estimator when a sender complies. The congestion window still governs;
+    /// only the smoothing goes.
     Bbr2,
 }
 
-/// The controller and whether quiche's pacing runs under it.
-///
-/// A pure mapping, so a test can hold each arm to its exact pair: the
-/// live socket carries traffic identically under either controller, and
-/// only this table says which one it was.
+/// Maps each controller to its algorithm and pacing flag.
 const fn congestion_config(
     congestion: CongestionControl,
 ) -> (quiche::CongestionControlAlgorithm, bool) {
@@ -351,19 +303,14 @@ impl Config {
         }
         config.set_max_recv_udp_payload_size(self.max_datagram_bytes);
         config.set_max_send_udp_payload_size(self.max_datagram_bytes);
-        // The configured datagram is a ceiling, not a claim about the path.
-        // Without discovery, a path narrower than the ceiling completes the
-        // handshake at 1200 bytes and then blackholes every data packet, and
-        // only the caller's budget turns the hang into an error; with it, the
-        // connection probes and settles under the ceiling the way MsQuic
-        // does unaided. The bakeoff report records both behaviors.
+        // The configured datagram is a ceiling, not a path claim. Without
+        // discovery, a narrower path completes the handshake at 1200 bytes then
+        // blackholes every data packet; with it, the connection probes and
+        // settles under the ceiling.
         config.discover_pmtu(true);
-        // Only in the pinned fork until upstream takes it (ADR-0028): the
-        // loss delay never undercuts the ack latency the connection has
-        // observed. On a path whose RTT sits at or under the pump's own
-        // ack-processing cadence, stock quiche declares delivered packets
-        // lost by the tens of thousands per gigabyte, and cubic pays for
-        // every one of them.
+        // The loss delay never undercuts the ack latency the connection has
+        // observed. Without it, stock quiche declares delivered packets lost
+        // on paths whose RTT sits at or under the pump's ack-processing cadence.
         config.set_enable_ack_latency_loss_floor(true);
         let (algorithm, pacing) = congestion_config(self.congestion);
         config.set_cc_algorithm(algorithm);
@@ -442,12 +389,9 @@ impl Transport {
         // fragmented and reassembled: a reassembled probe reads as success and
         // locks the connection above the path for good.
         vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
-        // Best effort, because buffer sizes are throughput and never
-        // correctness: a kernel that grants less sheds more under bursts and
-        // the peer's congestion window pays for it, which is measurable in
-        // the path stats rather than fatal. The defaults are one offload
-        // burst on some platforms, and a receiver descheduled for a quantum
-        // at ten gigabits needs megabytes, not kilobytes.
+        // Best effort: buffer sizes are throughput, not correctness. A kernel
+        // that grants less sheds under bursts, measurable in path stats rather
+        // than fatal.
         let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
         let mut quiche_config = config.build(role)?;
@@ -458,10 +402,8 @@ impl Transport {
         let close = Arc::new(AtomicU64::new(NO_CLOSE));
         let control_limit = Arc::new(AtomicUsize::new(config.limits.control_payload()));
         // As deep as the adapter's own queue, so one flush moves a batch. The
-        // adapter's bound is the real one either way, and a full channel leaves
-        // the submission at the head of that queue rather than dropping it, but a
-        // channel of one would have bounded throughput by the driver's loop rate
-        // rather than by the carrier.
+        // adapter's bound is the real limit; a full channel leaves the
+        // submission queued rather than dropped.
         let (commands, receiver) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
         let path = Arc::new(Mutex::new(None));
         let driver_inbound = Arc::clone(&inbound);
@@ -528,15 +470,10 @@ impl Transport {
 
     /// Parks until this endpoint has something to say, without consuming it.
     ///
-    /// A server's driver waits for a client's first packet before any
-    /// connection exists, while `serve` returns at the bind so its caller
-    /// can report the address. A session begun in between spends its own
-    /// budgets waiting out the accept; a serving caller parks here instead,
-    /// for as long as the accept allows (`accept_timeout_ms`, where zero is
-    /// forever). The first thing a driver ever queues is a lifecycle event,
-    /// `Connected` for a handshake or `Disconnected` for a driver that
-    /// ended without one, so this returns exactly when a session would have
-    /// something to react to.
+    /// A server's driver waits for the first packet before any connection
+    /// exists. The first thing a driver queues is a lifecycle event,
+    /// `Connected` or `Disconnected`, so this returns exactly when a session
+    /// has something to react to.
     pub fn wait_arrival(&self) {
         loop {
             let signal = {
@@ -603,16 +540,12 @@ impl Transport {
 impl Drop for Transport {
     /// Stops the driver, which can wait on the peer.
     ///
-    /// The close has to reach the peer for the connection to finish draining, so
-    /// dropping an endpoint whose peer has vanished waits out the idle timeout
-    /// rather than returning at once. That is the cost of the driver owning the
-    /// socket: it cannot be released while a packet might still be owed.
+    /// The close must reach the peer for the connection to drain, so dropping
+    /// an endpoint whose peer has vanished waits out the idle timeout.
     fn drop(&mut self) {
-        // The driver owns the socket, so it has to stop before this returns or
-        // the port outlives the endpoint that bound it. Dropping an endpoint is
-        // not an error, so it closes under no code at all. The command channel
-        // is disconnected as well, so the driver has two ways to hear that its
-        // owner is gone and no single failure of either can strand the join.
+        // The driver owns the socket, so it must stop before this returns or
+        // the port outlives the endpoint. The command channel is disconnected
+        // as well, so the driver has two ways to hear its owner is gone.
         self.close.store(NO_REASON, Ordering::Relaxed);
         let (dead, _) = mpsc::sync_channel(1);
         drop(std::mem::replace(&mut self.commands, dead));
@@ -732,10 +665,8 @@ struct Queued {
 impl Queued {
     /// Whether the driver has taken as much as it will hold.
     ///
-    /// Asked before a submission rather than about one, so a record larger than
-    /// the whole bound is still taken: a bound that refuses what it can never
-    /// fit is a stall rather than backpressure. One submission of overshoot is
-    /// the price, and the caller's queue bounds that at one record.
+    /// Checked before a submission so a record larger than the bound is still
+    /// taken: refusing what cannot fit is a stall, not backpressure.
     const fn is_full(&self) -> bool {
         self.bytes >= MAX_QUEUED_BYTES || self.records >= MAX_QUEUED_RECORDS
     }
@@ -757,8 +688,7 @@ impl Queued {
     }
 
     /// Releases everything an outbox held, for a stream that will not write
-    /// again. Missing this would leave the driver refusing submissions for a
-    /// connection with nothing left to send.
+    /// again.
     fn discard(&mut self, outbox: &VecDeque<(Payload, usize)>) {
         for (bytes, sent) in outbox {
             self.wrote(bytes.len().saturating_sub(*sent));
@@ -766,10 +696,9 @@ impl Queued {
         }
     }
 
-    /// Fails a debug build where the count has drifted from what is actually
-    /// waiting, which is the one failure a count kept beside the thing it
-    /// counts can have. Too high and the driver refuses submissions for a
-    /// connection holding nothing; too low and the bound is not one.
+    /// Fails a debug build where the count drifts from what is waiting.
+    /// Too high refuses submissions for an empty connection; too low
+    /// invalidates the bound.
     fn debug_assert_matches(&self, streams: &BTreeMap<u64, StreamState>) {
         debug_assert_eq!(
             self.bytes,
@@ -792,23 +721,18 @@ impl Queued {
 struct StreamState {
     framing: Framing<SharedBudget>,
     kind: StreamKind,
-    /// The QUIC stream these bytes travel on, kept rather than derived so the
-    /// mapping is applied once, where the lane was given.
+    /// The QUIC stream these bytes travel on, cached so the lane mapping is
+    /// applied once.
     id: u64,
     sequence: u64,
-    /// What the caller handed over that the connection has not taken yet, with
-    /// how much of each has gone. A stream's flow control is the peer's, so a
-    /// record may be written in pieces across several loops, and holding the
-    /// caller's own allocation means those pieces cost no copy of their own.
-    /// Bounded across every stream by [`Queued`], which is what the driver
-    /// checks before it takes another submission.
+    /// What the caller handed over that the connection has not taken yet.
+    /// A record may be written in pieces across loops because flow control is
+    /// the peer's; holding the caller's allocation means no copy per piece.
+    /// Bounded across every stream by [`Queued`].
     outbox: VecDeque<(Payload, usize)>,
-    /// Frames completed after the event queue refused one, by either of its
-    /// bounds, kept in arrival order until the caller drains the queue.
-    /// Reading the stream stops while this holds anything, so it is bounded
-    /// by what one read chunk and one partial frame can complete, not by the
-    /// peer's appetite; what waits here is charged to neither account, which
-    /// that same bound is what makes safe.
+    /// Frames completed after the event queue refused one, in arrival order.
+    /// Reading stops while this holds anything, so it is bounded by what one
+    /// read chunk plus one partial frame can complete.
     overflow: VecDeque<NativeEvent>,
 }
 
@@ -831,16 +755,11 @@ fn drive(
     datagram_bytes: usize,
     accept_timeout_ms: u64,
 ) -> Result<(), Error> {
-    // Heap rather than stack, and as large as the largest frame a lane carries.
-    // A read that holds a whole record hands it to the parser as one slice, so
-    // reassembly is what happens when a record is split rather than what happens
-    // to every record. A driver thread's stack is not the place for it either.
+    // Heap-allocated and large enough for the largest frame a lane carries, so
+    // a whole record is handed to the parser as one slice.
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
-    // A burst rather than a datagram, because packets are gathered and handed
-    // over together. One UDP datagram is the most the kernel will segment at a
-    // time, so that bounds it: at a 1472-byte path MTU this holds 44 packets
-    // and costs one syscall instead of 44, which is where the offload pays.
-    // A datagram already near the cap holds one, and the send is what it was.
+    // Sized for a burst, not one datagram: packets are gathered and handed over
+    // together so the offload can segment them in one call.
     let burst_bytes = LARGEST_DATAGRAM_SIZE.max(datagram_bytes);
     let out = vec![0_u8; burst_bytes];
     let offload = offload_available();
@@ -863,9 +782,8 @@ fn drive(
     };
 
     // Receive-side offload from here on: the handshake above read plain
-    // datagrams, and everything after this can be handed a coalesced buffer
-    // with the segment size beside it. A kernel that refuses the option
-    // leaves each datagram its own read.
+    // datagrams. A kernel that refuses the option leaves each datagram its own
+    // read.
     enable_receive_offload(socket);
     run(
         socket,
@@ -886,8 +804,8 @@ fn drive(
     )
 }
 
-/// Where a pump's datagrams come from: the socket it owns alone, or a
-/// listener routing one socket's arrivals to many pumps (ADR-0031).
+/// Where a pump's datagrams come from: its own socket, or a listener routing
+/// one socket's arrivals to many pumps.
 #[derive(Clone, Copy)]
 enum Intake<'a> {
     /// The pump owns the socket and reads it directly.
@@ -934,8 +852,7 @@ fn run(
     offload: bool,
 ) -> Result<(), Error> {
     let budget = SharedBudget(Arc::clone(inbound));
-    // Allocated once, because a control-message buffer per read is a malloc
-    // per packet, which is the cost this path exists to remove.
+    // Allocated once to avoid a control-message allocation per packet.
     let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut queued = Queued::default();
@@ -945,7 +862,6 @@ fn run(
 
     loop {
         queued.debug_assert_matches(&streams);
-        // What the caller asked for, and what the connection has to say about it.
         let orphaned = take_submissions(
             &mut conn,
             &mut streams,
@@ -1103,16 +1019,13 @@ const ROUTER_TICK: Duration = Duration::from_millis(50);
 /// listener's connections share one local address and port.
 static ROUTED: AtomicU64 = AtomicU64::new(0);
 
-/// One socket serving many connections: the demultiplexing listener of
-/// ADR-0031, so W rails reach one fixed address.
+/// One socket serving many connections, so W rails reach one fixed address.
 ///
-/// A router thread owns the socket's receive side, routes each datagram
-/// to its connection's pump by connection ID, and turns an unknown
-/// Initial into a new connection. Every accepted connection is an
-/// ordinary [`Transport`]; its pump sends on the shared socket directly,
-/// which the kernel serializes. Dropping the listener stops the router;
-/// accepted connections outlive it on their own pumps, going quiet only
-/// when their peers do.
+/// A router thread owns the socket's receive side, routes each datagram to its
+/// connection's pump by connection ID, and turns an unknown Initial into a new
+/// connection. Each accepted connection is an ordinary [`Transport`]; its pump
+/// sends on the shared socket directly, which the kernel serializes. Dropping
+/// the listener stops the router; accepted connections outlive it.
 pub struct Listener {
     local: SocketAddr,
     arrivals: mpsc::Receiver<Transport>,
@@ -1125,15 +1038,12 @@ pub struct Listener {
 /// The listener's socket as another protocol's, taken once and moved to
 /// whichever thread speaks it.
 ///
-/// Holds the send side of the socket the sessions arrive at, which is the
-/// point: a NAT mapping belongs to a socket, so an exchange about where
-/// this endpoint appears has to happen on the same one (ADR-0033). What
-/// arrives leading with the configured byte comes back here, one datagram
-/// at a time however the kernel coalesced them.
+/// Holds the send side of the socket the sessions arrive at: a NAT mapping
+/// belongs to a socket, so replies must come from the same one. Datagrams
+/// leading with the configured byte arrive here.
 ///
-/// The socket is held weakly, so holding this does not hold the port: the
-/// router owns the socket, and once the listener has joined it there is
-/// nothing left to send from.
+/// The socket is held weakly, so this does not keep the port alive once the
+/// router has joined.
 pub struct SideChannel {
     socket: std::sync::Weak<UdpSocket>,
     arrivals: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
@@ -1359,9 +1269,8 @@ fn route(
             continue;
         }
         if header.ty != quiche::Type::Initial {
-            // Not the opening of a connection: a stray, or a straggler of
-            // a session already gone. Dropped, per spec/security.md
-            // section 7, rather than grown a connection for.
+            // Not an Initial: a stray or a straggler of a session already gone.
+            // Dropped rather than growing a connection for it.
             continue;
         }
         routes.retain(|_, row| !row.done.load(Ordering::Relaxed));
@@ -1394,14 +1303,12 @@ fn route(
                 routes.insert(key, route);
             }
             Err(refused) => {
-                // The backlog is full, so the connection dies where it was
-                // made; the client's retransmission will find room or the
-                // same answer. The route goes first: its channel is what
-                // the pump waits on, so the pump ends within a tick and
-                // the transport's drop joins it promptly. Dropped the
-                // other way round, the join waits out a close handshake
-                // with this thread not reading the socket, which stalls
-                // every connection the listener carries.
+                // The backlog is full, so the connection dies where it was made.
+                // The route goes first: its channel is what the pump waits on,
+                // so the pump ends and the transport's drop joins it promptly.
+                // Dropped the other way, the join waits out a close handshake
+                // with this thread not reading the socket, stalling every
+                // connection the listener carries.
                 drop(route);
                 drop(refused);
             }
@@ -1538,12 +1445,8 @@ fn accept_one(
     buffer: &mut [u8],
     timeout_ms: u64,
 ) -> Result<Option<quiche::Connection>, Error> {
-    // Zero is the caller saying it will wait: `vot serve` exists to sit
-    // there until a client comes, and a bound would read to it as a
-    // carrier that died during the handshake. Written here rather than as
-    // a function of its own, because a function is a thing a mutation run
-    // can replace wholesale with "no bound", and the tests that start a
-    // server nobody connects to rely on the bound to end their driver.
+    // Zero means the caller will wait: a bound would read as a carrier that
+    // died during the handshake.
     let bound = match timeout_ms {
         0 => None,
         milliseconds => Some(Duration::from_millis(milliseconds)),
@@ -1684,10 +1587,8 @@ fn address_of(storage: &nix::sys::socket::SockaddrStorage) -> Option<SocketAddr>
 /// coalesced them.
 ///
 /// The kernel cuts a coalesced buffer into `segment`-sized pieces with only
-/// the last allowed short, so the split is the counted walk of those pieces.
-/// A packet the connection cannot read is not this connection's problem:
-/// another peer's or a stray one, and dropping it is what spec/security.md
-/// section 7 asks for rather than answering it.
+/// the last allowed short. A packet the connection cannot read is a stray or
+/// another peer's; it is dropped rather than answered.
 fn feed_received(
     conn: &mut quiche::Connection,
     local: SocketAddr,
@@ -1764,26 +1665,12 @@ fn drain_arrivals(
 
 /// Sends what the connection has generated, and says when it wants to send more.
 ///
-/// A congestion controller that asks for the next packet later is not asking this
-/// thread to stop: sleeping inside this loop would stop reading the socket, so
-/// acknowledgements would queue in the kernel and the window would stop opening.
-/// The deadline goes back to the caller instead, which waits on the socket until
-/// then and keeps reading the whole time.
-/// One send pass, and the remedy when the interface refuses its sizes.
+/// Returns a deadline rather than sleeping so the socket keeps being read:
+/// sleeping would stall acknowledgements and stop the window opening.
 ///
-/// A socket that will not take a packet at all is a carrier that has
-/// gone, and the error says so. The ceiling goes down whole: a discovery
-/// probe is only generated when the buffer offered could hold one, and
-/// the connection's own packet-size accessor caps its answer at 16383,
-/// so a slot sized by it can never hold the probe for a larger ceiling
-/// and discovery starves at the handshake floor. `send_all` opens each
-/// burst at the ceiling and lets the first packet written set the
-/// burst's segment, which keeps the offload's equal-sized runs.
-///
-/// More refusals than probing explains is an interface that narrowed
-/// under the settled PMTU. Revalidation reopens discovery, which settles
-/// under the interface as it now is, and the ledger starts again so the
-/// next narrowing is noticed too.
+/// A socket that refuses all packets is a dead carrier. Sustained size
+/// refusals beyond what probing explains mean the interface narrowed under the
+/// settled PMTU; revalidation reopens discovery and resets the ledger.
 fn send_and_revalidate(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
@@ -1848,25 +1735,16 @@ fn send_all(
     gso: bool,
     refused: &mut usize,
 ) -> Result<Option<Instant>, Error> {
-    // Packets are gathered into one buffer and handed over together, because a
-    // syscall per packet is most of what a fast path costs: at a 1500-byte MTU
-    // it is one call, one copy, and one round through the UDP stack for every
-    // 1500 bytes carried. Segmentation offload takes the whole burst in one
-    // call and lets the kernel cut it up.
+    // Packets are gathered into one buffer and handed over together so
+    // segmentation offload takes the whole burst in one call.
     let mut filled = 0_usize;
     let mut segment = 0_usize;
     let mut destination = None;
     let mut deadline = None;
     loop {
-        // A burst opens with room for the ceiling and continues at the size
-        // its first packet came out as. The connection only generates a
-        // discovery probe when the room offered could hold one, so the
-        // opening slot has to be the ceiling; every later packet is capped
-        // under it, so the rest of the burst is a run of equal slots and
-        // `filled` stays on a segment boundary. Cutting every slot to the
-        // ceiling instead made each settled packet "short" and flushed the
-        // burst per packet; sizing every slot from the connection's accessor,
-        // which caps at 16383, silenced every probe a jumbo ceiling needs.
+        // The opening slot is the ceiling so a discovery probe fits; later
+        // packets are capped under it, so the burst is a run of equal slots and
+        // `filled` stays on a segment boundary.
         let slot = if filled == 0 { ceiling } else { segment };
         let Some(room) = out.get_mut(filled..filled + slot) else {
             // The buffer holds no further packet, so this burst goes now.
@@ -1934,13 +1812,12 @@ fn send_all(
 
 /// Sends a burst as one datagram the kernel cuts into `segment`-sized pieces.
 ///
-/// `UDP_SEGMENT` is what `MsQuic` reaches for on this platform, and it is the
-/// difference between one syscall per packet and one per burst. The unsafe work
-/// is `nix`'s, which is why this crate still forbids unsafe of its own.
+/// Uses `UDP_SEGMENT` via `nix`, which is why this crate forbids unsafe of its
+/// own.
 ///
 /// # Errors
-/// Reports any refusal, including a kernel that does not carry the option, so
-/// the caller can fall back to sending the packets one at a time.
+/// Reports any refusal, including a kernel without the option, so the caller
+/// can fall back to sending packets one at a time.
 #[cfg(target_os = "linux")]
 fn send_segmented(
     socket: &UdpSocket,
@@ -1980,28 +1857,20 @@ fn send_segmented(
 
 /// Whether to try segmentation offload on this platform.
 ///
-/// The send side needs no socket option, only a control message per call, so
-/// this is a question about the platform rather than about the socket. A kernel
-/// that refuses the message falls back for that burst.
+/// A kernel that refuses the control message falls back for that burst.
 ///
-/// The receive side is deliberately left alone. `UDP_GRO` makes one read return
-/// several coalesced packets, and a reader that hands the whole buffer to
-/// `Connection::recv` as one packet is handing it something it cannot parse.
-/// Turning it on without splitting the buffer first broke every transfer large
-/// enough to coalesce while every test stayed green, because a short test never
-/// gives the kernel two packets to join. It is worth having, and it is worth
-/// having with the read path that goes with it.
+/// The receive side (`UDP_GRO`) is deliberately left alone: it returns several
+/// coalesced packets in one buffer, which must be split before `Connection::recv`
+/// or it cannot parse them. It needs its own read path, not just the option.
 const fn offload_available() -> bool {
     cfg!(target_os = "linux")
 }
 
 /// Hands one burst of equally sized packets to the socket.
 ///
-/// With offload the whole burst is one call and the kernel cuts it into
-/// `segment`-sized datagrams. Without it, or for a burst of one, this is the
-/// plain send it replaces. A kernel that refuses the control message falls back
-/// rather than failing, because the offload is a cost saving and never a
-/// correctness requirement.
+/// With offload the whole burst is one call; without it each packet is sent
+/// separately. A refused control message falls back rather than failing: offload
+/// is a cost saving, not a correctness requirement.
 fn flush_burst(
     socket: &UdpSocket,
     burst: &[u8],
@@ -2024,14 +1893,9 @@ fn flush_burst(
     for packet in burst.chunks(segment) {
         match socket.send_to(packet, destination) {
             Ok(_) => {}
-            // A datagram the local interface cannot carry is a lost path
-            // probe, and losing it is the probe's answer: discovery asked
-            // whether the path takes this size and the first hop said no.
-            // Ordinary packets never hit this, because the connection sizes
-            // them under the MTU it has validated. Treating it as fatal
-            // killed the connection on the first probe above the NIC, which
-            // is what made any ceiling above the path unusable
-            // (docs/perf-engineering.md, 2026-08-06).
+            // A datagram too large for the interface is a lost path probe, and
+            // losing it is the probe's answer. Ordinary packets never hit this
+            // because the connection sizes them under the validated MTU.
             Err(error) if datagram_too_large(&error) => {
                 *refused = refused.saturating_add(1);
             }
@@ -2064,12 +1928,9 @@ fn datagram_too_large(error: &std::io::Error) -> bool {
 
 /// Takes what the caller has handed over, while the driver is under its bound.
 ///
-/// A peer that stops reading would otherwise have every submission behind it
-/// pile up in the outboxes, where nothing refuses anything. Leaving them in the
-/// channel is what makes a stalled peer backpressure: the channel fills, the
-/// caller's queue stops draining into it, and the application is told. A
-/// datagram waits behind a stalled stream for the same reason, the channel
-/// being one queue, which is what a datagram does here in any case.
+/// Leaving submissions in the channel until the bound is what makes a stalled
+/// peer backpressure: the channel fills, the caller's queue stops draining, and
+/// the application is told.
 #[expect(
     clippy::too_many_arguments,
     reason = "one submission needs what the driver holds, and the driver holds no less"
@@ -2102,15 +1963,11 @@ fn take_submissions(
     false
 }
 
-/// Closes for an owner that is gone, which the dropped channel says.
+/// Closes for an owner that is gone, which the dropped channel signals.
 ///
-/// The stored-close path runs first on the same pass, so a code the
-/// caller stored is already the connection's by the time this is asked;
-/// what is left is an owner that vanished without one, and a close with
-/// nothing to say says [`NO_REASON`]. The point of a second path is that
-/// neither this nor [`note_close_request`] alone is what lets the driver
-/// end, and no single failure of either strands the drop's join on an
-/// idle timeout.
+/// The stored-close path runs first, so a code the caller stored is already the
+/// connection's. This handles an owner that vanished without one. Two paths
+/// ensure no single failure strands the drop's join on an idle timeout.
 fn note_orphaned(conn: &mut quiche::Connection, closing: &mut bool) {
     if *closing {
         return;
@@ -2242,8 +2099,7 @@ fn read_streams(
     inbound: &Arc<Mutex<Inbound>>,
     control_limit: &Arc<AtomicUsize>,
     role: Role,
-    // The driver's own buffer, so a read costs no allocation. One per loop is
-    // sixty-four kilobytes a pass, which at ten gigabits is most of the work.
+    // The driver's own buffer, so a read costs no allocation.
     buffer: &mut [u8],
 ) {
     // Overflow drains for every stream that holds any, not only the readable
@@ -2463,10 +2319,7 @@ mod tests {
 
     #[test]
     fn an_arrival_wait_parks_through_the_accept() {
-        // A server with no client has nothing to say until its accept
-        // ends, and the wait must hold for all of it: one that returns
-        // early hands a session an empty carrier, whose stall budget then
-        // prices the accept and recycles an idle serve forever.
+        // The wait must hold for the full accept, not return early.
         let (certificate, key) = credentials();
         let mut config = Config::server(limits(), certificate, key);
         config.accept_timeout_ms = 400;
@@ -2514,11 +2367,8 @@ mod tests {
 
     #[test]
     fn a_listener_carries_two_connections_through_one_socket() {
-        // ADR-0031's demultiplexing listener: one socket on the served
-        // address, W rails reaching it as W whole connections at once.
-        // Isolation is the property worth the test: each rail's frames
-        // surface on its own session and nobody else's, both directions,
-        // both connections live at the same time.
+        // Isolation is the property under test: each rail's frames surface on
+        // its own session, both directions, both connections live at once.
         let (certificate, key) = credentials();
         let config = Config::server(limits(), certificate, key);
         let listener =
@@ -2526,9 +2376,7 @@ mod tests {
         let address = listener.local_address();
         let mut client_config = Config::client(limits());
         client_config.verify_peer = false;
-        // Short, so a mutant that kills the router costs its failing
-        // clients seconds of drop-side draining rather than the default
-        // half minute each, which is a runner timeout.
+        // Short timeout so a killed router drains quickly rather than timing out.
         client_config.idle_timeout_ms = 3_000;
         let connect = || {
             Transport::connect(
@@ -2786,11 +2634,9 @@ mod tests {
 
     #[test]
     fn each_controller_maps_to_its_algorithm_and_pacing() {
-        // The socket test cannot tell the controllers apart, because both
-        // carry traffic; this table is the only witness of which
-        // algorithm ran and whether pacing ran with it. Bbr2 without the
-        // pacing-off half is the 22 Mbit/s starvation the enum's doc
-        // records.
+        // The socket test cannot tell the controllers apart, because both carry
+        // traffic; this table is the only witness of which algorithm ran and
+        // whether pacing ran with it.
         assert_eq!(
             congestion_config(CongestionControl::Cubic),
             (quiche::CongestionControlAlgorithm::CUBIC, true)
@@ -2804,11 +2650,9 @@ mod tests {
 
     #[test]
     fn a_bbr2_connection_carries_a_record_across_the_socket() {
-        // The controller choice reaches quiche and the connection still
-        // carries: Bbr2 disables quiche's pacing (its schedule starves a
-        // compliant sender, docs/perf-engineering.md 2026-08-06), and a
-        // wiring that broke the handshake or the send path would show
-        // here before any WAN measurement could.
+        // The controller choice reaches quiche and the connection still carries.
+        // A wiring that broke the handshake or send path would show here before
+        // any WAN measurement could.
         let (mut client, mut server) = pair_with(CongestionControl::Bbr2);
         let record = frame(b"carried-under-bbr2");
         client
@@ -2861,10 +2705,8 @@ mod tests {
 
     #[test]
     fn a_close_request_reaches_the_connection_exactly_once() {
-        // The caller's close travels by atomic; a driver that never takes
-        // it leaves the peer holding a session that will only die of idle
-        // timeout, which is what the stubbed version of this did for two
-        // minutes at a time.
+        // The caller's close travels by atomic; a driver that never takes it
+        // leaves the peer holding a session that only dies of idle timeout.
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a config");
         config
             .set_application_protos(&[vot_transport_api::ALPN])
@@ -2938,16 +2780,10 @@ mod tests {
 
     #[test]
     fn an_oversized_probe_is_lost_and_the_burst_survives_it() {
-        // A DPLPMTUD probe above the local interface's MTU is refused by
-        // the socket with EMSGSIZE. That refusal is the probe's answer,
-        // the same answer a don't-fragment drop gives one hop later, and
-        // the packets around the probe must still go. Treated as fatal it
-        // killed the connection on the first probe above the NIC, which
-        // made any datagram ceiling above the real path unusable
-        // (docs/perf-engineering.md, 2026-08-06). A 65,508-byte payload
-        // plus its IP and UDP headers overflows IPv4's 16-bit total
-        // length, so the refusal is the protocol's on every platform and
-        // interface, not any particular MTU's.
+        // A DPLPMTUD probe above the interface MTU is refused with EMSGSIZE.
+        // That refusal is the probe's answer, and the packets around it must
+        // still go. A 65,508-byte payload plus headers overflows IPv4's 16-bit
+        // total length, so the refusal is the protocol's on every platform.
         let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
         let receiver = UdpSocket::bind("127.0.0.1:0").expect("a receiver");
         let destination = receiver.local_addr().expect("its address");
@@ -2988,11 +2824,9 @@ mod tests {
 
     #[test]
     fn a_frame_sent_before_the_handshake_finishes_still_arrives() {
-        // The peer's stream allowance arrives with the handshake, so a
-        // frame handed over before then cannot be written yet and quiche
-        // answers StreamLimit. Treated as fatal, it was dropped and the
-        // peer waited forever on an answer to a request it never saw.
-        // Every caller that opens a session sends its first frame at once.
+        // The peer's stream allowance arrives with the handshake, so a frame
+        // handed over before then gets StreamLimit from quiche and must be
+        // retried, not dropped.
         let (mut client, mut server) = pair();
         let hello = frame(b"before-the-handshake");
         client
@@ -3049,7 +2883,6 @@ mod tests {
         assert!(connected(&from_server), "the server saw it too");
 
         // The path is what the connection measured, not a number invented here.
-        // ADR-0013 makes Careful Resume conditional on a backend exposing this.
         let stats = client.path_stats().expect("a path sample");
         assert!(stats.smoothed_rtt_us.is_some());
         assert!(stats.congestion_window_bytes.unwrap_or(0) > 0);
@@ -3063,14 +2896,8 @@ mod tests {
             connected(a) && connected(b)
         });
 
-        // Handshake-tail traffic can keep arriving briefly, and every push
-        // leaves the latch raised, which polling never consumes. Settle
-        // first: drain, then require one short wait to pass with nothing
-        // arriving, so the timed wait below parks on a quiet queue and only
-        // the record's own push can end it. This loop is also what pins that
-        // an idle wait costs its bound: a wait that returns at once with
-        // nothing to poll can never settle, and that spin is what the
-        // contract forbids.
+        // Settle first: drain and require a quiet wait so the timed wait below
+        // parks on an empty queue and only the record's push can end it.
         let quiet = Duration::from_millis(100);
         let settle_deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -3257,9 +3084,9 @@ mod tests {
 
     #[test]
     fn a_datagram_reports_only_what_was_observed() {
-        // ADR-0024: this carrier offers no per-datagram acknowledgement, so Sent
-        // is the last state there is. Reporting an acknowledgement that was never
-        // observed would be worse than reporting less.
+        // This carrier offers no per-datagram acknowledgement, so Sent is the
+        // last state there is. Reporting an acknowledgement never observed
+        // would be worse than reporting less.
         let (mut client, mut server) = pair();
         pump_until(&mut client, &mut server, 10, |a, b| {
             connected(a) && connected(b)
@@ -3376,18 +3203,14 @@ mod tests {
 
     /// What one lane carries over loopback, in bytes per second.
     ///
-    /// Ignored because it is a measurement rather than a rule: a shared machine
-    /// makes the number vary, and a threshold here would fail for reasons that
-    /// have nothing to do with the carrier. Run it when the pump changes:
+    /// Ignored: a shared machine makes the number vary, and a threshold here
+    /// would fail for reasons unrelated to the carrier. Run it when the pump
+    /// changes:
     ///
     /// ```text
     /// cargo test -p vot-transport-quiche --features live --release \
     ///     one_lane_throughput -- --ignored --nocapture
     /// ```
-    ///
-    /// It exists because the adapter can be the ceiling rather than the engine,
-    /// which is exactly what PERF-001 must not measure. A number far below the
-    /// link says to look here first.
     #[test]
     #[ignore = "a measurement, not a rule"]
     fn one_lane_throughput() {
@@ -3974,9 +3797,7 @@ mod tests {
     #[test]
     fn a_spent_byte_budget_pauses_the_stream_instead_of_closing_it() {
         // A caller that has not drained the queue is this endpoint's own lag.
-        // The connection must wait for it, not close: the fault path here
-        // used to kill the carrier with RESOURCE_LIMIT the moment the spine
-        // fell behind, which took every multi-rail transfer down with it.
+        // The connection must wait for it, not close.
         let (mut client, mut server) = sans_io_pair(1_000_000);
         frame_on_the_wire(&mut client, &mut server);
         let inbound = Arc::new(Mutex::new(Inbound {
@@ -4006,8 +3827,8 @@ mod tests {
             "a full queue still accepted an event"
         );
 
-        // Exactly at the gate's threshold the read proceeds: the gate asks
-        // for room to hold one chunk and one partial, not a byte more.
+        // At the exact threshold the read proceeds: headroom for one chunk
+        // plus one partial frame is enough, not a byte more.
         inbound.lock().expect("the queue").assembling =
             MAX_ASSEMBLY_BYTES - (vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len());
         read_streams(
@@ -4121,10 +3942,9 @@ mod tests {
 
     #[test]
     fn a_split_frame_waits_for_headroom_rather_than_faulting() {
-        // A frame wider than the read buffer assembles across chunks, and
-        // that assembly is what the headroom gate protects: reading it with
-        // no room would fail the framing's reservation, which is the fault
-        // path this endpoint's own lag must never reach.
+        // A frame wider than the read buffer assembles across chunks. Reading
+        // it with no headroom would fail the framing's reservation, which is
+        // the fault path this endpoint's own lag must never reach.
         let (mut client, mut server) = sans_io_pair(1_000_000);
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
@@ -4191,11 +4011,10 @@ mod tests {
 
     #[test]
     fn a_spent_event_count_parks_the_frame_and_delivers_it_later() {
-        // The byte gate cannot see a queue full of empty events, so the frame
-        // completes, the queue refuses it, and it waits in the stream's
-        // overflow. The stream may also leave the readable set for good
-        // here, which is why the drain walks every stream and not only the
-        // readable ones.
+        // The byte budget cannot see a queue full of empty events, so the frame
+        // completes, the queue refuses it, and it waits in overflow. The stream
+        // may leave the readable set for good, which is why the drain walks
+        // every stream, not only the readable ones.
         let (mut client, mut server) = sans_io_pair(1_000_000);
         let inbound = Arc::new(Mutex::new(Inbound::default()));
         {

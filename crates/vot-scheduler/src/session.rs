@@ -1,13 +1,7 @@
 //! Drives a [`ReliableReceiver`] from a negotiated session.
 //!
-//! A session moves frames. A receiver turns proof-bearing ranges into verified
-//! state. Nothing joined them, so a live carrier carried opaque records and
-//! verified nothing.
-//!
-//! Records and their bundle arrive as separate frames and in either order, so
-//! this holds whichever comes first and hands the receiver a complete bundle.
-//! Held, not unbounded: a peer that sends records for a bundle it never
-//! completes would otherwise grow this without limit.
+//! Records and bundles arrive as separate frames in either order. This holds
+//! whichever comes first, bounded, and hands the receiver a complete bundle.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -17,11 +11,8 @@ use vot_transport_api::{Event, SubjectId, TransportAdapter};
 
 use crate::{Error, RangeSink, ReliableReceiver};
 
-/// The most one admitted bundle can hold: its proof, bounded per frame by the
-/// negotiated control ceiling, plus every record it can declare.
-///
-/// A byte bound below this refuses a conforming transfer partway through, so it
-/// is the floor for the admitted budget rather than a target.
+/// Max bytes one bundle can hold. A lower bound would refuse a conforming
+/// transfer partway through.
 pub const MAX_PENDING_BUNDLE_BYTES: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD
     + vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE * vot_transport_api::MAX_DATA_RECORD_BYTES;
 
@@ -44,12 +35,7 @@ pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUND
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
 pub const REMEMBERED_BUNDLES: usize = 64;
 
-/// The identity of one record of a delivered bundle.
-///
-/// Its framing, not its bytes. Comparing bytes would mean keeping every
-/// delivered record or hashing verified plaintext again on each replay, and a
-/// record arriving after its range is verified cannot change that range either
-/// way. A record whose framing differs is a conflicting duplicate.
+/// Framing identity of one delivered record. Used for idempotent replay checks.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct DeliveredRecord {
     record_index: u64,
@@ -71,11 +57,8 @@ impl DeliveredRecord {
     }
 }
 
-/// What a delivered bundle was, and the records that covered it.
-///
-/// The bundle is kept as a hash of the frame it arrived in rather than as a
-/// choice of fields, so a replay differing anywhere the wire carries a
-/// difference is a conflicting duplicate rather than an accepted one.
+/// Delivered bundle: frame hash and record identities. A replay differing
+/// anywhere on the wire is a conflicting duplicate.
 #[derive(Clone, Eq, PartialEq)]
 struct Delivered {
     identity: [u8; 32],
@@ -101,10 +84,7 @@ struct Pending {
 }
 
 impl Pending {
-    /// The bytes this bundle is holding, proof and records alike.
-    ///
-    /// Summed on demand rather than kept alongside the frames, so the total and
-    /// what it describes cannot disagree.
+    /// Bytes held for this bundle, summed on demand.
     fn bytes(&self) -> usize {
         let proof = self.bundle.as_ref().map_or(0, |bundle| bundle.proof.len());
         proof
@@ -129,13 +109,7 @@ fn is_proof_bundle(frame: &[u8]) -> bool {
         .is_ok_and(|(frame_type, _)| frame_type == vot_codec::frame_type::PROOF_BUNDLE)
 }
 
-/// A bundle with every record in, handed to a caller that proves it itself.
-///
-/// Verification and placement are the expensive halves of taking a bundle
-/// and neither needs this receiver: `verify_typed_bundle` is an associated
-/// function and `write_to` wants only the sink. So a caller with threads to
-/// spare runs both off the session's thread and hands back the witness,
-/// which is the arrangement ADR-0029 wrote `WrittenRange` for.
+/// A complete bundle handed to a caller for off-thread verification.
 #[derive(Debug)]
 pub struct CompletedBundle {
     id: [u8; 16],
@@ -165,11 +139,7 @@ impl CompletedBundle {
     }
 }
 
-/// Completed bundles a deferring caller may owe at once.
-///
-/// The pending budget stops holding a bundle the moment it completes, so
-/// this is what bounds the handover instead: [`SessionReceiver::poll`]
-/// stops reading while this many are undrained.
+/// Max completed bundles undrained before `poll` stops reading.
 pub const DEFAULT_DEFERRED_BUNDLES: usize = 4;
 
 /// A receiver fed by a session over a real carrier.

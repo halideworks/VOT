@@ -1,11 +1,9 @@
-//! The `spec/wire.md` section 1 and 1.1 exchanges, and the gates they put in
-//! front of the data plane. See `docs/session.md`.
+//! The `spec/wire.md` section 1 and 1.1 negotiation and authentication
+//! exchange. See `docs/session.md`.
 //!
-//! Both halves of the authentication exchange run here. What a capability is
-//! worth, and what one to present, are the caller's: the state machine owns the
-//! sequence and the identities, and hands the decision out through
-//! [`Accepted::AuthorizationRequired`] on a server and
-//! [`Accepted::PresentationRequired`] on a client.
+//! The state machine owns the sequence; the caller decides what a capability
+//! is worth through [`Accepted::AuthorizationRequired`] (server) and
+//! [`Accepted::PresentationRequired`] (client).
 
 #![forbid(unsafe_code)]
 
@@ -20,8 +18,7 @@ use vot_transport_api::{Error as TransportError, Event, Payload, StreamId, Trans
 
 /// Peer records held while this endpoint finishes negotiating.
 ///
-/// A conforming peer can have data in flight before it learns this side is
-/// ready, so refusing them would close a session it did nothing wrong in.
+/// A conforming peer can have data in flight before it learns this side is ready.
 pub const DEFAULT_PENDING_RECORD_BYTES: usize = 4 * vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
 
 /// The same bound by count, since bytes alone do not limit per-record
@@ -120,12 +117,10 @@ pub enum ErrorKind {
     SessionOpenInvalid,
     /// `SESSION_ACCEPT` or `SESSION_REJECT` did not carry an answer.
     SessionAnswerInvalid { frame_type: u64 },
-    /// An answer named an attempt this endpoint did not make, so nothing here
-    /// can tell which request it belongs to.
+    /// An answer named an attempt this endpoint did not make.
     ///
-    /// Neither identifier is carried. `spec/telemetry.md` section 3 puts a raw
-    /// session identifier on the list that must not appear at any level, and an
-    /// error kind with a `Debug` derive is one log line away from being one.
+    /// Neither identifier is carried: a `Debug` derive is one log line from
+    /// leaking a session identifier.
     SessionIdentifierMismatch,
     /// The caller answered a request with something that cannot be encoded: a
     /// scope too wide for the frame, or a reason the registry does not assign
@@ -198,12 +193,8 @@ pub enum ErrorKind {
     },
 }
 
-/// Why a request the caller built cannot go out, from the rules
-/// `spec/wire.md` section 1.1 puts on `SESSION_OPEN`.
-///
-/// One table rather than an error kind per rule: every one of these is the
-/// caller handing the client half something the section forbids, and none of
-/// them is the peer's doing.
+/// Why a request the caller built cannot go out, from `spec/wire.md`
+/// section 1.1 rules on `SESSION_OPEN`. All are the caller's mistake, not the peer's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationError {
     /// No challenge is waiting for one, or an attempt is already out.
@@ -282,13 +273,10 @@ pub enum Accepted {
     /// Nothing moves until it does: the exchange is not concluded and the data
     /// plane is still shut.
     AuthorizationRequired,
-    /// A server asked this client for a capability, or refused the last one it
-    /// presented. The caller answers with [`Negotiation::present`], reading the
-    /// challenge from [`Negotiation::pending_presentation`] and the refusal, if
-    /// there was one, from [`Negotiation::last_refusal`].
-    ///
-    /// A caller with nothing left to present closes the carrier: no request is
-    /// also no conclusion, and the data plane stays shut either way.
+    /// A server asked for a capability, or refused the last one. The caller
+    /// answers with [`Negotiation::present`], reading the challenge from
+    /// [`Negotiation::pending_presentation`] and the refusal from
+    /// [`Negotiation::last_refusal`].
     PresentationRequired,
 }
 
@@ -300,9 +288,8 @@ pub struct Negotiation {
     state: State,
     local: Settings,
     extensions: BTreeSet<u64>,
-    /// The challenge a server advertises, and what a client read. Supplied by
-    /// the caller: this crate has no randomness, and a session whose freshness
-    /// came from inside it could not be tested for the value it actually sent.
+    /// The challenge a server advertises, or what a client read. Caller-supplied:
+    /// this crate has no randomness.
     challenge: AuthContext,
     /// Whether a client has read the server's challenge. A demanding challenge
     /// leaves the client `Negotiated`, so without this a second `AUTH_CONTEXT`
@@ -343,9 +330,9 @@ impl Negotiation {
     /// A connecting endpoint whose caller answers a challenge that asks for a
     /// capability.
     ///
-    /// Nothing is declared here. A request binds to the nonce in the challenge,
-    /// which does not exist until the server sends one, so the caller builds it
-    /// then and passes it to [`present`](Self::present).
+    /// Nothing is declared here: a request binds to the nonce in the challenge,
+    /// which does not exist until the server sends one. The caller passes it to
+    /// [`present`](Self::present).
     #[must_use]
     pub fn presenting_client(local: Settings, extensions: BTreeSet<u64>) -> Self {
         Self::new(
@@ -415,27 +402,18 @@ impl Negotiation {
 
     /// The extensions this endpoint may send under.
     ///
-    /// Always empty, and that is the specification gap rather than a policy.
-    /// Only the client sends `HELLO`, so a server can compute an intersection
-    /// and a client cannot. Sending under the server's half would put a frame
-    /// on the wire that the client is obliged to refuse, closing a session that
-    /// had negotiated correctly.
+    /// Always empty: only the client sends `HELLO`, so a server can compute an
+    /// intersection but a client cannot. Sending under the server's half would
+    /// put a frame on the wire the client is obliged to refuse.
     ///
-    /// Strict about what is sent, and [`negotiated_extensions`] for what is
-    /// accepted. This becomes the intersection once the exchange can confirm
-    /// extensions in both directions.
-    ///
-    /// [`negotiated_extensions`]: Self::negotiated_extensions
+    /// See [`negotiated_extensions`](Self::negotiated_extensions) for what is accepted.
     #[must_use]
     pub fn usable_extensions(&self) -> BTreeSet<u64> {
         BTreeSet::new()
     }
 
-    /// The extensions both endpoints advertised, which bound what is accepted.
-    ///
-    /// Advertising one does not authorise it, so this is the intersection.
-    /// Empty until the peer's `HELLO` arrives, which is what keeps an
-    /// experimental frame out of an unnegotiated session.
+    /// The intersection of both endpoints' extensions, which bound what is accepted.
+    /// Empty until the peer's `HELLO` arrives.
     #[must_use]
     pub fn negotiated_extensions(&self) -> BTreeSet<u64> {
         let Some(hello) = &self.peer_hello else {
@@ -520,10 +498,9 @@ impl Negotiation {
             frame_type::SETTINGS_ACK => self.accept_settings_ack(),
             frame_type::AUTH_CONTEXT => self.accept_auth_context(payload),
             frame_type::SESSION_OPEN => self.accept_session_open(payload),
-            // The exchange owns its answers inbound as well as outbound.
-            // Refused rather than handed to the application when no attempt is
-            // out, since an answer to a request nothing made would let a peer
-            // look like it had authenticated.
+            // The exchange owns its answers inbound too. Refused rather than
+            // handed to the application when no attempt is out: an answer to
+            // nothing would let a peer look authenticated.
             frame_type::SESSION_ACCEPT => self.accept_session_accept(payload),
             frame_type::SESSION_REJECT => self.accept_session_reject(payload),
             other => self.accept_application(other),
@@ -588,10 +565,9 @@ impl Negotiation {
         match self.role {
             EndpointRole::Client => Ok(Accepted::Consumed { reply: Vec::new() }),
             EndpointRole::Server => {
-                // Answer, acknowledgement, and challenge together: nothing
-                // further to ask. spec/wire.md section 1.1 puts AUTH_CONTEXT
-                // straight after SETTINGS_ACK, so a peer never has to be told
-                // to expect it.
+                // Answer, acknowledgement, and challenge together.
+                // spec/wire.md section 1.1 puts AUTH_CONTEXT straight after
+                // SETTINGS_ACK.
                 let reply = vec![
                     self.settings_frame()?,
                     settings_ack_frame()?,
@@ -625,15 +601,11 @@ impl Negotiation {
         Ok(Accepted::Consumed { reply: Vec::new() })
     }
 
-    /// Accepts the server's challenge.
-    ///
-    /// A challenge advertising no capability format is the concluding frame of
-    /// the exchange, so reading it is what authenticates the client. One that
-    /// advertises a format needs an answer, which the caller builds.
+    /// Accepts the server's challenge. One with no capability format concludes
+    /// the exchange; one with a format needs a caller-built answer.
     fn accept_auth_context(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
-        // Sent once. A demanding challenge leaves the client Negotiated, so
-        // without the flag a second one would replace the challenge an attempt
-        // is answering and change what it was signed over.
+        // Sent once. Without the flag a second would replace the challenge an
+        // attempt is answering and change what it was signed over.
         if self.role != EndpointRole::Client
             || self.state != State::Negotiated
             || self.challenge_read
@@ -650,9 +622,8 @@ impl Negotiation {
         }
         if !self.presenting {
             // A server asking for a capability this endpoint has none of.
-            // Refusing immediately is what section 1.1 gives the format list
-            // for, and it stops a client from looking authenticated to itself
-            // while the server waits for a SESSION_OPEN.
+            // Refusing immediately stops a client from looking authenticated
+            // to itself.
             return Err(Error::new(
                 ErrorKind::CapabilityRequired {
                     formats: context.formats.len(),
@@ -688,8 +659,7 @@ impl Negotiation {
     /// attempt.
     fn accept_session_reject(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
         let sent = self.answered_attempt(frame_type::SESSION_REJECT)?;
-        // The reason is one of the three section 1.1 assigns to a rejection:
-        // the codec refuses the rest, so nothing here has to name them twice.
+        // The codec refuses reasons section 1.1 does not assign to a rejection.
         let reject = vot_codec::frames::decode_session_reject_payload(payload).map_err(|_| {
             Error::new(
                 ErrorKind::SessionAnswerInvalid {
@@ -701,16 +671,12 @@ impl Negotiation {
         Self::require_answers_attempt(reject.session_id, sent)?;
         self.open = None;
         self.refusal = Some(reject);
-        // Still Negotiated, and the challenge still stands. Another attempt may
-        // follow while section 1.1 allows one.
+        // Still Negotiated. Another attempt may follow.
         Ok(Accepted::PresentationRequired)
     }
 
-    /// The identifier of the attempt an inbound answer must belong to.
-    ///
-    /// One pattern rather than a chain of conditions, so the only way to widen
-    /// what an answer is accepted in is to write another arm. A server holds a
-    /// request in the same field and must not read an answer to it.
+    /// The identifier an inbound answer must belong to.
+    /// A server holds a request in the same field and must not read an answer to it.
     fn answered_attempt(&self, frame_type: u64) -> Result<[u8; 16], Error> {
         match (self.role, self.state, &self.open) {
             (EndpointRole::Client, State::Negotiated, Some(open)) => Ok(open.session_id),
@@ -718,11 +684,9 @@ impl Negotiation {
         }
     }
 
-    /// Refuses an answer that names an attempt this endpoint did not make.
-    ///
-    /// Section 1.1 has both answers repeat the request's identifier. Without
-    /// this a server could authenticate a client by answering an attempt that
-    /// was never sent, and a rejection could clear an attempt still in flight.
+    /// Refuses an answer naming an attempt this endpoint did not make.
+    /// Without this a server could authenticate a client by answering an attempt
+    /// never sent, or a rejection could clear one in flight.
     fn require_answers_attempt(answered: [u8; 16], sent: [u8; 16]) -> Result<(), Error> {
         if answered == sent {
             return Ok(());
@@ -733,17 +697,11 @@ impl Negotiation {
         ))
     }
 
-    /// Decides whether a frame outside the exchange may be carried.
-    ///
-    /// Two gates, in the order `spec/wire.md` puts them: section 1 refuses
-    /// everything until negotiation has finished, and section 1.1 refuses the
-    /// subset the registry marks `auth: yes` until the authentication exchange
-    /// concludes. A frame the registry does not mark passes in between.
     /// Accepts a client's request to open a session.
     ///
-    /// Everything section 1.1 requires of the request is checked here; whether
-    /// the capability itself is good is the caller's policy to decide, which is
-    /// what [`Accepted::AuthorizationRequired`] asks for.
+    /// All section 1.1 rules on the request are checked here; whether the
+    /// capability itself is good is the caller's policy via
+    /// [`Accepted::AuthorizationRequired`].
     fn accept_session_open(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
         // A deployment advertising no capability format concluded the exchange
         // at AUTH_CONTEXT, so there is nothing here to open.
@@ -782,9 +740,7 @@ impl Negotiation {
                 error_code::AUTHENTICATION_FAILED,
             ));
         }
-        // The same rule the client half applies before sending. A proof under a
-        // binding that asks for none, or none under a binding that asks for a
-        // proof, is a request no policy can weigh.
+        // The same binding rule the client applies before sending.
         if !binding_proof_agrees(self.challenge.binding, &open.binding_proof) {
             return Err(Error::new(
                 ErrorKind::BindingProofMismatch {
@@ -808,13 +764,8 @@ impl Negotiation {
         }
     }
 
-    /// The challenge awaiting a capability, on a client that can present one.
-    ///
-    /// Absent while an attempt is out: the answer to that one decides whether
-    /// another is needed. The nonce is here because a proof of possession is
-    /// over it.
-    /// One pattern rather than a chain of negations: a client, negotiated, able
-    /// to present, having read a challenge, and with no attempt out.
+    /// The challenge awaiting a capability, on a presenting client.
+    /// Absent while an attempt is out.
     #[must_use]
     pub const fn pending_presentation(&self) -> Option<&AuthContext> {
         match (
@@ -850,18 +801,13 @@ impl Negotiation {
         self.refusal.as_ref()
     }
 
-    /// Presents the caller's capability against the challenge that asked for
-    /// one.
-    ///
-    /// Every rule section 1.1 puts on a request is checked here, so a request
-    /// this endpoint would be closed on never reaches the carrier. What the
-    /// capability itself is worth is the server's to decide.
+    /// Presents the caller's capability. All section 1.1 rules are checked
+    /// here; the server decides what the capability is worth.
     ///
     /// # Errors
-    /// Reports a request that answers no challenge, spent attempts, a reused
-    /// identifier, a format the server did not advertise, a binding proof that
-    /// does not match the challenge, and a request the peer's negotiated
-    /// control-frame limit will not carry. None of them closes the session.
+    /// Reports a request section 1.1 does not allow (no challenge, spent
+    /// attempts, reused identifier, unoffered format, mismatched binding proof,
+    /// or one the peer's limit will not carry). None closes the session.
     pub fn present(&mut self, request: SessionOpen) -> Result<Vec<Vec<u8>>, Error> {
         if self.pending_presentation().is_none() {
             return Err(presentation_error(PresentationError::NothingToAnswer {
@@ -873,9 +819,8 @@ impl Negotiation {
                 attempts: self.attempted.len(),
             }));
         }
-        // The rules the server checks on arrival, checked here first. A request
-        // breaking one of them is answered with a close rather than a rejection,
-        // so sending it costs the session every attempt it had left.
+        // Checked here first: breaking one is a close, not a rejection, and
+        // costs the session every attempt.
         if self.attempted.contains(&request.session_id) {
             return Err(presentation_error(PresentationError::IdentifierReused));
         }
@@ -902,12 +847,7 @@ impl Negotiation {
     }
 
     /// Refuses an exchange frame the peer's negotiated limit would not carry.
-    ///
-    /// A capability can be 48 KiB and a peer may advertise a control-frame
-    /// maximum of 1 KiB, so this is the difference between a local error and a
-    /// session the peer closes for a frame it said it would not accept. The
-    /// exchange does not go through [`Session::check_outbound`], which refuses
-    /// its frames as application ones.
+    /// The exchange does not go through [`Session::check_outbound`].
     ///
     /// [`Session::check_outbound`]: Session::check_outbound
     fn within_peer_control_limit(&self, frame: &[u8]) -> Result<(), Error> {
@@ -915,9 +855,8 @@ impl Negotiation {
             return Ok(());
         };
         let limits = vot_codec::DecodeLimits {
-            // The protocol ceiling, not the negotiated one. This endpoint
-            // encoded the frame, so the only bound that matters is the peer's,
-            // and reporting it as a decode failure would say the wrong thing.
+            // The protocol ceiling, not the negotiated one: this endpoint
+            // encoded the frame, so only the peer's bound matters.
             max_unknown_payload: vot_codec::HARD_MAX_FRAME_PAYLOAD,
             max_frames: 1,
         };
@@ -955,10 +894,8 @@ impl Negotiation {
             session_id: open.session_id,
             granted_scope,
         };
-        // Encoded and measured before the request is spent. An answer that
-        // cannot go out must leave the caller able to make another, and dropping
-        // the request first would leave a peer waiting on a decision nothing
-        // still holds.
+        // Encoded and measured before the request is spent. Dropping it first
+        // would leave a peer waiting on a decision nothing holds.
         let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionAccept(accept))?;
         self.within_peer_control_limit(&frame)?;
         self.open = None;
@@ -1049,10 +986,7 @@ impl Negotiation {
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type::AUTH_CONTEXT, &payload, &mut frame)
             .map_err(|error| Error::new(ErrorKind::Decode(error), error_code::MALFORMED_FRAME))?;
-        // Measured like the other three, though a maximal challenge is around
-        // 130 bytes and the smallest limit a peer may advertise is 1024. Uniform
-        // rather than reasoned about per frame, so a registry that widens the
-        // challenge does not leave one frame unmeasured.
+        // Measured like the other three, uniformly.
         self.within_peer_control_limit(&frame)?;
         Ok(frame)
     }
@@ -1072,11 +1006,7 @@ fn settings_ack_frame() -> Result<Vec<u8>, Error> {
 }
 
 /// Whether a request's binding proof matches the binding the challenge named.
-///
-/// `spec/wire.md` section 1.1: the proof is empty when the binding is none, and
-/// otherwise proves possession of the key the capability names. One function for
-/// both directions, so the rule cannot hold on the side that sends and not on
-/// the side that reads.
+/// One function for both directions so the rule cannot diverge between sender and reader.
 const fn binding_proof_agrees(binding: Binding, proof: &[u8]) -> bool {
     match binding {
         Binding::None => proof.is_empty(),
@@ -1110,11 +1040,8 @@ pub struct Session<A> {
     negotiation: Negotiation,
     /// Named by the caller, because no policy exists to establish it.
     authentication: Authentication,
-    /// Negotiation frames the backend has not accepted yet, at most two.
-    ///
-    /// The exchange advances in pairs, and the state machine will not produce
-    /// a frame twice, so a full outbound queue has to be backpressure rather
-    /// than a lost handshake.
+    /// Negotiation frames the backend has not accepted yet, at most two. A full
+    /// queue is backpressure, not a lost handshake.
     outbound: VecDeque<Vec<u8>>,
     /// Records the peer sent before this endpoint reached `Ready`. Held here
     /// rather than in the adapter, whose single queue would block the control
@@ -1131,10 +1058,8 @@ pub struct Session<A> {
 }
 
 impl<A: TransportAdapter> Session<A> {
-    /// A connecting session, which opens the negotiation stream.
-    ///
-    /// `authentication` has to be named because there is no implementation
-    /// behind it: see [`Authentication`].
+    /// A connecting session, which opens the negotiation stream. See
+    /// [`Authentication`] for why it must be named.
     pub fn client(
         adapter: A,
         local: Settings,
@@ -1150,9 +1075,7 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     /// An accepting session, which answers on the stream the client opened.
-    ///
-    /// `authentication` has to be named because the exchange is
-    /// unconditional: see [`Authentication`].
+    /// See [`Authentication`] for why it must be named.
     pub fn server(
         adapter: A,
         local: Settings,
@@ -1249,14 +1172,10 @@ impl<A: TransportAdapter> Session<A> {
 
     /// Borrows the backend mutably, for the code that drives the carrier.
     ///
-    /// Some backends do their work through methods the adapter contract does
-    /// not cover: a `TcpAdapter` moves bytes through `drain_commands` and
-    /// `record_native_event`, both of which need this, and without it a session
-    /// over one could queue a handshake nothing would ever send.
-    ///
-    /// This is for a driver, not an application. Reaching the adapter reaches
-    /// past the readiness gate, and an application that sends through here is
-    /// doing what [`send_reliable`](Self::send_reliable) exists to refuse.
+    /// Some backends work through methods the adapter contract does not cover.
+    /// This is for a driver, not an application: it reaches past the readiness
+    /// gate, and an application that sends through here is doing what
+    /// [`send_reliable`](Self::send_reliable) exists to refuse.
     pub const fn driver(&mut self) -> &mut A {
         &mut self.adapter
     }
@@ -1279,11 +1198,8 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     /// Refuses a stance that means nothing for this endpoint's role.
-    ///
     /// A server given a client's stance would advertise a nonce no caller
-    /// chose, and a client given a server's would ignore the challenge it was
-    /// handed. Both used to pass and do nothing, which is the failure that
-    /// shows up as a peer refusing the exchange.
+    /// chose; a client given a server's would ignore the challenge.
     fn check_authentication_role(&self) -> Result<(), Error> {
         let role = self.negotiation.role;
         let fits = match (&self.authentication, role) {
@@ -1392,11 +1308,9 @@ impl<A: TransportAdapter> Session<A> {
                     return Ok(Some(Event::Disconnected(connection)));
                 }
                 record @ Event::Reliable { .. } => {
-                    // No lane count here. A session never sees a stream close,
-                    // so it could only count lanes ever used and would refuse a
-                    // peer that closed one and opened another. The transport
-                    // counts them at adoption and releases them at shutdown,
-                    // which is the only place that lifecycle is visible.
+                    // No lane count here: a session never sees a stream close,
+                    // so counting would reject a peer that closed one and opened
+                    // another. The transport handles lane accounting.
                     if let Event::Reliable { bytes, .. } = &record {
                         self.check_inbound(bytes, Lane::Reliable)?;
                     }
@@ -1435,8 +1349,7 @@ impl<A: TransportAdapter> Session<A> {
         self.check_outbound(record, Lane::Reliable)?;
         self.require_lane_allowed(stream)?;
         // Counted only once the backend has it. A refused send opens no carrier
-        // stream, so counting it would spend a lane on nothing and, at a limit
-        // of one, refuse every later lane for good.
+        // stream, so counting it would spend a lane on nothing.
         self.adapter
             .send_reliable(stream, record)
             .map_err(transport_error)?;
@@ -1480,11 +1393,9 @@ impl<A: TransportAdapter> Session<A> {
                 bytes,
             )))),
             Accepted::Consumed { reply } => {
-                // Applied at Negotiated rather than at Authenticated. The
-                // peer's limit is known as soon as its SETTINGS arrive, and
-                // the authentication exchange itself sends frames under it: a
-                // peer advertising the registry minimum would otherwise be
-                // sent a challenge or an answer larger than it accepts.
+                // Applied at Negotiated, not Authenticated: the peer's limit is
+                // known as soon as its SETTINGS arrive, and the exchange itself
+                // sends frames under it.
                 let negotiated = self.negotiation.state().is_negotiated();
                 self.submit(reply)?;
                 if negotiated {
@@ -1651,10 +1562,9 @@ impl<A: TransportAdapter> Session<A> {
 
     /// Whether the application may put a frame on the carrier.
     ///
-    /// Readiness is not enough. A server becomes ready when it produces
+    /// Readiness is not enough: a server becomes ready when it produces
     /// `SETTINGS_ACK`, not when the backend takes it, so an application frame
-    /// sent while the acknowledgement is still queued would overtake it and
-    /// reach a peer that is still waiting to finish negotiating.
+    /// sent while the acknowledgement is queued would overtake it.
     fn require_sendable(&self) -> Result<(), Error> {
         if !self.negotiation.is_ready() {
             return Err(Error::new(
@@ -1714,11 +1624,8 @@ impl<A: TransportAdapter> Session<A> {
     }
 }
 
-/// Whether one more lane fits a negotiated limit.
-///
-/// A lane already in use is free: the limit is on how many exist, and nothing
-/// here closes one. Deciding is separate from recording, so a caller counts a
-/// lane only once whatever it was opening for has succeeded.
+/// Whether one more lane fits a negotiated limit. A lane already in use is
+/// free; deciding is separate from recording.
 fn lane_allowed(
     lanes: &BTreeSet<StreamId>,
     stream: StreamId,
@@ -1734,16 +1641,9 @@ fn lane_allowed(
     ))
 }
 
-/// The payload limit `settings` puts on `frame_type`.
-///
-/// `spec/registries.md` gives every frame a fixed maximum and negotiation can
-/// only lower it, so a setting below a registry limit takes effect here and
-/// nowhere else. A frame the settings do not name is bounded by the control
-/// ceiling alone.
-///
-/// One table rather than a check per setting: every frame, in either
-/// direction, is measured the same way, and a setting the registry adds later
-/// is a row here rather than another branch somewhere.
+/// The payload limit `settings` puts on `frame_type`. Negotiation can only
+/// lower a registry maximum; a frame the settings do not name is bounded by
+/// the control ceiling.
 fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
     let ceiling = settings.max_control_frame_payload;
     match frame_type {
@@ -1762,46 +1662,23 @@ fn negotiated_payload_limit(frame_type: u64, settings: &Settings) -> u64 {
 /// only, and [`Session::begin`] refuses a stance the role cannot act on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Authentication {
-    /// This deployment requires none. The server advertises no capability
-    /// format, so section 1.1 concludes the exchange at `AUTH_CONTEXT` and
-    /// both endpoints are authenticated once it has been sent or read.
+    /// No authentication required. The exchange concludes at `AUTH_CONTEXT`.
     ///
-    /// The nonce is what a server puts in that frame. It is supplied rather
-    /// than generated because this crate has no randomness, and a session
-    /// whose freshness came from inside it could not be tested for the value
-    /// it actually sent. A client ignores it.
+    /// The nonce is caller-supplied: this crate has no randomness. A client
+    /// ignores it.
     NotRequired { nonce: [u8; 32] },
     /// A server that asks for a capability. The exchange concludes at
-    /// `SESSION_ACCEPT`, and what a capability is worth is decided by the
-    /// caller through [`Session::pending_authorization`], [`Session::grant`],
-    /// and [`Session::refuse`].
-    ///
-    /// The boundary is the caller's rather than a trait this crate calls: a
-    /// policy needs a deployment's own identity store and clock, neither of
-    /// which a session has.
-    ///
-    /// One rule decides which of the two variants a challenge behaves as, and
-    /// it is the one `spec/wire.md` section 1.1 states: an empty format list
-    /// means no authentication is required. A `Capability` carrying an empty
-    /// list is therefore a `NotRequired` with a longer name, not a server that
-    /// silently asks for nothing.
+    /// `SESSION_ACCEPT`. The caller decides what a capability is worth through
+    /// [`Session::pending_authorization`], [`Session::grant`], and
+    /// [`Session::refuse`].
     Capability { challenge: AuthContext },
-    /// A client that answers a challenge asking for a capability.
-    ///
-    /// Nothing is named here. A request carries a fresh identifier and binds to
-    /// the nonce the challenge brings, neither of which exists before the server
-    /// sends one, so the caller builds the request then and passes it to
-    /// [`Session::present`]. A client that presents nothing uses
-    /// `NotRequired` and refuses a demanding challenge on the spot.
+    /// A client that answers a capability challenge. The caller builds the
+    /// request and passes it to [`Session::present`].
     Presenting,
 }
 
-/// Which stream a frame is on.
-///
-/// `spec/wire.md` section 7 gives negotiation its own stream and application
-/// records their lanes. A control-only frame on a lane bypasses negotiation
-/// entirely, so a duplicate `HELLO` after readiness would reach the
-/// application instead of producing the sequence error the exchange requires.
+/// Which stream a frame is on. A control-only frame on a lane bypasses
+/// negotiation, so lane checking exists to keep them apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Lane {
     /// The negotiation stream, which carries every control frame.
@@ -1811,12 +1688,8 @@ pub enum Lane {
 }
 
 impl Lane {
-    /// Whether a frame of this type belongs on the lane.
-    ///
-    /// `spec/wire.md` section 7 gives a lane the payload and the control stream
-    /// everything else. `DATA_RECORD` is the payload. A `PROOF_BUNDLE`
-    /// describes the payload and is bounded by the negotiated control ceiling,
-    /// not by the fixed record limit, so it travels on the control stream.
+    /// Whether a frame of this type belongs on the lane. `DATA_RECORD` is the
+    /// payload; everything else is control.
     const fn carries(self, frame_type: u64) -> bool {
         let payload = matches!(frame_type, vot_codec::frame_type::DATA_RECORD);
         match self {
@@ -1826,17 +1699,8 @@ impl Lane {
     }
 }
 
-/// Frames the negotiation state machine owns.
-///
-/// An application sending one drives the peer's exchange by hand: a second
-/// `HELLO` or `SETTINGS` is refused as out of sequence and closes a session
-/// that was working.
-/// Whether the exchange owns this frame type.
-///
-/// Every frame `spec/wire.md` sections 1 and 1.1 define. An application sending
-/// one would drive the peer's state machine while leaving its own behind, and a
-/// server sending its own `SESSION_ACCEPT` would claim an exchange this
-/// endpoint never ran. `grant` and `refuse` are the way to answer.
+/// Whether the exchange owns this frame type. An application sending one would
+/// drive the peer's state machine by hand. Use `grant` and `refuse` to answer.
 const fn is_exchange_frame(frame_type: u64) -> bool {
     matches!(
         frame_type,
@@ -1880,10 +1744,7 @@ pub enum Side {
 }
 
 /// Checks one encoded frame against the limits `settings` gives its type.
-///
-/// The one place a negotiated payload limit is applied. Records and control
-/// frames pass through it in both directions, so the payload length is read
-/// from the envelope once and a wire length is never mistaken for it.
+/// The one place a negotiated payload limit is applied, in both directions.
 fn check_frame(
     frame: &[u8],
     settings: &Settings,
@@ -1899,9 +1760,7 @@ fn check_frame(
     let envelope = vot_codec::peek_envelope(frame, limits).map_err(decode_error)?;
 
     // Exactly one whole frame. peek_envelope succeeds on a header alone, so a
-    // header declaring a payload that is not there would go out as it stands
-    // and leave the peer waiting on a stream that stays open. Trailing bytes
-    // are the same disagreement from the other end.
+    // partial frame would leave the peer waiting on an open stream.
     if envelope.total_length != frame.len() {
         return Err(Error::new(
             ErrorKind::NotExactlyOneFrame {
@@ -1914,9 +1773,7 @@ fn check_frame(
         ));
     }
 
-    // The stream a frame is on decides which types it may be. Without this a
-    // control-only frame on a lane skips negotiation and reaches the
-    // application, and a record on the negotiation stream is not a record.
+    // The lane decides which types it may carry.
     if !lane.carries(envelope.frame_type) {
         return Err(Error::new(
             ErrorKind::FrameOnTheWrongLane {
@@ -2160,7 +2017,6 @@ mod tests {
         client.begin().unwrap();
         assert_eq!(client.state(), State::HelloSent);
 
-        // spec/wire.md section 1: the client sends HELLO then SETTINGS.
         let sent = client.adapter.sent.clone();
         assert_eq!(sent.len(), 2);
         let limits = vot_codec::DecodeLimits::default();
@@ -2176,8 +2032,6 @@ mod tests {
             Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         server.begin().unwrap();
-        // The server answers rather than speaking first, so nothing goes out
-        // until the client's frames arrive.
         assert_eq!(server.state(), State::ControlReserved);
         assert!(server.adapter.sent.is_empty());
 
@@ -2194,8 +2048,6 @@ mod tests {
         assert_eq!(server.poll().unwrap(), None);
         assert!(server.is_ready());
 
-        // spec/wire.md section 1: the server sends its SETTINGS then
-        // SETTINGS_ACK, and section 1.1 puts AUTH_CONTEXT straight after.
         let answer = server.adapter.sent.clone();
         assert_eq!(answer.len(), 3);
         let types: Vec<u64> = answer
@@ -2273,15 +2125,11 @@ mod tests {
 
     #[test]
     fn the_exchange_concludes_at_the_challenge_when_none_is_required() {
-        // spec/wire.md section 1.1: a server advertising no capability format
-        // requires no authentication, and AUTH_CONTEXT is the concluding
-        // frame. Each endpoint reaches it by sending or reading that frame.
         let (client, server, answer) = negotiated_pair();
         assert_eq!(server.state(), State::Authenticated);
         assert_eq!(client.state(), State::Authenticated);
         assert!(server.is_ready() && client.is_ready());
 
-        // The nonce is the caller's, not a constant this crate chose.
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: 64 * 1024,
             max_frames: 8,
@@ -2305,8 +2153,6 @@ mod tests {
 
     #[test]
     fn a_negotiated_session_is_not_yet_an_authenticated_one() {
-        // The window between the two states is what the gate exists for. A
-        // record arriving in it is well sequenced and not yet allowed.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -2335,7 +2181,6 @@ mod tests {
         assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
         assert!(error.kind().is_peer_fault(), "the peer sent it too early");
 
-        // A frame the registry does not gate still passes in that window.
         inbound.state = State::Negotiated;
         assert_eq!(
             inbound
@@ -2430,10 +2275,6 @@ mod tests {
 
     #[test]
     fn a_request_is_handed_to_the_policy_and_its_answer_carries_the_identity() {
-        // The session frames are the mechanism; the decision is not this
-        // crate's to make. spec/wire.md section 1.1 also ties the answer to the
-        // request: a server choosing its own identifier would leave a client
-        // unable to tell which attempt was answered.
         let mut server = demanding_server();
         assert_eq!(server.pending_authorization(), None);
         assert_eq!(
@@ -2465,9 +2306,6 @@ mod tests {
 
     #[test]
     fn a_refusal_leaves_the_session_open_until_the_attempts_run_out() {
-        // Section 1.1: a client may try again with a different capability, and
-        // a server accepts three attempts before closing. Unbounded retries are
-        // the amplification spec/security.md section 7 exists to stop.
         let mut server = demanding_server();
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: 64 * 1024,
@@ -2510,8 +2348,6 @@ mod tests {
 
     #[test]
     fn a_session_hands_the_request_out_and_sends_what_the_caller_decides() {
-        // The Negotiation tests cover the rules. This covers the path a real
-        // caller takes: nothing reaches the carrier until the caller answers.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -2520,9 +2356,6 @@ mod tests {
                 challenge: demanding([3; 32]),
             },
         );
-        // Driven through the real transition rather than a state set by hand.
-        // A server that advertises a format has not concluded the exchange by
-        // sending its challenge, and hand-setting the state hides that.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -2540,9 +2373,6 @@ mod tests {
             State::Negotiated,
             "a challenge asking for a capability does not conclude the exchange"
         );
-        // The exchange itself sends frames under the peer's limit, so that
-        // limit has to reach the backend before the challenge does, not when
-        // the exchange concludes.
         assert!(
             server.control_limit_applied(),
             "the peer's limit is known once its SETTINGS arrive"
@@ -2587,7 +2417,6 @@ mod tests {
         assert!(server.is_ready(), "the exchange concluded");
         assert_eq!(server.adapter().sent.len(), 2);
 
-        // And with nothing pending, neither answer invents one.
         assert!(server.grant(Vec::new()).is_err());
         assert!(
             server
@@ -2598,9 +2427,6 @@ mod tests {
 
     #[test]
     fn a_challenge_is_answered_with_the_capability_the_caller_presents() {
-        // Both halves of section 1.1 over one carrier: the server asks, the
-        // caller answers, and neither endpoint opens the data plane until
-        // SESSION_ACCEPT has been sent and read.
         let (mut client, mut server) = demanding_pair(Settings::default(), Settings::default());
         let challenge = client
             .pending_presentation()
@@ -2646,9 +2472,6 @@ mod tests {
 
     #[test]
     fn a_refused_attempt_is_followed_by_another_until_the_bound_is_reached() {
-        // Section 1.1: a rejection does not close the connection, and a server
-        // accepts three attempts. The client counts the same bound, so a fourth
-        // request never goes out to be closed on.
         let (mut client, mut server) = demanding_pair(Settings::default(), Settings::default());
         for attempt in 0..MAX_AUTHENTICATION_ATTEMPTS {
             let id = [u8::try_from(attempt).unwrap(); 16];
@@ -2675,8 +2498,6 @@ mod tests {
             );
         }
 
-        // Nothing left to try. The request is refused here rather than sent for
-        // the server to close on, and the carrier is still this endpoint's.
         assert_eq!(client.attempts_remaining(), 0);
         let error = client.present(request([9; 16], 1)).unwrap_err();
         assert_eq!(
@@ -2695,9 +2516,6 @@ mod tests {
 
     #[test]
     fn a_request_section_1_1_forbids_never_reaches_the_carrier() {
-        // Every rule the server checks on arrival, checked before sending.
-        // Breaking one of them is answered with a close rather than a
-        // rejection, so it would cost the session every attempt it had left.
         let mut plain = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -2730,8 +2548,6 @@ mod tests {
         );
         assert!(client.adapter().sent.is_empty());
 
-        // A proof under a binding that asks for none. The challenge here names
-        // Binding::None, so the request has nothing to prove possession of.
         let mut signed = request([7; 16], 1);
         signed.binding_proof = vec![4; 8];
         assert_eq!(
@@ -2742,9 +2558,6 @@ mod tests {
             })
         );
 
-        // Sent, and then reused. Section 1.1 requires a fresh identifier per
-        // attempt, and a server reads a repeat as a duplicate rather than a
-        // retry.
         client.present(request([7; 16], 1)).unwrap();
         assert_eq!(
             client.present(request([8; 16], 1)).unwrap_err().kind(),
@@ -2771,10 +2584,6 @@ mod tests {
 
     #[test]
     fn the_binding_proof_rule_holds_in_both_directions() {
-        // One function decides it, so a request the client half refuses to send
-        // is one the server half refuses to read. A proof of possession with no
-        // proof in it is the case a length bound cannot catch: the codec accepts
-        // an empty byte string, and only the challenge says it may not be one.
         let mut server = Negotiation::server(
             Settings::default(),
             BTreeSet::new(),
@@ -2803,8 +2612,6 @@ mod tests {
             "and no policy is asked to weigh it"
         );
 
-        // The other direction of the same rule: a proof where the binding asks
-        // for none.
         let mut none = demanding_server();
         let mut open = request([7; 16], 1);
         open.binding_proof = vec![4; 8];
@@ -2822,9 +2629,6 @@ mod tests {
             }
         );
 
-        // And a client asked for a proof of possession must send one. Nothing
-        // here produces a proof; the caller does, which is what ADR-0022 stage
-        // two picks a format for.
         let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
         client
@@ -2844,10 +2648,6 @@ mod tests {
 
     #[test]
     fn an_answer_naming_another_attempt_is_refused() {
-        // Section 1.1 has both answers repeat the request's identifier. Without
-        // that check a server could authenticate this client by answering an
-        // attempt it never made, and a rejection could clear one still in
-        // flight.
         let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
         client.present(request([7; 16], 1)).unwrap();
         let mut mismatched = client.negotiation.clone();
@@ -2864,8 +2664,6 @@ mod tests {
         assert!(error.kind().is_peer_fault());
         assert!(!mismatched.is_ready(), "and the data plane stays shut");
 
-        // The same rule on a rejection, which would otherwise clear the attempt
-        // this client is still waiting on.
         let mut rejected = client.negotiation.clone();
         assert!(
             rejected
@@ -2887,8 +2685,6 @@ mod tests {
             "and nothing was recorded as its answer"
         );
 
-        // An answer to a request nothing made is out of sequence, whichever
-        // endpoint reads it.
         let mut unasked = demanding_server();
         assert_eq!(
             unasked
@@ -2906,10 +2702,6 @@ mod tests {
             }
         );
 
-        // A server holding a request is the case the field alone cannot tell
-        // apart: it has an attempt in hand, and an answer to it is still a
-        // frame it must not read. Authenticating on one would let a peer
-        // authorize itself with the identifier it chose.
         let mut holding = demanding_server();
         holding.accept_control(&session_open([7; 16], 1)).unwrap();
         for reply in [
@@ -2938,7 +2730,6 @@ mod tests {
             "the request it holds is still its own to answer"
         );
 
-        // And an answer that does not decode is the peer's, not the caller's.
         let mut malformed = client.negotiation.clone();
         let error = malformed
             .accept_control(&frame_of(frame_type::SESSION_ACCEPT, 3))
@@ -2954,9 +2745,6 @@ mod tests {
 
     #[test]
     fn a_client_that_can_present_asks_for_nothing_until_it_is_asked() {
-        // A client that presents a capability still works against a deployment
-        // that requires none, and has nothing pending in the window between
-        // negotiating and reading the challenge.
         let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
         client.begin().unwrap();
         client
@@ -2993,10 +2781,6 @@ mod tests {
 
     #[test]
     fn a_second_challenge_cannot_replace_the_one_an_attempt_answers() {
-        // A demanding challenge leaves the client Negotiated, which is the
-        // state AUTH_CONTEXT arrives in. Without the flag a second one would
-        // replace the nonce a proof was computed over and the formats a request
-        // was checked against.
         let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
         let error = client
             .negotiation
@@ -3020,10 +2804,6 @@ mod tests {
 
     #[test]
     fn a_frame_the_peer_will_not_carry_is_refused_before_it_is_sent() {
-        // A capability can be 48 KiB and a peer may advertise a control-frame
-        // maximum of 1 KiB. The exchange does not go through the application
-        // send path, so without this the frame goes out and the peer closes the
-        // session for a frame it said it would not accept.
         let narrow = Settings {
             max_control_frame_payload: 1024,
             ..Settings::default()
@@ -3048,8 +2828,6 @@ mod tests {
         assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
         assert!(client.adapter().sent.is_empty());
 
-        // The same bound on the answers a server sends, which is the same class
-        // of frame going the other way.
         client.present(request([7; 16], 1)).unwrap();
         pump(&mut client, &mut server);
         let mut narrow_client = server.negotiation.clone();
@@ -3079,9 +2857,6 @@ mod tests {
 
     #[test]
     fn a_stance_the_role_cannot_act_on_is_refused() {
-        // A server given a client's stance would advertise a nonce no caller
-        // chose, and a client given a server's would ignore the challenge it
-        // was handed. Both used to pass and quietly do nothing.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -3098,9 +2873,6 @@ mod tests {
         assert!(!error.kind().is_peer_fault(), "the caller's own doing");
         assert_eq!(server.state(), State::Connecting, "and nothing began");
 
-        // Nor can a server present one, whatever state it is in. It holds
-        // requests in the same field a client holds its own attempt in, and the
-        // role is what tells the two apart.
         let mut accepting = demanding_server();
         assert_eq!(accepting.pending_presentation(), None);
         assert_eq!(
@@ -3125,8 +2897,6 @@ mod tests {
             }
         );
 
-        // The stances that do fit each role begin, including the one that fits
-        // both.
         for authentication in [
             Authentication::NotRequired { nonce: [1; 32] },
             Authentication::Presenting,
@@ -3159,9 +2929,6 @@ mod tests {
 
     #[test]
     fn a_grant_the_backend_has_no_room_for_does_not_open_the_data_plane() {
-        // The exchange concluded on this side, but the peer has not read the
-        // acceptance yet. Sending records over it would put them in front of
-        // the frame that authorises them.
         let mut server = Session::server(
             Loopback {
                 control_capacity: Some(0),
@@ -3204,9 +2971,6 @@ mod tests {
 
     #[test]
     fn an_empty_format_list_means_the_same_thing_whichever_variant_names_it() {
-        // One rule decides, and it is the one section 1.1 states. A Capability
-        // carrying no format is a server that requires none, not one that
-        // silently asks for nothing and waits.
         let mut named = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -3233,8 +2997,6 @@ mod tests {
 
     #[test]
     fn a_request_this_endpoint_never_invited_is_refused() {
-        // Each of these would have the policy parse bytes whose shape it never
-        // agreed to, or answer an attempt it cannot tell from another.
         let mut reused = demanding_server();
         reused.accept_control(&session_open([7; 16], 1)).unwrap();
         reused
@@ -3262,9 +3024,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::SessionOpenInvalid);
 
-        // A request declaring more than the registry gives SESSION_OPEN is
-        // refused on its declared length, before a byte of it is read. The
-        // envelope is built by hand because no encoder will produce one.
         let mut oversized = demanding_server();
         let mut envelope = Vec::new();
         vot_codec::encode_varint(frame_type::SESSION_OPEN, &mut envelope).unwrap();
@@ -3279,8 +3038,6 @@ mod tests {
             error.kind()
         );
 
-        // A deployment advertising no format concluded at AUTH_CONTEXT, so
-        // there is nothing here to open.
         let mut open_to_nobody =
             Negotiation::server(Settings::default(), BTreeSet::new(), no_capability([1; 32]));
         open_to_nobody.state = State::Negotiated;
@@ -3290,19 +3047,14 @@ mod tests {
                 .is_err()
         );
 
-        // A second request while one is pending would let a peer replace the
-        // subject of a decision the policy is already making.
         let mut busy = demanding_server();
         busy.accept_control(&session_open([7; 16], 1)).unwrap();
         assert!(busy.accept_control(&session_open([8; 16], 1)).is_err());
 
-        // A client never reads one: it is the endpoint that sends it.
         let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
         assert!(client.accept_control(&session_open([7; 16], 1)).is_err());
 
-        // Nor does a server before negotiation finishes, or after the exchange
-        // already concluded. Each of the four conditions refuses on its own.
         let mut early = demanding_server();
         early.state = State::HelloSent;
         assert!(early.accept_control(&session_open([7; 16], 1)).is_err());
@@ -3313,8 +3065,6 @@ mod tests {
 
     #[test]
     fn an_answer_with_nothing_pending_is_refused() {
-        // Granting out of nowhere would authenticate a session no peer asked
-        // to open.
         let mut server = demanding_server();
         assert!(server.grant(Vec::new()).is_err());
         assert!(
@@ -3324,8 +3074,6 @@ mod tests {
         );
         assert_eq!(server.state(), State::Negotiated);
 
-        // And a reason the registry does not assign to authentication or
-        // authorization never reaches the wire.
         server.accept_control(&session_open([7; 16], 1)).unwrap();
         let error = server
             .refuse(error_code::MALFORMED_FRAME, String::new())
@@ -3335,8 +3083,6 @@ mod tests {
             !error.kind().is_peer_fault(),
             "the caller's answer, not the peer's request"
         );
-        // An answer that could not go out leaves the request to answer again.
-        // Spending it would leave the peer waiting on a decision nothing holds.
         assert!(server.pending_authorization().is_some());
         let scope = vec![0; 4097];
         assert_eq!(
@@ -3353,9 +3099,6 @@ mod tests {
 
     #[test]
     fn a_challenge_asking_for_a_capability_is_refused() {
-        // Nothing can present one yet. Accepting the frame would leave this
-        // endpoint believing it is authenticated while the server waits for a
-        // SESSION_OPEN that never comes.
         let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
         let error = client
@@ -3372,7 +3115,6 @@ mod tests {
 
     #[test]
     fn a_challenge_out_of_sequence_or_out_of_shape_is_refused() {
-        // A server never reads one: it is the endpoint that sends it.
         let mut server =
             Negotiation::server(Settings::default(), BTreeSet::new(), no_capability([1; 32]));
         server.state = State::Negotiated;
@@ -3387,7 +3129,6 @@ mod tests {
             }
         );
 
-        // Nor does a client before negotiation finishes.
         let mut early = Negotiation::client(Settings::default(), BTreeSet::new());
         early.state = State::HelloSent;
         assert!(
@@ -3396,7 +3137,6 @@ mod tests {
                 .is_err()
         );
 
-        // A second one after the exchange concluded is out of sequence too.
         let mut done = Negotiation::client(Settings::default(), BTreeSet::new());
         done.state = State::Negotiated;
         done.accept_control(&auth_context(&[7; 16], Vec::new()))
@@ -3407,8 +3147,6 @@ mod tests {
                 .is_err()
         );
 
-        // A payload that is not a challenge closes under the decode code, not
-        // the authentication one: nothing was decided about a capability.
         let mut malformed = Negotiation::client(Settings::default(), BTreeSet::new());
         malformed.state = State::Negotiated;
         let error = malformed
@@ -3420,9 +3158,6 @@ mod tests {
 
     #[test]
     fn an_answer_to_a_request_this_endpoint_never_made_is_refused() {
-        // Nothing here sends SESSION_OPEN yet, so an acceptance or a refusal
-        // answers nothing. Handing it to the application would let a peer look
-        // like it had authenticated this endpoint.
         for frame in [
             vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
                 session_id: [7; 16],
@@ -3453,9 +3188,6 @@ mod tests {
 
     #[test]
     fn the_application_may_not_send_the_exchange_itself() {
-        // The state machine owns every frame sections 1 and 1.1 define. A
-        // server sending its own SESSION_ACCEPT would claim an exchange the
-        // machine never ran, and grant is how it answers instead.
         let (mut client, _server, _answer) = negotiated_pair();
         let mut accept = Vec::new();
         vot_codec::frames::encode(
@@ -3494,7 +3226,6 @@ mod tests {
             );
         }
 
-        // A frame the exchange does not own still goes out.
         client.send_control(&frame_of(frame_type::PING, 0)).unwrap();
     }
 
@@ -3536,11 +3267,6 @@ mod tests {
 
     #[test]
     fn records_that_arrive_early_are_held_rather_than_refused() {
-        // The two endpoints reach readiness at different moments and QUIC
-        // orders nothing between the negotiation stream and an application
-        // lane, so a conforming peer can have records in flight already.
-        // Closing the session over them would punish it for the protocol's own
-        // shape.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -3557,15 +3283,11 @@ mod tests {
         server.begin().unwrap();
 
         let sent = std::mem::take(&mut client.adapter.sent);
-        // A record between the two negotiation frames, which is the worst
-        // ordering the carrier can produce.
         server.adapter.events.push_back(control(&sent[0]));
         server.adapter.events.push_back(record(7, b"early"));
         server.adapter.events.push_back(control(&sent[1]));
         server.adapter.events.push_back(record(8, b"also early"));
 
-        // The record does not surface before readiness, and it does not block
-        // the SETTINGS frame behind it either.
         let first = server
             .poll()
             .unwrap()
@@ -3599,8 +3321,6 @@ mod tests {
             ErrorKind::PendingRecordsExhausted { count: 2, .. }
         ));
 
-        // A bound that cannot hold one maximum record would refuse a peer that
-        // did nothing wrong.
         assert!(server.set_pending_limits(1, 1).is_err());
         assert!(server.set_pending_limits(usize::MAX, 0).is_err());
     }
@@ -3636,8 +3356,6 @@ mod tests {
 
     #[test]
     fn the_wrong_role_and_the_wrong_order_are_both_refused() {
-        // A HELLO claiming the server role on a client-initiated stream
-        // contradicts the stream initiator.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -3662,7 +3380,6 @@ mod tests {
             ErrorKind::Hello(HelloError::RoleMismatch { .. })
         ));
 
-        // A client never receives HELLO, because it is the one that sends it.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -3676,8 +3393,6 @@ mod tests {
             ErrorKind::OutOfSequence { .. }
         ));
 
-        // SETTINGS before HELLO leaves the server with limits from a peer it
-        // has not identified.
         let mut early = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -3720,8 +3435,6 @@ mod tests {
             }
         );
 
-        // After readiness the same frame belongs to the application and passes
-        // through untouched.
         let (mut client, _server) = negotiated();
         client.adapter.events.push_back(control(&frame));
         assert_eq!(client.poll().unwrap(), Some(control(&frame)));
@@ -3729,8 +3442,6 @@ mod tests {
 
     #[test]
     fn an_unknown_optional_frame_does_not_end_the_exchange() {
-        // spec/wire.md requires grease to be exercised, and a handshake is
-        // where a peer is most likely to send it.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -3745,7 +3456,6 @@ mod tests {
         assert_eq!(server.poll().unwrap(), None);
         assert_eq!(server.state(), State::ControlReserved);
 
-        // And an unknown critical one still ends it.
         let mut critical = Vec::new();
         vot_codec::encode_frame(0x0f, b"", &mut critical).unwrap();
         server.adapter.events.push_back(control(&critical));
@@ -3775,7 +3485,6 @@ mod tests {
             }
         );
 
-        // After readiness the same event is an ordinary end of session.
         let (mut client, _server) = negotiated();
         client
             .adapter
@@ -3789,8 +3498,6 @@ mod tests {
 
     #[test]
     fn the_peers_control_limit_reaches_the_backend() {
-        // Without this the exchange is a state enum. The peer's advertised
-        // maximum is the bound on what this endpoint may send.
         let peer = Settings {
             max_control_frame_payload: 64 * 1024,
             ..Settings::default()
@@ -3823,8 +3530,6 @@ mod tests {
         assert!(client.control_limit_applied());
         assert_eq!(client.adapter().control_limit, Some(64 * 1024));
 
-        // A backend with no such bound says so, and the session reports that
-        // and the session reports the limit as not applied.
         let mut refusing = Session::client(
             Loopback {
                 refuse_control_limit: true,
@@ -3867,16 +3572,12 @@ mod tests {
             ErrorKind::OutOfSequence { .. }
         ));
 
-        // spec/wire.md section 5: a duplicate acknowledgement is ignored.
         let mut ack = Vec::new();
         vot_codec::encode_frame(frame_type::SETTINGS_ACK, &[], &mut ack).unwrap();
         client.adapter.events.push_back(control(&ack));
         assert_eq!(client.poll().unwrap(), None);
         assert!(client.is_ready());
 
-        // spec/wire.md section 5 gives SETTINGS_ACK a maximum of zero bytes, so
-        // one carrying a payload is refused by its registered limit. Built by
-        // hand because the encoder will not produce it either.
         let fat = [u8::try_from(frame_type::SETTINGS_ACK).unwrap(), 0x01, b'x'];
         client.adapter.events.push_back(control(&fat));
         assert_eq!(
@@ -3887,8 +3588,6 @@ mod tests {
 
     #[test]
     fn every_submission_path_reaches_the_backend() {
-        // Shared payloads and flushes are the two paths an application uses
-        // most and the two easiest to leave as accepted-and-dropped.
         let (mut client, _server) = negotiated();
         let flushes = client.adapter().flushes;
         client
@@ -3904,8 +3603,6 @@ mod tests {
         client.flush().unwrap();
         assert_eq!(client.adapter().flushes, flushes + 1);
 
-        // And a backend refusal is reported rather than swallowed, under the
-        // code the refusal deserves rather than one generic code.
         let mut refusing = Session::client(
             Loopback {
                 refuse_sends: Some(TransportError::RecordTooLarge),
@@ -3956,9 +3653,6 @@ mod tests {
 
     #[test]
     fn the_held_byte_bound_is_exact() {
-        // The count bound and the byte bound fail differently, and only the
-        // byte bound limits memory. One record short of the bound is held; the
-        // byte that crosses it is not.
         let payload = vec![0_u8; 1024];
         let mut server = Session::server(
             Loopback::default(),
@@ -4001,8 +3695,6 @@ mod tests {
             }
         );
 
-        // The default holds several maximum records rather than one, so an
-        // ordinary burst does not end a session.
         assert_eq!(
             DEFAULT_PENDING_RECORD_BYTES,
             4 * vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES
@@ -4012,8 +3704,6 @@ mod tests {
 
     #[test]
     fn a_repeated_negotiation_frame_is_refused_at_every_point() {
-        // A second HELLO would replace the extensions and revision the rest of
-        // the exchange was decided under.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -4043,8 +3733,6 @@ mod tests {
             }
         ));
 
-        // And an acknowledgement before the settings it claims to acknowledge
-        // would make the client ready without ever reading the peer's limits.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -4068,10 +3756,6 @@ mod tests {
 
     #[test]
     fn only_the_peers_faults_reach_the_carrier() {
-        // One registered code covers a peer that sent a frame out of sequence
-        // and a local caller that asked too early. Closing on the second would
-        // tear down a healthy connection over an API misuse and would tell the
-        // peer it did something wrong when it did not.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -4089,7 +3773,6 @@ mod tests {
         assert_eq!(server.adapter().closed, vec![error_code::MALFORMED_FRAME]);
         assert_eq!(server.state(), State::Closed, "the session is over");
 
-        // A local caller asking too early leaves the carrier alone.
         let mut early = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -4104,8 +3787,6 @@ mod tests {
             "an API misuse is not the peer's fault"
         );
 
-        // Nor does a backend refusing a submission: that is backpressure, and
-        // closing over it would turn a full queue into a teardown.
         let mut refusing = Session::client(
             Loopback {
                 refuse_sends: Some(TransportError::OutboundQueueFull),
@@ -4123,7 +3804,6 @@ mod tests {
         );
         assert!(refusing.adapter().closed.is_empty());
 
-        // Nor does a carrier that has already gone; there is nothing to close.
         let mut gone = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -4140,7 +3820,6 @@ mod tests {
         ));
         assert!(gone.adapter().closed.is_empty());
 
-        // Each peer fault closes under its own registered code.
         for (frame_type, payload, expected) in [
             (
                 frame_type::SETTINGS_ACK,
@@ -4166,9 +3845,6 @@ mod tests {
 
     #[test]
     fn a_backend_that_would_accept_more_than_is_advertised_is_refused() {
-        // Advertising one control-frame bound and reassembling up to another is
-        // silent: the peer sends what it was told it could, and this endpoint
-        // accepts more. The mismatch is caught before the limit goes out.
         let mut mismatched = Session::client(
             Loopback {
                 receive_limits: Some(
@@ -4208,10 +3884,8 @@ mod tests {
             mismatched.adapter().sent.is_empty(),
             "nothing was advertised"
         );
-        // Local configuration, so the peer is not blamed for it.
         assert!(mismatched.adapter().closed.is_empty());
 
-        // Agreeing is enough, whatever the value.
         let mut agreed = Session::client(
             Loopback {
                 receive_limits: Some(
@@ -4236,7 +3910,6 @@ mod tests {
         agreed.begin().unwrap();
         assert_eq!(agreed.adapter().sent.len(), 2);
 
-        // A backend that reassembles nothing has nothing to disagree with.
         let mut silent = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -4249,9 +3922,6 @@ mod tests {
 
     #[test]
     fn a_closed_session_stops_interpreting_and_still_reports_the_carrier() {
-        // Polling a failed session again used to report whatever the next frame
-        // looked like against a closed state, which named the second thing that
-        // went wrong rather than the first.
         let mut server = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -4283,7 +3953,6 @@ mod tests {
             "closed once, under the first cause"
         );
 
-        // Anything still on the carrier is dropped rather than reinterpreted.
         server.adapter.events.push_back(control(&frame));
         server.adapter.events.push_back(record(1, b"late"));
         server
@@ -4305,10 +3974,6 @@ mod tests {
 
     #[test]
     fn a_full_outbound_queue_stalls_the_handshake_rather_than_losing_it() {
-        // The exchange advances in pairs. A backend with room for HELLO and not
-        // for SETTINGS used to leave the peer waiting for a frame nothing would
-        // send again, because the state machine had already moved past
-        // producing it and `begin` refuses a second call.
         let mut client = Session::client(
             Loopback {
                 control_capacity: Some(1),
@@ -4326,7 +3991,6 @@ mod tests {
             "the exchange has moved on, so it cannot be restarted"
         );
 
-        // Room appears, and the frame that did not fit goes out on its own.
         client.adapter.control_capacity = Some(2);
         client.flush().unwrap();
         assert_eq!(client.unsent_negotiation_frames(), 0);
@@ -4342,7 +4006,6 @@ mod tests {
             "and in the order the specification gives it"
         );
 
-        // A driver that only polls gets there too, without knowing it stalled.
         let mut polling = Session::client(
             Loopback {
                 control_capacity: Some(0),
@@ -4359,7 +4022,6 @@ mod tests {
         assert_eq!(polling.unsent_negotiation_frames(), 0);
         assert_eq!(polling.adapter().sent.len(), 2);
 
-        // The server's answer is three frames, and stalls the same way.
         let mut server = Session::server(
             Loopback {
                 control_capacity: Some(1),
@@ -4390,8 +4052,6 @@ mod tests {
             "in the order the exchange gives them"
         );
 
-        // A refusal that is not capacity is still a failure, and keeps the
-        // frame rather than dropping it.
         let mut broken = Session::client(
             Loopback {
                 refuse_control: Some(TransportError::Backend),
@@ -4407,10 +4067,6 @@ mod tests {
 
     #[test]
     fn a_closed_session_stops_pushing_the_handshake() {
-        // The retry queue and the closed state have to agree. A session that
-        // kept draining after it failed would put a stale HELLO on a dying
-        // connection, which the peer has to parse before it can tell the
-        // session is over.
         let mut client = Session::client(
             Loopback {
                 control_capacity: Some(0),
@@ -4424,8 +4080,6 @@ mod tests {
         assert_eq!(client.unsent_negotiation_frames(), 2);
         assert!(client.adapter().sent.is_empty());
 
-        // A client never receives HELLO, so this ends the session while both
-        // frames are still queued.
         let mut hello = Vec::new();
         vot_codec::encode_hello(
             &Hello {
@@ -4442,7 +4096,6 @@ mod tests {
         assert!(client.poll().is_err());
         assert_eq!(client.state(), State::Closed);
 
-        // Room appears, and neither path takes it.
         client.adapter.control_capacity = None;
         assert_eq!(client.poll().unwrap(), None);
         client.flush().unwrap();
@@ -4451,15 +4104,11 @@ mod tests {
             client.adapter().sent.is_empty(),
             "a closed session sends no more of the handshake"
         );
-        // The backend is still flushed, so anything it already holds can leave.
         assert!(client.adapter().flushes > 0);
     }
 
     #[test]
     fn an_application_frame_cannot_overtake_a_queued_acknowledgement() {
-        // A server is ready when it produces SETTINGS_ACK, not when the backend
-        // takes it. An application frame sent in between would reach a peer
-        // still in SettingsExchanged, which closes for NotNegotiated.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -4504,7 +4153,6 @@ mod tests {
         );
         assert!(server.adapter().records.is_empty());
 
-        // Once it goes out, the application may send.
         server.adapter.control_capacity = None;
         server.flush().unwrap();
         assert_eq!(server.unsent_negotiation_frames(), 0);
@@ -4514,8 +4162,6 @@ mod tests {
 
     #[test]
     fn a_record_larger_than_the_peer_accepts_is_refused() {
-        // The adapter only knows the protocol ceiling. Sending past what the
-        // peer advertised is a session the peer is entitled to end.
         let peer = Settings {
             max_data_record_payload: 64 * 1024,
             ..Settings::default()
@@ -4560,8 +4206,6 @@ mod tests {
                 side: Side::Peer,
             }
         );
-        // The wire length of a conforming record is larger than the negotiated
-        // payload maximum, so comparing it would refuse a legal frame.
         assert!(data_record(&vec![0; 64 * 1024]).len() > 64 * 1024);
         assert_eq!(
             client
@@ -4578,9 +4222,6 @@ mod tests {
 
     #[test]
     fn a_record_past_the_limit_this_endpoint_advertised_is_refused() {
-        // The adapters bound records by the protocol ceiling, so a session
-        // advertising less than that would hand the application a record the
-        // peer was told not to send.
         let local = Settings {
             max_data_record_payload: 64 * 1024,
             ..Settings::default()
@@ -4613,7 +4254,6 @@ mod tests {
                 side: Side::Local,
             }
         );
-        // The peer sent past what it was given, so the carrier is closed.
         assert_eq!(server.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
     }
 
@@ -4635,9 +4275,6 @@ mod tests {
 
     #[test]
     fn every_negotiated_payload_limit_is_applied_in_both_directions() {
-        // One table drives this, so a limit the registry adds later is a row
-        // rather than another check. The cases below are the three the settings
-        // name, plus a frame they do not, which falls back to the ceiling.
         let settings = Settings {
             max_control_frame_payload: 128 * 1024,
             max_data_record_payload: 64 * 1024,
@@ -4683,14 +4320,10 @@ mod tests {
                         side,
                     }
                 );
-                // Only the peer exceeding what it was given is the peer's
-                // fault.
                 assert_eq!(error.kind().is_peer_fault(), side == Side::Local);
             }
         }
 
-        // A manifest page is bounded by whichever of the two settings is lower,
-        // so a generous page limit does not widen the control ceiling.
         let narrow_control = Settings {
             max_control_frame_payload: 64 * 1024,
             max_manifest_page_payload: 1024 * 1024,
@@ -4710,7 +4343,6 @@ mod tests {
         };
         let (mut client, mut server) = negotiated_with(Settings::default(), peer);
 
-        // Outbound: the peer said 64 KiB, so a larger page never leaves.
         client
             .send_control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024))
             .unwrap();
@@ -4721,9 +4353,6 @@ mod tests {
         assert!(!error.kind().is_peer_fault());
         assert!(client.adapter().closed.is_empty());
 
-        // Inbound: the server advertised 64 KiB, so a larger page closes the
-        // session rather than being delivered. A known frame type is covered,
-        // which the codec's own per-type limit would have let through.
         server
             .adapter
             .events
@@ -4744,7 +4373,6 @@ mod tests {
         let record = data_record(b"record");
 
         client.send_reliable(StreamId(1), &record).unwrap();
-        // The same lane again is free; a second lane is not.
         client.send_reliable(StreamId(1), &record).unwrap();
         let error = client.send_reliable(StreamId(2), &record).unwrap_err();
         assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
@@ -4761,9 +4389,6 @@ mod tests {
 
     #[test]
     fn a_refused_send_does_not_spend_a_lane() {
-        // The send opens no carrier stream when the backend refuses it, so
-        // counting the lane would spend one on nothing and, at a limit of one,
-        // refuse every later lane for good.
         let peer = Settings {
             reliable_lane_limit: 1,
             ..Settings::default()
@@ -4773,7 +4398,6 @@ mod tests {
         let record = data_record(b"record");
         assert!(client.send_reliable(StreamId(1), &record).is_err());
 
-        // The lane the failed send named is still free, and so is any other.
         client.adapter.refuse_sends = None;
         client.send_reliable(StreamId(2), &record).unwrap();
         assert_eq!(client.adapter().records.len(), 1);
@@ -4791,9 +4415,6 @@ mod tests {
 
     #[test]
     fn a_submission_that_is_not_one_whole_frame_is_refused() {
-        // peek_envelope succeeds on a header alone, so a header declaring a
-        // payload that is not there would go out as it stands and leave the
-        // peer waiting on a stream that stays open.
         let (mut client, mut server) = negotiated();
         let whole = frame_of(frame_type::PING, 0);
         client.send_control(&whole).unwrap();
@@ -4807,8 +4428,6 @@ mod tests {
             ));
         }
 
-        // Two frames in one submission is the same disagreement about where a
-        // frame ends.
         let mut two = record.clone();
         two.extend_from_slice(&record);
         assert!(matches!(
@@ -4820,7 +4439,6 @@ mod tests {
             } if *found == two.len() && *declared == record.len()
         ));
 
-        // And the peer sending one closes the session rather than delivering it.
         server.adapter.events.push_back(control(&{
             let mut short = frame_of(frame_type::PING, 0);
             short.extend_from_slice(&frame_of(frame_type::PING, 0));
@@ -4833,8 +4451,6 @@ mod tests {
 
     #[test]
     fn an_experimental_frame_needs_its_extension_negotiated() {
-        // spec/wire.md section 5: a known experimental frame is invalid unless
-        // its extension was negotiated, and the default sets are empty.
         let credit = frame_of(frame_type::DATAGRAM_CREDIT, 8);
         let (mut client, mut server) = negotiated();
         let error = client.send_control(&credit).unwrap_err();
@@ -4853,12 +4469,6 @@ mod tests {
         assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
         assert!(error.kind().is_peer_fault());
 
-        // A client cannot reach the state where one is allowed, and that is a
-        // specification gap rather than a policy choice. spec/wire.md section 1
-        // has only the client send HELLO, so the server learns which extensions
-        // the client offered and the client learns nothing about the server's.
-        // The registry requires both endpoints to negotiate an extension, so
-        // the side that cannot know has to refuse.
         let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
         let mut client = Session::client(
             Loopback::default(),
@@ -4883,19 +4493,13 @@ mod tests {
         }
         client.poll().unwrap();
 
-        // The server saw the offer, so it can compute an intersection and
-        // will accept an experimental frame from the client.
         assert_eq!(
             server.negotiation.negotiated_extensions(),
             BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
         );
-        // The client saw no HELLO, so it has none and refuses either way.
         assert!(client.negotiation.negotiated_extensions().is_empty());
         assert!(client.send_control(&credit).is_err());
 
-        // And neither may send one. Sending under the server's half would put
-        // a frame on the wire the client is obliged to refuse, closing a
-        // session that had negotiated correctly.
         assert!(server.negotiation.usable_extensions().is_empty());
         assert!(client.negotiation.usable_extensions().is_empty());
         let error = server.send_control(&credit).unwrap_err();
@@ -4909,9 +4513,6 @@ mod tests {
 
     #[test]
     fn a_lane_carries_the_payload_and_the_control_stream_describes_it() {
-        // A PROOF_BUNDLE is bounded by the negotiated control ceiling, which a
-        // lane does not carry: every backend frames a lane at the fixed record
-        // limit, so a proof above it could be routed and never sent.
         assert!(Lane::Reliable.carries(frame_type::DATA_RECORD));
         assert!(!Lane::Control.carries(frame_type::DATA_RECORD));
         for frame_type in [
@@ -4929,10 +4530,6 @@ mod tests {
 
     #[test]
     fn a_frame_on_the_wrong_stream_is_refused() {
-        // spec/wire.md section 7 gives negotiation its own stream. A
-        // control-only frame on a lane would skip negotiation entirely, so a
-        // duplicate HELLO after readiness would reach the application instead
-        // of producing the sequence error the exchange requires.
         let (mut client, mut server) = negotiated();
         let mut hello = Vec::new();
         vot_codec::encode_hello(
@@ -4947,7 +4544,6 @@ mod tests {
         let mut frame = Vec::new();
         vot_codec::encode_frame(frame_type::HELLO, &hello, &mut frame).unwrap();
 
-        // Inbound on a lane: refused rather than delivered.
         server.adapter.events.push_back(Event::Reliable {
             stream: StreamId(1),
             sequence: 1,
@@ -4965,8 +4561,6 @@ mod tests {
         );
         assert!(error.kind().is_peer_fault());
 
-        // Outbound the same way, and a record on the negotiation stream is
-        // refused for the mirror reason.
         assert_eq!(
             client
                 .send_reliable(StreamId(1), &frame)
@@ -4993,9 +4587,6 @@ mod tests {
 
     #[test]
     fn a_driver_can_reach_a_backend_the_adapter_contract_does_not_cover() {
-        // A TcpAdapter moves bytes through methods the contract has no place
-        // for, so without this a session over one would queue a handshake that
-        // nothing could ever send.
         let mut client = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -5005,7 +4596,6 @@ mod tests {
         client.begin().unwrap();
         assert_eq!(client.adapter().sent.len(), 2);
 
-        // The same adapter, reachable for the work the session cannot do.
         client.driver().sent.clear();
         assert!(client.adapter().sent.is_empty());
         client
@@ -5020,9 +4610,6 @@ mod tests {
 
     #[test]
     fn an_application_cannot_send_the_frames_the_exchange_owns() {
-        // A caller encoding its own HELLO or SETTINGS drives the peer's state
-        // machine by hand: the peer refuses it as out of sequence and closes a
-        // session that was working.
         let (mut client, _server) = negotiated();
         for frame_type in [
             frame_type::HELLO,
@@ -5038,13 +4625,11 @@ mod tests {
                 error.kind(),
                 &ErrorKind::NegotiationFrameFromApplication { frame_type }
             );
-            // The caller's mistake, so the carrier is left alone.
             assert!(!error.kind().is_peer_fault());
             assert!(client.adapter().closed.is_empty());
         }
         assert!(client.adapter().sent.is_empty(), "none reached the backend");
 
-        // The exchange still sends its own, which do not go through this path.
         let mut fresh = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -5054,7 +4639,6 @@ mod tests {
         fresh.begin().unwrap();
         assert_eq!(fresh.adapter().sent.len(), 2);
 
-        // And an ordinary application frame is unaffected.
         let (mut ready, _peer) = negotiated();
         ready.send_control(&frame_of(frame_type::PING, 0)).unwrap();
         assert_eq!(ready.adapter().sent.len(), 1);

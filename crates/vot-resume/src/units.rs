@@ -1,27 +1,14 @@
 //! Run-length unit sets for resume checkpoint state.
-//!
-//! The durable snapshot has always stored checkpointed units run-length
-//! encoded. In memory they were one `BTreeSet` entry per unit, which is one
-//! entry per 64 KiB of object: sixteen million entries, several hundred
-//! megabytes of bookkeeping, for a single maximum-size object. A transfer
-//! checkpoints contiguously until loss fragments it, so runs cost a handful of
-//! entries for the same information.
+//! Reduces memory from one entry per unit to one entry per run.
 
 use std::fmt;
 
-/// Highest representable unit index.
-///
-/// Runs are held as start and length and compared by exclusive end, so a run
-/// covering `u64::MAX` would end past `u64`. Objects are capped at about
-/// sixteen million units, so nothing comes near this.
+/// Highest representable unit index. Runs compare by exclusive end, so
+/// `u64::MAX` itself is excluded.
 pub const MAX_UNIT: u64 = u64::MAX - 1;
 
-/// A sorted set of unit indices held as disjoint, non-adjacent runs.
-///
-/// The invariant is that `runs` is sorted by start, every length is at least
-/// one, and consecutive runs are separated by at least one absent unit. Two
-/// runs that become adjacent are merged, so the representation of a given set
-/// is unique and equality is structural.
+/// Sorted set of unit indices held as disjoint, non-adjacent runs.
+/// Representation is unique: adjacent runs are always merged.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnitRanges {
     runs: Vec<(u64, u64)>,
@@ -65,10 +52,7 @@ impl UnitRanges {
         self.runs.iter().copied()
     }
 
-    /// Every unit in the set, in order.
-    ///
-    /// Materialising this for a large object is exactly the cost this type
-    /// exists to avoid, so it is for tests and small sets.
+    /// Every unit in the set, in order. Avoid for large objects.
     pub fn units(&self) -> impl Iterator<Item = u64> + '_ {
         self.runs
             .iter()
@@ -82,8 +66,6 @@ impl UnitRanges {
 
     /// Index of the run containing `unit`.
     fn run_index(&self, unit: u64) -> Option<usize> {
-        // The run that could contain `unit` is the last one starting at or
-        // before it.
         let index = match self.runs.binary_search_by_key(&unit, |(start, _)| *start) {
             Ok(index) => return Some(index),
             Err(0) => return None,
@@ -103,8 +85,6 @@ impl UnitRanges {
         if unit > MAX_UNIT {
             return;
         }
-        // One past the last run starting at or before `unit`, so `at - 1` is the
-        // only run that can already cover it and `at` is where a new run goes.
         let at = self.runs.partition_point(|(start, _)| *start <= unit);
         let previous = at.checked_sub(1);
         if previous.is_some_and(|index| unit < self.end_of(index)) {
@@ -157,8 +137,6 @@ impl UnitRanges {
             self.runs.clone_from(&other.runs);
             return;
         }
-        // Merging sorted run lists once beats inserting unit by unit, which
-        // would be linear in the number of units rather than the number of runs.
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.runs.len() + other.runs.len());
         let mut left = self.runs.iter().copied().peekable();
         let mut right = other.runs.iter().copied().peekable();
@@ -178,11 +156,7 @@ impl UnitRanges {
         self.runs = merged;
     }
 
-    /// Builds a set from `(start, length)` runs.
-    ///
-    /// Runs may arrive in any order and may touch or overlap; the result is
-    /// normalised. An empty run is rejected because the encoding never produces
-    /// one and accepting it would let two encodings mean the same set.
+    /// Builds a set from `(start, length)` runs. Normalises order and merges.
     ///
     /// # Errors
     /// Rejects a zero-length run or one whose end overflows.
@@ -203,11 +177,7 @@ impl UnitRanges {
         Ok(Self { runs: normalised })
     }
 
-    /// Units in this set that `other` does not contain.
-    ///
-    /// Both sides are sorted, so one pass over each is enough. Restarting the
-    /// scan of `other` per run would be quadratic, and a fragmented object can
-    /// hold millions of runs.
+    /// Units in this set that `other` does not contain. Single-pass over both.
     #[must_use]
     pub fn difference(&self, other: &Self) -> Self {
         let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -218,7 +188,6 @@ impl UnitRanges {
             while let Some((other_start, other_length)) = others.peek().copied() {
                 let other_end = other_start.saturating_add(other_length);
                 if other_end <= cursor {
-                    // Entirely behind us, and it cannot matter to a later run.
                     others.next();
                     continue;
                 }
@@ -230,7 +199,6 @@ impl UnitRanges {
                 }
                 cursor = cursor.max(other_end);
                 if cursor >= end {
-                    // It may still overlap the next run, so leave it in place.
                     break;
                 }
                 others.next();
@@ -242,16 +210,9 @@ impl UnitRanges {
         Self { runs }
     }
 
-    /// Units below `total_units` that the set does not contain, in order.
-    ///
-    /// Lazy, and built from combinators over the borrowed runs. Collecting the
-    /// gaps first would duplicate the run storage, which for a maximally
-    /// fragmented object is millions of pairs the caller may never look at. A
-    /// hand-written iterator would be lazy too, but this cannot be turned into
-    /// an endless one by an arithmetic slip.
+    /// Units below `total_units` not in the set. Lazy: avoids materializing
+    /// the full gap list.
     pub fn missing(&self, total_units: u64) -> impl Iterator<Item = u64> + '_ {
-        // The gap before the first run, one between each pair, one after the
-        // last. An empty range yields nothing, so none of them need a guard.
         let leading = std::iter::once((
             0,
             self.runs.first().map_or(total_units, |(start, _)| *start),
@@ -280,8 +241,6 @@ fn push_run(runs: &mut Vec<(u64, u64)>, start: u64, length: u64) {
     if let Some(last) = runs.last_mut() {
         let last_end = last.0.saturating_add(last.1);
         if start <= last_end {
-            // Touching or overlapping: extend rather than append, or the
-            // representation would stop being unique.
             last.1 = end.max(last_end).saturating_sub(last.0);
             return;
         }
@@ -349,22 +308,18 @@ mod tests {
 
     #[test]
     fn each_join_direction_is_handled() {
-        // Extends the previous run only.
         let mut previous = ranges([0, 1]);
         previous.insert(2);
         assert_eq!(previous.runs().collect::<Vec<_>>(), vec![(0, 3)]);
 
-        // Extends the next run only.
         let mut next = ranges([5, 6]);
         next.insert(4);
         assert_eq!(next.runs().collect::<Vec<_>>(), vec![(4, 3)]);
 
-        // Neither: a new isolated run.
         let mut isolated = ranges([0]);
         isolated.insert(9);
         assert_eq!(isolated.runs().collect::<Vec<_>>(), vec![(0, 1), (9, 1)]);
 
-        // Both: closes the gap and merges.
         let mut both = ranges([0, 2]);
         both.insert(1);
         assert_eq!(both.runs().collect::<Vec<_>>(), vec![(0, 3)]);
@@ -406,7 +361,6 @@ mod tests {
         );
         assert_eq!(left.count(), 9);
 
-        // Union with an empty set on either side is the identity.
         let expected = left.clone();
         left.union(&UnitRanges::new());
         assert_eq!(left, expected);
@@ -429,7 +383,6 @@ mod tests {
         let rebuilt = UnitRanges::from_runs(set.runs()).unwrap();
         assert_eq!(rebuilt, set);
 
-        // Unordered, touching, and overlapping runs all normalise.
         assert_eq!(
             UnitRanges::from_runs([(9, 1), (0, 3), (3, 2)])
                 .unwrap()
@@ -454,9 +407,6 @@ mod tests {
             UnitRanges::from_runs([(u64::MAX, 2)]),
             Err(RunError::EndOverflow)
         );
-        // Runs are held as start and length but compared by exclusive end, so
-        // the very last unit index is not representable. No object comes close
-        // to it, and refusing it keeps every internal addition safe.
         assert_eq!(
             UnitRanges::from_runs([(u64::MAX, 1)]),
             Err(RunError::EndOverflow)
@@ -468,14 +418,11 @@ mod tests {
     fn missing_units_are_the_complement_below_the_total() {
         let set = ranges([0, 1, 4, 7, 8, 9]);
         assert_eq!(set.missing(10).collect::<Vec<_>>(), vec![2, 3, 5, 6]);
-        // A complete set is missing nothing.
         assert_eq!(ranges(0..10).missing(10).count(), 0);
-        // An empty set is missing everything.
         assert_eq!(
             UnitRanges::new().missing(4).collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
         );
-        // Units at or past the total are never reported.
         assert_eq!(ranges([0, 5]).missing(3).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(set.missing(0).count(), 0);
     }
@@ -501,7 +448,6 @@ mod tests {
         assert_eq!(all.difference(&UnitRanges::new()), all);
         assert_eq!(all.difference(&all), UnitRanges::new());
 
-        // Trimmed at the front, the back, and split in the middle.
         assert_eq!(
             all.difference(&ranges(0..5)).runs().collect::<Vec<_>>(),
             vec![(5, 15)]
@@ -515,7 +461,6 @@ mod tests {
             vec![(0, 8), (12, 8)]
         );
 
-        // Several holes, and a subtrahend reaching past both ends.
         let mut holes = ranges(2..6);
         holes.union(&ranges(10..12));
         assert_eq!(
@@ -524,7 +469,6 @@ mod tests {
         );
         assert_eq!(ranges(5..10).difference(&ranges(0..20)), UnitRanges::new());
 
-        // Disjoint sets leave both sides untouched.
         let low = ranges(0..5);
         assert_eq!(low.difference(&ranges(100..105)), low);
     }
@@ -557,7 +501,6 @@ mod tests {
             Err(RunError::EndOverflow)
         );
 
-        // One below it is ordinary.
         let mut edge = UnitRanges::new();
         edge.insert(super::MAX_UNIT);
         assert!(edge.contains(super::MAX_UNIT));
@@ -567,11 +510,8 @@ mod tests {
 
     #[test]
     fn difference_walks_each_side_once() {
-        // Two heavily fragmented sets. A scan that restarted per run would be
-        // quadratic here; this has to stay quick.
         let left = ranges((0..20_000).map(|unit| unit * 2));
         let right = ranges((0..20_000).map(|unit| unit * 2 + 20_000));
-        // The upper half of left is covered by right; the lower half is not.
         assert_eq!(left.difference(&right).count(), 10_000);
         assert_eq!(left.difference(&right).max(), Some(19_998));
         assert_eq!(left.difference(&left), UnitRanges::new());
@@ -579,8 +519,6 @@ mod tests {
 
     #[test]
     fn missing_walks_gaps_not_units() {
-        // A large object with two runs has three gaps, and enumerating them
-        // must not depend on the object being small.
         let mut set = ranges(0..1_000);
         set.union(&ranges(2_000..3_000));
         let missing: Vec<u64> = set.missing(4_000).collect();
@@ -588,15 +526,12 @@ mod tests {
         assert_eq!(missing.first().copied(), Some(1_000));
         assert_eq!(missing.last().copied(), Some(3_999));
 
-        // A run reaching past the total is clipped, not counted.
         assert_eq!(ranges(0..10).missing(5).count(), 0);
         assert_eq!(ranges([0, 8]).missing(4).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]
     fn missing_does_no_work_the_caller_does_not_ask_for() {
-        // A maximally fragmented object. Taking one result must not walk, or
-        // allocate, anything proportional to the run count.
         let set = ranges((0..200_000).map(|unit| unit * 2));
         assert_eq!(set.run_count(), 200_000);
         assert_eq!(set.missing(400_000).next(), Some(1));

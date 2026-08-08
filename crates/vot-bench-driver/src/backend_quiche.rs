@@ -1,17 +1,8 @@
-//! The quiche backend as a benchmark carrier.
+//! quiche backend as a benchmark carrier.
 //!
-//! A connected loopback pair: the client submits, the server receives, and each
-//! endpoint owns its socket and its connection on a driver thread of its own
-//! (ADR-0024). The handshake completes here, in the constructor, so no part of
-//! it lands inside the timed section.
-//!
-//! Nothing in this file decides what a run means. It opens the endpoints and
-//! forwards submissions and events; the transfer loop, the framing, and every
-//! reported number are in `lib.rs`, where the mutation gate measures them. That
-//! division is why this file is named in `.cargo/mutants.toml`: it compiles
-//! only under the `quiche` feature, which the mutation matrix does not enable,
-//! so a mutant here would be reported missed whatever the tests say. It is
-//! measured where it compiles, by the tests at the bottom of this file.
+//! A connected loopback pair: client submits, server receives. Handshake
+//! completes in the constructor so it stays outside the timed section. Transfer
+//! loop and reported numbers are in `lib.rs`.
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
@@ -23,28 +14,14 @@ use vot_transport_quiche::live::{Config as QuicheConfig, Transport};
 
 use crate::{Carrier, Config, Error};
 
-/// How long the pair is given to complete its handshake.
-///
-/// Loopback needs milliseconds. This is long enough that a loaded machine is
-/// not mistaken for a broken one, and short enough that a run which will never
-/// connect fails rather than hanging in CI.
+/// Handshake timeout for the loopback pair.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The datagram size the pair is configured with, when the case names one.
-///
-/// Not a `VOT_BENCH_*` variable, because it is not part of the benchmark
-/// contract: it describes the path the run was taken on rather than the
-/// workload. Named here so a comparison can hold packet size fixed across
-/// backends, which it must, since one datagram is one syscall and one packet's
-/// worth of crypto and the default is sized for a path whose MTU is unknown.
+/// Datagram size when the case names one. Not a `VOT_BENCH_*` variable; it
+/// describes the path, not the workload.
 const DATAGRAM_BYTES: &str = "VOT_BENCH_QUICHE_DATAGRAM_BYTES";
 
-/// Lanes the endpoints advertise.
-///
-/// The sequential transfer uses one, the ranged path uses one per worker
-/// starting at lane 1, and the workload defines worker counts up to 8, so the
-/// endpoint advertises room for that rather than being configured more
-/// tightly than the cases it carries.
+/// Lanes the endpoints advertise. Workload uses up to 8 workers (one per lane).
 const ADVERTISED_LANES: u64 = 16;
 
 /// A connected pair of quiche endpoints over loopback.
@@ -79,10 +56,7 @@ impl QuicheCarrier {
             client_config.max_datagram_bytes = bytes;
         }
         let mut server = Transport::serve(loopback, &server_config).map_err(Error::Transport)?;
-        // The credential is generated for this run and trusted by construction.
-        // What is being measured is the carrier, not the web PKI, and a
-        // benchmark that failed on certificate validation would say nothing
-        // about either.
+        // Self-signed credential: benchmark measures the carrier, not the PKI.
         client_config.verify_peer = false;
         let mut client = Transport::connect(
             loopback,
@@ -97,8 +71,6 @@ impl QuicheCarrier {
             client,
             server,
             unmodelled: unmodelled_for(config),
-            // What was configured, rather than what was asked for, so an
-            // unset case reports the default it actually ran at.
             datagram_bytes: client_config.max_datagram_bytes,
         })
     }
@@ -126,17 +98,12 @@ fn datagram_bytes_from_env() -> Result<Option<usize>, Error> {
         .map_err(|_| Error::Value(DATAGRAM_BYTES))
 }
 
-/// How long a role endpoint waits for its peer, against loopback's
-/// [`HANDSHAKE_TIMEOUT`]: the two halves of a two-machine run are started by
-/// hand on two machines, and a human is slower than a scheduler.
+/// Handshake timeout for two-machine runs. Longer than loopback because a
+/// human starts each half.
 const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Binds a listener without waiting for its handshake.
-///
-/// The ranged half binds every rail before any handshake starts: a sender
-/// connects its rails serially the moment the previous one completes, and a
-/// rail whose port is not yet bound loses that first Initial to a closed
-/// port and pays quiche's no-sample probe timeout, a full second, for it.
+/// Binds a listener without waiting for handshake. All rails bind before
+/// any connect starts to avoid Initial loss to closed ports.
 pub(crate) fn role_listen_bound(
     config: &Config,
     address: SocketAddr,
@@ -200,8 +167,6 @@ pub(crate) fn role_connect(
     if let Some(bytes) = datagram_bytes_from_env()? {
         client_config.max_datagram_bytes = bytes;
     }
-    // The receiving half's credential is generated for its run and trusted by
-    // construction, exactly as the loopback pair trusts its own.
     client_config.verify_peer = false;
     let local: SocketAddr = if peer.is_ipv4() {
         "0.0.0.0:0"
@@ -269,15 +234,9 @@ fn handshake(client: &mut Transport, server: &mut Transport) -> Result<(), Error
     Err(Error::Handshake)
 }
 
-/// Impairment fields this carrier describes but does not shape.
-///
-/// Loopback is not the path the file describes and nothing here shapes it to
-/// match. Every field is named rather than left for a reader to assume: the
-/// case's MTU, bandwidth, queue, loss, and reordering are all the loopback
-/// path's own, and its round-trip time is a few microseconds rather than the
-/// one the case asks for. The receive window still comes from the case's
-/// bandwidth-delay product, which is the one effect an impairment field has,
-/// exactly as it has on the simulator.
+/// Impairment fields this carrier describes but does not shape. Loopback has
+/// its own path characteristics; only the receive window (from the case's BDP)
+/// has effect.
 fn unmodelled_for(config: &Config) -> Vec<&'static str> {
     let mut unmodelled = vec!["mtu_bytes", "bandwidth_bps", "queue_bytes"];
     for (present, name) in [
@@ -292,13 +251,7 @@ fn unmodelled_for(config: &Config) -> Vec<&'static str> {
     unmodelled
 }
 
-/// Generates a self-signed credential once per process.
-///
-/// The same approach the quiche live tests take: `openssl` into a temporary
-/// directory, so no dependency is added for something that never leaves this
-/// host. Once per process because a run may build more than one pair, and two
-/// of them writing the same two paths at once would let one load a half-written
-/// certificate.
+/// Generates a self-signed credential once per process via `openssl`.
 ///
 /// # Errors
 /// Reports a failure to create the directory or to run `openssl`.
@@ -351,8 +304,6 @@ impl Carrier for QuicheCarrier {
         &self.unmodelled
     }
 
-    // The server is the endpoint that receives the object, so its inbound bound
-    // is the one the case's credit applies to.
     fn receiving(&mut self) -> &mut dyn TransportAdapter {
         &mut self.server
     }
@@ -366,8 +317,6 @@ impl Carrier for QuicheCarrier {
             .send_reliable_shared(stream, Payload::clone(frame))
     }
 
-    // Both ends. The client has records to hand its driver, and the server has
-    // the acknowledgements and window updates that let the client send more.
     fn flush(&mut self) -> Result<(), vot_transport_api::Error> {
         self.client.flush()?;
         self.server.flush()
@@ -377,15 +326,10 @@ impl Carrier for QuicheCarrier {
         self.server.poll()
     }
 
-    // A sender that loses its connection is reported here and discarded with
-    // the rest. The object stops arriving either way, so the run ends on the
-    // receiver's disconnect or on the budget rather than silently.
     fn drain_sent(&mut self) {
         while self.client.poll().is_some() {}
     }
 
-    // The receiving endpoint, because that is whose events an idle delivery
-    // was short of. The pump's signal ends the wait as soon as one lands.
     fn wait(&mut self, bound: Duration) {
         self.server.wait_for_event(bound);
     }
@@ -427,23 +371,16 @@ mod tests {
 
     #[test]
     fn a_case_crosses_a_real_socket_and_verifies() {
-        // Past one batch and past one datagram many times over, so the record
-        // is reassembled from packets rather than arriving whole.
         let object_bytes = 40 * 65_536;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
         assert_eq!(measured.bytes_sent, object_bytes);
         assert_eq!(note_field(&measured.notes, "backend"), "quiche");
-        // The whole object arrived over a carrier that delivers asynchronously,
-        // which the receiver only reports verified after every byte is in.
         assert!(measured.elapsed_ns >= 1);
     }
 
     #[test]
     fn a_ranged_case_crosses_a_real_socket_and_verifies() {
-        // The multi-worker path over a real socket in both arrangements:
-        // disjoint proof-bearing ranges on one lane per worker of a shared
-        // connection, or on a connection per worker, a ragged tail included.
         for workers in [2_usize, 4] {
             for rails in [Rails::Shared, Rails::Provisioned] {
                 let mut config = case(6 * 65_536 + 17);
@@ -465,18 +402,12 @@ mod tests {
         let object_bytes = 3 * 65_536 + 17;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
-        // The envelope is on the wire and the object is not, so the carrier
-        // moved strictly more than the object.
         let wire: u64 = note_field(&measured.notes, "wire_bytes").parse().unwrap();
         assert!(wire > object_bytes, "wire was {wire}");
     }
 
     #[test]
     fn the_carrier_bounds_its_credit_at_construction() {
-        // ADR-0024: quiche extends connection flow control as the application
-        // reads, so there is no absolute credit to set and the transport says
-        // so rather than accepting a bound it would not apply. The report has
-        // to carry which of the two happened.
         let measured = measure(&case(65_536)).unwrap();
         assert_eq!(note_field(&measured.notes, "credit_mode"), "constructed");
     }
@@ -497,9 +428,6 @@ mod tests {
 
     #[test]
     fn an_endpoint_pair_gives_its_ports_back() {
-        // Each endpoint owns a socket on a driver thread, so a pair that is
-        // dropped without stopping its drivers would leak both. Building
-        // several in one process is what the measurement work does.
         for _ in 0..3 {
             let carrier = QuicheCarrier::connected(&case(65_536)).unwrap();
             drop(carrier);

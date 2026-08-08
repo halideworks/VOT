@@ -1,16 +1,5 @@
-//! The bounded queue every backend adapter sits on.
-//!
-//! A [`TransportAdapter`](vot_transport_api::TransportAdapter) is submissions in
-//! one direction and events in the other, both bounded, and none of that depends
-//! on the carrier underneath. Two backends had grown the same queue, and the
-//! third would have been a third copy, so it lives here once: what a submission
-//! costs, what refuses it, what stays at the head of the queue when a driver
-//! cannot take it, and which limit is the peer's rather than this endpoint's.
-//!
-//! What is not here is what differs. A backend that opens a stream per lane has
-//! reserved identifiers to refuse; a backend that is one byte stream counts the
-//! lanes a peer names. Each keeps its own native event type and translates it,
-//! because an event a carrier cannot produce is an arm no test can reach.
+//! Bounded queue for backend adapters: submissions out, events in.
+//! Shared across backends; each keeps its own native event type.
 
 use std::collections::VecDeque;
 
@@ -77,7 +66,7 @@ fn event_payload_len(event: &Event) -> usize {
     }
 }
 
-/// Submissions out, events in, both bounded by count and by bytes.
+/// Submissions out, events in, both bounded by count and bytes.
 #[derive(Clone, Debug)]
 pub struct Queue {
     commands: VecDeque<Command>,
@@ -135,11 +124,8 @@ impl Queue {
         })
     }
 
-    /// Applies what this endpoint advertised.
-    ///
-    /// The bound has to be in force before the peer's first frame: accepting
-    /// more than was advertised is silent otherwise, since the peer sends what
-    /// it was told it could and this endpoint takes more.
+    /// Applies what this endpoint advertised. Must be in force before the
+    /// peer's first frame.
     pub const fn set_receive_limits(&mut self, limits: ReceiveLimits) {
         self.control_receive_limit = limits.control_payload();
         self.receive_limits = Some(limits);
@@ -150,12 +136,7 @@ impl Queue {
         self.receive_limits
     }
 
-    /// Applies the peer's bound on what this endpoint sends.
-    ///
-    /// Clamped to what the outbound queue can hold. A peer allowing more than
-    /// this endpoint can enqueue does not oblige it to send that much, and a
-    /// bound above the queue would refuse the frame at submission for ever,
-    /// which a caller reads as backpressure that never clears.
+    /// Applies the peer's send bound, clamped to the outbound queue capacity.
     ///
     /// # Errors
     /// Rejects a limit outside the protocol's range.
@@ -259,10 +240,7 @@ impl Queue {
         Some(command)
     }
 
-    /// Gives a driver one submission at a time.
-    ///
-    /// A failed submission stays at the head of the queue, so a driver can
-    /// apply its own retry or shutdown policy without silently dropping data.
+    /// Gives a driver one submission at a time. Failed submissions stay queued.
     ///
     /// # Errors
     /// Returns the first error the driver reports.
@@ -280,18 +258,13 @@ impl Queue {
         Ok(())
     }
 
-    /// Whether an event may be delivered at all, against what this endpoint
-    /// advertised it would accept.
-    ///
-    /// Separate from admission so a backend can refuse a malformed event before
-    /// counting anything against it.
+    /// Whether an event fits the advertised bounds. Separate from admission so
+    /// a backend can refuse before counting.
     ///
     /// # Errors
     /// Rejects a control frame or record past what this endpoint accepts.
     pub fn validate_event(&self, event: &Event) -> Result<(), Error> {
         match event {
-            // The receive bound: the peer's limit governs what goes out, not
-            // what may arrive.
             Event::Control(bytes) => validate_control_frame(bytes, self.control_receive_limit),
             Event::Reliable { bytes, .. } => validate_data_record(bytes),
             Event::Connected(_)
@@ -313,11 +286,6 @@ impl Queue {
     }
 
     /// Delivers an event, handing it back when the inbound queue is full.
-    ///
-    /// A driver holding the returned event can retry it later, so backpressure
-    /// costs no record and cannot reorder one. [`Self::admit_event`] drops the
-    /// event on failure, which is fine for a caller that can regenerate it and
-    /// wrong for one draining a carrier.
     ///
     /// # Errors
     /// Returns the event alongside the reason it was refused.
@@ -384,11 +352,8 @@ mod tests {
 
     use super::*;
 
-    /// A control frame of exactly this many wire bytes.
-    ///
-    /// The queue bounds what a frame may weigh and never reads one, so these are
-    /// bytes rather than an encoding. A varint written here would be a second
-    /// copy of the codec's rules with nothing checking it against them.
+    /// A control frame of exactly this many wire bytes. Stated as bytes, not
+    /// an encoding, to avoid duplicating codec rules.
     fn frame(wire_len: usize) -> Payload {
         shared_payload(&vec![0; wire_len])
     }
@@ -439,8 +404,6 @@ mod tests {
 
     #[test]
     fn a_submission_the_driver_could_not_take_stays_at_the_head() {
-        // The contract a retry depends on. A driver that loses the submission it
-        // failed on has dropped a record with nothing to say so.
         let mut queue = Queue::default();
         queue
             .send_reliable(StreamId(1), shared_payload(b"first"))
@@ -460,7 +423,6 @@ mod tests {
             })
         );
 
-        // And what a driver does take is released rather than held twice.
         let mut taken = Vec::new();
         let result: Result<(), &str> = queue.drain_commands(|command| {
             taken.push(command);
@@ -494,7 +456,6 @@ mod tests {
             Err(Error::OutboundQueueFull),
             "the bytes are reached"
         );
-        // What is taken is given back, so the next submission fits again.
         assert!(wide.next_command().is_some());
         assert!(
             wide.send_reliable(StreamId(1), shared_payload(b"x"))
@@ -504,8 +465,6 @@ mod tests {
 
     #[test]
     fn credit_costs_a_slot_and_no_bytes() {
-        // Credit has no payload, so a queue bounded by bytes still takes it, and
-        // a queue bounded by count still refuses it.
         let mut queue = Queue::with_limits(2, 1).expect("a bounded queue");
         queue.set_receive_credit(1).expect("credit");
         queue.set_receive_credit(2).expect("credit");
@@ -575,7 +534,6 @@ mod tests {
         );
         assert_eq!(queue.pending_commands(), 0, "nothing refused was taken");
 
-        // And each at its own bound is taken.
         assert!(
             queue
                 .send_datagram(1, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES])
@@ -599,8 +557,6 @@ mod tests {
         queue.set_receive_limits(advertised);
         assert_eq!(queue.receive_limits(), Some(advertised));
 
-        // The peer accepts less than this endpoint does. That governs what goes
-        // out and nothing about what may arrive.
         let peer = vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD;
         queue
             .set_control_send_limit(peer)
@@ -616,8 +572,6 @@ mod tests {
             "and one byte more"
         );
 
-        // A frame larger than the peer's bound but inside this endpoint's is
-        // still delivered inbound.
         assert_eq!(
             queue.validate_event(&Event::Control(frame(16_384 + ENVELOPE))),
             Ok(())
@@ -627,7 +581,6 @@ mod tests {
             Err(Error::RecordTooLarge)
         );
 
-        // A limit outside the protocol's range is not the peer's to set.
         assert_eq!(
             queue.set_control_send_limit(vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD - 1),
             Err(Error::InvalidConfiguration)
@@ -641,10 +594,6 @@ mod tests {
 
     #[test]
     fn the_send_bound_is_clamped_to_what_the_queue_can_hold() {
-        // A peer allowing more than this endpoint can enqueue does not oblige it
-        // to send that much. A bound above the queue would refuse the frame at
-        // submission for ever, which a caller reads as backpressure that never
-        // clears.
         let mut queue = Queue::with_limits(4, 64 * 1024).expect("a bounded queue");
         queue
             .set_control_send_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD)
@@ -656,9 +605,6 @@ mod tests {
         );
         assert!(queue.send_control(frame(64 * 1024)).is_ok());
 
-        // Never below the protocol minimum, whatever the queue can hold. A limit
-        // under it would refuse every frame as a configuration error rather than
-        // reporting backpressure.
         let mut narrow = Queue::with_limits(1, 8).expect("a bounded queue");
         narrow
             .set_control_send_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD)
@@ -671,9 +617,6 @@ mod tests {
 
     #[test]
     fn the_default_bounds_are_what_an_endpoint_advertises_against() {
-        // Pinned exactly. A default written as a product and read as a sum is a
-        // queue four thousand times smaller than the one an endpoint advertised
-        // it would hold, and nothing else here would notice.
         assert_eq!(DEFAULT_COUNT_LIMIT, 64);
         assert_eq!(DEFAULT_BYTE_LIMIT, 4_194_304);
         assert_eq!(INBOUND_BYTE_CAPACITY, DEFAULT_BYTE_LIMIT);
@@ -681,9 +624,6 @@ mod tests {
 
     #[test]
     fn a_batch_at_each_bound_is_taken_and_one_past_it_is_not() {
-        // The batch check is two comparisons, and each is at its own edge here.
-        // A bound read as one less refuses a batch the queue could hold, and a
-        // caller reads that as backpressure that never clears.
         let queue = Queue::with_limits(3, 32).expect("a bounded queue");
         assert_eq!(
             queue.preflight_reliable_batch(&[
@@ -723,7 +663,6 @@ mod tests {
         assert_eq!(queue.preflight_reliable_batch(&records), Ok(()));
         assert_eq!(queue.pending_commands(), 0, "a check takes nothing");
 
-        // One slot left, two records: refused whole rather than in part.
         queue
             .send_reliable(StreamId(1), shared_payload(b"first"))
             .expect("a record");
@@ -735,7 +674,6 @@ mod tests {
             Err(Error::OutboundQueueFull)
         );
 
-        // A record inside the batch that is too large refuses the batch.
         let fresh = Queue::default();
         assert_eq!(
             fresh.preflight_reliable_batch(&[
@@ -801,14 +739,11 @@ mod tests {
             queue.try_admit_event(refused.clone()),
             Err((refused.clone(), Error::InboundQueueFull))
         );
-        // The other entry point discards it, which is the difference between
-        // them.
         assert_eq!(
             queue.admit_event(refused.clone()),
             Err(Error::InboundQueueFull)
         );
 
-        // Taking the first event makes room, and the retry keeps the order.
         assert_eq!(queue.poll(), Some(Event::Connected(ConnectionId(1))));
         assert_eq!(queue.try_admit_event(refused.clone()), Ok(()));
         assert_eq!(queue.poll(), Some(refused));
@@ -832,10 +767,8 @@ mod tests {
             }),
             Err(Error::InboundQueueFull)
         );
-        // An event with no payload still fits, because bytes are not slots.
         assert_eq!(queue.admit_event(Event::Connected(ConnectionId(1))), Ok(()));
 
-        // And what is taken is given back.
         assert!(matches!(queue.poll(), Some(Event::Reliable { .. })));
         assert_eq!(
             queue.admit_event(Event::Reliable {
@@ -849,8 +782,6 @@ mod tests {
 
     #[test]
     fn a_malformed_event_is_refused_before_it_is_counted() {
-        // Validation is separate from admission so a backend can refuse an event
-        // before counting anything against the peer that sent it.
         let queue = Queue::default();
         assert_eq!(
             queue.validate_event(&Event::Reliable {

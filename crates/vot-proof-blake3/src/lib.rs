@@ -73,11 +73,7 @@ pub fn canonical_outboard(data: &[u8]) -> Vec<u8> {
     encoded
 }
 
-/// Which bytes a proof covers, and the proof itself.
-///
-/// [`prove`] returns the covered bytes with it because it was given the object.
-/// This is what a caller gets when it supplied only the chaining values, and it
-/// already has, or can regenerate, the bytes the cover names.
+/// Proof bytes and the range they cover. Used when proving without the object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RangeCover {
     pub covered_offset: u64,
@@ -85,16 +81,8 @@ pub struct RangeCover {
     pub proof: Vec<u8>,
 }
 
-/// The chaining value of every 64 KiB group, in order.
-///
-/// Enough to prove any range without the object. Every node above the group
-/// layer is a merge of these, so producing a sibling's chaining value costs a
-/// handful of 32-byte merges here where [`prove`] costs a hash of everything
-/// underneath it. Proving every range of an object is the difference between
-/// one pass and one pass per range.
-///
-/// It is 32 bytes per group, so about 512 KiB for a gigabyte, which is what
-/// lets a sender prove ranges without holding the object.
+/// Chaining values of every 64 KiB group, in order. Enough to prove any
+/// range without the object (~512 KiB per gigabyte).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GroupCvs {
     cvs: Vec<[u8; 32]>,
@@ -143,15 +131,8 @@ impl GroupCvs {
         self.cvs.len()
     }
 
-    /// Whether `group` is still the bytes this layer took at `index`.
-    ///
-    /// A sender that keeps only chaining values cannot otherwise tell that
-    /// the object it proves from has been rewritten under it, because a
-    /// rewrite that keeps the length reads back at the same offsets. What
-    /// catches the rewrite is the group's content, as it is in the SHA-256
-    /// layer too. The offset is recomputed from the index because a
-    /// chaining value carries the position it was taken at: taken at any
-    /// other offset it would refuse the object's own bytes.
+    /// Whether `group` matches what this layer took at `index`. Catches
+    /// object rewrites that keep the length.
     #[must_use]
     pub fn holds(&self, index: usize, group: &[u8]) -> bool {
         let Some(cv) = self.cvs.get(index) else {
@@ -173,11 +154,8 @@ impl GroupCvs {
     }
 }
 
-/// Proves a range from the chaining values rather than from the object.
-///
-/// The proof is byte-identical to [`prove`]'s for the same range, which its
-/// tests check directly, because the two walk the same tree and differ only in
-/// where a subtree's chaining value comes from.
+/// Proves a range from chaining values. Byte-identical to [`prove`] for the
+/// same range.
 ///
 /// # Errors
 /// Rejects an empty range and one that runs past the object.
@@ -528,7 +506,6 @@ mod tests {
             assert!(cvs.holds(index, group), "group {index} is its own bytes");
         }
 
-        // One byte different anywhere is a different group.
         let mut altered = groups[1].to_vec();
         altered[0] ^= 1;
         assert!(!cvs.holds(1, &altered));
@@ -537,21 +514,13 @@ mod tests {
         altered[last] ^= 1;
         assert!(!cvs.holds(1, &altered));
 
-        // A chaining value carries the offset it was taken at, so an object
-        // of three identical groups still gets three different ones. That
-        // is why the loop above passes at every index rather than only the
-        // first: `holds` recomputes at the index's own offset, and at any
-        // other offset it would refuse the object's own bytes.
         let repeated = vec![7u8; 3 * GROUP_SIZE as usize];
         let same = cvs_of(&repeated);
         assert_ne!(same.cvs[0], same.cvs[1]);
         assert_ne!(same.cvs[1], same.cvs[2]);
-        // Bytes that are not what the layer took at an index are refused
-        // there, which is the content answering, not the offset.
         assert!(!cvs.holds(0, groups[1]));
         assert!(!cvs.holds(2, groups[1]));
 
-        // And nothing holds outside the layer, or at an impossible size.
         assert!(!cvs.holds(groups.len(), groups[0]));
         assert!(!cvs.holds(usize::MAX, groups[0]));
         assert!(!cvs.holds(0, &[]));
@@ -560,9 +529,6 @@ mod tests {
 
     #[test]
     fn proving_from_chaining_values_matches_proving_from_the_object() {
-        // The whole point of the second path is that it is the first one
-        // without the object. A proof that differed would be a second
-        // implementation of the format, and only one of them is fuzzed.
         for length in [
             1,
             GROUP_SIZE as usize,
@@ -582,8 +548,6 @@ mod tests {
                 assert_eq!(cover.covered_offset, whole.covered_offset);
                 assert_eq!(cover.covered_length, whole.data.len() as u64);
 
-                // And it verifies against the root, which is what a receiver
-                // actually does with it.
                 let start = cover.covered_offset as usize;
                 let stop = start + cover.covered_length as usize;
                 verify(
@@ -601,7 +565,6 @@ mod tests {
     #[test]
     fn the_builder_takes_full_groups_until_a_short_last_one() {
         let mut cvs = GroupCvs::new();
-        // Nothing, and more than a group, are both not a group.
         assert_eq!(cvs.push(&[]), Err(Error::OutOfBounds));
         assert_eq!(
             cvs.push(&fixture(GROUP_SIZE as usize + 1)),
@@ -612,8 +575,6 @@ mod tests {
         cvs.push(&fixture(GROUP_SIZE as usize)).unwrap();
         cvs.push(&fixture(7)).unwrap();
         assert_eq!(cvs.object_len(), GROUP_SIZE + 7);
-        // A short group ends the object, so anything after it would put every
-        // later group at an offset the tree does not have.
         assert_eq!(cvs.push(&fixture(1)), Err(Error::OutOfBounds));
     }
 
@@ -627,7 +588,6 @@ mod tests {
             prove_with(&cvs, data.len() as u64, 1),
             Err(Error::OutOfBounds)
         );
-        // Exactly the object is not past it.
         assert!(prove_with(&cvs, 0, data.len() as u64).is_ok());
     }
 

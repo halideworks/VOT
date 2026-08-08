@@ -1,10 +1,5 @@
-//! Measured backend driver for the Wave 5.5 benchmark contract.
-//!
-//! `tools/run_benchmark.py` runs one process per matrix case, hands it the case
-//! through `VOT_BENCH_*`, and reads a single JSON object from stdout. The runner
-//! deliberately refuses to invent a measurement, and this driver holds the same
-//! line in the other direction: a case it cannot run honestly is an error, not
-//! an approximation.
+//! Benchmark driver for the runner contract. A case that cannot run honestly
+//! is an error, not an approximation.
 
 #![forbid(unsafe_code)]
 
@@ -40,31 +35,13 @@ const GROUP_BYTES: u64 = vot_verifier::GROUP_SIZE as u64;
 /// receiver's staging grows with object size.
 const SUBMIT_BATCH_RECORDS: usize = 16;
 
-/// Bytes drawn from the generator at a time.
 const WORD_BYTES: usize = 8;
 
 /// The lane the sequential transfer uses.
-///
-/// One lane, because the case describes one object. A second would measure how
-/// the carrier schedules between lanes, which is a different question from the
-/// one the sequential matrix asks; the ranged path asks exactly that question
-/// and numbers its lanes from here up (ADR-0025).
 const TRANSFER_LANE: StreamId = StreamId(1);
 
-/// The shortest wait after a delivery that moved nothing, and the longest.
-///
-/// How long the driver waits changes what it measures, which is why this backs
-/// off rather than picking one interval. Polling a carrier that has nothing to
-/// give contends with the thread that would be filling it: measured over a
-/// 512 MB object, a fixed 200 microsecond wait reported a median of about 1000
-/// Mbit/s with a 31 percent spread, and fixed waits of 1 to 5 milliseconds
-/// reported about 1500 with a 9 percent spread. Waiting less made the carrier
-/// slower and the result noisier.
-///
-/// A fixed long wait would then distort the small cases, where one wait is most
-/// of the run. Backing off from the short end gives a small object its answer
-/// without a millisecond of padding and a long one the interval where the
-/// driver is out of the carrier's way.
+/// Min and max idle-wait bounds. Exponential backoff avoids contention from
+/// polling and padding from a fixed long wait.
 const IDLE_WAIT_MIN: Duration = Duration::from_micros(16);
 const IDLE_WAIT_MAX: Duration = Duration::from_micros(1024);
 
@@ -73,24 +50,8 @@ const IDLE_WAIT_DOUBLINGS: u32 = 6;
 const _: () =
     assert!(IDLE_WAIT_MIN.as_micros() << IDLE_WAIT_DOUBLINGS == IDLE_WAIT_MAX.as_micros());
 
-/// Deliveries a transfer may make beyond one per record before its carrier is
-/// called stopped.
-///
-/// A count rather than a deadline, so the transfer ends by construction rather
-/// than only because a clock advanced. A run that reaches it is an error,
-/// because a partial transfer reported as a measurement is exactly what the
-/// benchmark contract exists to prevent.
-///
-/// Per record, with a floor, rather than a flat allowance. The budget is also
-/// how long a stopped carrier takes to be called stopped, at [`IDLE_WAIT_MAX`]
-/// a round, so a flat allowance made a one-record transfer wait as long as a
-/// gigabyte one. That is invisible in a healthy run and costs twenty seconds
-/// apiece under the mutation gate, where every test's carrier is stopped on
-/// purpose.
-///
-/// Both numbers are about eight times what was measured: 512 MB over loopback
-/// spends a few thousand rounds against a budget of 65,536, and a single record
-/// spends six to eight against 256.
+/// Delivery rounds per record before a carrier is called stopped.
+/// A count, not a deadline, so the transfer ends by construction.
 const ROUNDS_PER_RECORD: u64 = 8;
 const MIN_ROUNDS: u64 = 256;
 
@@ -115,10 +76,6 @@ pub enum Error {
     /// The carrier reported the connection gone before the object was whole.
     Disconnected,
     /// The endpoints did not connect, so nothing was carried at all.
-    ///
-    /// Separate from [`Error::Stalled`] because the two are found in different
-    /// places: a transfer that stops is the carrier's business, and a pair that
-    /// never connects is the case's configuration or the address it was given.
     Handshake,
 }
 
@@ -169,11 +126,8 @@ impl From<vot_verifier::VerifyError> for Error {
     }
 }
 
-/// The impairment case, as the runner describes it.
-///
-/// Every field is carried even when a backend cannot apply it, so
-/// [`Measurement::notes`] can say which ones went unmodelled rather than
-/// leaving a reader to assume the path was shaped as the file describes.
+/// Impairment case from the runner. All fields are carried even when
+/// unmodelled, so notes can say which were not applied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImpairmentCase {
     pub mtu_bytes: u64,
@@ -184,9 +138,7 @@ pub struct ImpairmentCase {
     pub queue_bytes: u64,
 }
 
-/// How the ranged path reaches the carrier: every worker on one shared
-/// connection, or one connection per worker. The spine hypothesis compares
-/// the two (ruling 6), so the case names its arrangement.
+/// How the ranged path reaches the carrier: one shared connection or one per worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rails {
     Shared,
@@ -206,10 +158,7 @@ pub struct Config {
     pub impairment: ImpairmentCase,
 }
 
-/// Where a ranged case's verified bytes go (ADR-0029).
-///
-/// Discard is the ram destination every landed number was taken on; a file
-/// makes the case ram-to-disk and the notes label which one a result paid.
+/// Where a ranged case's verified bytes go.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SinkChoice {
     Discard,
@@ -263,8 +212,7 @@ impl Config {
         if record_bytes == 0 || record_bytes > vot_transport_api::MAX_DATA_RECORD_BYTES {
             return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
         }
-        // Absent is the shared arrangement every landed number was taken on;
-        // the runner only names what it means to vary.
+        // Absent defaults to shared.
         let rails = match lookup("VOT_BENCH_RAILS").filter(|value| !value.is_empty()) {
             None => Rails::Shared,
             Some(value) if value == "shared" => Rails::Shared,
@@ -272,8 +220,6 @@ impl Config {
             Some(_) => return Err(Error::Value("VOT_BENCH_RAILS")),
         };
         if rails == Rails::Provisioned && workers == 1 {
-            // One worker has nothing to provision; a case that asks anyway is
-            // asking for a number this driver would have to invent.
             return Err(Error::Value("VOT_BENCH_RAILS"));
         }
         let sink = match lookup("VOT_BENCH_SINK_FILE").filter(|value| !value.is_empty()) {
@@ -281,8 +227,6 @@ impl Config {
             Some(path) => SinkChoice::File(std::path::PathBuf::from(path)),
         };
         if workers == 1 && matches!(sink, SinkChoice::File(_)) {
-            // One worker is the sequential path, which has no sink; a case
-            // that asks anyway would measure ram-to-ram and label nothing.
             return Err(Error::Value("VOT_BENCH_SINK_FILE"));
         }
         Ok(Self {
@@ -321,9 +265,7 @@ pub struct Measurement {
     pub verified_bytes: u64,
     pub elapsed_ns: u64,
     pub memory_high_water_bytes: u64,
-    /// `None` whenever no cycle counter was read. The benchmark README is
-    /// explicit that a missing counter cannot satisfy the Wave 6 cycle metric,
-    /// so this is never filled in with an estimate.
+    /// `None` when no cycle counter was read. Never estimated.
     pub cycles: Option<u64>,
     pub notes: String,
 }
@@ -364,11 +306,8 @@ fn escape(value: &str) -> String {
         .collect()
 }
 
-/// Deterministic object bytes for a seed.
-///
-/// The object is generated one record at a time rather than materialised, so a
-/// gigabyte case does not put a gigabyte of fixture into the high-water mark
-/// that is supposed to describe transport and verification.
+/// Deterministic object bytes for a seed. Generated one record at a time
+/// so the fixture does not inflate the high-water mark.
 struct ObjectSource {
     state: u64,
 }
@@ -381,14 +320,7 @@ impl ObjectSource {
         }
     }
 
-    /// The source advanced to `byte_offset`, exactly as if every preceding
-    /// byte had been drawn.
-    ///
-    /// Range workers start mid-object, and drawing a gigabyte of prefix
-    /// sequentially would charge the timed section for bytes nobody sends.
-    /// Byte offsets on this path are 64 KiB aligned, so the word alignment
-    /// this needs always holds; it is still checked, because a misaligned
-    /// start would generate a different object than the sequential path.
+    /// The source advanced to `byte_offset`. Requires word alignment.
     fn at(seed: u64, byte_offset: u64) -> Result<Self, Error> {
         if byte_offset % WORD_BYTES as u64 != 0 {
             return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
@@ -404,10 +336,6 @@ impl ObjectSource {
     }
 
     /// Fills `buffer` with the next `take` bytes of the object.
-    ///
-    /// The source does not decide when the object ends; [`record_lengths`] does.
-    /// Nothing in the transfer loop then depends on a signal a mutation could
-    /// pin true, which would hang rather than fail.
     fn fill(&mut self, buffer: &mut Vec<u8>, take: usize) {
         buffer.clear();
         buffer.reserve(take);
@@ -426,11 +354,6 @@ struct WorkerRange {
 }
 
 /// Disjoint, 64 KiB-aligned slabs covering the object exactly, one per worker.
-///
-/// Groups are dealt as evenly as they divide, the leading workers taking one
-/// more where they do not, and the last slab also takes the object's ragged
-/// tail. More workers than groups would leave some with nothing to send,
-/// which is a case with nothing honest to measure rather than a smaller one.
 fn worker_ranges(object_bytes: u64, workers: usize) -> Result<Vec<WorkerRange>, Error> {
     let groups = object_bytes.div_ceil(GROUP_BYTES);
     let count = workers as u64;
@@ -457,26 +380,16 @@ fn worker_ranges(object_bytes: u64, workers: usize) -> Result<Vec<WorkerRange>, 
     Ok(ranges)
 }
 
-/// Records one bundle carries on the ranged path.
-///
-/// The codec allows 17; 16 keeps a bundle of 64 KiB records at 1 MiB, inside
-/// the 4 MiB requested-range cap with room for the record size below.
+/// Records per bundle on the ranged path. Capped at 16 to stay under the
+/// 4 MiB range limit.
 const RECORDS_PER_BUNDLE: usize = 16;
 
-/// The largest record the ranged path accepts.
-///
-/// A `DATA_RECORD`'s whole CBOR payload is bounded at 256 KiB, and the map
-/// around the bytes costs some of it, so the largest 64 KiB multiple that
-/// fits is three groups. The sequential path keeps its own larger bound; the
-/// two paths frame differently and say so in `notes`.
+/// Largest record the ranged path accepts. Capped by the 256 KiB DATA_RECORD
+/// CBOR limit.
 const MAX_RANGED_RECORD_BYTES: usize = 3 * 65_536;
 
-/// The record size a ranged case runs at.
-///
-/// A multiple of the 64 KiB group, because ranges verify in whole groups and
-/// a record that straddled a group boundary would make every bundle's cover
-/// misaligned. Only a worker slab's final record may be short, so a short
-/// record can sit mid-object where two slabs meet.
+/// Record size for ranged cases. Must be a multiple of the group size so
+/// ranges verify in whole groups.
 fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
     let bytes = config.record_bytes;
     if bytes == 0 || bytes % vot_verifier::GROUP_SIZE != 0 || bytes > MAX_RANGED_RECORD_BYTES {
@@ -485,14 +398,8 @@ fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
     Ok(bytes)
 }
 
-/// The staging the ranged receiver needs: one in-flight range per worker,
-/// plus the verifier reservation.
-///
-/// ADR-0029: a verified range flows to the subject's sink at admission, so
-/// the receiver retains no object bytes and staging covers admissions only.
-/// Admissions serialize on the receiver today, but every worker can hold
-/// one verified range on its way in, so the limit prices that many rather
-/// than the object.
+/// Ranged receiver staging: one in-flight range per worker plus the verifier
+/// reservation.
 fn ranged_staging_limit(config: &Config) -> u64 {
     u64::try_from(config.workers)
         .unwrap_or(u64::MAX)
@@ -514,10 +421,8 @@ type BuiltSink = (
     Option<Arc<vot_scheduler::FileSink>>,
 );
 
-/// Builds the destination a ranged case's verified bytes flow to.
-///
-/// The file is created and sized before the clock starts, so the timed
-/// section pays for placing bytes, not for allocating the destination.
+/// Builds the destination for a ranged case. The file is pre-allocated
+/// before timing.
 fn sink_for(config: &Config) -> Result<BuiltSink, Error> {
     match &config.sink {
         SinkChoice::Discard => Ok((Arc::new(DiscardSink), None)),
@@ -534,13 +439,8 @@ fn sink_for(config: &Config) -> Result<BuiltSink, Error> {
     }
 }
 
-/// Names the sink in the notes and, for a file, syncs it after the clock
-/// and reports what the sync cost, so a result's durability story is
-/// explicit either way.
-///
-/// The sync goes through the handle the writes went through: a fresh
-/// handle lacks write access on Windows and opens its error window after
-/// any writeback failure on Linux, so it can neither sync nor tell.
+/// Syncs the file sink after timing and names it in the notes. Syncs through
+/// the write handle because a fresh handle lacks write access on Windows.
 fn sink_note(sink: Option<&vot_scheduler::FileSink>, notes: &mut String) -> Result<(), Error> {
     use std::fmt::Write as _;
     match sink {
@@ -557,10 +457,7 @@ fn sink_note(sink: Option<&vot_scheduler::FileSink>, notes: &mut String) -> Resu
     Ok(())
 }
 
-/// The chaining-value layer ranges are proved from, per suite.
-///
-/// ADR-0025: proving from the object costs a whole-object hash per range, so
-/// the sender streams the object once and keeps 32 bytes per 64 KiB group.
+/// Chaining-value layer ranges are proved from, per suite.
 enum ProverLayer {
     Blake3(vot_proof_blake3::GroupCvs),
     Sha256(vot_proof_sha256::PieceHashes),
@@ -699,8 +596,7 @@ impl BundleProducer {
         let mut records = Vec::new();
         let mut offset = covered_offset;
         let bundle_end = covered_offset + covered_length;
-        // Counted, not steered: the record count is fixed before the loop, so
-        // no arithmetic inside it can keep the loop alive.
+        // Record count is fixed before the loop.
         let bundle_records = covered_length.div_ceil(self.record_bytes as u64);
         for _ in 0..bundle_records {
             let take = usize::try_from((self.record_bytes as u64).min(bundle_end - offset))
@@ -757,16 +653,7 @@ impl BundleProducer {
 /// is observed at submission rather than assumed from completion.
 type RangedFrame = (Payload, u64);
 
-/// Bundles in flight on the receive side.
-///
-/// A lane delivers a bundle's header before its records, but lanes interleave
-/// between workers, so arrivals are keyed by identifier and held until the
-/// bundle's own record count is met. Bounded: per-lane order caps incomplete
-/// bundles at one per lane, so pending past the worker count is a carrier
-/// defect rather than a state to grow into.
-/// Verified ranges held between proving and admission: transport memory
-/// the receiver's own staging cannot see, reported alongside it so the
-/// note describes everything the transfer held (ADR-0029).
+/// Tracks peak bytes of verified ranges held between proving and admission.
 #[derive(Default)]
 pub(crate) struct WitnessLedger {
     held: std::sync::atomic::AtomicU64,
@@ -814,14 +701,8 @@ impl BundleReassembly {
         }
     }
 
-    /// Feeds one delivered frame, returning the bundle it completed, if any.
-    ///
-    /// The verify half is the caller's: this only reassembles, so a spine
-    /// that spreads verification across threads takes whole bundles here and
-    /// admits what its verifiers prove.
-    ///
-    /// # Errors
-    /// The same refusals as [`Self::accept`], without the receiver's.
+    /// Feeds one delivered frame, returns the completed bundle if any.
+    /// Only reassembles; verification is the caller's.
     fn take(&mut self, frame: &[u8]) -> Result<Option<PendingBundle>, Error> {
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: 0,
@@ -876,11 +757,9 @@ const fn step(mut state: u64) -> u64 {
     state
 }
 
-/// [`step`] applied `draws` times, in logarithmic time.
-///
-/// `step` is linear over GF(2): shifts and xors distribute over xor, so one
-/// draw is a 64x64 bit matrix and `draws` of them are that matrix raised to a
-/// power, by square and multiply. At most 64 squarings whatever the count.
+/// [`step`] applied `draws` times, in logarithmic time. `step` is linear over
+/// GF(2), so one draw is a 64x64 bit matrix and `draws` draws are that matrix
+/// raised to a power.
 fn advance(state: u64, draws: u64) -> u64 {
     // Columns: matrix[i] is the map applied to the basis state 1 << i.
     let mut matrix = [0_u64; 64];
@@ -889,8 +768,7 @@ fn advance(state: u64, draws: u64) -> u64 {
     }
     let mut result = state;
     let mut remaining = draws;
-    // One pass per bit of the count, counted rather than steered, so no
-    // mutation of the body can keep the loop alive.
+    // Square-and-multiply over the 64 bits of the count.
     for _ in 0..u64::BITS {
         if remaining & 1 == 1 {
             result = apply(&matrix, result);
@@ -921,10 +799,7 @@ fn square(matrix: &[u64; 64]) -> [u64; 64] {
     out
 }
 
-/// The record schedule for an object: full records, then a short final one.
-///
-/// Returning the schedule up front makes every loop over the object bounded by
-/// construction.
+/// Record schedule for an object: full records, then a short final one.
 fn record_lengths(
     object_bytes: u64,
     record_bytes: usize,
@@ -946,11 +821,7 @@ fn record_lengths(
     Ok(std::iter::repeat_n(record_bytes, full).chain((tail != 0).then_some(tail)))
 }
 
-/// Computes the subject identity by streaming the generated object once.
-///
-/// This runs before the timed section: a receiver is given an identity it did
-/// not derive from the bytes it is about to accept, exactly as a real transfer
-/// learns it from a package descriptor.
+/// Computes the subject identity by streaming the object once. Runs before timing.
 fn subject_of(config: &Config) -> Result<SubjectId, Error> {
     let mut verifier = StreamVerifier::new(config.suite);
     let mut source = ObjectSource::new(config.seed);
@@ -970,14 +841,7 @@ fn subject_of(config: &Config) -> Result<SubjectId, Error> {
 }
 
 /// User and system CPU time this process has spent, in nanoseconds.
-///
-/// `None` where the platform exposes no source, which is reported as unmeasured
-/// rather than as zero.
-///
-/// Worth having because throughput alone does not say where the time went. A
-/// carrier that is slower because it makes more syscalls and one that is slower
-/// because it hashes more look identical in bytes per second and are told apart
-/// at a glance by this split.
+/// `None` on platforms without a source.
 #[must_use]
 pub fn cpu_times_ns() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
@@ -990,12 +854,8 @@ pub fn cpu_times_ns() -> Option<(u64, u64)> {
     }
 }
 
-/// Extracts user and system CPU time from `/proc/self/stat`, in nanoseconds.
-///
-/// Fields are counted from the last `)` rather than from the start, because the
-/// second field is the executable name and may itself contain spaces and
-/// parentheses. Splitting the whole line on whitespace reads the wrong fields
-/// for any process whose name has a space in it.
+/// Extracts CPU time from `/proc/self/stat`. Fields are counted from the
+/// last `)` because the name field may contain spaces and parentheses.
 #[must_use]
 pub fn parse_cpu_times(stat: &str) -> Option<(u64, u64)> {
     // `/proc` reports these in USER_HZ, which is 100 on Linux regardless of the
@@ -1050,12 +910,8 @@ pub fn parse_vm_hwm(status: &str) -> Option<u64> {
     }
 }
 
-/// Builds the receiver for a case.
-///
-/// The staging limit is the bandwidth-delay product, floored so a submission
-/// batch always fits and raised by the per-object verifier reservation. That
-/// makes the impairment file decide the receiver's window instead of leaving it
-/// to an arbitrary constant.
+/// Builds the receiver for a case. Staging is the bandwidth-delay product,
+/// floored at a batch and raised by the verifier reservation.
 fn receiver_for(config: &Config) -> Result<ReliableReceiver, Error> {
     let batch = (config.record_bytes as u64).saturating_mul(SUBMIT_BATCH_RECORDS as u64);
     let window = config.bandwidth_delay_bytes().max(batch);
@@ -1102,17 +958,8 @@ fn simulator_impairment(config: &Config) -> Result<(Impairment, Vec<&'static str
     ))
 }
 
-/// Times generating the object and nothing else.
-///
-/// The transfer generates each record inside the timed section, because
-/// materialising the object first would put the fixture into the high-water
-/// mark that is supposed to describe transport and verification. That makes
-/// generation part of `elapsed_ns`, so its cost is measured separately and
-/// reported. A reader can subtract it; the driver does not subtract it for
-/// them and call the difference a transport number.
-///
-/// # Errors
-/// Propagates an invalid record schedule.
+/// Times generating the object. Generation runs inside the timed section and
+/// is reported separately so it can be subtracted.
 fn generator_nanos(config: &Config) -> Result<u64, Error> {
     let mut source = ObjectSource::new(config.seed);
     let mut record = Vec::with_capacity(config.record_bytes);
@@ -1124,12 +971,7 @@ fn generator_nanos(config: &Config) -> Result<u64, Error> {
     Ok(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// What the transfer loop needs from a carrier, whether it loops back inside
-/// this process or crosses a socket to another endpoint.
-///
-/// The methods are plumbing on purpose. Everything that decides a number lives
-/// in this file, where the mutation gate measures it, so a backend cannot
-/// quietly change what a run means by implementing one of these differently.
+/// What the transfer loop needs from a carrier, whether loopback or over a socket.
 trait Carrier {
     /// How the report names this carrier.
     fn name(&self) -> &'static str;
@@ -1144,9 +986,6 @@ trait Carrier {
     }
 
     /// The endpoint whose inbound bound the case's credit applies to.
-    ///
-    /// The receiving endpoint is the peer on a real carrier and the same object
-    /// on the simulator, so it is named rather than assumed.
     fn receiving(&mut self) -> &mut dyn TransportAdapter;
 
     /// Submits one framed record on the transfer lane.
@@ -1174,27 +1013,13 @@ trait Carrier {
     /// inbound bound the ceiling instead of the carrier.
     fn drain_sent(&mut self);
 
-    /// Waits for the receiving endpoint to have something, at most `bound`.
-    ///
-    /// Costs real time whether or not anything arrives, so a loop counting
-    /// rounds still bounds its wall clock. A backend with a wakeup signal
-    /// returns as soon as an event lands, which removes the driver's polling
-    /// interval from what a run measures; one without a signal sleeps the
-    /// bound out, which is exactly the wait this replaced.
+    /// Waits for the receiving endpoint, at most `bound`. Costs real time so
+    /// round-counting loops still bound wall clock.
     fn wait(&mut self, bound: Duration);
 }
 
-/// The object bytes inside a delivered record frame.
-///
-/// A lane carries `DATA_RECORD` frames, and a carrier hands back the whole
-/// frame it was given, envelope included. The receiver verifies object bytes,
-/// so the envelope comes off here. Anything that is not exactly the one frame
-/// that was submitted came back changed, which is a carrier defect rather than
-/// a measurement.
-///
-/// # Errors
-/// Reports [`Error::Corrupt`] for a frame that does not decode, is not a data
-/// record, or does not account for the whole delivery.
+/// Strips the envelope from a delivered DATA_RECORD frame. Anything that is
+/// not exactly one submitted frame is corruption.
 fn record_payload(frame: &[u8]) -> Result<&[u8], Error> {
     let limits = vot_codec::DecodeLimits {
         max_unknown_payload: 0,
@@ -1210,11 +1035,8 @@ fn record_payload(frame: &[u8]) -> Result<&[u8], Error> {
     }
 }
 
-/// Flushes submitted records and feeds every delivered one to the receiver.
-///
-/// Returns the object bytes delivered, which is what tells a caller whether the
-/// carrier is still making progress. It is not the same as the bytes the
-/// carrier moved: the envelope is not part of the object.
+/// Flushes and delivers to the receiver. Returns object bytes delivered
+/// (excludes envelope).
 fn deliver<C: Carrier>(
     carrier: &mut C,
     receiver: &mut ReliableReceiver,
@@ -1240,19 +1062,8 @@ fn deliver<C: Carrier>(
     Ok(delivered)
 }
 
-/// Delivers once, and waits if that moved nothing.
-///
-/// The carrier's own thread is what makes progress, so a caller that found
-/// nothing has nothing to do until that thread has run. Waiting rather than
-/// spinning matters here more than it usually would: a benchmark that burns a
-/// core polling takes it from the carrier it is measuring.
-///
-/// The waits are counted, which is worth reporting. A transfer that spent most
-/// of its deliveries finding nothing was waiting on the carrier, and one that
-/// never waited was never ahead of it.
-///
-/// # Errors
-/// Propagates delivery failures.
+/// Delivers once, waits if nothing moved. Waiting avoids competing with the
+/// carrier thread for CPU.
 fn deliver_or_wait<C: Carrier>(
     carrier: &mut C,
     receiver: &mut ReliableReceiver,
@@ -1267,18 +1078,8 @@ fn deliver_or_wait<C: Carrier>(
     Ok(progress)
 }
 
-/// How long to wait once this transfer has had `idle_waits` deliveries that
-/// moved nothing.
-///
-/// Doubling from [`IDLE_WAIT_MIN`], and never past [`IDLE_WAIT_MAX`].
-///
-/// The count is the transfer's total rather than a run of them, so the wait
-/// climbs once and stays. Backing off from a run instead was measured and is
-/// worse on both counts: deliveries that do find data reset it, this workload
-/// arrives in bursts, and the driver spends the transfer in the short waits
-/// that measure a slower and noisier carrier. It also leaves the wait free to
-/// stay short for an unbounded number of deliveries, which is the only reason
-/// the loops' round budget would need a wall clock to go with it.
+/// Idle wait for `idle_waits` total empty deliveries. Doubling from
+/// [`IDLE_WAIT_MIN`], capped at [`IDLE_WAIT_MAX`].
 fn idle_wait(idle_waits: u64) -> Duration {
     let doublings = u32::try_from(idle_waits.saturating_sub(1))
         .unwrap_or(IDLE_WAIT_DOUBLINGS)
@@ -1288,13 +1089,7 @@ fn idle_wait(idle_waits: u64) -> Duration {
         .min(IDLE_WAIT_MAX)
 }
 
-/// What one transfer spent, beyond the bytes it moved.
-///
-/// Every field is observed rather than derived, and each answers a question a
-/// reader of the result would otherwise have to guess at: how often the driver
-/// deliberately handed records over, how often the carrier refused one, how
-/// often the driver had nothing to do but wait, and how much more than the
-/// object went onto the wire.
+/// Per-transfer counters beyond bytes moved. All observed, not derived.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Tally {
     flushes: u64,
@@ -1310,10 +1105,7 @@ struct Tally {
 }
 
 impl Tally {
-    /// Folds another tally's counters in; CPU stays the caller's to set,
-    /// because it is a process total rather than a per-thread one. The rails
-    /// in the role module are its only caller, but it compiles everywhere so
-    /// the featureless mutation gate measures it.
+    /// Folds another tally's counters in. CPU is set by the caller, not merged.
     #[cfg_attr(not(any(feature = "msquic", feature = "quiche")), allow(dead_code))]
     pub(crate) fn merge(&mut self, other: &Self) {
         self.flushes = self.flushes.saturating_add(other.flushes);
@@ -1381,19 +1173,8 @@ fn transfer_notes(
     notes
 }
 
-/// The deliveries a transfer may make in a loop whose end depends on the
-/// carrier, before that carrier is called stopped.
-///
-/// One per record, because a healthy transfer may need that many, plus a flat
-/// allowance for the deliveries that find nothing while the carrier is still
-/// moving bytes. At [`IDLE_WAIT`] each, the allowance is a couple of minutes of
-/// a carrier delivering nothing, which no case on any path this benchmark runs
-/// reaches while healthy.
-///
-/// The budget is spent and counted by the loops themselves rather than by
-/// anything they call. A loop whose bound lives somewhere else is not bounded:
-/// whatever removes the bound leaves a benchmark that hangs, which is worse
-/// than one that fails.
+/// Delivery rounds a transfer may make before a carrier is called stopped.
+/// Per-record plus a flat floor.
 fn round_budget(config: &Config) -> u64 {
     let records = config
         .object_bytes
@@ -1418,19 +1199,9 @@ impl Credit {
     }
 }
 
-/// Applies the receiver's credit to the endpoint that will enforce it.
-///
-/// A carrier that fixes its inbound bound at construction reports
-/// `Unsupported` rather than accepting a credit it would not apply, which
-/// ADR-0024 requires of the quiche backend: accepting the call and doing
-/// nothing would let an endpoint advertise a credit no carrier enforces. Which
-/// of the two happened is recorded, because the report must never present a
-/// bound nothing applied. `credit_bytes` means the same thing either way: what
-/// the receiver advertised, which the receiver itself enforces by refusing
-/// staging beyond it.
-///
-/// # Errors
-/// Propagates any error other than `Unsupported`.
+/// Applies the receiver's credit to the endpoint. A carrier that fixes its
+/// bound at construction reports `Unsupported`; the report records which
+/// happened.
 fn enforced_credit(endpoint: &mut dyn TransportAdapter, credit: u64) -> Result<Credit, Error> {
     match endpoint.set_receive_credit(credit) {
         Ok(()) => Ok(Credit::Set),
@@ -1515,9 +1286,7 @@ pub fn measure(config: &Config) -> Result<Measurement, Error> {
 }
 
 fn measure_case(config: &Config) -> Result<Measurement, Error> {
-    // One worker keeps the sequential path every landed number was taken on;
-    // more run the ranged path, where workers carry disjoint proof-bearing
-    // ranges of the one object (ADR-0025).
+    // One worker is the sequential path; more run the ranged path.
     if config.workers == 1 {
         return match config.backend.as_str() {
             "simulator" => transfer(config, SimulatorCarrier::new(config)?),
@@ -1564,16 +1333,7 @@ fn measure_case(config: &Config) -> Result<Measurement, Error> {
     }
 }
 
-/// Carries one object over `carrier` and returns what was measured.
-///
-/// Every backend runs this same loop, so a difference between two results is a
-/// difference between two carriers rather than between two transfer
-/// strategies. The carrier is already connected: a handshake inside the timed
-/// section would be reported as transfer time.
-///
-/// # Errors
-/// Propagates transport, receive, and verification failures, and reports a
-/// carrier that stopped delivering rather than returning a partial transfer.
+/// Carries one object over `carrier`. Carrier must already be connected.
 fn transfer<C: Carrier>(config: &Config, carrier: C) -> Result<Measurement, Error> {
     transfer_within(config, carrier, round_budget(config))
 }
@@ -1611,10 +1371,7 @@ fn transfer_within<C: Carrier>(
         frame.clear();
         vot_codec::encode_frame(vot_codec::frame_type::DATA_RECORD, &record, &mut frame)
             .map_err(|_| Error::Value("VOT_BENCH_RECORD_BYTES"))?;
-        // Shared once. The submission contract takes a shared payload precisely
-        // so a record crosses into the backend without being copied again, and
-        // a driver that copied every record would measure itself as much as the
-        // carrier.
+        // Shared once so the record crosses into the backend without another copy.
         let shared = shared_payload(&frame);
         loop {
             match carrier.submit(TRANSFER_LANE, &shared) {
@@ -1623,10 +1380,7 @@ fn transfer_within<C: Carrier>(
                 // submitted has to move before more will fit. Delivering is
                 // what makes room, so the record is offered again after it.
                 Err(vot_transport_api::Error::OutboundQueueFull) => {
-                    // This loop ends only when the carrier takes the record, so
-                    // it keeps its own bound. Spending it here rather than
-                    // inside what it calls is what makes the loop bounded
-                    // whatever that call does.
+                    // This loop spends the budget here, not in what it calls.
                     rounds = rounds.saturating_add(1);
                     if rounds > budget {
                         return Err(Error::Stalled);
@@ -1659,11 +1413,7 @@ fn transfer_within<C: Carrier>(
         delivered = delivered.saturating_add(deliver(&mut carrier, &mut receiver, subject)?);
     }
 
-    // Every record has been submitted, so whatever has not arrived is in
-    // flight. A carrier that delivers immediately leaves this loop without
-    // entering it; one that crosses a socket stays here until the object is
-    // whole. The budget is what ends it either way, so a slow path is waited
-    // out and a stopped one is an error rather than a partial result.
+    // Completion loop: whatever is not yet arrived is in flight. The budget bounds it.
     while delivered < config.object_bytes {
         rounds = rounds.saturating_add(1);
         if rounds > budget {
@@ -1701,18 +1451,8 @@ fn transfer_within<C: Carrier>(
     })
 }
 
-/// Carries one object as proof-bearing ranges over one or more carriers.
-///
-/// W producer threads generate, prove, and frame disjoint slabs; this thread,
-/// the spine, is the only one that touches a carrier: it submits, flushes,
-/// polls, and verifies. The loop is byte-identical whether the carriers are
-/// one connection with a lane per worker or one connection per worker, so the
-/// only difference between those cases is the connection count, which is what
-/// the spine hypothesis asks about.
-///
-/// # Errors
-/// Propagates transport, proving, and verification failures, and reports a
-/// carrier that stopped rather than returning a partial transfer.
+/// Carries one object as proof-bearing ranges. Producer threads generate and
+/// frame; the spine thread submits, flushes, polls, and verifies.
 fn transfer_ranged<C: Carrier>(
     config: &Config,
     carriers: Vec<C>,
@@ -1772,10 +1512,8 @@ fn transfer_ranged_into<C: Carrier>(
     let mut tally = Tally::default();
     let mut bytes_sent = 0_u64;
     let mut delivered = 0_u64;
-    // Placement runs beside the spine, not on it: the spine reassembles and
-    // hands whole bundles over, and a pool the width of the workers proves,
-    // places, and admits them, so a slow sink prices the pool rather than
-    // the poll loop (ADR-0029's write-first order, the loopback half).
+    // Placement runs beside the spine: a pool proves, places, and admits
+    // whole bundles, so a slow sink prices the pool not the poll loop.
     let receiver = std::sync::Mutex::new(receiver);
     let witnesses = WitnessLedger::default();
     let (place, placements) = mpsc::sync_channel::<PendingBundle>(workers.saturating_mul(2));
@@ -1855,8 +1593,7 @@ fn transfer_ranged_into<C: Carrier>(
         let mut queued: Vec<VecDeque<RangedFrame>> =
             (0..workers).map(|_| VecDeque::new()).collect();
         'transfer: while delivered < config.object_bytes {
-            // Spent here rather than in anything the loop calls, which is what
-            // keeps the loop bounded whatever those calls do.
+            // Budget spent in the loop body, not in what it calls.
             tally.rounds = tally.rounds.saturating_add(1);
             if tally.rounds > budget {
                 return Err(Error::Stalled);
@@ -2025,11 +1762,8 @@ fn ranged_notes(
     notes
 }
 
-/// Turns a raw counter reading into what the report says, the way perf does:
-/// a counter multiplexed off part of the time is scaled by enabled over
-/// running, and one that never ran is unmeasured rather than zero. The
-/// running share comes back with the count so the notes can disclose a
-/// scaled figure instead of passing an estimate off as a plain one.
+/// Scales a raw counter reading like perf: multiplexed counters are scaled
+/// by enabled/running time, never-run counters are unmeasured.
 pub(crate) fn settle_cycles(reading: Option<cycles::CycleReading>) -> Option<(u64, u64)> {
     let reading = reading?;
     if reading.time_running == 0 {
@@ -2045,9 +1779,7 @@ pub(crate) fn settle_cycles(reading: Option<cycles::CycleReading>) -> Option<(u6
     Some((count, pct.min(100)))
 }
 
-/// Renders the settled count into the notes: the count, unmeasured where the
-/// host refused a counter so a reader never mistakes a null for a zero, and
-/// the running share whenever the count is a scaled figure.
+/// Appends the settled cycle count to the notes.
 pub(crate) fn note_cycles(notes: &mut String, settled: Option<(u64, u64)>) {
     notes.push_str(";cycles=");
     match settled {
@@ -2062,15 +1794,11 @@ pub(crate) fn note_cycles(notes: &mut String, settled: Option<(u64, u64)>) {
     }
 }
 
-/// A mutant that breaks a loop's progress check can turn an allocating loop
-/// into a machine-eater; one reached 96 GiB and the OOM kill took the whole
-/// terminal session with it. Aborting at a cap makes that mutant caught.
+/// Memory cap watchdog. Aborts the test binary if resident memory exceeds a limit.
 #[cfg(test)]
 mod test_guard {
     use std::sync::Once;
 
-    /// Far above any honest test, and low enough that two capped binaries
-    /// and their builds fit a CI runner's 16 GiB together.
     const CAP_BYTES: u64 = 2 << 30;
 
     static ARM: Once = Once::new();
@@ -2091,8 +1819,7 @@ mod test_guard {
         });
     }
 
-    /// Linux is where these tests and the mutation gates run; without procfs
-    /// there is no watchdog rather than a false abort.
+    /// Returns resident bytes from procfs. None on non-Linux.
     fn resident_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
         let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
@@ -2171,16 +1898,8 @@ mod tests {
         }
     }
 
-    /// A carrier that behaves the way one crossing a socket does: a submission
-    /// can be refused, delivery can lag behind submission or stop altogether,
-    /// and the credit call can be answered any of the ways a backend answers
-    /// it.
-    ///
-    /// The simulator does none of those things. It accepts every submission and
-    /// delivers before `flush` returns, so without this double the backpressure,
-    /// completion, stall, and credit paths would be exercised only under a
-    /// feature the mutation matrix does not build, and the gate would report
-    /// them as untested code in a required package.
+    /// Test carrier that can refuse, lag, stall, and corrupt, unlike the
+    /// simulator which does none of those.
     struct TestCarrier {
         /// Frames submitted and not yet released, with the lane each took, so
         /// delivery echoes the lane and a test can pin worker routing.
@@ -2345,10 +2064,6 @@ mod tests {
 
     #[test]
     fn a_refusing_sink_fails_the_ranged_transfer_instead_of_hanging_it() {
-        // Every placer dies within a few bundles when the sink refuses, and
-        // the spine must come back with the pool's verdict rather than park
-        // on the full handoff channel. Written against the pre-fix pool
-        // this test hangs, which is what it pins.
         struct RefusingSink;
         impl vot_scheduler::RangeSink for RefusingSink {
             fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
@@ -2359,9 +2074,6 @@ mod tests {
         let carriers = vec![SimulatorCarrier::new(&config).unwrap()];
         let refusing: std::sync::Arc<dyn vot_scheduler::RangeSink> =
             std::sync::Arc::new(RefusingSink);
-        // A finite rounds budget, so a transfer that stops progressing for
-        // any reason stalls out inside the test rather than spinning: the
-        // refusal itself needs only a handful of rounds.
         let outcome = super::transfer_ranged_into(&config, carriers, 5_000, &refusing, None);
         assert!(
             matches!(outcome, Err(Error::Receive(vot_scheduler::Error::Sink))),
@@ -2384,7 +2096,6 @@ mod tests {
 
     #[test]
     fn the_sink_variable_selects_the_destination() {
-        // Absent or empty is the ram destination every landed number used.
         assert_eq!(parse(&environment()).unwrap().sink, SinkChoice::Discard);
         assert_eq!(
             parse_with("VOT_BENCH_SINK_FILE", "").unwrap().sink,
@@ -2400,8 +2111,6 @@ mod tests {
             parse(&ranged).unwrap().sink,
             SinkChoice::File(std::path::PathBuf::from("/tmp/object.bin"))
         );
-        // The sequential path has no sink, so one worker with a file is
-        // refused rather than silently measured as ram-to-ram.
         assert!(matches!(
             parse_with("VOT_BENCH_SINK_FILE", "/tmp/object.bin"),
             Err(Error::Value("VOT_BENCH_SINK_FILE"))
@@ -2410,9 +2119,6 @@ mod tests {
 
     #[test]
     fn a_ranged_case_lands_the_verified_object_in_the_sink_file() {
-        // The whole path end to end: generated, framed, carried, proved,
-        // admitted, placed. The file must be the object, byte for byte, and
-        // the notes must label the destination and its sync cost.
         let path = std::env::temp_dir().join(format!("vot-bench-sink-{}.bin", std::process::id()));
         let object_bytes = 7 * 65_536 + 17;
         let mut config = ranged_case(object_bytes, 2, Suite::Blake3Bao64);
@@ -2430,10 +2136,6 @@ mod tests {
 
     #[test]
     fn a_ranged_case_verifies_over_the_simulator_for_both_suites() {
-        // Ragged on both edges: a short final record and a short final group,
-        // split across workers whose slabs do not divide evenly. Delivery is
-        // what the case asserts; the object arriving at all proves the frames,
-        // the proofs, and the mid-object sources all agree.
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
             for workers in [2_usize, 4] {
                 let object_bytes = 7 * 65_536 + 17;
@@ -2442,21 +2144,11 @@ mod tests {
                 assert_eq!(measured.bytes_sent, object_bytes);
                 assert_eq!(note_field_text(&measured.notes, "path"), "ranged");
                 assert_eq!(note_field(&measured.notes, "workers"), workers as u64);
-                // The envelope, the CBOR map, and the proof are all on the
-                // wire and none of them is the object.
                 assert!(note_field(&measured.notes, "wire_bytes") > object_bytes);
-                // One shared carrier is not the provisioned arrangement.
                 assert!(!measured.notes.contains(";rails="));
-                // Counted or refused, the field is always named.
                 assert!(measured.notes.contains(";cycles="));
-                // The destination is always labelled, discard included.
                 assert!(measured.notes.contains(";sink=discard"));
-                // The pool held at least one witness on its way in.
                 assert!(note_field(&measured.notes, "witness_peak_bytes") > 0);
-                // With placement pooled, receiver staging is the verifier
-                // reservation alone; the in-flight bytes are the witness
-                // field's. Pinned so the field's meaning cannot drift again
-                // unnoticed.
                 assert_eq!(note_field(&measured.notes, "staging_peak_bytes"), 65_536);
             }
         }
@@ -2482,29 +2174,20 @@ mod tests {
             time_enabled,
             time_running,
         };
-        // Fully scheduled is the count as read.
         assert_eq!(
             super::settle_cycles(Some(reading(80, 40, 40))),
             Some((80, 100))
         );
-        // Half scheduled doubles, and the share is disclosed.
         assert_eq!(
             super::settle_cycles(Some(reading(80, 40, 20))),
             Some((160, 50))
         );
-        // Never scheduled is unmeasured, not zero.
         assert_eq!(super::settle_cycles(Some(reading(80, 40, 0))), None);
-        // No reading is no count.
         assert_eq!(super::settle_cycles(None), None);
     }
 
     #[test]
     fn a_ranged_transfer_spends_its_whole_budget_before_stalling() {
-        // Worker threads make rounds-to-completion timing-dependent, so the
-        // edge is pinned from the stalling side, which is exact: a carrier
-        // that refuses every submission makes every round idle, five budgeted
-        // rounds wait five times, and the sixth check is the stall. A bound
-        // that fired one round early would wait one time fewer.
         let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
         let mut carrier = TestCarrier::new();
         carrier.refuse = usize::MAX;
@@ -2527,7 +2210,6 @@ mod tests {
             parse_with("VOT_BENCH_RAILS", "braided"),
             Err(Error::Value("VOT_BENCH_RAILS"))
         ));
-        // Provisioned rails need workers to provision for.
         let mut variables = environment();
         variables.insert("VOT_BENCH_RAILS".to_owned(), "provisioned".to_owned());
         assert!(matches!(
@@ -2536,8 +2218,6 @@ mod tests {
         ));
         variables.insert("VOT_BENCH_WORKERS".to_owned(), "2".to_owned());
         assert_eq!(parse(&variables).unwrap().rails, Rails::Provisioned);
-        // Junk at a worker count that could provision, so the rejection is
-        // the spelling's and not the one-worker rule's.
         variables.insert("VOT_BENCH_RAILS".to_owned(), "braided".to_owned());
         assert!(matches!(
             parse(&variables),
@@ -2547,8 +2227,6 @@ mod tests {
 
     #[test]
     fn a_provisioned_case_reaches_measure_with_a_rail_per_worker() {
-        // Through measure() rather than transfer_ranged directly, so the
-        // carrier construction itself is what the test pins.
         let mut config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
         config.rails = Rails::Provisioned;
         let measured = measure(&config).unwrap();
@@ -2566,10 +2244,7 @@ mod tests {
         let measured = transfer_ranged(&config, vec![first, second], TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, 4 * 65_536);
         assert!(measured.notes.contains(";rails=provisioned-multi-rail"));
-        // The test double models everything, so the note must not claim
-        // otherwise.
         assert!(!measured.notes.contains("unmodelled_impairment"));
-        // Each worker rides the transfer lane of a rail of its own.
         for lanes in [first_lanes, second_lanes] {
             let seen: std::collections::BTreeSet<StreamId> =
                 lanes.lock().unwrap().iter().copied().collect();
@@ -2579,20 +2254,14 @@ mod tests {
 
     #[test]
     fn a_ranged_transfer_reports_every_bundle_it_verified() {
-        // 7 groups over 2 workers is slabs of 4 and 3 groups; at one-group
-        // records and 16-record bundles that is one bundle each. The exact
-        // count pins the schedule, not just its total.
         let measured = measure(&ranged_case(7 * 65_536, 2, Suite::Blake3Bao64)).unwrap();
         assert_eq!(note_field(&measured.notes, "bundles"), 2);
-        // 40 groups over 2 workers: 20 groups each is two bundles each.
         let measured = measure(&ranged_case(40 * 65_536, 2, Suite::Blake3Bao64)).unwrap();
         assert_eq!(note_field(&measured.notes, "bundles"), 4);
     }
 
     #[test]
     fn a_prover_refuses_a_cover_wider_than_the_request() {
-        // A group-unaligned length keeps the offset exact while the cover
-        // widens; the widened cover must be refused, not returned.
         let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
         let (_, layer) = super::prover_layer_and_subject(&config).unwrap();
         assert!(super::prove_range(&layer, 0, 100).is_err());
@@ -2606,9 +2275,6 @@ mod tests {
         let measured = measure(&config).unwrap();
         assert_eq!(measured.verified_bytes, 6 * 65_536);
 
-        // The one-connection case puts each worker on its own lane; a
-        // transfer that serialized every worker onto one lane would measure
-        // the driver's queue, not the connection's spine.
         let carrier = TestCarrier::new();
         let lanes = std::sync::Arc::clone(&carrier.lanes);
         let config = ranged_case(4 * 65_536, 2, Suite::Blake3Bao64);
@@ -2623,7 +2289,6 @@ mod tests {
 
     #[test]
     fn ranged_backpressure_lag_and_stall_keep_the_sequential_verdicts() {
-        // A refusal is backpressure and costs rounds, not the transfer.
         let mut carrier = TestCarrier::new();
         carrier.refuse = 4;
         let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
@@ -2631,13 +2296,11 @@ mod tests {
         assert_eq!(measured.verified_bytes, 2 * 65_536);
         assert!(note_field(&measured.notes, "backpressure_waits") != 0);
 
-        // Late delivery is waited out.
         let mut late = TestCarrier::new();
         late.lag = 3;
         let measured = transfer_ranged(&config, vec![late], TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, 2 * 65_536);
 
-        // A carrier that stops is stalled, never a partial number.
         let mut dead = TestCarrier::new();
         dead.stalled = true;
         assert!(matches!(
@@ -2645,7 +2308,6 @@ mod tests {
             Err(Error::Stalled)
         ));
 
-        // A disconnect is its own verdict.
         let mut gone = TestCarrier::new();
         gone.disconnect = true;
         assert!(matches!(
@@ -2653,7 +2315,6 @@ mod tests {
             Err(Error::Disconnected)
         ));
 
-        // A changed frame is corruption, found at decode rather than trusted.
         let mut lying = TestCarrier::new();
         lying.corrupt = true;
         assert!(matches!(
@@ -2664,7 +2325,6 @@ mod tests {
 
     #[test]
     fn the_ranged_paths_carrier_count_must_fit_its_workers() {
-        // Two carriers for three workers is neither one shared nor one each.
         let config = ranged_case(6 * 65_536, 3, Suite::Blake3Bao64);
         let carriers = vec![TestCarrier::new(), TestCarrier::new()];
         assert!(matches!(
@@ -2692,10 +2352,6 @@ mod tests {
 
     #[test]
     fn ranged_staging_prices_admissions_not_the_object() {
-        // ADR-0029: the receiver never retains the object, so the limit is
-        // one in-flight range per worker plus the verifier reservation,
-        // exactly. Pinned by value because nothing else observes an
-        // over-generous limit.
         let config = ranged_case(7 * 65_536 + 17, 2, Suite::Blake3Bao64);
         assert_eq!(
             super::ranged_staging_limit(&config),
@@ -2713,10 +2369,6 @@ mod tests {
 
     #[test]
     fn a_source_started_mid_object_continues_the_same_object() {
-        // A range worker's bytes must be the sequential object's bytes at that
-        // offset, or worker count would change the object and no two runs
-        // would be comparable. Checked word for word against the sequential
-        // source across seeds and offsets, including zero.
         for seed in [0, 42, u64::MAX] {
             let mut reference = ObjectSource::new(seed);
             let words: Vec<u64> = (0..40_960).map(|_| reference.draw()).collect();
@@ -2736,19 +2388,12 @@ mod tests {
 
     #[test]
     fn a_jump_composes_and_a_misaligned_one_is_refused() {
-        // Composition is what pins the high bits of the exponent: two jumps
-        // must land where one jump of their sum does, at counts far past what
-        // a sequential check can reach.
         for (first, second) in [(1_u64 << 33, 1_u64 << 21), (12_345, 67_890_123)] {
             let one = super::advance(42, first.wrapping_add(second));
             let two = super::advance(super::advance(42, first), second);
             assert_eq!(one, two);
         }
-        // Zero draws is the identity, which square-and-multiply must not
-        // disturb.
         assert_eq!(super::advance(97, 0), 97);
-        // A misaligned byte offset would generate a different object than the
-        // sequential path, so it is an error rather than a rounding.
         assert!(ObjectSource::at(42, 3).is_err());
     }
 
@@ -2772,8 +2417,6 @@ mod tests {
             }
             assert_eq!(expected_offset, object_bytes, "slabs cover the object");
         }
-        // The leading workers take the remainder groups, one each, so the
-        // exact split is pinned rather than only its total.
         let ranges = super::worker_ranges(7 * 65_536, 3).unwrap();
         let bytes: Vec<u64> = ranges.iter().map(|range| range.bytes).collect();
         assert_eq!(bytes, vec![3 * 65_536, 2 * 65_536, 2 * 65_536]);
@@ -2789,40 +2432,25 @@ mod tests {
             super::worker_ranges(65_536, 0),
             Err(Error::Unsupported(_))
         ));
-        // One group, one worker is the smallest honest case.
         assert!(super::worker_ranges(1, 1).is_ok());
     }
 
     #[test]
     fn the_wait_backs_off_from_the_short_end_and_stops_at_the_long_one() {
-        // The first wait is the shortest, so a small object is not padded by a
-        // millisecond it did not need, and the last is the longest, so a long
-        // transfer reaches the interval where the driver is out of the
-        // carrier's way. Both ends are pinned because the measured throughput
-        // of every carrier depends on them.
         assert_eq!(super::idle_wait(1), super::IDLE_WAIT_MIN);
         assert_eq!(super::idle_wait(2), super::IDLE_WAIT_MIN * 2);
         assert_eq!(
             super::idle_wait(1 + u64::from(super::IDLE_WAIT_DOUBLINGS)),
             super::IDLE_WAIT_MAX
         );
-        // Past the last doubling it stays there rather than growing, including
-        // at a count no transfer reaches. The wait is what bounds how long the
-        // round budget can take, so it must have a ceiling at every input.
         for waits in [2 + u64::from(super::IDLE_WAIT_DOUBLINGS), 1_000, u64::MAX] {
             assert_eq!(super::idle_wait(waits), super::IDLE_WAIT_MAX);
         }
-        // A count of zero never reaches the wait, but it must not be longer
-        // than the first one if it ever does.
         assert_eq!(super::idle_wait(0), super::IDLE_WAIT_MIN);
     }
 
     #[test]
     fn idle_deliveries_wait_on_the_carrier_at_the_backed_off_bound() {
-        // The wait goes through the carrier, where a backend with a wakeup
-        // signal can end it early, and each bound follows the backoff. A
-        // driver that slept on its own instead would reintroduce the polling
-        // interval as a property of every published number.
         let mut carrier = TestCarrier::new();
         carrier.lag = 3;
         let waited = std::sync::Arc::clone(&carrier.waited);
@@ -2836,10 +2464,6 @@ mod tests {
 
     #[test]
     fn the_simulator_wait_costs_the_bound() {
-        // The simulator never has anything to signal, so its wait must cost
-        // real time: it is what bounds the round budget's wall clock when a
-        // transfer is stalled, and a free wait would turn that budget into a
-        // spin.
         let mut carrier = SimulatorCarrier::new(&case(65_536, Suite::Blake3Bao64)).unwrap();
         let bound = std::time::Duration::from_millis(30);
         let started = std::time::Instant::now();
@@ -2849,29 +2473,16 @@ mod tests {
 
     #[test]
     fn the_wait_does_not_start_over_when_a_delivery_moves_something() {
-        // The count is the transfer's total, so a burst of records does not put
-        // the driver back into the short waits that measure a slower carrier.
-        // A carrier that lags, delivers, and lags again is still waited on at
-        // the interval the transfer has reached.
         let mut carrier = TestCarrier::new();
         carrier.lag = 3;
         let config = case(2 * 65_536, Suite::Blake3Bao64);
         let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
         assert_eq!(measured.verified_bytes, 2 * 65_536);
-        // Three lagging deliveries: the batch flush that closes the submission
-        // loop takes the first and is not a wait, and the completion loop takes
-        // the other two before the records are released. Exact rather than a
-        // floor, because the count is what chooses every wait's length.
         assert_eq!(note_field(&measured.notes, "idle_waits"), 2);
     }
 
     #[test]
     fn a_backpressured_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
-        // The submission loop keeps its own bound, so its edge has to be pinned
-        // separately from the completion loop's. Four refusals need four
-        // rounds: a budget of four is exactly enough and three is exactly too
-        // little. A bound that fired one round early would fail a transfer
-        // whose carrier was applying backpressure rather than stopping.
         let config = case(65_536, Suite::Blake3Bao64);
         let mut carrier = TestCarrier::new();
         carrier.refuse = 4;
@@ -2889,35 +2500,20 @@ mod tests {
 
     #[test]
     fn the_budget_is_per_record_above_its_floor_and_the_floor_below_it() {
-        // What a real run is given, which no test that names its own budget
-        // exercises. Too small a budget calls a healthy carrier stopped, and
-        // too large a one makes a stopped carrier take as long to report as a
-        // gigabyte takes to carry.
         let config = case(64 * 65_536, Suite::Blake3Bao64);
         assert_eq!(super::round_budget(&config), 64 * super::ROUNDS_PER_RECORD);
 
-        // A short final record still needs deliveries of its own.
         let ragged = case(64 * 65_536 + 1, Suite::Blake3Bao64);
         assert_eq!(super::round_budget(&ragged), 65 * super::ROUNDS_PER_RECORD);
 
-        // Under the floor, the floor. One record over a real socket takes more
-        // deliveries than one, so the per-record term alone would call a
-        // healthy carrier stopped.
         let small = case(1, Suite::Blake3Bao64);
         assert_eq!(super::round_budget(&small), super::MIN_ROUNDS);
     }
 
-    /// The floor is a floor: below it the per-record term would decide, and one
-    /// record over a real socket takes more deliveries than that.
     const _: () = assert!(super::MIN_ROUNDS > super::ROUNDS_PER_RECORD);
 
     #[test]
     fn a_transfer_that_needs_its_whole_budget_is_not_called_stalled() {
-        // One record, and a carrier that releases it one delivery late. The
-        // completion loop therefore needs exactly one delivery, so a budget of
-        // one is exactly enough and a budget of none is exactly too little.
-        // Between them they pin the edge: a bound that fired one delivery early
-        // would fail a transfer that had not stopped.
         let config = case(65_536, Suite::Blake3Bao64);
         let mut carrier = TestCarrier::new();
         carrier.lag = 1;
@@ -2936,14 +2532,9 @@ mod tests {
 
     #[test]
     fn waiting_on_the_carrier_is_counted_and_not_waiting_is_counted_as_none() {
-        // The simulator delivers before flush returns, so no delivery of a
-        // healthy run finds nothing and the driver never waits. A run that
-        // reported waits here would be waiting on itself.
         let measured = measure(&case(4 * 65_536, Suite::Blake3Bao64)).unwrap();
         assert_eq!(note_field(&measured.notes, "idle_waits"), 0);
 
-        // A carrier that releases late is one the driver waits on, and the
-        // difference between the two is what the field is for.
         let mut lagging = TestCarrier::new();
         lagging.lag = 3;
         let waited =
@@ -2958,8 +2549,6 @@ mod tests {
     #[test]
     fn a_refused_submission_is_backpressure_and_the_record_is_offered_again() {
         let mut carrier = TestCarrier::new();
-        // Every record refused once, so the retry path runs for each of them
-        // and none of them is lost by it.
         carrier.refuse = 4;
         let config = case(4 * 65_536, Suite::Blake3Bao64);
         let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
@@ -2971,8 +2560,6 @@ mod tests {
     #[test]
     fn a_carrier_that_delivers_late_is_waited_out() {
         let mut carrier = TestCarrier::new();
-        // Nothing arrives until well after the last record is submitted, so the
-        // completion loop is what finishes the object.
         carrier.lag = 8;
         let config = case(2 * 65_536, Suite::Blake3Bao64);
         let measured = transfer_within(&config, carrier, TEST_BUDGET).unwrap();
@@ -2989,8 +2576,6 @@ mod tests {
             Err(Error::Stalled)
         ));
 
-        // A carrier that refuses every submission and delivers nothing stalls
-        // in the other loop, which has its own bound to reach.
         let mut refusing = TestCarrier::new();
         refusing.refuse = usize::MAX;
         refusing.stalled = true;
@@ -3002,9 +2587,6 @@ mod tests {
 
     #[test]
     fn a_carrier_that_reports_the_connection_gone_says_so_at_once() {
-        // Waiting out the stall bound would report a slow carrier where the
-        // truth is a broken one, and the run would take thirty seconds to say
-        // the wrong thing.
         let mut carrier = TestCarrier::new();
         carrier.disconnect = true;
         let config = case(65_536, Suite::Blake3Bao64);
@@ -3019,9 +2601,6 @@ mod tests {
         let mut carrier = TestCarrier::new();
         carrier.corrupt = true;
         let config = case(65_536, Suite::Blake3Bao64);
-        // Truncated inside the envelope, so the frame no longer accounts for
-        // what was delivered. Accepting it would verify against bytes the
-        // sender never sent.
         assert!(matches!(
             transfer_within(&config, carrier, TEST_BUDGET),
             Err(Error::Corrupt)
@@ -3035,8 +2614,6 @@ mod tests {
             .unwrap();
         assert_eq!(record_payload(&framed).unwrap(), b"payload");
 
-        // Nothing at all, a truncated frame, and a frame with a second one
-        // behind it are all deliveries this transfer never made.
         assert!(matches!(record_payload(&[]), Err(Error::Corrupt)));
         assert!(matches!(
             record_payload(&framed[..framed.len() - 1]),
@@ -3046,7 +2623,6 @@ mod tests {
         two.extend_from_slice(&framed);
         assert!(matches!(record_payload(&two), Err(Error::Corrupt)));
 
-        // A control frame is a frame this lane does not carry.
         let mut control = Vec::new();
         vot_codec::encode_frame(vot_codec::frame_type::SETTINGS, b"x", &mut control).unwrap();
         assert!(matches!(record_payload(&control), Err(Error::Corrupt)));
@@ -3056,13 +2632,9 @@ mod tests {
     fn the_credit_the_report_names_is_the_one_that_was_enforced() {
         let config = case(65_536, Suite::Blake3Bao64);
 
-        // A carrier that applies the credit says so.
         let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
         assert_eq!(note_field_text(&measured.notes, "credit_mode"), "set");
 
-        // One that bounds its inbound at construction reports Unsupported
-        // rather than accepting a credit it would not apply, and the report
-        // records which of the two happened rather than implying the first.
         let mut constructed = TestCarrier::new();
         constructed.endpoint = CreditEndpoint(Err(vot_transport_api::Error::Unsupported));
         let measured = transfer_within(&config, constructed, TEST_BUDGET).unwrap();
@@ -3070,11 +2642,8 @@ mod tests {
             note_field_text(&measured.notes, "credit_mode"),
             "constructed"
         );
-        // Either way the number is the receiver's own advertised credit, which
-        // the receiver enforces by refusing staging past it.
         assert_eq!(note_field(&measured.notes, "credit_bytes"), 1_250_000);
 
-        // Any other refusal is a backend failure rather than a mode.
         let mut refused = TestCarrier::new();
         refused.endpoint = CreditEndpoint(Err(vot_transport_api::Error::InvalidConfiguration));
         assert!(matches!(
@@ -3087,13 +2656,6 @@ mod tests {
 
     #[test]
     fn the_sender_events_are_drained_so_they_cannot_become_the_ceiling() {
-        // A sender reports acknowledgements and connection state this transfer
-        // never reads. Left queued they fill the backend's bound and it starts
-        // refusing submissions, so the run would stop for a reason that has
-        // nothing to do with the object or the carrier. The double refuses once
-        // its sender queue is full and clears it only when the driver drains,
-        // so a transfer that completes is a transfer that drained: more records
-        // than the queue holds went through it.
         let object_bytes = DRAIN_TEST_RECORDS as u64 * 65_536;
         let config = case(object_bytes, Suite::Blake3Bao64);
         let measured = transfer_within(&config, TestCarrier::new(), TEST_BUDGET).unwrap();
@@ -3104,8 +2666,6 @@ mod tests {
     fn what_the_carrier_moved_is_reported_apart_from_the_object() {
         let config = case(4 * 65_536, Suite::Blake3Bao64);
         let measured = measure(&config).unwrap();
-        // The envelope is on the wire and is not part of the object, so a
-        // reader can see the difference rather than assuming there is none.
         let wire = note_field(&measured.notes, "wire_bytes");
         assert!(wire > 4 * 65_536, "wire was {wire}");
         assert!(wire < 4 * 65_536 + 4 * 64, "wire was {wire}");
@@ -3114,10 +2674,6 @@ mod tests {
 
     #[test]
     fn every_note_is_a_named_value() {
-        // `notes` is read by people and by scripts, and both take it as
-        // semicolon-separated name=value. A carrier that has nothing extra to
-        // say adds nothing, rather than an empty field or a bare word that
-        // neither can interpret.
         let measured = measure(&case(65_536, Suite::Blake3Bao64)).unwrap();
         for field in measured.notes.split(';') {
             assert!(
@@ -3139,15 +2695,10 @@ mod tests {
                 assert_eq!(measured.verified_bytes, object_bytes);
                 assert_eq!(measured.bytes_sent, object_bytes);
                 assert!(measured.elapsed_ns >= 1);
-                // Counted or refused is the host's call, so neither outcome
-                // can be pinned here; the field and the note must agree.
                 assert_eq!(
                     measured.cycles.is_none(),
                     measured.notes.contains(";cycles=unmeasured")
                 );
-                // The carrier names itself in the result. A report that
-                // attributed a run to the wrong backend would be worse than no
-                // report, and this is the only place the name is written.
                 assert_eq!(note_field_text(&measured.notes, "backend"), "simulator");
             }
         }
@@ -3168,37 +2719,24 @@ mod tests {
 
     #[test]
     fn submissions_are_flushed_in_bounded_batches() {
-        // Seventeen records at a batch of sixteen: one full batch, then the
-        // closing flush for the record left over.
         let config = case(17 * 65_536, Suite::Blake3Bao64);
         assert_eq!(note_field(&measure(&config).unwrap().notes, "flushes"), 2);
 
-        // An exact multiple of the batch needs no closing flush.
         let exact = case(16 * 65_536, Suite::Blake3Bao64);
         assert_eq!(note_field(&measure(&exact).unwrap().notes, "flushes"), 1);
 
-        // Under one batch there is only the closing flush.
         let short = case(3 * 65_536, Suite::Blake3Bao64);
         assert_eq!(note_field(&measure(&short).unwrap().notes, "flushes"), 1);
     }
 
     #[test]
     fn generation_cost_is_reported_so_it_can_be_subtracted() {
-        // Generating the object is inside the timed section, so a reader has to
-        // be able to see how much of elapsed_ns it was.
         let measured = measure(&case(4 * 1_048_576, Suite::Blake3Bao64)).unwrap();
         let generator_ns = note_field(&measured.notes, "generator_ns");
-        // Four mebibytes of xorshift is hundreds of microseconds even on fast
-        // hardware, so ten is a floor no real measurement can fall through and
-        // no constant can climb over.
         assert!(
             generator_ns > 10_000,
             "generation was reported as {generator_ns} ns"
         );
-        // Deliberately no comparison against elapsed_ns. They are two separate
-        // timed passes over the same work, so which is larger depends on how
-        // loaded the machine is, and asserting an order made this flaky under
-        // CI load rather than testing anything.
         assert!(measured.elapsed_ns >= 1);
     }
 
@@ -3213,7 +2751,6 @@ mod tests {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap()
         };
-        // Sixteen times the object, and the receiver holds the same window.
         assert_eq!(peak_of(&small.notes), peak_of(&large.notes));
     }
 
@@ -3243,22 +2780,16 @@ mod tests {
         assert_eq!(lengths(1, 65_536), vec![1]);
         assert_eq!(lengths(3 * 65_536, 65_536), vec![65_536; 3]);
         assert_eq!(lengths(196_609, 65_536), vec![65_536, 65_536, 65_536, 1]);
-        // Nothing to send is an empty schedule, not one empty record.
         assert_eq!(lengths(0, 65_536), Vec::<usize>::new());
         assert_eq!(lengths(300_000, 65_536).iter().sum::<usize>(), 300_000);
     }
 
     #[test]
     fn an_unimplemented_case_is_an_error_not_a_number() {
-        // `tcp` is a backend the result schema allows and this driver has no
-        // carrier for, under any feature. It used to be `msquic`, which stopped
-        // being an example of an unimplemented backend once one was built.
         let mut backend = case(65_536, Suite::Blake3Bao64);
         backend.backend = "tcp".to_owned();
         assert!(matches!(measure(&backend), Err(Error::Unsupported(_))));
 
-        // A name no schema allows either, so the arm is what refuses both
-        // rather than a list of known backends that happens to be complete.
         let mut unknown = case(65_536, Suite::Blake3Bao64);
         unknown.backend = "carrier-pigeon".to_owned();
         assert!(matches!(measure(&unknown), Err(Error::Unsupported(_))));
@@ -3272,8 +2803,6 @@ mod tests {
     fn reordering_is_taken_from_the_impairment_and_bounded() {
         let mut reordered = case(196_608, Suite::Blake3Bao64);
         reordered.impairment.reorder_window = 2;
-        // One stream is never reordered against itself, so the run is identical
-        // to reorder_window 0 and has to say so.
         let measured = measure(&reordered).unwrap();
         assert_eq!(measured.verified_bytes, 196_608);
         let unmodelled = measured
@@ -3282,7 +2811,6 @@ mod tests {
             .find_map(|field| field.strip_prefix("unmodelled_impairment="))
             .unwrap();
         assert!(unmodelled.contains("reorder_window"), "{unmodelled}");
-        // With no reordering asked for there is nothing to disclaim.
         let clean = measure(&case(196_608, Suite::Blake3Bao64)).unwrap().notes;
         let clean_unmodelled = clean
             .split(';')
@@ -3323,8 +2851,6 @@ mod tests {
         assert!(unmodelled.contains("bandwidth_bps"));
         assert!(unmodelled.contains("queue_bytes"));
         assert!(unmodelled.contains("mtu_bytes"));
-        // The adapter delivers immediately, so no run waited out an RTT even
-        // though the round-trip time did size the receive window.
         assert!(unmodelled.contains("rtt_us"));
 
         let mut instant = case(65_536, Suite::Blake3Bao64);
@@ -3347,7 +2873,6 @@ mod tests {
     #[test]
     fn credit_follows_the_bandwidth_delay_product() {
         let config = case(65_536, Suite::Blake3Bao64);
-        // 10 Gb/s for 1 ms is 1.25 MB.
         assert_eq!(config.bandwidth_delay_bytes(), 1_250_000);
         let notes = measure(&config).unwrap().notes;
         assert!(notes.contains("credit_bytes=1250000"), "{notes}");
@@ -3516,9 +3041,6 @@ mod tests {
 
     #[test]
     fn generated_object_bytes_are_pinned_to_the_seed() {
-        // The generator is arbitrary but must stay stable, or a seed stops
-        // identifying an object and results from different builds stop being
-        // comparable. These bytes are the change detector for that.
         let mut source = ObjectSource::new(0);
         let mut record = Vec::new();
         let mut seen = Vec::new();
@@ -3543,8 +3065,6 @@ mod tests {
 
     #[test]
     fn a_short_final_record_takes_the_generator_prefix() {
-        // The tail must be a prefix of the full record, not a re-draw, or the
-        // object depends on how it was chunked.
         let mut whole = ObjectSource::new(3);
         let mut short = ObjectSource::new(3);
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -3572,8 +3092,6 @@ mod tests {
             Error::Unmeasurable("memory_high_water_bytes").to_string(),
             "memory_high_water_bytes has no measured source on this platform"
         );
-        // A pair that never connected and a carrier that stopped mid-transfer
-        // are found in different places, so they may not read the same.
         assert_eq!(
             Error::Handshake.to_string(),
             "the endpoints did not connect"
@@ -3596,11 +3114,6 @@ mod tests {
 
     #[test]
     fn cpu_time_is_read_past_an_executable_name_that_contains_spaces() {
-        // The second field of /proc/[pid]/stat is the executable name in
-        // parentheses and may contain spaces and parentheses of its own.
-        // Counting fields from the start of the line reads the wrong two for
-        // any process named like that, which is a silent wrong number rather
-        // than a failure.
         let awkward = "42 (vot bench (x) ) S 1 42 42 0 -1 4194304 125 0 0 0 700 300 0 0 20 0 1 0 8";
         assert_eq!(
             super::parse_cpu_times(awkward),
@@ -3613,7 +3126,6 @@ mod tests {
             Some((11 * 10_000_000, 13 * 10_000_000))
         );
 
-        // Truncated, and not a stat line at all.
         assert_eq!(super::parse_cpu_times("7 (driver) R 1 7"), None);
         assert_eq!(super::parse_cpu_times(""), None);
         assert_eq!(
@@ -3640,8 +3152,6 @@ mod tests {
             rounds: 2,
             cpu: Some((1, 1)),
         });
-        // Rounds share one budget across rails, so the widest count stands
-        // rather than a sum; CPU is a process total the caller sets.
         assert_eq!(
             tally,
             Tally {
@@ -3658,23 +3168,15 @@ mod tests {
     #[test]
     fn the_cpu_a_run_spent_is_a_difference_of_two_readings() {
         assert_eq!(super::cpu_spent(Some((5, 7)), Some((9, 10))), Some((4, 3)));
-        // A counter that did not advance is zero, not a wrap.
         assert_eq!(super::cpu_spent(Some((9, 9)), Some((9, 9))), Some((0, 0)));
         assert_eq!(super::cpu_spent(Some((9, 9)), Some((1, 1))), Some((0, 0)));
-        // A difference against a reading never taken is not a measurement.
         assert_eq!(super::cpu_spent(None, Some((9, 9))), None);
         assert_eq!(super::cpu_spent(Some((9, 9)), None), None);
     }
 
     #[test]
     fn the_cpu_reading_advances_as_the_process_spends_it() {
-        // A reading that never moves is not a reading. Asserting a positive
-        // number inside one short run cannot say this, because the counter
-        // advances in ten-millisecond ticks and a small run finishes inside
-        // one, which is what made an earlier version of this test fail in CI
-        // for being right about a fast machine. So spend CPU until the counter
-        // moves, and give it long enough that a loaded machine still gets
-        // there.
+        // The counter advances in 10ms ticks; spend CPU until it moves.
         let Some((before, _)) = super::cpu_times_ns() else {
             assert!(!cfg!(target_os = "linux"), "linux exposes this");
             return;
@@ -3702,18 +3204,10 @@ mod tests {
 
     #[test]
     fn a_run_reports_the_cpu_it_spent_rather_than_only_its_duration() {
-        // Throughput alone cannot separate a carrier that is slower because it
-        // makes more syscalls from one that is slower because it hashes more.
         let measured = measure(&case(4 * 1_048_576, Suite::Blake3Bao64)).unwrap();
         let user = note_field_text(&measured.notes, "cpu_user_ns");
         let system = note_field_text(&measured.notes, "cpu_sys_ns");
         if cfg!(target_os = "linux") {
-            // A number, and deliberately not a positive one. The counter
-            // advances in ten-millisecond ticks, and a few mebibytes of
-            // generating, framing, and verifying can finish inside one tick on
-            // an idle machine, so zero is a true reading rather than a broken
-            // one. That the fields carry the right values is pinned by the
-            // parser's own test, against known input, where it is exact.
             assert!(user.parse::<u64>().is_ok(), "user cpu was {user}");
             assert!(system.parse::<u64>().is_ok(), "system cpu was {system}");
         } else {
@@ -3724,19 +3218,13 @@ mod tests {
 
     #[test]
     fn the_high_water_mark_is_read_from_the_process_not_defaulted() {
-        // Any test binary that has hashed a megabyte is well past a megabyte of
-        // resident memory, so a stubbed constant cannot pass this.
         let measured = measure(&case(1_048_576, Suite::Blake3Bao64)).unwrap();
         assert!(
             measured.memory_high_water_bytes > 1 << 20,
             "high water was {} bytes",
             measured.memory_high_water_bytes
         );
-        // A high-water mark never falls, but the value procfs reports is
-        // max(stored peak, current RSS) and the current-RSS half comes from
-        // per-CPU counters that lag a read by their batch size on every CPU,
-        // so two reads of one peak can disagree by a few megabytes. Eight is
-        // past that lag on any runner here and far under the first assert.
+        // procfs peak RSS lags per-CPU counters; two reads of one peak can differ.
         let counter_slop = 8 << 20;
         assert!(
             super::memory_high_water_bytes().unwrap() + counter_slop

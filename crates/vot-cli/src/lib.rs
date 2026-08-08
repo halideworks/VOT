@@ -44,9 +44,8 @@ pub use wire::{fetch_bundle, rendezvous_service, serve_bundle};
 
 /// The certificate and key a server presents.
 ///
-/// ADR-0030: the certificate is ephemeral and unverified, and assurance
-/// comes from the proof chain rather than from the channel. It is still a
-/// real certificate because TLS 1.3 has no anonymous mode, so one is
+/// The certificate is ephemeral and unverified; assurance comes from the
+/// proof chain, not the channel. TLS 1.3 has no anonymous mode, so one is
 /// generated per process unless the caller supplies its own.
 pub enum Credentials {
     /// Generated for this process, thrown away with it.

@@ -1,27 +1,7 @@
-//! One half of a two-machine run.
-//!
-//! Loopback settles the engine comparison because it charges both endpoints to
-//! one host; what it cannot show is what either carrier does with a machine to
-//! itself, or what send-side offload is worth when the sender no longer pays
-//! for the receiver's syscalls. The two-machine run is that confirmation, and
-//! this module is the driver's half of it: `VOT_BENCH_ROLE=receive` listens on
-//! `VOT_BENCH_LISTEN` and reports the verified transfer, `VOT_BENCH_ROLE=send`
-//! connects to `VOT_BENCH_CONNECT` and reports what it submitted. Both halves
-//! are started by hand, never by CI, and their numbers are labeled `role=` so
-//! they are never mixed with loopback's.
-//!
-//! The split keeps the loopback discipline where it can. Records are framed,
-//! submitted, and verified by the same helpers `transfer` uses, the budgets and
-//! idle backoff are the same, and the receiver's number is the one that means
-//! throughput: its clock runs from the accepted connection to the verified
-//! object. The sender cannot see verification, so the receiver tells it: one
-//! record on a return lane after the object verifies, and the sender's clock
-//! stops when that record arrives.
-//!
-//! This file compiles only under a backend feature, which the mutation matrix
-//! does not enable, so it is named in `.cargo/mutants.toml` for the same reason
-//! the backend files are. It is measured where it compiles, by the loopback
-//! role tests at the bottom, which the live jobs run.
+//! One half of a two-machine run: `VOT_BENCH_ROLE=receive` listens on
+//! `VOT_BENCH_LISTEN`, `VOT_BENCH_ROLE=send` connects to `VOT_BENCH_CONNECT`.
+//! Both halves are started by hand; numbers are labeled `role=` to keep them
+//! separate from loopback.
 
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -49,30 +29,22 @@ pub(crate) const LISTEN: &str = "VOT_BENCH_LISTEN";
 /// Where the sending half connects, as `address:port`.
 pub(crate) const CONNECT: &str = "VOT_BENCH_CONNECT";
 
-/// The lane the receiver's done marker returns on.
-///
-/// Any lane but [`TRANSFER_LANE`] would do: the object only flows one way, so
-/// the sender reads any reliable delivery as the marker rather than depending
-/// on how each backend numbers a peer-initiated lane.
+/// The lane the receiver's done marker returns on. Any lane would do since
+/// the object flows one way; the sender reads any reliable delivery as the
+/// marker.
 const DONE_LANE: StreamId = StreamId(2);
 
 /// What the marker says. The content is never verified; arriving is the signal.
 const DONE_PAYLOAD: &[u8] = b"verified";
 
 /// The bound a multi-rail spine sleeps on when a round makes no progress.
-///
-/// The sequential half escalates its idle wait because its one connection's
-/// signal is the only wake it needs. A spine over W rails can only wait on
-/// one rail's signal while any rail's arrival is progress, so a long bound
-/// turns every wait on the wrong rail into a stall of the whole spine, and
-/// the odds of the wrong rail are (W-1)/W. A small fixed bound caps that
-/// stall; the rounds budget still bounds the loop.
+/// A small fixed bound caps stalls on the wrong rail; the rounds budget
+/// still bounds the loop.
 const RAIL_IDLE_WAIT: std::time::Duration = std::time::Duration::from_micros(250);
 
 /// Rounds the receiver stays reachable after sending the done marker, at
-/// [`LINGER_WAIT`] a round, so the marker and its retransmissions have a live
-/// socket to leave from. The sender's exit usually ends this early as a
-/// disconnect; the count is what bounds it when no disconnect ever arrives.
+/// [`LINGER_WAIT`] a round, so retransmissions have a live socket. The
+/// sender's disconnect usually ends this early.
 const LINGER_ROUNDS: u32 = 1024;
 const LINGER_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -99,10 +71,8 @@ pub(crate) struct Endpoint {
 pub fn measure(config: &Config) -> Result<Measurement, Error> {
     #[cfg(test)]
     crate::test_guard::arm();
-    // A multi-worker case runs the ranged path over provisioned rails, one
-    // connection per worker on consecutive ports. The shared arm stays
-    // rejected: one connection is one pump, so sharing it across two machines
-    // would measure the sequential path under the wrong label.
+    // Multi-worker requires provisioned rails: one shared connection would
+    // measure the sequential path under the wrong label.
     if config.workers != 1 && config.rails != Rails::Provisioned {
         return Err(Error::Unsupported(
             "role mode carries workers above one on provisioned rails only".to_owned(),
@@ -125,19 +95,15 @@ fn run_role(config: &Config, role: &str) -> Result<Measurement, Error> {
             send_ranged(config, generator_ns, address(CONNECT)?)
         }
         "send" => {
-            // Generation is timed before the endpoint exists: the receiver's
-            // clock starts at the accepted connection, so everything this
-            // process does between connecting and sending is charged to the
-            // transfer on the other machine.
+            // Timed before the endpoint exists so it falls outside the
+            // receiver's clock (which starts at connection).
             let generator_ns = generator_nanos(config)?;
             let endpoint = connect_endpoint(config, address(CONNECT)?)?;
             send(config, endpoint, generator_ns)
         }
         "receive" if config.workers > 1 => receive_ranged(config, address(LISTEN)?),
         "receive" => {
-            // The subject and the staging receiver are built before listening,
-            // for the same reason: once the sender connects, its clock is
-            // running.
+            // Built before listening so they fall outside the sender's clock.
             let subject = subject_of(config)?;
             let mut staging = receiver_for(config)?;
             staging.begin(subject)?;
@@ -187,9 +153,8 @@ fn bound_listener(_config: &Config, _listen: SocketAddr) -> Result<Endpoint, Err
 
 /// Waits for a bound endpoint to report its accepted connection.
 ///
-/// Anything polled before the connection is discarded, which is safe only
-/// because the sending half submits nothing until every rail is connected;
-/// this wait leans on that gate rather than enforcing one.
+/// Events polled before the connection are discarded. Safe only because the
+/// sender submits nothing until every rail is connected.
 fn wait_connected(
     adapter: &mut dyn TransportAdapter,
     timeout: std::time::Duration,
@@ -207,15 +172,9 @@ fn wait_connected(
     Err(Error::Handshake)
 }
 
-/// Appends each rail's final path measurements to the notes, so a slow run
-/// carries its own congestion story: losses name the path, their absence
-/// names the source.
-/// Snapshots every rail's ledger while the rails are alive.
-///
-/// Taken as data rather than read at render time because rail zero carries
-/// the done marker after the transfer, and a connection the marker exchange
-/// closed answers with nothing: the ledger sums then lie by one rail, which
-/// is exactly how the 2026-08-05 forensics went wrong first.
+/// Snapshots every rail's path stats while the rails are alive. Rail zero
+/// carries the done marker after the transfer, which closes that connection;
+/// reading stats at render time would miss it.
 fn rail_path_stats(endpoints: &mut [Endpoint]) -> Vec<Option<vot_transport_api::PathStats>> {
     endpoints
         .iter_mut()
@@ -343,11 +302,9 @@ fn drive_receive_rail(
 
 /// Accepts every rail's connection and starts the transfer clock.
 ///
-/// Every rail binds before any handshake starts where the backend allows
-/// it, or the sender's next Initial races the next bind and pays a full
-/// no-sample probe timeout when it loses. Either way the clock starts at
-/// the first accepted connection, the sequential half's accounting, and
-/// the sibling rails' handshakes run inside it.
+/// Rails bind before any handshake where the backend allows it, or the
+/// sender's next Initial races the next bind. The clock starts at the first
+/// accepted connection.
 #[expect(clippy::type_complexity, reason = "the clock rides with what it times")]
 fn accept_rails(
     config: &Config,
@@ -368,9 +325,8 @@ fn accept_rails(
             wait_connected(endpoint.adapter.as_mut(), ROLE_RAIL_HANDSHAKE_TIMEOUT)?;
         }
     } else {
-        // A backend whose listener accepts inside construction carries the
-        // bind race serially; the race and its cost stay visible here
-        // rather than being hidden outside the clock.
+        // Backends that accept inside construction carry the bind race
+        // inside the clock.
         endpoints.push(listen_endpoint(config, base)?);
         cpu_before = cpu_times_ns();
         started = Instant::now();
@@ -427,10 +383,8 @@ fn connect_endpoint(config: &Config, peer: SocketAddr) -> Result<Endpoint, Error
 /// Takes every event the sender's endpoint has, and returns how many there
 /// were.
 ///
-/// Any reliable delivery is the receiver's done marker, because nothing else
-/// ever flows toward the sender. A disconnect before the marker means the
-/// object cannot have verified; one after it is the receiver leaving, which is
-/// how this transfer is supposed to end.
+/// Any reliable delivery is the done marker; nothing else flows toward the
+/// sender. A disconnect before the marker means verification failed.
 fn drain_sender(adapter: &mut dyn TransportAdapter, done: &mut bool) -> Result<u64, Error> {
     let mut events = 0_u64;
     while let Some(event) = adapter.poll() {
@@ -445,12 +399,7 @@ fn drain_sender(adapter: &mut dyn TransportAdapter, done: &mut bool) -> Result<u
 }
 
 /// Submits the whole object, then waits for the receiver's done marker.
-///
-/// The same loop shape as `transfer`: a refused submission is backpressure and
-/// spends a round, a batch boundary flushes, and the rounds budget bounds both
-/// loops however the carrier behaves. What `transfer` learns from its own
-/// receiver this half learns from the marker, so `verified_bytes` is zero here:
-/// this process verified nothing and does not report that the other one did.
+/// `verified_bytes` is zero: this process verified nothing.
 fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Measurement, Error> {
     let budget = round_budget(config);
     let adapter = endpoint.adapter.as_mut();
@@ -501,9 +450,8 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
         }
     }
 
-    // Every record is with the carrier. The marker is what says the far end
-    // verified the object, so the clock runs until it arrives and a carrier
-    // that never delivers it is stalled, not finished.
+    // The clock runs until the done marker arrives; a carrier that never
+    // delivers it is stalled, not finished.
     while !done {
         rounds = rounds.saturating_add(1);
         if rounds > budget {
@@ -530,15 +478,9 @@ fn send(config: &Config, mut endpoint: Endpoint, generator_ns: u64) -> Result<Me
     })
 }
 
-/// Drives one rail: groups from the shared source, its own adapter's
-/// backpressure, its own flushes and waits, and nothing shared with its
-/// siblings but the source and the done flag.
-///
-/// The rails were once fed by one dealer thread, and its turn-taking
-/// coupled them: a rail ran dry whenever the dealer was busy elsewhere or
-/// asleep on another rail's signal, which measured about a gigabit against
-/// the same flows run as independent processes. Backpressure here is
-/// local: a full adapter parks this thread on this rail's own signal.
+/// Drives one rail: groups from the shared source, its own backpressure,
+/// flushes, and waits. Nothing shared with siblings but the source and the
+/// done flag. Backpressure is local to each rail.
 fn drive_rail(
     endpoint: &mut Endpoint,
     source: &GroupSource,
@@ -597,14 +539,10 @@ fn drive_rail(
         if marker {
             done.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // A rail is finished only when everything it will ever carry has
-        // been handed over and the receiver has said the whole object
-        // verified; until then it keeps flushing, because its own
-        // retransmissions may be what the verdict is waiting on.
+        // A rail finishes only when its source is dry, its queue is empty,
+        // and the object verified. Its retransmissions may still be needed.
         rail_done = marker && source_dry && queued.is_empty();
-        // Progress means frames handed over; routine acknowledgements are
-        // not it, or the closing wait would spin its budget dry on its own
-        // trailing ACKs.
+        // Only handed-over frames count as progress, not ACKs.
         if !progress && !rail_done {
             tally.idle_waits = tally.idle_waits.saturating_add(1);
             adapter.wait_for_event(RAIL_IDLE_WAIT);
@@ -630,13 +568,9 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     let cpu_before = cpu_times_ns();
     let started = std::time::Instant::now();
     let outcome = std::thread::scope(|scope| -> Result<(Tally, u64), Error> {
-        // Producers feed one bounded source and every rail takes from it as
-        // fast as its own adapter drains, so a quick rail carries more of
-        // the object and a slow one delays nothing but its share. The bound
-        // is what keeps producers from running ahead of the wire. The source
-        // lives inside the scope so a failing transfer can drop it: a
-        // producer parked on the full channel unblocks the moment the
-        // receiver dies, rather than holding the join forever.
+        // Producers feed one bounded source; rails take as fast as their
+        // adapters drain. The source lives in the scope so a failing
+        // transfer can drop it and unblock parked producers.
         let (group_tx, group_rx) =
             std::sync::mpsc::sync_channel::<Result<Vec<RangedFrame>, Error>>(workers * 2);
         let source: GroupSource = std::sync::Arc::new(std::sync::Mutex::new(group_rx));
@@ -721,23 +655,14 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     receiver.begin_ranges(subject, Box::new(sink.clone()))?;
     let mut reassembly = BundleReassembly::new(workers);
 
-    // Every rail binds before any handshake starts where the backend allows
-    // it, or the sender's next Initial races the next bind and pays a full
-    // no-sample probe timeout when it loses. Either way the clock starts at
-    // the first accepted connection, the sequential half's accounting, and
-    // the sibling rails' handshakes run inside it.
     let (mut endpoints, cpu_before, started) = accept_rails(config, base, workers)?;
     let mut credit = Credit::Constructed;
     for endpoint in &mut endpoints {
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
     }
 
-    // Every rail is its own thread end to end: it polls its own endpoint,
-    // reassembles its own bundles, proves them itself, and shares nothing
-    // with its siblings but the admission lock and the running total. The
-    // spine shapes this replaced measured a coupling tax twice: a dealer or
-    // a slice rotation asleep on one rail stalls every other through the
-    // pump's headroom gate.
+    // Each rail runs end to end on its own thread, sharing only the
+    // admission lock and running total.
     let receiver = std::sync::Mutex::new(receiver);
     let witnesses = WitnessLedger::default();
     let delivered = std::sync::atomic::AtomicU64::new(0);
@@ -830,11 +755,8 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
 }
 
 /// Receives, verifies, and reports the transfer, then tells the sender.
-///
-/// This half's number is the one that means throughput on a wire: its clock
-/// starts at the accepted connection and stops when the object verifies, so it
-/// covers everything the sender did after connecting, including generating the
-/// records it sent.
+/// This half's clock covers the full transfer including the sender's
+/// generation cost.
 fn receive(
     config: &Config,
     mut endpoint: Endpoint,
@@ -887,9 +809,8 @@ fn receive(
         ));
     }
 
-    // Tell the sender, then stay reachable long enough for the marker to
-    // leave. Its delivery is what stops the sender's clock, so it goes out
-    // after this half's own clock has stopped.
+    // The marker goes out after the clock stops; its delivery stops the
+    // sender's clock.
     let mut marker = Vec::new();
     vot_codec::encode_frame(
         vot_codec::frame_type::DATA_RECORD,
@@ -1003,16 +924,14 @@ mod tests {
         }
     }
 
-    /// A port the kernel just proved free. Racy in principle; in these tests
-    /// the rebind happens immediately and ephemeral ports are not reissued
-    /// that fast.
+    /// A port the kernel just proved free. Racy in principle but fine for
+    /// these tests.
     fn free_address() -> SocketAddr {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.local_addr().unwrap()
     }
 
-    /// Runs both halves against each other over loopback: the receive half on
-    /// its own thread, as its own machine would be, the send half here.
+    /// Runs both halves against each other over loopback.
     fn role_pair(
         config: &Config,
         listen: fn(&Config, SocketAddr) -> Result<super::Endpoint, crate::Error>,
@@ -1035,14 +954,10 @@ mod tests {
     }
 
     fn assert_roles_reported(config: &Config, sent: &Measurement, received: &Measurement) {
-        // The receiver's number is the throughput claim, so it must have
-        // verified the whole object; the sender verified nothing and must say
-        // so rather than echoing the case.
         assert_eq!(received.verified_bytes, config.object_bytes);
         assert_eq!(received.bytes_sent, 0);
         assert_eq!(sent.bytes_sent, config.object_bytes);
         assert_eq!(sent.verified_bytes, 0);
-        // Labeled, so a wire number is never read as a loopback one.
         assert!(sent.notes.contains(";role=send;"), "{}", sent.notes);
         assert!(
             received.notes.contains(";role=receive;"),
@@ -1059,8 +974,6 @@ mod tests {
     #[cfg(feature = "quiche")]
     #[test]
     fn a_quiche_role_pair_carries_and_verifies() {
-        // Past one batch and past one datagram many times over, as the
-        // loopback carrier tests hold, plus a short final record.
         let config = case("quiche", 40 * 65_536 + 17);
         let (sent, received) = role_pair(
             &config,
@@ -1089,9 +1002,6 @@ mod tests {
 
     #[test]
     fn a_multi_worker_case_on_a_shared_rail_is_refused_before_any_socket_exists() {
-        // The guard runs before the role lookup, so no environment and no
-        // network are needed to pin it. Provisioned rails carry workers above
-        // one; a shared connection would mislabel the sequential path.
         let mut config = case("quiche", 65_536);
         config.workers = 2;
         assert!(matches!(
@@ -1100,8 +1010,7 @@ mod tests {
         ));
     }
 
-    /// A base whose next `extra` ports are also free, so consecutive rails
-    /// can bind. Racy in principle, like `free_address`.
+    /// A base whose next `extra` ports are also free, for consecutive rails.
     #[cfg(feature = "quiche")]
     fn free_rail_base(extra: u16) -> SocketAddr {
         loop {
@@ -1121,15 +1030,10 @@ mod tests {
     #[cfg(feature = "quiche")]
     #[test]
     fn a_ranged_role_pair_carries_and_verifies_over_two_rails() {
-        // Two workers on two connections: each rail carries its own range,
-        // the receiver reassembles and verifies the whole object, and the
-        // marker comes back on rail zero.
         let mut config = case("quiche", 8 * 1024 * 1024);
         config.workers = 2;
         config.rails = Rails::Provisioned;
         let base = free_rail_base(1);
-        // The receiving half runs ram-to-disk, so this covers the role
-        // path's sink registration and the sync-after-clock flow.
         let sink_path =
             std::env::temp_dir().join(format!("vot-role-sink-{}.bin", std::process::id()));
         let mut far_config = config.clone();
@@ -1150,17 +1054,11 @@ mod tests {
                 measurement.notes
             );
         }
-        // The sender's rails publish the packet ledger the loss forensics
-        // read; a note that stopped carrying it would break that instrument
-        // silently.
         assert!(sent.notes.contains("rail0_sent="), "{}", sent.notes);
         assert!(sent.notes.contains("rail0_recv="), "{}", sent.notes);
         assert!(sent.notes.contains("rail0_lost="), "{}", sent.notes);
         assert!(sent.notes.contains("rail0_spurious="), "{}", sent.notes);
         assert!(received.notes.contains("bundles="), "{}", received.notes);
-        // The receiver's rail zero ledger must survive the done marker: the
-        // stats are snapshotted before the marker exchange closes the rail,
-        // or every ledger sum is short one rail.
         assert!(received.notes.contains("rail0_recv="), "{}", received.notes);
         assert!(received.notes.contains("rail0_sent="), "{}", received.notes);
         assert!(
@@ -1168,7 +1066,6 @@ mod tests {
             "{}",
             received.notes
         );
-        // The file is the object, which is the whole point of the sink.
         let written = std::fs::read(&sink_path).unwrap();
         let _ = std::fs::remove_file(&sink_path);
         let mut expected = Vec::new();

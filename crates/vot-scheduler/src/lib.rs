@@ -12,9 +12,7 @@ use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
 /// Range granularity a proof covers, from spec/proofs.md.
 pub const RANGE_UNIT_BYTES: u64 = 65_536;
-/// The most bytes one proof-bearing range may cover, from spec/proofs.md.
-/// Public because it is also the most a single admission can transiently
-/// hold, which is what sizes a receiver's staging under ADR-0029.
+/// Max bytes one proof-bearing range may cover. Also sizes receiver staging.
 pub const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
@@ -69,11 +67,8 @@ impl From<SinkError> for Error {
     }
 }
 
-/// Where a subject's verified bytes go the moment they are admitted (ADR-0029).
-///
-/// `write_at` takes `&self` because accepted writes commute: any two are
-/// disjoint or byte-identical, so a sink may be shared across threads and
-/// may see the same range twice.
+/// Where a subject's verified bytes go. `write_at` takes `&self` because
+/// accepted writes commute (disjoint or identical), so sinks are thread-safe.
 pub trait RangeSink: Send + Sync {
     /// # Errors
     /// Refuses a write it cannot take; the receiver keeps the range retryable.
@@ -99,12 +94,7 @@ impl<S: RangeSink + ?Sized> RangeSink for std::sync::Arc<S> {
 }
 
 /// A sink that places each verified range at its offset in one file.
-///
-/// Positional writes only, so a shared handle carries no cursor and
-/// concurrent rails cannot interleave through one. Durability stays the
-/// caller's contract, as [`ReliableReceiver::finish_ranges`] documents:
-/// sync the file through its path when the transfer's claim needs to
-/// include the platter.
+/// Positional writes only; durability is the caller's contract.
 pub struct FileSink {
     file: std::fs::File,
 }
@@ -118,10 +108,7 @@ impl FileSink {
     pub fn create(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
         let file = std::fs::File::create(path)?;
         file.set_len(length)?;
-        // Best effort: a filesystem that refuses costs the write path
-        // only the valid-data zero-fill this avoids, which on NTFS
-        // serializes writers landing out of order and writes every gap
-        // twice.
+        // Best effort: avoids NTFS valid-data zero-fill on out-of-order writes.
         let _ = vot_platform_fs::allow_unordered_writes(&file);
         Ok(Self { file })
     }
@@ -138,16 +125,12 @@ impl FileSink {
             .write(true)
             .open(path)?;
         file.set_len(length)?;
-        // Best effort, as in create: refusal costs only the zero-fill
-        // this avoids.
         let _ = vot_platform_fs::allow_unordered_writes(&file);
         Ok(Self { file })
     }
 
-    /// The handle the writes went through. Sync through this one: it has
-    /// write access, and its error window opened before the first write,
-    /// so a writeback failure between then and the sync must surface. A
-    /// freshly opened handle guarantees neither.
+    /// The handle writes went through. Sync through this one to catch
+    /// writeback failures from before the first write.
     #[must_use]
     pub fn file(&self) -> &std::fs::File {
         &self.file
@@ -196,20 +179,11 @@ impl RangeSink for FileSink {
     }
 }
 
-/// Bounds the extent map so an adversarial arrival order, alternating units
-/// to keep runs from merging, prices its attack at extent entries rather
-/// than being free. Real arrival is near-in-order per rail, so live
-/// fragmentation is on the order of the rail count.
+/// Bounds the extent map against adversarial arrival patterns.
 const MAX_RANGE_FRAGMENTS: usize = 4096;
 
-/// Accepted coverage for one object (ADR-0029).
-///
-/// `extents` maps each disjoint covered run's start to its end, neighbours
-/// merged on insert, so memory tracks fragmentation rather than bytes: the
-/// bytes themselves went to the sink when their range was admitted. Every
-/// range covers whole 64 KiB units, so `bytes` alone decides completeness:
-/// a set of disjoint ranges inside `[0, length)` totalling `length` bytes
-/// can only be the whole object.
+/// Accepted coverage for one object. Extents are merged on insert, so memory
+/// tracks fragmentation, not bytes. Completeness is decided from `bytes` alone.
 struct RangeState {
     extents: BTreeMap<u64, u64>,
     bytes: u64,
@@ -223,11 +197,7 @@ struct Booking {
 }
 
 /// Decides whether a range is new, a replay, or a conflict.
-///
-/// `Ok(None)` is a replay: the range sits wholly inside the covered
-/// extents, its proof bound its bytes to the root before this ran, and
-/// there is nothing to compare because two different byte strings for the
-/// same range cannot both have held.
+/// `Ok(None)` means replay (wholly inside covered extents).
 ///
 /// # Errors
 /// Rejects an overlap that straddles covered and uncovered bytes, a byte
@@ -248,8 +218,6 @@ fn check_range(
     {
         return Ok(None);
     }
-    // Accepted extents never overlap, so only the two neighbours of the
-    // new offset can conflict.
     let earlier = active.extents.range(..covered_offset).next_back();
     let overlaps_earlier = earlier.is_some_and(|(_, end)| covered_offset < *end);
     let overlaps_later = active
@@ -294,12 +262,7 @@ fn book_range(active: &mut RangeState, covered_offset: u64, booking: &Booking) {
     active.extents.insert(start, end);
 }
 
-/// Releases a transient staging hold on every exit, including an unwind.
-///
-/// The sink is caller-supplied code running inside the reserved window, so
-/// the release cannot rely on the line after the write being reached: a
-/// panicking sink would otherwise strand its reservation for the
-/// receiver's remaining life.
+/// Releases a transient staging hold on every exit, including panic.
 struct StagingHold<'capacity> {
     staging: &'capacity mut StagingCapacity,
     bytes: u64,
@@ -422,9 +385,6 @@ impl ReliableReceiver {
         proof: &[u8],
         caller_reserved: bool,
     ) -> Result<(), Error> {
-        // The subject gate runs before any proof work, as it always has: an
-        // unknown subject is refused for what it is, not for how its proof
-        // reads.
         let replay = self.verified.contains(&subject);
         if !replay && !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
@@ -446,9 +406,6 @@ impl ReliableReceiver {
         data: &[u8],
         caller_reserved: bool,
     ) -> Result<(), Error> {
-        // A subject whose every byte is verified has no range state left, but a
-        // peer may still replay a range it already sent. The replay is checked
-        // like any other and then changes nothing.
         if self.verified.contains(&subject) {
             return Ok(());
         }
@@ -461,7 +418,6 @@ impl ReliableReceiver {
             return Ok(());
         };
         let reserved = if caller_reserved {
-            // The caller holds its own reservation and releases it itself.
             0
         } else {
             self.staging.reserve(bytes)?;
@@ -482,16 +438,8 @@ impl ReliableReceiver {
         Ok(())
     }
 
-    /// Books a range whose bytes are already placed: the caller verified it,
-    /// wrote it through [`VerifiedRange::write_to`], and only the extent is
-    /// left to record, so nothing here needs the bytes or touches the sink.
-    ///
-    /// This is what lets a rail place its bytes outside the admission lock:
-    /// accepted writes commute, so placement needs no serialization, and the
-    /// lock covers only this booking. The cost of that order: a replayed
-    /// range reaches the sink again before admission calls it a replay,
-    /// where the sink path skips the write. The contract already allows it,
-    /// identical bytes at the same offset.
+    /// Books a range whose bytes are already placed. Only the extent is
+    /// recorded; no bytes or sink access needed.
     ///
     /// # Errors
     /// Rejects an unknown subject, an overlap with an accepted range, or a
@@ -519,13 +467,8 @@ impl ReliableReceiver {
         Ok(())
     }
 
-    /// Checks a decoded proof bundle without touching receiver state.
-    ///
-    /// Pure, which is what lets a caller spread verification across threads:
-    /// the returned witness carries the verified bytes and can only be built
-    /// here, so [`Self::admit_verified_range`] books it without holding the
-    /// proof again. Staging is not consulted; what a caller holds between
-    /// verifying and admitting is that caller's own bound to keep.
+    /// Checks a decoded proof bundle without touching receiver state. Pure:
+    /// the returned witness enables off-thread verification.
     ///
     /// # Errors
     /// Rejects identity conflicts, duplicate or missing records, unsupported
@@ -545,8 +488,7 @@ impl ReliableReceiver {
         })
     }
 
-    /// Books a range [`Self::verify_typed_bundle`] already proved: the
-    /// subject's sink takes the bytes and only the extent is kept.
+    /// Books a range already proved by [`Self::verify_typed_bundle`].
     ///
     /// # Errors
     /// Rejects an unknown subject, an overlap with an accepted range, a
@@ -576,9 +518,7 @@ impl ReliableReceiver {
     ) -> Result<(), Error> {
         let ordered = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = bundle.covered_length;
-        // Reserved for the span of reassembly and the sink write, released
-        // here whatever happened: once admitted the bytes live in the sink,
-        // not the receiver (ADR-0029).
+        // Released after reassembly and sink write; bytes live in the sink now.
         self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         let result = (|| {
@@ -607,22 +547,14 @@ impl ReliableReceiver {
         self.range_active
             .remove(&subject)
             .ok_or(Error::UnknownObject)?;
-        // Only the verifier reservation is held by now: every range's bytes
-        // went to the sink at admission.
         self.staging.release(VERIFIER_RESERVATION);
         self.verified.insert(subject);
         Ok(())
     }
 
     /// Forgets an incomplete range transfer, releasing what it reserved.
-    ///
-    /// ADR-0031: W rails fetch one object through W receivers, and the
-    /// object completes when the shared plan's coverage does, so a rail's
-    /// own receiver is left holding a partial extent map for an object that
-    /// is already whole on disk. Dropping that state is what bounds a rail's
-    /// receiver by the objects it is fetching rather than by every object it
-    /// ever touched. Answers whether there was anything to forget; a
-    /// verified subject stays verified.
+    /// Used when a rail's object completes elsewhere. Returns whether anything
+    /// was held; a verified subject stays verified.
     pub fn abandon_ranges(&mut self, subject: SubjectId) -> bool {
         if self.range_active.remove(&subject).is_none() {
             return false;
@@ -733,11 +665,8 @@ impl ReliableReceiver {
     }
 }
 
-/// A range whose proof has held against its subject's root.
-///
-/// Only [`ReliableReceiver::verify_typed_bundle`] builds one, so holding a
-/// value of this type is holding the verification itself; admission books
-/// the bytes without seeing the proof again.
+/// A range whose proof has held. Only [`ReliableReceiver::verify_typed_bundle`]
+/// builds one; holding it is holding the verification.
 #[derive(Debug)]
 pub struct VerifiedRange {
     subject: SubjectId,
@@ -760,11 +689,6 @@ impl VerifiedRange {
 
     /// Places the verified bytes and returns the witness admission takes.
     ///
-    /// Holding a [`WrittenRange`] is holding both the proof and the
-    /// placement, which is what lets a caller write outside the receiver's
-    /// lock and admit under it: accepted writes commute, so placement
-    /// needs no serialization.
-    ///
     /// # Errors
     /// Surfaces the sink's refusal; this witness stays usable for a retry.
     pub fn write_to(&self, sink: &dyn RangeSink) -> Result<WrittenRange, SinkError> {
@@ -777,10 +701,8 @@ impl VerifiedRange {
     }
 }
 
-/// A range whose proof has held and whose bytes are already placed.
-///
-/// Only [`VerifiedRange::write_to`] builds one, so holding it is holding
-/// the write itself; admission books the extent without the bytes.
+/// A range whose proof held and bytes are already placed. Admission books
+/// the extent without the bytes.
 #[derive(Debug)]
 pub struct WrittenRange {
     subject: SubjectId,
@@ -789,9 +711,6 @@ pub struct WrittenRange {
 }
 
 /// Checks a bundle's identity against its subject and orders its records.
-///
-/// The one place both bundle paths ask these questions, so a drifted check
-/// would drift for both and the same tests hold either.
 fn validate_typed_bundle<'records>(
     subject: SubjectId,
     bundle: &vot_codec::frames::ProofBundle,
@@ -846,11 +765,7 @@ fn assemble_ordered(
     Ok(data)
 }
 
-/// Holds a range's bounds and its proof against the subject's root.
-///
-/// Pure: nothing here reads or writes receiver state, which is what lets a
-/// caller run it on any thread and admit the result on the one that owns
-/// the receiver.
+/// Holds a range's bounds and its proof. Pure: no receiver state access.
 ///
 /// # Errors
 /// Rejects a range outside the subject, off the 64 KiB unit grid other than
@@ -871,10 +786,6 @@ fn check_range_proof(
     if covered_offset % RANGE_UNIT_BYTES != 0 || covered_end > subject.length {
         return Err(Error::LengthExceeded);
     }
-    // A range covers whole 64 KiB units unless it ends the object, the same
-    // rule `PROOF_BUNDLE` validation applies on the wire. Both proof suites
-    // enforce it too, but stating it here is what lets completion be decided
-    // from the accepted byte total alone.
     if covered_end < subject.length && bytes % RANGE_UNIT_BYTES != 0 {
         return Err(Error::LengthExceeded);
     }
@@ -956,12 +867,7 @@ mod tests {
         }
     }
 
-    /// Retains what it is written, so a test can assert exactly what reached
-    /// the sink and that a replay was not written twice. That second assert
-    /// is stricter than the [`RangeSink`] contract, which allows an identical
-    /// rewrite, so this fixture fits the sink path, where replays are
-    /// skipped before the write, and not the written-range path, where they
-    /// are not.
+    /// Retains what it is written, for test assertions.
     #[derive(Default)]
     struct MemorySink(std::sync::Mutex<BTreeMap<u64, Vec<u8>>>);
 
@@ -1051,8 +957,6 @@ mod tests {
     #[test]
     fn reordered_and_duplicated_delivery_still_verifies_every_range() {
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
-        // Each unit carries its own index so the receiver can recover the
-        // covered offset from a record that arrived out of order.
         let mut bytes = Vec::with_capacity(unit * 3);
         for index in 0..3_u8 {
             bytes.extend(std::iter::repeat_n(index, unit));
@@ -1065,9 +969,6 @@ mod tests {
             ..Impairment::default()
         })
         .unwrap();
-        // One stream per range, which is how ranges are fetched concurrently.
-        // A stream is never reordered against itself, so this is the only
-        // arrangement in which out-of-order arrival is a real carrier outcome.
         for (index, record) in bytes.chunks(unit).enumerate() {
             adapter
                 .send_reliable(StreamId(7 + index as u64), record)
@@ -1094,7 +995,6 @@ mod tests {
                 .unwrap();
             arrivals.push(index);
         }
-        // Out of order, with a duplicate the receiver absorbed idempotently.
         assert_eq!(arrivals.len(), 4);
         assert_ne!(arrivals, vec![0, 1, 2, 2], "delivery was not reordered");
         assert_eq!(
@@ -1108,11 +1008,7 @@ mod tests {
         );
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
-        // Every byte reached the sink exactly once: the duplicate was
-        // absorbed without a second write (MemorySink asserts that).
         assert_eq!(sink.assembled(), bytes);
-        // Staging covered one range at a time, not the object: the peak is
-        // the window, which is what ADR-0029 is for.
         assert_eq!(
             receiver.peak_staging(),
             RANGE_UNIT_BYTES + VERIFIER_RESERVATION
@@ -1138,11 +1034,6 @@ mod tests {
 
     #[test]
     fn an_abandoned_range_transfer_releases_its_room_and_can_begin_again() {
-        // ADR-0031: a rail abandons an object the shared plan completed
-        // elsewhere. The reservation has to come back, or a rail's receiver
-        // is bounded by every object it ever touched rather than the ones it
-        // is fetching; the room is sized to hold exactly one transfer so the
-        // release is what admits the next.
         let object = subject(b"abandoned");
         let other = subject(b"another");
         let mut receiver =
@@ -1158,8 +1049,6 @@ mod tests {
         assert!(receiver.abandon_ranges(object));
         assert!(!receiver.abandon_ranges(object), "forgotten once");
         receiver.begin_ranges(other, Box::new(DiscardSink)).unwrap();
-        // The forgotten subject may begin again: abandoning is not a verdict
-        // on the object, only on this receiver's part in it.
         receiver.abandon_ranges(other);
         receiver
             .begin_ranges(object, Box::new(DiscardSink))
@@ -1198,10 +1087,6 @@ mod tests {
 
     #[test]
     fn a_partial_unit_cannot_stand_in_for_a_whole_one() {
-        // Both proof suites already reject a range that stops mid-unit before
-        // the end of the object. The receiver rejects it first, so deciding
-        // completion from `bytes` alone rests on a rule this crate enforces
-        // rather than on a property of the proof crates.
         let bytes = vec![0x11; usize::try_from(2 * RANGE_UNIT_BYTES).unwrap()];
         let object = subject(&bytes);
         let prefix = vot_proof_blake3::prove(&bytes, 0, 1024).unwrap();
@@ -1215,7 +1100,6 @@ mod tests {
             Err(Error::LengthExceeded)
         );
 
-        // The final range may be short, because it ends the object.
         let short = vec![0x22; usize::try_from(RANGE_UNIT_BYTES).unwrap() + 7];
         let short_object = subject(&short);
         let tail_offset = RANGE_UNIT_BYTES;
@@ -1443,9 +1327,6 @@ mod tests {
         overlap
             .receive_range(range_subject, 0, first_two, &first_two_proof.proof)
             .unwrap();
-        // Wholly inside the covered extent is a replay under ADR-0029's
-        // coverage rule: the proof held, the bytes are already placed, and
-        // nothing changes.
         overlap
             .receive_range(
                 range_subject,
@@ -1534,11 +1415,7 @@ mod tests {
             std::thread::current().id()
         ));
         let sink = FileSink::create(&path, bytes.len() as u64).unwrap();
-        // Sized at creation, so a partially covered object still has the
-        // subject's length on disk.
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
-        // Out of order, and one range twice: writes place, never extend or
-        // interleave, so order and repetition cannot show in the bytes.
         sink.write_at(2 * RANGE_UNIT_BYTES, &bytes[unit * 2..])
             .unwrap();
         sink.write_at(0, &bytes[..unit]).unwrap();
@@ -1553,10 +1430,6 @@ mod tests {
 
     #[test]
     fn a_resumed_sink_keeps_what_the_last_fetch_placed() {
-        // ADR-0032: continuing a partial bundle reopens the file, and a
-        // truncating open would throw away exactly the bytes resume
-        // exists to keep. The reopen still sizes the file, so a resumed
-        // object holds the subject's length however the last fetch died.
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
         let path = std::env::temp_dir().join(format!(
             "vot-file-sink-resume-{}-{:?}.bin",
@@ -1601,8 +1474,6 @@ mod tests {
             let start = usize::try_from(offset).unwrap();
             &bytes[start..start + unit]
         };
-        // First and last, then the middle: the bridging insert merges with
-        // both neighbours and the map ends at one entry.
         receiver
             .receive_range(object, 0, range(0), &prove(0).proof)
             .unwrap();
@@ -1631,10 +1502,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 3 * RANGE_UNIT_BYTES)]
         );
-        // A replay of a range inside the coalesced run changes nothing and
-        // is not written again (MemorySink asserts the single write). The
-        // second replay ends exactly at the run's end, the boundary the
-        // coverage rule must still call covered.
         receiver
             .receive_range(
                 object,
@@ -1674,10 +1541,8 @@ mod tests {
             receiver.receive_range(object, 0, &bytes, &proof.proof),
             Err(Error::Sink)
         );
-        // Nothing was booked and nothing stayed charged.
         assert_eq!(receiver.advertised_credit(), credit);
         assert_eq!(receiver.range_active[&object].bytes, 0);
-        // The same range offered again completes the object.
         receiver
             .receive_range(object, 0, &bytes, &proof.proof)
             .unwrap();
@@ -1707,8 +1572,6 @@ mod tests {
             receiver.receive_range(object, 0, &bytes, &proof.proof)
         }));
         assert!(outcome.is_err(), "the sink's panic reached the caller");
-        // The unwind released the transient reservation, so the receiver's
-        // remaining life is not smaller for the panic.
         assert_eq!(receiver.advertised_credit(), credit);
     }
 
@@ -1722,8 +1585,6 @@ mod tests {
         receiver
             .begin_ranges(object, Box::new(DiscardSink))
             .unwrap();
-        // Fill the map to its bound with synthetic far-away runs; only the
-        // count matters to the refusal.
         {
             let active = receiver.range_active.get_mut(&object).unwrap();
             for index in 0..u64::try_from(MAX_RANGE_FRAGMENTS).unwrap() {
@@ -1736,8 +1597,6 @@ mod tests {
             receiver.receive_range(object, 0, &bytes[..unit], &first.proof),
             Err(Error::RangeFragmentsExhausted)
         );
-        // Adjacent to an existing run the same range merges rather than
-        // fragments, so the bound does not refuse it.
         {
             let active = receiver.range_active.get_mut(&object).unwrap();
             active.extents.remove(&(10 * RANGE_UNIT_BYTES));
@@ -1756,8 +1615,6 @@ mod tests {
             receiver.range_active[&object].extents[&0],
             2 * RANGE_UNIT_BYTES
         );
-        // The mirror case: a range adjacent from below merges through its
-        // earlier neighbour, so the bound does not refuse that side either.
         let third =
             vot_proof_blake3::prove(&bytes, 2 * RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         receiver
@@ -1939,8 +1796,6 @@ mod tests {
         receiver
             .receive_typed_bundle(subject, &bundle, &decoded_records)
             .unwrap();
-        // The bytes went to the sink, so their credit came back with the
-        // call; only the transient reassembly charge is left to see.
         assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
         assert_eq!(receiver.peak_staging(), staging_limit);
         receiver.finish_ranges(subject).unwrap();
@@ -1985,9 +1840,6 @@ mod tests {
 
     #[test]
     fn a_witness_verifies_off_thread_and_admits_on_it() {
-        // The two-phase surface: verification is pure and can run anywhere;
-        // admission books what the witness proves without seeing the proof
-        // again, and refuses what verification never touched.
         let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
         let subject = SubjectId {
             suite: 1,
@@ -2020,7 +1872,6 @@ mod tests {
             encoded: bytes.clone(),
         }];
 
-        // Verified on another thread, as the parallel receiver runs it.
         let range = std::thread::scope(|scope| {
             scope
                 .spawn(|| ReliableReceiver::verify_typed_bundle(subject, &bundle, &records))
@@ -2039,14 +1890,11 @@ mod tests {
             .unwrap();
         let credit_before = receiver.advertised_credit();
         receiver.admit_verified_range(range).unwrap();
-        // The write is what staging covered: the charge is transient, so
-        // credit is back but the peak recorded it.
         assert_eq!(receiver.advertised_credit(), credit_before);
         assert_eq!(receiver.peak_staging(), staging_limit);
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
 
-        // A corrupt payload never becomes a witness.
         let mut bad_records = records.to_vec();
         bad_records[0].encoded[0] ^= 1;
         assert!(matches!(
@@ -2054,7 +1902,6 @@ mod tests {
             Err(Error::ProofInvalid)
         ));
 
-        // A witness for a subject no receiver opened is refused at admission.
         let stray = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
         let mut closed =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
@@ -2063,7 +1910,6 @@ mod tests {
             Err(Error::UnknownObject)
         ));
 
-        // A replayed witness changes nothing, the duplicate rule ranges keep.
         let again = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
         let credit_verified = receiver.advertised_credit();
         receiver.admit_verified_range(again).unwrap();
@@ -2113,20 +1959,15 @@ mod tests {
             .begin_ranges(subject, Box::new(sink.clone()))
             .unwrap();
         let credit = receiver.advertised_credit();
-        // Placed outside any lock, admitted without the bytes: the caller
-        // holds the write's witness, so admission needs neither the data
-        // nor the sink.
         let written = range.write_to(sink.as_ref()).unwrap();
         drop(range);
         receiver.admit_written_range(written).unwrap();
-        // The bytes never crossed the receiver, so staging did not move.
         assert_eq!(receiver.advertised_credit(), credit);
         assert_eq!(receiver.range_active[&subject].bytes, bytes.len() as u64);
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
         assert_eq!(sink.assembled(), bytes);
 
-        // A replayed placement of a verified subject changes nothing.
         receiver
             .admit_written_range(WrittenRange {
                 subject,
@@ -2135,7 +1976,6 @@ mod tests {
             })
             .unwrap();
 
-        // A subject no receiver opened is refused at admission.
         let mut closed =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
         assert!(matches!(
@@ -2147,8 +1987,6 @@ mod tests {
             Err(Error::UnknownObject)
         ));
 
-        // A placement straddling covered and uncovered bytes is a conflict,
-        // the same answer the sink path gives.
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
         let second = vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let mut straddled =

@@ -1,12 +1,4 @@
-//! Serving one bundle over a session: the accept half of ADR-0030.
-//!
-//! A [`BundleServer`] holds everything a session needs answered: the
-//! descriptor and seal announced at readiness, the manifest pages the seal
-//! committed to, and a proving layer per stored object so a range is proved
-//! from chaining values rather than from the object (ADR-0025). The engine
-//! speaks frames to a [`Session`] over any [`TransportAdapter`]; the
-//! simulator carries it in tests and a socket-owning backend carries it for
-//! real behind the same seam.
+//! Serving one bundle over a session.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
@@ -27,36 +19,17 @@ use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
 /// The reliable lane every data record rides.
-///
-/// One lane is the shape the bench proved at one rail; more lanes are the
-/// multi-rail step ADR-0030 defers until a measurement asks for it.
 const RECORD_LANE: StreamId = StreamId(1);
 
-/// Plaintext bytes per data record, bounded on both sides.
-///
-/// A record's whole encoded payload must stay inside the codec's 256 KiB
-/// record limit, so the plaintext leaves room for the CBOR envelope. And the
-/// largest legal cover, a 4 MiB request expanded to its group boundaries, is
-/// 4,259,840 bytes and must fit the codec's seventeen records per bundle,
-/// which needs at least 250,579 bytes of plaintext each. 252 KiB satisfies
-/// both with 4 KiB of envelope room.
+/// Plaintext bytes per data record. Bounded by the codec record limit and the
+/// largest cover across the bundle's record cap.
 const RECORD_PLAINTEXT_BYTES: usize = 258_048;
 
-/// Answer bytes held before the loop stops producing more.
-///
-/// A peer pipelining requests faster than the carrier drains answers would
-/// otherwise grow the outbound queue without bound. Unread requests wait in
-/// the carrier and a manifest answer waits in its cursor, which is the
-/// backpressure. Two full-size range answers keeps the carrier busy while
-/// one drains.
+/// Outbound budget. Bounds the queue against a peer pipelining faster than it drains.
 const OUTBOUND_BUDGET_BYTES: u64 = 2 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
 
-/// Request identities remembered for replay detection.
-///
-/// `spec/wire.md` section 4: an exact duplicate reuses the original result,
-/// a duplicate identifier with different content is a protocol error. The
-/// window is bounded the way the receiver bounds its remembered bundles; a
-/// request evicted from it is simply answered as new.
+/// Request identities remembered for replay detection. An exact duplicate is
+/// re-answered; a duplicate identifier with different content is a protocol error.
 const REMEMBERED_REQUESTS: usize = 64;
 
 /// One bundle, opened and proved once, answering any number of sessions.
@@ -64,8 +37,7 @@ pub struct BundleServer {
     package: PackageSummary,
     manifest_id: [u8; 16],
     page_count: u64,
-    /// The seal's page digest by index, so a page read from disk later must
-    /// still be the one the seal committed to.
+    /// Page digest by index, to check pages read later against the seal.
     page_digests: Vec<[u8; 32]>,
     manifest_directory: PathBuf,
     /// The descriptor and seal frames, encoded once, announced at readiness.
@@ -81,28 +53,13 @@ struct ServedObject {
     witness: Witness,
 }
 
-/// What a file was before its layer was built, for a stat's worth of cost.
-///
-/// An ordinary write moves the modification time, so a witness that still
-/// matches is almost always a file nothing has written to, and one that
-/// does not match says something touched it, which is not yet a reason to
-/// end a session: the content decides that.
-///
-/// Almost always, not always. Length and modification time are both the
-/// writer's to choose, so a rewrite that restores them is not reported
-/// here, and neither is one that lands inside the same timestamp tick as
-/// the witness. That is what makes this a way to name a mutation cheaply
-/// and not a way to prove there was none. The proof of that is the peer's:
-/// every range it takes is verified against the object root before its
-/// bytes are placed, and `receive` verifies each object again end to end
-/// before publishing it. Mutated bytes cannot reach a destination whatever
-/// this answers, which is why it is worth a stat and not a hash of
-/// everything served.
+/// A file's length and modification time at open, for cheap mutation detection.
+/// Not a proof: a rewrite that restores both is missed, but the peer verifies
+/// every range against the object root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Witness {
     length: u64,
-    /// `None` where the platform will not report one, which proves nothing
-    /// and so never takes the cheap path.
+    /// `None` where the platform reports no modification time.
     modified: Option<SystemTime>,
 }
 
@@ -115,8 +72,7 @@ impl Witness {
         })
     }
 
-    /// Whether this and `current` together report no write since the
-    /// witness was taken.
+    /// True when no write is reported since the witness was taken.
     fn reports_untouched(&self, current: &Self) -> bool {
         self.modified.is_some() && self == current
     }
@@ -143,11 +99,10 @@ impl ProverLayer {
         }
     }
 
-    /// Whether the cover read back is still the bytes the layer was built
-    /// from, group by group.
+    /// Whether the bytes read back match what the layer was built from.
     ///
-    /// The cover starts on a group boundary, so its first group is at
-    /// `covered_offset / GROUP_SIZE` and the rest follow.
+    /// The cover starts on a group boundary; the first group is at
+    /// `covered_offset / GROUP_SIZE`.
     fn holds(&self, covered_offset: u64, plaintext: &[u8]) -> bool {
         if covered_offset % GROUP_SIZE as u64 != 0 {
             return false;
@@ -186,18 +141,14 @@ pub struct ServeConnection {
     remembered: VecDeque<Remembered>,
     pending: VecDeque<Outbound>,
     pending_bytes: u64,
-    /// The pages still owed on a manifest answer, as `(next, end)`. Held
-    /// here rather than queued at once because a conforming request may name
-    /// 8,192 pages of a mebibyte each, and the budget has to pace that the
-    /// way it paces range answers.
+    /// Owed manifest pages as `(next, end)`. Paced rather than queued at once;
+    /// a request may name thousands of pages.
     manifest_cursor: Option<(u64, u64)>,
     budget: u64,
     closed: Option<u16>,
-    /// Every answer this session has queued, only ever going up. A driving
-    /// loop reads it to tell a slow session from a stopped one.
+    /// Answers queued this session, only ever increasing.
     progress: u64,
-    /// And every answer the carrier has taken from it, which is the half of
-    /// that story a full outbound budget hides. See [`Self::progress`].
+    /// Answers the carrier has taken, which the outbound budget may hide.
     handed_over: u64,
 }
 
@@ -264,17 +215,13 @@ impl ServeConnection {
         self.pending_bytes
     }
 
-    /// Whether answers are still owed: queued frames or unpaged manifest
-    /// pages. A driving loop with a backlog calls service again rather than
-    /// waiting for a carrier event that may never come.
+    /// Whether answers are still owed: queued frames or unpaged manifest pages.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
         !self.pending.is_empty() || self.manifest_cursor.is_some()
     }
 
-    /// Records the close and forgets what was owed: nothing queued goes to a
-    /// carrier that ended, and a lingering backlog would tell a driving loop
-    /// to keep servicing a session that cannot progress.
+    /// Records the close and drops pending answers.
     fn close_with(&mut self, code: u16) {
         self.closed = Some(code);
         self.pending.clear();
@@ -296,8 +243,7 @@ impl ServeConnection {
             .find(|seen| seen.frame_type == frame_type && seen.request_id == request_id)
         {
             if seen.digest == digest {
-                // Rebuilding the answer reproduces it exactly: the bundle
-                // identity is derived from the request bytes.
+                // Rebuild reproduces it: the bundle identity derives from the request bytes.
                 return Ok(());
             }
             return Err(Fault::Peer(error_code::REPLAY_REJECTED));
@@ -313,15 +259,9 @@ impl ServeConnection {
         Ok(())
     }
 
-    /// Every answer this session has queued and every one the carrier has
-    /// taken, only ever going up.
-    ///
-    /// Both, because either alone stands still through a case the other
-    /// sees. Queuing stops at the outbound budget, so a server whose peer
-    /// reads slowly queues nothing new and hands over what it has one frame
-    /// at a time; counting only what is queued calls that stopped. Counting
-    /// only what is taken would miss a server building answers it has not
-    /// been able to send yet.
+    /// Queued plus handed-over answers, only ever increasing. Both are needed:
+    /// the outbound budget can stall queuing while the carrier still drains,
+    /// or vice versa.
     #[must_use]
     pub fn progress(&self) -> u64 {
         self.progress.saturating_add(self.handed_over)
@@ -357,16 +297,13 @@ impl ServeConnection {
                         };
                         self.pending_bytes = self.pending_bytes.saturating_sub(bytes as u64);
                     }
-                    // The carrier took one, which is this session getting
-                    // somewhere even when the budget stops it queuing more.
+                    // Progress even under a stalled budget.
                     self.handed_over = self.handed_over.saturating_add(1);
                 }
-                // Backpressure: the frame stays queued for the next pass.
+                // Backpressure: retry next pass.
                 Err(error) if is_backpressure(&error) => break,
                 Err(error) if matches!(error.kind(), ErrorKind::FrameExceedsLimit { .. }) => {
-                    // A conforming peer may advertise limits these answers
-                    // cannot fit; this server does not resize its answers, so
-                    // the session ends under the code that names the problem.
+                    // Peer limits too small for this server's answers.
                     let _ = session.driver().close(error_code::FRAME_TOO_LARGE);
                     self.close_with(error_code::FRAME_TOO_LARGE);
                     return Ok(());
@@ -387,16 +324,14 @@ fn fail<A: TransportAdapter>(
 ) -> Result<ServeStatus, Error> {
     match fault {
         Fault::Peer(code) => {
-            // The session cannot say why, so the carrier does; a simulator
-            // records it instead.
+            // The session cannot close itself; the carrier does.
             let _ = session.driver().close(code);
             connection.close_with(code);
             Ok(ServeStatus::Closed(code))
         }
         Fault::Local(error) => {
             if matches!(error, Error::SourceMutation) {
-                // The peer is otherwise left waiting on an answer this
-                // server detected it must not give.
+                // Tell the peer why before the local error surfaces.
                 let _ = session.driver().close(error_code::SOURCE_MUTATED);
                 connection.close_with(error_code::SOURCE_MUTATED);
             }
@@ -426,9 +361,7 @@ impl BundleServer {
     pub fn open(bundle: &Path) -> Result<Self, Error> {
         let package = crate::scan_manifest(bundle)?;
         let manifest_directory = bundle.join(MANIFEST_DIRECTORY);
-        // Bounded by what a SEAL frame may carry, not the page bound: a seal
-        // past the registered limit could never be announced, so refusing it
-        // here names the real constraint.
+        // Bounded by the SEAL frame limit: a larger seal could never be announced.
         let seal_limit = vot_codec::registered_payload_limit(vot_codec::frame_type::SEAL)
             .unwrap_or(vot_manifest::MAX_PAGE_BYTES);
         let seal_bytes =
@@ -436,8 +369,7 @@ impl BundleServer {
         let seal = vot_manifest::decode_seal(&seal_bytes).map_err(|_| Error::InvalidBundle)?;
         let page_digests = crate::seal_page_digests(&seal)?;
 
-        // Every stored object the manifest names: the logical object of a
-        // direct entry, the pack of a packed one.
+        // Map manifest entries to their stored objects.
         let mut reader = ManifestReader::open(bundle)?;
         let mut wanted: BTreeMap<[u8; 32], (Suite, u64)> = BTreeMap::new();
         while let Some(record) = reader.next_record()? {
@@ -495,10 +427,8 @@ impl BundleServer {
         self.package
     }
 
-    /// One pass over what the carrier holds: drains queued answers, reads
-    /// events until none are left or the outbound budget is reached, and
-    /// answers every request it reads. Never blocks; the caller waits on the
-    /// adapter between passes.
+    /// One non-blocking pass: drains queued answers, reads events up to the
+    /// outbound budget, and answers every request.
     pub fn service<A: TransportAdapter>(
         &self,
         session: &mut Session<A>,
@@ -520,8 +450,7 @@ impl BundleServer {
             }
             match session.poll() {
                 Ok(Some(Event::Control(bytes))) => {
-                    // Announced before the first answer, so the descriptor
-                    // and seal precede everything else on the stream.
+                    // Announce before the first answer.
                     self.ensure_announced(connection, session.is_ready());
                     if let Err(fault) = self.dispatch(&bytes, connection) {
                         return fail(fault, session, connection);
@@ -535,8 +464,7 @@ impl BundleServer {
                 }
                 Err(error) => {
                     if error.kind().is_peer_fault() {
-                        // The session already closed the carrier under this
-                        // code; the pass only records it.
+                        // The session already closed; record the code.
                         let code = error.close_code();
                         connection.closed = Some(code);
                         return Ok(ServeStatus::Closed(code));
@@ -579,8 +507,7 @@ impl BundleServer {
             Err(_) => return Err(Fault::Peer(error_code::MALFORMED_FRAME)),
         };
         if consumed != bytes.len() {
-            // One control event carries one frame; a conforming sender
-            // produces no trailing bytes.
+            // One event carries one frame; trailing bytes are a protocol error.
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
         }
         match frame {
@@ -614,13 +541,10 @@ impl BundleServer {
             .checked_add(request.page_count)
             .ok_or(Fault::Peer(error_code::MANIFEST_INVALID))?;
         if end > self.page_count {
-            // The descriptor named the page count; asking past it is not
-            // something a conforming client does.
+            // Asking past the announced page count.
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
-        // The answer is a cursor, not queued frames: the pages are produced
-        // under the outbound budget, and no further request is read until
-        // they have all been owed to the carrier.
+        // A cursor, not queued frames: pages are paced by the budget.
         connection.manifest_cursor = Some((request.first_page, end));
         Ok(())
     }
@@ -637,8 +561,7 @@ impl BundleServer {
             )?;
             let slot = usize::try_from(next).map_err(|_| Error::InvalidBundle)?;
             if self.page_digests.get(slot) != Some(blake3::hash(&bytes).as_bytes()) {
-                // The disk changed under a running server; this page is not
-                // the one the seal committed to.
+                // Page changed on disk since the seal.
                 return Err(Fault::Local(Error::SourceMutation));
             }
             connection.queue_control(encoded(&TypedFrame::ManifestPage(bytes))?);
@@ -665,13 +588,11 @@ impl BundleServer {
         if served.object != request.object {
             return Err(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH));
         }
-        // The codec bounded the request: nonzero, at most 4 MiB, inside the
-        // object. The cover expands it to group boundaries.
+        // The codec bounded the request; the cover expands it to group boundaries.
         let (covered_offset, covered_length, proof) =
             served.layer.prove(request.offset, request.length)?;
         let plaintext = served.read_covered(covered_offset, covered_length)?;
-        // Identity from the request bytes, so an exact replay re-serves the
-        // same bundle and the receiver's replay window recognises it.
+        // Bundle identity derives from the request bytes, for replay detection.
         let mut bundle_id = [0u8; 16];
         bundle_id.copy_from_slice(&blake3::hash(request_bytes).as_bytes()[..16]);
         let chunks = plaintext.chunks(RECORD_PLAINTEXT_BYTES);
@@ -711,10 +632,8 @@ impl ServedObject {
     fn build(objects: &Path, root: [u8; 32], suite: Suite, length: u64) -> Result<Self, Error> {
         let path = objects.join(crate::object_name(&root));
         let mut file = File::open(&path)?;
-        // Taken before a byte is read, not after: a write that lands during
-        // the read would otherwise be stamped into the witness, and every
-        // later stat would match it while the layer held the bytes from
-        // before the write.
+        // Take the witness before reading: a mid-read write would otherwise
+        // stamp into the witness.
         let witness = Witness::of(&file)?;
         let mut verifier = StreamVerifier::new(suite);
         let mut layer = ProverLayer::empty(suite);
@@ -747,27 +666,9 @@ impl ServedObject {
         })
     }
 
-    /// Reads the cover's bytes from the file the layer was built from, and
-    /// holds them to what the layer took at open.
-    ///
-    /// A file rewritten in place keeps its length, so it reads back whole
-    /// and only its content gives it away. Without this the bytes ship with
-    /// a proof they do not answer and the peer refuses them, which blames
-    /// the wire for what this end could see: the object under a served
-    /// bundle changed, and no session should continue over it.
-    ///
-    /// Hashing every cover is what shows that, and it is also exactly the
-    /// work the peer does with the same bytes, so a server that always did
-    /// it would spend most of a core at line rate recomputing the peer's
-    /// answer. It is spent only when the file's own metadata does not
-    /// report the file untouched since the layer was built. The stat comes
-    /// after the read and through the handle the bytes came from, so a
-    /// write landing mid-read is one the metadata still reports.
-    ///
-    /// The handle is opened per cover rather than held from open: a bundle
-    /// names as many stored objects as its manifest has entries, and one
-    /// descriptor each would refuse a large bundle at open for no reason a
-    /// peer could see.
+    /// Reads the cover's bytes and checks they match what the layer was built
+    /// from. Uses the witness stat first; falls back to hashing only when
+    /// metadata can't vouch for the file.
     fn read_covered(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
         let mut file = File::open(&self.path).map_err(missing_object)?;
         file.seek(SeekFrom::Start(offset))?;
@@ -784,10 +685,8 @@ impl ServedObject {
     }
 }
 
-/// An object that has gone since open changed under the server, the same
-/// answer a shortened one gets, so the peer is told why rather than left
-/// waiting on an answer it will not get. Anything else is this host's own
-/// trouble and keeps its cause.
+/// A missing object is treated as a source mutation: the peer is told why
+/// rather than left waiting.
 fn missing_object(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::NotFound {
         Error::SourceMutation
@@ -820,8 +719,7 @@ mod tests {
     use vot_scheduler::ReliableReceiver;
     use vot_transport_api::SubjectId;
 
-    /// A server session driven to readiness by a client's handshake frames,
-    /// with the handshake replies cleared so tests read only answers.
+    /// A ready server session with handshake replies cleared.
     fn ready_session() -> Session<Loopback> {
         ready_session_with(Settings::default())
     }
@@ -859,11 +757,7 @@ mod tests {
         }
     }
 
-    /// Pairs every sent proof bundle with the records that carry its bytes.
-    ///
-    /// Records are consumed in wire order, exactly `data_record_count` per
-    /// bundle, so a replayed bundle sharing an identity cannot swallow the
-    /// other's records and a short or long answer fails loudly.
+    /// Pairs proof bundles with their records, consumed in wire order.
     fn served_answers(session: &mut Session<Loopback>) -> Vec<(ProofBundle, Vec<DataRecord>)> {
         let control = std::mem::take(&mut session.driver().control);
         let records = std::mem::take(&mut session.driver().records);
@@ -1044,7 +938,7 @@ mod tests {
         server.service(&mut session, &mut connection).unwrap();
         session.driver().control.clear();
 
-        // Mid-object: the cover snaps outward to group boundaries.
+        // Mid-object: cover snaps to group boundaries.
         session
             .driver()
             .events
@@ -1054,7 +948,7 @@ mod tests {
                 offset: 70_000,
                 length: 50_000,
             })));
-        // Tail: the cover is clipped to the object's end.
+        // Tail: cover clipped to object end.
         session
             .driver()
             .events
@@ -1290,10 +1184,6 @@ mod tests {
 
     #[test]
     fn handing_an_answer_to_the_carrier_is_progress() {
-        // A server whose peer reads slowly queues nothing new, because the
-        // outbound budget stops it, and hands over what it has as room
-        // appears. Counting only what is queued calls that stopped, and the
-        // driving loop ends a session that is moving.
         let (bundle, _) = built_bundle("slow-peer", &[("big.bin", patterned(4_300_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
@@ -1316,8 +1206,7 @@ mod tests {
         session.driver().refuse_sends = usize::MAX;
         server.service(&mut session, &mut connection).unwrap();
         assert!(connection.pending_answer_bytes() >= OUTBOUND_BUDGET_BYTES);
-        // Nothing left to read, so anything the count does from here is the
-        // handover and not the queuing.
+        // No more requests to read; any progress change is handover only.
         session.driver().events.clear();
 
         let stalled = connection.progress();
@@ -1364,8 +1253,7 @@ mod tests {
                     length: 4_194_304,
                 })));
         }
-        // A carrier that takes nothing: answers queue until the budget stops
-        // the reading, and the last request waits in the carrier.
+        // Carrier refuses all sends; budget stops reading.
         session.driver().refuse_sends = usize::MAX;
         let status = server.service(&mut session, &mut connection).unwrap();
         assert_eq!(status, ServeStatus::Active);
@@ -1603,8 +1491,7 @@ mod tests {
         let (bundle, _) = built_bundle("narrow", &[("big.bin", patterned(300_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
-        // A conforming peer at the smallest record limit the registry allows
-        // cannot take this server's records; the session says so and ends.
+        // Peer's record limit too small for this server's answers.
         let mut session = ready_session_with(Settings {
             max_data_record_payload: 64 * 1024,
             ..Settings::default()
@@ -1838,8 +1725,7 @@ mod tests {
     fn a_peer_fault_in_the_session_is_recorded_with_its_code() {
         let (bundle, _) = built_bundle("fault", &[("a.txt", patterned(1000))]);
         let server = BundleServer::open(&bundle).unwrap();
-        // Garbage on the control stream before readiness is the session's
-        // error to close on; the pass records the code it chose.
+        // Garbage before readiness; the session closes.
         let mut session = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -1892,10 +1778,7 @@ mod tests {
 
     #[test]
     fn an_untouched_file_is_served_without_rehashing_it() {
-        // The cheap path is the point: metadata reporting no write to the
-        // file since it was read stands in for hashing every byte served.
-        // A layer that could not possibly hold the file's bytes still
-        // serves, which is what shows the hash was skipped.
+        // The witness stands in for hashing; an empty layer still serves.
         let (bundle, _) = built_bundle("untouched", &[("big.bin", patterned(150_000))]);
         let mut server = BundleServer::open(&bundle).unwrap();
         let stored = server.objects.values_mut().next().unwrap();
@@ -1930,9 +1813,7 @@ mod tests {
 
     #[test]
     fn an_object_removed_after_open_is_reported_and_closed() {
-        // Covers are read per answer, so an object can go between open and
-        // the request for it. That is the source changing under the server
-        // as much as a shortened one is, and the peer is owed the reason.
+        // An object removed between open and the request.
         let (bundle, _) = built_bundle("removed", &[("big.bin", patterned(150_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
@@ -1974,8 +1855,7 @@ mod tests {
         assert_ne!(taken, after);
         assert!(!taken.reports_untouched(&after));
 
-        // A platform that will not report a modification time proves
-        // nothing, however much else matches.
+        // No modification time means the witness proves nothing.
         let silent = Witness {
             length: taken.length,
             modified: None,
@@ -1985,9 +1865,7 @@ mod tests {
 
     #[test]
     fn an_object_rewritten_in_place_after_open_is_reported_and_closed() {
-        // A rewrite that keeps the length reads back whole, so nothing but
-        // the content gives it away. Two groups, and the change is in the
-        // second, so it is not the first bytes read that catch it.
+        // Length-preserving rewrite; change in the second group.
         let (bundle, _) = built_bundle("rewritten", &[("big.bin", patterned(150_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
@@ -1997,10 +1875,8 @@ mod tests {
         let mut rewritten = fs::read(&path).unwrap();
         rewritten[100_000] ^= 1;
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        // A write lands in whatever timestamp tick it lands in, so the test
-        // writes until the file's own metadata reports the change rather
-        // than assuming the first one did. Counted, not timed: a tick is
-        // milliseconds and a write of this file is microseconds.
+        // Retry writes until the modification time moves; a write may land
+        // in the same tick.
         let mut reported = false;
         for _ in 0..REWRITE_ATTEMPTS {
             fs::write(&path, &rewritten).unwrap();
@@ -2034,9 +1910,7 @@ mod tests {
 
     #[test]
     fn a_cover_is_held_to_the_groups_it_starts_at() {
-        // The check indexes by the cover's own offset, so a cover from the
-        // middle of an object is held to the groups that live there and not
-        // to the ones a zero-based walk would name.
+        // Indexed by the cover's own offset, not zero-based.
         let (bundle, _) = built_bundle("indexed", &[("big.bin", patterned(200_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let stored = server.objects.values().next().unwrap();

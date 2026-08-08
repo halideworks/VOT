@@ -149,8 +149,6 @@ pub enum Error {
     PeerClosed(u16),
     /// No serve registered for this rendezvous key.
     RendezvousUnresolved,
-    /// Rendezvous service did not answer in time.
-    RendezvousTimeout,
 }
 
 impl From<io::Error> for Error {

@@ -216,7 +216,6 @@ fn serve(
 fn rendezvous_service_address() -> Result<std::net::SocketAddr, vot_cli::Error> {
     std::env::var("VOT_RENDEZVOUS")
         .ok()
-        .or_else(|| std::env::var("VOT_RENDEZVOUS_DEFAULT").ok())
         .as_deref()
         .map(|v| v.trim().parse())
         .transpose()

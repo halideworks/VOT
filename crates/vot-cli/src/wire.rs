@@ -496,9 +496,9 @@ const RESOLVE_RETRIES: u32 = 6;
 /// the serve's observed mapping.
 ///
 /// # Errors
-/// Returns [`Error::RendezvousTimeout`] if the service never answers, or
-/// [`Error::RendezvousUnresolved`] if no serve registered before the retry
-/// budget was spent.
+/// Returns [`Error::RendezvousUnresolved`] if no serve is found before the
+/// retry budget is spent, or [`Error::CarrierUnavailable`] if the socket
+/// fails.
 pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, Error> {
     let key = crate::rendezvous::key_of(&root);
     let socket = std::net::UdpSocket::bind(if service.is_ipv6() {

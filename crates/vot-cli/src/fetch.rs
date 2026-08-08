@@ -690,7 +690,7 @@ fn refusal_code(error: &vot_scheduler::Error) -> u16 {
 /// a store.
 fn remove_store_files(bundle: &Path) -> Result<(), Error> {
     ResumeStore::open(bundle.join(RESUME_STORE))
-        .and_then(ResumeStore::remove)
+        .and_then(ResumeStore::remove_unshared)
         .map_err(resume_failure)
 }
 

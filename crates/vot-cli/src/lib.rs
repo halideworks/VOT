@@ -72,21 +72,50 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
     Ok(root)
 }
 
-/// A rendezvous service as an `ADDR:PORT`, or a `NAME:PORT` the resolver
-/// knows. A name that answers with several addresses takes the first.
+/// Every address a rendezvous service answers at, given `ADDR:PORT` or
+/// `NAME:PORT`, or a comma-separated list of either, IPv6 first.
+///
+/// IPv6 leads because a global IPv6 address has no translation in front of
+/// it: nothing to punch, and no mapping to keep alive. A serve registers
+/// at all of them and a fetch tries them in this order.
+///
+/// The list is for a service whose families are not behind one name, which
+/// is every service two people point at each other without running DNS.
 ///
 /// # Errors
-/// Rejects a value that is neither an address nor a name that resolves.
-pub fn parse_rendezvous(value: &str) -> Result<std::net::SocketAddr, Error> {
+/// Rejects a value with any part that is neither an address nor a name
+/// that resolves.
+pub fn parse_rendezvous(value: &str) -> Result<Vec<std::net::SocketAddr>, Error> {
     // `to_socket_addrs` parses a literal itself and only reaches the resolver
     // for what is not one, so a literal costs no lookup.
     use std::net::ToSocketAddrs as _;
-    value
-        .trim()
-        .to_socket_addrs()
-        .map_err(|_| Error::InvalidArguments)?
-        .next()
-        .ok_or(Error::InvalidArguments)
+    let mut answered: Vec<std::net::SocketAddr> = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(Error::InvalidArguments);
+        }
+        answered.extend(
+            part.to_socket_addrs()
+                .map_err(|_| Error::InvalidArguments)?,
+        );
+    }
+    let mut ordered: Vec<std::net::SocketAddr> = Vec::new();
+    for address in answered
+        .iter()
+        .filter(|address| address.is_ipv6())
+        .chain(answered.iter().filter(|address| address.is_ipv4()))
+    {
+        // A name and a literal can answer with the same address, and trying
+        // it twice would spend the punch bound twice on one route.
+        if !ordered.contains(address) {
+            ordered.push(*address);
+        }
+    }
+    if ordered.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(ordered)
 }
 
 /// The seal's page digests by index, refusing a commitment list that does
@@ -1890,6 +1919,52 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_rendezvous_names_every_address_it_answers_at_with_ipv6_first() {
+        use std::net::SocketAddr;
+
+        let at = |text: &str| text.parse::<SocketAddr>().expect("an address");
+        assert_eq!(
+            parse_rendezvous(" 198.51.100.7:9000 ").expect("an address"),
+            vec![at("198.51.100.7:9000")]
+        );
+        assert_eq!(
+            parse_rendezvous("[2001:db8::1]:9000").expect("an address"),
+            vec![at("[2001:db8::1]:9000")]
+        );
+        assert_eq!(
+            parse_rendezvous("198.51.100.7:9000, [2001:db8::1]:9000").expect("a list"),
+            vec![at("[2001:db8::1]:9000"), at("198.51.100.7:9000")],
+            "IPv6 leads whatever order they were given in"
+        );
+        assert_eq!(
+            parse_rendezvous("198.51.100.7:9000,198.51.100.7:9000").expect("a list"),
+            vec![at("198.51.100.7:9000")],
+            "one route named twice is one route, or the ladder pays for it twice"
+        );
+        let localhost = parse_rendezvous("localhost:9000").expect("a name the resolver knows");
+        assert!(!localhost.is_empty());
+        assert!(localhost.iter().all(|address| address.ip().is_loopback()));
+        assert!(
+            localhost
+                .windows(2)
+                .all(|pair| !pair[0].is_ipv4() || !pair[1].is_ipv6())
+        );
+
+        for refused in [
+            "198.51.100.7",
+            "rendezvous.example.com",
+            "",
+            "198.51.100.7:9000,",
+            " ",
+        ] {
+            assert!(
+                matches!(parse_rendezvous(refused), Err(Error::InvalidArguments)),
+                "{refused:?} names no service"
+            );
+        }
+    }
 
     pub(crate) fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

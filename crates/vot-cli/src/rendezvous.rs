@@ -252,9 +252,13 @@ fn warmable(fetch: SocketAddr, service: SocketAddr) -> bool {
 }
 
 /// The serve-side rendezvous state: what to send and when. Owns no socket.
+///
+/// One registrar covers every address the service has, because a serve is
+/// findable in each family it can reach the service over, and because the
+/// warming bound is the serve's, not one service address's.
 pub(crate) struct Registrar {
     key: [u8; 32],
-    service: SocketAddr,
+    services: Vec<SocketAddr>,
     /// When the next registration is due, which is immediately at first.
     due_at_ms: u64,
     /// Mappings owed warmings, and how many each is still owed. Drained one
@@ -266,11 +270,12 @@ pub(crate) struct Registrar {
 }
 
 impl Registrar {
-    /// A serve registering `root` with the service at `service`.
-    pub(crate) fn new(root: &[u8; 32], service: SocketAddr) -> Self {
+    /// A serve registering `root` with the service at every one of
+    /// `services`, which are the addresses one service answers at.
+    pub(crate) fn new(root: &[u8; 32], services: &[SocketAddr]) -> Self {
         Self {
             key: key_of(root),
-            service,
+            services: services.to_vec(),
             due_at_ms: 0,
             warming: std::collections::VecDeque::new(),
             warmed: 0,
@@ -278,8 +283,8 @@ impl Registrar {
     }
 
     /// What to send at `now_ms` with nothing having arrived: a
-    /// registration when the cadence is due, and one warming a pass
-    /// toward whatever fetches are still owed them.
+    /// registration to every service address when the cadence is due, and
+    /// one warming a pass toward whatever fetches are still owed them.
     pub(crate) fn due(&mut self, now_ms: u64) -> Vec<(SocketAddr, Datagram)> {
         let mut sends = Vec::new();
         if let Some((fetch, owed)) = self.warming.pop_front() {
@@ -291,7 +296,9 @@ impl Registrar {
         if now_ms >= self.due_at_ms {
             self.due_at_ms = now_ms.saturating_add(REGISTER_CADENCE_MS);
             self.warmed = 0;
-            sends.push((self.service, Datagram::Register { key: self.key }));
+            for service in &self.services {
+                sends.push((*service, Datagram::Register { key: self.key }));
+            }
         }
         sends
     }
@@ -299,13 +306,13 @@ impl Registrar {
     /// Processes a datagram from `source`. Only the service is heard, and
     /// only about this serve's key. Earned warmings are queued.
     pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr) {
-        if source != self.service {
+        if !self.services.contains(&source) {
             return;
         }
         let Datagram::Coming { key, fetch } = datagram else {
             return;
         };
-        if key != self.key || !warmable(fetch, self.service) {
+        if key != self.key || !warmable(fetch, source) {
             return;
         }
         let room = WARMINGS_PER_CADENCE.saturating_sub(self.warmed);
@@ -318,15 +325,61 @@ impl Registrar {
 }
 
 /// One registered serve: where it is, and until when it is believed.
+#[derive(Clone, Copy)]
 struct Registration {
     mapping: SocketAddr,
     expires_at_ms: u64,
 }
 
+impl Registration {
+    /// Whether this registration is still believed at `now_ms`.
+    const fn live(&self, now_ms: u64) -> bool {
+        self.expires_at_ms > now_ms
+    }
+}
+
+/// What one key is registered at: at most one mapping per family, because
+/// a serve reaches the service in each family it has and each of those
+/// arrives under an address only that family can use.
+#[derive(Default)]
+struct Mappings {
+    v4: Option<Registration>,
+    v6: Option<Registration>,
+}
+
+impl Mappings {
+    /// The slot an address belongs in. IPv4-mapped IPv6 is made canonical
+    /// where addresses are read, so this is the family it will be used in.
+    const fn slot(&mut self, address: SocketAddr) -> &mut Option<Registration> {
+        match address {
+            SocketAddr::V4(_) => &mut self.v4,
+            SocketAddr::V6(_) => &mut self.v6,
+        }
+    }
+
+    /// What is registered in `address`'s family and still believed.
+    fn live_like(&self, address: SocketAddr, now_ms: u64) -> Option<SocketAddr> {
+        let held = match address {
+            SocketAddr::V4(_) => self.v4,
+            SocketAddr::V6(_) => self.v6,
+        };
+        held.filter(|entry| entry.live(now_ms))
+            .map(|entry| entry.mapping)
+    }
+
+    /// Whether any family still holds a believed registration.
+    fn live(&self, now_ms: u64) -> bool {
+        [self.v4, self.v6]
+            .into_iter()
+            .flatten()
+            .any(|entry| entry.live(now_ms))
+    }
+}
+
 /// Service-side pairing table. Time is injected so expiry is testable.
 #[derive(Default)]
 pub(crate) struct Pairings {
-    registered: HashMap<[u8; 32], Registration>,
+    registered: HashMap<[u8; 32], Mappings>,
 }
 
 /// Service reply: zero or one reply to the source, plus at most one
@@ -352,31 +405,29 @@ impl Pairings {
                 {
                     // The only sweep. Expiry is read at every lookup, so a
                     // table with room costs nothing to hold, and no datagram
-                    // pays for the table's size.
-                    self.registered
-                        .retain(|_, registration| registration.expires_at_ms > now_ms);
+                    // pays for the table's size. A key goes only when every
+                    // family it holds has expired.
+                    self.registered.retain(|_, mappings| mappings.live(now_ms));
                     if self.registered.len() >= MAX_REGISTRATIONS {
                         return Answer::default();
                     }
                 }
-                self.registered.insert(
-                    key,
-                    Registration {
-                        mapping: source,
-                        expires_at_ms: now_ms.saturating_add(REGISTRATION_TTL_MS),
-                    },
-                );
+                *self.registered.entry(key).or_default().slot(source) = Some(Registration {
+                    mapping: source,
+                    expires_at_ms: now_ms.saturating_add(REGISTRATION_TTL_MS),
+                });
                 Answer {
                     reply: Some(Datagram::Registered { key }),
                     notify: None,
                 }
             }
             Datagram::Resolve { key } => {
+                // Answered in the family it arrived over: that is the only
+                // family the asker can reach a mapping in.
                 let serve = self
                     .registered
                     .get(&key)
-                    .filter(|entry| entry.expires_at_ms > now_ms)
-                    .map(|entry| entry.mapping);
+                    .and_then(|mappings| mappings.live_like(source, now_ms));
                 Answer {
                     reply: Some(Datagram::Resolved { key, serve }),
                     notify: serve.map(|mapping| (mapping, Datagram::Coming { key, fetch: source })),
@@ -610,7 +661,7 @@ mod tests {
         let service = v4("198.51.100.7:9000");
         let fetch = v4("203.0.113.9:60123");
         let root = [9; 32];
-        let mut registrar = Registrar::new(&root, service);
+        let mut registrar = Registrar::new(&root, &[service]);
         let key = key_of(&root);
 
         assert_eq!(
@@ -728,7 +779,7 @@ mod tests {
         // that was never opened for it.
         let service = v4("198.51.100.7:9000");
         let root = [9; 32];
-        let mut registrar = Registrar::new(&root, service);
+        let mut registrar = Registrar::new(&root, &[service]);
         let key = key_of(&root);
         registrar.due(0);
         let rails: Vec<SocketAddr> = (0..4)
@@ -755,7 +806,7 @@ mod tests {
     fn a_cadence_of_warmings_is_bounded_however_many_fetches_come() {
         let service = v4("198.51.100.7:9000");
         let root = [9; 32];
-        let mut registrar = Registrar::new(&root, service);
+        let mut registrar = Registrar::new(&root, &[service]);
         let key = key_of(&root);
         registrar.due(0);
         for index in 0..100_u16 {
@@ -796,6 +847,81 @@ mod tests {
         assert_eq!(
             registrar.due(REGISTER_CADENCE_MS),
             vec![(v4("203.0.113.9:6000"), Datagram::Warming)]
+        );
+    }
+
+    #[test]
+    fn a_key_holds_one_mapping_per_family_and_each_expires_alone() {
+        // A serve reaches the service in each family it has, and each of
+        // those arrives under an address only that family can use. A resolve
+        // is answered in the family it came over, because that is the only
+        // one the asker can reach a mapping in.
+        let mut pairings = Pairings::default();
+        let key = [5; 32];
+        let over_v4 = v4("198.51.100.1:4433");
+        let over_v6: SocketAddr = "[2001:db8::1]:4433".parse().expect("an address");
+        let asking_v4 = v4("203.0.113.9:60123");
+        let asking_v6: SocketAddr = "[2001:db8::9]:60123".parse().expect("an address");
+
+        pairings.take(Datagram::Register { key }, over_v4, 0);
+        assert_eq!(
+            pairings.take(Datagram::Resolve { key }, asking_v6, 1).reply,
+            Some(Datagram::Resolved { key, serve: None }),
+            "an IPv4 mapping is no answer to an asker that has only IPv6"
+        );
+        assert_eq!(
+            pairings.take(Datagram::Resolve { key }, asking_v4, 1).reply,
+            Some(Datagram::Resolved {
+                key,
+                serve: Some(over_v4)
+            })
+        );
+
+        // The same serve registers over its other family, under one key.
+        pairings.take(Datagram::Register { key }, over_v6, 2);
+        let answered = pairings.take(Datagram::Resolve { key }, asking_v6, 3);
+        assert_eq!(
+            answered.reply,
+            Some(Datagram::Resolved {
+                key,
+                serve: Some(over_v6)
+            })
+        );
+        assert_eq!(
+            answered.notify,
+            Some((
+                over_v6,
+                Datagram::Coming {
+                    key,
+                    fetch: asking_v6
+                }
+            )),
+            "and the serve is told in the family the fetch can be reached in"
+        );
+
+        // One family ages out on its own clock and the other stands.
+        let v4_gone = REGISTRATION_TTL_MS;
+        assert_eq!(
+            pairings
+                .take(Datagram::Resolve { key }, asking_v4, v4_gone)
+                .reply,
+            Some(Datagram::Resolved { key, serve: None }),
+            "the IPv4 registration is past its TTL"
+        );
+        assert_eq!(
+            pairings
+                .take(Datagram::Resolve { key }, asking_v6, v4_gone)
+                .reply,
+            Some(Datagram::Resolved {
+                key,
+                serve: Some(over_v6)
+            }),
+            "and the IPv6 one, registered later, is not"
+        );
+        assert_eq!(
+            pairings.registered.len(),
+            1,
+            "one key, however many families it holds"
         );
     }
 

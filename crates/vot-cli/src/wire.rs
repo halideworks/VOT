@@ -211,14 +211,17 @@ pub fn serve_bundle(
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
     // Configure rendezvous routing before bind so the listener can
     // filter side-channel datagrams.
-    let service = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;
-    config.side_channel_lead = service.map(|_| crate::rendezvous::MAGIC);
+    let services = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;
+    config.side_channel_lead = side_channel_lead(&services);
 
     // The loop and its failure policy are in `drive`.
     let mut listener = Listener::bind(address, &config).map_err(carrier_failure)?;
     listening(listener.local_address());
-    let registration =
-        start_registration(service, listener.take_side_channel(), server.package().root)?;
+    let registration = start_registration(
+        &services,
+        listener.take_side_channel(),
+        server.package().root,
+    )?;
     let outcome = crate::drive::serve_sessions(sessions, || {
         // Accept blocks until a connection arrives.
         let carrier = listener.accept().map_err(carrier_failure)?;
@@ -230,17 +233,28 @@ pub fn serve_bundle(
     Ok(server.package())
 }
 
+/// The lead byte the listener sheds rendezvous datagrams by, which is
+/// wanted exactly when there is a service to register with. Naming one
+/// without a service would route datagrams aside that nothing reads.
+const fn side_channel_lead(services: &[SocketAddr]) -> Option<u8> {
+    if services.is_empty() {
+        None
+    } else {
+        Some(crate::rendezvous::MAGIC)
+    }
+}
+
 /// Returns a registration only when both a service and side channel exist.
 ///
 /// # Errors
 /// Reports a registration thread that will not start.
 fn start_registration(
-    service: Option<SocketAddr>,
+    services: &[SocketAddr],
     side: Option<SideChannel>,
     root: [u8; 32],
 ) -> Result<Option<Registration>, Error> {
-    match (service, side) {
-        (Some(service), Some(side)) => Registration::begin(side, root, service).map(Some),
+    match (services.is_empty(), side) {
+        (false, Some(side)) => Registration::begin(side, root, services).map(Some),
         _ => Ok(None),
     }
 }
@@ -258,15 +272,22 @@ struct Registration {
 const STOP_TURNS: usize = 20;
 
 impl Registration {
-    /// Sends the first registration on the calling thread so an unreachable
-    /// service fails immediately.
+    /// Sends the first registration on the calling thread so a service this
+    /// socket cannot reach at all fails immediately.
+    ///
+    /// One address of several may refuse: a host with no IPv6 route cannot
+    /// send to the service's IPv6 address, and that is a route missing
+    /// rather than a service missing. Only a service where none of its
+    /// addresses took the registration is refused here.
     ///
     /// # Errors
-    /// Reports a service this socket cannot send to, and a thread that
-    /// will not start.
-    fn begin(side: SideChannel, root: [u8; 32], service: SocketAddr) -> Result<Self, Error> {
-        let mut registrar = crate::rendezvous::Registrar::new(&root, service);
-        post(&side, registrar.due(0))?;
+    /// Reports a service none of whose addresses this socket can send to,
+    /// and a thread that will not start.
+    fn begin(side: SideChannel, root: [u8; 32], services: &[SocketAddr]) -> Result<Self, Error> {
+        let mut registrar = crate::rendezvous::Registrar::new(&root, services);
+        if !posted_any(&side, registrar.due(0)) {
+            return Err(Error::CarrierUnavailable);
+        }
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -375,12 +396,13 @@ pub fn rendezvous_service(
 /// Rendezvous service address. Unset means no registration.
 const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
 
-/// The service [`RENDEZVOUS`] names, or nothing when it is unset.
+/// Every address the service [`RENDEZVOUS`] names, or none when it is
+/// unset.
 ///
 /// # Errors
 /// Rejects a value that is neither an address nor a name that resolves.
-fn rendezvous_from(pin: Option<&str>) -> Result<Option<SocketAddr>, Error> {
-    pin.map(crate::parse_rendezvous).transpose()
+fn rendezvous_from(pin: Option<&str>) -> Result<Vec<SocketAddr>, Error> {
+    pin.map_or_else(|| Ok(Vec::new()), crate::parse_rendezvous)
 }
 
 /// Side-channel read timeout for the registration thread.
@@ -398,20 +420,24 @@ fn for_socket(target: SocketAddr, local: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Sends registrar output on the listener's socket.
+/// Sends registrar output on the listener's socket, reporting whether any
+/// of it went.
 ///
-/// # Errors
-/// Reports a send failure on the serve's own socket.
-fn post(
-    side: &SideChannel,
-    sends: Vec<(SocketAddr, crate::rendezvous::Datagram)>,
-) -> Result<(), Error> {
-    let local = side.local_address().map_err(carrier_failure)?;
+/// False means this socket reached none of what it was given, which for a
+/// first registration is a service that is not there. One address of
+/// several refusing is a route this host does not have, and a serve with
+/// no IPv6 route is still findable over IPv4.
+fn posted_any(side: &SideChannel, sends: Vec<(SocketAddr, crate::rendezvous::Datagram)>) -> bool {
+    let Ok(local) = side.local_address() else {
+        return false;
+    };
+    let mut went = false;
     for (to, datagram) in sends {
-        side.send_to(&crate::rendezvous::encode(&datagram), for_socket(to, local))
-            .map_err(carrier_failure)?;
+        went |= side
+            .send_to(&crate::rendezvous::encode(&datagram), for_socket(to, local))
+            .is_ok();
     }
-    Ok(())
+    went
 }
 
 /// Sends what is due and keeps the cadence whatever one datagram does.
@@ -525,7 +551,22 @@ fn fetch_with<F>(
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
-    let mut fetcher = BundleFetcher::begin(connect()?, bundle, pin)?;
+    fetch_over(connect()?, connect, bundle, pin, rails)
+}
+
+/// [`fetch_with`] with the first carrier already open, for a caller that
+/// opened one to find out which route works.
+fn fetch_over<F>(
+    primary: Transport,
+    connect: F,
+    bundle: &Path,
+    pin: Option<[u8; 32]>,
+    rails: usize,
+) -> Result<PackageSummary, Error>
+where
+    F: Fn() -> Result<Transport, Error> + Sync,
+{
+    let mut fetcher = BundleFetcher::begin(primary, bundle, pin)?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
     }
@@ -563,7 +604,14 @@ const RESOLVE_RETRY_WAIT: Duration = Duration::from_millis(500);
 
 /// How long a punched rail waits for its handshake before the path is
 /// called unpunchable.
-const PUNCH_WAIT: Duration = Duration::from_secs(10);
+///
+/// A punch lands in the first tenth of a second when both NATs keep the
+/// mapping the service observed. When the serving end's NAT gives its
+/// warming a different external port, the hole and the Initial do not
+/// line up until the handshake has retried a few times, measured at
+/// around ten seconds on two conntrack NATs. The bound is past that, so
+/// what it names is a path that cannot open rather than one that is slow.
+const PUNCH_WAIT: Duration = Duration::from_secs(15);
 
 /// A rail's socket after the service has seen it: bound, announced under
 /// the key, and given the serve time to open its side. `serve` is the
@@ -717,36 +765,69 @@ fn wait_warm(
 pub fn fetch_via_rendezvous(
     root: [u8; 32],
     bundle: &Path,
-    service: SocketAddr,
+    services: &[SocketAddr],
 ) -> Result<PackageSummary, Error> {
     let rails = rails_from(
         std::env::var(FETCH_RAILS).ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
     )?;
-    fetch_via_rendezvous_railed(root, bundle, service, rails)
+    fetch_via_rendezvous_railed(root, bundle, services, rails)
 }
 
 /// Fetches through a rendezvous at an explicit rail width.
 fn fetch_via_rendezvous_railed(
     root: [u8; 32],
     bundle: &Path,
-    service: SocketAddr,
+    services: &[SocketAddr],
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
     let key = crate::rendezvous::key_of(&root);
-    let connect = || {
+    let open = |service: SocketAddr| -> Result<(Transport, SocketAddr), Error> {
         let punched = punch(key, service)?;
-        let carrier =
-            Transport::connect_on(punched.socket, punched.serve, Some("localhost"), &config)
-                .map_err(carrier_failure)?;
+        let serve = punched.serve;
+        let carrier = Transport::connect_on(punched.socket, serve, Some("localhost"), &config)
+            .map_err(carrier_failure)?;
         if carrier.connected_within(PUNCH_WAIT) {
-            Ok(carrier)
+            Ok((carrier, serve))
         } else {
             Err(Error::RendezvousUnpunched)
         }
     };
-    fetch_with(connect, bundle, Some(root), rails)
+    let (primary, service) = first_route(services, &open)?;
+    let connect = || open(service).map(|(carrier, _)| carrier);
+    fetch_over(primary, connect, bundle, Some(root), rails)
+}
+
+/// Opens a carrier by the first service address that gives one, and
+/// returns the address that did.
+///
+/// The candidates are ordered IPv6 first. Every rail after this one takes
+/// the same route: a family that could not carry the first rail is not
+/// going to carry the rest, and paying the punch bound per rail to find
+/// that out again would be the whole ladder's cost times the width.
+///
+/// # Errors
+/// Surfaces the last candidate's refusal, and
+/// [`Error::InvalidArguments`] when there are no candidates at all.
+fn first_route<F>(services: &[SocketAddr], open: &F) -> Result<(Transport, SocketAddr), Error>
+where
+    F: Fn(SocketAddr) -> Result<(Transport, SocketAddr), Error>,
+{
+    let mut refused = Error::InvalidArguments;
+    for service in services {
+        match open(*service) {
+            Ok((carrier, serve)) => {
+                // The route goes to stderr with the progress lines, because
+                // which one carried a transfer is the first thing anyone
+                // asks when one is slow or does not happen.
+                eprintln!("route {serve}");
+                return Ok((carrier, *service));
+            }
+            Err(error) => refused = error,
+        }
+    }
+    Err(refused)
 }
 
 #[cfg(test)]
@@ -893,7 +974,7 @@ mod tests {
         let served = listener.local_address();
         let side = listener.take_side_channel().expect("a side channel");
         let root = [9; 32];
-        let registration = Registration::begin(side, root, service).expect("a registration");
+        let registration = Registration::begin(side, root, &[service]).expect("a registration");
 
         let fetch = UdpSocket::bind("127.0.0.1:0").expect("a fetch socket");
         fetch
@@ -954,14 +1035,14 @@ mod tests {
         let root = [4; 32];
 
         assert!(
-            start_registration(None, None, root)
+            start_registration(&[], None, root)
                 .expect("no service is no registration")
                 .is_none()
         );
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
         let side = listener.take_side_channel().expect("a side channel");
         assert!(
-            start_registration(None, Some(side), root)
+            start_registration(&[], Some(side), root)
                 .expect("a socket without a service is no registration")
                 .is_none()
         );
@@ -971,7 +1052,7 @@ mod tests {
                 Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
             let at = listener.local_address();
             let side = listener.take_side_channel().expect("a side channel");
-            let registration = start_registration(Some(service), Some(side), root)
+            let registration = start_registration(&[service], Some(side), root)
                 .expect("a registration thread")
                 .expect("a service and a socket register");
             let watch = registration.watch();
@@ -986,13 +1067,24 @@ mod tests {
 
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
         let side = listener.take_side_channel().expect("a side channel");
+        let unreachable: SocketAddr = "[::1]:9".parse().unwrap();
         assert!(
             matches!(
-                start_registration(Some("[::1]:9".parse().unwrap()), Some(side), root),
+                start_registration(&[unreachable], Some(side), root),
                 Err(Error::CarrierUnavailable)
             ),
-            "an unreachable service is refused at the first registration"
+            "a service with no address this socket can reach is refused"
         );
+
+        // One address of several refusing is a route this host does not
+        // have, which is what a dual-stack name looks like from a host with
+        // only one family.
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+        let registration = start_registration(&[unreachable, service], Some(side), root)
+            .expect("one address that took it is a registration")
+            .expect("a service and a socket register");
+        drop(registration);
     }
 
     #[test]
@@ -1129,14 +1221,14 @@ mod tests {
     #[test]
     fn a_rendezvous_is_the_address_or_name_given_or_nowhere() {
         assert!(std::env::var(RENDEZVOUS).is_err(), "the suite owns no env");
-        assert_eq!(rendezvous_from(None).expect("unset is nowhere"), None);
+        assert_eq!(rendezvous_from(None).expect("unset is nowhere"), Vec::new());
         assert_eq!(
             rendezvous_from(Some(" 198.51.100.7:9000 ")).expect("an address"),
-            Some("198.51.100.7:9000".parse().unwrap()),
+            vec!["198.51.100.7:9000".parse::<SocketAddr>().unwrap()],
         );
         assert_eq!(
             rendezvous_from(Some("[2001:db8::1]:9000")).expect("an address"),
-            Some("[2001:db8::1]:9000".parse().unwrap()),
+            vec!["[2001:db8::1]:9000".parse::<SocketAddr>().unwrap()],
         );
         assert!(
             matches!(
@@ -1145,15 +1237,32 @@ mod tests {
             ),
             "a name without a port names no service"
         );
-        let named = rendezvous_from(Some("localhost:9000"))
-            .expect("a name the resolver knows")
-            .expect("an address");
-        assert!(named.ip().is_loopback(), "localhost is this machine");
-        assert_eq!(named.port(), 9000);
+        let named = rendezvous_from(Some("localhost:9000")).expect("a name the resolver knows");
+        assert!(!named.is_empty(), "localhost resolves to something");
+        assert!(
+            named.iter().all(|address| address.ip().is_loopback()),
+            "localhost is this machine, {named:?}"
+        );
+        assert!(named.iter().all(|address| address.port() == 9000));
+        assert!(
+            named
+                .windows(2)
+                .all(|pair| !pair[0].is_ipv4() || !pair[1].is_ipv6()),
+            "IPv6 comes first, {named:?}"
+        );
         assert!(matches!(
             rendezvous_from(Some("198.51.100.7")),
             Err(Error::InvalidArguments)
         ));
+        assert_eq!(
+            side_channel_lead(&[]),
+            None,
+            "no service is nothing to shed aside"
+        );
+        assert_eq!(
+            side_channel_lead(&["198.51.100.7:9000".parse().unwrap()]),
+            Some(crate::rendezvous::MAGIC)
+        );
         assert!(matches!(
             rendezvous_from(Some("")),
             Err(Error::InvalidArguments)
@@ -1254,6 +1363,42 @@ mod tests {
                 "the rail opened its own side from the session's socket"
             );
         }
+    }
+
+    #[test]
+    fn the_ladder_takes_the_first_candidate_that_opens() {
+        // The candidates are the service's addresses, IPv6 first. One that
+        // cannot open a carrier costs its own attempt and no more: the rest
+        // of the rails take the route that worked, rather than paying the
+        // punch bound again to learn the same thing.
+        let refusing: SocketAddr = "[2001:db8::1]:9000".parse().expect("an address");
+        let working: SocketAddr = "198.51.100.7:9000".parse().expect("an address");
+        let tried = std::sync::Mutex::new(Vec::new());
+        let open = |service: SocketAddr| -> Result<(Transport, SocketAddr), Error> {
+            tried.lock().expect("a lock").push(service);
+            Err(Error::RendezvousUnpunched)
+        };
+        assert!(
+            matches!(
+                first_route(&[refusing, working], &open),
+                Err(Error::RendezvousUnpunched)
+            ),
+            "every candidate refusing is the last refusal"
+        );
+        assert_eq!(
+            *tried.lock().expect("a lock"),
+            vec![refusing, working],
+            "in the order given, which is IPv6 first"
+        );
+        assert!(
+            matches!(first_route(&[], &open), Err(Error::InvalidArguments)),
+            "no candidates at all is an argument error, not a punch failure"
+        );
+        assert_eq!(
+            tried.lock().expect("a lock").len(),
+            2,
+            "and nothing was opened for it"
+        );
     }
 
     #[test]
@@ -1585,7 +1730,8 @@ mod tests {
         apply_datagram_bytes(&mut config).unwrap();
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
         let side = listener.take_side_channel().expect("a side channel");
-        let registration = Registration::begin(side, built.root, service).expect("a registration");
+        let registration =
+            Registration::begin(side, built.root, &[service]).expect("a registration");
 
         let opened = BundleServer::open(&bundle).unwrap();
         let serving = std::thread::spawn(move || {
@@ -1599,7 +1745,7 @@ mod tests {
 
         // Fetch via rendezvous: resolve root -> connect -> transfer.
         let fetched = crate::tests::temporary("rendezvous-wire-fetched");
-        let package = fetch_via_rendezvous_railed(built.root, &fetched, service, RAILS)
+        let package = fetch_via_rendezvous_railed(built.root, &fetched, &[service], RAILS)
             .expect("a fetch via rendezvous");
         assert_eq!(package, built);
 

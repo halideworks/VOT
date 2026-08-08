@@ -38,7 +38,7 @@ pub fn rendezvous_service(
 pub fn fetch_via_rendezvous(
     _root: [u8; 32],
     _bundle: &Path,
-    _service: SocketAddr,
+    _services: &[SocketAddr],
 ) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }

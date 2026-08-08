@@ -411,6 +411,54 @@ pub fn is_registered_operation(identifier: u64) -> bool {
     REGISTERED_OPERATIONS.contains(&identifier)
 }
 
+/// An operation this revision can name.
+///
+/// A capability keeps whatever identifiers it was issued with, unknown ones
+/// included, because `spec/registries.md` section 12 says an unknown value
+/// does not invalidate the token. It also says such a value grants nothing,
+/// and that is only true if an unknown identifier cannot reach the place
+/// where a grant is decided. This is the type that stops it: an authorization
+/// takes one of these, and the only way to get one is from an identifier the
+/// registry names.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Operation {
+    Publish,
+    ReadManifest,
+    ReadRanges,
+}
+
+/// An identifier this revision cannot name, carried so a diagnostic can say
+/// which one it was.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownOperation(pub u64);
+
+impl Operation {
+    /// Every operation, in identifier order.
+    pub const ALL: [Self; 3] = [Self::Publish, Self::ReadManifest, Self::ReadRanges];
+
+    #[must_use]
+    pub const fn identifier(self) -> u64 {
+        match self {
+            Self::Publish => operation::PUBLISH,
+            Self::ReadManifest => operation::READ_MANIFEST,
+            Self::ReadRanges => operation::READ_RANGES,
+        }
+    }
+}
+
+impl TryFrom<u64> for Operation {
+    type Error = UnknownOperation;
+
+    fn try_from(identifier: u64) -> Result<Self, Self::Error> {
+        match identifier {
+            operation::PUBLISH => Ok(Self::Publish),
+            operation::READ_MANIFEST => Ok(Self::ReadManifest),
+            operation::READ_RANGES => Ok(Self::ReadRanges),
+            other => Err(UnknownOperation(other)),
+        }
+    }
+}
+
 /// Every registered resource limit, in identifier order.
 pub const REGISTERED_LIMITS: [u64; 3] = [
     resource_limit::CONCURRENT_LANES,
@@ -1549,6 +1597,37 @@ mod tests {
         assert!(
             decode_all(&at_limit, limits).is_ok(),
             "a payload at its own limit"
+        );
+    }
+
+    #[test]
+    fn no_unregistered_identifier_becomes_an_operation() {
+        // The registry's width. Every value in it either names an operation
+        // or cannot be turned into one, with no third answer.
+        for identifier in 0..=u64::from(u16::MAX) {
+            let converted = Operation::try_from(identifier);
+            assert_eq!(
+                converted.is_ok(),
+                is_registered_operation(identifier),
+                "{identifier:#06x}"
+            );
+            match converted {
+                Ok(operation) => assert_eq!(operation.identifier(), identifier),
+                Err(UnknownOperation(reported)) => assert_eq!(reported, identifier),
+            }
+        }
+        // And past it, where a capability's own validation would already have
+        // refused the value.
+        for identifier in [0x1_0000, u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(
+                Operation::try_from(identifier),
+                Err(UnknownOperation(identifier))
+            );
+        }
+        assert_eq!(
+            Operation::ALL.map(Operation::identifier).to_vec(),
+            REGISTERED_OPERATIONS.to_vec(),
+            "the closed set and the registry table disagree"
         );
     }
 

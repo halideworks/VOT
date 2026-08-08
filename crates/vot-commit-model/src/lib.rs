@@ -66,6 +66,14 @@ pub struct Observation {
     pub sequence: u64,
 }
 
+/// A transition that has passed every guard and is waiting to be committed.
+struct Transition {
+    next: State,
+    sequence: u64,
+    recovery_state: Option<State>,
+    observation: Option<Assurance>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Machine {
     profile: Profile,
@@ -109,6 +117,13 @@ impl Machine {
     }
 
     pub fn apply(&mut self, event: Event) -> Result<Option<Observation>, Error> {
+        let transition = self.plan(event)?;
+        Ok(self.commit(&transition))
+    }
+
+    /// Computes the complete transition for `event`, or rejects it. Every
+    /// guard runs here so that a rejection cannot leave the machine changed.
+    fn plan(&self, event: Event) -> Result<Transition, Error> {
         if !self.current_incarnation {
             return Err(Error::StaleIncarnation);
         }
@@ -119,17 +134,22 @@ impl Machine {
             return Err(Error::Terminal);
         }
 
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(Error::InvalidTransition)?;
+
         if event == Event::Recover {
             if self.state != State::RecoveryRequired {
                 return Err(Error::InvalidTransition);
             }
-            let recovered = self.recovery_state.take().ok_or(Error::InvalidTransition)?;
-            self.sequence = self
-                .sequence
-                .checked_add(1)
-                .ok_or(Error::InvalidTransition)?;
-            self.state = recovered;
-            return Ok(None);
+            let recovered = self.recovery_state.ok_or(Error::InvalidTransition)?;
+            return Ok(Transition {
+                next: recovered,
+                sequence,
+                recovery_state: None,
+                observation: None,
+            });
         }
 
         let (next, observation) = match (self.state, event) {
@@ -168,29 +188,43 @@ impl Machine {
             (state, Event::NamespaceLinkAmbiguous | Event::NamespaceFlushFailed | Event::Crash)
                 if state != State::RecoveryRequired =>
             {
-                self.recovery_state = Some(state);
                 (State::RecoveryRequired, None)
             }
             _ => return Err(Error::InvalidTransition),
         };
 
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(Error::InvalidTransition)?;
-        self.state = next;
-        if let Some(level) = observation {
-            if level == Assurance::Published && !self.required_predecessor_performed() {
-                return Err(Error::MissingPredecessor);
-            }
+        if observation == Some(Assurance::Published) && !self.required_predecessor_performed() {
+            return Err(Error::MissingPredecessor);
+        }
+
+        // Entering recovery saves the state it came from; every other
+        // transition leaves whatever an earlier crash saved.
+        let recovery_state = if next == State::RecoveryRequired {
+            Some(self.state)
+        } else {
+            self.recovery_state
+        };
+
+        Ok(Transition {
+            next,
+            sequence,
+            recovery_state,
+            observation,
+        })
+    }
+
+    /// Applies a transition this machine planned. Cannot fail.
+    fn commit(&mut self, transition: &Transition) -> Option<Observation> {
+        self.state = transition.next;
+        self.sequence = transition.sequence;
+        self.recovery_state = transition.recovery_state;
+        transition.observation.map(|level| {
             self.performed.push(level);
-            Ok(Some(Observation {
+            Observation {
                 level,
                 sequence: self.sequence,
-            }))
-        } else {
-            Ok(None)
-        }
+            }
+        })
     }
 
     fn can_publish_from(&self, state: State) -> bool {
@@ -215,6 +249,126 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EVENTS: [Event; 15] = [
+        Event::Admit,
+        Event::TransitVerified,
+        Event::DataFlushSucceeded,
+        Event::DataFlushFailed,
+        Event::JournalFlushSucceeded,
+        Event::JournalFlushFailed,
+        Event::AtRestVerified,
+        Event::AtRestVerificationFailed,
+        Event::NamespaceLinked,
+        Event::NamespaceLinkAmbiguous,
+        Event::NamespaceDurable,
+        Event::NamespaceFlushFailed,
+        Event::Crash,
+        Event::Recover,
+        Event::Abort,
+    ];
+
+    /// Two machines behave alike when everything but the sequence agrees, so
+    /// the search dedupes on that and terminates.
+    fn shape(machine: &Machine) -> (Profile, State, bool, Option<State>, Vec<Assurance>) {
+        (
+            machine.profile,
+            machine.state,
+            machine.current_incarnation,
+            machine.recovery_state,
+            machine.performed.clone(),
+        )
+    }
+
+    /// Every machine an accepted event sequence can produce, stale variants
+    /// included. No path is longer than the number of events, which bounds
+    /// the search.
+    fn every_reachable_machine() -> Vec<Machine> {
+        let mut frontier: Vec<Machine> = [Profile::Fast, Profile::Balanced, Profile::Strict]
+            .into_iter()
+            .map(Machine::new)
+            .collect();
+        let mut found = frontier.clone();
+        for _ in 0..EVENTS.len() {
+            let mut next = Vec::new();
+            for machine in &frontier {
+                for event in EVENTS {
+                    let mut candidate = machine.clone();
+                    if candidate.apply(event).is_ok()
+                        && !found.iter().any(|seen| shape(seen) == shape(&candidate))
+                    {
+                        found.push(candidate.clone());
+                        next.push(candidate);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let stale: Vec<Machine> = found
+            .iter()
+            .map(|machine| {
+                let mut stale = machine.clone();
+                stale.mark_stale();
+                stale
+            })
+            .collect();
+        found.extend(stale);
+        found
+    }
+
+    #[test]
+    fn a_rejected_event_leaves_the_machine_untouched() {
+        let machines = every_reachable_machine();
+        assert!(
+            machines.len() > 20,
+            "the search found only {} machines",
+            machines.len()
+        );
+        let mut rejections = 0_u32;
+        for machine in &machines {
+            for event in EVENTS {
+                let mut candidate = machine.clone();
+                if candidate.apply(event).is_err() {
+                    rejections += 1;
+                    assert_eq!(
+                        &candidate, machine,
+                        "{event:?} was rejected from {:?} but changed the machine",
+                        machine.state
+                    );
+                }
+            }
+        }
+        assert!(rejections > 100, "only {rejections} events were rejected");
+    }
+
+    #[test]
+    fn the_last_sequence_rejects_every_event_without_mutating() {
+        let machine = Machine {
+            profile: Profile::Fast,
+            state: State::Admitted,
+            current_incarnation: true,
+            recovery_state: None,
+            sequence: u64::MAX,
+            performed: vec![Assurance::Admitted],
+        };
+        for event in EVENTS {
+            let mut candidate = machine.clone();
+            assert_eq!(candidate.apply(event), Err(Error::InvalidTransition));
+            assert_eq!(candidate, machine, "{event:?} at the last sequence");
+        }
+    }
+
+    #[test]
+    fn a_saved_recovery_state_survives_a_rejected_event() {
+        let mut machine = Machine::new(Profile::Fast);
+        machine.apply(Event::Admit).unwrap();
+        machine.apply(Event::Crash).unwrap();
+        let waiting = machine.clone();
+        assert_eq!(machine.apply(Event::Admit), Err(Error::InvalidTransition));
+        assert_eq!(machine, waiting);
+        machine.apply(Event::Recover).unwrap();
+        assert_eq!(machine.state(), State::Admitted);
+    }
 
     fn reach_durable(machine: &mut Machine) {
         machine.apply(Event::Admit).unwrap();
@@ -361,10 +515,12 @@ mod tests {
             sequence: 0,
             performed: Vec::new(),
         };
+        let linked = machine.clone();
         assert_eq!(
             machine.apply(Event::NamespaceDurable),
             Err(Error::MissingPredecessor)
         );
         assert!(!machine.performed(Assurance::Published));
+        assert_eq!(machine, linked);
     }
 }

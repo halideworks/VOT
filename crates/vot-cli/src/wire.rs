@@ -655,7 +655,7 @@ fn punch_within(
                 service,
             )
             .map_err(|_| Error::CarrierUnavailable)?;
-        if let Some(serve) = resolved(&socket, &mut buffer, key)? {
+        if let Some(serve) = resolved(&socket, &mut buffer, key, service)? {
             open_toward(&socket, serve);
             wait_warm(&socket, &mut buffer, warming)?;
             return Ok(Punched { socket, serve });
@@ -684,8 +684,15 @@ fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
     }
 }
 
-/// Reads until the service names a serve for `key` or the read runs out.
+/// Reads until `service` names a serve for `key` or the read runs out.
 /// Nothing named is a retry, not a failure.
+///
+/// The answer decides where this rail sends its Initial, so it is taken
+/// only from the service that was asked. The key alone is not enough: a
+/// package root is not a secret, and anyone who can reach this port could
+/// otherwise point the rail at an address of their choosing. This is the
+/// check [`crate::rendezvous::Registrar::take`] already makes on the
+/// serving end.
 ///
 /// Only the first read waits for the service to answer at all. Later ones
 /// wait [`STRAY_WAIT`], because anything after the first arrival is already
@@ -695,12 +702,13 @@ fn resolved(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
     key: [u8; 32],
+    service: SocketAddr,
 ) -> Result<Option<SocketAddr>, Error> {
     socket
         .set_read_timeout(Some(RESOLVE_TIMEOUT))
         .map_err(|_| Error::CarrierUnavailable)?;
     for read in 0..STRAY_READS {
-        let (length, _) = match socket.recv_from(buffer) {
+        let (length, source) = match socket.recv_from(buffer) {
             Ok(arrival) => arrival,
             Err(error) => return read_failure(&error).map_or(Ok(None), Err),
         };
@@ -708,6 +716,9 @@ fn resolved(
             socket
                 .set_read_timeout(Some(STRAY_WAIT))
                 .map_err(|_| Error::CarrierUnavailable)?;
+        }
+        if crate::rendezvous::canonical(source) != crate::rendezvous::canonical(service) {
+            continue;
         }
         let Some(crate::rendezvous::Datagram::Resolved {
             key: answered,
@@ -729,6 +740,11 @@ fn resolved(
 /// A NAT that filters by port sheds the warming, so its absence proves
 /// nothing and the wait is a floor on how long the serve has had to open
 /// its side.
+///
+/// The source is not checked here, unlike in [`resolved`]. A warming that
+/// arrives from a port other than the one the service reported is the
+/// unpunchable case, and the wait ending early there costs nothing: the
+/// warming decides no address, it only says the floor can end.
 fn wait_warm(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
@@ -1411,13 +1427,15 @@ mod tests {
         let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
         let at = rail.local_addr().expect("the rail address");
         let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let service = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        let service_at = service.local_addr().expect("the service address");
         stranger
             .send_to(&encode(&Datagram::Warming), at)
             .expect("something that is not an answer");
         let mut buffer = [0_u8; 128];
         let began = std::time::Instant::now();
         assert_eq!(
-            resolved(&rail, &mut buffer, [5; 32]).expect("a read"),
+            resolved(&rail, &mut buffer, [5; 32], service_at).expect("a read"),
             None,
             "nothing named this key"
         );
@@ -1425,6 +1443,38 @@ mod tests {
             began.elapsed() < RESOLVE_TIMEOUT,
             "the read after the first arrival waited {:?}, not the short wait",
             began.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_the_service_that_was_asked_can_name_the_serve() {
+        use crate::rendezvous::{Datagram, encode};
+
+        let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
+        let at = rail.local_addr().expect("the rail address");
+        let service = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        let service_at = service.local_addr().expect("the service address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let steered = "203.0.113.9:443".parse().expect("an address to be sent to");
+
+        // The right key, the right shape, from the wrong host.
+        let answer = encode(&Datagram::Resolved {
+            key: [7; 32],
+            serve: Some(steered),
+        });
+        stranger.send_to(&answer, at).expect("a forged answer");
+        let mut buffer = [0_u8; 128];
+        assert_eq!(
+            resolved(&rail, &mut buffer, [7; 32], service_at).expect("a read"),
+            None,
+            "a stranger steered the rail"
+        );
+
+        // The same answer from the service is taken.
+        service.send_to(&answer, at).expect("the real answer");
+        assert_eq!(
+            resolved(&rail, &mut buffer, [7; 32], service_at).expect("a read"),
+            Some(steered)
         );
     }
 

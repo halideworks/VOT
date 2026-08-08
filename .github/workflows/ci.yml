@@ -73,6 +73,7 @@ jobs:
           python3 tools/verify_wave4_package.py
           python3 tools/validate_commit_fixtures.py
           python3 tools/validate_commit_model_sync.py
+          VOT_CARGO="cargo +1.88.0" python3 tools/validate_commit_transitions.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_negotiation_vectors.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_session_vectors.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_capability_vectors.py

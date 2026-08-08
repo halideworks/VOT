@@ -480,6 +480,85 @@ fn fetch_railed(
     crate::drive::fetch_striped(fetcher, rails, connect)
 }
 
+/// How long a resolve attempt waits for the service to answer.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait after resolving for the serve to warm the path.
+const WARMING_WAIT: Duration = Duration::from_millis(500);
+
+/// Retries a resolve when no serve is registered yet.
+const RESOLVE_RETRIES: u32 = 6;
+
+/// Resolves a package root to a serve address via a rendezvous service.
+///
+/// Sends `Resolve` datagrams to the service at `service_address`, retrying
+/// until a registered serve is found or the retry budget is spent. Returns
+/// the serve's observed mapping.
+///
+/// # Errors
+/// Returns [`Error::RendezvousUnresolved`] if no serve is found before the
+/// retry budget is spent, or [`Error::CarrierUnavailable`] if the socket
+/// fails.
+pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, Error> {
+    let key = crate::rendezvous::key_of(&root);
+    let socket = std::net::UdpSocket::bind(if service.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    })
+    .map_err(|_| Error::CarrierUnavailable)?;
+    socket
+        .set_read_timeout(Some(RESOLVE_TIMEOUT))
+        .map_err(|_| Error::CarrierUnavailable)?;
+    let mut buffer = [0_u8; 128];
+    for _ in 0..RESOLVE_RETRIES {
+        socket
+            .send_to(
+                &crate::rendezvous::encode(&crate::rendezvous::Datagram::Resolve { key }),
+                service,
+            )
+            .map_err(|_| Error::CarrierUnavailable)?;
+        let (length, _) = match socket.recv_from(&mut buffer) {
+            Ok(arrival) => arrival,
+            Err(error) => {
+                if waited_out(&error) {
+                    continue;
+                }
+                return Err(Error::CarrierUnavailable);
+            }
+        };
+        let Some(crate::rendezvous::Datagram::Resolved {
+            serve: Some(serve), ..
+        }) = crate::rendezvous::decode(&buffer[..length])
+        else {
+            continue;
+        };
+        return Ok(serve);
+    }
+    Err(Error::RendezvousUnresolved)
+}
+
+/// Fetches a bundle by resolving `root` through a rendezvous service.
+///
+/// Resolves the root, waits briefly for the serve to warm the path, then
+/// fetches with the root as both the address and the pin.
+///
+/// # Errors
+/// Surfaces a resolution failure, or what [`fetch_railed`] does.
+pub fn fetch_via_rendezvous(
+    root: [u8; 32],
+    bundle: &Path,
+    service: SocketAddr,
+) -> Result<PackageSummary, Error> {
+    let address = resolve_root(root, service)?;
+    std::thread::sleep(WARMING_WAIT);
+    let rails = rails_from(
+        std::env::var(FETCH_RAILS).ok().as_deref(),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    )?;
+    fetch_railed(address, bundle, Some(root), rails)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,5 +988,62 @@ mod tests {
             std::fs::read(destination.join("a.txt")).unwrap(),
             vec![7_u8; 1000]
         );
+    }
+
+    #[test]
+    fn a_fetch_resolves_a_root_and_crosses_a_real_socket() {
+        let source = crate::tests::temporary("rendezvous-wire-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.bin"), vec![0x5a; 200_000]).unwrap();
+        let bundle = crate::tests::temporary("rendezvous-wire-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        // Start the rendezvous service.
+        let (addressed, service_addr) = mpsc::channel();
+        let service_thread = std::thread::spawn(move || {
+            rendezvous_service("127.0.0.1:0".parse().unwrap(), Some(200), |at| {
+                let _ = addressed.send(at);
+            })
+        });
+        let service = service_addr
+            .recv()
+            .expect("the service reported its address");
+
+        // Start a serve with rendezvous registration.
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.side_channel_lead = Some(crate::rendezvous::MAGIC);
+        config.accept_timeout_ms = 0;
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+        let registration = Registration::begin(side, built.root, service).expect("a registration");
+
+        let opened = BundleServer::open(&bundle).unwrap();
+        let serving = std::thread::spawn(move || {
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = listener.accept().map_err(carrier_failure)?;
+                ServeSession::begin(&opened, carrier, authentication())
+            })
+            .unwrap();
+            opened.package()
+        });
+
+        // Fetch via rendezvous: resolve root -> connect -> transfer.
+        let fetched = crate::tests::temporary("rendezvous-wire-fetched");
+        let package =
+            fetch_via_rendezvous(built.root, &fetched, service).expect("a fetch via rendezvous");
+        assert_eq!(package, built);
+
+        drop(registration);
+        let served = serving.join().expect("the serving thread");
+        assert_eq!(served, built);
+        let _ = service_thread.join().expect("the service thread");
+        crate::harness::discard(&[&source, &bundle, &fetched]);
     }
 }

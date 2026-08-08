@@ -33,3 +33,17 @@ pub fn rendezvous_service(
 ) -> Result<(), Error> {
     Err(Error::WireUnsupported)
 }
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn resolve_root(_root: [u8; 32], _service: SocketAddr) -> Result<SocketAddr, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn fetch_via_rendezvous(
+    _root: [u8; 32],
+    _bundle: &Path,
+    _service: SocketAddr,
+) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}

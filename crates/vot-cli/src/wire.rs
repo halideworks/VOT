@@ -504,6 +504,9 @@ const WARMING_WAIT: Duration = Duration::from_millis(1_500);
 /// else arrives on the socket cannot extend a wait without bound.
 const STRAY_READS: usize = 8;
 
+/// How long a read waits once something has already arrived.
+const STRAY_WAIT: Duration = Duration::from_millis(100);
+
 /// Retries a resolve when no serve is registered yet.
 const RESOLVE_RETRIES: u32 = 6;
 
@@ -548,9 +551,6 @@ fn punch_within(
     // so is every mapping the service ever observed to answer with.
     let socket =
         std::net::UdpSocket::bind(local_for(service)?).map_err(|_| Error::CarrierUnavailable)?;
-    socket
-        .set_read_timeout(Some(RESOLVE_TIMEOUT))
-        .map_err(|_| Error::CarrierUnavailable)?;
     let mut buffer = [0_u8; 128];
     for _ in 0..RESOLVE_RETRIES {
         socket
@@ -572,17 +572,30 @@ fn punch_within(
 
 /// Reads until the service names a serve for `key` or the read runs out.
 /// Nothing named is a retry, not a failure.
+///
+/// Only the first read waits for the service to answer at all. Later ones
+/// wait [`STRAY_WAIT`], because anything after the first arrival is already
+/// on its way, and a stranger sending to this port must not be able to
+/// spend the whole timeout again per datagram.
 fn resolved(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
     key: [u8; 32],
 ) -> Result<Option<SocketAddr>, Error> {
-    for _ in 0..STRAY_READS {
+    socket
+        .set_read_timeout(Some(RESOLVE_TIMEOUT))
+        .map_err(|_| Error::CarrierUnavailable)?;
+    for read in 0..STRAY_READS {
         let (length, _) = match socket.recv_from(buffer) {
             Ok(arrival) => arrival,
             Err(error) if waited_out(&error) => return Ok(None),
             Err(_) => return Err(Error::CarrierUnavailable),
         };
+        if read == 0 {
+            socket
+                .set_read_timeout(Some(STRAY_WAIT))
+                .map_err(|_| Error::CarrierUnavailable)?;
+        }
         let Some(crate::rendezvous::Datagram::Resolved {
             key: answered,
             serve,
@@ -611,6 +624,8 @@ fn wait_warm(
     socket
         .set_read_timeout(Some(wait))
         .map_err(|_| Error::CarrierUnavailable)?;
+    // The wait is not shortened by what else arrives: it is the floor the
+    // serve needs, and [`STRAY_READS`] is what bounds the whole thing.
     for _ in 0..STRAY_READS {
         let Ok((length, _)) = socket.recv_from(buffer) else {
             return Ok(());
@@ -1015,6 +1030,33 @@ mod tests {
             punched.socket.local_addr().expect("the socket"),
             observed.join().expect("the service thread"),
             "the announced mapping is the socket the session connects on"
+        );
+    }
+
+    #[test]
+    fn a_resolve_that_reads_nothing_of_its_own_gives_up_on_the_short_wait() {
+        // Only the first read waits for the service. Datagrams from anyone
+        // else buy [`STRAY_WAIT`] each, so the whole read budget cannot be
+        // spent at [`RESOLVE_TIMEOUT`] apiece.
+        use crate::rendezvous::{Datagram, encode};
+
+        let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
+        let at = rail.local_addr().expect("the rail address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        stranger
+            .send_to(&encode(&Datagram::Warming), at)
+            .expect("something that is not an answer");
+        let mut buffer = [0_u8; 128];
+        let began = std::time::Instant::now();
+        assert_eq!(
+            resolved(&rail, &mut buffer, [5; 32]).expect("a read"),
+            None,
+            "nothing named this key"
+        );
+        assert!(
+            began.elapsed() < RESOLVE_TIMEOUT,
+            "the read after the first arrival waited {:?}, not the short wait",
+            began.elapsed()
         );
     }
 

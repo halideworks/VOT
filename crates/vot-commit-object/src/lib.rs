@@ -90,7 +90,7 @@ impl<S: S3Compatible> ObjectCommit<S> {
                 return Err(Error::Store(error));
             }
         };
-        if self.store.head(&self.key) != Some((object.bytes.len() as u64, object.checksum_crc32c)) {
+        if self.store.head(&self.key) != Some((object.length, object.checksum_crc32c)) {
             self.machine.apply(Event::AtRestVerificationFailed)?;
             return Err(Error::ChecksumMismatch);
         }
@@ -190,7 +190,10 @@ mod tests {
         commit.upload_verified_part(1, b"one").unwrap();
         commit.upload_verified_part(2, b"two").unwrap();
         let (object, receipt) = commit.complete().unwrap();
-        assert_eq!(object.bytes, b"onetwo");
+        assert_eq!(
+            (object.length, object.checksum_crc32c),
+            (b"onetwo".len() as u64, vot_journal::crc32c(b"onetwo"))
+        );
         assert_eq!(receipt.assurance, Assurance::Published);
     }
 
@@ -204,7 +207,10 @@ mod tests {
         ));
         assert_eq!(commit.state(), State::RecoveryRequired);
         let (object, receipt) = commit.complete().unwrap();
-        assert_eq!(object.bytes, b"bytes");
+        assert_eq!(
+            (object.length, object.checksum_crc32c),
+            (b"bytes".len() as u64, vot_journal::crc32c(b"bytes"))
+        );
         assert_eq!(receipt.assurance, Assurance::Published);
     }
 }

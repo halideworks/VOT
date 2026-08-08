@@ -271,14 +271,27 @@ fn parent_directory(path: &Path) -> &Path {
 
 #[must_use]
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
+    crc32c_update(CRC32C_EMPTY, bytes)
+}
+
+/// The CRC of nothing, which is what a running checksum starts from.
+pub const CRC32C_EMPTY: u32 = 0;
+
+/// Extends a CRC over more bytes, so a checksum can be computed from a stream
+/// without holding what it covers.
+///
+/// `crc32c_update(crc32c_update(CRC32C_EMPTY, a), b)` equals
+/// `crc32c([a, b].concat())`.
+#[must_use]
+pub fn crc32c_update(crc: u32, bytes: &[u8]) -> u32 {
+    let mut running = !crc;
     for byte in bytes {
-        crc ^= u32::from(*byte);
+        running ^= u32::from(*byte);
         for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(crc & 1));
+            running = (running >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(running & 1));
         }
     }
-    !crc
+    !running
 }
 
 fn encode(record: &Record) -> Result<Vec<u8>, Error> {
@@ -472,6 +485,20 @@ mod tests {
     #[test]
     fn crc32c_matches_standard_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
+    fn a_running_crc_matches_one_taken_over_the_whole() {
+        assert_eq!(crc32c_update(CRC32C_EMPTY, b""), crc32c(b""));
+        let whole = b"123456789";
+        for split in 0..=whole.len() {
+            let (head, tail) = whole.split_at(split);
+            assert_eq!(
+                crc32c_update(crc32c_update(CRC32C_EMPTY, head), tail),
+                crc32c(whole),
+                "split at {split}"
+            );
+        }
     }
 
     #[test]

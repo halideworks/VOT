@@ -15,9 +15,14 @@ pub struct PartReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// What a completed multipart upload turned out to be.
+///
+/// Its length and checksum rather than its bytes: a completion that handed
+/// back the object would put a ceiling on object size at the size of memory,
+/// and every caller here is checking what landed rather than reading it.
 pub struct CompletedObject {
     pub key: String,
-    pub bytes: Vec<u8>,
+    pub length: u64,
     pub checksum_crc32c: u32,
 }
 
@@ -63,6 +68,8 @@ pub struct MockStore {
     next_upload: u64,
     uploads: BTreeMap<String, Upload>,
     objects: BTreeMap<String, CompletedObject>,
+    /// What a real backend holds and this double has to stand in for.
+    stored: BTreeMap<String, Vec<u8>>,
     leases: BTreeMap<String, u64>,
     tombstones: BTreeSet<String>,
 }
@@ -187,10 +194,13 @@ impl S3Compatible for MockStore {
         }
         let object = CompletedObject {
             key: upload.key.clone(),
+            length: bytes.len() as u64,
             checksum_crc32c: vot_journal::crc32c(&bytes),
-            bytes,
         };
         upload.completed = true;
+        // The double keeps the bytes a real backend would not, because tests
+        // read objects back and a real backend is asked to.
+        self.stored.insert(object.key.clone(), bytes);
         self.objects.insert(object.key.clone(), object.clone());
         Ok(object)
     }
@@ -198,7 +208,7 @@ impl S3Compatible for MockStore {
     fn head(&self, key: &str) -> Option<(u64, u32)> {
         self.objects
             .get(key)
-            .map(|object| (object.bytes.len() as u64, object.checksum_crc32c))
+            .map(|object| (object.length, object.checksum_crc32c))
     }
 }
 
@@ -266,7 +276,10 @@ mod tests {
             .upload_part(&id, 2, b"two", vot_journal::crc32c(b"two"))
             .unwrap();
         let object = store.complete_multipart(&id, &[one, two]).unwrap();
-        assert_eq!(object.bytes, b"onetwo");
+        assert_eq!(
+            (object.length, object.checksum_crc32c),
+            (b"onetwo".len() as u64, vot_journal::crc32c(b"onetwo"))
+        );
         assert_eq!(
             store.head("object"),
             Some((6, vot_journal::crc32c(b"onetwo")))
@@ -339,7 +352,10 @@ mod tests {
         // back what it holds rather than nothing.
         let object = store.complete_multipart(&id, &[one]).unwrap();
         assert_eq!(store.object("object"), Some(&object));
-        assert_eq!(object.bytes, b"one");
+        assert_eq!(
+            (object.length, object.checksum_crc32c),
+            (b"one".len() as u64, vot_journal::crc32c(b"one"))
+        );
         assert!(store.object("absent").is_none());
     }
 

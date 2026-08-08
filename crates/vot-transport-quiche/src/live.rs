@@ -370,8 +370,12 @@ impl Transport {
         server_name: Option<&str>,
         config: &Config,
     ) -> Result<Self, Error> {
-        let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
-        Self::connect_on(socket, peer, server_name, config)
+        Self::start(
+            address,
+            Some((peer, server_name.map(str::to_owned))),
+            config,
+            Role::Client,
+        )
     }
 
     /// Connects to `peer` on an already-bound socket.
@@ -382,8 +386,9 @@ impl Transport {
     ///
     /// # Errors
     /// Reports a socket or configuration failure. A socket bound to a
-    /// wildcard address is refused: quiche needs the local address the
-    /// packets will carry.
+    /// wildcard address is refused: it names no one mapping, so it cannot be
+    /// the mapping a peer was told to expect. [`Transport::connect`] takes a
+    /// wildcard, since a caller that binds nothing itself announces nothing.
     pub fn connect_on(
         socket: UdpSocket,
         peer: SocketAddr,
@@ -2595,6 +2600,28 @@ mod tests {
         assert!(
             answering.connected_within(Duration::from_millis(0)),
             "the verdict was peeked, so it is still there to read"
+        );
+    }
+
+    #[test]
+    fn only_a_lifecycle_event_is_a_verdict_on_the_connection() {
+        // What a caller waiting on a handshake reads each event as. The whole
+        // decision is this table.
+        assert_eq!(lifecycle_verdict(&NativeEvent::Connected(1)), Some(true));
+        assert_eq!(
+            lifecycle_verdict(&NativeEvent::Disconnected(1)),
+            Some(false)
+        );
+        assert_eq!(
+            lifecycle_verdict(&NativeEvent::Control(vec![7_u8; 8].into())),
+            None
+        );
+        assert_eq!(
+            lifecycle_verdict(&NativeEvent::Acknowledged {
+                lane: 1,
+                sequence: 1
+            }),
+            None
         );
     }
 

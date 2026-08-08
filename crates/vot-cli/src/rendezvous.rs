@@ -805,27 +805,20 @@ mod tests {
         let refreshed = pairings.take(Datagram::Register { key: held }, v4("192.0.2.3:3000"), 1);
         assert_eq!(refreshed.reply, Some(Datagram::Registered { key: held }));
 
-        // A full table sweeps what has expired rather than shedding forever.
-        let after = REGISTRATION_TTL_MS + 1;
+        // A full table sweeps what has expired rather than shedding forever,
+        // at the instant those registrations expire and not a millisecond
+        // later: everything here was registered at 0 except the refresh above.
+        let at_expiry = REGISTRATION_TTL_MS;
         let room = pairings.take(
             Datagram::Register { key: [0xFF; 32] },
             v4("192.0.2.2:2000"),
-            after,
+            at_expiry,
         );
         assert_eq!(room.reply, Some(Datagram::Registered { key: [0xFF; 32] }));
         assert_eq!(
-            pairings
-                .take(
-                    Datagram::Resolve { key: [0; 32] },
-                    v4("192.0.2.4:4000"),
-                    after
-                )
-                .reply,
-            Some(Datagram::Resolved {
-                key: [0; 32],
-                serve: None
-            }),
-            "an expired registration is not answered with, swept or not"
+            pairings.registered.len(),
+            2,
+            "the refreshed registration and the one the sweep made room for"
         );
     }
 }

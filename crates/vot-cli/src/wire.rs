@@ -417,6 +417,16 @@ fn keep_registered(
     }
 }
 
+/// What a failed read is worth reporting as: a wait that ran out is
+/// nothing, and any other failure is the carrier's.
+fn read_failure(error: &std::io::Error) -> Option<Error> {
+    if waited_out(error) {
+        None
+    } else {
+        Some(Error::CarrierUnavailable)
+    }
+}
+
 /// Returns true for timeout/WouldBlock, false for real errors.
 fn waited_out(error: &std::io::Error) -> bool {
     matches!(
@@ -588,8 +598,7 @@ fn resolved(
     for read in 0..STRAY_READS {
         let (length, _) = match socket.recv_from(buffer) {
             Ok(arrival) => arrival,
-            Err(error) if waited_out(&error) => return Ok(None),
-            Err(_) => return Err(Error::CarrierUnavailable),
+            Err(error) => return read_failure(&error).map_or(Ok(None), Err),
         };
         if read == 0 {
             socket
@@ -1131,6 +1140,17 @@ mod tests {
     #[test]
     fn only_a_read_without_a_datagram_is_waited_out() {
         use std::io::ErrorKind;
+        // What a failed read is reported as, which is the whole decision.
+        assert!(read_failure(&std::io::Error::from(ErrorKind::WouldBlock)).is_none());
+        assert!(read_failure(&std::io::Error::from(ErrorKind::TimedOut)).is_none());
+        assert!(matches!(
+            read_failure(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+            Some(Error::CarrierUnavailable)
+        ));
+        assert!(matches!(
+            read_failure(&std::io::Error::from(ErrorKind::BrokenPipe)),
+            Some(Error::CarrierUnavailable)
+        ));
         assert!(waited_out(&std::io::Error::from(ErrorKind::WouldBlock)));
         assert!(waited_out(&std::io::Error::from(ErrorKind::TimedOut)));
         assert!(!waited_out(&std::io::Error::from(
@@ -1355,10 +1375,7 @@ mod tests {
 
         let opened = BundleServer::open(&bundle).unwrap();
         let serving = std::thread::spawn(move || {
-            // One session answers the whole bundle. The second rail still
-            // punches for itself, which is what this test reads off the
-            // service, and finds the plan already done.
-            crate::drive::serve_sessions(Some(1), || {
+            crate::drive::serve_sessions(Some(u32::try_from(RAILS).unwrap()), || {
                 let carrier = listener.accept().map_err(carrier_failure)?;
                 ServeSession::begin(&opened, carrier, authentication())
             })

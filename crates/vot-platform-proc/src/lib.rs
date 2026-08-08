@@ -6,14 +6,9 @@ use std::io;
 
 /// Reads this process's peak resident memory, in bytes.
 ///
-/// Linux is deliberately absent: `/proc/self/status` carries `VmHWM` and needs
-/// no FFI, so the reader for it lives with its caller. This crate covers the
-/// platforms whose only source is a native call.
-///
 /// # Errors
-/// Returns the operating-system error when the measurement cannot be taken,
-/// and `Unsupported` where no native source exists; the caller owns saying a
-/// metric has no measured source rather than inventing a zero.
+/// Returns the OS error when the measurement fails, or `Unsupported` where
+/// no native source exists.
 pub fn peak_resident_bytes() -> io::Result<u64> {
     #[cfg(windows)]
     {

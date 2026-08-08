@@ -1,26 +1,7 @@
-//! `ed25519-cbor-v1`, the capability format `spec/registries.md` section 11
-//! registers as `0x0001`.
+//! `ed25519-cbor-v1` capability format (`spec/registries.md` section 11).
 //!
-//! What a capability contains is fixed by `spec/security.md` section 5. How it is
-//! bound to the peer presenting it is fixed by ADR-0022: a holder public key and
-//! a proof of possession over the `AUTH_CONTEXT` nonce, because the `MsQuic`
-//! wrapper exposes no TLS exporter and a carrier-bound capability would not
-//! survive the QUIC to TCP switch `spec/wire.md` section 7 requires. Whose
-//! signature to believe is fixed by ADR-0023 and is not decided here: this crate
-//! reads and writes the format and checks the signature over it, and a verifier
-//! decides whether the issuer that signed it is one it trusts.
-//!
-//! The signature covers the capability exactly as it arrived rather than a
-//! re-encoding of the decoded claims. A verifier that re-encodes is trusting its
-//! decoder and encoder to be exact inverses; one that signs what it sends is not.
-//! The claims are then read by a decoder that refuses anything but the one
-//! canonical form, so a capability that parses was canonical.
-//!
-//! Times are seconds since `1970-01-01T00:00:00Z`. The rest of VOT writes an
-//! instant as RFC 3339 text, which this deliberately does not: not-before and
-//! expiry are compared against a clock, no time library is in the dependency set,
-//! and this repository validates RFC 3339 syntax without parsing it into
-//! anything comparable.
+//! Reads, writes, and checks signatures over capabilities. Signature covers the
+//! canonical bytes exactly as signed (not a re-encoding). Times are epoch seconds.
 
 #![forbid(unsafe_code)]
 
@@ -37,11 +18,7 @@ pub const FORMAT_ID: u16 = 0x0001;
 /// over one statement is not valid input for another.
 const DOMAIN: &[u8] = b"VOT capability v0\0";
 
-/// The one delegation constraint this format defines.
-///
-/// ADR-0023 defers chained attenuation to a separate format identifier, so the
-/// claim is present and checked rather than absent or unread. A capability
-/// claiming any other value is refused.
+/// The one delegation constraint this format defines. Any other value is refused.
 pub const NO_FURTHER_DELEGATION: u64 = 0;
 
 /// Bounds every field the format fixes. `spec/capability.cddl` is normative and
@@ -66,9 +43,6 @@ pub mod bounds {
 }
 
 /// Why a capability could not be read, written, or checked.
-///
-/// One variant per rule rather than one per field: a caller acts on the rule that
-/// was broken, and a mutation run can tell them apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     /// Not deterministic CBOR at all.
@@ -171,15 +145,11 @@ pub struct Capability {
     pub delegation: u64,
 }
 
-/// A capability with the issuer signature over it.
-///
-/// `capability` holds the bytes the signature covers. Keeping them rather than
-/// re-encoding the claims is what makes verification independent of this crate's
-/// encoder.
+/// A capability with the issuer signature over it. Holds the exact signed
+/// bytes so verification is independent of this crate's encoder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedCapability {
-    /// Which key the issuer claimed to use. Bound into the signature, so it
-    /// cannot be relabelled.
+    /// Which key the issuer claimed to use. Bound into the signature.
     pub key_id: Vec<u8>,
     /// The canonical capability, exactly as signed.
     pub capability: Vec<u8>,
@@ -209,11 +179,8 @@ impl Scope {
         let mut previous_end = None;
         for range in &self.ranges {
             range.validate()?;
-            // Strictly separated, not merely disjoint. Two adjacent ranges are
-            // one range written twice, and the issuer that meant one authorization
-            // has one way to say it. It also means a request spanning what an
-            // issuer intended as one region is not refused for how the issuer
-            // happened to split it.
+            // Strictly separated, not just disjoint: adjacent ranges are one
+            // range written twice.
             if previous_end.is_some_and(|end| range.offset <= end) {
                 return Err(Error::InvalidRange);
             }
@@ -242,8 +209,6 @@ impl Scope {
         if self.ranges.is_empty() {
             return self.length.is_none_or(|length| end <= length);
         }
-        // One allowed range has to cover it whole, which is why the encoding
-        // refuses adjacent ranges: an issuer that meant one region wrote one.
         self.ranges
             .iter()
             .any(|allowed| range.offset >= allowed.offset && Some(end) <= allowed.end())
@@ -314,9 +279,6 @@ impl Scope {
 pub fn encode_scope(scope: &Scope) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     scope.encode(&mut out)?;
-    // No size check. The collection bounds cap the widest scope well under the
-    // field, which `the_widest_capability_fits_the_field_that_carries_it` measures
-    // rather than estimates.
     Ok(out)
 }
 
@@ -339,9 +301,6 @@ fn validate_identity(value: &str) -> Result<(), Error> {
     if !(low..=high).contains(&value.len()) {
         return Err(Error::InvalidIdentity);
     }
-    // A control character in an identity is a line an operator prints. The
-    // telemetry rules keep these out of traces; this keeps them out of anything
-    // else a deployment writes them to.
     if value.chars().any(char::is_control) {
         return Err(Error::InvalidIdentity);
     }
@@ -371,9 +330,6 @@ impl Capability {
         if !(low..=high).contains(&self.operations.len()) {
             return Err(Error::InvalidOperations);
         }
-        // Ascending with no repeats, so one grant has one encoding, and never the
-        // reserved zero. What an unknown operation means is a verifier's
-        // decision, not an encoding rule: section 12 has it grant nothing.
         if self.operations[0] == 0
             || !self.operations.windows(2).all(|pair| pair[0] < pair[1])
             || self.operations.iter().any(|value| *value > 0xffff)
@@ -392,8 +348,6 @@ impl Capability {
 
         self.scope.validate()?;
 
-        // A window that has already closed when it opens authorizes nothing, and
-        // an issuer that wrote one meant something else.
         if self.expiry <= self.not_before {
             return Err(Error::InvalidValidity);
         }
@@ -403,11 +357,8 @@ impl Capability {
         Ok(())
     }
 
-    /// Whether the window is open at `now`, in seconds since the epoch.
-    ///
-    /// Inclusive of `not_before` and exclusive of `expiry`, so a capability is
-    /// valid for exactly the seconds between them. The clock is the verifier's:
-    /// ADR-0023 puts it at the policy boundary, since no VOT frame carries one.
+    /// Whether the window is open at `now`. Inclusive of `not_before`, exclusive
+    /// of `expiry`.
     #[must_use]
     pub const fn is_current(&self, now: u64) -> bool {
         now >= self.not_before && now < self.expiry
@@ -533,14 +484,8 @@ impl Capability {
     }
 }
 
-/// What an issuer signs, and what a verifier checks the signature against.
-///
-/// The domain separates a capability from a receipt and a witness statement. The
-/// format identifier is bound in, so a capability signed under this format is not
-/// valid input for another one, which is what keeps chained delegation arriving as
-/// a new identifier from reinterpreting these bytes. The key identifier is bound
-/// in for the reason ADR-0017 gives: left outside, it is a label anyone can
-/// rewrite.
+/// What an issuer signs, and what a verifier checks against. The domain and
+/// format identifier are bound in so signatures cannot be repurposed.
 ///
 /// # Errors
 /// Rejects a key identifier outside its bounds.
@@ -560,9 +505,7 @@ pub fn signing_input(key_id: &[u8], capability: &[u8]) -> Result<Vec<u8>, Error>
 ///
 /// # Errors
 /// Rejects a capability the format does not allow and a key identifier outside
-/// its bounds. The size a session gives the field needs no check here: the
-/// collection bounds keep the widest envelope well under it, and
-/// `the_widest_capability_fits_the_field_that_carries_it` records what that is.
+/// its bounds.
 pub fn sign(
     capability: &Capability,
     key_id: &[u8],
@@ -577,20 +520,16 @@ pub fn sign(
     })
 }
 
-/// Checks the signature over a capability under one issuer key.
-///
-/// This says the bytes came from the holder of that key and nothing more. Whether
-/// that key is one this deployment trusts for this issuer and audience is
-/// ADR-0023's question, and a verifier answers it separately.
+/// Checks the signature over a capability under one issuer key. Only confirms
+/// the bytes came from that key; trust is the verifier's decision.
 ///
 /// # Errors
 /// Rejects a key identifier outside its bounds and a signature that does not
 /// verify.
 pub fn verify_signature(signed: &SignedCapability, key: &VerifyingKey) -> Result<(), Error> {
     let input = signing_input(&signed.key_id, &signed.capability)?;
-    // verify_strict rejects low-order and torsion public keys, so one signature
-    // cannot verify under two of them and two issuers cannot claim one
-    // capability.
+    // verify_strict rejects low-order/torsion keys so one signature cannot
+    // verify under two.
     key.verify_strict(&input, &Signature::from_bytes(&signed.signature))
         .map_err(|_| Error::Signature)
 }
@@ -614,10 +553,7 @@ pub fn encode(signed: &SignedCapability) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// Reads a signed capability, without checking the signature or the claims.
-///
-/// Separate from both on purpose: a verifier checks the signature over the bytes
-/// this returns, and reads the claims only from bytes a trusted issuer signed.
+/// Reads a signed capability without checking the signature or claims.
 ///
 /// # Errors
 /// Rejects bytes that are not one canonical envelope, a key identifier outside
@@ -716,9 +652,6 @@ mod tests {
 
     #[test]
     fn the_signature_is_over_the_bytes_that_arrived() {
-        // A verifier that re-encoded the decoded claims would be trusting its own
-        // encoder to be the inverse of its decoder. This one does not have to:
-        // the bytes are kept and the signature is checked over them.
         let signed = sign(&capability(), b"issuer-1", &issuer_key()).unwrap();
         let decoded = decode(&encode(&signed).unwrap()).unwrap();
         assert_eq!(decoded.capability, signed.capability);
@@ -732,7 +665,6 @@ mod tests {
     fn a_signature_is_bound_to_its_key_identifier_and_its_format() {
         let signed = sign(&capability(), b"issuer-1", &issuer_key()).unwrap();
 
-        // Relabelled: the same bytes and signature under another identifier.
         let mut relabelled = signed.clone();
         relabelled.key_id = b"issuer-2".to_vec();
         assert_eq!(
@@ -740,8 +672,6 @@ mod tests {
             Err(Error::Signature)
         );
 
-        // The format identifier is inside the signed input, so a future format
-        // cannot reinterpret these bytes under its own rules and still verify.
         let mut other_format = signing_input(b"issuer-1", &signed.capability).unwrap();
         let position = DOMAIN.len();
         other_format[position..position + 2].copy_from_slice(&2u16.to_be_bytes());
@@ -752,7 +682,6 @@ mod tests {
                 .is_err()
         );
 
-        // And another issuer's key does not verify it.
         let other = SigningKey::from_bytes(&[9; 32]);
         assert_eq!(
             verify_signature(&signed, &other.verifying_key()),
@@ -997,16 +926,12 @@ mod tests {
         ];
         for (name, value, expected) in cases {
             assert_eq!(value.validate(), Err(expected), "{name}");
-            // And it cannot be encoded either, so a refused rule cannot reach a
-            // signature.
             assert_eq!(value.canonical_bytes(), Err(expected), "{name} encoded");
         }
     }
 
     #[test]
     fn a_bound_admits_its_own_maximum() {
-        // A bound that refuses its own maximum refuses a conforming issuer, and
-        // nothing else here would notice.
         let mut value = capability();
         value.issuer = "i".repeat(bounds::IDENTITY.1);
         value.audience = "a".repeat(bounds::IDENTITY.1);
@@ -1030,7 +955,6 @@ mod tests {
         let signed = sign(&value, &[0xab; 64], &issuer_key()).unwrap();
         assert_eq!(decode(&encode(&signed).unwrap()), Ok(signed));
 
-        // One past each collection bound is refused.
         let mut wide = capability();
         wide.operations = (1..=bounds::OPERATIONS.1 as u64 + 1).collect();
         assert_eq!(wide.validate(), Err(Error::InvalidOperations));
@@ -1091,8 +1015,6 @@ mod tests {
             Err(Error::Encoding(vot_cbor::Error::Trailing))
         );
 
-        // A wider head than the length needs is a different encoding of the same
-        // map, and deterministic encoding has one.
         let mut noncanonical = vec![0xb8, 0x04];
         noncanonical.extend_from_slice(&encoded[1..]);
         assert_eq!(
@@ -1100,12 +1022,9 @@ mod tests {
             Err(Error::Encoding(vot_cbor::Error::NonCanonical))
         );
 
-        // A version this format does not define, rather than a shape it cannot
-        // read: refused for what it says it is.
         let mut future = SignedCapability { ..signed };
         future.capability = {
             let mut bytes = capability().canonical_bytes().unwrap();
-            // Key 0 is the version, and its value is the third byte of the map.
             bytes[2] = 1;
             bytes
         };
@@ -1118,7 +1037,6 @@ mod tests {
     #[test]
     fn a_scope_decides_what_it_allows() {
         let scope = capability().scope;
-        // Inside an allowed range, at each edge of it.
         assert!(scope.allows(Range {
             offset: 0,
             length: 65_536
@@ -1131,23 +1049,18 @@ mod tests {
             offset: 131_072,
             length: 1
         }));
-        // One byte past an allowed range.
         assert!(!scope.allows(Range {
             offset: 0,
             length: 65_537
         }));
-        // In the gap between two of them.
         assert!(!scope.allows(Range {
             offset: 65_536,
             length: 1
         }));
-        // Spanning two allowed ranges: they are separate authorizations and do
-        // not combine.
         assert!(!scope.allows(Range {
             offset: 0,
             length: 196_608
         }));
-        // An empty request asks for nothing and is not a way to probe.
         assert!(!scope.allows(Range {
             offset: 0,
             length: 0
@@ -1157,7 +1070,6 @@ mod tests {
             length: 1
         }));
 
-        // No ranges means the whole object, bounded by a known length.
         let whole = Scope {
             ranges: Vec::new(),
             length: Some(1024),
@@ -1172,7 +1084,6 @@ mod tests {
             length: 1025
         }));
 
-        // An unknown length bounds nothing, which is what "when known" means.
         let unbounded = Scope {
             ranges: Vec::new(),
             length: None,
@@ -1202,12 +1113,7 @@ mod tests {
 
     #[test]
     fn every_bound_is_tested_at_its_own_edge() {
-        // Each of these is a comparison, and a comparison is wrong one value
-        // either side of where it belongs. The value that must be accepted is
-        // asserted with the one that must not.
 
-        // Adjacent ranges are one range written twice, so the encoding refuses
-        // them; a gap of one byte is two regions and is allowed.
         let adjacent = Scope {
             ranges: vec![
                 Range {
@@ -1237,7 +1143,6 @@ mod tests {
         };
         assert_eq!(separated.validate(), Ok(()));
 
-        // A range ending exactly at a known length is inside the object.
         let exact = Scope {
             length: Some(64),
             ranges: vec![Range {
@@ -1257,16 +1162,12 @@ mod tests {
         };
         assert_eq!(past.validate(), Err(Error::InvalidRange));
 
-        // The widest operation the registry can name is allowed; one past it is
-        // not a registry value at all.
         let mut widest = capability();
         widest.operations = vec![0xffff];
         assert_eq!(widest.validate(), Ok(()));
         widest.operations = vec![0x1_0000];
         assert_eq!(widest.validate(), Err(Error::InvalidOperations));
 
-        // An input of exactly the size bound is refused for what it is rather
-        // than for how long it is, which is what tells the two comparisons apart.
         assert_eq!(
             decode_scope(&[0; bounds::SCOPE]),
             Err(Error::Encoding(vot_cbor::Error::WrongType))
@@ -1278,8 +1179,6 @@ mod tests {
         );
         assert_eq!(decode(&vec![0; bounds::SIGNED + 1]), Err(Error::TooLarge));
 
-        // And a capability that encodes to exactly the envelope bound is minted,
-        // while one byte more is not.
         let mut value = capability();
         value.scope.length = None;
         value.scope.ranges = Vec::new();
@@ -1311,12 +1210,6 @@ mod tests {
 
     #[test]
     fn the_widest_capability_fits_the_field_that_carries_it() {
-        // Measured rather than estimated. An upper bound computed from the field
-        // bounds would carry slack, and slack is what makes such a bound survive
-        // being changed: the arithmetic can be wrong by a lot and the conclusion
-        // still holds. Encoding the widest thing this crate will produce and
-        // recording its size cannot be wrong that way, and a field added to the
-        // format moves a number here rather than passing unnoticed.
         let mut value = capability();
         value.issuer = "i".repeat(bounds::IDENTITY.1);
         value.audience = "a".repeat(bounds::IDENTITY.1);
@@ -1328,9 +1221,6 @@ mod tests {
             })
             .collect();
         value.scope.length = None;
-        // Offsets and lengths wide enough to need the widest head, strictly
-        // separated, and ending inside `u64`. A range list of small numbers is not
-        // the widest thing this encodes, and measuring one would understate it.
         value.scope.ranges = (0..bounds::RANGES as u64)
             .map(|index| Range {
                 offset: index * (1 << 49),
@@ -1348,8 +1238,6 @@ mod tests {
         assert!(envelope.len() <= bounds::SIGNED, "and it fits its field");
         assert_eq!(decode(&envelope), Ok(signed));
 
-        // A capability larger than the field is still refused where it arrives,
-        // because an input is not bounded by what this crate would encode.
         assert_eq!(decode(&vec![0; bounds::SIGNED + 1]), Err(Error::TooLarge));
     }
 }

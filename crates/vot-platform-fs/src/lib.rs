@@ -98,18 +98,11 @@ pub use same_file_regular_windows as same_file_regular;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-/// Frees a preallocated file from valid-data tracking, so positional
-/// writes may land at any offset without the filesystem zero-filling
-/// everything below them first.
-///
-/// NTFS keeps a valid data length per file: a write past it zero-fills
-/// the whole gap under the file's resources, which serializes concurrent
-/// out-of-order writers and writes the gap twice. A sparse file has no
-/// gap to fill, because unwritten regions read as zeros by construction.
+/// Marks a file as sparse so positional writes skip valid-data-length
+/// zero-filling, which otherwise serializes out-of-order writers.
 ///
 /// # Errors
-/// Returns the operating system's refusal, filesystems without the
-/// attribute among them; the caller loses nothing but the saving.
+/// Returns the OS refusal; callers without the attribute lose only the saving.
 pub fn allow_unordered_writes_windows(file: &std::fs::File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::System::IO::DeviceIoControl;

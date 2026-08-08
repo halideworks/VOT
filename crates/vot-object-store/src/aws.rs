@@ -333,12 +333,8 @@ mod tests {
         }
     }
 
-    /// An S3-compatible endpoint that answers from a rule rather than a script.
-    ///
-    /// The SDK retries what it considers retryable and sends what it considers
-    /// necessary, and neither is this test's business. A handler that answers by
-    /// what it was asked is right however many times it is asked, which is what
-    /// keeps these tests about the adapter rather than about the SDK's policy.
+    /// An S3-compatible endpoint that answers from a rule. Right regardless of
+    /// how many times the SDK retries.
     struct FakeS3 {
         endpoint: String,
         seen: Arc<Mutex<Vec<Request>>>,
@@ -364,9 +360,6 @@ mod tests {
                             stream
                                 .set_nonblocking(false)
                                 .expect("a blocking connection");
-                            // One connection is served at a time, so a client
-                            // that opens one and says nothing would hold every
-                            // later request behind it until the job times out.
                             stream
                                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                                 .expect("a connection that gives up");
@@ -555,16 +548,11 @@ mod tests {
             }
         );
 
-        // What the object store reports about an object is what it read, not what
-        // it was told.
         assert_eq!(
             store.head("key"),
             Some((7, vot_journal::crc32c(b"payload")))
         );
 
-        // The part went up with the checksum the caller gave, encoded as S3 wants
-        // it. A part sent under another checksum is a part the endpoint verifies
-        // against the wrong number.
         let sent = endpoint.requests();
         let part = sent
             .iter()
@@ -581,8 +569,6 @@ mod tests {
         assert_eq!(part.body, b"payload");
         assert!(part.target.contains("partNumber=1"));
 
-        // And the object is deletable, which is the other half of the lease the
-        // collector holds.
         assert_eq!(store.delete_object("key"), Ok(()));
     }
 
@@ -635,7 +621,6 @@ mod tests {
             "nothing a caller got wrong was sent"
         );
 
-        // The last part a multipart upload may have is not one of the refusals.
         assert!(
             store
                 .upload_part(
@@ -651,9 +636,6 @@ mod tests {
 
     #[test]
     fn a_part_the_endpoint_echoes_differently_is_refused() {
-        // S3 answers with the checksum it stored. A part that comes back under
-        // another number was not stored as it was sent, whatever the transfer
-        // said.
         let endpoint = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -675,8 +657,6 @@ mod tests {
             Err(Error::ChecksumMismatch)
         );
 
-        // An endpoint that says nothing about the checksum is not contradicting
-        // the one that was sent.
         let quiet = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -766,9 +746,6 @@ mod tests {
             );
         }
 
-        // A part set that is consistent with itself and still not an upload. Each
-        // of these agrees with what went up receipt for receipt, so only the rule
-        // about which parts an upload is made of refuses them.
         let mut from_two = endpoint.store();
         let second_upload = from_two.create_multipart("key", 0).expect("an upload");
         let two_of_two = from_two
@@ -797,8 +774,6 @@ mod tests {
             "an upload with a part missing from the middle"
         );
 
-        // The upload survived every refusal. An upload dropped on a caller's
-        // mistake would have to be uploaded again.
         let object = store
             .complete_multipart(&upload_id, &[one, two])
             .expect("the completion that matches");
@@ -808,9 +783,6 @@ mod tests {
 
     #[test]
     fn an_object_that_is_not_what_went_up_is_refused_after_completion() {
-        // The endpoint takes the completion and then serves something else. The
-        // read back is what decides, so this is a checksum mismatch rather than an
-        // object.
         let endpoint = FakeS3::new(happy_endpoint(b"something else"));
         let mut store = endpoint.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
@@ -819,9 +791,6 @@ mod tests {
             Err(Error::ChecksumMismatch)
         );
 
-        // An object of the right length and the wrong bytes is refused for the
-        // same reason, which is what says the checksum is compared and not only
-        // the length.
         let swapped = FakeS3::new(happy_endpoint(b"paylaod"));
         let mut store = swapped.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
@@ -833,8 +802,6 @@ mod tests {
 
     #[test]
     fn a_completion_that_may_have_landed_is_reconciled_by_reading_it_back() {
-        // NoSuchUpload after a completion means the upload was consumed, which is
-        // what a retried completion looks like. The object decides.
         let endpoint = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -861,9 +828,6 @@ mod tests {
             .expect("an upload that had already landed");
         assert_eq!(object.bytes, b"payload");
 
-        // The same answer with an object that is not what went up is ambiguous
-        // rather than a mismatch: this endpoint never said the completion
-        // happened, so the difference is not evidence of corruption.
         let wrong = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -890,7 +854,6 @@ mod tests {
             Err(Error::CompletionAmbiguous)
         );
 
-        // An object that cannot be read at all is ambiguous for the same reason.
         let absent = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -921,9 +884,6 @@ mod tests {
 
     #[test]
     fn a_completion_that_is_never_answered_is_reconciled_like_any_other() {
-        // The endpoint takes the completion and closes without answering, so there
-        // is no service error to read a code out of. That is the case where the
-        // object is the only evidence, and reading it back is what settles it.
         let endpoint = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -953,9 +913,6 @@ mod tests {
 
     #[test]
     fn a_completion_the_endpoint_refuses_outright_is_a_backend_failure() {
-        // A service error that is not the consumed upload is not reconciled. The
-        // upload is still there, and the caller is told the backend refused
-        // rather than that the object may exist.
         let endpoint = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -981,7 +938,6 @@ mod tests {
             store.complete_multipart(&upload_id, &[receipt.clone()]),
             Err(Error::Backend)
         );
-        // And the upload is still known, so the caller may try again.
         assert_eq!(
             store.complete_multipart(&upload_id, &[receipt]),
             Err(Error::Backend)
@@ -990,9 +946,6 @@ mod tests {
 
     #[test]
     fn an_endpoint_that_says_nothing_is_a_backend_failure() {
-        // Nothing listens on the address, so every call fails at the transport.
-        // A store that read an empty object out of that would report an object
-        // that does not exist.
         let mut store =
             AwsS3Store::new("http://127.0.0.1:1", "bucket", "us-east-1", "key", "secret")
                 .expect("a store against a closed port");
@@ -1025,8 +978,6 @@ mod tests {
                 etag: "one".to_owned(),
             },
         );
-        // The parts are summed in part order rather than insertion order, which is
-        // what makes the checksum the object's rather than this map's.
         let expected_checksum = crc32c_parts(&parts);
         assert_eq!(expected_checksum, vot_journal::crc32c(b"onetwo"));
         assert_ne!(expected_checksum, vot_journal::crc32c(b"twoone"));
@@ -1038,8 +989,6 @@ mod tests {
             6,
             vot_journal::crc32c(b"onetwo")
         ));
-        // Each half of the comparison on its own. A length that matches is not an
-        // object that matches, and neither is a checksum.
         assert!(!read_back_matches(
             6,
             expected_checksum,

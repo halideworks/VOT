@@ -1,21 +1,8 @@
-//! The `MsQuic` backend as a benchmark carrier.
+//! `MsQuic` backend as a benchmark carrier.
 //!
-//! A connected loopback pair: the client submits, the accepted connection
-//! receives, and `MsQuic` owns the sockets and the worker threads behind both.
-//! The handshake completes here, in the constructor, so no part of it lands
-//! inside the timed section.
-//!
-//! The same division as the quiche carrier. Nothing in this file decides what a
-//! run means; it opens the endpoints and forwards submissions and events, while
-//! the transfer loop, the framing, and every reported number stay in `lib.rs`
-//! where the mutation gate measures them. That is why this file is named in
-//! `.cargo/mutants.toml`: it compiles only under the `msquic` feature, which
-//! the mutation matrix does not enable, so a mutant here would be reported
-//! missed whatever the tests say.
-//!
-//! No `MsQuic` type appears below, which ADR-0012 requires of everything
-//! outside `vot-transport-msquic`. The pair is built from that crate's `Config`
-//! and its two boundary constructors.
+//! A connected loopback pair: client submits, accepted connection receives.
+//! Handshake completes in the constructor. Transfer loop and reported numbers
+//! are in `lib.rs`. No `MsQuic` type appears directly (ADR-0012).
 
 use std::net::SocketAddr;
 use std::sync::OnceLock;
@@ -29,16 +16,10 @@ use vot_transport_msquic::live::{
 
 use crate::{Carrier, Config, Error};
 
-/// How long the pair is given to connect and be accepted.
-///
-/// Loopback needs milliseconds. Long enough that a loaded machine is not
-/// mistaken for a broken one, and short enough that a run which will never
-/// connect fails rather than hanging in CI.
+/// Handshake timeout for the loopback pair.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lanes the endpoints advertise. The sequential transfer uses one, the
-/// ranged path uses one per worker starting at lane 1, and the workload
-/// defines worker counts up to 8, so the endpoint advertises room for that.
+/// Lanes the endpoints advertise. Workload uses up to 8 workers (one per lane).
 const ADVERTISED_LANES: u64 = 16;
 
 /// The connection identifier the client reports its connection under. Arbitrary
@@ -71,8 +52,7 @@ impl MsQuicCarrier {
             MsQuicServer::bind(loopback, &MsQuicConfig::server(limits, certificate, key))
                 .map_err(Error::Transport)?;
         let mut client_config = MsQuicConfig::client(limits);
-        // The credential is generated for this run and trusted by
-        // construction. What is measured is the carrier, not the web PKI.
+        // Self-signed credential: benchmark measures the carrier, not the PKI.
         client_config.verify_peer = false;
         let mut client = MsQuicTransport::dial(
             server.local_address().map_err(Error::Transport)?,
@@ -103,9 +83,8 @@ fn advertised_limits() -> Result<ReceiveLimits, Error> {
     .map_err(Error::Transport)
 }
 
-/// How long a role endpoint waits for its peer, against loopback's
-/// [`HANDSHAKE_TIMEOUT`]: the two halves of a two-machine run are started by
-/// hand on two machines, and a human is slower than a scheduler.
+/// Handshake timeout for two-machine runs. Longer than loopback because a
+/// human starts each half.
 const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Listens on `address` and waits for the sending half to connect.
@@ -135,8 +114,6 @@ pub(crate) fn role_listen(
     };
     Ok(crate::role::Endpoint {
         adapter: Box::new(accepted),
-        // The listener produced the connection and MsQuic keeps registration
-        // and worker threads behind it, so it lives as long as the adapter.
         keepalive: Some(Box::new(server)),
         backend: "msquic",
         detail: None,
@@ -144,17 +121,12 @@ pub(crate) fn role_listen(
     })
 }
 
-/// How long one dial is given before the next, inside the role deadline.
-///
-/// `MsQuic` reports a refused first flight as a dead connection rather than
-/// retrying it, so a dial that lands before the receiving half listens would
-/// otherwise spend the whole deadline waiting on a connection that already
-/// failed. quiche needs no equivalent because its pump retransmits the flight.
+/// Dial interval for two-machine connects. `MsQuic` reports a refused first
+/// flight as dead rather than retrying, so dials repeat until the deadline.
 const ROLE_DIAL_RETRY: Duration = Duration::from_secs(2);
 
-/// Connects to the receiving half at `peer`, dialing again while the deadline
-/// allows, because the halves are started by hand and the receiver may not be
-/// listening yet.
+/// Connects to the receiving half at `peer`, redialing while the deadline
+/// allows.
 ///
 /// # Errors
 /// Reports a socket or configuration failure, and a handshake that did not
@@ -164,8 +136,6 @@ pub(crate) fn role_connect(
     peer: SocketAddr,
 ) -> Result<crate::role::Endpoint, Error> {
     let mut client_config = MsQuicConfig::client(advertised_limits()?);
-    // The receiving half's credential is generated for its run and trusted by
-    // construction, exactly as the loopback pair trusts its own.
     client_config.verify_peer = false;
     let deadline = Instant::now() + ROLE_HANDSHAKE_TIMEOUT;
     loop {
@@ -225,12 +195,9 @@ fn handshake(
     Err(Error::Handshake)
 }
 
-/// Impairment fields this carrier describes but does not shape.
-///
-/// The same account the quiche carrier gives, and for the same reason: loopback
-/// is not the path the file describes and nothing here shapes it to match. The
-/// receive window still comes from the case's bandwidth-delay product, which is
-/// the one effect an impairment field has.
+/// Impairment fields this carrier describes but does not shape. Loopback has
+/// its own characteristics; only the receive window (from the case's BDP) has
+/// effect.
 fn unmodelled_for(config: &Config) -> Vec<&'static str> {
     let mut unmodelled = vec!["mtu_bytes", "bandwidth_bps", "queue_bytes"];
     for (present, name) in [
@@ -245,11 +212,7 @@ fn unmodelled_for(config: &Config) -> Vec<&'static str> {
     unmodelled
 }
 
-/// Generates a self-signed credential once per process.
-///
-/// The same approach both live test suites take: `openssl` into a temporary
-/// directory, so nothing is added as a dependency for something that never
-/// leaves this host.
+/// Generates a self-signed credential once per process via `openssl`.
 ///
 /// # Errors
 /// Reports a failure to create the directory or to run `openssl`.
@@ -298,8 +261,6 @@ impl Carrier for MsQuicCarrier {
         &self.unmodelled
     }
 
-    // The accepted connection is the endpoint that receives the object, so its
-    // inbound bound is the one the case's credit applies to.
     fn receiving(&mut self) -> &mut dyn TransportAdapter {
         &mut self.accepted
     }
@@ -313,8 +274,6 @@ impl Carrier for MsQuicCarrier {
             .send_reliable_shared(stream, Payload::clone(frame))
     }
 
-    // Both ends, as on quiche: the client has records to hand over, and the
-    // receiver has the acknowledgements that let the client send more.
     fn flush(&mut self) -> Result<(), vot_transport_api::Error> {
         self.client.flush()?;
         self.accepted.flush()
@@ -324,16 +283,10 @@ impl Carrier for MsQuicCarrier {
         self.accepted.poll()
     }
 
-    // A sender that loses its connection is reported here and discarded with
-    // the rest. The object stops arriving either way, so the run ends on the
-    // receiver's disconnect or on the budget rather than silently.
     fn drain_sent(&mut self) {
         while self.client.poll().is_some() {}
     }
 
-    // The receiving endpoint, because that is whose events an idle delivery
-    // was short of. The callback queue's signal ends the wait as soon as one
-    // lands.
     fn wait(&mut self, bound: Duration) {
         self.accepted.wait_for_event(bound);
     }
@@ -375,8 +328,6 @@ mod tests {
 
     #[test]
     fn a_case_crosses_a_real_socket_and_verifies() {
-        // Past one batch and past one datagram many times over, so records are
-        // reassembled from packets rather than arriving whole.
         let object_bytes = 40 * 65_536;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
@@ -386,9 +337,6 @@ mod tests {
 
     #[test]
     fn a_ranged_case_crosses_a_real_socket_and_verifies() {
-        // The multi-worker path over a real socket in both arrangements:
-        // disjoint proof-bearing ranges on one lane per worker of a shared
-        // connection, or on a connection per worker, a ragged tail included.
         for workers in [2_usize, 4] {
             for rails in [Rails::Shared, Rails::Provisioned] {
                 let mut config = case(6 * 65_536 + 17);
@@ -410,16 +358,12 @@ mod tests {
         let object_bytes = 3 * 65_536 + 17;
         let measured = measure(&case(object_bytes)).unwrap();
         assert_eq!(measured.verified_bytes, object_bytes);
-        // The envelope is on the wire and the object is not.
         let wire: u64 = note_field(&measured.notes, "wire_bytes").parse().unwrap();
         assert!(wire > object_bytes, "wire was {wire}");
     }
 
     #[test]
     fn the_carrier_bounds_its_credit_at_construction() {
-        // The assembled MsQuic transport reports Unsupported for a per-call
-        // credit, as the quiche one does, so the report has to say which bound
-        // was in force rather than implying the receiver's was applied.
         let measured = measure(&case(65_536)).unwrap();
         assert_eq!(note_field(&measured.notes, "credit_mode"), "constructed");
     }
@@ -440,8 +384,6 @@ mod tests {
 
     #[test]
     fn a_pair_can_be_built_more_than_once_in_a_process() {
-        // The measurement work builds one per case, and MsQuic keeps a
-        // registration and worker threads behind each.
         for _ in 0..3 {
             let carrier = MsQuicCarrier::connected(&case(65_536)).unwrap();
             drop(carrier);

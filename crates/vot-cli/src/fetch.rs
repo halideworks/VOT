@@ -1,13 +1,6 @@
-//! Fetching one bundle over a session: the request half of ADR-0030.
-//!
-//! A [`BundleFetcher`] opens a session, takes the announced descriptor and
-//! seal, holds every manifest page to the seal's commitments as it writes
-//! them, validates the written manifest with the same chain walk `receive`
-//! trusts, and then fetches every stored object the manifest names:
-//! sequentially per object, ranges pipelined, each range root-verified by
-//! the receiver before its bytes are placed through a [`FileSink`] into
-//! `objects/`. The output is a bundle directory `receive_bundle` consumes
-//! unchanged; nothing about publication is reimplemented here.
+//! Fetching one bundle over a session: opening it, validating the
+//! manifest, and pipelining range requests into a bundle directory
+//! `receive_bundle` consumes unchanged.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -31,16 +24,11 @@ use vot_resume::{ResumeStore, UnitRanges};
 use crate::serve::is_backpressure;
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
-/// The resume store beside the manifest directory (ADR-0032): a partial
-/// bundle carries its own continuation state, and completion removes it
-/// so a finished bundle looks exactly as one fetched without a store.
+/// Resume store beside the manifest directory; removed on completion.
 const RESUME_STORE: &str = "resume.vot";
 
-/// The store entry binding a store to the package it continues.
-///
-/// Suite zero belongs to no object (`suite_id` starts at one), so the
-/// entry can never collide with a stored object, and the root it carries
-/// is what a resume is checked against before a byte is requested.
+/// Store entry binding a store to the package it continues. Suite zero
+/// never collides with a stored object; its root is checked before resume.
 const fn package_sentinel(root: [u8; 32]) -> SubjectId {
     SubjectId {
         suite: 0,
@@ -83,21 +71,15 @@ fn durable_units(covered: &BTreeMap<u64, u64>, length: u64) -> UnitRanges {
         } else {
             end / unit
         }
-        // Capped at the object: no arithmetic above can name a unit the
-        // object does not have, and the cap is what bounds the extension
-        // below by the object rather than by the arithmetic. An extent
-        // too small to hold a whole unit makes an empty range here, and
-        // an empty range extends nothing.
+        // Capped at the object to avoid naming a unit it does not have.
         .min(total_units_of(length));
         units.extend_units(first..past);
     }
     units
 }
 
-/// The reservations a plan makes in its store: every stored object that
-/// has units to checkpoint, which zero-length objects do not (the store
-/// refuses a zero-unit reservation, and an empty object is written
-/// directly rather than fetched).
+/// Store reservations for objects with units to checkpoint; zero-length
+/// objects are written directly.
 fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)> {
     objects
         .iter()
@@ -106,48 +88,25 @@ fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)> {
         .collect()
 }
 
-/// Covers this fetch will have asked for and not yet been given.
+/// Outstanding covers the fetch may have on the wire.
 ///
-/// The bound is on the wire, not on the queue. Bounding the queue is what
-/// this did first, on the reasoning that a pass runs when the carrier
-/// reports something so requests leave at the rate answers arrive. Over a
-/// real carrier they do not: a pass costs microseconds and an answer
-/// costs a round trip, so an object of any size is asked for in full long
-/// before the first cover lands, the server answers all of it, and the
-/// receiver refuses the fifth incomplete bundle it is holding. A 200 MB
-/// fetch died of `PendingBundlesExhausted` that way.
-///
-/// So a request is issued only while fewer than this many covers are
-/// outstanding, counted as the distance between what has been asked for
-/// and what the sink has placed.
-///
-/// Two was the number while proving ran on the session's own thread,
-/// where it was enough to keep the next request at the server while it
-/// answered the current one, and where raising it bought nothing because
-/// nothing else could be proved at once anyway. With the provers beside
-/// the session it is what decides how many of them can work: at two, two.
-/// Measured on 512 MiB over loopback, four gives 1.50 s against two's
-/// 1.65 and eight's 1.49, so four is where it stops paying. It costs
-/// receive credit and staging in proportion, both of which follow it.
+/// The bound is on the wire, not the queue: a pass costs microseconds and
+/// an answer costs a round trip, so bounding the queue lets an object of
+/// any size be asked for in full before the first cover lands.
 const OUTSTANDING_COVERS: usize = 4;
 
-/// What may be asked for and not yet placed, in the units a request is
-/// made in: a cover is what comes back, but a request names at most
-/// [`MAX_REQUESTED_RANGE`] and the two differ by a group.
+/// Bytes this fetch may have asked for and not yet placed.
 const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;
 
-/// The credit this end advertises: the covers it asked for, which is what
-/// the server may have in flight towards it.
+/// Credit advertised to the server: the covers this end asked for.
 const FETCH_CREDIT_BYTES: u64 = OUTSTANDING_COVERS as u64 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
 
-/// What the receiver may stage: that credit plus the verifier's group
-/// reservation, so a cover arriving at the advertised limit still has room
-/// to be verified rather than refused.
+/// What the receiver may stage: credit plus the group reservation, so a
+/// cover at the limit can still be verified.
 const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE as u64;
 
-// The credit is what it advertises, and the limit clears it by a group: a
-// limit at or under the advertised credit would refuse a conforming answer
-// for want of room rather than for anything wrong with it.
+// The limit clears the credit by a group; at or under it would refuse a
+// conforming answer.
 const _: () = assert!(FETCH_CREDIT_BYTES == 17_039_360);
 const _: () = assert!(FETCH_STAGING_BYTES == 17_104_896);
 
@@ -164,9 +123,8 @@ pub enum FetchStatus {
     Closed(u16),
 }
 
-/// Why a frame could not be taken: the server broke protocol under a
-/// registered close code, the package is not the pinned one, or this end
-/// failed on its own.
+/// Why a frame could not be taken: server protocol fault, wrong package,
+/// or local failure.
 enum Fault {
     Peer(u16),
     Pin,
@@ -179,47 +137,32 @@ impl From<Error> for Fault {
     }
 }
 
-/// Bytes placed between the flushes that keep durability in placement's
-/// stride.
+/// Bytes placed between stride flushes.
 ///
-/// The sync that gates an object's completion is serial: nothing
-/// advances while it runs, and syncing a whole object there measured
-/// 220 ms of every 512 MiB wire fetch, a quarter of the wall. Flushing
-/// every stride from the writer that crosses it moves that work into
-/// the transfer, where the other provers and every rail keep going;
-/// the final sync then flushes at most a stride. 64 MiB is a few tens
-/// of milliseconds on an `NVMe` and small enough to leave the tail
-/// negligible.
+/// The completion sync is serial; flushing each stride spreads that work
+/// across the transfer so the final sync covers at most a stride.
 const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
 
 /// A sink that counts what it places, and keeps durability in stride.
 ///
-/// The fetch cannot see its answers arrive: the receiver takes proof
-/// bundles and records straight off the session and hands back nothing,
-/// so the only place this end learns that a cover landed is where its
-/// verified bytes are written. That count is what paces the requests and
-/// what tells a driving loop the session is getting somewhere.
+/// The fetch cannot see answers arrive; the placed-byte count is the only
+/// signal that paces requests and reports progress.
 struct CountingSink {
     file: FileSink,
     placed: AtomicU64,
-    /// The placed-byte crossing at which the next stride flush is due.
-    /// Whichever writer crosses it flushes; the exchange is what keeps
-    /// two writers from paying for the same stride.
+    /// Next placed-byte crossing due a flush; the exchange keeps two
+    /// writers from flushing the same stride.
     flush_due: AtomicU64,
-    /// Stride flushes taken, the observable half of a call whose effect
-    /// is the platter's.
+    /// Stride flushes taken.
     flushes: AtomicU64,
-    /// Where a stride flush records what it made durable, when a store
-    /// rides the fetch (ADR-0032).
+    /// Stride flush checkpoint hook, when a store rides the fetch.
     durable: Option<DurableHook>,
 }
 
-/// What a stride flush needs to turn durability into a checkpoint: the
-/// coverage the flush is about to make durable, and the store to say so.
+/// What a stride flush needs to turn durability into a checkpoint.
 ///
-/// Coverage is snapshotted BEFORE the sync: a range settled while the
-/// sync runs has no claim on it, and checkpointing it would claim
-/// durability the platter never promised.
+/// Coverage is snapshotted before the sync: checkpointing a range that
+/// settles mid-sync would claim durability the disk never promised.
 struct DurableHook {
     /// Weak, because the plan holds the sink that holds this.
     plan: std::sync::Weak<Mutex<FetchPlan>>,
@@ -316,9 +259,8 @@ impl vot_scheduler::RangeSink for CountingSink {
                 )
                 .is_ok()
         {
-            // Best effort, on this writer's own thread while the others
-            // keep placing: the sync that gates completion still runs,
-            // and a refusal here costs only the tail this spreads out.
+            // Best effort; the completion sync still runs, and a failure
+            // here costs only the tail.
             self.flushes.fetch_add(1, Ordering::Relaxed);
             match &self.durable {
                 Some(hook) => hook.flush(&self.file),
@@ -331,21 +273,16 @@ impl vot_scheduler::RangeSink for CountingSink {
     }
 }
 
-/// Threads that prove and place covers, beside the session rather than on
-/// it.
+/// Threads that prove and place covers, beside the session thread.
 ///
-/// Measured on 2026-08-06: a 512 MiB loopback fetch spent 938 ms of 1.84 s
-/// proving and placing on the session's own thread, and much of the rest
-/// waiting, because one thread cannot receive a cover while it proves the
-/// one before it. Neither step needs the receiver, so both move here and
-/// the witness goes back through `SessionReceiver::settle`.
+/// One thread cannot receive a cover while it proves the one before, so
+/// both steps move here and the witness returns through `settle`.
 const DEFAULT_PROVING_THREADS: usize = 4;
 
 /// How long a pass waits for a prover it is already owed.
 ///
-/// Only reached when the pass would otherwise book nothing, and the work
-/// is this end's own and already in hand, so it bounds a wait that is
-/// about to end rather than setting a poll interval.
+/// Only reached when the pass would otherwise book nothing; the work is
+/// this end's own and already in hand.
 const PROVER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What a prover is handed: a bundle to prove and where its bytes go.
@@ -372,8 +309,7 @@ struct ProvingPool {
     /// Bundles handed out and not yet settled, which is what decides
     /// whether this end has room to take another.
     in_flight: usize,
-    /// Witnesses booked over the pool's life: the ledger that says the
-    /// provers, not the session thread, did the proving.
+    /// Witnesses booked over the pool's life.
     witnesses: u64,
     width: usize,
 }
@@ -444,7 +380,7 @@ impl Drop for ProvingPool {
     }
 }
 
-/// Proves one bundle and places its bytes. The whole of what a prover does.
+/// Proves one bundle and places its bytes.
 fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
     let range = ReliableReceiver::verify_typed_bundle(
         work.completed.subject(),
@@ -462,9 +398,7 @@ fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
 #[derive(Clone)]
 struct PlannedObject {
     object: frames::ObjectId,
-    /// Byte extents a previous fetch checkpointed as durable, empty on a
-    /// fresh fetch: the handout never asks for what is already placed
-    /// (ADR-0032).
+    /// Byte extents a previous fetch made durable; the handout skips them.
     resumed: BTreeMap<u64, u64>,
 }
 
@@ -484,10 +418,8 @@ impl PlannedObject {
 
 /// The objects still owed once the manifest is validated, behind a lock.
 ///
-/// ADR-0031: the plan is the striping point. It hands out range requests
-/// through [`FetchPlan::next_span`] and [`FetchPlan::take`], and W rails
-/// taking from the same handout is work stealing by construction: a slow
-/// rail simply takes fewer.
+/// The plan is the striping point: it hands out range requests, and rails
+/// taking from the same handout is work stealing by construction.
 pub(crate) type SharedPlan = Arc<Mutex<FetchPlan>>;
 
 /// Marks a plan abandoned, so every rail on it stops at its next pass
@@ -512,9 +444,8 @@ pub(crate) struct FetchPlan {
     placed_before: u64,
     /// Where the current object's next range request starts.
     next_offset: u64,
-    /// Settled extents of the current object, coalesced. Kept by the plan
-    /// rather than any rail's receiver because no one rail sees the whole
-    /// object: the object is done when this covers it (ADR-0031).
+    /// Settled extents of the current object, coalesced; completion is
+    /// full coverage.
     covered: BTreeMap<u64, u64>,
     /// Bytes [`FetchPlan::covered`] spans, each counted once however many
     /// rails a misbehaving server answers with the same range.
@@ -528,19 +459,16 @@ pub(crate) struct FetchPlan {
     /// The current object's resumed extents, which the handout walks
     /// around: what a previous fetch made durable is never asked for.
     skip: BTreeMap<u64, u64>,
-    /// The store checkpoints go to, carried by the plan so every rail
-    /// reaches the one store the way it reaches the one sink (ADR-0032).
+    /// Resume store, shared by every rail through the plan.
     store: Option<Arc<Mutex<ResumeStore>>>,
     finished: bool,
 }
 
 impl FetchPlan {
-    /// The next range a taker would request, uncommitted and unpaced: how
-    /// much a rail may have outstanding is the rail's own account.
+    /// The next range a taker would request, uncommitted and unpaced.
     ///
-    /// The walk steps over the resumed extents: what a previous fetch
-    /// made durable is never asked for, and a span is clipped where the
-    /// next resumed extent begins so no request overlaps one.
+    /// Steps over resumed extents so durable ranges are never re-asked
+    /// and no request overlaps one.
     fn next_span(&self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
         if self.active.is_none() {
             return Ok(None);
@@ -579,9 +507,8 @@ impl FetchPlan {
 
     /// Commits the span [`FetchPlan::next_span`] handed out.
     ///
-    /// Separate from the peek, and called only once the span's frame is
-    /// queued: a span committed before its frame exists is consumed by
-    /// the failure between the two, a hole no rail would ever re-request.
+    /// Called only once the span's frame is queued: committing before the
+    /// frame exists would consume it on a failure that leaves a hole.
     fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
         self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
         Ok(())
@@ -589,10 +516,8 @@ impl FetchPlan {
 
     /// Books a settled cover into the current object's coverage.
     ///
-    /// Coalescing counts every byte once, so a server that answers two
-    /// rails with the same range cannot complete an object it left a hole
-    /// in: the bytes are identical either way, proved against the root,
-    /// but only coverage of every offset is completion.
+    /// Coalescing counts each byte once, so a duplicate range from another
+    /// rail cannot complete an object that still has a hole.
     fn cover(&mut self, offset: u64, length: u64) {
         if length == 0 {
             return;
@@ -602,10 +527,8 @@ impl FetchPlan {
         };
         let mut start = offset;
         let mut absorbed: u64 = 0;
-        // Walked right to left from the last extent starting at or before
-        // `end`; everything that reaches back to `start` merges, and the
-        // first extent that falls short ends the walk, extents being
-        // disjoint and sorted.
+        // Walk right to left from the extent at or before `end`; extents
+        // are disjoint and sorted, so the first gap ends the merge.
         let overlapping: Vec<(u64, u64)> = self
             .covered
             .range(..=end)
@@ -644,26 +567,21 @@ pub struct BundleFetcher<A: TransportAdapter> {
     spans: Vec<(u64, u64)>,
     next_span: usize,
     plan: Option<SharedPlan>,
-    /// The resume store this fetch records into, held here until the
-    /// manifest hands it to the plan; a rail reaches it through the plan
-    /// instead (ADR-0032).
+    /// Resume store, held until the manifest hands it to the plan.
     store: Option<Arc<Mutex<ResumeStore>>>,
     /// Whether this fetch continues a partial bundle, which is what makes
     /// the store's checkpoints a seed rather than a record.
     resuming: bool,
-    /// Whether this fetcher is a rail joined to another fetch's plan: it
-    /// reads the announcement and requests ranges, and the manifest is the
-    /// primary's work alone (ADR-0031).
+    /// Whether this fetcher is a rail on another fetch's plan.
     secondary: bool,
     /// The object this rail has admitted to its own receiver, by plan
     /// index. Admission is per rail; the plan cannot do it.
     admitted: Option<(usize, SubjectId)>,
     /// Range bytes this rail has committed to spans, only ever going up.
     taken_bytes: u64,
-    /// Range bytes this rail has settled witnesses for, only ever going
-    /// up. The distance between the two is this rail's outstanding, which
-    /// is what paces its requests: pacing on the shared sink would let one
-    /// rail ask past its own receiver's budgets on the others' arrivals.
+    /// Range bytes this rail has settled witnesses for. The gap between
+    /// taken and settled paces requests per rail; pacing on the shared
+    /// sink would let one rail overdraw on another's arrivals.
     settled_bytes: u64,
     /// The most this rail keeps outstanding:
     /// [`OUTSTANDING_REQUEST_BYTES`] always, narrowed only by tests so a
@@ -679,18 +597,14 @@ pub struct BundleFetcher<A: TransportAdapter> {
     stopped: bool,
     /// Everything this end has taken or asked for, only ever going up.
     ///
-    /// A driving loop reads it to tell a session that is getting somewhere
-    /// slowly from one that has stopped: the first is what a large object
-    /// looks like, and giving up on it would kill the transfer.
+    /// A driving loop reads it to tell a slow transfer from a stuck one.
     progress: u64,
     /// The provers, started with the first cover so a fetch that carries
     /// none starts no threads.
     pool: Option<ProvingPool>,
     /// How many provers to start, or none for proving on this thread.
     proving_threads: usize,
-    /// How long a pass waits for a witness it is owed. [`PROVER_WAIT`]
-    /// outside tests; a test that must see the wait happen sets a bound
-    /// that outlasts any load the machine is under.
+    /// How long a pass waits for a witness it is owed. Overridden in tests.
     prover_wait: std::time::Duration,
     /// Where placed-byte crossings are reported, if anywhere.
     placed_report: Option<PlacedReport>,
@@ -707,10 +621,7 @@ struct PlacedReport {
 
 /// The crossing after `placed`, if `placed` reached the one due.
 ///
-/// A pure mapping, so a test can hold the boundary exactly: reaching
-/// `next_at` is a crossing, and the one after it starts at the next
-/// whole quantum above what is placed, however many quanta one pass
-/// spanned.
+/// Pure mapping, so a test can hold the boundary exactly.
 const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<u64> {
     if placed < next_at {
         return None;
@@ -724,9 +635,8 @@ const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<u64> {
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
 ///
-/// Counted by what the page count needs, not by the cursor: a span that
-/// does not advance would otherwise grow this until the allocator gave up,
-/// and the seal that gave the count is what bounds the answer.
+/// Bounded by the page count (from the seal), not by a cursor, so a
+/// non-advancing span cannot grow this unboundedly.
 fn manifest_spans(page_count: u64) -> Vec<(u64, u64)> {
     let mut spans = Vec::new();
     let mut first = 0;
@@ -749,10 +659,8 @@ fn range_span(offset: u64, length: u64) -> Option<(u64, u64)> {
 
 /// The code a receiver's refusal closes under.
 ///
-/// A proof the server could not back is the server's fault. This end's own
-/// storage and budget failures are not, and closing those as
-/// `PROOF_INVALID` would tell a server its proof was bad about a bundle it
-/// served correctly, which is the one thing the code is read for.
+/// Local storage/budget failures are not `PROOF_INVALID`: that code tells
+/// a server its proof was bad about a bundle it served correctly.
 fn refusal_code(error: &vot_scheduler::Error) -> u16 {
     use vot_scheduler::Error as Refusal;
     match error {
@@ -820,10 +728,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Surfaces a deferred bound the receiver refuses.
     pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
         if (self.secondary || self.resuming) && threads == 0 {
-            // A rail paces on settled witnesses, and inline proving books
-            // none: it would take its window and never earn it back. A
-            // resumed fetch completes on the plan's coverage, which only
-            // settled witnesses feed, so the same refusal holds.
+            // Inline proving books no witnesses: a rail paces on them and
+            // a resumed fetch completes on coverage they feed.
             return Err(Error::InvalidArguments);
         }
         self.proving_threads = threads;
@@ -839,15 +745,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// Opens the session and the bundle directory the fetch will fill.
     ///
-    /// The optional pin is the package root this fetch will accept; without
-    /// it the fetch records what the server announced and the pin lives in
-    /// the receipt step, as ADR-0030 settles.
-    ///
-    /// A destination that already holds a partial bundle WITH its resume
-    /// store is continued rather than refused (ADR-0032): the store's own
-    /// identity becomes the pin, the manifest is re-fetched fresh, and
-    /// the handout never asks for what the store says is durable. A
-    /// destination without a store is refused exactly as before.
+    /// The optional pin is the package root this fetch will accept. A
+    /// destination with a partial bundle and resume store is continued:
+    /// the store's identity becomes the pin, the manifest is re-fetched,
+    /// and durable ranges are skipped. A destination without a store is
+    /// refused.
     pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
         let store_path = bundle.join(RESUME_STORE);
         let resuming = bundle.exists();
@@ -856,17 +758,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 return Err(Error::DestinationExists);
             }
             // The manifest is re-fetched, not resumed: partial pages went
-            // with the fetch that died, and re-validating fresh is what
-            // re-derives the identity the store is checked against.
+            // with the fetch that died, and re-validating fresh re-derives
+            // the identity the store is checked against.
             fs::remove_dir_all(bundle.join(MANIFEST_DIRECTORY))?;
         }
         fs::create_dir_all(bundle.join(MANIFEST_DIRECTORY))?;
         fs::create_dir_all(bundle.join("objects"))?;
         let store = ResumeStore::create(&store_path).map_err(resume_failure)?;
-        // The store's identity is the pin a resume is held to: a caller's
-        // pin that disagrees is refused before a byte crosses, and a
-        // store too young to know (died before the manifest) binds to
-        // whatever the manifest proves this time.
+        // The store's identity is the resume pin; a caller's pin that
+        // disagrees is refused. A store too young to know binds to the
+        // manifest this fetch proves.
         let mut pin = pin;
         if resuming {
             let stored = store
@@ -892,13 +793,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let receiver =
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
         let mut receiver = SessionReceiver::new(session, receiver);
-        // Every outstanding cover must be holdable in whichever state it
-        // arrives: admitted and incomplete, or records ahead of their proof.
-        // The receiver's defaults are sized for a shallower pipeline, and on
-        // a real wire the lane outruns the control stream by whole bundles,
-        // so a budget below the pipeline depth fails a conforming transfer
-        // with `PendingBundlesExhausted`. Derived, so a depth change cannot
-        // outgrow the buffers again.
+        // Every outstanding cover must be holdable in any arrival state;
+        // the receiver defaults are too shallow and fail a conforming
+        // transfer with `PendingBundlesExhausted`.
         receiver.set_pending_limits(
             OUTSTANDING_COVERS,
             OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
@@ -942,18 +839,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(fetcher)
     }
 
-    /// Opens a rail onto a fetch already planned: a whole session against
-    /// the same server, striping range requests over the shared plan into
-    /// the shared sink (ADR-0031).
+    /// Opens a rail onto a fetch already planned: a session striping
+    /// range requests over the shared plan into the shared sink.
     ///
-    /// The rail pins the plan's package root, so a server answering for
-    /// anything else is refused the way a pinned fetch refuses it. The
-    /// manifest is not fetched again in full: the rail reads the
-    /// announcement and requests ranges, nothing else.
+    /// The rail pins the plan's package root. It reads the announcement
+    /// and requests ranges; the manifest is not fetched again.
     ///
     /// # Errors
-    /// Surfaces a session that could not begin, and a receiver that
-    /// refuses its bounds.
+    /// Surfaces a session or receiver that could not start.
     #[cfg(any(test, feature = "wire"))]
     pub(crate) fn join(adapter: A, bundle: &Path, plan: SharedPlan) -> Result<Self, Error> {
         let root = plan.lock().map_err(|_| Error::InvalidBundle)?.summary.root;
@@ -968,8 +861,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let receiver =
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
         let mut receiver = SessionReceiver::new(session, receiver);
-        // The same pipeline budgets as the primary: each rail carries the
-        // whole depth on its own session (ADR-0031).
+        // Same pipeline budgets as the primary: each rail carries the full depth.
         receiver.set_pending_limits(
             OUTSTANDING_COVERS,
             OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
@@ -1022,8 +914,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.receiver.session_mut()
     }
 
-    /// The plan this fetch stripes over, once the manifest has settled it,
-    /// which is what a rail joins (ADR-0031).
+    /// The plan this fetch stripes over; what a rail joins.
     #[cfg(any(test, feature = "wire"))]
     pub(crate) fn shared_plan(&self) -> Option<SharedPlan> {
         self.plan.clone()
@@ -1058,23 +949,19 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// The plan under its lock, or nothing before the manifest settles it.
     ///
-    /// A poisoned lock reads as no plan: the thread that poisoned it took
-    /// the fetch down with it, and every caller of this has a conservative
-    /// answer for a plan that is not there.
+    /// A poisoned lock reads as no plan; callers have a conservative
+    /// answer for that.
     fn locked_plan(&self) -> Option<std::sync::MutexGuard<'_, FetchPlan>> {
         self.plan.as_ref().and_then(|plan| plan.lock().ok())
     }
 
     /// Reports placed bytes to `observer` at every `quantum` crossing.
     ///
-    /// The cadence is counted in the fetch's own bytes rather than a
-    /// clock: a fast path reports in bursts, a slow one at its own pace,
-    /// and an idle session reports nothing. The observer gets the placed
-    /// count and the package length once the manifest has settled it. A
-    /// pass that placed several quanta is one report, not several.
+    /// Paced by bytes, not a clock: fast paths report in bursts, slow
+    /// ones at their own pace, idle sessions report nothing.
     ///
     /// # Errors
-    /// Rejects a zero quantum, which would ask for a report per pass.
+    /// Rejects a zero quantum.
     pub fn report_placed(
         &mut self,
         quantum: u64,
@@ -1106,16 +993,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     /// Whether a request is queued that the carrier would not take, which
-    /// is work another pass can do without waiting on an event.
+    /// is work another pass can do without an event.
     ///
-    /// Ranges not yet asked for are deliberately not backlog. A pass issues
-    /// at most [`OUTSTANDING_COVERS`] and the next pass runs when the
-    /// carrier reports something, so what is on the wire is paced by the
-    /// answers coming back rather than by how fast this end can build
-    /// request frames.
-    ///
-    /// A fetch that has stopped owes nothing: a lingering backlog would tell
-    /// a driving loop to keep servicing a session that cannot progress.
+    /// Ranges not yet asked for are not backlog: the wire is paced by
+    /// answers coming back. A stopped fetch owes nothing.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
         !self.stopped
@@ -1144,9 +1025,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             return Ok(FetchStatus::Disconnected);
         }
         if self.locked_plan().is_some_and(|plan| plan.abandoned) {
-            // Another rail failed, so the spans it took will never arrive
-            // and the plan cannot finish: ending now is what spares every
-            // remaining rail its whole stall budget (ADR-0031).
+            // Another rail failed; ending now spares the rest their stall budgets.
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
@@ -1168,9 +1047,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 Err(error) => return self.receive_failed(error),
             }
         }
-        // Between taking frames and judging the pass: what the provers
-        // finished is as much a part of this pass's progress as what the
-        // carrier delivered, and the plan advances on placed bytes.
+        // Between taking frames and judging the pass: placed bytes advance the plan.
         if let Err(error) = self.pump_provers() {
             return self.receive_failed(error);
         }
@@ -1190,10 +1067,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
-        // Topped up before the drain, not after: refilling what the carrier
-        // has just taken would put a pass's worth of requests on the wire
-        // each time round instead of the covers this fetch means to have
-        // outstanding.
+        // Topped up before the drain, so the carrier holds the covers, not
+        // a pass's worth of requests each time round.
         self.issue_ranges()?;
         self.drain()?;
         self.receiver.session_mut().flush()?;
@@ -1221,12 +1096,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Err(Error::Scheduler(error))
     }
 
-    /// Hands what the receiver completed to the provers, and books what
-    /// they finished.
+    /// Hands completed bundles to the provers, and books what they finish.
     ///
-    /// Nothing here proves anything: the provers do, off this thread, and
-    /// what comes back is a witness the receiver admits the same way the
-    /// inline path does.
+    /// Proof happens off this thread; what returns is a witness the
+    /// receiver admits like the inline path does.
     fn pump_provers(&mut self) -> Result<(), vot_scheduler::Error> {
         if self.proving_threads == 0 {
             return Ok(());
@@ -1252,10 +1125,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 break;
             };
             if completed.subject() != subject {
-                // A cover for an object the plan has already left behind:
-                // the plan only advances over complete coverage, so every
-                // byte it names is settled and it is a duplicate. Dropped,
-                // because the active sink is another object's file.
+                // A cover for an object the plan moved past: the plan only
+                // advances on full coverage, so this is a duplicate for
+                // another object's sink.
                 continue;
             }
             if pool.work.try_send(Proving { completed, sink }).is_err() {
@@ -1263,23 +1135,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             }
             pool.in_flight = pool.in_flight.saturating_add(1);
         }
-        // Every witness already waiting, then one waited for if the pass
-        // would otherwise book nothing. Waiting here is not waiting on a
-        // peer: the work is this end's own and already in hand, and a pass
-        // that returned without it would spin until a prover was scheduled.
+        // Every ready witness, then one waited for if the pass would
+        // otherwise book nothing. A pass that returned without it would spin.
         if pool.in_flight == 0 {
             // Nothing is out, so there is nothing to wait for or book.
             self.pool = Some(pool);
             return Ok(());
         }
         let mut outcome = Ok(());
-        // The first witness is waited for, because the work is this end's
-        // own and already in hand, and a pass that returned without it
-        // would spin until a prover was scheduled; the rest are taken as
-        // found. Structurally bounded: the chain is one bounded wait and
-        // then at most what is out with a prover, so the walk ends
-        // whatever a mutation does to any count inside it, and there is
-        // no branch here for one to turn into an unbounded wait.
+        // The first witness is waited for (this end's own work, already in
+        // hand); the rest are taken as found. Bounded by construction:
+        // one bounded wait, then at most what is out with a prover.
         let first = pool.proved.recv_timeout(self.prover_wait).ok();
         let ready: Vec<_> = first
             .into_iter()
@@ -1299,10 +1165,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     // Earned back against this rail's window: what was
                     // taken is settled, so the next span may be asked for.
                     self.settled_bytes = self.settled_bytes.saturating_add(bundle.covered_length);
-                    // And booked into the shared coverage, which is what
-                    // completes the object (ADR-0031). The subject check
-                    // keeps a straggling replay of a finished object out
-                    // of the current one's account.
+                    // Booked into shared coverage, which completes the object.
+                    // The subject check drops stragglers.
                     if let Some(mut plan) = self.locked_plan() {
                         if plan.objects.get(plan.current).map(subject_of)
                             == Some(proved.completed.subject())
@@ -1448,9 +1312,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
         if self.secondary {
-            // A rail has the manifest already, through the plan it joined:
-            // the announcement was held to the pin and the descriptor, and
-            // nothing further is asked for (ADR-0031).
+            // A rail already has the manifest through its plan; nothing
+            // further is asked.
             self.seal_bytes = Some(seal_bytes);
             return Ok(());
         }
@@ -1569,11 +1432,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }));
             }
         }
-        // The store learns the whole plan in one reservation, the
-        // sentinel binding it to the package the manifest just proved;
-        // a store continuing something else refuses here, before a byte
-        // of ranges is requested. What it already holds seeds the
-        // handout (ADR-0032).
+        // The store learns the whole plan in one reservation; a store
+        // continuing a different package refuses here. What it already
+        // holds seeds the handout.
         if let Some(store) = &self.store {
             let mut locked = store
                 .lock()
@@ -1610,13 +1471,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     /// Moves the object plan forward: a covered object is synced and left
-    /// behind, the next one is admitted and its ranges requested, and the
-    /// last one seals the bundle with a directory sync.
+    /// behind, the next is admitted and requested, the last seals the bundle.
     ///
-    /// Every rail runs this over the shared plan. Admission and
-    /// abandonment are this rail's own; the transition belongs to
-    /// whichever rail sees the coverage whole first, and `syncing` keeps
-    /// the file work outside the lock without a second rail repeating it.
+    /// Every rail runs this. Admission and abandonment are per-rail; the
+    /// transition goes to whichever rail sees coverage whole first, and
+    /// `syncing` keeps file work outside the lock without duplication.
     fn advance(&mut self) -> Result<(), Error> {
         // The handle apart from self, so the receiver and the bundle stay
         // reachable while the plan is held under its lock.
@@ -1638,10 +1497,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .len();
         for _ in 0..=objects {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            // What this rail still holds for an object the plan has left
-            // behind is a partial account of an object already whole on
-            // disk: forgotten, so the receiver is bounded by what is being
-            // fetched rather than everything this rail ever touched.
+            // Forget partial accounts for objects the plan left behind, so
+            // the receiver is bounded by what is current, not everything
+            // this rail touched.
             if let Some((index, subject)) = self.admitted {
                 if index != plan.current {
                     if !self.receiver.is_verified(subject) {
@@ -1658,9 +1516,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
                     self.admitted = Some((plan.current, subject));
                 }
-                // Complete when the shared coverage spans the object; this
-                // rail's own receiver saying so is the same fact stated
-                // for the fetch every cover went through one receiver.
+                // Complete when shared coverage spans the object, or this
+                // rail's receiver verified it.
                 let whole = plan.covered_bytes == length || self.receiver.is_verified(subject);
                 if !whole || plan.syncing {
                     return Ok(());
@@ -1674,8 +1531,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 drop(plan);
                 let synced = sink.file.file().sync_all();
                 if synced.is_ok() {
-                    // The whole object at once: a resume after this never
-                    // asks for any of it again (ADR-0032).
+                    // The whole object is now durable; a resume never asks
+                    // for it again.
                     if let Some(store) = &store {
                         if let Ok(mut store) = store.lock() {
                             let mut units = UnitRanges::new();
@@ -1747,10 +1604,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let resumed = if path.exists() {
                 planned.resumed.clone()
             } else {
-                // The checkpoint outlived its file, so the object is owed
-                // whole again. The store's record is cleared too: left in
-                // place, a later resume would seed from a claim the disk
-                // cannot back and trust bytes nobody placed.
+                // The checkpoint outlived its file; clear the store too,
+                // or a later resume would trust bytes nobody placed.
                 let at = plan.current;
                 if !plan.objects[at].resumed.is_empty() {
                     if let Some(store) = &plan.store {
@@ -1795,18 +1650,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// Asks for as much of the object as this rail may have outstanding.
     ///
-    /// The spans come from the plan's handout; this rail turns each into
-    /// a request frame of its own, and commits the span only once its
-    /// frame is queued, so a failure between the two leaves the span
-    /// owed rather than consumed. The lock is held across the pair,
-    /// which is what keeps two takers from framing the same span.
+    /// Each span is committed only once its frame is queued, so a failure
+    /// between the two leaves the span owed. The lock across the pair
+    /// prevents two takers from framing the same span.
     ///
-    /// What has been taken and not yet settled is the pace, per rail:
-    /// each session advertises its own credit and holds its own budgets,
-    /// so a rail asking on the strength of another's arrivals would ask
-    /// past what its receiver can hold. With provers, settled witnesses
-    /// are the account; proving inline, the sink is this rail's alone
-    /// (a rail cannot prove inline) and what it placed is the same fact.
+    /// Pacing is per rail (taken minus settled): a rail asking on another's
+    /// arrivals would overdraw its own receiver. Inline proving uses the
+    /// sink's placed count instead of settled witnesses.
     fn issue_ranges(&mut self) -> Result<(), Error> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
@@ -1917,13 +1767,10 @@ mod tests {
         status
     }
 
-    /// Rounds a fetch in these tests may take before it is not progressing.
+    /// Rounds a fetch may take before it is not progressing.
     ///
-    /// The longest of them settles in seven: a round moves every frame both
-    /// ends have, and the largest object is three covers. Tight on purpose,
-    /// because a round of a fetch that is not progressing still re-fetches
-    /// an object, so a generous budget is minutes of work before the
-    /// failure and a mutation run times out instead of reporting.
+    /// Tight on purpose: a round of a stuck fetch re-fetches an object, so
+    /// a generous budget means minutes of work before a failure surfaces.
     const ROUND_BUDGET: usize = 32;
 
     /// Runs both engines and the pump until the fetch reaches a terminal
@@ -1993,9 +1840,7 @@ mod tests {
 
     #[test]
     fn a_bundle_round_trips_build_serve_fetch_receive() {
-        // The ADR's step-3 test: everything the CLI builds crosses the wire
-        // and publishes unchanged. A packed pair, a direct object big
-        // enough for several range requests, and an empty file.
+        // A packed pair, a direct object spanning several ranges, and an empty file.
         let source = temporary("trip-source");
         fs::create_dir_all(source.join("nested")).unwrap();
         fs::write(source.join("a.txt"), patterned(1000)).unwrap();
@@ -2014,10 +1859,8 @@ mod tests {
         assert_eq!(fetcher.package(), Some(built));
         assert!(!fetcher.has_backlog());
 
-        // The fetched bundle is the built bundle, byte for byte.
         assert_same_tree(&bundle, &output);
 
-        // And the existing receive publishes it unchanged.
         let destination = temporary("trip-destination");
         let receipt = temporary("trip-receipt.cbor");
         let report = receive_bundle(
@@ -2052,15 +1895,8 @@ mod tests {
 
     #[test]
     fn two_rails_stripe_one_object_over_a_shared_plan() {
-        // The ADR's step-3 sim test: two whole sessions against one
-        // server, striping one object's spans over the shared plan into
-        // the shared sink, pumps interleaved so the handout is
-        // deterministic. The primary's window is narrowed to one span so
-        // a two-span object stripes: the primary takes its window in its
-        // first pass, the second rail takes exactly the span left over,
-        // which is work stealing doing the striping. Narrow rather than
-        // large because this test rides every mutant of the crate, and a
-        // window's worth of data per run is most of the suite's time.
+        // Two sessions striping one object: the primary's window is narrowed
+        // to one span so a two-span object must stripe across both rails.
         let length = 2 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
         let (bundle, built) = built_bundle("striped", &[("big.bin", patterned(length))]);
         let server = BundleServer::open(&bundle).unwrap();
@@ -2089,10 +1925,7 @@ mod tests {
             BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
 
         let (mut seq1, mut seq2) = (0, 0);
-        // The rail is handshaken, announced, and admitted before the
-        // primary settles anything, so the handout is deterministic: the
-        // primary's whole window is already out, and the rail's first ask
-        // takes the one span that remains.
+        // Admit the rail before the primary settles, so the handout is deterministic.
         for _ in 0..ROUND_BUDGET {
             round(
                 &server,
@@ -2127,8 +1960,6 @@ mod tests {
             }
         }
         assert!(settled, "the rails never finished the fetch");
-        // The handout striped: the primary filled its narrowed window, and
-        // the rail took exactly the object's last span from the same plan.
         assert_eq!(primary.taken_bytes, MAX_REQUESTED_RANGE);
         assert_eq!(secondary.taken_bytes, MAX_REQUESTED_RANGE);
         assert!(!primary.has_backlog());
@@ -2141,9 +1972,8 @@ mod tests {
 
     #[test]
     fn an_abandoned_plan_ends_every_rail_without_its_stall_budget() {
-        // A rail that fails marks the plan, and the others end at their
-        // next pass: waiting out a stall budget per rail would turn one
-        // dead rail into half a minute of silence for each of the rest.
+        // A failed rail marks the plan; the others end at their next pass
+        // instead of waiting out a stall budget.
         let (bundle, _) = built_bundle("abandoned", &[("big.bin", patterned(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("abandoned-fetched");
@@ -2162,9 +1992,7 @@ mod tests {
 
     #[test]
     fn a_rail_paces_itself_and_refuses_inline_proving() {
-        // A rail's window is its own account (the shared sink fills with
-        // every rail's arrivals), and proving inline would never earn the
-        // window back: the wiring that keeps both is the join itself.
+        // A rail's window is its own account; inline proving would never earn it back.
         let (bundle, _) = built_bundle("railpace", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("railpace-fetched");
@@ -2186,9 +2014,7 @@ mod tests {
             secondary.set_proving_threads(2).is_ok(),
             "a narrower pool is the rail's to choose"
         );
-        // The rail's budgets are the pipeline depth in whole bundles, byte
-        // for byte, exactly as the primary's: a sum where a product
-        // belongs is one bundle wide and fails a conforming transfer.
+        // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
         assert_eq!(
             secondary.receiver.pending_byte_limit(),
             OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
@@ -2202,10 +2028,8 @@ mod tests {
 
     #[test]
     fn a_rail_forgets_the_object_the_plan_moved_past() {
-        // A rail admits the current object to its own receiver; when the
-        // plan moves past one the rail only partly received, the partial
-        // account is forgotten, or the receiver holds a reservation per
-        // object it ever touched.
+        // A partial account for a moved-past object is forgotten, or the
+        // receiver keeps a reservation per object.
         let output = temporary("railforget");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let first = PlannedObject::fresh(frames::ObjectId {
@@ -2282,10 +2106,8 @@ mod tests {
 
     #[test]
     fn a_finished_plan_is_left_exactly_as_it_is() {
-        // A pass over a finished plan changes nothing and touches no file:
-        // re-running the closing directory sync would make every pass
-        // after completion an I/O ritual, and here the directory is gone
-        // to prove nothing reaches for it.
+        // A pass over a finished plan touches nothing; the directory is
+        // gone to prove it.
         let output = temporary("finished-left");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
@@ -2314,11 +2136,8 @@ mod tests {
 
     #[test]
     fn coverage_counts_every_byte_once() {
-        // The object completes when the plan's coverage spans it, and the
-        // plan cannot trust any rail's receiver to have seen the whole
-        // object. Coalescing counts a byte once however it arrives, so a
-        // server answering two rails with the same range cannot complete
-        // an object it left a hole in.
+        // Coalescing counts each byte once, so a duplicate range cannot
+        // complete an object with a hole.
         let mut plan = FetchPlan {
             summary: PackageSummary {
                 root: [0; 32],
@@ -2363,19 +2182,14 @@ mod tests {
 
     #[test]
     fn a_striped_fetch_over_threads_completes_and_spawns_its_rails() {
-        // The whole arrangement with real concurrency: the primary is
-        // driven until its plan exists, one rail joins over its own
-        // session, the server serves both sessions at once, and the
-        // fetched tree is the built tree. The connect count pins that the
-        // rail was actually spawned: a fetch that quietly completed at
-        // width one would pass every other assertion here.
+        // The connect count pins that the rail was spawned; width one
+        // would pass every other assertion.
         use std::sync::Condvar;
         use std::sync::atomic::AtomicUsize;
 
         type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
 
-        // Small on purpose: the striping distribution is the interleaved
-        // test's subject, and this one rides every mutant of the crate.
+        // Small: striping distribution is the interleaved test's subject.
         let (bundle, built) = built_bundle("threaded", &[("big.bin", patterned(300_000))]);
         let output = temporary("threaded-fetched");
         let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
@@ -2428,11 +2242,8 @@ mod tests {
 
     #[test]
     fn a_stride_crossing_flushes_once_and_arms_the_next() {
-        // Durability in placement's stride: the writer that crosses the
-        // due mark flushes, exactly once however many writers or strides
-        // one write spans, and the next mark is the whole stride above
-        // what is placed. The counter is the observable half; the sync
-        // itself is the platter's business.
+        // The crossing writer flushes once; the next mark is a stride
+        // above what is placed.
         let output = temporary("stride");
         fs::create_dir_all(&output).unwrap();
         let stride = usize::try_from(FLUSH_STRIDE_BYTES).unwrap();
@@ -2473,10 +2284,8 @@ mod tests {
 
     #[test]
     fn a_killed_fetch_resumes_from_what_it_placed() {
-        // The ADR's test: die after the first object is durable, begin
-        // again over the same directory, and the second fetch asks only
-        // for what the first never placed. The store must be gone at the
-        // end, so the completed bundle looks fetched-in-one.
+        // Die after the first object is durable, then resume: the second
+        // fetch asks only for the rest.
         let (bundle, built) = built_bundle(
             "killed",
             &[("a.bin", patterned(900_000)), ("b.bin", noise(900_000))],
@@ -2549,11 +2358,8 @@ mod tests {
 
     #[test]
     fn a_checkpoint_whose_file_is_gone_is_cleared_in_the_store_too() {
-        // Discarding the stale claim locally is not enough: left in the
-        // store, a later resume would seed from it against a freshly
-        // created file and trust bytes nobody placed. The clear happens
-        // when the missing file is discovered, and the whole object is
-        // re-requested.
+        // A stale checkpoint must be cleared in the store too, or a later
+        // resume trusts bytes nobody placed.
         let (bundle, built) = built_bundle(
             "stale",
             &[("a.bin", patterned(900_000)), ("b.bin", noise(900_000))],
@@ -2637,9 +2443,8 @@ mod tests {
 
     #[test]
     fn a_partial_bundle_without_a_store_is_refused_and_identity_is_held() {
-        // Without a store there is nothing safe to continue: the refusal
-        // is exactly the one an occupied destination always got. With a
-        // store, its sentinel is the pin a resume is held to.
+        // Without a store, nothing is safe to continue. With one, its
+        // sentinel is the resume pin.
         let occupied = temporary("resume-nostore");
         fs::create_dir_all(occupied.join(MANIFEST_DIRECTORY)).unwrap();
         assert!(matches!(
@@ -2679,10 +2484,8 @@ mod tests {
 
     #[test]
     fn checkpoint_units_and_extents_convert_by_whole_units_only() {
-        // The conversion table both directions: only units wholly inside
-        // coverage may be checkpointed (a partial unit reads back with a
-        // hole), and stored units come back as byte extents clipped to
-        // the object.
+        // Only whole units may be checkpointed; stored units come back
+        // clipped to the object.
         let unit = vot_scheduler::RANGE_UNIT_BYTES;
         let length = 3 * unit + 100;
         assert_eq!(total_units_of(length), 4, "the tail unit counts");
@@ -2757,10 +2560,8 @@ mod tests {
 
     #[test]
     fn only_whole_nonempty_objects_reserve_and_resume_whole() {
-        // The reservation list excludes zero-length objects (the store
-        // refuses zero units, and empty objects are written, not
-        // fetched), and fully_resumed holds only for a nonempty object
-        // whose extents sum to its length.
+        // Reservations exclude zero-length objects; fully_resumed needs a
+        // nonempty object fully covered.
         let empty = PlannedObject::fresh(frames::ObjectId {
             suite: 1,
             root: [1; 32],
@@ -2789,8 +2590,8 @@ mod tests {
 
     #[test]
     fn a_resumed_sinks_flush_mark_starts_past_what_is_placed() {
-        // The seed arms the next stride above the resumed bytes, so the
-        // first flush is a stride of new work, not a replay of the seed.
+        // The seed arms the next stride above resumed bytes, so the first
+        // flush is new work.
         let output = temporary("resume-seed");
         fs::create_dir_all(&output).unwrap();
         let path = output.join("s.obj");
@@ -2823,10 +2624,8 @@ mod tests {
 
     #[test]
     fn a_stride_flush_checkpoints_the_covered_units_of_its_own_object() {
-        // The hook's whole contract: coverage snapshotted for the
-        // matching object becomes checkpointed units after the sync, and
-        // a sink whose object the plan has moved past checkpoints
-        // nothing.
+        // Matching coverage becomes checkpointed units after sync; a
+        // moved-past object checkpoints nothing.
         let unit = vot_scheduler::RANGE_UNIT_BYTES;
         let output = temporary("hook");
         fs::create_dir_all(&output).unwrap();
@@ -2915,8 +2714,7 @@ mod tests {
 
     #[test]
     fn the_handout_walks_around_what_is_already_placed() {
-        // The skip set is the resumed extents, and the handout neither
-        // asks inside one nor lets a span overlap one.
+        // The handout never asks inside a resumed extent or overlaps one.
         let object = frames::ObjectId {
             suite: 1,
             root: [3; 32],
@@ -2975,9 +2773,6 @@ mod tests {
 
     #[test]
     fn the_crossing_is_the_quantum_after_what_is_placed() {
-        // The boundary exactly: reaching the due crossing reports, one
-        // short of it does not, and the next crossing is the whole
-        // quantum above what is placed however many one pass spanned.
         assert_eq!(crossing(999_999, 1_000_000, 1_000_000), None);
         assert_eq!(
             crossing(1_000_000, 1_000_000, 1_000_000),
@@ -2999,11 +2794,8 @@ mod tests {
 
     #[test]
     fn placed_bytes_report_at_their_quantum_and_only_there() {
-        // The observer is paced by the fetch's own bytes: one report per
-        // quantum crossing however the passes are sized, placed only ever
-        // going up, and the total present because a report needs the plan
-        // the manifest settled. A zero quantum is refused where the error
-        // can name it.
+        // One report per quantum crossing; total is present once the
+        // manifest settles.
         const QUANTUM: u64 = 1_000_000;
         type Seen = Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>;
         let source = temporary("placed-source");
@@ -3056,10 +2848,7 @@ mod tests {
 
     #[test]
     fn the_pool_reports_room_and_business_from_what_is_out() {
-        // has_room is what stops the session thread handing out more than
-        // the provers can hold, and busy is what keeps the driving loop on
-        // the short wait while witnesses are owed. Both read `in_flight`,
-        // and each has an off-by-one that only shows at the bound.
+        // Both read `in_flight`; each has an off-by-one that only shows at the bound.
         let mut pool = ProvingPool::start(2);
         assert!(!pool.busy(), "an idle pool owes nothing");
         assert!(pool.has_room(), "an idle pool can take work");
@@ -3074,9 +2863,7 @@ mod tests {
 
     #[test]
     fn dropping_the_pool_ends_its_provers() {
-        // The drop joins every prover, so nothing of the pool survives it.
-        // A drop that skips the join leaves provers holding their half of
-        // the work channel past the fetch that spawned them.
+        // The drop joins every prover, so nothing survives it.
         let pool = ProvingPool::start(2);
         let probe = std::sync::Arc::downgrade(&pool.taking);
         drop(pool);
@@ -3088,12 +2875,7 @@ mod tests {
 
     #[test]
     fn a_pass_with_a_witness_owed_books_it_before_returning() {
-        // The handover counts what is out, and the booking loop waits for
-        // the first witness rather than spinning past it: a pass that hands
-        // a bundle to a prover settles it in the same pass. If the count
-        // never rises the wait is skipped, and every witness is left to a
-        // later pass that happens to look, which is a fetch that goes idle
-        // between covers.
+        // A pass that hands a bundle to a prover settles it in the same pass.
         let (bundle, _) = built_bundle("witness", &[("big.bin", patterned(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("witness-fetched");
@@ -3150,11 +2932,8 @@ mod tests {
             "no cover completed within the round budget"
         );
 
-        // The decisive pass must wait, not spin, and its wait has to cover
-        // a cold pool proving one cover under whatever load the suite runs
-        // at; the mutant this test exists for books nothing however long
-        // it is given. Set only now, so a mutant that reroutes an empty
-        // pool into the wait costs the earlier rounds nothing.
+        // The decisive pass must wait, not spin; set now so the earlier
+        // rounds are not slowed.
         fetcher.prover_wait = std::time::Duration::from_secs(5);
         fetcher.pump_provers().unwrap();
         let pool = fetcher.pool.as_ref().expect("the pass started the pool");
@@ -3176,9 +2955,7 @@ mod tests {
             fetcher.receiver.deferred_limit(),
             DEFAULT_PROVING_THREADS + 1
         );
-        // The receiver's budgets are the pipeline depth in whole bundles,
-        // byte for byte: a sum where a product belongs is one bundle wide
-        // and fails a conforming transfer on a real wire.
+        // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
         assert_eq!(
             fetcher.receiver.pending_byte_limit(),
             OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
@@ -3201,16 +2978,11 @@ mod tests {
 
     #[test]
     fn records_arriving_before_their_proofs_do_not_exhaust_the_receiver() {
-        // What a real wire does that the in-order pump never shows: the
-        // data lane outruns the control stream by whole bundles, so every
-        // outstanding cover's records can land before any of their proofs.
-        // Each proof-less bundle occupies the receiver's orphan budget, and
-        // a budget below the request pipeline's depth fails a conforming
-        // transfer with PendingBundlesExhausted, which is how an inline
-        // 512 MiB wire fetch died on 2026-08-06. Three covers is enough:
-        // the third orphan is the one a limit of two refuses. Noise rather
-        // than a pattern, so the held records weigh what wire records
-        // weigh and the byte budget is exercised along with the count.
+        // Records can land before their proofs (the data lane outruns the
+        // control stream). Each orphan occupies the receiver's budget; a
+        // budget below the pipeline depth fails with
+        // `PendingBundlesExhausted`. Noise, not a pattern, so the byte
+        // budget is exercised along with the count.
         let (bundle, built) = built_bundle("orphans", &[("big.bin", noise(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("orphans-fetched");
@@ -3278,9 +3050,8 @@ mod tests {
 
     #[test]
     fn a_tampered_record_ends_the_fetch_as_proof_invalid() {
-        // Three covers, so the fetch still has one to ask for when the
-        // proof fails: a close that left it owed would tell a driving loop
-        // to keep servicing a session that cannot progress.
+        // Three covers, so the fetch still has one outstanding when the
+        // proof fails.
         let (bundle, _) = built_bundle("tampered", &[("big.bin", patterned(8_500_000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("tampered-fetched");
@@ -3297,9 +3068,8 @@ mod tests {
 
     #[test]
     fn this_ends_own_failures_do_not_close_as_a_bad_proof() {
-        // The code says whose fault it was, and a server told PROOF_INVALID
-        // about a bundle it served correctly is told the one thing the code
-        // exists to say, wrongly.
+        // Local failures must not close as PROOF_INVALID; that blames the
+        // server wrongly.
         assert_eq!(
             refusal_code(&vot_scheduler::Error::Sink),
             error_code::STORAGE_WRITE_FAILED
@@ -3355,9 +3125,8 @@ mod tests {
 
     #[test]
     fn a_zero_length_stored_object_is_written_rather_than_asked_for() {
-        // Nothing a build stores is zero length, because an empty file
-        // packs. A manifest can still name one, and the receiver refuses to
-        // begin a subject of no length, so the fetch writes it itself.
+        // A manifest can name an empty object; the receiver refuses to
+        // begin one, so the fetch writes it.
         let (_, summary) = built_bundle("emptyobj", &[("a.txt", patterned(1000))]);
         let output = temporary("emptyobj-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
@@ -3487,9 +3256,8 @@ mod tests {
 
     #[test]
     fn a_close_forgets_the_requests_the_carrier_never_took() {
-        // The close finds the queue holding a request, because the carrier
-        // stopped taking them. Left there it would tell a driving loop to
-        // keep servicing a session that has already ended.
+        // The queue holds a request the carrier refused; left there it would
+        // keep a dead session serviced.
         let (bundle, _) = built_bundle("forget", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("forget-fetched");
@@ -3579,8 +3347,6 @@ mod tests {
             .events
             .push_back(Event::Disconnected(ConnectionId(3)));
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
-        // A carrier that has gone is gone for every later pass, not only
-        // the one that saw it go.
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
         assert!(!fetcher.has_backlog(), "and nothing is still owed");
         discard(&[&bundle, &output]);
@@ -3588,9 +3354,8 @@ mod tests {
 
     #[test]
     fn a_disconnect_that_arrives_with_the_last_bytes_still_completes() {
-        // A server that closes as soon as it has served leaves the records
-        // and the disconnect for one pass to take. The bundle is whole, and
-        // reporting the carrier over it would throw a finished fetch away.
+        // Records and disconnect arrive in one pass; the bundle is whole
+        // and must complete.
         let (bundle, _) = built_bundle("lastgasp", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("lastgasp-fetched");
@@ -3636,9 +3401,8 @@ mod tests {
 
     #[test]
     fn manifest_spans_are_requested_one_at_a_time_in_arrival_order() {
-        // A manifest past 8,192 pages takes more than one request, which no
-        // bundle a test can build reaches: that many pages is millions of
-        // entries. The cursor is driven directly instead.
+        // More than 8,192 pages takes multiple requests; the cursor is
+        // driven directly.
         let output = temporary("manifest-spans");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         fetcher.descriptor = Some(PackageDescriptor {
@@ -3664,8 +3428,7 @@ mod tests {
             "the next span waits on the pages of this one"
         );
 
-        // It is asked for once the pages of the span before it have arrived,
-        // because arrival order is what indexes the digest check.
+        // The next span waits for prior pages (arrival order indexes the digest check).
         fetcher.pages_received = MAX_MANIFEST_REQUEST_PAGES - 1;
         fetcher.request_pages().map_err(|_| ()).unwrap();
         assert!(fetcher.pending.is_empty(), "one page short is still short");
@@ -3691,10 +3454,8 @@ mod tests {
 
     #[test]
     fn a_seal_must_answer_the_descriptor_in_every_field() {
-        // The seal is the only thing that names the pages, so a seal that
-        // answers a different package than the descriptor announced would
-        // put this fetch on a manifest the pin never covered. Each field
-        // the two share has to agree on its own.
+        // Each field the seal and descriptor share must agree, or the fetch
+        // lands on an unpinned manifest.
         let (bundle, _) = built_bundle("sealfields", &[("a.txt", patterned(1000))]);
         let seal_bytes = fs::read(bundle.join(MANIFEST_DIRECTORY).join(MANIFEST_SEAL)).unwrap();
         let seal = vot_manifest::decode_seal(&seal_bytes).unwrap();
@@ -3809,8 +3570,7 @@ mod tests {
             })
             .collect();
 
-        // The second page before the first is a gap the control stream
-        // cannot have made, so it is the server's doing.
+        // A page before its predecessor is a server-side gap.
         let (server, mut session, mut connection) = serving(&bundle);
         let early = temporary("pageorder-early");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &early, None).unwrap();
@@ -3848,8 +3608,8 @@ mod tests {
 
     #[test]
     fn a_send_failure_that_is_not_backpressure_surfaces() {
-        // Backpressure holds a request for the next pass. Anything else is
-        // this end failing, and holding it would hide that forever.
+        // Backpressure holds a request; anything else is a failure that
+        // must surface.
         let (bundle, _) = built_bundle("sendfail", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("sendfail-fetched");
@@ -3863,11 +3623,8 @@ mod tests {
 
     #[test]
     fn no_more_is_asked_for_than_may_be_outstanding() {
-        // The bound is what has been asked for and not yet placed, so a
-        // fetch asks for its covers and stops until some arrive, however
-        // many passes it is given and however long the object is. Bounding
-        // the queue instead let an object of any size be asked for in full
-        // before the first cover landed.
+        // The bound is asked-for minus placed; queue bounding instead would
+        // fetch an object in full before any cover lands.
         let (bundle, summary) = built_bundle("inflight", &[("a.txt", patterned(1000))]);
         let output = temporary("inflight-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
@@ -3906,10 +3663,7 @@ mod tests {
             "asked for more than may be outstanding"
         );
 
-        // What this rail settles is what buys its next request: the pace
-        // is per rail, because each session advertises its own credit and
-        // holds its own budgets, and asking on the strength of another
-        // rail's arrivals would ask past both.
+        // Pacing is per rail; asking on another's arrivals overdraws both receivers.
         sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
         fetcher.settled_bytes = MAX_REQUESTED_RANGE;
         fetcher.issue_ranges().unwrap();
@@ -3918,14 +3672,11 @@ mod tests {
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
             "a settled cover did not buy the next request"
         );
-        // And placing counts as progress, which is what keeps a driving
-        // loop from giving up on a transfer that is arriving.
+        // Placing counts as progress, so a driving loop keeps a slow transfer alive.
         assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
 
-        // A span is committed only once its frame is queued: a failure
-        // between the handout and the frame leaves the span owed. At one
-        // rail this ends the fetch either way; at W rails a span consumed
-        // by a failed frame would be a hole nobody ever re-requests.
+        // A span is committed only once its frame is queued, or a failure
+        // leaves a hole nobody re-requests.
         fetcher.settled_bytes = 2 * MAX_REQUESTED_RANGE;
         let owed = fetcher.locked_plan().unwrap().next_offset;
         fetcher.next_request = u64::MAX;
@@ -3939,10 +3690,8 @@ mod tests {
             "a span whose frame never queued was consumed"
         );
 
-        // The shared sink is not this rail's account: every rail's
-        // arrivals land there, and a rail asking on their strength would
-        // ask past its own receiver's budgets. With this rail's window
-        // exactly full, no amount placed buys it a span.
+        // The shared sink is not this rail's account; a full window blocks
+        // regardless of placement.
         fetcher.next_request = 0;
         fetcher.settled_bytes = MAX_REQUESTED_RANGE;
         sink.placed
@@ -3954,8 +3703,7 @@ mod tests {
             "the shared sink paid for a rail's spans"
         );
 
-        // Proving inline there are no witnesses and no other rails, so
-        // what the sink placed is the same account and the pace.
+        // Inline proving has no witnesses, so the sink's placement is the pace.
         fetcher.set_proving_threads(0).unwrap();
         fetcher.issue_ranges().unwrap();
         assert_eq!(
@@ -4025,10 +3773,8 @@ mod tests {
                 (MAX_MANIFEST_REQUEST_PAGES, 1),
             ]
         );
-        // Walking the cursor covers the object exactly once, and stops.
-        // Counted by what the length can need, so a span that does not
-        // advance ends the walk with a wrong answer here rather than
-        // filling memory until something else stops it.
+        // Bounded by the length, so a non-advancing span ends the walk
+        // instead of filling memory.
         let walk = |length: u64| {
             let mut spans = Vec::new();
             let mut offset = 0;

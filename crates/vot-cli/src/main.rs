@@ -179,7 +179,7 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
     }
 }
 
-/// Runs the rendezvous service of ADR-0033 until it is stopped.
+/// Runs the rendezvous service until it is stopped.
 fn rendezvous(address: &str) -> Result<(), vot_cli::Error> {
     let address = address
         .parse()

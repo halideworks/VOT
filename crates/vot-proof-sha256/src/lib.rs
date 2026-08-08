@@ -56,17 +56,9 @@ pub struct RangeCover {
     pub proof: Vec<u8>,
 }
 
-/// The hash of every 64 KiB piece, in order.
-///
-/// Enough to prove any range without the object, where [`prove`] rebuilds the
-/// whole piece layer on every call. It is 32 bytes per piece, about 512 KiB for
-/// a gigabyte, which is what lets a sender prove ranges without holding the
-/// object.
-///
-/// Unlike [`piece_layer`] this has no single-piece case, which a reader
-/// comparing the two should not take for an omission. An object of one piece
-/// has no parent to encode, so its proof is empty and the layer is never read;
-/// the root the receiver checks against comes from the range's own bytes.
+/// Hash of every 64 KiB piece, in order. Enough to prove any range without
+/// the object (~512 KiB per gigabyte). No single-piece case: the proof is
+/// empty and the root comes from the bytes.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PieceHashes {
     hashes: Vec<[u8; 32]>,
@@ -111,12 +103,6 @@ impl PieceHashes {
 
     /// Whether `piece` is still the bytes this layer took at `index`.
     ///
-    /// A sender that keeps only piece hashes cannot otherwise tell that the
-    /// object it proves from has been rewritten under it, because a rewrite
-    /// that keeps the length reads back at the same offsets. A piece hash
-    /// carries no offset, so unlike the BLAKE3 layer this holds bytes to
-    /// their content alone and two identical pieces are interchangeable,
-    /// which is exactly what the tree already treats them as.
     #[must_use]
     pub fn holds(&self, index: usize, piece: &[u8]) -> bool {
         let Some(hash) = self.hashes.get(index) else {
@@ -129,10 +115,8 @@ impl PieceHashes {
     }
 }
 
-/// Proves a range from the piece hashes rather than from the object.
-///
-/// The proof is byte-identical to [`prove`]'s for the same range, which its
-/// tests check directly.
+/// Proves a range from piece hashes. Byte-identical to [`prove`] for the
+/// same range.
 ///
 /// # Errors
 /// Rejects an empty range and one that runs past the object.
@@ -431,7 +415,6 @@ mod tests {
             assert!(pieces.holds(index, piece), "piece {index} is its own bytes");
         }
 
-        // One byte different anywhere is a different piece.
         let mut altered = chunks[1].to_vec();
         altered[0] ^= 1;
         assert!(!pieces.holds(1, &altered));
@@ -440,15 +423,12 @@ mod tests {
         altered[last] ^= 1;
         assert!(!pieces.holds(1, &altered));
 
-        // A piece hash carries no offset, so the same bytes at another index
-        // are the same piece. That is the tree's own rule, not a gap here.
         assert!(!pieces.holds(0, chunks[1]));
         let repeated = vec![7u8; 2 * PIECE_SIZE as usize];
         let layer = pieces_of(&repeated);
         assert!(layer.holds(0, &repeated[..PIECE_SIZE as usize]));
         assert!(layer.holds(1, &repeated[..PIECE_SIZE as usize]));
 
-        // And nothing holds outside the layer, or at an impossible size.
         assert!(!pieces.holds(chunks.len(), chunks[0]));
         assert!(!pieces.holds(usize::MAX, chunks[0]));
         assert!(!pieces.holds(0, &[]));
@@ -457,9 +437,6 @@ mod tests {
 
     #[test]
     fn proving_from_piece_hashes_matches_proving_from_the_object() {
-        // The second path is the first one without the object, including the
-        // single-piece object whose layer is its root rather than its piece
-        // hash, which is the case a streaming builder cannot see coming.
         for length in [
             1,
             PIECE_SIZE as usize,

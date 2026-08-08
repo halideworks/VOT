@@ -60,11 +60,9 @@ pub struct Receipt {
 
 /// Registered receipt authentication schemes.
 ///
-/// Ed25519 is the default because a receipt is evidence for a third party. A
-/// symmetric MAC cannot serve that: anyone able to verify it is equally able to
-/// forge it, so the auditor a receipt is meant for either cannot check it or
-/// becomes capable of manufacturing it. HMAC remains registered for traffic
-/// that never leaves one trust domain.
+/// Ed25519 is the default: a receipt is evidence for a third party, and a
+/// symmetric MAC is forgeable by anyone who can verify it. HMAC is registered
+/// for traffic that never leaves one trust domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthScheme {
     Ed25519 = 1,
@@ -303,10 +301,8 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
 /// A witness statement: an independent party recording that it saw a chain head
 /// at its own clock time.
 ///
-/// This is what anchors a chain. An issuer signing its own observations can
-/// rewrite and re-sign all of them, and `observed_at` is whatever the issuer
-/// says. A witness signature over the head, timestamped by the witness, means a
-/// later rewrite has to also produce witness signatures the issuer cannot make.
+/// Anchors a chain against issuer rewrites: the witness timestamp is outside
+/// the issuer's control, so re-signing observations cannot move it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WitnessStatement {
     /// Envelope digest of the observation being witnessed.
@@ -451,15 +447,10 @@ pub fn verify_chain(chain: &[AuthenticatedReceipt]) -> Result<(), Error> {
 
 /// Bytes an authenticator covers: domain, scheme, then the canonical receipt.
 ///
-/// The scheme is inside the signed input so an authenticator produced under one
-/// scheme can never be replayed as another.
-/// Bytes an authenticator covers.
-///
-/// The key identifier is inside them. It names which key the issuer claimed to
-/// be using, and a verifier that treats it as a context label needs it to be
-/// authentic: otherwise a receipt signed by the same issuer for another context
-/// can be relabelled without disturbing the signature. It is length prefixed so
-/// no identifier can be read as the start of the canonical receipt.
+/// The scheme and key identifier are inside the signed input. Scheme binding
+/// prevents replay under another scheme; the key identifier acts as a context
+/// label, so a receipt cannot be relabelled without breaking the signature.
+/// Length-prefixed so no identifier can be read as the start of the receipt.
 fn signing_input(scheme: AuthScheme, key_id: &[u8], receipt: &Receipt) -> Result<Vec<u8>, Error> {
     validate_key_id(key_id)?;
     let key_id_len = u8::try_from(key_id.len()).map_err(|_| Error::InvalidKeyId)?;
@@ -711,10 +702,9 @@ fn decode_assurance(value: u64) -> Result<AssuranceLevel, Error> {
 
 /// The receipt crate's view of a deterministic CBOR reader.
 ///
-/// `vot-cbor` decides what a well-formed canonical item is. This decides what a
-/// receipt calls each failure: everything structural is an invalid encoding
-/// except a shortest-form violation, which callers distinguish, and a bound the
-/// receipt set, which is too large.
+/// Maps `vot-cbor` failures to receipt errors: structural problems are invalid
+/// encodings, except shortest-form violations (`NonCanonical`) and receipt-set
+/// bounds (`TooLarge`).
 struct Decoder<'a> {
     reader: vot_cbor::Reader<'a>,
 }
@@ -766,10 +756,8 @@ impl<'a> Decoder<'a> {
 
     /// A map of exactly `expected` pairs.
     ///
-    /// The length is compared here rather than by the reader, because a wider
-    /// head than the length needs is a non-canonical encoding and a length that
-    /// is simply not the one expected is an invalid one. Letting the reader
-    /// decide both would report the first as the second.
+    /// Compared here rather than by the reader: a non-minimal head is
+    /// `NonCanonical`, but a wrong count is an invalid encoding.
     fn exact_map(&mut self, expected: u64) -> Result<(), Error> {
         if self.map_len()? == expected {
             Ok(())
@@ -876,12 +864,6 @@ mod tests {
 
     #[test]
     fn the_published_conformance_vector_is_what_this_produces() {
-        // ADR-0007 requires vectors for a wire-visible change, and the point of
-        // publishing one is that somebody else's implementation can check
-        // itself against it. This asserts ours still produces those exact
-        // bytes; tools/validate_receipt_vectors.py rebuilds the same transcript
-        // independently in Python and recomputes the MAC, so the two agreeing
-        // is what makes the file trustworthy rather than merely recorded.
         let key_id = vector_field("key_id_hex");
         let canonical = vector_field("canonical_receipt_hex");
         let seed: [u8; 32] = vector_field("secret_key_seed_hex").try_into().unwrap();
@@ -939,12 +921,8 @@ mod tests {
 
     #[test]
     fn the_authenticated_bytes_match_the_registry() {
-        // spec/registries.md defines this input normatively: domain separator,
-        // two-byte scheme, key identifier behind a one-byte length, canonical
-        // receipt. An independent implementation follows that text, not this
-        // crate, so the two agreeing is the whole of interoperability. Pinned
-        // as bytes rather than described, because a test that rebuilt the input
-        // the same way the code does would agree with any format at all.
+        // Pinned as bytes: this crate defines the format, so rebuilding the
+        // input the same way would agree with any encoding.
         let input = signing_input(AuthScheme::Ed25519, b"receiver-1", &receipt()).unwrap();
         let canonical = receipt().canonical_bytes().unwrap();
 
@@ -1117,10 +1095,6 @@ mod tests {
 
     #[test]
     fn deterministic_cbor_integer_widths_and_decoder_edges_are_exact() {
-        // The head itself is `vot-cbor`'s to get right and its tests cover every
-        // width for every major type. What belongs here is that a receipt whose
-        // field lands on each boundary still round-trips, and that this crate's
-        // decoder reports a non-canonical width as one.
         for value in [
             23,
             24,
@@ -1212,8 +1186,6 @@ mod tests {
 
     #[test]
     fn rewriting_one_observation_breaks_every_link_after_it() {
-        // This is what the chain buys: a middle entry cannot be replaced
-        // without also reissuing everything downstream.
         let key = signing_key();
         let mut signed = chain(
             &key,
@@ -1298,7 +1270,6 @@ mod tests {
             "564f54207769746e65737320763000a3005820abababababababababababababababababababababababababababababababab0174323032362d30382d30325430343a30303a30305a02497769746e6573732d61"
         );
 
-        // Every field is inside those bytes.
         for changed in [
             WitnessStatement {
                 head: [0xac; 32],
@@ -1409,7 +1380,6 @@ mod tests {
 
     #[test]
     fn an_ed25519_receipt_verifies_with_only_the_public_key() {
-        // The whole point: the party checking the receipt cannot produce one.
         let key = signing_key();
         let signed = sign_ed25519(receipt(), b"issuer-1", &key).unwrap();
         assert_eq!(signed.scheme, AuthScheme::Ed25519);
@@ -1417,17 +1387,14 @@ mod tests {
         assert!(signed.scheme.is_third_party_verifiable());
         verify_ed25519(&signed, &key.verifying_key()).unwrap();
 
-        // A different issuer key does not verify.
         let other = SigningKey::from_bytes(&[8; 32]);
         assert_eq!(
             verify_ed25519(&signed, &other.verifying_key()),
             Err(Error::Authentication)
         );
 
-        // Relabelling the key identifier breaks the signature. A verifier that
-        // uses it to separate contexts, as the CLI does for its publication
-        // receipts, would otherwise accept a receipt the same issuer signed for
-        // something else entirely.
+        // Relabelling the key identifier breaks the signature, so a receipt
+        // cannot be moved between contexts.
         let mut relabelled = signed.clone();
         relabelled.key_id = b"issuer-2".to_vec();
         assert_eq!(

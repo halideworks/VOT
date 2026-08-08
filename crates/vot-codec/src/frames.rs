@@ -7,29 +7,17 @@ use super::{DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, f
 const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 const GROUP_BYTES: u64 = 65_536;
 
-/// The most one `RANGE_REQUEST` may ask for, so a requester paces itself
-/// by the same number the decoder holds it to.
+/// Maximum bytes a `RANGE_REQUEST` may ask for.
 pub const MAX_REQUESTED_RANGE: u64 = 4_194_304;
 
-/// What a covered range can reach, which is not a rule of its own.
-///
-/// Used by the tests that construct the maximum, rather than by a check.
-///
-/// The covered range runs from the group the request starts in to the group its
-/// end falls in, so an unaligned request of the largest allowed length covers one
-/// group more: 64 groups requested, 65 covered. That is fixed by
-/// `MAX_REQUESTED_RANGE` and the rule that the covered range ends exactly at the
-/// aligned request end, so checking it separately would be a condition no value
-/// can reach on its own. It is kept as the number a reader needs and asserted
-/// against the arithmetic that produces it.
+/// Max covered range: one group more than `MAX_REQUESTED_RANGE` for an unaligned request.
 #[cfg(test)]
 const MAX_COVERED_RANGE: u64 = MAX_REQUESTED_RANGE + GROUP_BYTES;
 #[cfg(test)]
 const _: () = assert!(MAX_COVERED_RANGE == 4_259_840);
 const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DATA_BYTES: usize = 256 * 1024;
-/// The most pages one `MANIFEST_REQUEST` may name, so a requester chunks
-/// by the same number the decoder holds it to.
+/// Maximum pages one `MANIFEST_REQUEST` may name.
 pub const MAX_MANIFEST_REQUEST_PAGES: u64 = 8_192;
 const MAX_HAVE_RUNS: u64 = 2_097_152;
 
@@ -43,14 +31,7 @@ const MAX_SCOPE_BYTES: usize = 4_096;
 const MAX_REJECT_DETAIL_BYTES: usize = 1_024;
 const MAX_CAPABILITY_FORMAT: u64 = 65_535;
 
-/// What is left of a `SESSION_OPEN` after the two scopes and the framing.
-///
-/// A capability sized without regard to what travels beside it would encode
-/// alone and be refused in a real request, which is a bound admitting
-/// something the wire never can. The 64 below is the CBOR around the fields:
-/// the map head, six keys, the session identifier, the format, and three
-/// byte-string heads come to 39 at these sizes, rounded up so a head that
-/// widens does not take the bound with it.
+/// Max capability bytes in a `SESSION_OPEN`, leaving room for both scopes and CBOR framing.
 const MAX_CAPABILITY_BYTES: usize = 49_152;
 const _: () = assert!(
     match crate::registered_payload_limit(frame_type::SESSION_OPEN) {
@@ -162,10 +143,7 @@ impl Binding {
     }
 }
 
-/// What the server asks a client to present, and what it accepts.
-///
-/// An empty `formats` means this deployment requires no authentication, which
-/// `spec/wire.md` section 1.1 gives as the way to say so.
+/// Server authentication challenge. Empty `formats` means no auth required.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthContext {
     pub nonce: Vec<u8>,
@@ -183,7 +161,7 @@ pub struct SessionOpen {
     pub binding_proof: Vec<u8>,
 }
 
-/// What the server authorized, which may be narrower than what was asked.
+/// Granted scope, possibly narrower than requested.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionAccept {
     pub session_id: [u8; 16],
@@ -394,8 +372,7 @@ fn validate_auth_context(value: &AuthContext) -> Result<(), Error> {
     if value.formats.len() as u64 > MAX_CAPABILITY_FORMATS {
         return Err(Error::TooLarge);
     }
-    // Ascending with no repeats, so one server policy has one encoding, and
-    // `0x0000` is reserved by `spec/registries.md` section 11.
+    // Ascending with no repeats: one policy, one encoding. 0x0000 is reserved.
     let ordered = value.formats.windows(2).all(|pair| pair[0] < pair[1]);
     if !ordered
         || value
@@ -410,11 +387,8 @@ fn validate_auth_context(value: &AuthContext) -> Result<(), Error> {
 
 /// Decodes an `AUTH_CONTEXT` payload, envelope excluded.
 ///
-/// The negotiation state machine reads this one payload without going through
-/// the typed frame dispatch, since it handles the frame itself.
-///
 /// # Errors
-/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`.
+/// Rejects non-canonical CBOR under `spec/session.cddl`.
 pub fn decode_auth_context_payload(payload: &[u8]) -> Result<AuthContext, Error> {
     decode_auth_context(payload)
 }
@@ -543,11 +517,8 @@ fn validate_session_accept(value: &SessionAccept) -> Result<(), Error> {
 
 /// Decodes a `SESSION_ACCEPT` payload, envelope excluded.
 ///
-/// The negotiation state machine reads the four section 1.1 payloads without
-/// going through the typed frame dispatch, since it handles the frames itself.
-///
 /// # Errors
-/// Rejects a payload that is not canonical CBOR under `spec/session.cddl`.
+/// Rejects non-canonical CBOR under `spec/session.cddl`.
 pub fn decode_session_accept_payload(payload: &[u8]) -> Result<SessionAccept, Error> {
     decode_session_accept(payload)
 }
@@ -577,8 +548,7 @@ fn decode_session_accept(input: &[u8]) -> Result<SessionAccept, Error> {
         session_id,
         granted_scope,
     };
-    // Every one of the four checks the same rules on both sides, so a rule
-    // added to one direction cannot be missed in the other.
+    // Validates on both sides so a new rule is never missed in one direction.
     validate_session_accept(&value)?;
     Ok(value)
 }
@@ -598,9 +568,7 @@ fn encode_session_reject(value: &SessionReject, output: &mut Vec<u8>) -> Result<
 }
 
 fn validate_session_reject(value: &SessionReject) -> Result<(), Error> {
-    // spec/wire.md section 1.1 names the three codes a rejection may carry, so
-    // a rejection cannot report something that is not an authentication or
-    // authorization outcome.
+    // Only the three rejection codes from spec/wire.md section 1.1 are allowed.
     let registered = matches!(
         u16::try_from(value.reason),
         Ok(crate::error_code::AUTHENTICATION_FAILED
@@ -723,9 +691,7 @@ fn validate_manifest_request(value: &ManifestRequest) -> Result<(), Error> {
 
 fn encode_range_request(value: &RangeRequest, output: &mut Vec<u8>) -> Result<(), Error> {
     value.object.validate()?;
-    // No separate bound on the offset. An object is never longer than
-    // MAX_OBJECT_LENGTH, so an offset past that is already past this object, and
-    // the end check below refuses it before a bound of its own could.
+    // No separate offset bound: the end check below catches out-of-range offsets.
     if value.length == 0
         || value.length > MAX_REQUESTED_RANGE
         || value
@@ -858,20 +824,12 @@ fn validate_proof_bundle_with_proof_len(
             .requested_offset
             .checked_add(value.requested_length)
             .is_none_or(|end| end > value.object.length)
-        // The covered offset is the group the request starts in. That makes it a
-        // multiple of the group size and never past the request, so neither of
-        // those follows as a rule of its own: a value that broke them would have
-        // to break this one first. Nor does the covered range need a length or an
-        // end of its own here: the end below is exact, so a length of zero or an
-        // end past the object cannot reach it.
+        // Covered offset must be the group-aligned start of the request.
         || value.covered_offset != value.requested_offset / GROUP_BYTES * GROUP_BYTES
         || value.data_record_count == 0
         || value.data_record_count > MAX_DATA_RECORDS_PER_BUNDLE as u64
         || value.total_plaintext_length != value.covered_length
-        // No separate bound on the proof. It travels inside the payload, and the
-        // payload limit is the same 16 MiB, so a proof past its own bound has
-        // already passed this one. The decoder bounds the byte string it reads,
-        // which is where an untrusted length is refused before it is allocated.
+        // Proof size is bounded by the payload limit, not separately.
         || crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
             .is_some_and(|limit| proof_bundle_payload_len_with(value, proof_len) > limit)
     {
@@ -886,11 +844,7 @@ fn validate_proof_bundle_with_proof_len(
         .checked_mul(GROUP_BYTES)
         .ok_or(Error::InvalidValue)?
         .min(value.object.length);
-    // Nothing here asks whether the covered length is a whole number of groups.
-    // The offset is the group the request starts in and the end is the group its
-    // end falls in, so the length between them is a multiple of the group size
-    // wherever the object does not cut it short, which is the only case such a
-    // rule would cover.
+    // Covered length need not be group-aligned: the last group may be short.
     if value.covered_offset.checked_add(value.covered_length) == Some(expected_end) {
         Ok(())
     } else {
@@ -1137,7 +1091,7 @@ fn have_payload_len(value: &Have) -> usize {
     length
 }
 
-/// What one run costs on the wire, which is what a map is built up from.
+/// Wire size of one HAVE run.
 fn have_run_len(run: &HaveRun) -> usize {
     cbor_head_len(2)
         .saturating_add(cbor_head_len(run.start_group))
@@ -1277,11 +1231,8 @@ fn decode_object(reader: &mut Reader<'_>) -> Result<ObjectId, Error> {
 
 /// The frame codec's view of a deterministic CBOR reader.
 ///
-/// `vot-cbor` decides what a well-formed canonical item is. This decides what a
-/// frame payload calls each failure, which is two things: a bound the registry
-/// set is `TooLarge`, and everything else is `Malformed`. A peer that sent an
-/// item of the wrong type and a peer that sent a wider head than its value needs
-/// have both sent a frame this endpoint refuses the same way.
+/// Translates `vot-cbor` errors: registry-bound violations become `TooLarge`,
+/// everything else `Malformed`.
 struct Reader<'a> {
     reader: vot_cbor::Reader<'a>,
 }
@@ -1309,10 +1260,7 @@ impl<'a> Reader<'a> {
         self.reader.uint().map_err(structural)
     }
 
-    /// A map key, which has to be the one the schema puts there.
-    ///
-    /// A key that is not the expected value is the same refusal as one that is
-    /// not an integer: this payload is not the shape the schema fixes.
+    /// A map key matching the expected schema key.
     fn key(&mut self, expected: u64) -> Result<(), Error> {
         self.reader.key(expected).map_err(|_| Error::Malformed)
     }
@@ -1329,10 +1277,6 @@ impl<'a> Reader<'a> {
     }
 
     /// An array head bounded by a registered maximum.
-    ///
-    /// Both halves are `TooLarge`, which is what the caller acts on: a count
-    /// past the bound and a head that is not an array both mean this payload
-    /// cannot be admitted.
     fn array_len(&mut self, maximum: u64) -> Result<u64, Error> {
         self.reader.array_len(maximum).map_err(|_| Error::TooLarge)
     }
@@ -1347,8 +1291,7 @@ impl<'a> Reader<'a> {
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         self.reader.fixed_bytes::<N>().map_err(|error| match error {
-            // A byte string of another length where a fixed one was expected is
-            // the wrong shape rather than an oversized one.
+            // Wrong-length byte string at a fixed position is malformed.
             vot_cbor::Error::TooLarge => Error::Malformed,
             other => structural(other),
         })
@@ -1371,13 +1314,6 @@ mod tests {
         }
     }
 
-    /// A valid object, a valid frame of each kind, and one rule broken at a time.
-    ///
-    /// Every validator here is a chain of disjuncts, and a chain is where a rule
-    /// goes missing without anything noticing: each `||` that never decides an
-    /// outcome, and each comparison never tested at its edge, is a rule the wire
-    /// does not actually have. These tables break one rule per row and require
-    /// the value that must be accepted beside it.
     fn wide_object() -> ObjectId {
         ObjectId {
             suite: 2,
@@ -1386,11 +1322,7 @@ mod tests {
         }
     }
 
-    /// A HAVE map whose payload is exactly what the registry allows.
-    ///
-    /// Built by measuring rather than by dividing: a run's size depends on the
-    /// group numbers in it, so the count that reaches the limit is found and the
-    /// last few bytes are spent one at a time.
+    /// A HAVE map at exactly its registered payload limit.
     fn have_at_payload_limit() -> Have {
         let limit = crate::registered_payload_limit(frame_type::HAVE).unwrap();
         let mut value = Have {
@@ -1402,10 +1334,7 @@ mod tests {
             map_sequence: 0,
             runs: Vec::new(),
         };
-        // Runs 25 groups apart, which leaves room for a count of 24 below. Each
-        // one is measured by the function under test rather than by arithmetic
-        // written here, so the count that reaches the limit is right even when
-        // what a run costs is not what this test would have guessed.
+        // Runs spaced 25 groups apart; sizes measured by the function under test.
         let mut total = have_payload_len(&value);
         for index in 0..MAX_HAVE_RUNS {
             let run = HaveRun {
@@ -1419,13 +1348,11 @@ mod tests {
             total += cost;
             value.runs.push(run);
         }
-        // The run array's own head grew while the runs did, so the size is
-        // measured again rather than accumulated.
+        // Re-measure: the array head widened as runs were added.
         while have_payload_len(&value) > limit {
             assert!(value.runs.pop().is_some(), "no map reaches the limit");
         }
-        // A run of 24 groups spends one byte more than a run of one, so what is
-        // left over is spent a byte at a time.
+        // Spend remaining bytes by widening run counts.
         let short = limit - have_payload_len(&value);
         for run in value.runs.iter_mut().take(short) {
             run.group_count = 24;
@@ -1441,19 +1368,16 @@ mod tests {
 
         let mut encoded = Vec::new();
         encode(&TypedFrame::Have(value.clone()), &mut encoded).unwrap();
-        // The size this endpoint refuses on is the size it would have written. An
-        // estimate that ran high would refuse a map a peer is allowed to send.
+        // The refused size must match what encode would actually write.
         assert_eq!(payload_of(&encoded).len(), limit);
         assert_eq!(decode_have(payload_of(&encoded)), Ok(value.clone()));
-        // And through the frame layer, which holds the same limit one step out.
         assert_eq!(
             decode(&encoded, DecodeLimits::default()),
             Ok((TypedFrame::Have(value.clone()), encoded.len())),
             "a map at its limit is a frame the layer above carries"
         );
 
-        // One byte more, spent on the map sequence rather than on a run, so the
-        // map is otherwise the one just carried.
+        // One byte over, via the map sequence.
         let over = Have {
             map_sequence: 24,
             ..value
@@ -1464,17 +1388,14 @@ mod tests {
 
     #[test]
     fn a_have_map_is_refused_before_its_runs_are_reserved() {
-        // The count is bounded twice: by the registry, and by what the remaining
-        // bytes could possibly hold. The second is what stops a peer naming two
-        // million runs in a short frame and having them reserved.
+        // Run count is bounded by the registry and by remaining bytes.
         let valid = have();
         let mut encoded = Vec::new();
         encode(&TypedFrame::Have(valid.clone()), &mut encoded).unwrap();
         let payload = payload_of(&encoded);
         assert_eq!(decode_have(payload), Ok(valid));
 
-        // A run count the frame cannot hold: the head says many, the bytes are
-        // few. Each run is two integers, so the bound is half of what is left.
+        // Run count exceeds what the remaining bytes can hold.
         let mut lying = Vec::new();
         vot_cbor::map(&mut lying, 3);
         vot_cbor::uint(&mut lying, 0);
@@ -1485,10 +1406,7 @@ mod tests {
         vot_cbor::array(&mut lying, 64);
         assert_eq!(decode_have(&lying), Err(Error::Malformed));
 
-        // The bound has to be half of what is left rather than any larger
-        // multiple of it. Two well-formed runs occupy six bytes, so a count of
-        // four is more than those bytes can hold and is refused here, before the
-        // reader gets to run out of input and answer something else.
+        // Count of 4 exceeds the 6 bytes two runs occupy.
         let mut over_half = Vec::new();
         vot_cbor::map(&mut over_half, 3);
         vot_cbor::uint(&mut over_half, 0);
@@ -1504,9 +1422,7 @@ mod tests {
         }
         assert_eq!(decode_have(&over_half), Err(Error::Malformed));
 
-        // A map that claims nothing. Nothing remains after the run head, so the
-        // count and the bound are both zero, and a peer that has verified no group
-        // yet says so with an empty sequence of runs rather than being refused.
+        // Empty runs are valid: the peer has verified nothing yet.
         let empty = Have {
             object: wide_object(),
             map_sequence: 7,
@@ -1516,8 +1432,6 @@ mod tests {
         encode(&TypedFrame::Have(empty.clone()), &mut encoded_empty).unwrap();
         assert_eq!(decode_have(payload_of(&encoded_empty)), Ok(empty));
 
-        // And the count the remaining bytes do allow is read rather than refused,
-        // which is what says the bound is not simply always refusing.
         let mut exact = Vec::new();
         vot_cbor::map(&mut exact, 3);
         vot_cbor::uint(&mut exact, 0);
@@ -1533,8 +1447,7 @@ mod tests {
         }
         assert!(decode_have(&exact).is_ok(), "a count the bytes can hold");
 
-        // A run at the very last group of the object, which is the edge the end
-        // check sits on inside validate_have.
+        // Run at the last group (edge of the end check).
         let groups = wide_object().length.div_ceil(GROUP_BYTES);
         round_trip(&TypedFrame::Have(Have {
             runs: vec![HaveRun {
@@ -1562,18 +1475,15 @@ mod tests {
     fn a_seal_is_bounded_by_the_payload_its_registry_entry_allows() {
         let limit = crate::registered_payload_limit(frame_type::SEAL)
             .expect("a seal has a registered payload limit");
-        // One byte past the limit is refused for its size, before anything tries
-        // to read a manifest structure out of it.
+        // One byte over: size refusal before manifest parsing.
         assert_eq!(validate_seal(&vec![0; limit + 1]), Err(Error::TooLarge));
-        // At the limit it is refused for what it is instead, which is what says
-        // the comparison is on the right side of its edge.
+        // At the limit: manifest parse failure, not size.
         assert_eq!(validate_seal(&vec![0; limit]), Err(Error::Seal));
     }
 
     #[test]
     fn a_challenge_outside_its_bounds_never_reaches_the_wire() {
-        // encode_auth_context_payload is the door the session state machine uses,
-        // so a challenge it would refuse must not encode through this one either.
+        // A refused challenge must not encode through the payload API.
         let mut out = Vec::new();
         assert_eq!(
             encode_auth_context_payload(
@@ -1603,10 +1513,7 @@ mod tests {
 
     #[test]
     fn a_covered_range_that_stops_short_of_the_object_ends_on_a_group() {
-        // The last group of an object is short, so a covered range that reaches
-        // the end of the object need not be a whole number of groups. One that
-        // stops before the end must be. Both sides of that condition, which is
-        // the only place the object length decides the rule.
+        // A covered range at the object end may be short; one stopping early must be group-aligned.
         let ragged = ObjectId {
             length: GROUP_BYTES * 2 + 17,
             ..wide_object()
@@ -1643,8 +1550,6 @@ mod tests {
 
     #[test]
     fn a_reader_that_has_not_finished_says_so() {
-        // Reader::finish is what refuses trailing bytes inside a payload, and
-        // every typed decoder ends with it.
         let mut encoded = Vec::new();
         encode(
             &TypedFrame::Capacity(Capacity {
@@ -1676,7 +1581,7 @@ mod tests {
         for suite in [1, 2] {
             assert_eq!(ObjectId { suite, ..object() }.validate(), Ok(()));
         }
-        // The longest object the registry allows, and one byte more.
+        // Max length and one byte over.
         assert_eq!(
             ObjectId {
                 length: MAX_OBJECT_LENGTH,
@@ -1774,8 +1679,6 @@ mod tests {
             assert!(out.is_empty(), "{name} wrote bytes before refusing");
         }
 
-        // The bounds themselves are allowed, which is what says each comparison
-        // is on the right side of its edge.
         let mut out = Vec::new();
         assert_eq!(
             encode_range_request(
@@ -1962,9 +1865,7 @@ mod tests {
             );
         }
 
-        // A single run covering every group, which is the edge the end check sits
-        // on, and a first run starting at zero, which the adjacency rule must not
-        // refuse.
+        // Full-coverage run and a run starting at zero.
         round_trip(&TypedFrame::Have(Have {
             runs: vec![HaveRun {
                 start_group: 0,
@@ -1980,7 +1881,7 @@ mod tests {
             ..have()
         }));
 
-        // An object identity that is not valid is refused before any run is read.
+        // Invalid object identity refused before runs are read.
         let mut out = Vec::new();
         assert_eq!(
             encode(
@@ -1996,15 +1897,13 @@ mod tests {
             Err(Error::InvalidValue)
         );
 
-        // More runs than the payload limit can carry, which is a size refusal
-        // rather than a rule about the runs themselves.
+        // Too many runs: size refusal.
         let crowded = Have {
             object: ObjectId {
                 length: MAX_OBJECT_LENGTH,
                 ..wide_object()
             },
-            // Wide start groups, so each run needs the widest heads and the
-            // payload reaches its bound in a few hundred thousand of them.
+            // Wide start groups for wider CBOR heads.
             runs: (0..400_000)
                 .map(|index| HaveRun {
                     start_group: index * (1 << 40),
@@ -2060,11 +1959,7 @@ mod tests {
                 },
             ),
             (
-                // The same rule, isolated. Above it, the covered range disagrees
-                // with the request as well, so the second check refuses the value
-                // too and either rule alone would look sufficient. Here the
-                // covered range is what a zero-length request at offset one would
-                // cover, so this is refused for that reason and no other.
+                // Same rule isolated: covered range agrees, so only zero-length check refuses.
                 "a requested length of zero with a covered range that agrees",
                 ProofBundle {
                     requested_offset: 1,
@@ -2154,15 +2049,12 @@ mod tests {
             );
         }
 
-        // Each bound at its own maximum. The covered range may exceed the
-        // requested one by design, so both maxima are their own case.
+        // All bounds at their maximum. Covered may exceed requested.
         let long = ObjectId {
             length: MAX_OBJECT_LENGTH,
             ..wide_object()
         };
-        // The largest bundle there is, and the reason the covered maximum is one
-        // group more than the requested one: an unaligned request of 64 groups is
-        // covered by 65.
+        // Unaligned max request: 64 groups requested, 65 covered.
         assert_eq!(
             validate_proof_bundle(&ProofBundle {
                 object: long,
@@ -2190,8 +2082,7 @@ mod tests {
             Err(Error::InvalidValue),
             "one byte past the requested maximum"
         );
-        // A covered range that does not end where the request's group does, in
-        // both directions, which is the rule that fixes it rather than a bound.
+        // Covered end must match the request's aligned end.
         for covered_length in [MAX_COVERED_RANGE - GROUP_BYTES, MAX_COVERED_RANGE + 1] {
             assert_eq!(
                 validate_proof_bundle(&ProofBundle {
@@ -2208,9 +2099,7 @@ mod tests {
             );
         }
 
-        // The proof is bounded by the payload it travels in, so the edge is where
-        // the estimate meets the registry's limit. Found rather than assumed: a
-        // number written here would be one the estimate could drift away from.
+        // Proof edge: where the payload estimate meets the registry limit.
         let limit = crate::registered_payload_limit(frame_type::PROOF_BUNDLE)
             .expect("a proof bundle has a registered payload limit");
         let widest = (1..=limit)
@@ -2347,9 +2236,7 @@ mod tests {
 
     #[test]
     fn a_capacity_frame_carries_what_it_was_given() {
-        // Nothing about a capacity frame is bounded, so what a test can say is
-        // that every field reaches the wire and comes back. A writer that dropped
-        // one would round-trip as a default.
+        // Capacity is unbounded; verify all fields round-trip.
         round_trip(&TypedFrame::Capacity(Capacity {
             epoch: 7,
             available_bytes: 1 << 40,
@@ -2383,8 +2270,6 @@ mod tests {
             binding: Binding::ProofOfPossession,
             formats: vec![1, 2, 9],
         }));
-        // No capability format means no authentication is required, which
-        // spec/wire.md section 1.1 gives as the way a server says so.
         round_trip(&TypedFrame::AuthContext(AuthContext {
             nonce: vec![3; 64],
             binding: Binding::None,
@@ -2415,10 +2300,7 @@ mod tests {
 
     #[test]
     fn the_payload_api_reads_what_the_typed_frame_api_writes() {
-        // The negotiation state machine handles the section 1.1 frames itself,
-        // so it decodes payloads rather than typed frames and never goes through
-        // the dispatch the tests above use. Only these four have that door, and
-        // it has to lead to the same place.
+        // Payload API must match typed frame dispatch for session frames.
         let frames = [
             TypedFrame::AuthContext(AuthContext {
                 nonce: vec![1; MIN_AUTH_NONCE],
@@ -2468,14 +2350,9 @@ mod tests {
             assert_eq!(read, frame);
         }
 
-        // And the same refusals, since a payload decoder that skipped the
-        // validation the dispatch applies would be a way around it.
         assert!(decode_session_accept_payload(&[]).is_err());
 
-        // Canonical CBOR under the schema, carrying a code section 1.1 does not
-        // assign to a rejection. Built field by field rather than by editing an
-        // encoded one, so the payload is refused for its reason and not for a
-        // key the edit moved.
+        // Valid CBOR with an unregistered rejection reason.
         let mut unregistered = Vec::new();
         vot_cbor::map(&mut unregistered, 4);
         vot_cbor::uint(&mut unregistered, 0);
@@ -2497,8 +2374,6 @@ mod tests {
 
     #[test]
     fn every_authentication_bound_admits_its_own_maximum() {
-        // A bound that refuses its own maximum refuses a peer that sent
-        // nothing oversized, and nothing else here would notice.
         round_trip(&TypedFrame::AuthContext(AuthContext {
             nonce: vec![1; MIN_AUTH_NONCE],
             binding: Binding::None,
@@ -2583,8 +2458,6 @@ mod tests {
 
     #[test]
     fn a_rejection_carries_a_registered_reason() {
-        // A rejection that could report anything would let a server describe
-        // an outcome the error registry never assigned.
         let mut out = Vec::new();
         for reason in [
             crate::error_code::AUTHENTICATION_FAILED,

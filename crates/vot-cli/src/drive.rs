@@ -1,11 +1,7 @@
-//! Driving one end of a session to a settled state.
+//! Shared driving loop for serve and fetch sessions.
 //!
-//! Serving and fetching are the same loop with different work in it: make
-//! a pass, and if the pass left something this end can do without hearing
-//! from the peer, make another; otherwise wait on the carrier. Both
-//! engines document that rule and getting it wrong is silent, either a
-//! spin over a session that cannot progress or a wait for an event that
-//! was never coming. So it is written once here and both ends take it.
+//! Make a pass; if it left something to do without hearing from the peer,
+//! make another; otherwise wait on the carrier.
 
 use std::time::Duration;
 
@@ -13,45 +9,20 @@ use vot_transport_api::TransportAdapter;
 
 use crate::Error;
 
-/// How long a pass waits on a carrier with nothing to do.
-///
-/// A wait ends when an event lands, so this is only how often an idle end
-/// looks up (`docs/perf-engineering.md`, 2026-08-04: the bound stopped
-/// being a result once waits became blocking). Long enough not to spin,
-/// short enough that a carrier which dies quietly is noticed.
+/// How long a pass waits on an idle carrier. Long enough not to spin,
+/// short enough to notice a dead carrier.
 const IDLE_BOUND_MS: u64 = 50;
 const IDLE_BOUND: Duration = Duration::from_millis(IDLE_BOUND_MS);
 
-/// How long a pass waits when the carrier is holding work back.
-///
-/// A backlog is a frame the carrier would not take, so what this end is
-/// waiting for is room to send rather than something to read, and a
-/// carrier does not report room as an event. Waiting the idle bound for
-/// it would pace a transfer at one drain every fifty milliseconds;
-/// waiting not at all would spin a core for the length of the transfer.
+/// How long to wait when the carrier has backpressure. Shorter than
+/// IDLE_WAIT to avoid pacing the transfer at one drain per tick.
 const BUSY_BOUND_MS: u64 = 1;
 const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 
-/// What a driving loop may wait through without the engine getting
-/// anywhere, in the milliseconds of its own two bounds.
-///
-/// Not a bound on how long a session may take: any progress at all sets it
-/// back, so it only ends a session where nothing is happening. Not a clock
-/// either. What a pass spends is the wait it chose, both of them constants
-/// here, so a machine slow enough to take a second inside `service` spends
-/// one millisecond of this and not a second.
-///
-/// Counting passes instead made the budget mean two different things. Half
-/// a minute of silence at the idle bound was the number chosen and
-/// documented; the same six hundred passes at the busy bound was 0.6
-/// seconds, so a peer that merely stopped reading for a moment ended the
-/// session. The two now cost what they wait.
-///
-/// Half a minute is already past where a live carrier gives up on its own:
-/// quiche's idle timeout is thirty seconds and reports a disconnect, which
-/// settles the loop. So this is the backstop for a carrier with no timeout
-/// of its own, and a longer one would only make a wedged session take
-/// longer to say so.
+/// Max cumulative wait without progress before declaring a stall.
+/// Any progress resets it. Measured in wait time, not pass count, so both
+/// bounds cost what they actually wait. Quiche's idle timeout settles most
+/// sessions first; this is the backstop.
 const STALLED_WAIT_MS: u64 = 30_000;
 
 /// One end of a session: a pass to make, a way to say the pass settled it,
@@ -72,12 +43,7 @@ pub trait Engine {
     /// Whether the carrier is holding work this end has already prepared.
     fn has_backlog(&self) -> bool;
 
-    /// Everything this end has settled, only ever going up.
-    ///
-    /// Any increase is progress, and progress is what tells a session that
-    /// is getting somewhere slowly from one that has stopped. A count that
-    /// stood still while a large object was being fetched would end the
-    /// transfer partway through.
+    /// Cumulative progress. Any increase resets the stall budget.
     fn progress(&self) -> u64;
 
     /// Waits for the carrier to report something, or for `bound`.
@@ -90,16 +56,10 @@ pub trait Engine {
 /// Surfaces the engine's own failure, or [`Error::Stalled`] if the loop
 /// made its whole budget of passes without the engine getting anywhere.
 pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
-    // The predicate that never holds, so the loop runs to its settled end.
     drive_until(engine, |_| false)?.ok_or(Error::Stalled)
 }
 
-/// Drives `engine` until a pass settles it or `done` holds, whichever is
-/// first: the settled status, or `None` for a loop `done` ended.
-///
-/// This is how a fetch grows rails (ADR-0031): the primary is driven here
-/// until its plan exists, the rails are spawned onto that plan, and the
-/// same loop then drives the primary to its end.
+/// Drives `engine` until a pass settles it or `done` holds.
 ///
 /// # Errors
 /// Surfaces the engine's own failure, or [`Error::Stalled`] as [`drive`].
@@ -117,10 +77,8 @@ pub fn drive_until<E: Engine>(
         if done(engine) {
             return Ok(None);
         }
-        // Every pass waits, including one with a backlog: a backlog is the
-        // carrier refusing what this end already prepared, so there is
-        // nothing to do but let it drain, and doing it in a tight loop is
-        // a spun core rather than a faster transfer.
+        // Always wait, even with a backlog: tight-looping a backpressured
+        // carrier just burns a core.
         let (wait, spent) = if engine.has_backlog() {
             (BUSY_BOUND, BUSY_BOUND_MS)
         } else {
@@ -128,9 +86,7 @@ pub fn drive_until<E: Engine>(
         };
         let progress = engine.progress();
         if progress == settled_so_far {
-            // Saturating rather than `+=`, so the loop's own end does not
-            // hang on an operator: an increment that stopped incrementing
-            // is a loop with nothing left to stop it.
+            // Saturating add so a stuck counter cannot overflow to the stall check.
             stalled_ms = stalled_ms.saturating_add(spent);
             if stalled_ms > STALLED_WAIT_MS {
                 return Err(Error::Stalled);
@@ -152,28 +108,19 @@ fn fetched<A: TransportAdapter>(
 ) -> Result<crate::PackageSummary, Error> {
     match status {
         crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
-        // The code says what the peer refused, and losing it here would
-        // leave the caller with nothing to tell the difference by.
+        // Preserve the original error code for the caller.
         crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
         crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-        // The loops above answer only with a settled status.
         crate::FetchStatus::Active => Err(Error::InvalidBundle),
     }
 }
 
-/// Fetches at `rails` width: the primary is driven until its plan exists,
-/// every further rail joins that plan on a fresh connection from
-/// `connect`, and the plan striping the requests is what makes W rails
-/// one fetch (ADR-0031).
-///
-/// A rail that fails marks the plan abandoned, so the others end at their
-/// next pass instead of waiting out their stall budgets on spans nobody
-/// will answer; the failure that started it is what surfaces.
+/// Fetches at `rails` width. The primary builds the plan; rails join it
+/// on fresh connections. A rail failure abandons the plan.
 ///
 /// # Errors
-/// Rejects a width of zero, and a width past one with inline proving,
-/// which could not pace itself. Surfaces the primary's failure, or the
-/// rail failure that explains a primary that only stalled or stopped.
+/// Rejects zero width or width past one with inline proving. Surfaces the
+/// primary's failure, or the rail failure that explains a stalled primary.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn fetch_striped<A, F>(
     mut primary: crate::BundleFetcher<A>,
@@ -187,7 +134,6 @@ where
     if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
         return Err(Error::InvalidArguments);
     }
-    // The manifest is one rail's work; the rest join once it is a plan.
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
         return fetched(&primary, status);
     }
@@ -232,8 +178,7 @@ where
         }
         match outcome {
             Ok(package) => Ok(package),
-            // A primary that stalled or lost its carrier because a rail
-            // died is reported as the rail's failure, which is the cause.
+            // Report the rail's failure as the cause of a stalled primary.
             Err(Error::Stalled | Error::CarrierUnavailable) => {
                 Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
             }
@@ -267,10 +212,7 @@ impl<A: TransportAdapter> Engine for crate::BundleFetcher<A> {
     }
 }
 
-/// The serve side against one carrier.
-///
-/// The server answers any number of sessions and holds no per-session
-/// state, so a session's own state is gathered here rather than in it.
+/// Per-session state for the serve side. The server holds none.
 pub struct ServeSession<'server, A: TransportAdapter> {
     server: &'server crate::BundleServer,
     session: vot_session::Session<A>,
@@ -302,37 +244,19 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     }
 }
 
-/// Sessions a serve drives at once before the next accepted client waits.
-///
-/// ADR-0031: a rail is a whole session, so one fetch at width W is W of
-/// these, and a serve that drove them one at a time would serialize the
-/// rails it exists to parallelise. The bound is on the server's own
-/// threads; an accepted client past it is not refused, it waits for a
-/// running session to settle, which is backpressure rather than failure.
+/// Concurrent sessions a serve drives. Excess clients wait for a slot
+/// (backpressure, not refusal).
 #[cfg(any(test, feature = "wire"))]
 pub(crate) const CONCURRENT_SESSIONS: usize = 8;
 
 /// Serves sessions from `next` until it fails, or `sessions` are answered.
 ///
-/// Sessions run concurrently, each on its own thread, at most
-/// [`CONCURRENT_SESSIONS`] at once (ADR-0031: a fetch's rails are whole
-/// sessions, and they only help if the serve drives them together).
-///
-/// A client that connects and goes away leaves its session stalling or
-/// failing, and a server told to answer everyone should outlive any one of
-/// them: with no session bound, a session's failure ends the session and
-/// never the loop. A bounded serve surfaces it instead, because its caller
-/// asked for exactly those sessions and deserves to hear one was not
-/// served. What ends an unbounded serve is only `next` itself failing,
-/// which is the endpoint rather than a peer; the sessions already running
-/// are still driven to their end before it is surfaced.
+/// Sessions run concurrently at [`CONCURRENT_SESSIONS`] at once. Unbounded
+/// serves outlive any single session failure; bounded serves surface it.
 ///
 /// # Errors
 /// Surfaces `next`'s failure always, and a session's failure only when
 /// `sessions` is bounded.
-///
-/// Compiled exactly where it is called: the wire commands and the tests
-/// that hold its policy under the mutation gate the wire is not.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn serve_sessions<'server, A, F>(sessions: Option<u32>, mut next: F) -> Result<(), Error>
 where
@@ -342,26 +266,15 @@ where
     std::thread::scope(|scope| {
         let mut running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, _>)> =
             std::collections::VecDeque::new();
-        // Each session announces its own end here, so a wait for a free
-        // slot is a wait for whichever session finishes first. Waiting on
-        // the oldest instead held every accept behind a session whose
-        // client vanished without a close, which settles only at the
-        // carrier's idle timeout: on the rig that stalled a fetch for 29
-        // of its 30-second budget while five settled sessions sat ready
-        // to be reaped.
+        // Wait for any session to finish, not the oldest: a vanished client
+        // only settles at the carrier idle timeout.
         let (ended, endings) = std::sync::mpsc::channel::<u64>();
         let mut spawned: u64 = 0;
-        // The first session's failure, under a bounded serve. Later ones
-        // still run to their end: they were accepted, and the joins below
-        // are what keeps the report ordered rather than racy.
+        // First failure under a bounded serve. Later sessions still finish
+        // before the error surfaces.
         let mut failed = Ok(());
-        // Takes one finished session's outcome, waiting for a session to
-        // finish if none has: every session announces as it ends, however
-        // it ends, so a wait with any session running answers. The wait
-        // wakes at [`REAP_TICK`] only to hold the announcement contract:
-        // a finished session with nothing in the channel is one whose
-        // announcement was lost, and a serve that waited on it would hang
-        // forever, so it panics with the diagnosis instead.
+        // Waits for the next session to finish. Wakes periodically to detect
+        // a lost announcement, which would otherwise hang forever.
         let reap = |running: &mut std::collections::VecDeque<(
             u64,
             std::thread::ScopedJoinHandle<'_, _>,
@@ -400,22 +313,13 @@ where
             let settled = handle.join().expect("a session thread never panics");
             settle_session(sessions, settled, failed);
         };
-        // The bound is an iterator's, so no counter exists for a mutation
-        // to stop counting: a bounded serve accepts exactly as many times
-        // as the range yields, and an unbounded one is the range that
-        // never ends.
         let mut turns = turns(sessions);
         while turns.next().is_some() {
-            // The accept waits here, on this thread, so a factory error is
-            // ordered after every session it already handed out.
+            // Accept blocks here, so factory errors are ordered after prior sessions.
             let mut accepted = next();
-            // A fixed port frees only when a session holding it ends: the
-            // carrier's drop joins its driver, so after the reap below the
-            // next bind finds the port released. An accept refused while
-            // sessions still run therefore reaps one and asks again, and
-            // each retry shrinks `running`, which bounds this loop by its
-            // own body. A factory failing with nothing left running is
-            // the endpoint itself, and surfaces below.
+            // A refused bind while sessions run means the port is still held.
+            // Reap a finished session and retry. Each attempt shrinks
+            // `running`, so the loop is bounded.
             while accepted.is_err() && !running.is_empty() {
                 reap(&mut running, &mut failed);
                 accepted = next();
@@ -439,10 +343,8 @@ where
             running.push_back((
                 id,
                 scope.spawn(move || {
-                    // Held for the whole drive and announced by its drop,
-                    // so the end is announced however the thread ends: a
-                    // panic that skipped the announcement would leave the
-                    // reap waiting on a session that already died.
+                    // Announced via Drop so the reap never waits on a dead thread,
+                    // even on panic.
                     let _announce = announce;
                     drive(&mut session).map(|_| ())
                 }),
@@ -453,10 +355,7 @@ where
     })
 }
 
-/// How often a reap looks up from its wait to check the announcement
-/// contract. It prices the detection of a lost announcement, never the
-/// reap itself: an announcement that was sent ends the wait the moment
-/// it lands.
+/// How often the reap wakes to check for lost announcements.
 #[cfg(any(test, feature = "wire"))]
 const REAP_TICK: Duration = Duration::from_millis(250);
 
@@ -468,17 +367,12 @@ enum ReapWake {
     Take(u64),
     /// Nothing has finished; keep waiting.
     Wait,
-    /// A session finished and no announcement exists for it, which is the
-    /// contract broken: a thread announces before it can finish, so a
-    /// finished one either left its announcement in the channel or never
-    /// sent it, and waiting on it would wait forever.
+    /// Session finished but no announcement arrived. Waiting would hang.
     Breach,
 }
 
-/// Decides one wake of the reap's wait, apart from the channel and the
-/// threads so the whole table is a test's to hold: any announcement is
-/// taken, silence with nothing finished is patience, and silence with a
-/// finished session is the breach the wake exists to catch.
+/// Decides one reap wake: take any announcement, wait on silence,
+/// panic on a finished session without one.
 #[cfg(any(test, feature = "wire"))]
 fn reap_wake(finished: usize, announced: Option<u64>) -> ReapWake {
     match (finished, announced) {
@@ -488,9 +382,8 @@ fn reap_wake(finished: usize, announced: Option<u64>) -> ReapWake {
     }
 }
 
-/// One session's end, announced by drop: however the session's thread
-/// ends, the announcement goes, so the reap never waits on a session
-/// that already died.
+/// Session-end announcement sent via Drop, so the reap never blocks
+/// on a dead thread.
 #[cfg(any(test, feature = "wire"))]
 struct Announcement {
     id: u64,
@@ -513,10 +406,7 @@ fn turns(sessions: Option<u32>) -> Box<dyn Iterator<Item = ()>> {
     }
 }
 
-/// Joins every running session and folds each outcome into the policy.
-///
-/// Order stops mattering here: everything left must end before the serve
-/// answers, so each join waits for its own session and no other's.
+/// Joins all running sessions and folds outcomes into the policy.
 #[cfg(any(test, feature = "wire"))]
 fn drain<T>(
     running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, Result<T, Error>>)>,
@@ -580,19 +470,12 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 mod tests {
     use super::*;
 
-    /// Passes the budget allows at each bound. That these differ by fifty
-    /// while the time they stand for does not is the whole of the change:
-    /// a pass costs what it waits.
+    /// Passes the budget allows at each bound.
     const IDLE_PASSES: u64 = STALLED_WAIT_MS / IDLE_BOUND_MS;
     const BUSY_PASSES: u64 = STALLED_WAIT_MS / BUSY_BOUND_MS;
 
     #[test]
     fn an_unbounded_serve_outlives_a_failed_session() {
-        // A client that connects and goes away leaves its session stalling,
-        // and one dead peer must not take the server from everyone else.
-        // Three sessions: one that stalls, one that settles, and then the
-        // endpoint itself failing, which is the only thing that may end an
-        // unbounded serve.
         use crate::harness::{Loopback, built_bundle, not_required, patterned};
         use vot_transport_api::{ConnectionId, Event};
 
@@ -602,8 +485,6 @@ mod tests {
         let outcome = serve_sessions(None, || {
             sessions += 1;
             match sessions {
-                // An empty carrier: the session makes no progress and the
-                // loop gives up on it, which is the failure to outlive.
                 1 => ServeSession::begin(&server, Loopback::default(), not_required()),
                 2 => {
                     let mut carrier = Loopback::default();
@@ -619,36 +500,19 @@ mod tests {
             matches!(outcome, Err(Error::CarrierUnavailable)),
             "the endpoint's own failure ends the serve, a session's never"
         );
-        // Five accepts, not three: each refused accept joined one of the
-        // two running sessions and asked again, and only with nothing left
-        // running did the failure surface as the endpoint's own.
         assert_eq!(sessions, 5, "the stalled session was survived");
 
-        // Told to answer exactly these sessions, the same failure surfaces:
-        // the caller asked for them and deserves to hear one was not served.
         let mut bounded = 0_u32;
         let outcome = serve_sessions(Some(2), || {
             bounded += 1;
             if bounded > 2 {
-                // Accepting past the bound is a count that stopped
-                // counting; erroring here ends the mutant's run rather
-                // than a runner's timeout.
                 return Err(Error::CarrierUnavailable);
             }
             ServeSession::begin(&server, Loopback::default(), not_required())
         });
         assert!(matches!(outcome, Err(Error::Stalled)));
-        // Both were accepted before the first failure could surface: a
-        // concurrent serve detects a session's end at its join, not at
-        // the next accept, and what was accepted is still driven.
         assert_eq!(bounded, 2, "the bound was accepted, the failure surfaced");
 
-        // And a bounded serve that succeeds answers exactly its bound: the
-        // factory errors on any call past it, so a count that under- or
-        // overshoots surfaces here rather than serving a session too many.
-        // A clean session needs the client's real first flight, because a
-        // carrier that dies mid-handshake settles as the failure above; a
-        // throwaway client session provides the frames.
         let mut counted = 0_u32;
         let outcome = serve_sessions(Some(1), || {
             counted += 1;
@@ -681,11 +545,6 @@ mod tests {
 
     #[test]
     fn a_refused_accept_waits_for_a_running_session_and_asks_again() {
-        // The fixed-port shape: binding the next session's socket fails
-        // while the previous session still holds the port, and frees the
-        // moment that session ends. A serve that surfaced the first refusal
-        // would die after every first session; one that joins a running
-        // session and asks again serves them one after another.
         use crate::harness::{Loopback, built_bundle, not_required, patterned};
         use vot_transport_api::{ConnectionId, Event};
 
@@ -715,8 +574,6 @@ mod tests {
             accepts += 1;
             match accepts {
                 1 | 3 => ServeSession::begin(&server, clean(), not_required()),
-                // Accept two is the port still held by session one; any
-                // accept past three would be a count that kept counting.
                 _ => Err(Error::CarrierUnavailable),
             }
         });
@@ -730,15 +587,12 @@ mod tests {
     fn the_width_guard_refuses_what_cannot_pace() {
         use crate::harness::Loopback;
 
-        // Zero rails is no fetch at all.
         let output = crate::tests::temporary("widthguard-zero");
         let fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let outcome = fetch_striped(fetcher, 0, || Err::<Loopback, _>(Error::CarrierUnavailable));
         assert!(matches!(outcome, Err(Error::InvalidArguments)));
         crate::harness::discard(&[&output]);
 
-        // Rails past one pace on settled witnesses, which inline proving
-        // never books: the width and the mode are refused together.
         let output = crate::tests::temporary("widthguard-inline");
         let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         fetcher.set_proving_threads(0).unwrap();
@@ -749,9 +603,6 @@ mod tests {
 
     #[test]
     fn one_rail_proving_inline_is_still_a_fetch() {
-        // Width one restores today's shape exactly, inline proving
-        // included; a guard that caught it would take a working
-        // configuration away.
         use crate::harness::{built_bundle, duplex_pair, not_required, patterned};
 
         let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
@@ -781,10 +632,6 @@ mod tests {
 
     #[test]
     fn a_wake_takes_waits_or_refuses_by_the_whole_table() {
-        // The reap's wake decision, exhaustively: an announcement in hand
-        // is taken whatever the count says (the count may lag the send by
-        // the width of the race), silence with nothing finished waits,
-        // and silence with anything finished is the breach.
         assert_eq!(reap_wake(0, Some(4)), ReapWake::Take(4));
         assert_eq!(reap_wake(3, Some(9)), ReapWake::Take(9));
         assert_eq!(reap_wake(0, None), ReapWake::Wait);
@@ -794,9 +641,6 @@ mod tests {
 
     #[test]
     fn an_announcement_goes_however_its_thread_ends() {
-        // The reap waits on announcements, so one that never went would
-        // block the serve forever: the drop is what sends it, cleanly or
-        // through an unwind alike.
         let (ended, endings) = std::sync::mpsc::channel();
         drop(Announcement { id: 7, ended });
         assert_eq!(endings.recv().expect("the drop announced"), 7);
@@ -816,13 +660,6 @@ mod tests {
 
     #[test]
     fn a_slow_session_does_not_hold_the_accepts_behind_it() {
-        // A session whose client vanished without a close settles only at
-        // its carrier's idle timeout. The bound's wait must take whichever
-        // session finishes first, not the oldest: blocked on the oldest,
-        // every later accept waited out that timeout, which stalled a
-        // fetch for 29 of its 30-second budget on the rig. The gate
-        // proves the loop kept accepting: the first session waits at it,
-        // and only the last session accepted can fill it.
         use crate::harness::{Loopback, Rendezvous, built_bundle, not_required, patterned};
         use vot_transport_api::{ConnectionId, Event};
 
@@ -834,9 +671,6 @@ mod tests {
         let outcome = serve_sessions(Some(total), || {
             handed += 1;
             if handed > total {
-                // Accepting past the bound is a count that stopped
-                // counting; erroring here ends a mutant's run rather
-                // than a runner's timeout.
                 return Err(Error::CarrierUnavailable);
             }
             let mut carrier = Loopback::default();
@@ -852,20 +686,12 @@ mod tests {
             handed, total,
             "an accept behind the slow session never happened"
         );
-        // Every session settled through the drain; what each settled as is
-        // the failure policy's business, already held above.
         assert!(outcome.is_ok() || outcome.is_err());
         crate::harness::discard(&[&bundle]);
     }
 
     #[test]
     fn sessions_are_served_at_the_same_time() {
-        // Two carriers meet at a rendezvous inside their waits: a serve
-        // that drives sessions one after another leaves the first waiting
-        // at the gate forever and fails its bound; one that drives them
-        // together fills the gate and both proceed. ADR-0031: a fetch's
-        // rails are whole sessions, and they only help if the serve
-        // drives them at once.
         use crate::harness::{Loopback, Rendezvous, built_bundle, not_required, patterned};
         use vot_transport_api::{ConnectionId, Event};
 
@@ -876,9 +702,6 @@ mod tests {
         let outcome = serve_sessions(Some(2), || {
             handed += 1;
             if handed > 2 {
-                // A serve that keeps accepting past its bound is one whose
-                // count stopped counting, and the error ends it here
-                // rather than at a runner's timeout.
                 return Err(Error::CarrierUnavailable);
             }
             let mut carrier = Loopback {
@@ -891,8 +714,6 @@ mod tests {
             ServeSession::begin(&server, carrier, not_required())
         });
         assert_eq!(handed, 2, "both sessions were accepted");
-        // Both settled through the gate; what they settled as is the
-        // failure policy's business, already held above.
         assert!(outcome.is_err() || outcome.is_ok());
         crate::harness::discard(&[&bundle]);
     }
@@ -909,9 +730,6 @@ mod tests {
         backlogged: bool,
         settled: u64,
         passes: u64,
-        /// Counted rather than collected: a mutant that stops the loop
-        /// ending makes this grow for as long as the process lives, and a
-        /// vector of them is a test that takes the machine with it.
         busy_waits: u64,
         idle_waits: u64,
     }
@@ -964,7 +782,6 @@ mod tests {
         let (bundle, _) = built_bundle("engine", &[("a.txt", patterned(1000))]);
         let output = crate::tests::temporary("engine-fetched");
         let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        // Nothing prepared and nothing taken, before a pass.
         assert!(!Engine::has_backlog(&fetcher));
         assert_eq!(Engine::progress(&fetcher), 0);
 
@@ -974,9 +791,6 @@ mod tests {
         assert!(!Engine::has_backlog(&serving));
         assert_eq!(Engine::progress(&serving), 0);
 
-        // One round between them: each end reports what it settled as its
-        // own progress, which is what tells the loop a slow session from a
-        // stopped one.
         let mut sequence = 0;
         Engine::service(&mut fetcher).unwrap();
         pump(
@@ -984,9 +798,6 @@ mod tests {
             serving.session.driver(),
             &mut sequence,
         );
-        // Its carrier takes nothing on the pass it announces, so what it
-        // prepared stays held: that is the backlog it reports, and queuing
-        // it is the progress it reports.
         serving.session.driver().refuse_sends = usize::MAX;
         Engine::service(&mut serving).unwrap();
         assert!(
@@ -1004,9 +815,6 @@ mod tests {
             fetcher.session_mut().driver(),
             &mut sequence,
         );
-        // The pass that takes the announcement asks for the manifest, and
-        // a carrier that takes nothing leaves that request held, which is
-        // the backlog this end reports.
         fetcher.session_mut().driver().refuse_sends = usize::MAX;
         Engine::service(&mut fetcher).unwrap();
         assert!(
@@ -1023,10 +831,6 @@ mod tests {
 
     #[test]
     fn each_engine_is_driven_until_its_carrier_settles_it() {
-        // The loop is what turns a pass into a transfer, and the two
-        // answers it needs from an engine are whether a status ends it and
-        // how to wait for the next one. Neither is exercised by a pass a
-        // test makes itself.
         use crate::harness::{Loopback, built_bundle, not_required, patterned, pump};
         use vot_transport_api::{ConnectionId, Event};
 
@@ -1037,8 +841,6 @@ mod tests {
         let mut serving =
             ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
 
-        // Past the handshake first: a carrier that goes before it is done
-        // is a session that failed, not one the loop settled.
         let mut sequence = 0;
         let mut ready = false;
         for _ in 0..16 {
@@ -1061,8 +863,6 @@ mod tests {
         }
         assert!(ready, "the two never finished their handshake");
 
-        // Neither next pass is the last, so each loop has to wait, and what
-        // it waits for is the carrier reporting it has gone.
         fetcher
             .session_mut()
             .driver()
@@ -1096,9 +896,6 @@ mod tests {
 
     #[test]
     fn every_unsettled_pass_waits_rather_than_spinning() {
-        // Including one with a backlog: the carrier is holding what this
-        // end prepared, and asking again without pause is a spun core for
-        // the length of the transfer rather than a faster one.
         let mut engine = Scripted {
             unsettled: 4,
             with_progress: 4,
@@ -1126,10 +923,6 @@ mod tests {
 
     #[test]
     fn progress_sets_the_budget_back() {
-        // The budget ends a session where nothing is happening, not a long
-        // one. A fetch of a large object makes one pass per answer with no
-        // backlog to show for it, and a budget that counted those would
-        // end the transfer partway through.
         let mut engine = Scripted {
             unsettled: 4 * IDLE_PASSES,
             with_progress: 4 * IDLE_PASSES,
@@ -1141,11 +934,6 @@ mod tests {
 
     #[test]
     fn a_session_where_nothing_happens_is_given_up_on() {
-        // A peer that holds a session open and does nothing with it would
-        // otherwise hold this end forever.
-        // Enough passes to outlast the budget and no more: a stub that
-        // never settles at all leaves a mutant that stops the budget
-        // counting to run for as long as the numbers allow.
         let mut engine = Scripted {
             unsettled: 4 * IDLE_PASSES,
             with_progress: 0,
@@ -1157,10 +945,6 @@ mod tests {
 
     #[test]
     fn a_backlogged_stall_gets_the_same_half_minute_as_an_idle_one() {
-        // Counting passes rather than what they wait made this budget 0.6
-        // seconds where the idle one was thirty, so a peer that stopped
-        // reading for as long as a large sync takes ended the session. The
-        // two bounds now buy the same time.
         let mut engine = Scripted {
             unsettled: 2 * BUSY_PASSES,
             with_progress: 0,
@@ -1179,14 +963,12 @@ mod tests {
 
     #[test]
     fn progress_late_in_a_stall_sets_the_budget_back() {
-        // The counter is consecutive passes, not passes overall.
         let mut engine = Scripted {
             unsettled: IDLE_PASSES + 10,
             with_progress: 1,
             ..Scripted::default()
         };
         assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
-        // One pass made progress, so the budget started again after it.
         assert_eq!(engine.passes, IDLE_PASSES + 2);
     }
 }

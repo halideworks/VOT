@@ -122,39 +122,20 @@ pub struct PathStats {
     pub mtu_bytes: Option<u64>,
     /// Current pacing rate in bits per second, when available.
     pub pacing_rate_bps: Option<u64>,
-    /// Packets the sender declared lost over the connection's life, when the
-    /// engine counts them. The congestion story a throughput number needs:
-    /// a low rate with losses is a path problem, without them a source one.
+    /// Packets declared lost over the connection's lifetime, when counted.
     pub lost_packets: Option<u64>,
-    /// Of the declared losses, how many a later acknowledgement disproved,
-    /// when the engine counts them. Splits `lost_packets` into detection
-    /// error and real drops: spurious losses name the loss detector, the
-    /// remainder names the path.
+    /// Of the declared losses, how many a later ACK disproved. Spurious losses
+    /// indicate a detector issue; the rest are real drops.
     pub spurious_lost_packets: Option<u64>,
-    /// Packets this endpoint transmitted, when the engine counts them.
-    /// Both engines count every retransmission as its own packet, so
-    /// against the peer's received count this approximates the wire's own
-    /// ledger. What "received" means differs: quiche counts a packet after
-    /// decryption and duplicate rejection, `MsQuic` counts arrivals before
-    /// either, so a cross-engine comparison of the residual is not exact,
-    /// and both ends sample on their own clocks a tick apart.
+    /// Packets this endpoint transmitted, when counted. Each retransmission
+    /// counts as its own packet. Cross-engine comparison is approximate.
     pub packets_sent: Option<u64>,
-    /// Packets this endpoint received, when the engine counts them, with
-    /// the same per-engine meaning as [`PathStats::packets_sent`].
+    /// Packets this endpoint received, when counted.
     pub packets_received: Option<u64>,
 }
 
-/// A latched doorbell for [`TransportAdapter::wait_for_event`].
-///
-/// A backend thread that queues an event calls [`EventSignal::raise`]; a
-/// caller with nothing to poll sleeps in [`EventSignal::wait`]. The latch
-/// holds a raise until a wait consumes it, so an event queued between a
-/// caller's last poll and its wait wakes that wait immediately instead of
-/// being slept past. The cost of the latch is an occasional spurious return,
-/// which the `wait_for_event` contract already allows.
-///
-/// Lives here because every backend with a feeding thread needs exactly this
-/// and none should build its own subtly different one.
+/// Latched event signal for [`TransportAdapter::wait_for_event`]. A raise
+/// wakes a subsequent wait so events queued between poll and wait are not missed.
 #[derive(Debug, Default)]
 pub struct EventSignal {
     raised: Mutex<bool>,
@@ -214,9 +195,6 @@ pub trait TransportAdapter {
 
     /// Checks a reliable batch without changing adapter state.
     ///
-    /// Implementations with bounded queues must include their available queue
-    /// capacity in this check so `send_reliable_batch` cannot partially enqueue.
-    ///
     /// # Errors
     /// Rejects protocol-limit or queue-capacity failures before submission.
     fn preflight_reliable_batch(
@@ -231,9 +209,7 @@ pub trait TransportAdapter {
     }
 
     /// Submits a batch before the caller requests a backend flush.
-    ///
-    /// The preflight is required to be side-effect free; a failure therefore
-    /// leaves the adapter unchanged and never accepts only a prefix of `records`.
+    /// Side-effect free: a failure leaves the adapter unchanged.
     ///
     /// # Errors
     /// Propagates the first backend or protocol limit failure.
@@ -264,20 +240,8 @@ pub trait TransportAdapter {
     /// Returns the next backend event without blocking.
     fn poll(&mut self) -> Option<Event>;
 
-    /// Blocks until an event may be available for [`TransportAdapter::poll`],
-    /// or for at most `bound`.
-    ///
-    /// Spurious returns are allowed: a caller treats every return as "poll
-    /// again", never as a promise that an event is there. That contract is
-    /// what lets a backend signal arrivals with a latch instead of proving
-    /// emptiness under a lock, and it is why the default, sleeping the bound
-    /// out, is honest for a backend with no wakeup signal: no event is ever
-    /// missed, only time.
-    ///
-    /// Always bounded, never indefinite, so the caller's loop keeps its own
-    /// budget. Exists because a caller that can only poll has to guess a
-    /// polling interval, and the guess changes what a benchmark measures:
-    /// polling a carrier that has nothing contends with the thread filling it.
+    /// Blocks until an event may be available, or for at most `bound`.
+    /// Spurious returns are allowed. Always bounded, never indefinite.
     #[allow(
         clippy::disallowed_methods,
         reason = "the default is a sleep by contract; the simulator's ban on \
@@ -336,13 +300,8 @@ pub trait TransportAdapter {
     }
 }
 
-/// What an endpoint advertises in `SETTINGS` and will be held to.
-///
-/// Built against the inbound queue that has to hold a frame, so an endpoint
-/// cannot advertise a limit its own backend would refuse. A frame inside the
-/// advertised bound but larger than the queue can hold is never deliverable:
-/// retrying cannot make it fit, and a driver treating a full queue as
-/// backpressure waits for ever.
+/// Limits an endpoint advertises and enforces. Built against the inbound
+/// queue capacity so advertised limits are always deliverable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiveLimits {
     control_payload: usize,
@@ -352,9 +311,6 @@ pub struct ReceiveLimits {
 impl ReceiveLimits {
     /// Derives the limits from what a session will advertise.
     ///
-    /// `inbound_byte_capacity` is the most the backend's inbound queue holds
-    /// for one event.
-    ///
     /// # Errors
     /// Rejects a control-frame limit outside the protocol range or larger than
     /// the queue can hold with its envelope, and a lane limit that does not
@@ -363,8 +319,6 @@ impl ReceiveLimits {
         settings: &vot_codec::Settings,
         inbound_byte_capacity: usize,
     ) -> Result<Self, Error> {
-        // Against the registry rather than by hand, so a range copied here
-        // could not drift from the one the codec encodes and decodes under.
         for (setting, value) in settings.advertised() {
             if !vot_codec::setting_in_range(setting, value) {
                 return Err(Error::InvalidConfiguration);
@@ -373,9 +327,6 @@ impl ReceiveLimits {
         let control_payload = usize::try_from(settings.max_control_frame_payload)
             .map_err(|_| Error::InvalidConfiguration)?;
         validate_control_payload_limit(control_payload)?;
-        // Every frame the queue has to hold, not only the control one. A
-        // conforming record past the capacity is refused with an empty queue,
-        // and the driver holds it back as backpressure that never clears.
         let record_payload = usize::try_from(settings.max_data_record_payload)
             .map_err(|_| Error::InvalidConfiguration)?;
         for payload in [control_payload, record_payload] {
@@ -406,11 +357,7 @@ impl ReceiveLimits {
         self.lanes
     }
 
-    /// Whether these are the limits `settings` advertises.
-    ///
-    /// Advertising one thing while the carrier enforces another either refuses
-    /// conforming frames or accepts more than was promised, and neither shows
-    /// up without comparing every limit.
+    /// Whether these limits match what `settings` advertises.
     #[must_use]
     pub fn match_settings(self, settings: &vot_codec::Settings) -> bool {
         u64::try_from(self.control_payload) == Ok(settings.max_control_frame_payload)
@@ -485,9 +432,6 @@ impl StagingCapacity {
 
 /// Validates the wire length of a reliable `DATA_RECORD` submission.
 ///
-/// The protocol limit applies to the encoded frame payload. The bounded
-/// envelope is allowed in addition to that payload limit.
-///
 /// # Errors
 /// Returns [`Error::RecordTooLarge`] when the encoded record exceeds the
 /// payload limit plus the bounded envelope.
@@ -500,17 +444,10 @@ pub fn validate_data_record(record: &[u8]) -> Result<(), Error> {
 }
 
 /// The most a backend may send under a peer's advertised limit.
-///
-/// The smaller of what the peer allows and what this endpoint can enqueue.
-/// Sending less than the peer permits is always allowed; a bound above the
-/// outbound queue is not, because a frame that large is refused at submission
-/// for ever and a caller reads that as backpressure that never clears.
+/// Capped at the smaller of the peer limit and the outbound queue.
 #[must_use]
 pub fn effective_send_limit(peer_limit: usize, outbound_byte_capacity: usize) -> usize {
-    // Never below the protocol minimum. A queue too small for one conforming
-    // frame reports backpressure; a limit under the minimum would instead make
-    // validate_control_frame reject every frame, including an empty PING, as a
-    // configuration error.
+    // Clamped to protocol minimum.
     peer_limit
         .min(outbound_byte_capacity.saturating_sub(MAX_FRAME_ENVELOPE_BYTES))
         .max(MIN_CONTROL_FRAME_PAYLOAD)
@@ -666,9 +603,6 @@ mod tests {
         assert!(!limits.match_settings(&settings(largest as u64, 15)));
         assert!(!limits.match_settings(&settings(largest as u64 - 1, 16)));
 
-        // A record has to fit too. The minimum control frame is 1 KiB and the
-        // minimum record is 64 KiB, so a queue sized for the first alone
-        // refuses a conforming record with the queue empty.
         assert_eq!(
             ReceiveLimits::advertised(
                 &vot_codec::Settings {
@@ -692,8 +626,6 @@ mod tests {
             .is_ok()
         );
 
-        // One past what the queue holds is never deliverable, so it cannot be
-        // advertised.
         assert_eq!(
             ReceiveLimits::advertised(&settings(largest as u64 + 1, 16), capacity),
             Err(Error::InvalidConfiguration)
@@ -705,9 +637,6 @@ mod tests {
             ),
             Err(Error::InvalidConfiguration)
         );
-        // Every registered range applies, from the codec's table rather than one
-        // copied here. Zero lanes leaves a peer unable to send anything, and
-        // one past the registry maximum is not a count the peer could encode.
         for lanes in [0, 257] {
             assert_eq!(
                 ReceiveLimits::advertised(&settings(largest as u64, lanes), capacity),
@@ -727,9 +656,6 @@ mod tests {
 
     #[test]
     fn a_send_bound_never_exceeds_what_the_backend_can_queue() {
-        // A peer allowing more than this endpoint can enqueue does not oblige
-        // it to send that much. A bound above the queue would refuse the frame
-        // at submission for ever, which a caller reads as backpressure.
         let capacity = 4 * 1024 * 1024;
         assert_eq!(
             effective_send_limit(64 * 1024, capacity),
@@ -745,8 +671,6 @@ mod tests {
             effective_send_limit(capacity - MAX_FRAME_ENVELOPE_BYTES, capacity),
             capacity - MAX_FRAME_ENVELOPE_BYTES
         );
-        // Never below the protocol minimum, so the clamp always yields a
-        // limit the protocol allows.
         assert_eq!(effective_send_limit(1024, 0), MIN_CONTROL_FRAME_PAYLOAD);
         assert_eq!(
             effective_send_limit(
@@ -829,9 +753,6 @@ mod tests {
         assert_eq!(adapter.flush(), Ok(()));
         assert_eq!(adapter.path_stats(), None);
 
-        // Defaulting these to success would let a caller believe a limit was
-        // applied, or a peer told why the session ended, when neither
-        // happened.
         assert_eq!(
             adapter.close(vot_codec::error_code::MALFORMED_FRAME),
             Err(Error::Unsupported)
@@ -868,21 +789,13 @@ mod tests {
         assert_eq!(staging.advertised_credit(), 724);
     }
 
-    /// Long enough that an early return is unmistakable on a loaded machine,
-    /// and short enough that the slow paths cost tests only tens of
-    /// milliseconds each.
     const WAIT_BOUND: Duration = Duration::from_millis(40);
 
-    /// The most a "returns promptly" path may take. Half the long bound used
-    /// in those tests, so a wait that slept the bound out cannot pass.
     const PROMPT: Duration = Duration::from_secs(2);
     const LONG_BOUND: Duration = Duration::from_secs(5);
 
     #[test]
     fn the_default_wait_sleeps_the_bound_out() {
-        // The contract's floor: a backend with no signal must not spin. A
-        // caller's loop budget is only a bound on wall clock because every
-        // wait costs real time.
         let mut adapter = ContractAdapter::default();
         let started = std::time::Instant::now();
         adapter.wait_for_event(WAIT_BOUND);
@@ -891,9 +804,6 @@ mod tests {
 
     #[test]
     fn a_raise_before_the_wait_is_not_slept_past() {
-        // The latch is the point: an event queued between a caller's last
-        // poll and its wait must wake that wait, or the caller sleeps a full
-        // bound with work available.
         let signal = EventSignal::default();
         signal.raise();
         let started = std::time::Instant::now();
@@ -908,9 +818,6 @@ mod tests {
         signal.wait(WAIT_BOUND);
         assert!(started.elapsed() >= WAIT_BOUND);
 
-        // One raise satisfies one wait. If the latch survived consumption,
-        // every later wait would return immediately and the caller would be
-        // back to spinning.
         signal.raise();
         signal.wait(WAIT_BOUND);
         let started = std::time::Instant::now();
@@ -920,9 +827,6 @@ mod tests {
 
     #[test]
     fn a_raise_wakes_a_parked_waiter() {
-        // The notify half of the latch. Without it a raise during the wait
-        // is only seen when the bound expires, which is the polling the
-        // signal exists to end.
         let signal = Arc::new(EventSignal::default());
         let raiser = Arc::clone(&signal);
         let waker = std::thread::spawn(move || {

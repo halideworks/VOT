@@ -1,29 +1,13 @@
-//! The deterministic CBOR every VOT structure encodes in.
+//! Deterministic CBOR encoding for VOT structures.
 //!
 //! RFC 8949 section 4.2.1 core deterministic encoding, restricted to the item
-//! types VOT uses: unsigned and negative integers, byte and text strings,
-//! definite-length arrays and maps, and `null`. Indefinite lengths, tags,
-//! floats, and every other simple value are absent by construction on the way
-//! out and refused on the way in.
-//!
-//! This exists because three crates had grown their own copy of it.
-//! `vot-manifest`, `vot-codec`, and `vot-receipt` each wrote the same head
-//! rules with the same shortest-form thresholds, and a fourth was about to
-//! arrive with the capability format. One implementation is one place to hold
-//! the encoding to the vectors, and one place a mutation run has to cover.
-//!
-//! Field-level rules stay with the format that owns them. This crate decides
-//! what a well-formed deterministic item is; how long a particular byte string
-//! may be, and which keys a map must carry, belong to the schema.
+//! types VOT uses: integers, byte/text strings, definite-length arrays and
+//! maps, and `null`. Field-level rules (lengths, keys) stay with the schema.
 
 #![forbid(unsafe_code)]
 
-/// Why a CBOR item could not be read.
-///
-/// Distinguished rather than collapsed, because each caller maps them onto its
-/// own error type and the distinctions are the ones those types already made: a
-/// truncated item is not a non-canonical one, and neither is a well-formed item
-/// of the wrong type.
+/// Why a CBOR item could not be read. Each variant maps to a distinct
+/// caller error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     /// The item claims more bytes than the input holds.
@@ -60,18 +44,7 @@ const NULL: u8 = 0xf6;
 
 /// Appends the shortest head for `major` and `value`.
 ///
-/// The only head writer, so an item cannot be encoded one width too wide by a
-/// caller that reached for the bytes itself.
-///
-/// The tag is `major * 32` rather than `major << 5`. They are the same byte, and
-/// the shift has a mutant that is not: with the low five bits clear, `|` and `^`
-/// agree on every input, so a test cannot tell one from the other and the
-/// arithmetic form is the one a mutation run can hold.
-///
-/// `major` is a CBOR major type, so at most [`major::SIMPLE`]. A larger value is
-/// a caller error: a debug assertion catches it, and a release build wraps rather
-/// than corrupting the tag of some other type. Every caller in this crate passes
-/// a constant from [`major`].
+/// The tag uses `major * 32` (not `<< 5`) so mutation runs can verify it.
 pub fn head(out: &mut Vec<u8>, major: u8, value: u64) {
     debug_assert!(major <= major::SIMPLE, "major type outside CBOR's range");
     let tag = major.wrapping_mul(32);
@@ -104,9 +77,8 @@ pub fn uint(out: &mut Vec<u8>, value: u64) {
 /// Appends a signed integer, as the unsigned or negative type its sign selects.
 pub fn int(out: &mut Vec<u8>, value: i64) {
     if value < 0 {
-        // A negative head encodes -1 - n, so the magnitude is one less than the
-        // absolute value. Computed on the unsigned side, because negating
-        // i64::MIN overflows.
+        // CBOR negative encoding is -1 - n. Computed on unsigned side to
+        // avoid i64::MIN overflow.
         head(out, major::NEGATIVE, value.unsigned_abs() - 1);
     } else {
         head(out, major::UNSIGNED, value.unsigned_abs());
@@ -142,9 +114,7 @@ pub fn null(out: &mut Vec<u8>) {
 
 /// Reads deterministic CBOR items from a borrowed input.
 ///
-/// Every read advances the cursor and every failure leaves the cursor where it
-/// was not: a reader that has returned an error is finished, and callers treat
-/// it that way rather than resynchronising.
+/// A reader that has returned an error is finished; callers do not resync.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     input: &'a [u8],
@@ -167,9 +137,6 @@ impl<'a> Reader<'a> {
     /// What has not been consumed.
     #[must_use]
     pub fn remaining(&self) -> &'a [u8] {
-        // The offset only ever advances to a position inside the input, so the
-        // slice cannot fail; an empty tail is the honest answer if it somehow
-        // did.
         self.input.get(self.offset..).unwrap_or(&[])
     }
 
@@ -199,8 +166,6 @@ impl<'a> Reader<'a> {
         let first = *self.take(1)?.first().ok_or(Error::Truncated)?;
         let major = first >> 5;
         let additional = first & 0x1f;
-        // The shortest form for a value is the narrowest width that holds it, so
-        // each wider width has a floor one past the previous width's ceiling.
         let (value, floor) = match additional {
             0..=23 => (u64::from(additional), 0),
             24 => (u64::from(self.byte()?), 24),
@@ -258,7 +223,6 @@ impl<'a> Reader<'a> {
         let (major, value) = self.head()?;
         match major {
             major::UNSIGNED => i64::try_from(value).map_err(|_| Error::TooLarge),
-            // -1 - value, computed so that i64::MIN is reachable.
             major::NEGATIVE => i64::try_from(value)
                 .map_err(|_| Error::TooLarge)
                 .map(|magnitude| -1 - magnitude),
@@ -401,9 +365,6 @@ mod tests {
     use super::*;
 
     /// Every width boundary, and the value on each side of it.
-    ///
-    /// Exhaustive over the interesting space rather than sampled: the only place
-    /// a head can be wrong is at a width change.
     const BOUNDARIES: [u64; 12] = [
         0,
         1,
@@ -452,9 +413,8 @@ mod tests {
 
     #[test]
     fn a_wider_head_than_the_value_needs_is_refused() {
-        // The check that makes an encoding canonical rather than merely valid.
-        // Written out per width, because a loop over widths would reproduce the
-        // same off-by-one it is meant to catch.
+        // Canonical encoding check. Written per-width to avoid the off-by-one
+        // a loop would reproduce.
         for (encoded, value) in [
             (vec![0x18, 0x00], 0u64),
             (vec![0x18, 0x17], 23),
@@ -468,8 +428,6 @@ mod tests {
                 Err(Error::NonCanonical),
                 "{value:#x} in a wider head"
             );
-            // The same value in its own width is accepted, so the rejection is
-            // about the width and not the value.
             let mut shortest = Vec::new();
             head(&mut shortest, major::UNSIGNED, value);
             assert_eq!(Reader::new(&shortest).head(), Ok((major::UNSIGNED, value)));
@@ -485,7 +443,6 @@ mod tests {
                 "additional {additional}"
             );
         }
-        // 31 is the indefinite length this profile does not encode or accept.
         assert_eq!(Reader::new(&[0x5f]).head(), Err(Error::Malformed));
         assert_eq!(Reader::new(&[0x7f]).head(), Err(Error::Malformed));
         assert_eq!(Reader::new(&[0x9f]).head(), Err(Error::Malformed));
@@ -502,7 +459,6 @@ mod tests {
                 "{head_byte:#x} with no argument"
             );
         }
-        // A byte string whose head promises more than follows.
         let mut short = Vec::new();
         bytes(&mut short, b"eight!!!");
         short.truncate(short.len() - 1);
@@ -531,8 +487,7 @@ mod tests {
             assert_eq!(reader.int(), Ok(value), "{value}");
             assert_eq!(reader.finish(), Ok(()));
         }
-        // A negative magnitude past i64 is well formed CBOR this profile cannot
-        // represent, and says so rather than wrapping.
+        // Magnitude past i64 is well-formed CBOR this profile cannot represent.
         let mut huge = Vec::new();
         head(&mut huge, major::NEGATIVE, u64::MAX);
         assert_eq!(Reader::new(&huge).int(), Err(Error::TooLarge));
@@ -568,8 +523,6 @@ mod tests {
         assert_eq!(Reader::new(&encoded).bytes(16).map(<[u8]>::len), Ok(16));
         assert_eq!(Reader::new(&encoded).bytes(15), Err(Error::TooLarge));
         assert_eq!(Reader::new(&encoded).fixed_bytes::<16>(), Ok([0xa5; 16]));
-        // A fixed read of another width is a length error rather than a silent
-        // truncation of the item.
         assert_eq!(
             Reader::new(&encoded).fixed_bytes::<8>(),
             Err(Error::TooLarge)
@@ -589,9 +542,6 @@ mod tests {
 
     #[test]
     fn a_length_past_usize_is_refused_before_it_is_used() {
-        // On a 64-bit target this is the same width as usize, so the check that
-        // matters is the bound rather than the conversion. Both report TooLarge,
-        // which is what a caller acts on.
         let mut enormous = Vec::new();
         head(&mut enormous, major::BYTES, u64::MAX);
         assert_eq!(Reader::new(&enormous).bytes(1024), Err(Error::TooLarge));
@@ -649,8 +599,6 @@ mod tests {
         assert_eq!(reader.null(), Ok(()));
         assert_eq!(reader.finish(), Ok(()));
 
-        // false, true, undefined, and a float are all refused, so a decoder that
-        // reads an absent field as null cannot be handed another simple value.
         for byte in [0xf4u8, 0xf5, 0xf7, 0xfa, 0xfb] {
             let encoded = [byte];
             let mut reader = Reader::new(&encoded);

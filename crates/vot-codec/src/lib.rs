@@ -1,8 +1,4 @@
 //! Typed payload schemas and bounded framing for the VOT v0.3 wire protocol.
-//!
-//! This crate validates the common envelope, criticality convention, grease
-//! handling, registered per-frame limits, and typed application payloads before
-//! a parser can allocate or mutate state.
 
 #![forbid(unsafe_code)]
 
@@ -31,20 +27,14 @@ pub mod setting_id {
     pub const TELEMETRY_LEVEL: u64 = 0x22;
 }
 
-/// What a capability authorizes, from `spec/registries.md` section 12.
-///
-/// Coarser than a frame type, because authorization is a decision about what a
-/// peer may ask for rather than about one message.
+/// What a capability authorizes.
 pub mod operation {
     pub const PUBLISH: u64 = 0x0001;
     pub const READ_MANIFEST: u64 = 0x0002;
     pub const READ_RANGES: u64 = 0x0003;
 }
 
-/// What a capability may cap, from `spec/registries.md` section 13.
-///
-/// A limit is a restriction rather than a grant, so an identifier a verifier
-/// cannot name fails closed: see [`is_registered_limit`].
+/// What a capability may cap.
 pub mod resource_limit {
     pub const CONCURRENT_LANES: u64 = 0x0001;
     pub const WIRE_BYTES: u64 = 0x0002;
@@ -71,7 +61,7 @@ pub mod error_code {
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
 }
 
-/// Extension identifiers from `spec/registries.md` section 4.
+/// Extension identifiers.
 pub mod extension_id {
     pub const CORE_RELIABLE: u64 = 0x00;
     pub const DATAGRAM_FEC: u64 = 0x01;
@@ -83,10 +73,6 @@ pub mod extension_id {
 }
 
 /// The extension a known frame needs before it may be used.
-///
-/// `spec/wire.md` section 5: an experimental frame is invalid unless its
-/// extension is negotiated, and using one anyway is
-/// `EXPERIMENT_NOT_NEGOTIATED`. A frame with no entry needs nothing.
 #[must_use]
 pub const fn required_extension(frame_type: u64) -> Option<u64> {
     use crate::frame_type as ty;
@@ -142,10 +128,9 @@ pub mod frame_type {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeLimits {
-    /// Limit used for an unknown optional frame, whose registered limit is not
-    /// available to this implementation.
+    /// Limit for an unknown optional frame.
     pub max_unknown_payload: usize,
-    /// Bounds result-vector growth when decoding a caller-provided batch.
+    /// Bounds result-vector growth when decoding a batch.
     pub max_frames: usize,
 }
 
@@ -221,8 +206,7 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Every registered setting and the value advertised for it, in identifier
-    /// order. Encoding walks this, so there is no lookup that cannot fail.
+    /// Registered settings and their advertised values, in identifier order.
     #[must_use]
     pub const fn advertised(&self) -> [(u64, u64); 8] {
         use setting_id as id;
@@ -296,11 +280,10 @@ impl HelloError {
     }
 }
 
-/// Decodes the bounded HELLO payload before negotiation state is changed.
+/// Decodes the bounded HELLO payload.
 ///
 /// # Errors
-/// Rejects the wrong revision or role, excessive or duplicate extensions,
-/// truncation, and trailing bytes.
+/// Rejects wrong revision/role, duplicate/excessive extensions, truncation, and trailing bytes.
 pub fn decode_hello(payload: &[u8], expected_role: EndpointRole) -> Result<Hello, HelloError> {
     let mut offset = 0;
     let draft_revision = hello_varint(payload, &mut offset)?;
@@ -366,11 +349,7 @@ impl SettingsError {
 
 /// Decodes a bounded SETTINGS payload as identifier/value varint pairs.
 ///
-/// Unknown optional settings are ignored. Unknown critical settings and
-/// duplicates terminate negotiation.
-///
-/// # Errors
-/// Returns a settings or bounded varint error.
+/// Unknown optional settings are ignored; unknown critical settings and duplicates terminate negotiation.
 pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
     let mut settings = Settings::default();
     let mut seen = BTreeSet::new();
@@ -403,7 +382,7 @@ pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
     Ok(settings)
 }
 
-/// Every setting `spec/registries.md` defines, in identifier order.
+/// Every registered setting, in identifier order.
 pub const REGISTERED_SETTINGS: [u64; 8] = [
     setting_id::MAX_CONTROL_FRAME_PAYLOAD,
     setting_id::MAX_DATA_RECORD_PAYLOAD,
@@ -415,45 +394,36 @@ pub const REGISTERED_SETTINGS: [u64; 8] = [
     setting_id::TELEMETRY_LEVEL,
 ];
 
-/// Every operation `spec/registries.md` section 12 defines, in identifier order.
+/// Every registered operation, in identifier order.
 pub const REGISTERED_OPERATIONS: [u64; 3] = [
     operation::PUBLISH,
     operation::READ_MANIFEST,
     operation::READ_RANGES,
 ];
 
-/// Whether this revision knows what an operation authorizes.
-///
-/// `spec/registries.md` section 12: an unknown identifier in a capability's set
-/// grants nothing and does not invalidate the capability, so a verifier asks this
-/// per value rather than refusing a token issued for a later revision. Answering
-/// from one list is what keeps a value registered but unauthorizable from being
-/// an oversight in one verifier and not another.
+/// Whether this revision knows what an operation authorizes. Unknown
+/// identifiers grant nothing but do not invalidate the capability.
 #[must_use]
 pub fn is_registered_operation(identifier: u64) -> bool {
     REGISTERED_OPERATIONS.contains(&identifier)
 }
 
-/// Every resource limit `spec/registries.md` section 13 defines, in identifier
-/// order.
+/// Every registered resource limit, in identifier order.
 pub const REGISTERED_LIMITS: [u64; 3] = [
     resource_limit::CONCURRENT_LANES,
     resource_limit::WIRE_BYTES,
     resource_limit::STORAGE_BYTES,
 ];
 
-/// Whether this revision knows what a resource limit bounds.
-///
-/// `spec/registries.md` section 13: an unknown identifier fails closed and the
-/// capability is refused, which is the opposite of what an unknown operation
-/// does. Ignoring a restriction lifts it; ignoring a grant grants nothing.
+/// Whether this revision knows what a resource limit bounds. Unknown
+/// identifiers fail closed (opposite of operations): ignoring a restriction
+/// lifts it.
 #[must_use]
 pub fn is_registered_limit(identifier: u64) -> bool {
     REGISTERED_LIMITS.contains(&identifier)
 }
 
-/// The inclusive value range `spec/registries.md` gives a setting. One source
-/// for both directions.
+/// The inclusive value range a registered setting allows.
 #[must_use]
 pub const fn setting_range(identifier: u64) -> Option<(u64, u64)> {
     use setting_id as id;
@@ -491,10 +461,7 @@ fn setting_field(settings: &mut Settings, identifier: u64) -> Option<&mut u64> {
     }
 }
 
-/// Whether `value` is inside the range `spec/registries.md` gives `identifier`.
-///
-/// An unregistered identifier has no range, so nothing may be advertised under
-/// it.
+/// Whether `value` is inside the registered range for `identifier`.
 #[must_use]
 pub fn setting_in_range(identifier: u64, value: u64) -> bool {
     setting_range(identifier).is_some_and(|(low, high)| (low..=high).contains(&value))
@@ -514,25 +481,20 @@ fn apply_setting(
         } else if is_critical(identifier) {
             Err(SettingsError::UnknownCritical(identifier))
         } else {
-            // An unknown optional setting is ignored, which is what lets a
-            // later revision add one without breaking this one.
+            // Unknown optional settings are ignored for forward compatibility.
             Ok(())
         };
     }
-    // Registered and in range, so the field is there.
     if let Some(target) = setting_field(settings, identifier) {
         *target = value;
     }
     Ok(())
 }
 
-/// Encodes a `SETTINGS` payload as `spec/wire.md` section 1 defines it.
-///
-/// Every registered setting is advertised: the peer's defaults are its own.
+/// Encodes a `SETTINGS` payload. Every registered setting is advertised.
 ///
 /// # Errors
-/// Returns [`SettingsError::InvalidValue`] for a value outside the registered
-/// range, so a frame the peer would reject is never put on the wire.
+/// Returns [`SettingsError::InvalidValue`] for a value outside the registered range.
 pub fn encode_settings(settings: &Settings, output: &mut Vec<u8>) -> Result<(), SettingsError> {
     for (identifier, value) in settings.advertised() {
         if !setting_in_range(identifier, value) {
@@ -547,10 +509,7 @@ pub fn encode_settings(settings: &Settings, output: &mut Vec<u8>) -> Result<(), 
     Ok(())
 }
 
-/// Encodes a `HELLO` payload as `spec/wire.md` section 1 defines it.
-///
-/// The revision is written as given, so a test can produce the frame a peer on
-/// another draft would send.
+/// Encodes a `HELLO` payload. The revision is written as given.
 ///
 /// # Errors
 /// Returns [`HelloError::TooManyExtensions`] above the registered bound.
@@ -607,19 +566,9 @@ pub const fn is_grease(frame_type: u64) -> bool {
 
 /// Whether a frame type requires an authenticated session.
 ///
-/// The `Auth` column of the `spec/wire.md` section 5 table, which
-/// `tools/validate_registries.py` checks this against. The session frames are
-/// `no`: requiring an authenticated session to send them would leave no way to
-/// reach one. `ERROR` is phase-dependent there and is never refused here,
-/// since a peer has to be able to report a fault before it authenticates.
-///
-/// This answers for a known frame type. A gate consults it after the section 3
-/// step 6 skip, so an unknown optional or grease type is discarded by its
-/// length rather than refused: section 2 asks a peer to grease live handshakes,
-/// which happen before authentication concludes.
-///
-/// An unregistered type answers true, so a critical frame added to the registry
-/// without a decision here is refused rather than let through.
+/// Session-setup frames are exempt: requiring auth to send them would block
+/// reaching a session. `ERROR` is never refused so a peer can report a fault
+/// before authenticating. Unregistered types answer true (fail-closed).
 #[must_use]
 pub const fn requires_authentication(frame_type: u64) -> bool {
     use crate::frame_type as ty;
@@ -690,9 +639,6 @@ pub fn encode_varint(value: u64, output: &mut Vec<u8>) -> Result<(), DecodeError
     if value < (1 << 6) {
         output.push(u8::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))?);
     } else if value < (1 << 14) {
-        // The two length bits are added rather than set. They are clear in a
-        // value this small, so `|`, `^`, and `+` write the same byte, and only
-        // the arithmetic form has no mutant that agrees with it.
         let encoded =
             u16::try_from(value).map_err(|_| DecodeError::ValueOutOfRange(value))? + 0x4000;
         output.extend_from_slice(&encoded.to_be_bytes());
@@ -729,9 +675,6 @@ pub fn decode_varint(input: &[u8]) -> Result<(u64, usize), DecodeError> {
 
     let mut value = u64::from(first & 0x3f);
     for byte in &input[1..width] {
-        // Added rather than set, for the reason `encode_varint` gives: the shift
-        // clears the low eight bits, so the bitwise and arithmetic forms agree
-        // and only one of them can be held by a test.
         value = (value << 8) + u64::from(*byte);
     }
     Ok((value, width))
@@ -772,23 +715,18 @@ pub struct FrameEnvelope {
     pub header_length: usize,
     /// Header plus payload.
     pub total_length: usize,
-    /// Whether the payload is to be discarded rather than parsed, which is the
-    /// case for an unknown optional type and for grease.
+    /// Whether the payload is discarded (unknown optional or grease).
     pub skipped: bool,
 }
 
-/// Reads the next frame's envelope without requiring its payload to be present.
+/// Reads the next frame's envelope without requiring its payload present.
 ///
-/// `spec/wire.md` has a decoder determine the applicable limit and reject an
-/// oversized or unknown critical frame before allocating anything, and
-/// stream-discard an unknown optional payload rather than buffering it. A
-/// stream transport cannot follow that with [`decode_one`] alone, because that
-/// reports the frame incomplete until every byte has arrived, by which point a
-/// caller has already held the payload it was supposed to throw away.
+/// Unlike [`decode_one`], allows a stream transport to reject or discard a
+/// frame before buffering its payload.
 ///
 /// # Errors
-/// Returns `Incomplete` until both varints have arrived, and otherwise the same
-/// overflow, excessive-length, and unknown-critical errors as [`decode_one`].
+/// Returns `Incomplete` until both varints arrive; otherwise the same overflow,
+/// length, and unknown-critical errors as [`decode_one`].
 pub fn peek_envelope(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope, DecodeError> {
     validate_limits(limits)?;
     let (frame_type, type_width) = decode_varint(input)?;
@@ -928,16 +866,10 @@ mod tests {
 
     #[test]
     fn an_envelope_is_read_before_its_payload_arrives() {
-        // spec/wire.md has a decoder decide the limit, reject an oversized or
-        // unknown critical frame, and stream-discard an unknown optional
-        // payload, all before allocating. decode_one cannot serve that on a
-        // stream transport: it reports incomplete until the last byte lands, by
-        // which point the payload it was meant to throw away is already held.
         let mut frame = Vec::new();
         encode_frame(frame_type::DATA_RECORD, &[7; 4096], &mut frame).unwrap();
         let limits = DecodeLimits::default();
 
-        // The header alone is enough, and it agrees with the full decode.
         let envelope = peek_envelope(&frame[..4], limits).unwrap();
         assert_eq!(envelope.frame_type, frame_type::DATA_RECORD);
         assert_eq!(envelope.payload_length, 4096);
@@ -953,8 +885,6 @@ mod tests {
             Err(DecodeError::Incomplete { .. })
         ));
 
-        // An unknown optional type is skipped, and so is grease of a known one.
-        // Each is read from its header alone, with none of the payload present.
         for (frame_type, payload) in [(0x7ffe_u64, &b"skip me"[..]), (0x1f00, &b"grease"[..])] {
             let mut encoded = Vec::new();
             encode_frame(frame_type, payload, &mut encoded).unwrap();
@@ -962,7 +892,6 @@ mod tests {
             let envelope = peek_envelope(&encoded[..header], limits).unwrap();
             assert!(envelope.skipped, "type {frame_type:#x} must be skipped");
             assert_eq!(envelope.payload_length, payload.len());
-            // One byte short of the header is not yet decidable.
             assert!(matches!(
                 peek_envelope(&encoded[..header - 1], limits),
                 Err(DecodeError::Incomplete { .. })
@@ -970,13 +899,11 @@ mod tests {
         }
         assert!(is_grease(0x1f00));
 
-        // Too few bytes for both varints is incomplete, not malformed.
         assert!(matches!(
             peek_envelope(&[], limits),
             Err(DecodeError::Incomplete { .. })
         ));
 
-        // The rejections happen on the envelope, with no payload in hand.
         let mut critical = Vec::new();
         encode_varint(0x7fff, &mut critical).unwrap();
         encode_varint(16, &mut critical).unwrap();
@@ -992,9 +919,6 @@ mod tests {
             Err(DecodeError::FrameTooLarge { .. })
         ));
 
-        // The limit is inclusive. A record of exactly the registered size is
-        // legal, and rejecting it would refuse the largest frame the protocol
-        // defines while every smaller one still worked.
         let mut exact = Vec::new();
         encode_varint(frame_type::DATA_RECORD, &mut exact).unwrap();
         encode_varint(MAX_DATA_RECORD_PAYLOAD_FOR_TEST, &mut exact).unwrap();
@@ -1400,8 +1324,7 @@ mod tests {
             Err(HelloError::RoleMismatch { .. })
         ));
 
-        // The leading value is the draft revision, so this literal moves with
-        // it rather than being a constant that happens to have matched.
+        // Moves with DRAFT_REVISION rather than a coincidental constant.
         let server = [u8::try_from(DRAFT_REVISION).unwrap(), 1, 0];
         assert_eq!(
             decode_hello(&server, EndpointRole::Server)
@@ -1456,8 +1379,6 @@ mod tests {
 
     #[test]
     fn encoded_negotiation_payloads_decode_back_to_what_was_sent() {
-        // Until these existed no endpoint could send HELLO or SETTINGS, so the
-        // decoders had nothing to read but hand-built bytes.
         let hello = Hello {
             draft_revision: DRAFT_REVISION,
             endpoint_role: EndpointRole::Client,
@@ -1465,8 +1386,7 @@ mod tests {
         };
         let mut payload = Vec::new();
         encode_hello(&hello, &mut payload).unwrap();
-        // spec/wire.md section 1: revision, role, count, then the extensions in
-        // ascending order because the set is ordered.
+        // Wire order: revision, role, count, then extensions ascending.
         assert_eq!(
             payload,
             vec![u8::try_from(DRAFT_REVISION).unwrap(), 0, 3, 0, 2, 6]
@@ -1477,8 +1397,6 @@ mod tests {
         let mut payload = Vec::new();
         encode_settings(&settings, &mut payload).unwrap();
         assert_eq!(decode_settings(&payload).unwrap(), settings);
-        // Every registered setting is advertised, not only those that differ
-        // from a default the peer does not share.
         let mut identifiers = Vec::new();
         let mut offset = 0;
         while offset < payload.len() {
@@ -1494,9 +1412,6 @@ mod tests {
 
     #[test]
     fn every_frame_type_carries_the_payload_limit_the_registry_gives_it() {
-        // Pinned per arm, and the arms are what a peer is held to. A limit written
-        // as 4 * 1024 and read as 4 + 1024 is a frame this endpoint refuses that
-        // the registry allows, which nothing else here would notice.
         use frame_type as ty;
         for (frame, limit) in [
             (ty::HELLO, 4 * 1024),
@@ -1540,12 +1455,10 @@ mod tests {
             assert!(is_known(frame), "frame {frame:#04x}");
         }
 
-        // A frame with an empty payload is registered with a limit of zero, which
-        // is not the same as having no limit: is_known has to answer for it.
+        // A zero limit is not the same as having no limit.
         assert_eq!(registered_payload_limit(ty::PING), Some(0));
         assert!(is_known(ty::PING));
 
-        // And a type the registry does not define has no limit and is not known.
         for frame in [0x00, 0x02, 0x1f00, u64::MAX] {
             assert_eq!(registered_payload_limit(frame), None, "frame {frame:#04x}");
             assert!(!is_known(frame), "frame {frame:#04x}");
@@ -1554,9 +1467,6 @@ mod tests {
 
     #[test]
     fn only_registered_limits_are_enforceable() {
-        // The companion of only_registered_operations_are_recognized, and the
-        // opposite rule: section 13 has an unknown limit refuse the capability, so
-        // a verifier asks this and fails closed rather than ignoring it.
         for identifier in REGISTERED_LIMITS {
             assert!(is_registered_limit(identifier), "{identifier:#06x}");
         }
@@ -1574,9 +1484,6 @@ mod tests {
 
     #[test]
     fn decode_limits_are_refused_before_anything_is_read() {
-        // Both halves of the guard, each at its own edge. A caller that asked for
-        // an unknown payload past the protocol ceiling, or for no frames at all,
-        // is asking for something no input can satisfy.
         let mut payload = Vec::new();
         encode_frame(frame_type::PING, &[], &mut payload).unwrap();
         assert_eq!(
@@ -1617,8 +1524,6 @@ mod tests {
 
     #[test]
     fn a_payload_at_its_registered_limit_decodes_and_one_byte_more_does_not() {
-        // The frame-too-large comparison, at the edge. A SETTINGS_ACK is
-        // registered with a limit of zero, so its own edge is one byte.
         let mut exact = Vec::new();
         encode_frame(frame_type::SETTINGS_ACK, &[], &mut exact).unwrap();
         let limits = DecodeLimits::default();
@@ -1633,9 +1538,6 @@ mod tests {
             Err(DecodeError::FrameTooLarge { limit: 0, .. })
         ));
 
-        // And a frame whose payload is exactly its registered limit is accepted,
-        // which is what says the comparison is not off by one in the other
-        // direction.
         let limit = registered_payload_limit(frame_type::HELLO).unwrap();
         let mut at_limit = Vec::new();
         encode_varint(frame_type::HELLO, &mut at_limit).unwrap();
@@ -1649,18 +1551,12 @@ mod tests {
 
     #[test]
     fn only_registered_operations_are_recognized() {
-        // spec/registries.md section 12: an unknown identifier grants nothing and
-        // does not invalidate the capability, so a verifier asks per value. The
-        // reserved zero is unknown like any other unassigned value, which is what
-        // stops it being a wildcard.
         for identifier in REGISTERED_OPERATIONS {
             assert!(is_registered_operation(identifier), "{identifier:#06x}");
         }
         for identifier in [0x0000, 0x0004, 0x0011, u64::MAX] {
             assert!(!is_registered_operation(identifier), "{identifier:#06x}");
         }
-        // Named rather than only counted, so a value that moved would fail here
-        // as well as in the registry cross-check.
         assert_eq!(
             REGISTERED_OPERATIONS,
             [
@@ -1669,9 +1565,6 @@ mod tests {
                 operation::READ_RANGES
             ]
         );
-        // Ascending, which the list claims and nothing else checks. An operation
-        // set on the wire is canonical, so the order this is written in is the
-        // order an issuer will encode.
         assert!(
             REGISTERED_OPERATIONS
                 .windows(2)
@@ -1687,9 +1580,6 @@ mod tests {
     fn a_payload_the_peer_would_reject_is_never_encoded() {
         use setting_id as id;
 
-        // The encoder and the decoder read one range table, so a value this
-        // side would refuse is refused before it reaches the wire rather than
-        // costing a round trip and a closed session.
         let out_of_range = Settings {
             telemetry_level: 3,
             ..Settings::default()
@@ -1701,10 +1591,6 @@ mod tests {
                 value: 3,
             })
         );
-        // Every range pinned to the value spec/registries.md gives it, rather
-        // than only checked for internal consistency. A range that quietly
-        // widened would let this endpoint advertise a limit the registry does
-        // not allow, and a peer would be right to refuse the session.
         assert_eq!(
             setting_range(id::MAX_CONTROL_FRAME_PAYLOAD),
             Some((1024, 16 * 1024 * 1024))
@@ -1733,7 +1619,6 @@ mod tests {
         for identifier in REGISTERED_SETTINGS {
             let (low, high) = setting_range(identifier).expect("a registered setting has a range");
             assert!(low <= high);
-            // The bound itself is inside the range, and one past it is not.
             assert!(setting_in_range(identifier, low));
             assert!(setting_in_range(identifier, high));
             assert!(!setting_in_range(identifier, high + 1));
@@ -1745,9 +1630,6 @@ mod tests {
             assert_eq!(decode_settings(&payload).unwrap(), settings);
         }
 
-        // The bound itself encodes, and one past it does not. Without the
-        // first half a bound off by one would go unnoticed and this endpoint
-        // would refuse a HELLO the registry allows.
         let at_bound = Hello {
             draft_revision: DRAFT_REVISION,
             endpoint_role: EndpointRole::Client,
@@ -1772,8 +1654,6 @@ mod tests {
             ))
         );
 
-        // The revision is written as given, so the frame a peer on an older
-        // draft would send can be produced and shown to be rejected.
         let older = Hello {
             draft_revision: DRAFT_REVISION - 1,
             endpoint_role: EndpointRole::Client,
@@ -1789,9 +1669,6 @@ mod tests {
 
     #[test]
     fn experimental_frames_name_the_extension_they_need() {
-        // spec/wire.md section 5: an experimental frame is invalid unless its
-        // extension is negotiated. Without this table nothing can tell one
-        // from an ordinary frame.
         for frame_type in [
             frame_type::DATAGRAM_CREDIT,
             frame_type::CODING_EPOCH_OPEN,
@@ -1822,8 +1699,6 @@ mod tests {
 
     #[test]
     fn only_the_frames_that_reach_an_authenticated_session_are_exempt() {
-        // tools/validate_registries.py holds this against the Auth column of
-        // spec/wire.md section 5. This states the two ends of it.
         for frame_type in [
             frame_type::HELLO,
             frame_type::SETTINGS,
@@ -1847,10 +1722,6 @@ mod tests {
         ] {
             assert!(requires_authentication(frame_type), "{frame_type:#x}");
         }
-        // A critical type nobody decided on is refused rather than let
-        // through. A grease or unknown optional type never reaches here: a
-        // gate consults this after the section 3 step 6 skip, since section 2
-        // asks a peer to grease handshakes, which precede authentication.
         assert!(requires_authentication(0x1f01));
         assert!(requires_authentication(u64::MAX));
     }

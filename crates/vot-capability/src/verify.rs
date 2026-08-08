@@ -1,34 +1,18 @@
-//! What a verifier decides about a capability, from ADR-0023.
+//! Capability verification: whether to believe a presented capability.
 //!
-//! The format says whether bytes are a capability and whether the signature over
-//! them holds. This says whether to believe it: that the key is one this
-//! deployment anchored, for the issuer that claims it and the audience it names;
-//! that the window is open on this verifier's clock; that the token is not
-//! denied; that the holder proved possession of the key the capability names; and
-//! that the operation and scope a request asks for are inside it.
-//!
-//! Every refusal is reported precisely here and coarsely on the wire.
-//! `spec/wire.md` section 1.1 forbids a rejection that distinguishes a valid
-//! capability with insufficient scope from an invalid one, because that
-//! difference is an oracle a holder can probe. [`Denial`] is for the audit record
-//! the deployment keeps; [`Denial::wire_reason`] is what a peer learns, and it is
-//! deliberately the same answer for almost all of them.
+//! Checks key anchoring, issuer, audience, time window, denial list, proof of
+//! possession, and request scope. Refusals are precise locally but coarse on the
+//! wire to avoid leaking an oracle.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::{Capability, Error, FORMAT_ID, Range, SignedCapability, bounds};
 
-/// What a proof of possession covers, before the capability and the challenge.
-///
-/// Distinct from the domain the capability itself is signed under, so a signature
-/// over one is not valid input for the other.
+/// What a proof of possession covers. Distinct from the capability signature
+/// domain.
 const PROOF_DOMAIN: &[u8] = b"VOT capability pop v0\0";
 
-/// One key this deployment trusts, for one issuer, for named audiences.
-///
-/// The three travel together because each alone admits something nobody
-/// authorized: a key with no issuer signs for any name, and an issuer with no
-/// audience list signs for any deployment that trusts it.
+/// One trusted key bound to one issuer and its audiences.
 #[derive(Clone, Debug)]
 pub struct IssuerEntry {
     /// The identifier the issuer puts in the envelope. Issuer-chosen and not
@@ -41,12 +25,7 @@ pub struct IssuerEntry {
     pub key: VerifyingKey,
 }
 
-/// The issuer keys a verifier will accept, and nothing else.
-///
-/// An empty set accepts nothing. `spec/wire.md` section 1.1 already covers the
-/// deployment that requires no authentication: it advertises no capability
-/// format. An empty set with a format advertised is a misconfiguration, and
-/// failing closed is what `spec/security.md` section 5 asks of one.
+/// Trusted issuer keys. Empty set accepts nothing (fail closed).
 #[derive(Clone, Debug, Default)]
 pub struct Anchors {
     entries: Vec<IssuerEntry>,
@@ -73,10 +52,7 @@ impl Anchors {
         self.entries.is_empty()
     }
 
-    /// The entries whose key identifier matches, in configured order.
-    ///
-    /// More than one is expected rather than exceptional: two issuers can choose
-    /// the same identifier, so the issuer claim is what decides between them.
+    /// Entries whose key ID matches. May be multiple; the issuer claim decides.
     fn candidates<'a>(&'a self, key_id: &'a [u8]) -> impl Iterator<Item = &'a IssuerEntry> {
         self.entries
             .iter()
@@ -90,18 +66,13 @@ pub struct Policy<'a> {
     /// The audience a capability must name. A verifier that accepted any would
     /// accept a capability issued for another deployment.
     pub audience: &'a str,
-    /// Seconds since the epoch, from the verifier's clock. ADR-0023 puts the
-    /// clock here because no VOT frame carries one.
+    /// Seconds since the epoch, from the verifier's clock.
     pub now: u64,
-    /// How far the clock may be out, in seconds, declared rather than assumed. A
-    /// tolerance wide enough for one deployment's clocks is a replay window in
-    /// another.
+    /// Clock skew tolerance in seconds. Declared, not assumed.
     pub skew: u64,
     /// Token identifiers this deployment has revoked before their expiry.
     pub denied: &'a [[u8; 16]],
-    /// Resource limits this verifier can enforce. A capability naming one that is
-    /// absent here is refused: `spec/registries.md` section 13 makes an unknown
-    /// restriction fail closed, because ignoring one lifts it.
+    /// Enforceable resource limits. Unknown restrictions fail closed.
     pub known_limits: &'a [u16],
 }
 
@@ -117,10 +88,7 @@ pub struct Presentation<'a> {
     pub proof: &'a [u8],
 }
 
-/// Why a capability was not believed.
-///
-/// Precise for the audit record and coarse on the wire: see
-/// [`wire_reason`](Self::wire_reason).
+/// Why a capability was not believed. Precise for audit, coarse on the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Denial {
     /// The bytes are not a capability of this format.
@@ -154,16 +122,8 @@ pub enum Denial {
 }
 
 impl Denial {
-    /// What a peer is told, from the three codes section 1.1 assigns.
-    ///
-    /// Almost every denial answers `AUTHENTICATION_FAILED`, including the ones a
-    /// deployment can tell apart locally. Section 1.1 forbids a rejection that
-    /// distinguishes a valid capability with insufficient scope from an invalid
-    /// one, so a holder probing with a narrow capability learns the same thing
-    /// either way. A revoked token is the one exception, because a holder
-    /// presenting a token this deployment revoked is being told to stop rather
-    /// than to try again, and `REPLAY_REJECTED` is the code the registry assigns
-    /// a token that has been seen and refused.
+    /// Wire-facing reason. Almost always `AUTHENTICATION_FAILED` to avoid
+    /// leaking an oracle. Revoked tokens return `REPLAY_REJECTED`.
     #[must_use]
     pub const fn wire_reason(self) -> u16 {
         match self {
@@ -172,12 +132,7 @@ impl Denial {
         }
     }
 
-    /// The detail a rejection may carry, which is nothing.
-    ///
-    /// Section 1.1 allows an optional detail and forbids one that distinguishes
-    /// these cases. Every string that would be useful to an operator is a string
-    /// that would be useful to a holder probing, so the audit record gets the
-    /// [`Denial`] and the peer gets an empty detail.
+    /// Wire-facing detail. Always empty to avoid leaking an oracle.
     #[must_use]
     pub const fn wire_detail() -> &'static str {
         ""
@@ -196,10 +151,7 @@ pub struct Request {
     pub range: Option<Range>,
 }
 
-/// A capability this verifier believes, and what it believed about it.
-///
-/// Held rather than returned as bare claims so a caller cannot forget which
-/// audience and clock it was accepted under.
+/// A verified capability with the audience and clock it was accepted under.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authorized {
     capability: Capability,
@@ -212,12 +164,7 @@ impl Authorized {
         &self.capability
     }
 
-    /// Whether this capability authorizes `request`.
-    ///
-    /// Checked again per request rather than once at authentication, which is
-    /// what `spec/security.md` section 5 requires: authorization is rechecked
-    /// when a request expands scope, switches source or carrier, publishes, or
-    /// renews.
+    /// Whether this capability authorizes `request`. Rechecked per request.
     ///
     /// # Errors
     /// Reports an operation the capability does not allow, another object, and a
@@ -246,37 +193,25 @@ impl Authorized {
     }
 }
 
-/// Decides whether to believe a presented capability.
-///
-/// The order is deliberate: nothing expensive happens before the anchor is
-/// found, and the signature is checked before any claim is read, because a claim
-/// from an unsigned capability is a claim from whoever sent it.
+/// Decides whether to believe a presented capability. Checks anchor first,
+/// then signature, then claims (cheapest to most expensive).
 ///
 /// # Errors
-/// Reports the first rule the presentation broke. Every one of them is refused;
-/// which one a peer is told is [`Denial::wire_reason`]'s answer, not this one's.
+/// Reports the first rule the presentation broke.
 pub fn authorize(
     signed: &SignedCapability,
     presented: Presentation<'_>,
     anchors: &Anchors,
     policy: Policy<'_>,
 ) -> Result<Authorized, Denial> {
-    // An entry has to name the key before anything is read from the capability.
-    // The claims decide which entry, so the candidates come first and the issuer
-    // narrows them.
     let mut key_known = false;
     let mut issuer_known = false;
     for entry in anchors.candidates(&signed.key_id) {
         key_known = true;
-        // The signature is checked per candidate, because two entries can share
-        // an identifier and only one holds the key that signed this.
         if crate::verify_signature(signed, &entry.key).is_err() {
             continue;
         }
         let capability = Capability::from_canonical_bytes(&signed.capability).map_err(|error| {
-            // The signature held, so the issuer minted something this revision
-            // cannot read. That is the issuer's fault and not the holder's, and
-            // it is still refused.
             Denial::Malformed(error)
         })?;
         if capability.issuer != entry.issuer {
@@ -285,8 +220,6 @@ pub fn authorize(
         }
         return finish(capability, entry, presented, policy);
     }
-    // Reported as precisely as the anchor set allows, and no more: a holder is
-    // told the same thing either way.
     Err(if !key_known {
         Denial::UnknownKey
     } else if issuer_known {
@@ -303,11 +236,6 @@ fn finish(
     presented: Presentation<'_>,
     policy: Policy<'_>,
 ) -> Result<Authorized, Denial> {
-    // The audience is two checks, not one. The entry decides whether this key may
-    // issue for that audience at all, and the policy decides whether that
-    // audience is this deployment. Without the first, a key anchored for one
-    // tenant signs for another; without the second, a capability issued for
-    // another deployment verifies here.
     if !entry.audiences.contains(&capability.audience) {
         return Err(Denial::AudienceNotPermitted);
     }
@@ -315,7 +243,6 @@ fn finish(
         return Err(Denial::AudienceIsAnother);
     }
 
-    // The window, against this verifier's clock and its declared tolerance.
     if policy.now.saturating_add(policy.skew) < capability.not_before {
         return Err(Denial::NotYetValid);
     }
@@ -327,8 +254,6 @@ fn finish(
         return Err(Denial::Revoked);
     }
 
-    // Every limit the capability states has to be one this verifier can hold the
-    // holder to. Ignoring one would lift it.
     for limit in &capability.limits {
         if !policy.known_limits.contains(&limit.id) {
             return Err(Denial::LimitNotEnforceable(limit.id));
@@ -360,8 +285,6 @@ fn verify_proof_of_possession(
     capability: &Capability,
     presented: Presentation<'_>,
 ) -> Result<(), Denial> {
-    // The nonce bounds are the challenge's, from spec/session.cddl. A proof over
-    // a nonce this endpoint could not have sent is not a proof of anything.
     if !(16..=64).contains(&presented.nonce.len()) {
         return Err(Denial::ProofOfPossession);
     }
@@ -535,8 +458,6 @@ mod tests {
             Err(Denial::Signature)
         );
 
-        // A capability another key signed, whose identifier this deployment does
-        // anchor. The identifier is a label, and the key is what decides.
         let other = SigningKey::from_bytes(&[9; 32]);
         let elsewhere = crate::sign(&value, b"issuer-1", &other).unwrap();
         assert_eq!(
@@ -549,7 +470,6 @@ mod tests {
             Err(Denial::Signature)
         );
 
-        // And an identifier nothing anchors at all.
         let unknown = crate::sign(&value, b"issuer-9", &issuer_key()).unwrap();
         assert_eq!(
             authorize(
@@ -564,8 +484,6 @@ mod tests {
 
     #[test]
     fn token_issuer_rejected() {
-        // The key verifies and the issuer is not the one it was anchored for, so a
-        // key cannot sign for a name nobody authorized it for.
         let mut value = capability();
         value.issuer = "issuer.elsewhere".to_owned();
         let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
@@ -583,9 +501,6 @@ mod tests {
 
     #[test]
     fn token_audience_rejected() {
-        // Two separate checks. The entry decides whether this key may issue for an
-        // audience at all, and the policy decides whether that audience is this
-        // deployment.
         let mut value = capability();
         value.audience = "receiver.elsewhere".to_owned();
         let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
@@ -600,8 +515,6 @@ mod tests {
             Err(Denial::AudienceNotPermitted)
         );
 
-        // Anchored for that audience, and this deployment is another one: the case
-        // that makes a capability issued for one deployment fail at every other.
         let wider = Anchors::new().with(IssuerEntry {
             key_id: b"issuer-1".to_vec(),
             issuer: "issuer.example".to_owned(),
@@ -622,7 +535,6 @@ mod tests {
         let value = capability();
         let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
         let proof = proof_for(&value);
-        // The limit list has to outlive the closure, since a Policy borrows it.
         let known = limits();
         let at = |now, skew| Policy {
             now,
@@ -630,8 +542,6 @@ mod tests {
             ..policy(&known, &[])
         };
 
-        // The window is inclusive of not-before and exclusive of expiry, and each
-        // edge is asserted with the value one second outside it.
         assert!(
             authorize(
                 &signed,
@@ -664,7 +574,6 @@ mod tests {
             Err(Denial::Expired)
         );
 
-        // Declared skew moves both edges and nothing else.
         assert!(
             authorize(
                 &signed,
@@ -717,7 +626,6 @@ mod tests {
             ),
             Err(Denial::Revoked)
         );
-        // Another token on the list is not this one.
         assert!(
             authorize(
                 &signed,
@@ -731,9 +639,6 @@ mod tests {
 
     #[test]
     fn token_channel_binding_rejected() {
-        // The binding is proof of possession, so this is where a stolen capability
-        // stops: the holder key is in the signed claims and the thief cannot sign
-        // the challenge under it.
         let value = capability();
         let signed = crate::sign(&value, b"issuer-1", &issuer_key()).unwrap();
         let honest = proof_for(&value);
@@ -750,7 +655,6 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        // A proof over another challenge, which is what makes it fresh.
         let elsewhere = prove_possession(&value, &SESSION, &[0x11; 32], &holder_key()).unwrap();
         assert_eq!(
             authorize(
@@ -762,8 +666,6 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        // A proof from another attempt on the same session, which shares the
-        // nonce. Without the attempt identifier in the input this would pass.
         let earlier = prove_possession(&value, &[0xc9; 16], NONCE, &holder_key()).unwrap();
         assert_eq!(
             authorize(
@@ -775,7 +677,6 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        // A proof made for another capability, which the token identifier binds.
         let mut other = capability();
         other.token_id = [0xc2; 16];
         let other_signed = crate::sign(&other, b"issuer-1", &issuer_key()).unwrap();
@@ -789,8 +690,6 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        // A proof of the wrong size, and a challenge outside the bounds
-        // spec/session.cddl gives one.
         assert_eq!(
             authorize(&signed, presented(&[]), &anchors(), policy(&limits(), &[])),
             Err(Denial::ProofOfPossession)
@@ -827,7 +726,6 @@ mod tests {
         )
         .unwrap();
 
-        // An operation the capability does not name.
         assert_eq!(
             authorized.allows(Request {
                 operation: vot_codec::operation::READ_MANIFEST,
@@ -840,7 +738,6 @@ mod tests {
             ))
         );
 
-        // Another object, by root and by suite.
         assert_eq!(
             authorized.allows(Request {
                 operation: vot_codec::operation::PUBLISH,
@@ -860,7 +757,6 @@ mod tests {
             Err(Denial::SubjectIsAnother)
         );
 
-        // One byte past the range it allows, and the last byte inside it.
         assert_eq!(
             authorized.allows(Request {
                 operation: vot_codec::operation::READ_RANGES,
@@ -889,15 +785,10 @@ mod tests {
 
     #[test]
     fn token_delegation_rejected() {
-        // The format refuses a delegation claim it does not define, so a verifier
-        // never reads past one. Signed by an anchored key, so this is the
-        // verifier's answer to an issuer that minted a capability for a later
-        // format rather than a decoder's answer to a stranger.
         let mut value = capability();
         value.delegation = 1;
         let bytes = {
             let mut honest = capability().canonical_bytes().unwrap();
-            // Key 10 is the delegation constraint and its value is the last byte.
             let last = honest.len() - 1;
             honest[last] = 1;
             honest
@@ -922,9 +813,6 @@ mod tests {
 
     #[test]
     fn a_limit_this_verifier_cannot_enforce_refuses_the_capability() {
-        // spec/registries.md section 13: an unknown restriction fails closed,
-        // which is the opposite of what an unknown operation does. Ignoring this
-        // would lift the ceiling the issuer set.
         let mut value = capability();
         value.limits = vec![Limit {
             id: 0x4000,
@@ -941,7 +829,6 @@ mod tests {
             ),
             Err(Denial::LimitNotEnforceable(0x4000))
         );
-        // And a verifier that can enforce it accepts the same capability.
         assert!(
             authorize(
                 &signed,
@@ -972,9 +859,6 @@ mod tests {
 
     #[test]
     fn two_issuers_may_choose_the_same_key_identifier() {
-        // A key identifier is issuer-chosen, so it selects candidates and the
-        // issuer claim decides. A verifier keyed on the identifier alone works
-        // until the second issuer arrives.
         let second = SigningKey::from_bytes(&[13; 32]);
         let shared = Anchors::new()
             .with(IssuerEntry {
@@ -1004,11 +888,6 @@ mod tests {
             );
         }
 
-        // The second issuer's key does not sign for the first issuer's name. Both
-        // entries are tried: the first's key does not verify these bytes, the
-        // second's does and is anchored for another name, so the refusal names the
-        // issuer rather than the signature. A peer is told the same thing either
-        // way, which is what keeps the distinction out of the oracle.
         let mut crossed = capability();
         crossed.issuer = "issuer.example".to_owned();
         let signed = crate::sign(&crossed, b"key-1", &second).unwrap();
@@ -1025,10 +904,6 @@ mod tests {
 
     #[test]
     fn a_peer_learns_the_same_thing_from_almost_every_refusal() {
-        // spec/wire.md section 1.1: a rejection must not distinguish a valid
-        // capability with insufficient scope from an invalid one, because that
-        // difference is an oracle. The audit record keeps the difference; the
-        // peer does not.
         for denial in [
             Denial::Malformed(Error::InvalidValidity),
             Denial::UnknownKey,
@@ -1050,8 +925,6 @@ mod tests {
                 "{denial:?}"
             );
         }
-        // A revoked token is the one a holder is told to stop over rather than to
-        // try again with another capability.
         assert_eq!(
             Denial::Revoked.wire_reason(),
             vot_codec::error_code::REPLAY_REJECTED

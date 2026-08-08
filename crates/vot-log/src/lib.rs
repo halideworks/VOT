@@ -1,18 +1,8 @@
 //! Append-only transparency log for receipt chain heads.
 //!
-//! A witnessed chain stops an issuer rewriting its own history. It does not
-//! stop the issuer telling two counterparties two different histories for the
-//! same object, because neither counterparty sees the other's copy. A log both
-//! can read closes that gap: entries are append-only, and a consistency proof
-//! between any two published tree heads shows nothing earlier was changed or
-//! removed.
-//!
-//! The tree is RFC 6962. That specification is chosen because it is precise,
-//! independently implemented many times, and its proofs are checkable by a
-//! reader who has only a published head. Nothing here depends on who runs the
-//! log: a customer, an auditor, a counterparty, or a third-party service can
-//! all operate one, and a checkpoint carries however many witness signatures a
-//! relying party demands.
+//! RFC 6962 merkle tree. Entries are append-only; consistency proofs show
+//! nothing earlier was changed. Checkpoints are compatible with Go's signed-note
+//! format and Sigstore.
 
 #![forbid(unsafe_code)]
 
@@ -82,11 +72,7 @@ fn split(n: usize) -> usize {
     1 << (usize::BITS - 1 - (n - 1).leading_zeros())
 }
 
-/// An append-only log holding one leaf hash per entry.
-///
-/// Proofs are recomputed from the leaves rather than cached. That is linear per
-/// proof, which is the right trade while a log is small and is the reason
-/// `MAX_ENTRIES` exists; a production operator would keep interior nodes.
+/// Append-only merkle tree. Proofs are recomputed from leaves (no caching).
 #[derive(Clone, Debug, Default)]
 pub struct MerkleLog {
     leaves: Vec<Hash>,
@@ -191,8 +177,6 @@ fn path(index: usize, leaves: &[Hash]) -> Vec<Hash> {
 
 fn subproof(old_size: usize, leaves: &[Hash], is_prefix: bool) -> Vec<Hash> {
     if old_size == leaves.len() {
-        // The old tree is the whole of this subtree. Its head is only needed
-        // when this is not the caller's original left edge.
         return if is_prefix {
             Vec::new()
         } else {
@@ -234,8 +218,6 @@ pub fn verify_inclusion(
     proof: &[Hash],
     root: &Hash,
 ) -> Result<(), Error> {
-    // A size is attacker supplied by way of a checkpoint, and a full-width
-    // shift in the decomposition would panic rather than fail.
     if size == 0 || size > MAX_ENTRIES || index >= size {
         return Err(Error::OutOfRange);
     }
@@ -291,10 +273,7 @@ pub fn verify_consistency(
         };
     }
 
-    // Walk up from the old tree's right edge to the root of each tree at once.
-    // Each step shifts right, so the bit width bounds every loop below. A
-    // mutated condition then fails rather than hanging, and a hung mutant is
-    // indistinguishable from an untested one.
+    // Walk up from the old tree's right edge to the root.
     let mut node = old_size - 1;
     let mut last = new_size - 1;
     for _ in 0..usize::BITS {
@@ -351,11 +330,7 @@ pub fn verify_consistency(
     }
 }
 
-/// A published tree head.
-///
-/// The serialisation is the signed-note format used by Go's checkpoint tooling
-/// and by Sigstore, so an existing witness can co-sign a VOT checkpoint without
-/// knowing anything about VOT.
+/// A published tree head. Serialized as a signed note (Go/Sigstore compatible).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Checkpoint {
     /// Names the log, so a signature over one log's head is not valid for
@@ -373,10 +348,8 @@ pub struct NoteSignature {
     pub signature: Vec<u8>,
 }
 
-/// A checkpoint with the signatures gathered over it.
-///
-/// The log's own signature carries no weight on its own. What a relying party
-/// checks is how many independent witnesses signed the same head.
+/// A checkpoint with witness signatures. The log's own signature carries no
+/// weight; what matters is how many independent witnesses signed the same head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedCheckpoint {
     pub checkpoint: Checkpoint,
@@ -387,12 +360,8 @@ const ED25519_NOTE_ALGORITHM: u8 = 0x01;
 const MAX_NOTE_BYTES: usize = 65_536;
 const MAX_NAME_BYTES: usize = 256;
 
-/// Whether a name may appear in a signed note.
-///
-/// These are the rules Go's signed-note tooling applies: non-empty, no plus
-/// sign, and no Unicode whitespace. Interoperating with that tooling is the
-/// whole reason for this format, so a name it would reject must not be emitted
-/// here either.
+/// Whether a name may appear in a signed note. Follows Go's signed-note rules:
+/// non-empty, no plus sign, no Unicode whitespace.
 fn valid_note_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
@@ -501,8 +470,6 @@ impl SignedCheckpoint {
             });
         }
         let checkpoint = Checkpoint { origin, size, root };
-        // Round-trip so a note with a shape the encoder would never produce is
-        // refused rather than silently normalised.
         let rebuilt = Self {
             checkpoint,
             signatures: parsed,
@@ -514,11 +481,8 @@ impl SignedCheckpoint {
     }
 }
 
-/// Adds a signature over a checkpoint body.
-///
-/// The same call serves the log operator and a witness. Nothing distinguishes
-/// them in the format, which is deliberate: a witness is a key pair and a
-/// clock, so any party can be one without the log granting it a role.
+/// Adds a signature over a checkpoint body. Same call for log operator or
+/// witness; the format makes no distinction.
 ///
 /// # Errors
 /// Rejects a malformed origin or signer name.
@@ -547,11 +511,8 @@ pub struct WitnessKey {
     pub key: VerifyingKey,
 }
 
-/// Checks a checkpoint against a witness policy.
-///
-/// Returns the names that verified. A signature from a key the caller did not
-/// list is ignored rather than rejected, so an extra witness is never a reason
-/// to refuse an otherwise well-witnessed head.
+/// Checks a checkpoint against a witness policy. Returns verifying names.
+/// Unknown signers are ignored, not rejected.
 ///
 /// # Errors
 /// Rejects a malformed checkpoint, or one carrying fewer distinct accepted
@@ -562,9 +523,7 @@ pub fn verify_checkpoint(
     required: usize,
 ) -> Result<Vec<String>, Error> {
     let body = signed.checkpoint.body()?;
-    // Counted only once per name and once per key. A policy can alias one key
-    // under two names, or hold two keys under one name during rotation, and
-    // either way that is one witness, not two.
+    // Counted once per name and per key to prevent aliasing.
     let mut accepted: Vec<(String, [u8; 32])> = Vec::new();
     for signature in &signed.signatures {
         let bytes: [u8; 64] = match signature.signature.as_slice().try_into() {
@@ -626,8 +585,6 @@ mod tests {
 
     #[test]
     fn hashing_matches_rfc_6962() {
-        // The empty tree is the hash of nothing, and prefixes separate a leaf
-        // from an interior node so one can never be presented as the other.
         assert_eq!(
             hex(&MerkleLog::new().root().unwrap()),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -671,7 +628,6 @@ mod tests {
         let leaf = leaf_hash(&6_usize.to_be_bytes());
         verify_inclusion(&leaf, 6, size, &proof, &root).unwrap();
 
-        // A different leaf, index, root, or a tampered node.
         let other = leaf_hash(&7_usize.to_be_bytes());
         assert_eq!(
             verify_inclusion(&other, 6, size, &proof, &root),
@@ -689,7 +645,6 @@ mod tests {
             Err(Error::ProofInvalid)
         );
 
-        // A padded or truncated proof is rejected on length, not consumed.
         let mut padded = proof.clone();
         padded.push([0; 32]);
         assert_eq!(
@@ -729,8 +684,6 @@ mod tests {
 
     #[test]
     fn a_log_that_rewrote_history_cannot_produce_a_consistency_proof() {
-        // The property the whole design rests on. Two logs agree for ten
-        // entries, then one of them changes an early entry.
         let honest = log_of(20);
         let mut forged = MerkleLog::new();
         for index in 0..20_usize {
@@ -745,8 +698,6 @@ mod tests {
         let forged_head = forged.root().unwrap();
         assert_ne!(forged.root_at(10).unwrap(), published);
 
-        // No proof the forger can produce reconciles the head it already
-        // published with the history it now claims.
         let proof = forged.consistency_proof(10, 20).unwrap();
         assert_eq!(
             verify_consistency(10, &published, 20, &forged_head, &proof),
@@ -784,7 +735,6 @@ mod tests {
         let log = log_of(7);
         let root = log.root().unwrap();
         verify_consistency(7, &root, 7, &root, &[]).unwrap();
-        // A prover cannot pad an equal-size proof.
         assert_eq!(
             verify_consistency(7, &root, 7, &root, &[[0; 32]]),
             Err(Error::ProofInvalid)
@@ -822,7 +772,6 @@ mod tests {
         assert_eq!(log.append(b"b").unwrap(), 1);
         assert_eq!(log.len(), 2);
         assert!(!log.is_empty());
-        // A head over a prefix is the head that prefix had at the time.
         assert_eq!(log.root_at(1).unwrap(), leaf_hash(b"a"));
         assert_eq!(MAX_ENTRIES, 1 << 32);
     }
@@ -836,8 +785,6 @@ mod tests {
 
     #[test]
     fn proof_lengths_are_derived_not_assumed() {
-        // Both halves of the decomposition matter: the inner path within the
-        // leaf's subtree, and the border nodes above it.
         assert_eq!(decompose(0, 1), (0, 0));
         assert_eq!(decompose(0, 2), (1, 0));
         assert_eq!(decompose(2, 3), (0, 1));
@@ -879,8 +826,6 @@ mod tests {
         for bad in ["A", "AAAAA", "A===", "Zg=A", "!!!!"] {
             assert_eq!(unbase64(bad), Err(Error::Malformed), "accepted {bad}");
         }
-        // Empty decodes to nothing, which the note parser rejects downstream
-        // because a root is 32 bytes and a signature blob is at least four.
         assert_eq!(unbase64("").unwrap(), Vec::<u8>::new());
     }
 
@@ -924,7 +869,6 @@ mod tests {
             );
         }
 
-        // An origin with a newline could be read as a different checkpoint.
         let mut sneaky = checkpoint_of(&log);
         sneaky.checkpoint.origin = "a\nb".to_owned();
         assert_eq!(sneaky.to_note(), Err(Error::Malformed));
@@ -968,16 +912,12 @@ mod tests {
             ["alpha", "beta"]
         );
 
-        // The same witness twice is still one witness.
         sign_checkpoint(&mut signed, "alpha", &alpha).unwrap();
         assert_eq!(
             verify_checkpoint(&signed, &witnesses, 3),
             Err(Error::Unwitnessed)
         );
 
-        // One witness stays one witness however the policy spells it: one key
-        // under two names, or two keys under one name during a rotation.
-        // Either way a threshold of two must not be satisfied by one party.
         let aliased = vec![
             WitnessKey {
                 name: "alpha".to_owned(),
@@ -1030,7 +970,6 @@ mod tests {
         sign_checkpoint(&mut signed, "alpha", &alpha).unwrap();
         verify_checkpoint(&signed, &witnesses, 1).unwrap();
 
-        // A different size, root, or origin is a different body.
         for mutated in [
             Checkpoint {
                 size: 10,
@@ -1055,8 +994,6 @@ mod tests {
             );
         }
 
-        // Relabelling a signature does not make it another witness's, because
-        // the key hash binds the name to the key.
         let mut relabelled = signed.clone();
         relabelled.signatures[0].name = "beta".to_owned();
         let beta_listed = vec![WitnessKey {
@@ -1068,7 +1005,6 @@ mod tests {
             Err(Error::Unwitnessed)
         );
 
-        // An unknown signer is ignored, not fatal.
         let mut extra = signed;
         extra.signatures.push(NoteSignature {
             name: "stranger".to_owned(),
@@ -1080,8 +1016,6 @@ mod tests {
 
     /// Builds a valid note of exactly `target` bytes by padding signer names.
     ///
-    /// Each signature line costs the name length plus fourteen: the marker, two
-    /// spaces, eight base64 characters for a four byte blob, and a newline.
     fn note_of_length(target: usize) -> String {
         const LINE_OVERHEAD: usize = 14;
         let mut signed = checkpoint_of(&log_of(3));
@@ -1104,8 +1038,6 @@ mod tests {
 
     #[test]
     fn an_absurd_tree_size_is_refused_rather_than_crashing() {
-        // A size arrives inside a checkpoint, so it is attacker supplied. A
-        // full width shift in the proof decomposition would panic.
         let root = [0; 32];
         assert_eq!(
             verify_inclusion(&root, 0, usize::MAX, &[], &root),
@@ -1120,9 +1052,6 @@ mod tests {
             Err(Error::OutOfRange)
         );
 
-        // The limit itself is allowed through, and then fails on proof length
-        // rather than range. Testing only past the limit would not observe
-        // where the limit is.
         assert_eq!(
             verify_inclusion(&root, 0, MAX_ENTRIES, &[], &root),
             Err(Error::ProofInvalid)
@@ -1131,7 +1060,6 @@ mod tests {
             verify_consistency(1, &root, MAX_ENTRIES, &root, &[]),
             Err(Error::ProofInvalid)
         );
-        // And a note can carry such a size, so the two must agree.
         let mut signed = checkpoint_of(&log_of(2));
         signed.checkpoint.size = usize::MAX;
         let note = signed.to_note().unwrap();
@@ -1144,8 +1072,6 @@ mod tests {
 
     #[test]
     fn signer_names_follow_the_signed_note_rules() {
-        // Go's tooling rejects a plus sign and any Unicode whitespace. Emitting
-        // a name it would reject defeats the reason for using this format.
         let mut signed = checkpoint_of(&log_of(3));
         let key = SigningKey::from_bytes(&[81; 32]);
         for bad in [
@@ -1167,7 +1093,6 @@ mod tests {
         for good in ["vot.example", "witness-1", "a.b/c", "\u{00e9}quipe"] {
             assert!(sign_checkpoint(&mut signed, good, &key).is_ok(), "{good}");
         }
-        // to_note applies the same rules, not a weaker set.
         signed.signatures[0].name = "bad+name".to_owned();
         assert_eq!(signed.to_note(), Err(Error::Malformed));
     }
@@ -1190,14 +1115,12 @@ mod tests {
         let log = log_of(2);
         let mut signed = checkpoint_of(&log);
 
-        // Origin: 256 bytes is allowed, 257 is not.
         signed.checkpoint.origin = "o".repeat(256);
         assert!(signed.checkpoint.body().is_ok());
         signed.checkpoint.origin = "o".repeat(257);
         assert_eq!(signed.checkpoint.body(), Err(Error::Malformed));
         signed.checkpoint.origin = "vot.example/log".to_owned();
 
-        // Signer name: the same edge, checked when the note is rendered.
         let key = SigningKey::from_bytes(&[61; 32]);
         sign_checkpoint(&mut signed, "ok", &key).unwrap();
         signed.signatures[0].name = "n".repeat(256);
@@ -1207,9 +1130,6 @@ mod tests {
         signed.signatures[0].name = String::new();
         assert_eq!(signed.to_note(), Err(Error::Malformed));
 
-        // A well formed note at the exact ceiling parses, and the same note one
-        // byte longer is refused. Testing the limit with a note that is
-        // malformed anyway would not observe the limit at all.
         assert_eq!(
             note_of_length(super::MAX_NOTE_BYTES).len(),
             super::MAX_NOTE_BYTES
@@ -1230,12 +1150,10 @@ mod tests {
         let line = note.lines().last().unwrap();
         let blob = line.rsplit(' ').next().unwrap();
 
-        // Four bytes is exactly the key hash and nothing else, which parses.
         let four = note.replace(blob, &base64(&[1, 2, 3, 4]));
         let parsed = SignedCheckpoint::parse_note(&four).unwrap();
         assert!(parsed.signatures[0].signature.is_empty());
 
-        // Three bytes cannot even carry the key hash.
         let three = note.replace(blob, &base64(&[1, 2, 3]));
         assert_eq!(SignedCheckpoint::parse_note(&three), Err(Error::Malformed));
     }

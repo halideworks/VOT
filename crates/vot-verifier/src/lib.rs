@@ -158,8 +158,6 @@ impl StreamVerifier {
     /// # Errors
     /// Propagates group-order or length overflow errors from the verifier.
     pub fn update(&mut self, mut bytes: &[u8]) -> Result<(), VerifyError> {
-        // Finish any partial group first, so the borrowed path below always
-        // starts on a group boundary.
         if !self.pending.is_empty() {
             let consumed = (GROUP_SIZE - self.pending.len()).min(bytes.len());
             self.pending.extend_from_slice(&bytes[..consumed]);
@@ -169,9 +167,6 @@ impl StreamVerifier {
             }
         }
         if self.pending.is_empty() {
-            // Whole groups are hashed straight out of the caller's buffer. A
-            // 64 KiB-aligned range is therefore never copied on its way to the
-            // hash, which is the dominant cost on the sequential path.
             let mut groups = bytes.chunks_exact(GROUP_SIZE);
             for group in groups.by_ref() {
                 self.feed_group(group)?;
@@ -277,10 +272,6 @@ impl MerkleAccumulator {
             .checked_next_power_of_two()
             .ok_or(VerifyError::LengthOverflow)?;
         while self.count < target {
-            // The largest subtree the current count is aligned for always fits
-            // in the padding: `count` is a multiple of its lowest set bit, and
-            // so is `target - count`, because `target` is a higher power of two.
-            // Clamping the width against the remainder would be dead code.
             let level = self.count.trailing_zeros() as usize;
             debug_assert!(1_u64 << level <= target - self.count);
             self.add_subtree(zero_subtree(level), level)?;
@@ -328,8 +319,6 @@ fn reduce(nodes: &[Root]) -> Root {
 }
 
 fn zero_subtree(level: usize) -> Root {
-    // A bounded fold rather than a countdown loop: an arithmetic mutation of a
-    // decrementing counter here would hang instead of failing.
     (0..level).fold(piece_hash(&[]), |value, _| parent(&value, &value))
 }
 
@@ -368,8 +357,6 @@ mod tests {
             assert_eq!(verifier.buffered_bytes(), 0);
             assert_eq!(verifier.finish().unwrap(), root(suite, &data).unwrap());
 
-            // A misaligned prefix is buffered, then the stream realigns and the
-            // remaining whole groups take the borrowed path again.
             let mut split = StreamVerifier::new(suite);
             split.update(&data[..7]).unwrap();
             assert_eq!(split.buffered_bytes(), 7);
@@ -392,7 +379,6 @@ mod tests {
                 verifier.feed(0, &vec![0; GROUP_SIZE + 1]),
                 Err(VerifyError::InvalidGroupLength)
             );
-            // A short group is the final group for both suites.
             verifier.feed(0, &[1]).unwrap();
             assert_eq!(verifier.feed(1, &[2]), Err(VerifyError::GroupAfterFinal));
         }
@@ -413,16 +399,7 @@ mod tests {
             })
     }
 
-    /// Known-answer roots for both suites.
-    ///
-    /// The lengths, byte patterns, and expected roots are the committed suite
-    /// vectors in `test-vectors/blake3-bao64/vectors.json` and
-    /// `test-vectors/sha256-bep52-64k/vectors.json`, which
-    /// `tools/verify_wave1_vectors.py` checks independently. Asserting exact
-    /// root bytes here is what makes this crate's accumulator, group reduction,
-    /// and padding testable at all: every other test only checks that the root
-    /// is stable across chunk sizes, which any consistent wrong answer also
-    /// satisfies.
+    /// Known-answer roots for both suites (committed test vectors).
     #[test]
     fn suite_roots_match_the_committed_vectors() {
         const BLAKE3_STEP: usize = 31;
@@ -479,8 +456,6 @@ mod tests {
                 expected,
                 "sha256-bep52-64k length {length}"
             );
-            // The same root must come out of a chunked stream, so the
-            // accumulator path and the single-group path agree.
             let mut streamed = StreamVerifier::new(Suite::Sha256Bep52);
             for chunk in data.chunks(4096) {
                 streamed.update(chunk).unwrap();

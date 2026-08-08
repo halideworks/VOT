@@ -18,15 +18,8 @@ const MAGIC: &[u8; 8] = b"VOTRES02";
 const MAX_STORE_BYTES: u64 = 67_108_864;
 const MAX_STORE_PAYLOAD_BYTES: u64 = MAX_STORE_BYTES - 20;
 const MIN_STORE_BYTES: u64 = 8;
-/// Largest unit count a single object can reserve.
-///
-/// This is derived from the snapshot format, not chosen: it is the largest
-/// `total_units` whose worst-case checkpoint encoding — every other unit
-/// checkpointed, so the run-length ranges degenerate to one range per pair —
-/// still fits a store holding that object alone. At the 64 KiB unit that is
-/// just under 1 TiB. `max_units_per_object_is_derived_from_the_snapshot_format`
-/// pins both sides of the boundary, so a format change fails the test rather
-/// than silently shifting the limit.
+/// Largest unit count a single object can reserve. Derived from the snapshot
+/// format worst case (~1 TiB at 64 KiB units).
 const MAX_UNITS_PER_OBJECT: u64 = 16_777_198;
 const RECORD_HEADER_BYTES: u64 = 4;
 const RECORD_CHECKSUM_BYTES: u64 = 8;
@@ -113,12 +106,7 @@ impl ResumeStore {
     }
 
     /// Clears a subject's checkpointed units, keeping its reservation.
-    ///
-    /// For a checkpoint whose file no longer exists: the record claims
-    /// durability the disk cannot back, and a later resume seeded from it
-    /// would trust bytes nobody placed. Checkpoints only ever union, so
-    /// clearing needs a snapshot rewrite; a subject with nothing recorded
-    /// is left as it is.
+    /// Used when the checkpoint file is gone.
     ///
     /// # Errors
     /// Surfaces the snapshot rewrite's failure.
@@ -148,12 +136,7 @@ impl ResumeStore {
         Ok(())
     }
 
-    /// Opens the store and makes sure it exists on disk, empty if new.
-    ///
-    /// ADR-0032: the store's presence beside a partial bundle is what
-    /// says the bundle may be continued, so it has to exist from the
-    /// first moment a crash could leave the bundle behind, not from the
-    /// first checkpoint.
+    /// Opens the store, creating it if new. Must exist before any checkpoint.
     ///
     /// # Errors
     /// Surfaces what [`ResumeStore::open`] or the creating write refuses.
@@ -167,11 +150,8 @@ impl ResumeStore {
         Self::open(store.path)
     }
 
-    /// Removes the store and its lock file, for a bundle that is whole:
-    /// a completed bundle looks exactly as one fetched without a store.
-    ///
-    /// # Errors
-    /// Surfaces a file that exists and will not go.
+    /// Removes the store and its lock file. A completed bundle looks like
+    /// one fetched without a store.
     pub fn remove(self) -> Result<(), Error> {
         let lock = lock_path(&self.path)?;
         let temporary = temporary_path(&self.path)?;
@@ -403,9 +383,7 @@ impl ResumeTracker {
     }
 
     pub fn checkpoint(&mut self, store: &mut ResumeStore) -> Result<(), Error> {
-        // Build the pending units as their own runs first, then merge the two
-        // lists in one pass. Inserting them one at a time into a set that
-        // already holds millions of runs would shift the vector per unit.
+        // Merge pending and checkpointed runs in one pass to avoid per-unit shifts.
         let mut pending = UnitRanges::new();
         pending.extend_units(self.completed_since_checkpoint.iter().copied());
         let mut checkpointed = self.checkpointed.clone();
@@ -805,9 +783,7 @@ fn decode_store(path: &Path) -> Result<BTreeMap<SubjectId, StoredObject>, Error>
     if decoder.take(MAGIC.len())? != MAGIC {
         return Err(Error::Corrupt);
     }
-    // Replay accumulates raw runs and normalises once at the end. Merging into
-    // a UnitRanges per record would copy every run replayed so far, and a valid
-    // log can hold hundreds of thousands of checkpoint records.
+    // Replay accumulates raw runs, normalising once at the end.
     let mut objects: BTreeMap<SubjectId, ReplayObject> = BTreeMap::new();
     while !decoder.is_empty() {
         let record_start = bytes.len().saturating_sub(decoder.remaining.len());
@@ -905,8 +881,6 @@ fn encode_subject(subject: &SubjectId, output: &mut Vec<u8>) {
 }
 
 fn encode_ranges(units: &UnitRanges, output: &mut Vec<u8>) {
-    // The set is already run-length in memory, so encoding is a copy rather
-    // than a scan that rediscovers the runs.
     encode_uvarint(u64::try_from(units.run_count()).unwrap_or(u64::MAX), output);
     for (start, length) in units.runs() {
         encode_uvarint(start, output);
@@ -950,10 +924,6 @@ fn append_record(path: &Path, payload: &[u8]) -> Result<(), Error> {
     if !append_fits(current_length, header_length, record_length) {
         return Err(Error::TooLarge);
     }
-    // One test for both effects of creating the file: the magic prefix is
-    // written, and the directory entry needs an fsync. Growing an existing file
-    // changes no directory entry, so the parent fsync is charged once per store
-    // rather than once per checkpoint.
     let created = current_length == 0;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     if created {
@@ -1031,7 +1001,6 @@ fn apply_record(
             if object.total_units != total_units {
                 return Err(Error::Corrupt);
             }
-            // Append only. The whole log is normalised once at the end.
             object.runs.extend(delta);
         }
         SNAPSHOT_RECORD => {
@@ -1074,10 +1043,6 @@ fn decode_ranges(decoder: &mut Decoder<'_>, total_units: u64) -> Result<UnitRang
 
 fn decode_run_list(decoder: &mut Decoder<'_>, total_units: u64) -> Result<Vec<(u64, u64)>, Error> {
     let count = decoder.uvar()?;
-    // Runs are separated by at least one absent unit, so an object of n units
-    // holds at most ceil(n / 2) of them. Checking that before allocating means
-    // a corrupt record cannot ask for a reservation the object could never
-    // justify.
     if count > total_units.div_ceil(2) {
         return Err(Error::Corrupt);
     }
@@ -1093,8 +1058,6 @@ fn decode_run_list(decoder: &mut Decoder<'_>, total_units: u64) -> Result<Vec<(u
         if end > total_units {
             return Err(Error::Corrupt);
         }
-        // Runs stay run-length all the way in. Expanding them here was one
-        // entry per 64 KiB of every object in the store.
         runs.push((start, length));
         previous_end = end;
     }
@@ -1270,10 +1233,6 @@ mod tests {
 
     #[test]
     fn checkpoints_accumulate_under_identity_and_subjects_enumerate() {
-        // The public write path a fetch checkpoints through: unions
-        // accumulate across calls and reopens, identity is held to the
-        // reservation, and the subject listing is what lets a caller find
-        // what a store continues without knowing it beforehand.
         let path = temp_path("accumulate");
         let _ = fs::remove_file(&path);
         let mut store = ResumeStore::create(&path).unwrap();
@@ -1315,9 +1274,6 @@ mod tests {
 
     #[test]
     fn a_reset_clears_the_checkpoint_and_keeps_the_reservation() {
-        // For a checkpoint whose file is gone: the record must shrink,
-        // which only a snapshot rewrite can do, and the reservation must
-        // survive so the object can checkpoint again as it re-fetches.
         let path = temp_path("reset");
         let _ = fs::remove_file(&path);
         let mut store = ResumeStore::create(&path).unwrap();
@@ -1340,8 +1296,6 @@ mod tests {
             &units([1]),
             "the reservation survived and checkpoints again"
         );
-        // A subject never reserved, or one with nothing recorded, resets
-        // to exactly what it was.
         store.reset(subject(0x42)).unwrap();
         store.reset(subject(0x41)).unwrap();
         store.reset(subject(0x41)).unwrap();
@@ -1351,18 +1305,12 @@ mod tests {
 
     #[test]
     fn a_created_store_exists_at_once_and_a_removed_one_is_gone_whole() {
-        // ADR-0032: presence beside a partial bundle is what says the
-        // bundle may be continued, so creation puts the file on disk
-        // before any checkpoint could; removal takes the lock file too,
-        // so a completed bundle looks exactly as one fetched without a
-        // store.
         let path = temp_path("created");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(lock_path(&path).unwrap());
 
         let store = ResumeStore::create(&path).unwrap();
         assert!(path.exists(), "created means on disk, empty or not");
-        // Creating over an existing store keeps what it holds.
         drop(store);
         let mut store = ResumeStore::create(&path).unwrap();
         store.reserve_many([(subject(0x21), 4)]).unwrap();
@@ -1379,12 +1327,9 @@ mod tests {
             !lock_path(&path).unwrap().exists(),
             "and its lock went with it"
         );
-        // Removing what is already gone is nothing to report.
         ResumeStore::create(&path).unwrap().remove().unwrap();
         ResumeStore::open(&path).unwrap().remove().unwrap();
 
-        // A leftover temporary goes too, and a removal that actually
-        // fails says so rather than reporting a store gone that is not.
         let store = ResumeStore::create(&path).unwrap();
         fs::create_dir(temporary_path(&path).unwrap()).unwrap();
         fs::write(temporary_path(&path).unwrap().join("held"), b"x").unwrap();
@@ -1458,9 +1403,6 @@ mod tests {
         fs::remove_file(&exact_header_path).unwrap();
         fs::remove_file(lock_path(&exact_header_path).unwrap()).unwrap();
 
-        // A tail of exactly one header is enough to read a length from, so it
-        // is decoded rather than treated as torn. A zero length is not a record
-        // that was cut short, it is a corrupt one.
         let zero_header_path = temp_path("zero-length-header");
         let mut zero_header = MAGIC.to_vec();
         zero_header.extend_from_slice(&vec![0; RECORD_HEADER_BYTES as usize]);
@@ -1748,8 +1690,6 @@ mod tests {
 
     #[test]
     fn max_units_per_object_is_derived_from_the_snapshot_format() {
-        // A snapshot record holding one object: magic, record header, record
-        // checksum, the snapshot kind byte, and the object-count varint.
         let ceiling = MAX_STORE_BYTES
             - MAGIC.len() as u64
             - RECORD_HEADER_BYTES
@@ -1758,7 +1698,6 @@ mod tests {
             - uvarint_length(1);
         assert!(worst_case_object_payload_length(MAX_UNITS_PER_OBJECT).unwrap() <= ceiling);
         assert!(worst_case_object_payload_length(MAX_UNITS_PER_OBJECT + 1).unwrap() > ceiling);
-        // The cap is a unit count; at 64 KiB units it admits just under 1 TiB.
         let max_object_bytes = MAX_UNITS_PER_OBJECT * 65_536;
         assert!(max_object_bytes < 1 << 40);
         assert!(max_object_bytes > (1 << 40) - (2 << 20));
@@ -1827,7 +1766,6 @@ mod tests {
         let decoded_ranges = decode_ranges(&mut range_decoder, 9).unwrap();
         assert!(range_decoder.is_empty());
         assert_eq!(decoded_ranges, checkpointed);
-        // Three runs, and the encoding says so rather than listing five units.
         assert_eq!(checkpointed.run_count(), 3);
         assert_eq!(encoded_ranges.first().copied(), Some(3));
 
@@ -1904,8 +1842,6 @@ mod tests {
         assert_eq!(decoded_store[&subject(12)].checkpointed, units([3]));
         fs::remove_file(&path).unwrap();
 
-        // The most fragmented an object can be is every other unit, and that
-        // exact shape has to decode.
         let alternating = units([0, 2, 4, 6, 8]);
         assert_eq!(alternating.run_count(), 5);
         let mut encoded_alternating = Vec::new();
@@ -1915,8 +1851,6 @@ mod tests {
             alternating
         );
 
-        // One more run than the object can hold, and a count no object could
-        // ever justify, are both refused before anything is sized from them.
         let mut over_count = Vec::new();
         encode_uvarint(6, &mut over_count);
         assert!(matches!(
@@ -1968,16 +1902,9 @@ mod tests {
         fs::remove_file(lock_path(&no_op_path).unwrap()).unwrap();
     }
 
-    // The two million-object tests are the whole runtime of this suite: 6.3s of
-    // 6.7s. Mutation testing reruns the suite once per mutant, so leaving them
-    // in the default set charges that 272 times. They run in their own CI step
-    // instead.
     #[test]
     #[ignore = "scale test, run with --ignored"]
     fn replaying_many_checkpoint_records_stays_linear() {
-        // Every record adds one isolated run near the front, which is the shape
-        // that made replay copy all prior runs per record. Twenty thousand of
-        // them has to reopen promptly.
         let path = temp_path("replay-many-checkpoints");
         let object = subject(21);
         let total_units = 100_000;
@@ -1997,9 +1924,6 @@ mod tests {
 
     #[test]
     fn a_large_contiguous_object_costs_one_run_in_memory() {
-        // The point of holding checkpoint state as runs. At the maximum object
-        // size a per-unit set would be sixteen million entries; a transfer that
-        // has not lost anything is one run, and one gap makes it two.
         let path = temp_path("run-length-memory");
         let subject = SubjectId {
             suite: 1,
@@ -2026,7 +1950,6 @@ mod tests {
         assert_eq!(held.count(), 250_001);
         assert_eq!(held.run_count(), 2);
 
-        // And it survives a reload, still as runs.
         let reopened = ResumeStore::open(&path).unwrap();
         assert_eq!(reopened.checkpointed(subject).unwrap().run_count(), 2);
         assert_eq!(reopened.checkpointed(subject).unwrap(), &fragmented);
@@ -2083,9 +2006,6 @@ mod tests {
     #[test]
     #[ignore = "scale test, run with --ignored"]
     fn fully_checkpointed_million_object_snapshot_fits_the_store() {
-        // The reserved-only workload above proves the reservation path. This
-        // proves the durable path it grows into: every object checkpointed, so
-        // every object also carries a range record.
         let path = temp_path("million-checkpointed");
         let subject_for = |index: u32| {
             let mut root = [0; 32];

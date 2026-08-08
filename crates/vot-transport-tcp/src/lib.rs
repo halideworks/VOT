@@ -22,11 +22,7 @@ const DEFAULT_COMMAND_BYTE_LIMIT: usize = vot_transport_queue::DEFAULT_BYTE_LIMI
 #[cfg(test)]
 const CONTROL_LIMIT: usize = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD;
 
-/// Most this adapter's inbound queue holds for one event.
-///
-/// `ReceiveLimits` is built against it, so an endpoint cannot advertise a
-/// control frame this backend could never enqueue: retrying would not make it
-/// fit and the queue is empty either way.
+/// Max inbound queue bytes per event. `ReceiveLimits` is built against it.
 pub const INBOUND_BYTE_CAPACITY: usize = vot_transport_queue::INBOUND_BYTE_CAPACITY;
 
 pub use vot_transport_queue::Command;
@@ -48,11 +44,7 @@ pub enum NativeEvent {
 }
 
 /// Bounded TLS/TCP command and event adapter. VOT frame bytes are not rewritten.
-///
-/// What is here rather than in `vot-transport-queue` is what this carrier has of
-/// its own. It is one byte stream, so a lane is a logical identifier with no
-/// open or close, and the count of distinct identifiers a peer has named is the
-/// only lane count there is.
+/// One byte stream: lanes are logical identifiers, not separate streams.
 #[derive(Clone, Debug, Default)]
 pub struct TcpAdapter {
     queue: Queue,
@@ -78,7 +70,6 @@ impl TcpAdapter {
     /// Reports a peer using more lanes than it was told this endpoint carries.
     fn admit_lane(&mut self, stream: u64) -> Result<(), Error> {
         let Some(limits) = self.queue.receive_limits() else {
-            // Nothing advertised, so nothing to hold the peer to.
             return Ok(());
         };
         if self.inbound_lanes.contains(&stream) {
@@ -91,11 +82,8 @@ impl TcpAdapter {
         Ok(())
     }
 
-    /// Applies what this endpoint advertises.
-    ///
-    /// The bound has to be in force before the peer's first frame: accepting
-    /// more than was advertised is silent otherwise, since the peer sends what
-    /// it was told it could and this endpoint takes more.
+    /// Applies what this endpoint advertised. Must be in force before the
+    /// peer's first frame.
     pub const fn set_receive_limits(&mut self, limits: vot_transport_api::ReceiveLimits) {
         self.queue.set_receive_limits(limits);
     }
@@ -106,8 +94,6 @@ impl TcpAdapter {
     /// Rejects oversized records, arithmetic overflow, or a full inbound queue.
     pub fn record_native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let event = translate(event);
-        // The payload rules first, so a record this endpoint would refuse never
-        // counts a lane against the peer that sent it.
         self.queue.validate_event(&event)?;
         if let Event::Reliable { stream, .. } = &event {
             self.admit_lane(stream.0)?;
@@ -119,10 +105,7 @@ impl TcpAdapter {
         self.queue.next_command()
     }
 
-    /// Gives a carrier driver one queued command at a time.
-    ///
-    /// A failed submission remains at the head of the queue so a caller can
-    /// retry or close the carrier without silently dropping data.
+    /// Gives a carrier driver one queued command. Failed submissions stay queued.
     ///
     /// # Errors
     /// Returns the first carrier error reported by `submit`.
@@ -157,15 +140,10 @@ fn translate(event: NativeEvent) -> Event {
 
 impl TransportAdapter for TcpAdapter {
     fn receive_limits(&self) -> Option<vot_transport_api::ReceiveLimits> {
-        // This adapter does bound the control frames it accepts, in
-        // `record_native_event`, so a session can check that what it is about
-        // to advertise is what will be enforced.
         self.queue.receive_limits()
     }
 
     fn set_control_payload_limit(&mut self, limit: usize) -> Result<(), Error> {
-        // The send bound only. What this endpoint accepts is what it
-        // advertised, and a peer's limit must not widen or narrow that.
         self.queue.set_control_send_limit(limit)
     }
 
@@ -178,8 +156,6 @@ impl TransportAdapter for TcpAdapter {
     }
 
     fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
-        // Checked before the payload is shared, so an oversized record costs no
-        // allocation.
         vot_transport_api::validate_data_record(record)?;
         self.send_reliable_shared(stream, shared_payload(record))
     }
@@ -204,15 +180,8 @@ impl TransportAdapter for TcpAdapter {
         self.queue.set_receive_credit(bytes)
     }
 
-    /// Always absent on this backend.
-    ///
-    /// This crate is a bounded command queue and a rustls state machine. It
-    /// owns no socket, so there is nothing here to sample; the msquic backend
-    /// reports metrics because a driver reads them off a live connection and
-    /// pushes them in. Reporting a fabricated RTT or congestion window instead
-    /// would be worse than reporting nothing, because ADR-0013 says a backend
-    /// that cannot expose enough state does not use Careful Resume, and that
-    /// decision is made from this value.
+    /// Always absent on this backend. No socket to sample; fabricated metrics
+    /// would be worse than none.
     fn path_stats(&self) -> Option<PathStats> {
         None
     }
@@ -254,10 +223,6 @@ impl TlsClientCarrier {
 
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
-        // A rustls client leaves the handshake only after certificate and
-        // server-name validation succeeds under its ClientConfig. Plaintext is
-        // VOT data only when the peer also selected the VOT application
-        // protocol.
         !self.connection.is_handshaking()
             && self.connection.alpn_protocol() == Some(vot_transport_api::ALPN)
     }
@@ -658,19 +623,12 @@ mod tests {
 
     #[test]
     fn a_peer_using_more_lanes_than_advertised_is_refused() {
-        // Reporting the limit as enforced while accepting any number of lanes
-        // is worse than not reporting it: a session checks the carrier agrees
-        // with what it advertises and then nothing holds the peer to it.
-        //
-        // One byte stream carries every lane here, so a lane has no open or
-        // close of its own and distinct identifiers seen is the whole count.
         let mut adapter = TcpAdapter::default();
         let record = |lane: u64| NativeEvent::Reliable {
             stream: lane,
             sequence: lane,
             bytes: vec![0; 8],
         };
-        // Nothing advertised yet, so nothing to hold the peer to.
         assert_eq!(adapter.receive_limits(), None);
         for lane in 0..4 {
             adapter.record_native_event(record(lane)).unwrap();
@@ -689,7 +647,6 @@ mod tests {
         );
         bounded.record_native_event(record(1)).unwrap();
         bounded.record_native_event(record(2)).unwrap();
-        // A lane already seen is free.
         bounded.record_native_event(record(1)).unwrap();
         assert_eq!(
             bounded.record_native_event(record(3)),
@@ -700,8 +657,6 @@ mod tests {
 
     #[test]
     fn the_two_control_bounds_move_independently() {
-        // A limit the inbound queue could never hold is refused before it can
-        // be advertised, whatever the protocol range allows.
         assert_eq!(INBOUND_BYTE_CAPACITY, DEFAULT_COMMAND_BYTE_LIMIT);
         let too_large = vot_transport_api::ReceiveLimits::advertised(
             &vot_codec::Settings {
@@ -714,10 +669,6 @@ mod tests {
         );
         assert_eq!(too_large, Err(Error::InvalidConfiguration));
 
-        // What this endpoint sends is bounded by what the peer advertised. What
-        // it accepts is bounded by what it advertised itself. One setter for
-        // both would either send frames the peer will refuse or accept frames
-        // this endpoint said it would not.
         let envelope = vot_transport_api::MAX_FRAME_ENVELOPE_BYTES;
         let mut adapter = TcpAdapter::default();
         assert_eq!(
@@ -730,8 +681,6 @@ mod tests {
             "nothing is advertised until it is configured"
         );
 
-        // The peer allows more than the default, so more may be sent. The
-        // receive bound does not move with it.
         adapter.set_control_payload_limit(2 * 1024 * 1024).unwrap();
         assert_eq!(
             adapter.receive_limits(),
@@ -752,7 +701,6 @@ mod tests {
             "still only what this endpoint advertised"
         );
 
-        // Advertising more raises the receive bound, and only that.
         let wide = vot_transport_api::ReceiveLimits::advertised(
             &vot_codec::Settings {
                 max_control_frame_payload: 2 * 1024 * 1024,
@@ -768,9 +716,6 @@ mod tests {
             Ok(())
         );
 
-        // A peer allowing more than the queue holds does not let this endpoint
-        // send more: the bound is clamped, so an oversized frame is refused at
-        // submission rather than queued for ever.
         let mut generous = TcpAdapter::default();
         generous
             .set_control_payload_limit(vot_codec::HARD_MAX_FRAME_PAYLOAD)
@@ -783,9 +728,6 @@ mod tests {
             "refused at submission, not queued for ever"
         );
 
-        // And advertising less is enforced, which is the direction that was
-        // silent before: the peer sends what it was told it could and this
-        // endpoint takes exactly that.
         let mut narrow = TcpAdapter::default();
         let narrow_limits = vot_transport_api::ReceiveLimits::advertised(
             &vot_codec::Settings {

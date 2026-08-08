@@ -27,16 +27,9 @@ pub(crate) struct Loopback {
     pub(crate) fail_sends_with: Option<vot_transport_api::Error>,
     pub(crate) closed: Option<u16>,
     /// What the carrier reports when a driving loop waits on it.
-    ///
-    /// A fake carrier otherwise never delivers anything a pass did not
-    /// already put there, so a loop that waits for one can only be tested
-    /// against a loop that never needed to.
     pub(crate) on_wait: VecDeque<Event>,
-    /// A rendezvous other carriers share, for tests whose subject is
-    /// concurrency itself: a wait blocks until the expected number of
-    /// carriers are waiting at once, so a loop that drives sessions one
-    /// after another deadlocks where a concurrent one passes. Bounded,
-    /// because a deadlock should fail the test rather than hang it.
+    /// A rendezvous for concurrency tests. A wait blocks until the expected
+    /// number of carriers are waiting at once.
     pub(crate) rendezvous: Option<std::sync::Arc<Rendezvous>>,
 }
 
@@ -56,9 +49,7 @@ impl Rendezvous {
         })
     }
 
-    /// Blocks until `expected` waiters have arrived, or panics after a
-    /// bound: the sequential loop this exists to reject would otherwise
-    /// hold the suite forever.
+    /// Blocks until `expected` waiters arrive, or panics after a bound.
     fn meet(&self) {
         let mut waiting = self.state.lock().expect("the gate");
         *waiting += 1;
@@ -154,13 +145,8 @@ impl DuplexQueue {
     }
 }
 
-/// A thread-safe carrier pair: what one end sends is what the other end
-/// polls, and a wait parks on arrival rather than an interval.
-///
-/// The cross-thread counterpart of [`Loopback`], for tests whose subject
-/// is rails (ADR-0031): whole sessions driven on their own threads, with
-/// no pump to interleave them. Dropping an end hangs up, so a session
-/// whose peer is done hears a disconnect rather than stalling out.
+/// Thread-safe carrier pair. What one end sends, the other polls.
+/// Dropping an end hangs up.
 pub(crate) struct Duplex {
     inbox: std::sync::Arc<DuplexQueue>,
     outbox: std::sync::Arc<DuplexQueue>,
@@ -262,8 +248,6 @@ pub(crate) fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, P
         fs::write(path, bytes).unwrap();
     }
     let summary = build_bundle(&source, &bundle).unwrap();
-    // The source has served its purpose; only the bundle is answered from,
-    // and what a test leaves behind it leaves behind for every mutant.
     fs::remove_dir_all(&source).unwrap();
     (bundle, summary)
 }
@@ -291,9 +275,7 @@ pub(crate) fn decode_control(bytes: &[u8]) -> TypedFrame {
     frame
 }
 
-/// Moves everything `from` sent into `to`'s inbound events, the way a
-/// carrier would: control frames in order, records as reliable events with
-/// per-call sequence numbers. Returns whether anything moved.
+/// Moves everything `from` sent into `to`'s inbound events.
 pub(crate) fn pump(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u64) -> bool {
     let mut moved = false;
     for frame in std::mem::take(&mut from.control) {
@@ -312,15 +294,11 @@ pub(crate) fn pump(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u
     moved
 }
 
-/// Bytes that do not compress, for a test whose point is how much the
-/// carrier and the receiver actually hold: patterned data shrinks to
-/// almost nothing in a record, and a byte budget several bundles wide
-/// then never fills.
+/// Incompressible bytes for tests that exercise byte budgets.
 pub(crate) fn noise(length: usize) -> Vec<u8> {
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut bytes = Vec::with_capacity(length);
     while bytes.len() < length {
-        // xorshift64*, whose output does not repeat within any record.
         state ^= state >> 12;
         state ^= state << 25;
         state ^= state >> 27;
@@ -331,11 +309,8 @@ pub(crate) fn noise(length: usize) -> Vec<u8> {
     bytes
 }
 
-/// Moves everything `from` sent into `to`'s inbound events with every
-/// record ahead of every control frame, which is what a real wire does
-/// when the data lane outruns the control stream: whole bundles of
-/// records arrive before the proofs that name them. Relative order
-/// within each kind is preserved, as each stream's is on the wire.
+/// Moves records ahead of control frames (simulates data lane outrunning
+/// control). Relative order within each kind is preserved.
 pub(crate) fn pump_records_first(from: &mut Loopback, to: &mut Loopback, next_sequence: &mut u64) {
     for (stream, bytes) in std::mem::take(&mut from.records) {
         *next_sequence += 1;
@@ -350,11 +325,8 @@ pub(crate) fn pump_records_first(from: &mut Loopback, to: &mut Loopback, next_se
     }
 }
 
-/// Removes what a test wrote.
-///
-/// `temporary` paths outlive the process that made them, and a mutation
-/// run is this suite over and over: a bundle left behind per run per
-/// mutant fills a CI runner's disk long before the mutants are through.
+/// Removes temporary paths. Paths outlive the process; this prevents
+/// disk accumulation.
 pub(crate) fn discard(paths: &[&std::path::Path]) {
     for path in paths {
         let _ = fs::remove_dir_all(path);

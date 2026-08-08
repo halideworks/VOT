@@ -2380,6 +2380,9 @@ dependencies = [
 [[package]]
 name = "vot-journal"
 version = "0.0.1"
+dependencies = [
+ "fs4",
+]
 
 [[package]]
 name = "vot-log"

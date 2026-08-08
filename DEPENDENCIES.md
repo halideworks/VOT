@@ -27,7 +27,7 @@ Minimum Rust version: 1.88.
 | `unicode-normalization` | 0.1.24 | NFC for portable path collision checks |
 | `aligned-vec` | 0.6.4 | Aligned buffers for direct I/O |
 | `rustix` | 1.1.4 | Safe Linux `O_DIRECT` |
-| `fs4` | 1.1.0 | Cross-platform file locking for resume store |
+| `fs4` | 1.1.0 | Cross-platform file locking for the resume store and journal writer leases |
 | `libc` | 0.2.189 | Don't-fragment socket options, process metrics |
 
 ### Optional (`s3-live` feature)

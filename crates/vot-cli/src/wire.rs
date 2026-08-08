@@ -124,7 +124,7 @@ impl Drop for Ephemeral {
 }
 
 impl Ephemeral {
-    /// Generates a self-signed ECDSA P-256 certificate. BoringSSL rejects
+    /// Generates a self-signed ECDSA P-256 certificate. `BoringSSL` rejects
     /// Ed25519 leaves; RSA generation is too slow for an unchecked cert.
     fn generate() -> Result<Self, Error> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)

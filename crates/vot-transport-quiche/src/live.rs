@@ -370,8 +370,36 @@ impl Transport {
         server_name: Option<&str>,
         config: &Config,
     ) -> Result<Self, Error> {
-        Self::start(
-            address,
+        let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
+        Self::connect_on(socket, peer, server_name, config)
+    }
+
+    /// Connects to `peer` on an already-bound socket.
+    ///
+    /// A caller that made itself reachable on a socket, by punching a NAT or
+    /// announcing that socket's mapping, hands it here so the handshake comes
+    /// from the mapping the peer was told to expect.
+    ///
+    /// # Errors
+    /// Reports a socket or configuration failure. A socket bound to a
+    /// wildcard address is refused: quiche needs the local address the
+    /// packets will carry.
+    pub fn connect_on(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        server_name: Option<&str>,
+        config: &Config,
+    ) -> Result<Self, Error> {
+        if socket
+            .local_addr()
+            .map_err(|_| Error::Backend)?
+            .ip()
+            .is_unspecified()
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Self::start_on(
+            socket,
             Some((peer, server_name.map(str::to_owned))),
             config,
             Role::Client,
@@ -385,6 +413,15 @@ impl Transport {
         role: Role,
     ) -> Result<Self, Error> {
         let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
+        Self::start_on(socket, peer, config, role)
+    }
+
+    fn start_on(
+        socket: UdpSocket,
+        peer: Option<(SocketAddr, Option<String>)>,
+        config: &Config,
+        role: Role,
+    ) -> Result<Self, Error> {
         // Discovery's probes must be dropped where the path narrows, never
         // fragmented and reassembled: a reassembled probe reads as success and
         // locks the connection above the path for good.
@@ -495,6 +532,31 @@ impl Transport {
             // only covers a driver that exited without ever pushing, which
             // the check above then sees.
             signal.wait(ARRIVAL_TICK);
+        }
+    }
+
+    /// Whether the connection formed within `bound`.
+    ///
+    /// Peeks, so the lifecycle event it reads is still there for the session
+    /// to drain. A path whose peer never opened its side fails by silence and
+    /// has no other tell.
+    pub fn connected_within(&self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            let signal = {
+                let Ok(inbound) = self.inbound.lock() else {
+                    return false;
+                };
+                match inbound.events.iter().find_map(lifecycle_verdict) {
+                    Some(verdict) => return verdict,
+                    None => Arc::clone(&inbound.arrived),
+                }
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            signal.wait(ARRIVAL_TICK.min(left));
         }
     }
 
@@ -991,6 +1053,16 @@ fn read_ran_out(error: &std::io::Error) -> bool {
 /// a driver that exited without pushing is noticed, and it prices that
 /// detection, not the arrival itself.
 const ARRIVAL_TICK: Duration = Duration::from_millis(250);
+
+/// A lifecycle event read as a verdict on the connection. Anything else
+/// says nothing about whether the handshake landed.
+const fn lifecycle_verdict(event: &NativeEvent) -> Option<bool> {
+    match event {
+        NativeEvent::Connected(_) => Some(true),
+        NativeEvent::Disconnected(_) => Some(false),
+        _ => None,
+    }
+}
 
 /// Reads a router holds for a pump that has not drained them.
 ///
@@ -2439,6 +2511,91 @@ mod tests {
         });
         assert_eq!(carried(&on_client1), vec![frame(b"first-answer")]);
         assert_eq!(carried(&on_client2), vec![frame(b"second-answer")]);
+    }
+
+    #[test]
+    fn a_connection_on_a_given_socket_speaks_from_that_socket() {
+        // A punched socket is only worth punching if the handshake leaves by
+        // it: the peer's NAT was opened for that mapping and no other.
+        let (certificate, key) = credentials();
+        let config = Config::server(limits(), certificate, key);
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let address = listener.local_address();
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        client_config.idle_timeout_ms = 3_000;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        let punched = socket.local_addr().expect("a local address");
+        let mut client = Transport::connect_on(socket, address, Some("localhost"), &client_config)
+            .expect("a client");
+        assert_eq!(client.local_address(), punched, "the socket it was given");
+        let mut server = listener.accept().expect("the connection");
+        client.send_control(&frame(b"punched")).expect("a frame");
+        let (_, on_server) = pump_until(&mut client, &mut server, 15, |_, server| {
+            server
+                .iter()
+                .any(|event| matches!(event, Event::Control(_)))
+        });
+        assert!(
+            on_server
+                .iter()
+                .any(|event| matches!(event, Event::Control(bytes) if bytes.as_ref() == frame(b"punched"))),
+            "the handshake and the frame crossed on the given socket"
+        );
+
+        let wildcard = UdpSocket::bind("0.0.0.0:0").expect("a socket");
+        assert!(
+            matches!(
+                Transport::connect_on(wildcard, address, Some("localhost"), &client_config),
+                Err(Error::InvalidConfiguration)
+            ),
+            "quiche needs the local address the packets will carry"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_never_forms_says_so_before_the_idle_timeout() {
+        // What a punched path that the peer's NAT never opened looks like from
+        // here: an address that answers nothing at all.
+        let silent = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        let nowhere = silent.local_addr().expect("a local address");
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        client_config.idle_timeout_ms = 30_000;
+        let client = Transport::connect(
+            "127.0.0.1:0".parse().expect("an address"),
+            nowhere,
+            Some("localhost"),
+            &client_config,
+        )
+        .expect("a client");
+        assert!(
+            !client.connected_within(Duration::from_millis(400)),
+            "silence is not a connection, and the verdict beats the idle timeout"
+        );
+
+        let (certificate, key) = credentials();
+        let config = Config::server(limits(), certificate, key);
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let answering = Transport::connect(
+            "127.0.0.1:0".parse().expect("an address"),
+            listener.local_address(),
+            Some("localhost"),
+            &client_config,
+        )
+        .expect("a client");
+        let _server = listener.accept().expect("the connection");
+        assert!(
+            answering.connected_within(Duration::from_secs(5)),
+            "a handshake that landed is a verdict, not a wait"
+        );
+        assert!(
+            answering.connected_within(Duration::from_millis(0)),
+            "the verdict was peeked, so it is still there to read"
+        );
     }
 
     #[test]

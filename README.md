@@ -54,6 +54,18 @@ vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE \
 vot rendezvous LISTEN_ADDR
 ```
 
+A fetch may name the package root where an address goes, which removes the
+port-forward on an unmanaged network. Both ends point `VOT_RENDEZVOUS` at the
+same service: the serve registers under a hash of the root, the fetch resolves
+it, and each end punches the other's NAT. Symmetric and carrier-grade NAT
+defeat the punch by construction, and the fetch says so rather than hanging.
+
+```sh
+export VOT_RENDEZVOUS=rendezvous.example:9999
+vot serve BUNDLE_DIR 0.0.0.0:0            # registers under the bundle's root
+vot fetch ROOT BUNDLE_DIR                 # resolves that root, no address
+```
+
 The channel is not authenticated. The server presents a throwaway certificate
 and the client does not verify it. What an attacker cannot do is serve different
 bytes: every range proves to its object root, every root is named by the
@@ -67,7 +79,7 @@ which package the fetcher will accept.
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
 | `VOT_FETCH_RAILS` | `min(4, cores)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
-| `VOT_RENDEZVOUS` | unset | Rendezvous service address for serve registration |
+| `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
 
 ## Keys

@@ -55,8 +55,10 @@ the human-carried `ADDR:PORT` with a machine-carried one.
   minutes, refreshed by the serve's periodic re-registration (which is
   also what keeps the serve's NAT mapping alive). Replies are no larger
   than requests and go only to the observed source, so the service
-  amplifies nothing. A default endpoint ships in the binary;
-  `VOT_RENDEZVOUS` overrides it; running your own is one command.
+  amplifies nothing. No endpoint is baked into the
+  binary: `VOT_RENDEZVOUS` names one, as an address or a name, and both
+  ends name the same one. Running your own is one command, and which one
+  to run is a deployment's choice rather than the tool's.
 - **Rendezvous datagrams share the serve's socket and are told apart by
   a magic prefix** that is not a valid QUIC long or short header lead
   byte. The listener's router hands them to the registration state and
@@ -64,12 +66,14 @@ the human-carried `ADDR:PORT` with a machine-carried one.
   before its connection exists and owns its socket alone.
 - **Fallbacks are ordered and explicit.** A literal address argument
   behaves exactly as today and involves no rendezvous. A root argument
-  tries the peer's mappings in order: a directly reachable address
-  (including IPv6, where NAT usually does not apply) before a punched
-  one. A punch that cannot complete, which is what a symmetric or
-  carrier-grade NAT produces, fails within a bounded number of attempts
-  and says so by name, pointing at the direct-address and overlay
-  routes rather than timing out silently.
+  uses the one mapping the service observed, which is already the
+  directly reachable address when nothing translates it, and is an IPv6
+  address when the serve registered over IPv6; the service holds one
+  mapping per key, so there is no candidate list to order. A punch that
+  cannot complete, which is what a symmetric or carrier-grade NAT
+  produces, fails within a bounded number of attempts and says so by
+  name, pointing at the direct-address and overlay routes rather than
+  timing out silently.
 
 ## Consequences
 

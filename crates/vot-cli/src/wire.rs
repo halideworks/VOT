@@ -363,19 +363,12 @@ pub fn rendezvous_service(
 /// Rendezvous service address. Unset means no registration.
 const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
 
-/// Parses [`RENDEZVOUS`] as an address. No DNS resolution.
+/// The service [`RENDEZVOUS`] names, or nothing when it is unset.
 ///
 /// # Errors
-/// Rejects a value that is not an `ADDR:PORT`.
+/// Rejects a value that is neither an address nor a name that resolves.
 fn rendezvous_from(pin: Option<&str>) -> Result<Option<SocketAddr>, Error> {
-    let Some(value) = pin else {
-        return Ok(None);
-    };
-    value
-        .trim()
-        .parse()
-        .map(Some)
-        .map_err(|_| Error::InvalidArguments)
+    pin.map(crate::parse_rendezvous).transpose()
 }
 
 /// Side-channel read timeout for the registration thread.
@@ -456,15 +449,34 @@ fn fetch_railed(
     pin: Option<[u8; 32]>,
     rails: usize,
 ) -> Result<PackageSummary, Error> {
+    let config = client_config()?;
+    let connect = || {
+        Transport::connect(local_for(address)?, address, Some("localhost"), &config)
+            .map_err(carrier_failure)
+    };
+    fetch_with(connect, bundle, pin, rails)
+}
+
+/// The configuration every fetch rail is opened with.
+fn client_config() -> Result<Config, Error> {
     let mut config = Config::client(limits()?);
     // Channel is unauthenticated; proof verification catches forged servers.
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
-    let connect = || {
-        Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-            .map_err(carrier_failure)
-    };
+    Ok(config)
+}
+
+/// Fetches `bundle` over `rails` carriers that `connect` opens.
+fn fetch_with<F>(
+    connect: F,
+    bundle: &Path,
+    pin: Option<[u8; 32]>,
+    rails: usize,
+) -> Result<PackageSummary, Error>
+where
+    F: Fn() -> Result<Transport, Error> + Sync,
+{
     let mut fetcher = BundleFetcher::begin(connect()?, bundle, pin)?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
@@ -483,30 +495,59 @@ fn fetch_railed(
 /// How long a resolve attempt waits for the service to answer.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long to wait after resolving for the serve to warm the path.
-const WARMING_WAIT: Duration = Duration::from_millis(500);
+/// How long a rail waits for the serve's warming before connecting anyway.
+/// Long enough to cover a wide-area round trip to the service and the
+/// serve's next registrar pass.
+const WARMING_WAIT: Duration = Duration::from_millis(1_500);
+
+/// Datagrams either rendezvous wait reads before giving up, so whatever
+/// else arrives on the socket cannot extend a wait without bound.
+const STRAY_READS: usize = 8;
 
 /// Retries a resolve when no serve is registered yet.
 const RESOLVE_RETRIES: u32 = 6;
 
-/// Resolves a package root to a serve address via a rendezvous service.
+/// How long a rail waits between resolves when the key is not registered.
+const RESOLVE_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// How long a punched rail waits for its handshake before the path is
+/// called unpunchable.
+const PUNCH_WAIT: Duration = Duration::from_secs(10);
+
+/// A rail's socket after the service has seen it: bound, announced under
+/// the key, and given the serve time to open its side. `serve` is the
+/// mapping the service holds for the key.
+struct Punched {
+    socket: std::net::UdpSocket,
+    serve: SocketAddr,
+}
+
+/// Announces one rail's socket at the service and waits for the warming.
 ///
-/// Sends `Resolve` datagrams to the service at `service_address`, retrying
-/// until a registered serve is found or the retry budget is spent. Returns
-/// the serve's observed mapping.
+/// The `Resolve` leaves by the socket the session will use, so the mapping
+/// the service forwards to the serve is the one the Initial arrives from.
+/// Any other socket earns a hole in the serve's NAT that this rail's
+/// packets do not fit through.
 ///
 /// # Errors
-/// Returns [`Error::RendezvousUnresolved`] if no serve is found before the
-/// retry budget is spent, or [`Error::CarrierUnavailable`] if the socket
-/// fails.
-pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, Error> {
-    let key = crate::rendezvous::key_of(&root);
-    let socket = std::net::UdpSocket::bind(if service.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    })
-    .map_err(|_| Error::CarrierUnavailable)?;
+/// Returns [`Error::RendezvousUnresolved`] when no serve is registered
+/// under the key before the retry budget is spent, and
+/// [`Error::CarrierUnavailable`] for a socket that will not bind or send.
+fn punch(key: [u8; 32], service: SocketAddr) -> Result<Punched, Error> {
+    punch_within(key, service, RESOLVE_RETRY_WAIT, WARMING_WAIT)
+}
+
+/// [`punch`] with its two waits as arguments, so a test spends neither.
+fn punch_within(
+    key: [u8; 32],
+    service: SocketAddr,
+    retry: Duration,
+    warming: Duration,
+) -> Result<Punched, Error> {
+    // Bound toward the service, so the socket is in the service's family, and
+    // so is every mapping the service ever observed to answer with.
+    let socket =
+        std::net::UdpSocket::bind(local_for(service)?).map_err(|_| Error::CarrierUnavailable)?;
     socket
         .set_read_timeout(Some(RESOLVE_TIMEOUT))
         .map_err(|_| Error::CarrierUnavailable)?;
@@ -518,45 +559,114 @@ pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, E
                 service,
             )
             .map_err(|_| Error::CarrierUnavailable)?;
-        let (length, _) = match socket.recv_from(&mut buffer) {
-            Ok(arrival) => arrival,
-            Err(error) => {
-                if waited_out(&error) {
-                    continue;
-                }
-                return Err(Error::CarrierUnavailable);
-            }
-        };
-        let Some(crate::rendezvous::Datagram::Resolved {
-            serve: Some(serve), ..
-        }) = crate::rendezvous::decode(&buffer[..length])
-        else {
-            continue;
-        };
-        return Ok(serve);
+        if let Some(serve) = resolved(&socket, &mut buffer, key)? {
+            wait_warm(&socket, &mut buffer, warming)?;
+            return Ok(Punched { socket, serve });
+        }
+        // A serve that has not registered yet is the case worth waiting on:
+        // the answer came back at once, so the next attempt would too.
+        std::thread::sleep(retry);
     }
     Err(Error::RendezvousUnresolved)
 }
 
+/// Reads until the service names a serve for `key` or the read runs out.
+/// Nothing named is a retry, not a failure.
+fn resolved(
+    socket: &std::net::UdpSocket,
+    buffer: &mut [u8; 128],
+    key: [u8; 32],
+) -> Result<Option<SocketAddr>, Error> {
+    for _ in 0..STRAY_READS {
+        let (length, _) = match socket.recv_from(buffer) {
+            Ok(arrival) => arrival,
+            Err(error) if waited_out(&error) => return Ok(None),
+            Err(_) => return Err(Error::CarrierUnavailable),
+        };
+        let Some(crate::rendezvous::Datagram::Resolved {
+            key: answered,
+            serve,
+        }) = crate::rendezvous::decode(&buffer[..length])
+        else {
+            continue;
+        };
+        if answered == key {
+            return Ok(serve);
+        }
+    }
+    Ok(None)
+}
+
+/// Waits for the serve's warming, the one sign this end gets that the
+/// serve has sent something toward this mapping.
+///
+/// A NAT that filters by port sheds the warming, so its absence proves
+/// nothing and the wait is a floor on how long the serve has had to open
+/// its side.
+fn wait_warm(
+    socket: &std::net::UdpSocket,
+    buffer: &mut [u8; 128],
+    wait: Duration,
+) -> Result<(), Error> {
+    socket
+        .set_read_timeout(Some(wait))
+        .map_err(|_| Error::CarrierUnavailable)?;
+    for _ in 0..STRAY_READS {
+        let Ok((length, _)) = socket.recv_from(buffer) else {
+            return Ok(());
+        };
+        if crate::rendezvous::decode(&buffer[..length])
+            == Some(crate::rendezvous::Datagram::Warming)
+        {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// Fetches a bundle by resolving `root` through a rendezvous service.
 ///
-/// Resolves the root, waits briefly for the serve to warm the path, then
-/// fetches with the root as both the address and the pin.
+/// Every rail punches for itself: one hole in the serve's NAT admits one
+/// mapping, and each rail's socket is its own.
 ///
 /// # Errors
-/// Surfaces a resolution failure, or what [`fetch_railed`] does.
+/// Returns [`Error::RendezvousUnpunched`] when a serve is registered but
+/// no session forms, which symmetric or carrier-grade NAT on either end
+/// produces. Otherwise surfaces a resolution failure, or what
+/// [`fetch_with`] does.
 pub fn fetch_via_rendezvous(
     root: [u8; 32],
     bundle: &Path,
     service: SocketAddr,
 ) -> Result<PackageSummary, Error> {
-    let address = resolve_root(root, service)?;
-    std::thread::sleep(WARMING_WAIT);
     let rails = rails_from(
         std::env::var(FETCH_RAILS).ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
     )?;
-    fetch_railed(address, bundle, Some(root), rails)
+    fetch_via_rendezvous_railed(root, bundle, service, rails)
+}
+
+/// Fetches through a rendezvous at an explicit rail width.
+fn fetch_via_rendezvous_railed(
+    root: [u8; 32],
+    bundle: &Path,
+    service: SocketAddr,
+    rails: usize,
+) -> Result<PackageSummary, Error> {
+    let config = client_config()?;
+    let key = crate::rendezvous::key_of(&root);
+    let connect = || {
+        let punched = punch(key, service)?;
+        let carrier =
+            Transport::connect_on(punched.socket, punched.serve, Some("localhost"), &config)
+                .map_err(carrier_failure)?;
+        if carrier.connected_within(PUNCH_WAIT) {
+            Ok(carrier)
+        } else {
+            Err(Error::RendezvousUnpunched)
+        }
+    };
+    fetch_with(connect, bundle, Some(root), rails)
 }
 
 #[cfg(test)]
@@ -806,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rendezvous_is_the_address_given_or_nowhere() {
+    fn a_rendezvous_is_the_address_or_name_given_or_nowhere() {
         assert!(std::env::var(RENDEZVOUS).is_err(), "the suite owns no env");
         assert_eq!(rendezvous_from(None).expect("unset is nowhere"), None);
         assert_eq!(
@@ -822,8 +932,13 @@ mod tests {
                 rendezvous_from(Some("rendezvous.example.com")),
                 Err(Error::InvalidArguments)
             ),
-            "a name is not resolved here"
+            "a name without a port names no service"
         );
+        let named = rendezvous_from(Some("localhost:9000"))
+            .expect("a name the resolver knows")
+            .expect("an address");
+        assert!(named.ip().is_loopback(), "localhost is this machine");
+        assert_eq!(named.port(), 9000);
         assert!(matches!(
             rendezvous_from(Some("198.51.100.7")),
             Err(Error::InvalidArguments)
@@ -832,6 +947,143 @@ mod tests {
             rendezvous_from(Some("")),
             Err(Error::InvalidArguments)
         ));
+    }
+
+    /// A service that answers one resolve with `serve`, warms whoever asked,
+    /// and reports the source it observed. Ahead of the answer it sends what
+    /// a rail has to read past: a datagram that is no answer, and an answer
+    /// under another key naming `elsewhere`.
+    fn one_resolve(
+        serve: SocketAddr,
+        elsewhere: SocketAddr,
+    ) -> (SocketAddr, std::thread::JoinHandle<SocketAddr>) {
+        use crate::rendezvous::{Datagram, decode, encode};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        let at = socket.local_addr().expect("the service address");
+        let thread = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 128];
+            loop {
+                let (length, from) = socket.recv_from(&mut buffer).expect("a resolve");
+                let Some(Datagram::Resolve { key }) = decode(&buffer[..length]) else {
+                    continue;
+                };
+                let noise = [
+                    Datagram::Registered { key },
+                    Datagram::Resolved {
+                        key: [0xAB; 32],
+                        serve: Some(elsewhere),
+                    },
+                    Datagram::Resolved {
+                        key,
+                        serve: Some(serve),
+                    },
+                    Datagram::Warming,
+                ];
+                for datagram in noise {
+                    socket.send_to(&encode(&datagram), from).expect("an answer");
+                }
+                return from;
+            }
+        });
+        (at, thread)
+    }
+
+    #[test]
+    fn a_rail_announces_the_socket_it_then_connects_on() {
+        // The mapping the service observes is what the serve opens its NAT
+        // for, so it has to be the session's own socket. Loopback cannot
+        // filter by port, so the identity itself is the assertion.
+        let serve: SocketAddr = "203.0.113.7:4433".parse().expect("an address");
+        let elsewhere: SocketAddr = "198.51.100.9:4433".parse().expect("an address");
+        let (service, observed) = one_resolve(serve, elsewhere);
+        let punched = punch_within(
+            [5; 32],
+            service,
+            Duration::from_millis(1),
+            Duration::from_millis(50),
+        )
+        .expect("a punch");
+        assert_eq!(
+            punched.serve, serve,
+            "the mapping the service holds under this key, not another"
+        );
+        assert_eq!(
+            punched.socket.local_addr().expect("the socket"),
+            observed.join().expect("the service thread"),
+            "the announced mapping is the socket the session connects on"
+        );
+    }
+
+    #[test]
+    fn a_rail_reads_its_warming_and_gives_up_without_one() {
+        use crate::rendezvous::{Datagram, encode};
+
+        let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
+        let at = rail.local_addr().expect("the rail address");
+        let serve = UdpSocket::bind("127.0.0.1:0").expect("a serve socket");
+        serve
+            .send_to(&encode(&Datagram::Registered { key: [1; 32] }), at)
+            .expect("something that is not a warming");
+        serve
+            .send_to(&encode(&Datagram::Warming), at)
+            .expect("a warming");
+        let mut buffer = [0_u8; 128];
+        wait_warm(&rail, &mut buffer, Duration::from_secs(10)).expect("a wait");
+        rail.set_nonblocking(true).expect("a peek");
+        assert!(
+            rail.recv_from(&mut buffer).is_err(),
+            "the warming was read, not left for the session's socket"
+        );
+        rail.set_nonblocking(false).expect("a bounded wait");
+        wait_warm(&rail, &mut buffer, Duration::from_millis(50))
+            .expect("a warming that never comes is not a failure");
+    }
+
+    #[test]
+    fn a_root_nobody_registered_is_unresolved_rather_than_punched() {
+        use crate::rendezvous::{Datagram, decode, encode};
+
+        // A service that is up and answers, but holds no mapping for the key.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        let at = socket.local_addr().expect("the service address");
+        let service = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 128];
+            let mut answered = 0_u32;
+            while answered < RESOLVE_RETRIES {
+                let (length, from) = socket.recv_from(&mut buffer).expect("a resolve");
+                let Some(Datagram::Resolve { key }) = decode(&buffer[..length]) else {
+                    continue;
+                };
+                let answer = Datagram::Resolved { key, serve: None };
+                socket.send_to(&encode(&answer), from).expect("an answer");
+                answered += 1;
+            }
+            answered
+        });
+        assert!(
+            matches!(
+                punch_within(
+                    [6; 32],
+                    at,
+                    Duration::from_millis(1),
+                    Duration::from_millis(1)
+                ),
+                Err(Error::RendezvousUnresolved)
+            ),
+            "a service that names no serve is not a path to punch"
+        );
+        assert_eq!(
+            service.join().expect("the service thread"),
+            RESOLVE_RETRIES,
+            "the whole retry budget was spent before the root was called unresolved"
+        );
     }
 
     #[test]
@@ -991,23 +1243,58 @@ mod tests {
     }
 
     #[test]
-    fn a_fetch_resolves_a_root_and_crosses_a_real_socket() {
+    fn a_rendezvous_fetch_punches_once_for_every_rail() {
+        // One hole in a serve's NAT admits one mapping, so a rail that did not
+        // announce its own socket has no path. Loopback cannot filter, so what
+        // this asserts is that the service saw one distinct source per rail.
+        const RAILS: usize = 2;
+        /// Reads the service loop makes before giving up on the flag, so a
+        /// fetch that never returns cannot leave the thread running.
+        const SERVICE_READS: usize = 400;
+
         let source = crate::tests::temporary("rendezvous-wire-source");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("data.bin"), vec![0x5a; 200_000]).unwrap();
         let bundle = crate::tests::temporary("rendezvous-wire-bundle");
         let built = crate::build_bundle(&source, &bundle).unwrap();
 
-        // Start the rendezvous service.
-        let (addressed, service_addr) = mpsc::channel();
+        // The real pairing policy, in a loop that also records who resolved.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("a bounded wait");
+        let service = socket.local_addr().expect("the service address");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
         let service_thread = std::thread::spawn(move || {
-            rendezvous_service("127.0.0.1:0".parse().unwrap(), Some(200), |at| {
-                let _ = addressed.send(at);
-            })
+            let mut pairings = crate::rendezvous::Pairings::default();
+            let began = std::time::Instant::now();
+            let mut resolvers = Vec::new();
+            let mut buffer = [0_u8; 128];
+            for _ in 0..SERVICE_READS {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((length, from)) = socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) else {
+                    continue;
+                };
+                if matches!(datagram, crate::rendezvous::Datagram::Resolve { .. }) {
+                    resolvers.push(from);
+                }
+                let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let answer = pairings.take(datagram, from, now_ms);
+                if let Some(reply) = answer.reply {
+                    let _ = socket.send_to(&crate::rendezvous::encode(&reply), from);
+                }
+                if let Some((mapping, notice)) = answer.notify {
+                    let _ = socket.send_to(&crate::rendezvous::encode(&notice), mapping);
+                }
+            }
+            resolvers
         });
-        let service = service_addr
-            .recv()
-            .expect("the service reported its address");
 
         // Start a serve with rendezvous registration.
         let written = Ephemeral::generate().expect("credentials");
@@ -1026,6 +1313,9 @@ mod tests {
 
         let opened = BundleServer::open(&bundle).unwrap();
         let serving = std::thread::spawn(move || {
+            // One session answers the whole bundle. The second rail still
+            // punches for itself, which is what this test reads off the
+            // service, and finds the plan already done.
             crate::drive::serve_sessions(Some(1), || {
                 let carrier = listener.accept().map_err(carrier_failure)?;
                 ServeSession::begin(&opened, carrier, authentication())
@@ -1036,14 +1326,22 @@ mod tests {
 
         // Fetch via rendezvous: resolve root -> connect -> transfer.
         let fetched = crate::tests::temporary("rendezvous-wire-fetched");
-        let package =
-            fetch_via_rendezvous(built.root, &fetched, service).expect("a fetch via rendezvous");
+        let package = fetch_via_rendezvous_railed(built.root, &fetched, service, RAILS)
+            .expect("a fetch via rendezvous");
         assert_eq!(package, built);
 
         drop(registration);
         let served = serving.join().expect("the serving thread");
         assert_eq!(served, built);
-        let _ = service_thread.join().expect("the service thread");
+        stop.store(true, Ordering::Relaxed);
+        let mut resolvers = service_thread.join().expect("the service thread");
+        resolvers.sort_unstable();
+        resolvers.dedup();
+        assert_eq!(
+            resolvers.len(),
+            RAILS,
+            "every rail announced its own socket at the service"
+        );
         crate::harness::discard(&[&source, &bundle, &fetched]);
     }
 }

@@ -211,10 +211,12 @@ pub(crate) const REGISTER_CADENCE_MS: u64 = 20_000;
 /// single path's fate.
 pub(crate) const WARMING_DATAGRAMS: usize = 3;
 
-/// Total warming datagrams per cadence. Caps amplification: one Coming earns
-/// at most [`WARMING_DATAGRAMS`], and this bounds the total regardless of
-/// how many Comings arrive.
-pub(crate) const WARMINGS_PER_CADENCE: usize = 24;
+/// Total warming datagrams per cadence. One Coming earns at most
+/// [`WARMING_DATAGRAMS`], and this bounds the total regardless of how many
+/// Comings arrive, so a forged Coming cannot make a serve a reflector.
+/// Sized for two fetches at the widest rail count inside one cadence,
+/// since each of a fetch's rails punches for itself.
+pub(crate) const WARMINGS_PER_CADENCE: usize = 48;
 
 /// Whether to warm `fetch` based on a Coming from `service`. Rejects
 /// addresses that cannot be an observed source mapping.
@@ -240,8 +242,10 @@ pub(crate) struct Registrar {
     service: SocketAddr,
     /// When the next registration is due, which is immediately at first.
     due_at_ms: u64,
-    /// Warmings earned and not yet sent, drained one per pass.
-    warming: std::collections::VecDeque<SocketAddr>,
+    /// Mappings owed warmings, and how many each is still owed. Drained one
+    /// mapping per pass and rotated, so a rail waiting on its first warming
+    /// never waits behind another rail's second.
+    warming: std::collections::VecDeque<(SocketAddr, usize)>,
     /// Warmings this cadence has already earned, against the bound.
     warmed: usize,
 }
@@ -263,8 +267,11 @@ impl Registrar {
     /// toward whatever fetches are still owed them.
     pub(crate) fn due(&mut self, now_ms: u64) -> Vec<(SocketAddr, Datagram)> {
         let mut sends = Vec::new();
-        if let Some(fetch) = self.warming.pop_front() {
+        if let Some((fetch, owed)) = self.warming.pop_front() {
             sends.push((fetch, Datagram::Warming));
+            if owed > 1 {
+                self.warming.push_back((fetch, owed - 1));
+            }
         }
         if now_ms >= self.due_at_ms {
             self.due_at_ms = now_ms.saturating_add(REGISTER_CADENCE_MS);
@@ -289,8 +296,8 @@ impl Registrar {
         let room = WARMINGS_PER_CADENCE.saturating_sub(self.warmed);
         let owed = WARMING_DATAGRAMS.min(room);
         self.warmed = self.warmed.saturating_add(owed);
-        for _ in 0..owed {
-            self.warming.push_back(fetch);
+        if owed > 0 {
+            self.warming.push_back((fetch, owed));
         }
     }
 }
@@ -324,13 +331,18 @@ impl Pairings {
     /// the bound, resolve to whatever is live, pair the two ends, and
     /// shed what is expired, malformed, or not the service's to answer.
     pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr, now_ms: u64) -> Answer {
-        self.registered
-            .retain(|_, registration| registration.expires_at_ms > now_ms);
         match datagram {
             Datagram::Register { key } => {
                 if self.registered.len() >= MAX_REGISTRATIONS && !self.registered.contains_key(&key)
                 {
-                    return Answer::default();
+                    // The only sweep. Expiry is read at every lookup, so a
+                    // table with room costs nothing to hold, and no datagram
+                    // pays for the table's size.
+                    self.registered
+                        .retain(|_, registration| registration.expires_at_ms > now_ms);
+                    if self.registered.len() >= MAX_REGISTRATIONS {
+                        return Answer::default();
+                    }
                 }
                 self.registered.insert(
                     key,
@@ -345,7 +357,11 @@ impl Pairings {
                 }
             }
             Datagram::Resolve { key } => {
-                let serve = self.registered.get(&key).map(|entry| entry.mapping);
+                let serve = self
+                    .registered
+                    .get(&key)
+                    .filter(|entry| entry.expires_at_ms > now_ms)
+                    .map(|entry| entry.mapping);
                 Answer {
                     reply: Some(Datagram::Resolved { key, serve }),
                     notify: serve.map(|mapping| (mapping, Datagram::Coming { key, fetch: source })),
@@ -690,6 +706,37 @@ mod tests {
     }
 
     #[test]
+    fn every_mapping_is_warmed_before_any_is_warmed_twice() {
+        // A fetch's rails each punch for themselves, and a rail connects when
+        // its own warming lands. Draining one mapping to exhaustion before
+        // starting the next would leave the last rail connecting into a NAT
+        // that was never opened for it.
+        let service = v4("198.51.100.7:9000");
+        let root = [9; 32];
+        let mut registrar = Registrar::new(&root, service);
+        let key = key_of(&root);
+        registrar.due(0);
+        let rails: Vec<SocketAddr> = (0..4)
+            .map(|index| v4(&format!("203.0.113.9:{}", 60_000 + index)))
+            .collect();
+        for rail in &rails {
+            registrar.take(Datagram::Coming { key, fetch: *rail }, service);
+        }
+        let mut sent = Vec::new();
+        for _ in 0..rails.len() * WARMING_DATAGRAMS {
+            sent.extend(registrar.due(1).into_iter().map(|(to, _)| to));
+        }
+        assert_eq!(sent.len(), rails.len() * WARMING_DATAGRAMS);
+        for round in sent.chunks(rails.len()) {
+            let mut seen = round.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), rails.len(), "a round warms each rail once");
+        }
+        assert_eq!(registrar.due(1), Vec::new(), "and no more than it owes");
+    }
+
+    #[test]
     fn a_cadence_of_warmings_is_bounded_however_many_fetches_come() {
         let service = v4("198.51.100.7:9000");
         let root = [9; 32];
@@ -757,5 +804,28 @@ mod tests {
         held[..8].copy_from_slice(&0_u64.to_be_bytes());
         let refreshed = pairings.take(Datagram::Register { key: held }, v4("192.0.2.3:3000"), 1);
         assert_eq!(refreshed.reply, Some(Datagram::Registered { key: held }));
+
+        // A full table sweeps what has expired rather than shedding forever.
+        let after = REGISTRATION_TTL_MS + 1;
+        let room = pairings.take(
+            Datagram::Register { key: [0xFF; 32] },
+            v4("192.0.2.2:2000"),
+            after,
+        );
+        assert_eq!(room.reply, Some(Datagram::Registered { key: [0xFF; 32] }));
+        assert_eq!(
+            pairings
+                .take(
+                    Datagram::Resolve { key: [0; 32] },
+                    v4("192.0.2.4:4000"),
+                    after
+                )
+                .reply,
+            Some(Datagram::Resolved {
+                key: [0; 32],
+                serve: None
+            }),
+            "an expired registration is not answered with, swept or not"
+        );
     }
 }

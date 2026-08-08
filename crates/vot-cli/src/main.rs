@@ -46,8 +46,10 @@ matching ed25519-public key. A shared secret cannot: whoever can check it can
 also forge it, so verify-receipt reports SHARED-SECRET rather than
 THIRD-PARTY-VERIFIABLE.
 
-A ROOT in the address position is resolved through a rendezvous service
-(VOT_RENDEZVOUS=ADDR:PORT). The serve must register with the same service.
+A ROOT in the address position is resolved through the rendezvous service
+VOT_RENDEZVOUS names, as ADDR:PORT or NAME:PORT. There is no default: point
+it at whatever service the two ends share, which `vot rendezvous` runs.
+Both ends must name the same one.
 ";
 
 fn main() {
@@ -212,15 +214,11 @@ fn serve(
     Ok(())
 }
 
-/// Writes a bundle directory from a server, which receive then publishes.
+/// The rendezvous service a root-addressed fetch resolves at. Unset is an
+/// argument error: nothing resolves a root without one.
 fn rendezvous_service_address() -> Result<std::net::SocketAddr, vot_cli::Error> {
-    std::env::var("VOT_RENDEZVOUS")
-        .ok()
-        .as_deref()
-        .map(|v| v.trim().parse())
-        .transpose()
-        .map_err(|_| vot_cli::Error::InvalidArguments)?
-        .ok_or(vot_cli::Error::InvalidArguments)
+    let named = std::env::var("VOT_RENDEZVOUS").map_err(|_| vot_cli::Error::InvalidArguments)?;
+    vot_cli::parse_rendezvous(&named)
 }
 
 fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {

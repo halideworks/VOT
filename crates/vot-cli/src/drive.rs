@@ -422,6 +422,29 @@ fn drain<T>(
     }
 }
 
+/// Whether a session's failure is one its peer had said anything by.
+#[cfg(any(test, feature = "wire"))]
+fn spoken_for(error: &Error) -> bool {
+    let Error::Session(session) = error else {
+        return true;
+    };
+    match session.kind() {
+        vot_session::ErrorKind::Interrupted { state } => peer_spoke(*state),
+        _ => true,
+    }
+}
+
+/// Whether the peer had sent anything by this state. A server reaches
+/// `HelloSent` on the peer's `HELLO`, so the two states before it are the
+/// ones where nothing arrived.
+#[cfg(any(test, feature = "wire"))]
+const fn peer_spoke(state: vot_session::State) -> bool {
+    !matches!(
+        state,
+        vot_session::State::Connecting | vot_session::State::ControlReserved
+    )
+}
+
 /// One session's end, under the serve's policy: bounded surfaces the
 /// first failure, unbounded logs it and carries on.
 #[cfg(any(test, feature = "wire"))]
@@ -433,6 +456,12 @@ fn settle_session(
     let Err(error) = settled else {
         return;
     };
+    // A carrier that went before its peer said anything is a scan, a probe,
+    // or a fetch rail that found the plan already done. Nothing this end
+    // does about it, and on a public port it is ordinary.
+    if !spoken_for(&error) {
+        return;
+    }
     if sessions.is_some() {
         if failed.is_ok() {
             *failed = Err(error);
@@ -655,6 +684,51 @@ mod tests {
             endings.recv().expect("the unwind announced"),
             9,
             "a panic that skipped the announcement would hang the reap"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_never_spoke_does_not_fail_a_bounded_serve() {
+        use crate::harness::{Loopback, built_bundle, not_required, patterned};
+        use vot_transport_api::{ConnectionId, Event};
+
+        // Anyone who reaches the port can open a carrier and go. A serve with
+        // a session cap that took that for its own failure would be killable
+        // by a stranger, and a rendezvous fetch's rails do it by accident
+        // whenever the plan finishes before they join.
+        let (bundle, _) = built_bundle("silent", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        let outcome = serve_sessions(Some(1), || {
+            let mut carrier = Loopback::default();
+            carrier
+                .on_wait
+                .push_back(Event::Disconnected(ConnectionId(1)));
+            ServeSession::begin(&server, carrier, not_required())
+        });
+        assert!(
+            outcome.is_ok(),
+            "a carrier that said nothing is weather: {outcome:?}"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn only_a_session_its_peer_spoke_in_is_that_serves_failure() {
+        use vot_session::State;
+
+        // Every state a session can be interrupted in, and whether the peer
+        // had said anything by it.
+        assert!(!peer_spoke(State::Connecting));
+        assert!(!peer_spoke(State::ControlReserved));
+        assert!(peer_spoke(State::HelloSent));
+        assert!(peer_spoke(State::SettingsExchanged));
+        assert!(peer_spoke(State::Negotiated));
+        assert!(peer_spoke(State::Authenticated));
+        assert!(peer_spoke(State::Closed));
+
+        assert!(
+            spoken_for(&Error::CarrierUnavailable),
+            "what is not a session failure is this serve's either way"
         );
     }
 

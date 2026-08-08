@@ -37,14 +37,10 @@ mod wire;
 pub use drive::{Engine, ServeSession, drive};
 pub use fetch::{BundleFetcher, FetchStatus};
 #[cfg(not(feature = "wire"))]
-pub use nowire::{
-    fetch_bundle, fetch_via_rendezvous, rendezvous_service, resolve_root, serve_bundle,
-};
+pub use nowire::{fetch_bundle, fetch_via_rendezvous, rendezvous_service, serve_bundle};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
-pub use wire::{
-    fetch_bundle, fetch_via_rendezvous, rendezvous_service, resolve_root, serve_bundle,
-};
+pub use wire::{fetch_bundle, fetch_via_rendezvous, rendezvous_service, serve_bundle};
 
 /// The certificate and key a server presents.
 ///
@@ -74,6 +70,23 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
         *slot = high * 16 + low;
     }
     Ok(root)
+}
+
+/// A rendezvous service as an `ADDR:PORT`, or a `NAME:PORT` the resolver
+/// knows. A name that answers with several addresses takes the first.
+///
+/// # Errors
+/// Rejects a value that is neither an address nor a name that resolves.
+pub fn parse_rendezvous(value: &str) -> Result<std::net::SocketAddr, Error> {
+    // `to_socket_addrs` parses a literal itself and only reaches the resolver
+    // for what is not one, so a literal costs no lookup.
+    use std::net::ToSocketAddrs as _;
+    value
+        .trim()
+        .to_socket_addrs()
+        .map_err(|_| Error::InvalidArguments)?
+        .next()
+        .ok_or(Error::InvalidArguments)
 }
 
 /// The seal's page digests by index, refusing a commitment list that does
@@ -149,6 +162,11 @@ pub enum Error {
     PeerClosed(u16),
     /// No serve registered for this rendezvous key.
     RendezvousUnresolved,
+    /// A serve was found but no session formed: the path could not be
+    /// punched, which symmetric or carrier-grade NAT on either end
+    /// produces. A literal address still reaches a serve that forwards a
+    /// port.
+    RendezvousUnpunched,
 }
 
 impl From<io::Error> for Error {

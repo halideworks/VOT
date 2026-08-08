@@ -1741,7 +1741,10 @@ mod tests {
         ];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(TransportError::RecordTooLarge)
+            Err(vot_transport_api::BatchFailure {
+                accepted: 0,
+                error: TransportError::RecordTooLarge
+            })
         );
         assert_eq!(adapter.pending_submissions(), 1);
         adapter.flush().unwrap();

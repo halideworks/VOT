@@ -110,6 +110,21 @@ pub enum Error {
     Backend,
     /// A peer used more lanes than this endpoint advertised it would carry.
     LaneLimitExceeded,
+    /// A ledger released more than it held. Nothing it reports afterwards can
+    /// be trusted, so it grants nothing until it is rebuilt.
+    AccountingPoisoned,
+}
+
+/// A batch that stopped part way through.
+///
+/// The records before `accepted` reached the backend and cannot be unsent.
+/// A caller retrying the batch resends from `accepted`, never from zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchFailure {
+    /// How many records of the batch the backend took.
+    pub accepted: usize,
+    /// What stopped the rest.
+    pub error: Error,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -209,14 +224,28 @@ pub trait TransportAdapter {
     }
 
     /// Submits a batch before the caller requests a backend flush.
-    /// Side-effect free: a failure leaves the adapter unchanged.
+    ///
+    /// Not atomic. Preflight rejects the whole batch before anything is
+    /// submitted, but a backend that fails part way has already taken the
+    /// records before it, and no default implementation over a per-record
+    /// send can unsend them. [`BatchFailure::accepted`] says how many, so a
+    /// caller retries the rest rather than duplicating the lot. An adapter
+    /// whose backend can submit atomically should override this and report
+    /// `accepted: 0` on every failure.
     ///
     /// # Errors
-    /// Propagates the first backend or protocol limit failure.
-    fn send_reliable_batch(&mut self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
-        self.preflight_reliable_batch(stream, records)?;
-        for record in records {
-            self.send_reliable_shared(stream, record.clone())?;
+    /// Reports the first backend or protocol limit failure, with the count
+    /// of records already submitted. Preflight failures report zero.
+    fn send_reliable_batch(
+        &mut self,
+        stream: StreamId,
+        records: &[Payload],
+    ) -> Result<(), BatchFailure> {
+        self.preflight_reliable_batch(stream, records)
+            .map_err(|error| BatchFailure { accepted: 0, error })?;
+        for (accepted, record) in records.iter().enumerate() {
+            self.send_reliable_shared(stream, record.clone())
+                .map_err(|error| BatchFailure { accepted, error })?;
         }
         Ok(())
     }
@@ -372,6 +401,7 @@ pub struct StagingCapacity {
     used: u64,
     bdp_target: u64,
     configured_max: u64,
+    poisoned: bool,
 }
 
 impl StagingCapacity {
@@ -386,12 +416,17 @@ impl StagingCapacity {
             used: 0,
             bdp_target,
             configured_max,
+            poisoned: false,
         })
     }
 
     /// # Errors
-    /// Rejects arithmetic overflow or a reservation beyond the hard limit.
+    /// Rejects arithmetic overflow, a reservation beyond the hard limit, or a
+    /// ledger that has already over-released.
     pub fn reserve(&mut self, bytes: u64) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::AccountingPoisoned);
+        }
         let next = self
             .used
             .checked_add(bytes)
@@ -403,8 +438,26 @@ impl StagingCapacity {
         Ok(())
     }
 
-    pub fn release(&mut self, bytes: u64) {
-        self.used = self.used.saturating_sub(bytes);
+    /// Gives back a reservation.
+    ///
+    /// Releasing more than is held is a bug in the caller's accounting, not a
+    /// condition to absorb: subtracting to zero would hand out capacity
+    /// nobody earned. The ledger poisons instead, and grants nothing
+    /// afterwards. This returns nothing because one of its callers is a
+    /// `Drop`, which has nowhere to put a failure.
+    pub const fn release(&mut self, bytes: u64) {
+        if let Some(used) = self.used.checked_sub(bytes) {
+            self.used = used;
+        } else {
+            self.used = 0;
+            self.poisoned = true;
+        }
+    }
+
+    /// Whether this ledger has released more than it held.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Updates the current BDP target while preserving the configured hard cap.
@@ -422,9 +475,13 @@ impl StagingCapacity {
         self.limit.saturating_sub(self.used)
     }
 
-    /// Credit is a pure function of the current staging state.
+    /// Credit is a pure function of the current staging state. A poisoned
+    /// ledger advertises none: its remaining count is not evidence.
     #[must_use]
     pub fn advertised_credit(&self) -> u64 {
+        if self.poisoned {
+            return 0;
+        }
         let target = self.bdp_target.min(self.configured_max);
         self.remaining().min(target)
     }
@@ -495,6 +552,9 @@ mod tests {
         reliable: Vec<(StreamId, Vec<u8>)>,
         events: VecDeque<Event>,
         credits: Vec<u64>,
+        /// How many reliable records this backend takes before it starts
+        /// failing. `None` takes everything.
+        reliable_failures_after: Option<usize>,
     }
 
     impl TransportAdapter for ContractAdapter {
@@ -504,6 +564,9 @@ mod tests {
         }
 
         fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
+            if self.reliable_failures_after == Some(self.reliable.len()) {
+                return Err(Error::Backend);
+            }
             self.reliable.push((stream, record.to_vec()));
             Ok(())
         }
@@ -538,6 +601,52 @@ mod tests {
         exact.reserve(10).unwrap();
         assert_eq!(exact.used(), 10);
         assert_eq!(exact.advertised_credit(), 0);
+    }
+
+    #[test]
+    fn releasing_more_than_was_held_poisons_the_ledger() {
+        let mut staging = StagingCapacity::new(1024, 800, 900).unwrap();
+        staging.reserve(400).unwrap();
+        staging.release(400);
+        assert!(!staging.is_poisoned(), "an exact release is not an error");
+        assert_eq!(staging.advertised_credit(), 800);
+
+        // The second release of the same reservation would have handed out
+        // 400 bytes nobody earned.
+        staging.release(400);
+        assert!(staging.is_poisoned());
+        assert_eq!(staging.used(), 0);
+        assert_eq!(
+            staging.advertised_credit(),
+            0,
+            "a poisoned ledger's remaining count is not evidence"
+        );
+        assert_eq!(staging.reserve(1), Err(Error::AccountingPoisoned));
+    }
+
+    #[test]
+    fn a_batch_that_stops_part_way_reports_what_the_backend_took() {
+        let mut adapter = ContractAdapter {
+            reliable_failures_after: Some(2),
+            ..ContractAdapter::default()
+        };
+        let records = [
+            shared_payload(b"one"),
+            shared_payload(b"two"),
+            shared_payload(b"three"),
+        ];
+        assert_eq!(
+            adapter.send_reliable_batch(StreamId(1), &records),
+            Err(BatchFailure {
+                accepted: 2,
+                error: Error::Backend
+            })
+        );
+        assert_eq!(
+            adapter.reliable.len(),
+            2,
+            "the count reported is the count the backend has"
+        );
     }
 
     #[test]
@@ -742,7 +851,10 @@ mod tests {
         ];
         assert_eq!(
             preflight.send_reliable_batch(StreamId(8), &invalid_records),
-            Err(Error::RecordTooLarge)
+            Err(BatchFailure {
+                accepted: 0,
+                error: Error::RecordTooLarge
+            })
         );
         assert!(preflight.reliable.is_empty());
 

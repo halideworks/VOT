@@ -1920,6 +1920,52 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn a_rendezvous_names_every_address_it_answers_at_with_ipv6_first() {
+        use std::net::SocketAddr;
+
+        let at = |text: &str| text.parse::<SocketAddr>().expect("an address");
+        assert_eq!(
+            parse_rendezvous(" 198.51.100.7:9000 ").expect("an address"),
+            vec![at("198.51.100.7:9000")]
+        );
+        assert_eq!(
+            parse_rendezvous("[2001:db8::1]:9000").expect("an address"),
+            vec![at("[2001:db8::1]:9000")]
+        );
+        assert_eq!(
+            parse_rendezvous("198.51.100.7:9000, [2001:db8::1]:9000").expect("a list"),
+            vec![at("[2001:db8::1]:9000"), at("198.51.100.7:9000")],
+            "IPv6 leads whatever order they were given in"
+        );
+        assert_eq!(
+            parse_rendezvous("198.51.100.7:9000,198.51.100.7:9000").expect("a list"),
+            vec![at("198.51.100.7:9000")],
+            "one route named twice is one route, or the ladder pays for it twice"
+        );
+        let localhost = parse_rendezvous("localhost:9000").expect("a name the resolver knows");
+        assert!(!localhost.is_empty());
+        assert!(localhost.iter().all(|address| address.ip().is_loopback()));
+        assert!(
+            localhost
+                .windows(2)
+                .all(|pair| !pair[0].is_ipv4() || !pair[1].is_ipv6())
+        );
+
+        for refused in [
+            "198.51.100.7",
+            "rendezvous.example.com",
+            "",
+            "198.51.100.7:9000,",
+            " ",
+        ] {
+            assert!(
+                matches!(parse_rendezvous(refused), Err(Error::InvalidArguments)),
+                "{refused:?} names no service"
+            );
+        }
+    }
+
     pub(crate) fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "vot-cli-{}-{}-{name}",

@@ -212,7 +212,7 @@ pub fn serve_bundle(
     // Configure rendezvous routing before bind so the listener can
     // filter side-channel datagrams.
     let services = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;
-    config.side_channel_lead = (!services.is_empty()).then_some(crate::rendezvous::MAGIC);
+    config.side_channel_lead = side_channel_lead(&services);
 
     // The loop and its failure policy are in `drive`.
     let mut listener = Listener::bind(address, &config).map_err(carrier_failure)?;
@@ -231,6 +231,17 @@ pub fn serve_bundle(
     drop(registration);
     outcome?;
     Ok(server.package())
+}
+
+/// The lead byte the listener sheds rendezvous datagrams by, which is
+/// wanted exactly when there is a service to register with. Naming one
+/// without a service would route datagrams aside that nothing reads.
+const fn side_channel_lead(services: &[SocketAddr]) -> Option<u8> {
+    if services.is_empty() {
+        None
+    } else {
+        Some(crate::rendezvous::MAGIC)
+    }
 }
 
 /// Returns a registration only when both a service and side channel exist.
@@ -1239,27 +1250,19 @@ mod tests {
                 .all(|pair| !pair[0].is_ipv4() || !pair[1].is_ipv6()),
             "IPv6 comes first, {named:?}"
         );
-        let listed = rendezvous_from(Some("127.0.0.1:9000, [::1]:9000 ,127.0.0.1:9000"))
-            .expect("a list of addresses");
-        assert_eq!(
-            listed,
-            vec![
-                "[::1]:9000".parse::<SocketAddr>().unwrap(),
-                "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
-            ],
-            "IPv6 first, and one route named twice is one route"
-        );
-        assert!(
-            matches!(
-                rendezvous_from(Some("127.0.0.1:9000,")),
-                Err(Error::InvalidArguments)
-            ),
-            "an empty part names no service"
-        );
         assert!(matches!(
             rendezvous_from(Some("198.51.100.7")),
             Err(Error::InvalidArguments)
         ));
+        assert_eq!(
+            side_channel_lead(&[]),
+            None,
+            "no service is nothing to shed aside"
+        );
+        assert_eq!(
+            side_channel_lead(&["198.51.100.7:9000".parse().unwrap()]),
+            Some(crate::rendezvous::MAGIC)
+        );
         assert!(matches!(
             rendezvous_from(Some("")),
             Err(Error::InvalidArguments)

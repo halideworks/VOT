@@ -69,13 +69,21 @@ skip them after enforcing the frame-length bound.
 | `0x05` | `MAX_MANIFEST_PAGE_PAYLOAD` | 1 MiB | 64 KiB--1 MiB | critical |
 | `0x07` | `RELIABLE_LANE_LIMIT` | 16 | 1--256 | critical |
 | `0x09` | `IDLE_TIMEOUT_MS` | 90000 | 1000--600000 | critical |
-| `0x0b` | `ACTIVE_KEEPALIVE_MS` | 20000 | 10000--30000 | critical |
-| `0x20` | `COMPRESSION_MIN_GAIN_BPS` | 500 | 0--10000 | optional |
-| `0x22` | `TELEMETRY_LEVEL` | 1 | 0--2 | optional |
 
 Setting values are QUIC varints. A duplicate setting is a protocol error. An
 unknown optional setting is ignored; an unknown critical setting closes the VOT
 session. A value outside its registered range is `INVALID_SETTING`.
+
+`IDLE_TIMEOUT_MS` is negotiated and validated but not installed. QUIC fixes its
+own idle timeout during the handshake, before these are negotiated, and what
+closes an idle connection is the carrier's timeout, taken from the default
+above. ADR-0035 has the reasoning and what installing it would require.
+
+`0x0b`, `0x20`, and `0x22` are retired and MUST NOT be reassigned. They were
+`ACTIVE_KEEPALIVE_MS`, `COMPRESSION_MIN_GAIN_BPS`, and `TELEMETRY_LEVEL`, and
+ADR-0035 removed them because nothing installed any of them: there is no
+keepalive timer, no compressor, and no telemetry level. Each returns with the
+thing it configures.
 
 ## 4. Extension identifiers
 

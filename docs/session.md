@@ -128,12 +128,17 @@ Eight settings are defined. Four are enforced by `vot-session`:
 | `MAX_DATA_RECORD_PAYLOAD` | yes | payload limit table |
 | `MAX_MANIFEST_PAGE_PAYLOAD` | yes | payload limit table |
 | `RELIABLE_LANE_LIMIT` | yes | outbound in session, inbound in transport |
-| `IDLE_TIMEOUT_MS` | no | |
-| `ACTIVE_KEEPALIVE_MS` | no | |
-| `COMPRESSION_MIN_GAIN_BPS` | no | |
-| `TELEMETRY_LEVEL` | no | advisory |
+| `IDLE_TIMEOUT_MS` | no | carrier's own timeout, from the same default |
 
-The four payload limits go through one table. A proof (`PROOF_BUNDLE`) is on
+The four payload limits go through one table.
+
+`IDLE_TIMEOUT_MS` is the one negotiated setting nothing installs, and
+ADR-0035 says why: QUIC fixes its idle timeout during the handshake, before
+VOT negotiates anything, and the session has no clock to enforce a deadline
+with instead. What closes an idle connection is the carrier's timeout, which
+takes its default from the registered one so the two numbers cannot drift.
+ADR-0035 retired the three settings that were not enforced anywhere and
+configured nothing that exists. A proof (`PROOF_BUNDLE`) is on
 the control stream and bounded by the control ceiling, not the record limit.
 
 Lane limit is split: the session counts outbound lanes; the transport counts

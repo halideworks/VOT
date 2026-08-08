@@ -29,6 +29,11 @@ use crate::{
 /// probe is dropped rather than reassembled into a false success.
 const MAX_DATAGRAM_SIZE: usize = 1_472;
 
+/// QUIC's idle timeout, taken from the registered `IDLE_TIMEOUT_MS` default
+/// rather than written again beside it. Two fields of one name holding two
+/// numbers is how the drift ADR-0035 records got there.
+const IDLE_TIMEOUT_MS: u64 = vot_codec::DEFAULT_IDLE_TIMEOUT_MS;
+
 /// The smallest datagram a caller may ask for.
 ///
 /// QUIC requires an endpoint to carry a 1200-byte initial datagram, so anything
@@ -188,7 +193,12 @@ pub struct Config {
     pub private_key: Option<String>,
     /// Whether the client verifies the server's certificate.
     pub verify_peer: bool,
-    /// Idle timeout in milliseconds.
+    /// Idle timeout in milliseconds, installed as QUIC's own.
+    ///
+    /// This is what actually closes an idle connection. The negotiated
+    /// `IDLE_TIMEOUT_MS` cannot be: QUIC fixes its transport parameter during
+    /// the handshake, before VOT negotiates anything. The default here is the
+    /// registered one so the two numbers are one number. ADR-0035.
     pub idle_timeout_ms: u64,
     /// How long a server waits for its first packet, in milliseconds, or
     /// zero to wait for as long as it takes.
@@ -250,7 +260,7 @@ impl Config {
             certificate: None,
             private_key: None,
             verify_peer: true,
-            idle_timeout_ms: 30_000,
+            idle_timeout_ms: IDLE_TIMEOUT_MS,
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
@@ -266,7 +276,7 @@ impl Config {
             certificate: Some(certificate),
             private_key: Some(private_key),
             verify_peer: false,
-            idle_timeout_ms: 30_000,
+            idle_timeout_ms: IDLE_TIMEOUT_MS,
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,

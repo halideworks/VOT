@@ -149,7 +149,7 @@ def validate(path: Path) -> None:
     assert registry, "no settings registry entries"
     for entry in registry.values():
         assert entry["min"] <= entry["default"] <= entry["max"], entry["name"]
-        assert entry["min"] < entry["max"] or entry["name"] == "TELEMETRY_LEVEL", entry["name"]
+        assert entry["min"] < entry["max"], entry["name"]
         # spec/wire.md section 2 puts criticality in the least-significant bit,
         # and the settings registry uses the same convention: a peer that does
         # not know an odd identifier must stop rather than carry on.

@@ -40,27 +40,6 @@
       "min": 1000,
       "max": 600000,
       "default": 90000
-    },
-    {
-      "id": 11,
-      "name": "ACTIVE_KEEPALIVE_MS",
-      "min": 10000,
-      "max": 30000,
-      "default": 20000
-    },
-    {
-      "id": 32,
-      "name": "COMPRESSION_MIN_GAIN_BPS",
-      "min": 0,
-      "max": 10000,
-      "default": 500
-    },
-    {
-      "id": 34,
-      "name": "TELEMETRY_LEVEL",
-      "min": 0,
-      "max": 2,
-      "default": 1
     }
   ],
   "hello": [
@@ -197,7 +176,7 @@
   "settings": [
     {
       "name": "every-registered-setting-at-its-default",
-      "canonical_hex": "01801000000380040000058010000007100980015f900b80004e202041f42201",
+      "canonical_hex": "01801000000380040000058010000007100980015f90",
       "expected": {
         "result": "ok",
         "settings": {
@@ -205,17 +184,14 @@
           "3": 262144,
           "5": 1048576,
           "7": 16,
-          "9": 90000,
-          "11": 20000,
-          "32": 500,
-          "34": 1
+          "9": 90000
         }
       },
       "note": "Every registered setting is advertised rather than only those differing from a default, because the peer's defaults are its own."
     },
     {
       "name": "every-registered-setting-at-its-minimum",
-      "canonical_hex": "0144000380010000058001000007010943e80b671020002200",
+      "canonical_hex": "0144000380010000058001000007010943e8",
       "expected": {
         "result": "ok",
         "settings": {
@@ -223,16 +199,13 @@
           "3": 65536,
           "5": 65536,
           "7": 1,
-          "9": 1000,
-          "11": 10000,
-          "32": 0,
-          "34": 0
+          "9": 1000
         }
       }
     },
     {
       "name": "every-registered-setting-at-its-maximum",
-      "canonical_hex": "01810000000380040000058010000007410009800927c00b800075302067102202",
+      "canonical_hex": "01810000000380040000058010000007410009800927c0",
       "expected": {
         "result": "ok",
         "settings": {
@@ -240,10 +213,7 @@
           "3": 262144,
           "5": 1048576,
           "7": 256,
-          "9": 600000,
-          "11": 30000,
-          "32": 10000,
-          "34": 2
+          "9": 600000
         }
       }
     },
@@ -257,10 +227,7 @@
           "3": 262144,
           "5": 1048576,
           "7": 16,
-          "9": 90000,
-          "11": 20000,
-          "32": 500,
-          "34": 1
+          "9": 90000
         }
       },
       "note": "A peer that advertises nothing is taken to mean the defaults, which is what lets a later revision add a setting without breaking this one."
@@ -275,10 +242,7 @@
           "3": 262144,
           "5": 1048576,
           "7": 16,
-          "9": 90000,
-          "11": 20000,
-          "32": 500,
-          "34": 1
+          "9": 90000
         }
       },
       "note": "Identifier 256 is even, so unknown means ignore. Its value is still read, which is what keeps the pairs aligned."
@@ -313,13 +277,38 @@
     },
     {
       "name": "value-above-the-registered-range",
-      "hex": "2203",
+      "hex": "09800927c1",
       "expected": {
         "result": "error",
         "error": "INVALID_SETTING",
-        "setting": 34,
-        "value": 3
+        "setting": 9,
+        "value": 600001
       }
+    },
+    {
+      "name": "retired-critical-setting-rejected",
+      "hex": "0b80004e20",
+      "expected": {
+        "result": "error",
+        "error": "INVALID_SETTING",
+        "setting": 11
+      },
+      "note": "ADR-0035 retired 0x0b. It was critical, so a peer built against an earlier draft that still sends it closes the session rather than being quietly ignored."
+    },
+    {
+      "name": "retired-optional-setting-ignored",
+      "hex": "2201",
+      "expected": {
+        "result": "ok",
+        "settings": {
+          "1": 1048576,
+          "3": 262144,
+          "5": 1048576,
+          "7": 16,
+          "9": 90000
+        }
+      },
+      "note": "ADR-0035 retired 0x22, which was optional, so it is ignored like any unknown optional setting."
     },
     {
       "name": "identifier-without-a-value",

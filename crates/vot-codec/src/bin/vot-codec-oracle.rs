@@ -198,9 +198,6 @@ fn setting_value(settings: &Settings, identifier: u64) -> u64 {
         id::MAX_MANIFEST_PAGE_PAYLOAD => settings.max_manifest_page_payload,
         id::RELIABLE_LANE_LIMIT => settings.reliable_lane_limit,
         id::IDLE_TIMEOUT_MS => settings.idle_timeout_ms,
-        id::ACTIVE_KEEPALIVE_MS => settings.active_keepalive_ms,
-        id::COMPRESSION_MIN_GAIN_BPS => settings.compression_min_gain_bps,
-        id::TELEMETRY_LEVEL => settings.telemetry_level,
         _ => u64::MAX,
     }
 }
@@ -355,11 +352,22 @@ mod tests {
         // thought it was and still passing.
         assert_eq!(
             settings_line(""),
-            "ok|1=1048576|3=262144|5=1048576|7=16|9=90000|11=20000|32=500|34=1\
-             |re=01801000000380040000058010000007100980015f900b80004e202041f42201"
+            "ok|1=1048576|3=262144|5=1048576|7=16|9=90000\
+             |re=01801000000380040000058010000007100980015f90"
                 .replace(' ', "")
         );
         assert_eq!(settings_line("410101"), "err|INVALID_SETTING");
+        // ADR-0035 retired 0x0b, 0x20, and 0x22. The first was critical, so a
+        // peer still sending it closes the session under the same code any
+        // unknown critical setting closes under; the other two are optional
+        // and are ignored, which is what forward compatibility means.
+        assert_eq!(settings_line("0b80004e20"), "err|INVALID_SETTING");
+        assert_eq!(
+            settings_line("2041f4"),
+            settings_line(""),
+            "a retired optional setting changes nothing"
+        );
+        assert_eq!(settings_line("2201"), settings_line(""));
         assert_eq!(settings_line("07100710"), "err|DUPLICATE_SETTING");
         assert_eq!(settings_line("01"), "err|MALFORMED_FRAME");
         assert_eq!(settings_line("0"), "err|INVALID_HEX");

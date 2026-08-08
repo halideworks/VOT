@@ -327,7 +327,8 @@ pub fn rendezvous_service(
     socket
         .set_read_timeout(Some(SERVICE_TICK))
         .map_err(|_| Error::CarrierUnavailable)?;
-    listening(socket.local_addr().map_err(|_| Error::CarrierUnavailable)?);
+    let listening_at = socket.local_addr().map_err(|_| Error::CarrierUnavailable)?;
+    listening(listening_at);
     let began = std::time::Instant::now();
     let mut pairings = crate::rendezvous::Pairings::default();
     let mut buffer = [0_u8; 128];
@@ -348,13 +349,24 @@ pub fn rendezvous_service(
         let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) else {
             continue;
         };
+        // A dual-stack socket sees an IPv4 peer as ::ffff:a.b.c.d. What it
+        // records and hands out is the address that peer can be reached at
+        // from its own family; what it sends to goes back through this
+        // socket's family.
+        let source = crate::rendezvous::canonical(source);
         let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
         let answer = pairings.take(datagram, source, now_ms);
         if let Some(reply) = answer.reply {
-            let _ = socket.send_to(&crate::rendezvous::encode(&reply), source);
+            let _ = socket.send_to(
+                &crate::rendezvous::encode(&reply),
+                for_socket(source, listening_at),
+            );
         }
         if let Some((mapping, notice)) = answer.notify {
-            let _ = socket.send_to(&crate::rendezvous::encode(&notice), mapping);
+            let _ = socket.send_to(
+                &crate::rendezvous::encode(&notice),
+                for_socket(mapping, listening_at),
+            );
         }
     }
     Ok(())
@@ -374,6 +386,18 @@ fn rendezvous_from(pin: Option<&str>) -> Result<Option<SocketAddr>, Error> {
 /// Side-channel read timeout for the registration thread.
 const REGISTRAR_TICK: Duration = Duration::from_millis(200);
 
+/// `target` as a socket bound in `local`'s family can address it. A
+/// dual-stack socket takes an IPv4 destination only in its mapped form,
+/// which is the inverse of what [`crate::rendezvous::canonical`] undoes.
+fn for_socket(target: SocketAddr, local: SocketAddr) -> SocketAddr {
+    match (local, target) {
+        (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
+            SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        _ => target,
+    }
+}
+
 /// Sends registrar output on the listener's socket.
 ///
 /// # Errors
@@ -382,15 +406,32 @@ fn post(
     side: &SideChannel,
     sends: Vec<(SocketAddr, crate::rendezvous::Datagram)>,
 ) -> Result<(), Error> {
+    let local = side.local_address().map_err(carrier_failure)?;
     for (to, datagram) in sends {
-        side.send_to(&crate::rendezvous::encode(&datagram), to)
+        side.send_to(&crate::rendezvous::encode(&datagram), for_socket(to, local))
             .map_err(carrier_failure)?;
     }
     Ok(())
 }
 
-/// Runs the registration cadence until `stop`. Logs and exits on send
-/// failure or router shutdown.
+/// Sends what is due and keeps the cadence whatever one datagram does.
+///
+/// A warming to a fetch that has gone draws an ICMP unreachable, and with
+/// path-MTU discovery on the socket the kernel reports that on the next
+/// send, which is usually the registration. Ending the cadence there
+/// stops the serve being findable at all, over one datagram nobody was
+/// waiting for.
+fn post_regardless(side: &SideChannel, sends: Vec<(SocketAddr, crate::rendezvous::Datagram)>) {
+    let Ok(local) = side.local_address() else {
+        return;
+    };
+    for (to, datagram) in sends {
+        let _ = side.send_to(&crate::rendezvous::encode(&datagram), for_socket(to, local));
+    }
+}
+
+/// Runs the registration cadence until `stop`, or until the router that
+/// owns the socket has gone.
 fn keep_registered(
     side: &SideChannel,
     registrar: &mut crate::rendezvous::Registrar,
@@ -400,10 +441,7 @@ fn keep_registered(
     while !stop.load(Ordering::Relaxed) {
         let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Send pending registrations before blocking on the channel.
-        if post(side, registrar.due(now_ms)).is_err() {
-            eprintln!("rendezvous registration stopped: the socket would not send");
-            return;
-        }
+        post_regardless(side, registrar.due(now_ms));
         match side.next_within(REGISTRAR_TICK) {
             Ok(Some((bytes, from))) => {
                 if let Some(datagram) = crate::rendezvous::decode(&bytes) {
@@ -570,6 +608,7 @@ fn punch_within(
             )
             .map_err(|_| Error::CarrierUnavailable)?;
         if let Some(serve) = resolved(&socket, &mut buffer, key)? {
+            open_toward(&socket, serve);
             wait_warm(&socket, &mut buffer, warming)?;
             return Ok(Punched { socket, serve });
         }
@@ -578,6 +617,23 @@ fn punch_within(
         std::thread::sleep(retry);
     }
     Err(Error::RendezvousUnresolved)
+}
+
+/// Sends this end's own warming toward the serve, before waiting for the
+/// serve's.
+///
+/// Both ends have to send. A warming that arrives before this end has sent
+/// anything to the serve is unsolicited, and a NAT that tracks it takes the
+/// mapping this socket would have used: the session's packets then leave
+/// under a different one than the service observed, and the serve's hole
+/// does not fit them. Sending first is what keeps the mapping.
+fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
+    let warming = crate::rendezvous::encode(&crate::rendezvous::Datagram::Warming);
+    // A lost one costs the mapping, so it goes more than once. The serve
+    // sheds them: they are not from its service, so they earn nothing.
+    for _ in 0..crate::rendezvous::WARMING_DATAGRAMS {
+        let _ = socket.send_to(&warming, serve);
+    }
 }
 
 /// Reads until the service names a serve for `key` or the read runs out.
@@ -940,6 +996,137 @@ mod tests {
     }
 
     #[test]
+    fn a_dual_stack_service_answers_an_ipv4_peer_with_an_ipv4_mapping() {
+        // A service bound to [::] sees an IPv4 peer as ::ffff:a.b.c.d. Handing
+        // that back as the mapping gives a fetch an IPv6 peer to connect its
+        // IPv4 socket to, which fails before a packet leaves.
+        use crate::rendezvous::{Datagram, decode, encode};
+
+        let (addressed, address) = mpsc::channel();
+        let service = std::thread::spawn(move || {
+            rendezvous_service("[::]:0".parse().unwrap(), Some(40), |at| {
+                let _ = addressed.send(at);
+            })
+        });
+        let at = address.recv().expect("the service reported its address");
+        let reachable = SocketAddr::new("127.0.0.1".parse().unwrap(), at.port());
+        let key = [11; 32];
+
+        let serve = UdpSocket::bind("127.0.0.1:0").expect("an IPv4 serve socket");
+        serve
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        serve
+            .send_to(&encode(&Datagram::Register { key }), reachable)
+            .expect("a register");
+        let mut buffer = [0_u8; 128];
+        let (length, _) = serve.recv_from(&mut buffer).expect("an acknowledgement");
+        assert_eq!(
+            decode(&buffer[..length]),
+            Some(Datagram::Registered { key }),
+            "the answer came back to an IPv4 socket"
+        );
+
+        let fetch = UdpSocket::bind("127.0.0.1:0").expect("an IPv4 fetch socket");
+        fetch
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        fetch
+            .send_to(&encode(&Datagram::Resolve { key }), reachable)
+            .expect("a resolve");
+        let (length, _) = fetch.recv_from(&mut buffer).expect("an answer");
+        let Some(Datagram::Resolved {
+            serve: Some(mapping),
+            ..
+        }) = decode(&buffer[..length])
+        else {
+            panic!("the resolve was not answered with the serve's mapping");
+        };
+        assert!(
+            mapping.is_ipv4(),
+            "an IPv4 serve is named by an IPv4 mapping, not {mapping}"
+        );
+        assert_eq!(mapping, serve.local_addr().expect("the socket"));
+
+        let (length, _) = serve.recv_from(&mut buffer).expect("the notification");
+        let Some(Datagram::Coming { fetch: coming, .. }) = decode(&buffer[..length]) else {
+            panic!("the serve was not told the fetch is coming");
+        };
+        assert_eq!(
+            coming,
+            fetch.local_addr().expect("the socket"),
+            "and so is the fetch it is told about"
+        );
+        service
+            .join()
+            .expect("the service thread")
+            .expect("the service served its bound");
+    }
+
+    #[test]
+    fn an_address_is_the_family_that_is_really_its_own() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.7]:4433".parse().expect("an address");
+        let plain: SocketAddr = "192.0.2.7:4433".parse().expect("an address");
+        let six: SocketAddr = "[2001:db8::1]:4433".parse().expect("an address");
+        assert_eq!(crate::rendezvous::canonical(mapped), plain);
+        assert_eq!(crate::rendezvous::canonical(plain), plain);
+        assert_eq!(crate::rendezvous::canonical(six), six);
+
+        let v6_socket: SocketAddr = "[::]:9999".parse().expect("an address");
+        let v4_socket: SocketAddr = "0.0.0.0:9999".parse().expect("an address");
+        assert_eq!(
+            for_socket(plain, v6_socket),
+            mapped,
+            "a dual-stack socket takes IPv4 only in its mapped form"
+        );
+        assert_eq!(for_socket(plain, v4_socket), plain);
+        assert_eq!(for_socket(six, v6_socket), six);
+        assert_eq!(for_socket(six, v4_socket), six, "nothing to do about it");
+    }
+
+    #[test]
+    fn a_datagram_the_socket_refuses_does_not_end_the_cadence() {
+        // What happens on a real serve: a warming goes to a fetch that has
+        // gone, an ICMP unreachable comes back, and the kernel reports it on
+        // the next send. If that ended the cadence, the serve would stop
+        // being findable over one datagram nobody was waiting for.
+        use crate::rendezvous::{Datagram, decode};
+
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.side_channel_lead = Some(crate::rendezvous::MAGIC);
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+
+        let service = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        service
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        let at = service.local_addr().expect("the service address");
+        // An address this socket cannot send to at all: it is bound to IPv4.
+        let refused: SocketAddr = "[::1]:9".parse().expect("an address");
+
+        post_regardless(
+            &side,
+            vec![
+                (refused, Datagram::Register { key: [1; 32] }),
+                (at, Datagram::Register { key: [2; 32] }),
+            ],
+        );
+        let mut buffer = [0_u8; 128];
+        let (length, _) = service.recv_from(&mut buffer).expect("the second send");
+        assert_eq!(
+            decode(&buffer[..length]),
+            Some(Datagram::Register { key: [2; 32] }),
+            "the send after the refused one still went"
+        );
+    }
+
+    #[test]
     fn a_rendezvous_is_the_address_or_name_given_or_nowhere() {
         assert!(std::env::var(RENDEZVOUS).is_err(), "the suite owns no env");
         assert_eq!(rendezvous_from(None).expect("unset is nowhere"), None);
@@ -1021,7 +1208,21 @@ mod tests {
         // The mapping the service observes is what the serve opens its NAT
         // for, so it has to be the session's own socket. Loopback cannot
         // filter by port, so the identity itself is the assertion.
-        let serve: SocketAddr = "203.0.113.7:4433".parse().expect("an address");
+        //
+        // The rail also has to send toward the serve before it waits: a
+        // warming that arrives before this end sent anything is unsolicited,
+        // and a NAT that tracks it takes the mapping the session wanted.
+        // Loopback cannot show that either, so what is asserted is that the
+        // datagrams go, and go from the session's socket.
+        use crate::rendezvous::{Datagram, decode};
+
+        let at_serve = UdpSocket::bind("127.0.0.1:0").expect("a socket at the serve's mapping");
+        // The warmings are queued before the punch returns, so this bound only
+        // prices a mutant that sends none.
+        at_serve
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a bounded wait");
+        let serve = at_serve.local_addr().expect("the serve's mapping");
         let elsewhere: SocketAddr = "198.51.100.9:4433".parse().expect("an address");
         let (service, observed) = one_resolve(serve, elsewhere);
         let punched = punch_within(
@@ -1035,11 +1236,24 @@ mod tests {
             punched.serve, serve,
             "the mapping the service holds under this key, not another"
         );
+        let announced = punched.socket.local_addr().expect("the socket");
         assert_eq!(
-            punched.socket.local_addr().expect("the socket"),
+            announced,
             observed.join().expect("the service thread"),
             "the announced mapping is the socket the session connects on"
         );
+
+        let mut buffer = [0_u8; 128];
+        for datagram in 0..crate::rendezvous::WARMING_DATAGRAMS {
+            let (length, from) = at_serve
+                .recv_from(&mut buffer)
+                .unwrap_or_else(|_| panic!("warming {datagram} never reached the serve"));
+            assert_eq!(decode(&buffer[..length]), Some(Datagram::Warming));
+            assert_eq!(
+                from, announced,
+                "the rail opened its own side from the session's socket"
+            );
+        }
     }
 
     #[test]

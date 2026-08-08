@@ -157,9 +157,24 @@ enum AddressSlot {
     Held(SocketAddr),
 }
 
+/// An address by the family that is really its own.
+///
+/// A socket bound to `[::]` observes an IPv4 peer as `::ffff:a.b.c.d` and
+/// would hand that back as the peer's mapping, which the peer cannot then
+/// connect to from the IPv4 socket it announced.
+pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
+    let SocketAddr::V6(v6) = address else {
+        return address;
+    };
+    match v6.ip().to_ipv4_mapped() {
+        Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+        None => address,
+    }
+}
+
 /// The inverse of [`push_address`].
 fn pull_address(bytes: &[u8]) -> AddressSlot {
-    let held = |ip, port| AddressSlot::Held(SocketAddr::new(ip, port));
+    let held = |ip, port| AddressSlot::Held(canonical(SocketAddr::new(ip, port)));
     match bytes {
         [0] => AddressSlot::Empty,
         [4, rest @ ..] if rest.len() == 6 => {

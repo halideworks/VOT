@@ -1153,6 +1153,16 @@ impl SideChannel {
         Ok(())
     }
 
+    /// The address the listener's socket is bound to, which tells a caller
+    /// which family its destinations have to be in.
+    ///
+    /// # Errors
+    /// Reports a listener that has already released the socket.
+    pub fn local_address(&self) -> Result<SocketAddr, Error> {
+        let socket = self.socket.upgrade().ok_or(Error::Backend)?;
+        socket.local_addr().map_err(|_| Error::Backend)
+    }
+
     /// The next datagram, or nothing within `wait`.
     ///
     /// # Errors

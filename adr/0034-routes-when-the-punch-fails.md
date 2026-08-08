@@ -46,13 +46,16 @@ punched IPv4 mapping, and last a relay that forwards datagrams for a
 bounded slot. Which route carried the transfer is reported, not
 inferred.**
 
-- **The service holds one mapping per family per key.** A serve whose
-  listener is dual-stack registers over both and is findable at both. A
-  resolve answers with the mappings the service holds, and the fetch
-  tries IPv6 first, because a global IPv6 address has no translation in
-  front of it and needs no punch, no mapping to keep alive, and no wait
-  before the handshake. This is what ADR-0033's fallback bullet described
-  before the one-mapping-per-key shape made it unwritable.
+- **The service holds one mapping per family per key, and a resolve is
+  answered in the family it arrived over.** A serve whose listener is
+  dual-stack registers with the service at each address it has, and is
+  findable at both. A fetch tries the service's IPv6 address before its
+  IPv4 one, and what comes back is the serve's mapping in that same
+  family, so nothing on the wire has to carry two addresses and the
+  amplification bound is untouched. IPv6 goes first because a global
+  address has no translation in front of it: no mapping to keep alive,
+  and no NAT to take one. This is what ADR-0033's fallback bullet
+  described before the one-mapping-per-key shape made it unwritable.
 - **A relay forwards datagrams and reads none of them.** It carries
   opaque UDP payloads between the two ends of a slot. The QUIC session,
   its congestion control, the manifest, and every proof stay end to end.
@@ -103,9 +106,10 @@ inferred.**
 ## Sequence
 
 1. One mapping per family per key, and the ordered ladder without a
-   relay: register both families where the listener has both, answer a
-   resolve with what the service holds, try IPv6 before punched IPv4,
-   and report the route the transfer took.
+   relay: `VOT_RENDEZVOUS` names a service by every address it has,
+   a serve registers at each, a resolve is answered in the family it
+   came over, a fetch tries IPv6 before punched IPv4, and the route the
+   transfer took is reported.
 2. The relay protocol and the `vot relay` verb: slot allocation keyed by
    the rendezvous key, forwarding, the TTL and byte ceilings, loopback
    tests, and the bounds held by construction rather than by policy.

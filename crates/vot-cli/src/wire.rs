@@ -496,9 +496,9 @@ const RESOLVE_RETRIES: u32 = 6;
 /// the serve's observed mapping.
 ///
 /// # Errors
-/// Returns [`Error::RendezvousTimeout`] if no answer arrives, or
-/// [`Error::RendezvousUnresolved`] if the service answers but no serve is
-/// registered for this key.
+/// Returns [`Error::RendezvousTimeout`] if the service never answers, or
+/// [`Error::RendezvousUnresolved`] if no serve registered before the retry
+/// budget was spent.
 pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, Error> {
     let key = crate::rendezvous::key_of(&root);
     let socket = std::net::UdpSocket::bind(if service.is_ipv6() {
@@ -527,14 +527,15 @@ pub fn resolve_root(root: [u8; 32], service: SocketAddr) -> Result<SocketAddr, E
                 return Err(Error::CarrierUnavailable);
             }
         };
-        let Some(crate::rendezvous::Datagram::Resolved { serve, .. }) =
-            crate::rendezvous::decode(&buffer[..length])
+        let Some(crate::rendezvous::Datagram::Resolved {
+            serve: Some(serve), ..
+        }) = crate::rendezvous::decode(&buffer[..length])
         else {
             continue;
         };
-        return serve.ok_or(Error::RendezvousUnresolved);
+        return Ok(serve);
     }
-    Err(Error::RendezvousTimeout)
+    Err(Error::RendezvousUnresolved)
 }
 
 /// Fetches a bundle by resolving `root` through a rendezvous service.

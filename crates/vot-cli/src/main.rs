@@ -243,7 +243,7 @@ fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::
 
 /// Fetch then receive, for the common case.
 fn pull(
-    address: &str,
+    target: &str,
     bundle: &str,
     destination: &str,
     receipt: &str,
@@ -251,14 +251,16 @@ fn pull(
     observed_at: &str,
     root: Option<&str>,
 ) -> Result<(), vot_cli::Error> {
-    let address = address
-        .parse()
-        .map_err(|_| vot_cli::Error::InvalidArguments)?;
-    let pin = root.map(vot_cli::parse_package_root).transpose()?;
-    // The key is loaded before a byte crosses the wire, so a pull that
-    // cannot write a receipt says so before it spends the transfer.
+    // The key is loaded before a byte crosses the wire.
     let key = vot_cli::load_key_spec(key)?;
-    vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
+    if let Ok(address) = target.parse::<std::net::SocketAddr>() {
+        let pin = root.map(vot_cli::parse_package_root).transpose()?;
+        vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
+    } else {
+        let parsed_root = vot_cli::parse_package_root(target)?;
+        let service = rendezvous_service_address()?;
+        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), service)?;
+    }
     let report = vot_cli::receive_bundle(
         Path::new(bundle),
         Path::new(destination),

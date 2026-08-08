@@ -306,7 +306,9 @@ pub fn validate_entries(
 }
 
 pub fn canonical_path_key(path: &PackagePath, profile: PathProfile) -> Result<Vec<u8>, Error> {
-    if path.is_empty() {
+    // The decoder refuses a path past this bound, so an encoder that emitted
+    // one would produce a page nothing could read back.
+    if path.is_empty() || path.len() > MAX_PATH_COMPONENTS {
         return Err(Error::InvalidPath);
     }
     let mut key = Vec::new();
@@ -908,8 +910,13 @@ fn is_device_digit(value: &str) -> bool {
 }
 
 fn valid_raw_component(component: &[u8]) -> bool {
+    // "." and ".." are not names, they are directions. A raw path that can
+    // say either is a path that can leave the destination it was extracted
+    // into, and the portable profile has refused them all along.
     !component.is_empty()
         && component.len() <= 255
+        && component != b"."
+        && component != b".."
         && !component.contains(&0)
         && !component.contains(&b'/')
 }
@@ -1649,9 +1656,44 @@ mod tests {
             ("one byte past the bound", vec![b'a'; 256]),
             ("a name holding a zero byte", b"a\0b".to_vec()),
             ("a name holding a separator", b"a/b".to_vec()),
+            ("this directory", b".".to_vec()),
+            ("the one above", b"..".to_vec()),
         ] {
             assert!(!valid_raw_component(&component), "{name}");
         }
+
+        // Only those two exactly. A name that merely starts with a dot is a
+        // name.
+        assert!(valid_raw_component(b"..."));
+        assert!(valid_raw_component(b".hidden"));
+        assert!(valid_raw_component(b"..a"));
+    }
+
+    #[test]
+    fn a_raw_path_cannot_leave_its_destination() {
+        let escape = vec![
+            Component::Bytes(b"..".to_vec()),
+            Component::Bytes(b"etc".to_vec()),
+        ];
+        assert!(matches!(
+            canonical_path_key(&escape, PathProfile::RawPosix),
+            Err(Error::InvalidPath)
+        ));
+    }
+
+    #[test]
+    fn an_encoder_refuses_a_path_the_decoder_would_not_read() {
+        let widest: PackagePath = (0..MAX_PATH_COMPONENTS)
+            .map(|_| Component::Text("a".to_owned()))
+            .collect();
+        assert!(canonical_path_key(&widest, PathProfile::Portable).is_ok());
+
+        let mut wider = widest;
+        wider.push(Component::Text("a".to_owned()));
+        assert!(matches!(
+            canonical_path_key(&wider, PathProfile::Portable),
+            Err(Error::InvalidPath)
+        ));
     }
 
     #[test]

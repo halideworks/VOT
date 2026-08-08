@@ -135,6 +135,18 @@ pub enum Error {
     ChainBroken,
     /// An entry in the chain is about a different subject.
     ChainSubjectMismatch,
+    /// An entry was authenticated under a different key than the chain's
+    /// first. Two issuers signing in turn is not one issuer's record.
+    ChainIssuerMismatch,
+    /// An entry names a different provider, session, or incarnation. A chain
+    /// is one incarnation's account of one object.
+    ChainScopeMismatch,
+    /// An entry claims no more assurance than the one before it. A chain is
+    /// scoped to one incarnation, and the relation performs each level once
+    /// within one, so a repeat is as wrong as a step backwards.
+    AssuranceDidNotAdvance,
+    /// A publication names a predecessor weaker than its profile requires.
+    PredecessorTooWeak,
     /// A chain with no observations proves nothing.
     EmptyChain,
     InvalidEncoding,
@@ -409,40 +421,138 @@ fn subject_identity(receipt: &Receipt) -> (SubjectKind, u16, [u8; 32], u64) {
     )
 }
 
-/// Checks that a sequence of observations forms one unbroken chain.
+/// A receipt whose authenticator this process checked.
 ///
-/// Each entry must link to its predecessor's envelope digest, carry the same
-/// subject, and advance the issuer sequence. The first entry must not link.
+/// The only way to hold one is to have verified it, which is what makes a
+/// chain of them evidence. `AuthenticatedReceipt` names a decoded envelope
+/// carrying an authenticator; it says nothing about whether the authenticator
+/// is good. There is no constructor and no deserialization: a persisted
+/// receipt is decoded and verified again.
+#[derive(Clone, Debug)]
+pub struct VerifiedReceipt {
+    authenticated: AuthenticatedReceipt,
+}
+
+impl VerifiedReceipt {
+    #[must_use]
+    pub const fn receipt(&self) -> &Receipt {
+        &self.authenticated.receipt
+    }
+
+    #[must_use]
+    pub const fn authenticated(&self) -> &AuthenticatedReceipt {
+        &self.authenticated
+    }
+
+    /// What authenticated it. A chain is scoped to one of these.
+    #[must_use]
+    pub fn key_id(&self) -> &[u8] {
+        &self.authenticated.key_id
+    }
+}
+
+/// What one issuer's observations of one object must agree about.
+fn chain_scope(receipt: &Receipt) -> (u16, [u16; 3], [u8; 16], [u8; 16]) {
+    (
+        receipt.provider,
+        receipt.provider_version,
+        receipt.session_id,
+        receipt.incarnation_id,
+    )
+}
+
+/// Checks that a sequence of verified observations forms one unbroken chain.
+///
+/// Every entry must link to its predecessor's envelope digest, carry the same
+/// subject, advance the issuer sequence, and come from the same issuer key,
+/// provider, session, and incarnation. The first entry must not link.
+///
+/// Assurance advances at every step, and a `Published`
+/// observation must name the predecessor its profile requires, which is the
+/// same table `vot_commit_model` holds the machine to.
+///
+/// The elements are `VerifiedReceipt` rather than `AuthenticatedReceipt`
+/// because an unbroken chain of forgeries is not evidence of anything, and a
+/// caller that has to remember to check each one separately will one day
+/// forget.
 ///
 /// # Errors
-/// Reports the first structural break.
-pub fn verify_chain(chain: &[AuthenticatedReceipt]) -> Result<(), Error> {
+/// Reports the first break.
+pub fn verify_chain(chain: &[VerifiedReceipt]) -> Result<(), Error> {
     let Some(first) = chain.first() else {
         return Err(Error::EmptyChain);
     };
-    if first.receipt.previous.is_some() {
+    if first.receipt().previous.is_some() {
         return Err(Error::ChainBroken);
     }
     // Object identity is the suite, the root, and the length. Identical digest
     // bytes under different suites are different objects, so leaving the suite
     // out would let a chain mix two of them.
-    let subject = subject_identity(&first.receipt);
-    let mut previous_digest = first.digest()?;
-    let mut previous_sequence = first.receipt.sequence;
+    let subject = subject_identity(first.receipt());
+    let scope = chain_scope(first.receipt());
+    let key_id = first.key_id().to_vec();
+    let mut previous_digest = first.authenticated().digest()?;
+    let mut previous_sequence = first.receipt().sequence;
+    let mut previous_assurance = first.receipt().assurance;
+    check_predecessor(first.receipt())?;
     for entry in chain.iter().skip(1) {
-        if entry.receipt.previous != Some(previous_digest) {
+        let receipt = entry.receipt();
+        if receipt.previous != Some(previous_digest) {
             return Err(Error::ChainBroken);
         }
-        if subject_identity(&entry.receipt) != subject {
+        if subject_identity(receipt) != subject {
             return Err(Error::ChainSubjectMismatch);
         }
-        if entry.receipt.sequence <= previous_sequence {
+        if entry.key_id() != key_id {
+            return Err(Error::ChainIssuerMismatch);
+        }
+        if chain_scope(receipt) != scope {
+            return Err(Error::ChainScopeMismatch);
+        }
+        if receipt.sequence <= previous_sequence {
             return Err(Error::InvalidSequence);
         }
-        previous_digest = entry.digest()?;
-        previous_sequence = entry.receipt.sequence;
+        if model_assurance(receipt.assurance) <= model_assurance(previous_assurance) {
+            return Err(Error::AssuranceDidNotAdvance);
+        }
+        check_predecessor(receipt)?;
+        previous_digest = entry.authenticated().digest()?;
+        previous_sequence = receipt.sequence;
+        previous_assurance = receipt.assurance;
     }
     Ok(())
+}
+
+/// A publication must name the assurance its profile requires. Anything
+/// weaker is a receipt claiming an assurance the commit relation would not
+/// have produced.
+fn check_predecessor(receipt: &Receipt) -> Result<(), Error> {
+    if receipt.assurance != AssuranceLevel::Published {
+        return Ok(());
+    }
+    let required = model_profile(receipt.profile).required_predecessor();
+    if model_assurance(receipt.actual_predecessor) < required {
+        return Err(Error::PredecessorTooWeak);
+    }
+    Ok(())
+}
+
+const fn model_assurance(level: AssuranceLevel) -> vot_commit_model::Assurance {
+    match level {
+        AssuranceLevel::Admitted => vot_commit_model::Assurance::Admitted,
+        AssuranceLevel::TransitVerified => vot_commit_model::Assurance::TransitVerified,
+        AssuranceLevel::Durable => vot_commit_model::Assurance::Durable,
+        AssuranceLevel::AtRestVerified => vot_commit_model::Assurance::AtRestVerified,
+        AssuranceLevel::Published => vot_commit_model::Assurance::Published,
+    }
+}
+
+const fn model_profile(profile: CommitProfile) -> vot_commit_model::Profile {
+    match profile {
+        CommitProfile::Fast => vot_commit_model::Profile::Fast,
+        CommitProfile::Balanced => vot_commit_model::Profile::Balanced,
+        CommitProfile::Strict => vot_commit_model::Profile::Strict,
+    }
 }
 
 /// Bytes an authenticator covers: domain, scheme, then the canonical receipt.
@@ -496,7 +606,10 @@ pub fn sign_ed25519(
 /// # Errors
 /// Rejects a receipt authenticated under another scheme, a malformed
 /// signature, or one that does not verify.
-pub fn verify_ed25519(receipt: &AuthenticatedReceipt, key: &VerifyingKey) -> Result<(), Error> {
+pub fn verify_ed25519(
+    receipt: &AuthenticatedReceipt,
+    key: &VerifyingKey,
+) -> Result<VerifiedReceipt, Error> {
     if receipt.scheme != AuthScheme::Ed25519 {
         return Err(Error::UnexpectedScheme);
     }
@@ -509,7 +622,10 @@ pub fn verify_ed25519(receipt: &AuthenticatedReceipt, key: &VerifyingKey) -> Res
     // verify_strict rejects signatures under low-order or torsion public keys,
     // so one signature cannot verify under two different keys.
     key.verify_strict(&input, &Signature::from_bytes(&bytes))
-        .map_err(|_| Error::Authentication)
+        .map_err(|_| Error::Authentication)?;
+    Ok(VerifiedReceipt {
+        authenticated: receipt.clone(),
+    })
 }
 
 /// Authenticates a receipt with a shared secret.
@@ -542,7 +658,10 @@ pub fn authenticate_hmac_sha256(
 /// # Errors
 /// Rejects a receipt authenticated under another scheme, a short key, or a MAC
 /// that does not verify.
-pub fn verify_hmac_sha256(receipt: &AuthenticatedReceipt, key: &[u8]) -> Result<(), Error> {
+pub fn verify_hmac_sha256(
+    receipt: &AuthenticatedReceipt,
+    key: &[u8],
+) -> Result<VerifiedReceipt, Error> {
     if receipt.scheme != AuthScheme::HmacSha256 {
         return Err(Error::UnexpectedScheme);
     }
@@ -553,7 +672,10 @@ pub fn verify_hmac_sha256(receipt: &AuthenticatedReceipt, key: &[u8]) -> Result<
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| Error::InvalidKey)?;
     mac.update(&input);
     mac.verify_slice(&receipt.authentication)
-        .map_err(|_| Error::Authentication)
+        .map_err(|_| Error::Authentication)?;
+    Ok(VerifiedReceipt {
+        authenticated: receipt.clone(),
+    })
 }
 
 pub fn encode_authenticated(receipt: &AuthenticatedReceipt) -> Result<Vec<u8>, Error> {
@@ -962,8 +1084,8 @@ mod tests {
         let mut changed = authenticated;
         changed.receipt.sequence += 1;
         assert_eq!(
-            verify_hmac_sha256(&changed, &key),
-            Err(Error::Authentication)
+            verify_hmac_sha256(&changed, &key).unwrap_err(),
+            Error::Authentication
         );
     }
 
@@ -1160,6 +1282,14 @@ mod tests {
         chain
     }
 
+    /// Verifies every entry, which is the only way to get a chain now.
+    fn verified(chain: &[AuthenticatedReceipt], key: &SigningKey) -> Vec<VerifiedReceipt> {
+        chain
+            .iter()
+            .map(|entry| verify_ed25519(entry, &key.verifying_key()).expect("a signature"))
+            .collect()
+    }
+
     #[test]
     fn a_chain_links_every_observation_to_its_predecessor() {
         let key = signing_key();
@@ -1173,10 +1303,7 @@ mod tests {
                 AssuranceLevel::Published,
             ],
         );
-        verify_chain(&signed).unwrap();
-        for entry in &signed {
-            verify_ed25519(entry, &key.verifying_key()).unwrap();
-        }
+        verify_chain(&verified(&signed, &key)).unwrap();
         assert!(signed[0].receipt.previous.is_none());
         assert_eq!(
             signed[4].receipt.previous,
@@ -1200,7 +1327,105 @@ mod tests {
         signed[1] = sign_ed25519(rewritten, b"issuer-1", &key).unwrap();
         // Re-signed and individually valid, but the chain no longer joins.
         verify_ed25519(&signed[1], &key.verifying_key()).unwrap();
-        assert_eq!(verify_chain(&signed), Err(Error::ChainBroken));
+        assert_eq!(
+            verify_chain(&verified(&signed, &key)),
+            Err(Error::ChainBroken)
+        );
+    }
+
+    #[test]
+    fn a_chain_belongs_to_one_issuer_and_one_incarnation() {
+        let key = signing_key();
+        let signed = chain(&key, &[AssuranceLevel::Admitted, AssuranceLevel::Durable]);
+
+        // A second issuer's signature over the same link. Both entries verify
+        // and the digests join, so only the scope check refuses it.
+        let other = SigningKey::from_bytes(&[8; 32]);
+        let elsewhere = sign_ed25519(signed[1].receipt.clone(), b"issuer-2", &other).unwrap();
+        let mixed = vec![
+            verify_ed25519(&signed[0], &key.verifying_key()).unwrap(),
+            verify_ed25519(&elsewhere, &other.verifying_key()).unwrap(),
+        ];
+        assert_eq!(verify_chain(&mixed), Err(Error::ChainIssuerMismatch));
+
+        // A provider, a provider version, a session, or an incarnation that
+        // changes part way is a different account of the object.
+        for divergent in [
+            Receipt {
+                provider: signed[1].receipt.provider + 1,
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                provider_version: [9, 9, 9],
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                session_id: [0xab; 16],
+                ..signed[1].receipt.clone()
+            },
+            Receipt {
+                incarnation_id: [0xcd; 16],
+                ..signed[1].receipt.clone()
+            },
+        ] {
+            let switched = sign_ed25519(divergent, b"issuer-1", &key).unwrap();
+            assert_eq!(
+                verify_chain(&verified(&[signed[0].clone(), switched], &key)),
+                Err(Error::ChainScopeMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_cannot_lose_assurance_or_publish_without_its_predecessor() {
+        let key = signing_key();
+        let signed = chain(&key, &[AssuranceLevel::Durable, AssuranceLevel::Published]);
+        verify_chain(&verified(&signed, &key)).unwrap();
+
+        // Going backwards. Every field but the assurance is the one the chain
+        // already accepted.
+        let mut weaker = signed[1].receipt.clone();
+        weaker.assurance = AssuranceLevel::Admitted;
+        let weaker = sign_ed25519(weaker, b"issuer-1", &key).unwrap();
+        assert_eq!(
+            verify_chain(&verified(&[signed[0].clone(), weaker], &key)),
+            Err(Error::AssuranceDidNotAdvance)
+        );
+
+        // And standing still. Two observations at one level cannot both be
+        // this incarnation performing it.
+        let mut repeated = signed[1].receipt.clone();
+        repeated.assurance = signed[0].receipt.assurance;
+        let repeated = sign_ed25519(repeated, b"issuer-1", &key).unwrap();
+        assert_eq!(
+            verify_chain(&verified(&[signed[0].clone(), repeated], &key)),
+            Err(Error::AssuranceDidNotAdvance)
+        );
+
+        // Publishing under a profile whose predecessor was never reached. The
+        // required assurance per profile is the one `vot_commit_model` holds
+        // the machine to, not a second copy of the table.
+        for (profile, too_weak) in [
+            (CommitProfile::Balanced, AssuranceLevel::TransitVerified),
+            (CommitProfile::Strict, AssuranceLevel::Durable),
+            (CommitProfile::Fast, AssuranceLevel::Admitted),
+        ] {
+            let mut published = signed[1].receipt.clone();
+            published.profile = profile;
+            published.actual_predecessor = too_weak;
+            let published = sign_ed25519(published, b"issuer-1", &key).unwrap();
+            let mut genesis = signed[0].receipt.clone();
+            genesis.profile = profile;
+            let genesis = sign_ed25519(genesis, b"issuer-1", &key).unwrap();
+            let mut linked = published.receipt.clone();
+            linked.previous = Some(genesis.digest().unwrap());
+            let linked = sign_ed25519(linked, b"issuer-1", &key).unwrap();
+            assert_eq!(
+                verify_chain(&verified(&[genesis, linked], &key)),
+                Err(Error::PredecessorTooWeak),
+                "{profile:?} published on {too_weak:?}"
+            );
+        }
     }
 
     #[test]
@@ -1212,10 +1437,13 @@ mod tests {
         let mut genesis = receipt();
         genesis.previous = Some([9; 32]);
         let orphan = sign_ed25519(genesis, b"issuer-1", &key).unwrap();
-        assert_eq!(verify_chain(&[orphan]), Err(Error::ChainBroken));
+        assert_eq!(
+            verify_chain(&verified(&[orphan], &key)),
+            Err(Error::ChainBroken)
+        );
 
         let signed = chain(&key, &[AssuranceLevel::Admitted, AssuranceLevel::Durable]);
-        verify_chain(&signed).unwrap();
+        verify_chain(&verified(&signed, &key)).unwrap();
 
         // An entry about a different subject. Identity is the suite, the root
         // and the length, so each of them has to break the chain.
@@ -1240,7 +1468,7 @@ mod tests {
         ] {
             let foreign = sign_ed25519(divergent, b"issuer-1", &key).unwrap();
             assert_eq!(
-                verify_chain(&[signed[0].clone(), foreign]),
+                verify_chain(&verified(&[signed[0].clone(), foreign], &key)),
                 Err(Error::ChainSubjectMismatch)
             );
         }
@@ -1250,7 +1478,7 @@ mod tests {
         stalled.sequence = signed[0].receipt.sequence;
         let stalled = sign_ed25519(stalled, b"issuer-1", &key).unwrap();
         assert_eq!(
-            verify_chain(&[signed[0].clone(), stalled]),
+            verify_chain(&verified(&[signed[0].clone(), stalled], &key)),
             Err(Error::InvalidSequence)
         );
     }
@@ -1371,10 +1599,13 @@ mod tests {
         let genesis = encode_authenticated(&signed[0]).unwrap();
         let linked = encode_authenticated(&signed[1]).unwrap();
         assert!(linked.len() > genesis.len());
-        verify_chain(&[
-            decode_authenticated(&genesis).unwrap(),
-            decode_authenticated(&linked).unwrap(),
-        ])
+        verify_chain(&verified(
+            &[
+                decode_authenticated(&genesis).unwrap(),
+                decode_authenticated(&linked).unwrap(),
+            ],
+            &key,
+        ))
         .unwrap();
     }
 
@@ -1389,8 +1620,8 @@ mod tests {
 
         let other = SigningKey::from_bytes(&[8; 32]);
         assert_eq!(
-            verify_ed25519(&signed, &other.verifying_key()),
-            Err(Error::Authentication)
+            verify_ed25519(&signed, &other.verifying_key()).unwrap_err(),
+            Error::Authentication
         );
 
         // Relabelling the key identifier breaks the signature, so a receipt
@@ -1398,8 +1629,8 @@ mod tests {
         let mut relabelled = signed.clone();
         relabelled.key_id = b"issuer-2".to_vec();
         assert_eq!(
-            verify_ed25519(&relabelled, &key.verifying_key()),
-            Err(Error::Authentication)
+            verify_ed25519(&relabelled, &key.verifying_key()).unwrap_err(),
+            Error::Authentication
         );
 
         // An identifier outside the registry bound is refused before any
@@ -1407,13 +1638,13 @@ mod tests {
         let mut unbounded = signed.clone();
         unbounded.key_id = Vec::new();
         assert_eq!(
-            verify_ed25519(&unbounded, &key.verifying_key()),
-            Err(Error::InvalidKeyId)
+            verify_ed25519(&unbounded, &key.verifying_key()).unwrap_err(),
+            Error::InvalidKeyId
         );
         unbounded.key_id = vec![b'k'; 65];
         assert_eq!(
-            verify_ed25519(&unbounded, &key.verifying_key()),
-            Err(Error::InvalidKeyId)
+            verify_ed25519(&unbounded, &key.verifying_key()).unwrap_err(),
+            Error::InvalidKeyId
         );
     }
 
@@ -1425,22 +1656,22 @@ mod tests {
         let mut altered = signed.clone();
         altered.receipt.sequence += 1;
         assert_eq!(
-            verify_ed25519(&altered, &key.verifying_key()),
-            Err(Error::Authentication)
+            verify_ed25519(&altered, &key.verifying_key()).unwrap_err(),
+            Error::Authentication
         );
 
         let mut flipped = signed.clone();
         flipped.authentication[0] ^= 1;
         assert_eq!(
-            verify_ed25519(&flipped, &key.verifying_key()),
-            Err(Error::Authentication)
+            verify_ed25519(&flipped, &key.verifying_key()).unwrap_err(),
+            Error::Authentication
         );
 
         let mut truncated = signed;
         truncated.authentication.pop();
         assert_eq!(
-            verify_ed25519(&truncated, &key.verifying_key()),
-            Err(Error::Authentication)
+            verify_ed25519(&truncated, &key.verifying_key()).unwrap_err(),
+            Error::Authentication
         );
     }
 
@@ -1453,12 +1684,12 @@ mod tests {
         // A verifier that requires one scheme refuses the other outright,
         // rather than reporting a signature failure it might retry.
         assert_eq!(
-            verify_hmac_sha256(&signed, &[9; 32]),
-            Err(Error::UnexpectedScheme)
+            verify_hmac_sha256(&signed, &[9; 32]).unwrap_err(),
+            Error::UnexpectedScheme
         );
         assert_eq!(
-            verify_ed25519(&maced, &key.verifying_key()),
-            Err(Error::UnexpectedScheme)
+            verify_ed25519(&maced, &key.verifying_key()).unwrap_err(),
+            Error::UnexpectedScheme
         );
 
         // The scheme is inside the signed bytes, so the two cover different
@@ -1574,8 +1805,8 @@ mod tests {
         );
         let authenticated = authenticate_hmac_sha256(receipt(), b"receiver-1", &[9; 32]).unwrap();
         assert_eq!(
-            verify_hmac_sha256(&authenticated, &[9; 31]),
-            Err(Error::InvalidKey)
+            verify_hmac_sha256(&authenticated, &[9; 31]).unwrap_err(),
+            Error::InvalidKey
         );
 
         assert_eq!(
@@ -1612,8 +1843,8 @@ mod tests {
         *changed.last_mut().unwrap() ^= 1;
         let decoded = decode_authenticated(&changed).unwrap();
         assert_eq!(
-            verify_hmac_sha256(&decoded, &[9; 32]),
-            Err(Error::Authentication)
+            verify_hmac_sha256(&decoded, &[9; 32]).unwrap_err(),
+            Error::Authentication
         );
     }
 }

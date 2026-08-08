@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 vot-cbor = { path = "../vot-cbor" }
+vot-commit-model = { path = "../vot-commit-model" }
 ed25519-dalek.workspace = true
 hmac = "0.13.0"
 sha2.workspace = true

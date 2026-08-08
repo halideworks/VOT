@@ -237,12 +237,7 @@ impl Machine {
     }
 
     fn required_predecessor_performed(&self) -> bool {
-        let required = match self.profile {
-            Profile::Fast => Assurance::TransitVerified,
-            Profile::Balanced => Assurance::Durable,
-            Profile::Strict => Assurance::AtRestVerified,
-        };
-        self.performed(required)
+        self.performed(self.profile.required_predecessor())
     }
 }
 
@@ -268,6 +263,18 @@ impl Event {
 }
 
 impl Profile {
+    /// The assurance a publication under this profile must already have
+    /// performed. One home for the rule: a receipt chain checks the same
+    /// table the machine enforces.
+    #[must_use]
+    pub const fn required_predecessor(self) -> Assurance {
+        match self {
+            Self::Fast => Assurance::TransitVerified,
+            Self::Balanced => Assurance::Durable,
+            Self::Strict => Assurance::AtRestVerified,
+        }
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

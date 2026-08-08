@@ -1766,6 +1766,7 @@ impl KeyMaterial {
             Self::Verifying(key) => verify_ed25519(authenticated, key),
             Self::Shared(secret) => verify_hmac_sha256(authenticated, secret),
         }
+        .map(drop)
         .map_err(|_| Error::InvalidBundle)
     }
 }

@@ -168,10 +168,10 @@ impl ResumeStore {
     ///
     /// Only for a caller that owns the containing directory and knows no
     /// other process has this store open, such as a fetch tidying up its own
-    /// finished output. The unlink happens under the lock, so no transaction
-    /// is in flight, but a process that opened the lock file and has not yet
-    /// acquired it would go on to hold an inode with no name while the next
-    /// process takes a fresh one.
+    /// finished output. The lock is released before the lock file goes,
+    /// because Windows will not unlink an open one, so a process that had
+    /// been waiting on the lock could take it in between and then hold an
+    /// inode with no name while the next process opens a fresh one.
     pub fn remove_unshared(self) -> Result<(), Error> {
         self.remove_within(true)
     }
@@ -179,12 +179,12 @@ impl ResumeStore {
     fn remove_within(self, lock_file_too: bool) -> Result<(), Error> {
         let lock_file = lock_path(&self.path)?;
         let lock = lock_store(&self.path)?;
-        let mut removal = remove_if_present(&self.path)
+        let removal = remove_if_present(&self.path)
             .and_then(|()| remove_if_present(&temporary_path(&self.path)?));
-        if lock_file_too && removal.is_ok() {
-            removal = remove_if_present(&lock_file);
-        }
         drop(lock);
+        if lock_file_too && removal.is_ok() {
+            return remove_if_present(&lock_file);
+        }
         removal
     }
 
@@ -1621,6 +1621,10 @@ mod tests {
         fs::remove_file(lock_path(&path).unwrap()).unwrap();
     }
 
+    // The hazard is a POSIX one: unlinking a locked name leaves the lock
+    // held on an inode nothing else can reach. Windows refuses the unlink
+    // outright, so there is nothing to check there.
+    #[cfg(unix)]
     #[test]
     fn removal_keeps_the_lock_inode_so_two_writers_cannot_split() {
         use std::os::unix::fs::MetadataExt;

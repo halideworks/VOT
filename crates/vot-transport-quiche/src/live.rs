@@ -244,6 +244,13 @@ pub struct Config {
     pub max_datagram_bytes: usize,
     /// The congestion controller this endpoint runs.
     pub congestion: CongestionControl,
+    /// A lead byte whose datagrams are not this transport's, handed to
+    /// the listener's side channel instead of routed.
+    ///
+    /// The transport knows nothing of what such a datagram says. A caller
+    /// sharing the socket with another protocol names the byte that tells
+    /// them apart; without one every arrival is routed as QUIC.
+    pub side_channel_lead: Option<u8>,
 }
 
 /// Which congestion controller carries the connection.
@@ -295,6 +302,7 @@ impl Config {
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
+            side_channel_lead: None,
         }
     }
 
@@ -310,6 +318,7 @@ impl Config {
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
+            side_channel_lead: None,
         }
     }
 
@@ -1110,6 +1119,67 @@ pub struct Listener {
     stop: Arc<std::sync::atomic::AtomicBool>,
     accept_timeout_ms: u64,
     router: Option<JoinHandle<()>>,
+    side: Option<SideChannel>,
+}
+
+/// The listener's socket as another protocol's, taken once and moved to
+/// whichever thread speaks it.
+///
+/// Holds the send side of the socket the sessions arrive at, which is the
+/// point: a NAT mapping belongs to a socket, so an exchange about where
+/// this endpoint appears has to happen on the same one (ADR-0033). What
+/// arrives leading with the configured byte comes back here, one datagram
+/// at a time however the kernel coalesced them.
+///
+/// The socket is held weakly, so holding this does not hold the port: the
+/// router owns the socket, and once the listener has joined it there is
+/// nothing left to send from.
+pub struct SideChannel {
+    socket: std::sync::Weak<UdpSocket>,
+    arrivals: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+}
+
+/// Side-channel datagrams held for a reader that has not taken them.
+///
+/// Small on purpose: the reader expects a handful of replies to what it
+/// sent, and anyone who can reach the port can send the lead byte, so
+/// what does not fit is shed the way a full receive buffer sheds.
+const SIDE_CHANNEL_BACKLOG: usize = 64;
+
+/// The most a side-channel datagram may be, checked before the router
+/// copies one out of its buffer.
+///
+/// A side channel carries small fixed-shape datagrams. Without a bound,
+/// anyone who can reach the port makes the router allocate a read's worth
+/// of bytes per arrival before the queue can shed it.
+const SIDE_CHANNEL_MAX_BYTES: usize = 128;
+
+impl SideChannel {
+    /// Sends one datagram from the listener's socket.
+    ///
+    /// # Errors
+    /// Reports a socket that would not send it, and a listener that has
+    /// already released it.
+    pub fn send_to(&self, bytes: &[u8], to: SocketAddr) -> Result<(), Error> {
+        let socket = self.socket.upgrade().ok_or(Error::Backend)?;
+        socket.send_to(bytes, to).map_err(|_| Error::Backend)?;
+        Ok(())
+    }
+
+    /// The next datagram, or nothing within `wait`.
+    ///
+    /// # Errors
+    /// Reports a router that has ended, which is the same condition
+    /// [`Listener::accept`] reports and not a wait that came up empty:
+    /// a caller that could not tell them apart would spin, because a
+    /// dead channel answers immediately and forever.
+    pub fn next_within(&self, wait: Duration) -> Result<Option<(Vec<u8>, SocketAddr)>, Error> {
+        match self.arrivals.recv_timeout(wait) {
+            Ok(arrival) => Ok(Some(arrival)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::Backend),
+        }
+    }
 }
 
 impl Listener {
@@ -1129,6 +1199,11 @@ impl Listener {
         let socket = Arc::new(socket);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (arrived, arrivals) = mpsc::sync_channel(ACCEPT_BACKLOG);
+        let (aside, beside) = mpsc::sync_channel(SIDE_CHANNEL_BACKLOG);
+        let side = config.side_channel_lead.map(|_| SideChannel {
+            socket: Arc::downgrade(&socket),
+            arrivals: beside,
+        });
         let router_socket = Arc::clone(&socket);
         let router_stop = Arc::clone(&stop);
         let router_config = config.clone();
@@ -1140,6 +1215,7 @@ impl Listener {
                     local,
                     &router_config,
                     &arrived,
+                    &aside,
                     &router_stop,
                 );
             })
@@ -1151,7 +1227,14 @@ impl Listener {
             stop,
             accept_timeout_ms: config.accept_timeout_ms,
             router: Some(router),
+            side,
         })
+    }
+
+    /// Takes the side channel, once, if the configuration named a lead
+    /// byte for one.
+    pub fn take_side_channel(&mut self) -> Option<SideChannel> {
+        self.side.take()
     }
 
     /// The address this listener is bound to.
@@ -1207,6 +1290,7 @@ fn route(
     local: SocketAddr,
     config: &Config,
     arrived: &mpsc::SyncSender<Transport>,
+    aside: &mpsc::SyncSender<(Vec<u8>, SocketAddr)>,
     stop: &std::sync::atomic::AtomicBool,
 ) {
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
@@ -1228,6 +1312,17 @@ fn route(
                 return;
             }
         };
+        if is_side_channel(config.side_channel_lead, &buffer[..len], segment) {
+            for piece in split_read(&buffer[..len], segment) {
+                if piece.len() > SIDE_CHANNEL_MAX_BYTES {
+                    continue;
+                }
+                // A full queue sheds the datagram, as a full kernel
+                // receive buffer would; the sender's cadence recovers it.
+                let _ = aside.try_send((piece.to_vec(), from));
+            }
+            continue;
+        }
         // The header wants only the first datagram of a coalesced read,
         // and the kernel only coalesces one flow, so its identifier
         // stands for the batch.
@@ -1600,14 +1695,41 @@ fn feed_received(
     from: SocketAddr,
     segment: Option<usize>,
 ) {
-    let step = match segment {
-        Some(step) if step > 0 => step,
-        _ => received.len().max(1),
-    };
+    let step = segment_step(received.len(), segment);
     for piece in received.chunks_mut(step) {
         let info = quiche::RecvInfo { from, to: local };
         let _ = conn.recv(piece, info);
     }
+}
+
+/// The width the kernel cut a coalesced read into: the offload's segment
+/// where it gave one, and the whole read where it did not.
+const fn segment_step(len: usize, segment: Option<usize>) -> usize {
+    match segment {
+        Some(step) if step > 0 => step,
+        _ if len == 0 => 1,
+        _ => len,
+    }
+}
+
+/// One read as the datagrams it arrived as.
+fn split_read(bytes: &[u8], segment: Option<usize>) -> impl Iterator<Item = &[u8]> {
+    bytes.chunks(segment_step(bytes.len(), segment))
+}
+
+/// Whether a read belongs to the side channel rather than to QUIC.
+///
+/// Every datagram in the read has to lead with the byte, not just the
+/// first: one peer can send both protocols from one address, and the
+/// kernel coalesces by address. A mixed read goes to QUIC, where a
+/// side-channel datagram is dropped by the header parse, because losing
+/// one of those costs nothing and losing a QUIC packet costs a
+/// retransmission.
+fn is_side_channel(lead: Option<u8>, bytes: &[u8], segment: Option<usize>) -> bool {
+    let Some(named) = lead else {
+        return false;
+    };
+    !bytes.is_empty() && split_read(bytes, segment).all(|piece| piece.first() == Some(&named))
 }
 
 /// Takes what has already arrived without waiting, up to the counted budget.
@@ -2539,6 +2661,126 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(300),
             "the accept gave up early, at {waited:?}"
+        );
+    }
+
+    #[test]
+    fn the_side_channel_takes_its_lead_byte_and_leaves_the_rest_routed() {
+        // A socket two protocols share: what leads with the named byte
+        // reaches the side channel with its source, what does not stays
+        // the router's, and the channel sends from the listener's own
+        // address, which is the mapping a peer observes.
+        let (certificate, key) = credentials();
+        let mut config = Config::server(limits(), certificate, key);
+        config.side_channel_lead = Some(0x1F);
+        let mut listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let at = listener.local_address();
+        let side = listener.take_side_channel().expect("a lead byte was named");
+        assert!(
+            listener.take_side_channel().is_none(),
+            "the side channel is one thread's"
+        );
+
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a peer socket");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        peer.send_to(&[0x1F, 1, 2, 3], at).expect("a side datagram");
+        // A QUIC-shaped datagram in between: it goes to the router, which
+        // sheds it, and never to the side channel.
+        peer.send_to(&[0xC0, 0, 0, 0, 1, 0, 0], at)
+            .expect("a QUIC-shaped datagram");
+        peer.send_to(&[0x1F, 4, 5, 6], at).expect("another");
+        let first = side
+            .next_within(Duration::from_secs(10))
+            .expect("the router is live")
+            .expect("the first side datagram");
+        assert_eq!(first.0, vec![0x1F, 1, 2, 3]);
+        assert_eq!(
+            first.1.port(),
+            peer.local_addr().expect("the socket").port()
+        );
+        let second = side
+            .next_within(Duration::from_secs(10))
+            .expect("the router is live")
+            .expect("the second side datagram");
+        assert_eq!(
+            second.0,
+            vec![0x1F, 4, 5, 6],
+            "the QUIC-shaped datagram was routed, not handed aside"
+        );
+
+        // A datagram past the side channel's own bound is shed before it
+        // is copied, so the lead byte cannot make the router allocate a
+        // read's worth of bytes per arrival. The one at the bound still
+        // arrives, which is what makes the refusal a bound and not a
+        // narrower shape.
+        let mut wide = vec![0x1F; SIDE_CHANNEL_MAX_BYTES + 1];
+        peer.send_to(&wide, at).expect("an oversized side datagram");
+        wide.pop();
+        peer.send_to(&wide, at).expect("one at the bound");
+        let third = side
+            .next_within(Duration::from_secs(10))
+            .expect("the router is live")
+            .expect("the datagram at the bound");
+        assert_eq!(
+            third.0.len(),
+            SIDE_CHANNEL_MAX_BYTES,
+            "the oversized one was shed and the one at the bound was not"
+        );
+
+        side.send_to(&[0x1F, 7], first.1).expect("a reply");
+        let mut buffer = [0_u8; 64];
+        let (length, from) = peer.recv_from(&mut buffer).expect("the reply");
+        assert_eq!(&buffer[..length], &[0x1F, 7]);
+        assert_eq!(from.port(), at.port(), "the reply came from the listener");
+
+        // The listener owns the socket: dropping it releases the port and
+        // leaves the side channel with nothing to send from or wait on,
+        // rather than a holder that keeps the port bound after the router
+        // has ended.
+        let served = listener.local_address();
+        drop(listener);
+        assert!(
+            side.next_within(Duration::from_secs(10)).is_err(),
+            "a router that ended is an error, not an empty wait"
+        );
+        assert!(side.send_to(&[0x1F, 8], first.1).is_err());
+        UdpSocket::bind(served).expect("the dropped listener released its port");
+    }
+
+    #[test]
+    fn a_lead_byte_decides_the_side_channel_and_a_segment_the_split() {
+        // The two pure halves of the tap: which reads are the side
+        // channel's, and how one read comes apart into the datagrams the
+        // kernel coalesced. A read with no offload is one datagram.
+        assert!(is_side_channel(Some(0x1F), &[0x1F, 0], None));
+        assert!(!is_side_channel(Some(0x1F), &[0xC0, 0x1F], None));
+        assert!(!is_side_channel(Some(0x1F), &[], None));
+        assert!(!is_side_channel(None, &[0x1F, 0], None));
+        // A coalesced read is the side channel's only if every datagram
+        // in it is: one peer can send both protocols from one address.
+        assert!(is_side_channel(Some(0x1F), &[0x1F, 0, 0x1F, 1], Some(2)));
+        assert!(
+            !is_side_channel(Some(0x1F), &[0x1F, 0, 0xC0, 1], Some(2)),
+            "a QUIC packet coalesced behind a side datagram stays routed"
+        );
+        assert!(
+            !is_side_channel(Some(0x1F), &[0xC0, 0, 0x1F, 1], Some(2)),
+            "and ahead of one"
+        );
+        assert_eq!(segment_step(9, Some(4)), 4);
+        assert_eq!(segment_step(9, Some(0)), 9, "no offload is one datagram");
+        assert_eq!(segment_step(9, None), 9);
+        assert_eq!(segment_step(0, None), 1, "a step of zero would not walk");
+        let coalesced = [1, 2, 3, 4, 5];
+        assert_eq!(
+            split_read(&coalesced, Some(2)).collect::<Vec<_>>(),
+            vec![&[1, 2][..], &[3, 4][..], &[5][..]]
+        );
+        assert_eq!(
+            split_read(&coalesced, None).collect::<Vec<_>>(),
+            vec![&coalesced[..]]
         );
     }
 

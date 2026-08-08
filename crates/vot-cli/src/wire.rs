@@ -7,10 +7,12 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use vot_transport_api::ReceiveLimits;
-use vot_transport_quiche::live::{Config, CongestionControl, Listener, Transport};
+use vot_transport_quiche::live::{Config, CongestionControl, Listener, SideChannel, Transport};
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession};
 
@@ -272,6 +274,10 @@ pub fn serve_bundle(
     }
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
+    // The rendezvous shares this socket, so the router has to be told
+    // which arrivals are not its own before it binds (ADR-0033).
+    let service = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;
+    config.side_channel_lead = service.map(|_| crate::rendezvous::MAGIC);
 
     // One socket for every session, and the address reported once: a
     // caller that asked for port zero cannot connect until it knows what
@@ -279,20 +285,140 @@ pub fn serve_bundle(
     // return; without one the command serves until it is stopped. The
     // loop and its failure policy live in `drive`, under the gate this
     // file is not.
-    let listener = Listener::bind(address, &config).map_err(carrier_failure)?;
+    let mut listener = Listener::bind(address, &config).map_err(carrier_failure)?;
     listening(listener.local_address());
-    crate::drive::serve_sessions(sessions, || {
+    let registration =
+        start_registration(service, listener.take_side_channel(), server.package().root)?;
+    let outcome = crate::drive::serve_sessions(sessions, || {
         // The accept parks this thread until a client's first packet
         // names a connection, so a session never spends its stall budget
         // waiting for one to exist.
         let carrier = listener.accept().map_err(carrier_failure)?;
         ServeSession::begin(&server, carrier, authentication())
-    })?;
+    });
+    // Before the failure is surfaced, so a serve that ends badly still
+    // stops registering and releases its socket.
+    drop(registration);
+    outcome?;
     Ok(server.package())
 }
 
+/// A registration when there is both a service to register with and a
+/// socket to register on, and none otherwise.
+///
+/// Both halves come from the same decision: the configuration named a
+/// service, so the bind was told to hand rendezvous datagrams aside. A
+/// serve with one and not the other would send registrations nobody
+/// answers, or hold a channel nothing reads.
+///
+/// # Errors
+/// Reports a registration thread that will not start.
+fn start_registration(
+    service: Option<SocketAddr>,
+    side: Option<SideChannel>,
+    root: [u8; 32],
+) -> Result<Option<Registration>, Error> {
+    match (service, side) {
+        (Some(service), Some(side)) => Registration::begin(side, root, service).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// A serve's registration for as long as it serves.
+///
+/// The thread lives beside the accept loop rather than inside it,
+/// because the cadence has to keep running while an accept is parked
+/// waiting for a client. Dropping it stops the thread and joins it,
+/// which is also what releases the listener's socket: the thread holds
+/// the same socket the router does, so one left running holds the port
+/// after the serve has returned.
+struct Registration {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Turns the drop waits for the registration thread to notice the stop
+/// flag, at [`REGISTRAR_TICK`] each.
+///
+/// The wait is counted rather than open: a thread that will not stop is
+/// left behind, which costs a thread, where joining it would cost the
+/// process. Its socket is the listener's and weakly held, so what it is
+/// holding goes when the listener does either way.
+const STOP_TURNS: usize = 20;
+
+impl Registration {
+    /// Starts registering `root` with `service` on the listener's socket.
+    ///
+    /// The first registration goes on this thread, so a service the
+    /// socket cannot reach at all stops the serve here rather than
+    /// leaving it running and unfindable: an address of the wrong family
+    /// for the bound socket, or a route that does not exist, fails the
+    /// send outright. A service that is merely not answering cannot be
+    /// told from one that is, and the cadence keeps trying.
+    ///
+    /// # Errors
+    /// Reports a service this socket cannot send to, and a thread that
+    /// will not start.
+    fn begin(side: SideChannel, root: [u8; 32], service: SocketAddr) -> Result<Self, Error> {
+        let mut registrar = crate::rendezvous::Registrar::new(&root, service);
+        post(&side, registrar.due(0))?;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let ended = Arc::clone(&stopped);
+        let thread = std::thread::Builder::new()
+            .name("vot-rendezvous".to_owned())
+            .spawn(move || {
+                keep_registered(&side, &mut registrar, &flag);
+                ended.store(true, Ordering::Relaxed);
+            })
+            .map_err(|_| Error::CarrierUnavailable)?;
+        Ok(Self {
+            stop,
+            stopped,
+            thread: Some(thread),
+        })
+    }
+
+    /// Whether the registration thread has ended, which the drop waits
+    /// for and a caller can watch across it.
+    #[cfg(test)]
+    fn watch(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.stopped)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // Counted turns rather than a join outright: a thread that does
+        // not answer the flag would otherwise hold the serve's return
+        // forever, and a leaked thread on a weakly held socket is the
+        // smaller failure.
+        for _ in 0..STOP_TURNS {
+            if self.stopped.load(Ordering::Relaxed) {
+                let _ = thread.join();
+                return;
+            }
+            std::thread::sleep(REGISTRAR_TICK);
+        }
+    }
+}
+
+/// How long the service waits on an empty socket before taking another
+/// turn.
+///
+/// A bound counts turns rather than arrivals, so this is also what lets
+/// a bounded service return when nobody is sending: without it a test
+/// that asks for more turns than it produces waits on a read forever.
+const SERVICE_TICK: Duration = Duration::from_millis(100);
+
 /// Runs the rendezvous service of ADR-0033 on `address` until stopped,
-/// or until `datagrams` arrivals when bounded (which is what lets a test
+/// or until `datagrams` turns when bounded (which is what lets a test
 /// serve an exchange and return).
 ///
 /// One socket, the bounded pairing table, and nothing sent anywhere but
@@ -308,6 +434,9 @@ pub fn rendezvous_service(
     mut listening: impl FnMut(SocketAddr),
 ) -> Result<(), Error> {
     let socket = std::net::UdpSocket::bind(address).map_err(|_| Error::CarrierUnavailable)?;
+    socket
+        .set_read_timeout(Some(SERVICE_TICK))
+        .map_err(|_| Error::CarrierUnavailable)?;
     listening(socket.local_addr().map_err(|_| Error::CarrierUnavailable)?);
     let began = std::time::Instant::now();
     let mut pairings = crate::rendezvous::Pairings::default();
@@ -341,6 +470,90 @@ pub fn rendezvous_service(
         }
     }
     Ok(())
+}
+
+/// The environment variable naming the rendezvous service a serve
+/// registers with. Unset, a serve registers nowhere and behaves exactly
+/// as it did before ADR-0033.
+const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
+
+/// The service [`RENDEZVOUS`] names, apart from the environment that
+/// feeds it, as [`congestion_from`] and [`rails_from`] are.
+///
+/// An address, not a name: nothing here resolves, so a serve's start
+/// makes no DNS query. A value that is not one is refused where the
+/// refusal can name the argument, rather than serving without the
+/// reachability the caller asked for and never saying so.
+///
+/// # Errors
+/// Rejects a value that is not an `ADDR:PORT`.
+fn rendezvous_from(pin: Option<&str>) -> Result<Option<SocketAddr>, Error> {
+    let Some(value) = pin else {
+        return Ok(None);
+    };
+    value
+        .trim()
+        .parse()
+        .map(Some)
+        .map_err(|_| Error::InvalidArguments)
+}
+
+/// How long a registered serve waits on its side channel before looking
+/// at the clock and the stop flag again.
+const REGISTRAR_TICK: Duration = Duration::from_millis(200);
+
+/// Sends what the registrar handed back, on the listener's own socket,
+/// which is the mapping the service observes and the one sessions arrive
+/// at.
+///
+/// # Errors
+/// Reports a socket that would not send, which is the socket this serve
+/// answers on and not a peer's failure.
+fn post(
+    side: &SideChannel,
+    sends: Vec<(SocketAddr, crate::rendezvous::Datagram)>,
+) -> Result<(), Error> {
+    for (to, datagram) in sends {
+        side.send_to(&crate::rendezvous::encode(&datagram), to)
+            .map_err(carrier_failure)?;
+    }
+    Ok(())
+}
+
+/// Keeps a serve registered and warms the fetches it is told about,
+/// until `stop`.
+///
+/// Every decision is [`crate::rendezvous::Registrar`]'s. A send that
+/// fails, or a router that has ended, ends the registration and says so
+/// once: a serve that keeps a cadence nothing receives is a serve no
+/// fetch can find, which is worth a line on stderr rather than silence.
+fn keep_registered(
+    side: &SideChannel,
+    registrar: &mut crate::rendezvous::Registrar,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    let began = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // What is due goes before the wait, so a registration is never
+        // held up by an arrival that has not come.
+        if post(side, registrar.due(now_ms)).is_err() {
+            eprintln!("rendezvous registration stopped: the socket would not send");
+            return;
+        }
+        match side.next_within(REGISTRAR_TICK) {
+            Ok(Some((bytes, from))) => {
+                if let Some(datagram) = crate::rendezvous::decode(&bytes) {
+                    registrar.take(datagram, from);
+                }
+            }
+            Ok(None) => {}
+            // The router is gone, so nothing can arrive and the socket is
+            // going with it. Returning is what keeps this from spinning
+            // on a channel that answers instantly and forever.
+            Err(_) => return,
+        }
+    }
 }
 
 /// Whether a socket read failed only for want of a datagram, which is
@@ -546,6 +759,191 @@ mod tests {
             .join()
             .expect("the service thread")
             .expect("the service served its bound");
+    }
+
+    #[test]
+    fn a_registered_serve_is_resolved_and_warms_the_fetch_that_comes() {
+        // ADR-0033 step 2 end to end over loopback: the listener's own
+        // socket registers under the bundle's key, so what a fetch
+        // resolves is the address sessions arrive at, and the Coming the
+        // service forwards makes this end send toward the fetch's
+        // mapping, which is what opens its NAT.
+        use crate::rendezvous::{Datagram, decode, encode, key_of};
+
+        let (addressed, address) = mpsc::channel();
+        // Bounded in turns, and joined at the end, so the service and
+        // its socket go with the test rather than living on in the test
+        // binary. A turn is an arrival or an empty tick, so the bound is
+        // also what makes the join return.
+        let service_thread = std::thread::spawn(move || {
+            rendezvous_service("127.0.0.1:0".parse().unwrap(), Some(120), |at| {
+                let _ = addressed.send(at);
+            })
+        });
+        let service = address.recv().expect("the service reported its address");
+
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.side_channel_lead = Some(crate::rendezvous::MAGIC);
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let served = listener.local_address();
+        let side = listener.take_side_channel().expect("a side channel");
+        let root = [9; 32];
+        let registration = Registration::begin(side, root, service).expect("a registration");
+
+        let fetch = UdpSocket::bind("127.0.0.1:0").expect("a fetch socket");
+        fetch
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("a bounded wait");
+        let mut buffer = [0_u8; 128];
+        let mut mapping = None;
+        // Bounded by its own count: each turn asks once, and backs off a
+        // little when the answer is that nobody has registered yet. The
+        // count and the waits are what a regression costs the suite, so
+        // they are the smallest that clear a loaded runner.
+        for _ in 0..40 {
+            fetch
+                .send_to(&encode(&Datagram::Resolve { key: key_of(&root) }), service)
+                .expect("a resolve");
+            let Ok((length, _)) = fetch.recv_from(&mut buffer) else {
+                continue;
+            };
+            if let Some(Datagram::Resolved {
+                serve: Some(at), ..
+            }) = decode(&buffer[..length])
+            {
+                mapping = Some(at);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mapping = mapping.expect("the serve registered and was resolved");
+        assert_eq!(
+            mapping.port(),
+            served.port(),
+            "the mapping is the socket sessions arrive at"
+        );
+
+        // The service told the serve a fetch is coming, and the serve
+        // warmed the path toward it.
+        let mut warmed = false;
+        for _ in 0..40 {
+            let Ok((length, from)) = fetch.recv_from(&mut buffer) else {
+                continue;
+            };
+            if decode(&buffer[..length]) == Some(Datagram::Warming) {
+                assert_eq!(from.port(), served.port(), "the serve warmed the path");
+                warmed = true;
+                break;
+            }
+        }
+        assert!(warmed, "the fetch's mapping was never warmed");
+        drop(registration);
+        drop(listener);
+        let _ = service_thread.join().expect("the service thread");
+    }
+
+    #[test]
+    fn a_registration_needs_both_a_service_and_a_socket_and_releases_it() {
+        // Two properties of the same object. Which serves register: only
+        // one told where to and given the socket to do it on, because
+        // either half alone is a serve sending where nobody answers or
+        // holding a channel nothing reads. And a registration that ends
+        // releases the socket: its thread holds the same socket the
+        // router does, so one left running keeps the port bound after
+        // the serve has returned, and the next serve cannot have it.
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.side_channel_lead = Some(crate::rendezvous::MAGIC);
+        // A loopback address nothing answers on: the first registration
+        // has to leave the socket, and nothing has to reply for it to.
+        let service: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let root = [4; 32];
+
+        assert!(
+            start_registration(None, None, root)
+                .expect("no service is no registration")
+                .is_none()
+        );
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+        assert!(
+            start_registration(None, Some(side), root)
+                .expect("a socket without a service is no registration")
+                .is_none()
+        );
+
+        let served = {
+            let mut listener =
+                Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+            let at = listener.local_address();
+            let side = listener.take_side_channel().expect("a side channel");
+            let registration = start_registration(Some(service), Some(side), root)
+                .expect("a registration thread")
+                .expect("a service and a socket register");
+            let watch = registration.watch();
+            drop(registration);
+            assert!(
+                watch.load(Ordering::Relaxed),
+                "the drop stopped the registration thread and waited for it"
+            );
+            at
+        };
+        UdpSocket::bind(served).expect("the ended registration released the socket");
+
+        // A service of the wrong family for the bound socket cannot be
+        // sent to at all, and that is refused where it happens rather
+        // than left as a serve nobody can resolve.
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+        assert!(
+            matches!(
+                start_registration(Some("[::1]:9".parse().unwrap()), Some(side), root),
+                Err(Error::CarrierUnavailable)
+            ),
+            "an unreachable service is refused at the first registration"
+        );
+    }
+
+    #[test]
+    fn a_rendezvous_is_the_address_given_or_nowhere() {
+        // The pin apart from the process environment: unset is a serve
+        // that registers nowhere, which is every serve before ADR-0033,
+        // and a value that is not an address is refused at the argument
+        // rather than at the socket.
+        assert!(std::env::var(RENDEZVOUS).is_err(), "the suite owns no env");
+        assert_eq!(rendezvous_from(None).expect("unset is nowhere"), None);
+        assert_eq!(
+            rendezvous_from(Some(" 198.51.100.7:9000 ")).expect("an address"),
+            Some("198.51.100.7:9000".parse().unwrap()),
+        );
+        assert_eq!(
+            rendezvous_from(Some("[2001:db8::1]:9000")).expect("an address"),
+            Some("[2001:db8::1]:9000".parse().unwrap()),
+        );
+        assert!(
+            matches!(
+                rendezvous_from(Some("rendezvous.example.com")),
+                Err(Error::InvalidArguments)
+            ),
+            "a name is not resolved here"
+        );
+        assert!(matches!(
+            rendezvous_from(Some("198.51.100.7")),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            rendezvous_from(Some("")),
+            Err(Error::InvalidArguments)
+        ));
     }
 
     #[test]

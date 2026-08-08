@@ -201,6 +201,21 @@ fn pull_address(bytes: &[u8]) -> AddressSlot {
     }
 }
 
+/// The context string the rendezvous key is derived under, which is what
+/// keeps that derivation from colliding with any other use of the root.
+const KEY_CONTEXT: &str = "VOT 2026-08 rendezvous key v1";
+
+/// The rendezvous key for a package root.
+///
+/// A derived key rather than the root: the service pairs by it and never
+/// learns what it names, and holding it is the same thing as holding the
+/// root, which is already the capability to fetch (ADR-0033). Both ends
+/// derive it from the string the humans exchanged, so it has to stay
+/// exactly this derivation forever.
+pub(crate) fn key_of(root: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(KEY_CONTEXT, root)
+}
+
 /// How long a registration stands without being refreshed.
 ///
 /// The serve re-registers every [`REGISTER_CADENCE_MS`], so a live serve
@@ -212,6 +227,132 @@ pub(crate) const REGISTRATION_TTL_MS: u64 = 90_000;
 /// Registrations one service holds at most, which bounds its memory by
 /// a constant however many keys are thrown at it.
 pub(crate) const MAX_REGISTRATIONS: usize = 65_536;
+
+/// How often a serve re-registers, which is also what keeps its NAT
+/// mapping alive. Several refreshes fit inside [`REGISTRATION_TTL_MS`],
+/// so a lost datagram costs findability for one cadence and no more.
+pub(crate) const REGISTER_CADENCE_MS: u64 = 20_000;
+
+/// Warming datagrams the serve sends toward a fetch it has been told is
+/// coming. More than one because any of them may be the one a NAT drops,
+/// and few because they are sent before anything has been verified.
+///
+/// They go one per pass rather than together: three that leave in the
+/// same microsecond down the same path share the fate the redundancy
+/// exists to cover.
+pub(crate) const WARMING_DATAGRAMS: usize = 3;
+
+/// Warming datagrams a serve will send between registrations, however
+/// many fetches the service says are coming.
+///
+/// This is the whole amplification story of the serving end. One Coming
+/// of 54 bytes earns at most [`WARMING_DATAGRAMS`] warmings of 3 bytes,
+/// which shrinks bytes and multiplies packets by three, and this bound
+/// caps the packets a cadence can be made to emit at 24 no matter how
+/// many Comings arrive. The key is what an abuser needs to get one at
+/// all, and holding the key is already holding the root.
+pub(crate) const WARMINGS_PER_CADENCE: usize = 24;
+
+/// Whether this end will send unprompted datagrams at `fetch`, having
+/// been told about it by the service at `service`.
+///
+/// A Coming names where the serve sends with nothing yet verified, so
+/// what cannot be an observed mapping is refused here: the wildcard, a
+/// multicast group, a broadcast address, and port zero are nobody's
+/// source address. Loopback is refused by the same test rather than
+/// listed apart: a service out on the network cannot have observed one,
+/// so the mapping is forged, while a service on loopback is this
+/// machine's own and a loopback mapping from it is the only kind there
+/// is.
+fn warmable(fetch: SocketAddr, service: SocketAddr) -> bool {
+    if fetch.port() == 0 {
+        return false;
+    }
+    let near = service.ip().is_loopback();
+    match fetch.ip() {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && (near || !ip.is_loopback())
+        }
+        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast() && (near || !ip.is_loopback()),
+    }
+}
+
+/// The serve's side of the rendezvous: what it sends and when.
+///
+/// The whole policy with time as an argument, so every branch is a
+/// test's. It owns no socket; the caller sends what this hands back on
+/// the listener's own socket, which is the mapping being registered.
+pub(crate) struct Registrar {
+    key: [u8; 32],
+    service: SocketAddr,
+    /// When the next registration is due, which is immediately at first.
+    due_at_ms: u64,
+    /// Warmings earned and not yet sent, drained one per pass.
+    warming: std::collections::VecDeque<SocketAddr>,
+    /// Warmings this cadence has already earned, against the bound.
+    warmed: usize,
+}
+
+impl Registrar {
+    /// A serve registering `root` with the service at `service`.
+    pub(crate) fn new(root: &[u8; 32], service: SocketAddr) -> Self {
+        Self {
+            key: key_of(root),
+            service,
+            due_at_ms: 0,
+            warming: std::collections::VecDeque::new(),
+            warmed: 0,
+        }
+    }
+
+    /// What to send at `now_ms` with nothing having arrived: a
+    /// registration when the cadence is due, and one warming a pass
+    /// toward whatever fetches are still owed them.
+    pub(crate) fn due(&mut self, now_ms: u64) -> Vec<(SocketAddr, Datagram)> {
+        let mut sends = Vec::new();
+        if let Some(fetch) = self.warming.pop_front() {
+            sends.push((fetch, Datagram::Warming));
+        }
+        if now_ms >= self.due_at_ms {
+            self.due_at_ms = now_ms.saturating_add(REGISTER_CADENCE_MS);
+            self.warmed = 0;
+            sends.push((self.service, Datagram::Register { key: self.key }));
+        }
+        sends
+    }
+
+    /// What a datagram that arrived from `source` earns.
+    ///
+    /// Only the service is heard, and only about this serve's own key: a
+    /// Coming names an address this end will send to unprompted, so an
+    /// arrival from anywhere else would make the serve a reflector. What
+    /// it earns is queued rather than returned, because the warmings go
+    /// one per pass.
+    pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr) {
+        if source != self.service {
+            return;
+        }
+        let Datagram::Coming { key, fetch } = datagram else {
+            // The cadence is unconditional, so a Registered gates
+            // nothing: a serve that never hears one registers exactly as
+            // often as one that does, and the rest of the shapes are not
+            // the service's to send.
+            return;
+        };
+        if key != self.key || !warmable(fetch, self.service) {
+            return;
+        }
+        let room = WARMINGS_PER_CADENCE.saturating_sub(self.warmed);
+        let owed = WARMING_DATAGRAMS.min(room);
+        self.warmed = self.warmed.saturating_add(owed);
+        for _ in 0..owed {
+            self.warming.push_back(fetch);
+        }
+    }
+}
 
 /// One registered serve: where it is, and until when it is believed.
 struct Registration {
@@ -289,6 +430,14 @@ mod tests {
 
     fn v4(text: &str) -> SocketAddr {
         text.parse().expect("an address")
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
     }
 
     #[test]
@@ -470,6 +619,223 @@ mod tests {
         assert_eq!(
             pairings.take(Datagram::Warming, fetch, 5_000),
             Answer::default()
+        );
+    }
+
+    #[test]
+    fn the_key_is_this_derivation_of_the_root_and_no_other() {
+        // Both ends derive the key from the root alone, so a derivation
+        // that drifts pairs nobody and says nothing about why. The
+        // committed vectors are the pin, and they are a file rather than
+        // a literal here because a second implementation has to be able
+        // to build against them: changing them is changing the protocol.
+        let vectors = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test-vectors/rendezvous/key.json"),
+        )
+        .expect("the committed key vectors");
+        assert!(vectors.contains(KEY_CONTEXT), "the context is the vectors'");
+        let mut cases = 0;
+        for case in vectors.split("\"root_hex\": \"").skip(1) {
+            let (root, rest) = case.split_once('"').expect("a root");
+            let (_, key) = rest.split_once("\"key_hex\": \"").expect("a key");
+            let (key, _) = key.split_once('"').expect("a key");
+            let mut bytes = [0_u8; 32];
+            for (byte, pair) in bytes.iter_mut().zip(root.as_bytes().chunks(2)) {
+                *byte = u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16)
+                    .expect("a byte");
+            }
+            assert_eq!(hex(&key_of(&bytes)), key, "the vector for root {root}");
+            cases += 1;
+        }
+        assert_eq!(cases, 4, "every committed case was checked");
+        assert_ne!(
+            key_of(&[1; 32]),
+            key_of(&[0; 32]),
+            "another root, another key"
+        );
+        assert_ne!(key_of(&[0; 32]), [0; 32], "the key is not the root");
+    }
+
+    #[test]
+    fn a_registrar_registers_on_its_cadence_and_warms_only_for_the_service() {
+        let service = v4("198.51.100.7:9000");
+        let fetch = v4("203.0.113.9:60123");
+        let root = [9; 32];
+        let mut registrar = Registrar::new(&root, service);
+        let key = key_of(&root);
+
+        // Due immediately, then not again until the cadence has run.
+        assert_eq!(
+            registrar.due(0),
+            vec![(service, Datagram::Register { key })],
+            "a serve is findable from the moment it is serving"
+        );
+        assert_eq!(registrar.due(REGISTER_CADENCE_MS - 1), Vec::new());
+        assert_eq!(
+            registrar.due(REGISTER_CADENCE_MS),
+            vec![(service, Datagram::Register { key })]
+        );
+
+        // A Coming from the service warms the fetch's mapping, one
+        // datagram a pass so the three do not share one path's fate.
+        registrar.take(Datagram::Coming { key, fetch }, service);
+        let now = REGISTER_CADENCE_MS;
+        for pass in 0..WARMING_DATAGRAMS {
+            assert_eq!(
+                registrar.due(now),
+                vec![(fetch, Datagram::Warming)],
+                "pass {pass} owes exactly one warming"
+            );
+        }
+        assert_eq!(registrar.due(now), Vec::new(), "and no more than it owes");
+
+        // What earns nothing at all: an arrival from anywhere but the
+        // service, since obeying it would make this end send unprompted
+        // datagrams wherever a stranger named; another key's fetch; an
+        // address that is nobody's mapping; and the shapes this end is
+        // the one that sends.
+        let refused = [
+            (Datagram::Coming { key, fetch }, fetch),
+            (
+                Datagram::Coming {
+                    key: [0xAB; 32],
+                    fetch,
+                },
+                service,
+            ),
+            (
+                Datagram::Coming {
+                    key,
+                    fetch: v4("0.0.0.0:5000"),
+                },
+                service,
+            ),
+            (
+                Datagram::Coming {
+                    key,
+                    fetch: v4("203.0.113.9:0"),
+                },
+                service,
+            ),
+            (
+                Datagram::Coming {
+                    key,
+                    fetch: v4("239.0.0.1:5000"),
+                },
+                service,
+            ),
+            (
+                Datagram::Coming {
+                    key,
+                    fetch: v4("255.255.255.255:5000"),
+                },
+                service,
+            ),
+            (Datagram::Registered { key }, service),
+            (Datagram::Resolve { key }, service),
+            (Datagram::Warming, service),
+        ];
+        for (datagram, source) in refused {
+            registrar.take(datagram, source);
+            assert_eq!(
+                registrar.due(now),
+                Vec::new(),
+                "{datagram:?} from {source} earned a warming"
+            );
+        }
+    }
+
+    #[test]
+    fn only_what_could_be_an_observed_mapping_is_warmed() {
+        // A Coming names where this end sends with nothing verified, so
+        // this table is the whole of what it will aim at. Loopback turns
+        // on where the service is: one out on the network cannot have
+        // observed a loopback source, and one on loopback observes
+        // nothing else.
+        let far = v4("198.51.100.7:9000");
+        let near = v4("127.0.0.1:9000");
+        assert!(warmable(v4("203.0.113.9:60123"), far));
+        assert!(warmable(
+            "[2001:db8::2]:60123".parse().expect("an address"),
+            far
+        ));
+        for refused in [
+            "0.0.0.0:5000",
+            "203.0.113.9:0",
+            "239.0.0.1:5000",
+            "255.255.255.255:5000",
+        ] {
+            assert!(!warmable(v4(refused), far), "{refused} is nobody's mapping");
+        }
+        assert!(!warmable("[::]:5000".parse().expect("an address"), far));
+        assert!(!warmable(
+            "[ff02::1]:5000".parse().expect("an address"),
+            far
+        ));
+        assert!(
+            !warmable(v4("127.0.0.1:5000"), far),
+            "a service on the network never observed a loopback source"
+        );
+        assert!(!warmable("[::1]:5000".parse().expect("an address"), far));
+        assert!(
+            warmable(v4("127.0.0.1:5000"), near),
+            "a service on loopback observes nothing else"
+        );
+        assert!(warmable("[::1]:5000".parse().expect("an address"), near));
+    }
+
+    #[test]
+    fn a_cadence_of_warmings_is_bounded_however_many_fetches_come() {
+        // The serving end's whole amplification story: a Coming is three
+        // warmings, and a cadence emits no more than the bound however
+        // many Comings arrive, so a key holder cannot turn the serve into
+        // a packet multiplier at someone else's address.
+        let service = v4("198.51.100.7:9000");
+        let root = [9; 32];
+        let mut registrar = Registrar::new(&root, service);
+        let key = key_of(&root);
+        registrar.due(0);
+        for index in 0..100_u16 {
+            let fetch = SocketAddr::new(v4("203.0.113.9:0").ip(), 1_000 + index);
+            registrar.take(Datagram::Coming { key, fetch }, service);
+        }
+        let mut warmings = 0;
+        // Bounded by its own count: the queue cannot outlive the bound.
+        for _ in 0..WARMINGS_PER_CADENCE * 4 {
+            warmings += registrar
+                .due(1)
+                .iter()
+                .filter(|(_, datagram)| *datagram == Datagram::Warming)
+                .count();
+        }
+        assert_eq!(warmings, WARMINGS_PER_CADENCE);
+
+        // The next cadence opens the allowance again, and no sooner.
+        registrar.take(
+            Datagram::Coming {
+                key,
+                fetch: v4("203.0.113.9:6000"),
+            },
+            service,
+        );
+        assert_eq!(registrar.due(2), Vec::new(), "still inside the cadence");
+        let opened = registrar.due(REGISTER_CADENCE_MS);
+        assert_eq!(
+            opened,
+            vec![(service, Datagram::Register { key })],
+            "the cadence turns over"
+        );
+        registrar.take(
+            Datagram::Coming {
+                key,
+                fetch: v4("203.0.113.9:6000"),
+            },
+            service,
+        );
+        assert_eq!(
+            registrar.due(REGISTER_CADENCE_MS),
+            vec![(v4("203.0.113.9:6000"), Datagram::Warming)]
         );
     }
 

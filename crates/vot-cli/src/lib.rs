@@ -37,10 +37,14 @@ mod wire;
 pub use drive::{Engine, ServeSession, drive};
 pub use fetch::{BundleFetcher, FetchStatus};
 #[cfg(not(feature = "wire"))]
-pub use nowire::{fetch_bundle, rendezvous_service, serve_bundle};
+pub use nowire::{
+    fetch_bundle, fetch_via_rendezvous, rendezvous_service, resolve_root, serve_bundle,
+};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
-pub use wire::{fetch_bundle, rendezvous_service, serve_bundle};
+pub use wire::{
+    fetch_bundle, fetch_via_rendezvous, rendezvous_service, resolve_root, serve_bundle,
+};
 
 /// The certificate and key a server presents.
 ///
@@ -143,6 +147,10 @@ pub enum Error {
     CarrierUnavailable,
     /// The peer ended the session under a registered code.
     PeerClosed(u16),
+    /// No serve registered for this rendezvous key.
+    RendezvousUnresolved,
+    /// Rendezvous service did not answer in time.
+    RendezvousTimeout,
 }
 
 impl From<io::Error> for Error {

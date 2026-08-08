@@ -9,8 +9,8 @@ Usage:
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
   vot rendezvous LISTEN_ADDR
-  vot fetch CONNECT_ADDR BUNDLE_DIR [PACKAGE_ROOT]
-  vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
+  vot fetch CONNECT_ADDR|ROOT BUNDLE_DIR [PACKAGE_ROOT]
+  vot pull CONNECT_ADDR|ROOT BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
            OBSERVED_AT [PACKAGE_ROOT]
 
 serve and fetch move a bundle over the wire; fetch writes a bundle directory
@@ -45,6 +45,9 @@ A receipt signed with ed25519-secret can be checked by anyone holding only the
 matching ed25519-public key. A shared secret cannot: whoever can check it can
 also forge it, so verify-receipt reports SHARED-SECRET rather than
 THIRD-PARTY-VERIFIABLE.
+
+A ROOT in the address position is resolved through a rendezvous service
+(VOT_RENDEZVOUS=ADDR:PORT). The serve must register with the same service.
 ";
 
 fn main() {
@@ -210,12 +213,26 @@ fn serve(
 }
 
 /// Writes a bundle directory from a server, which receive then publishes.
-fn fetch(address: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
-    let address = address
-        .parse()
-        .map_err(|_| vot_cli::Error::InvalidArguments)?;
-    let pin = root.map(vot_cli::parse_package_root).transpose()?;
-    let package = vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
+fn rendezvous_service_address() -> Result<std::net::SocketAddr, vot_cli::Error> {
+    std::env::var("VOT_RENDEZVOUS")
+        .ok()
+        .or_else(|| std::env::var("VOT_RENDEZVOUS_DEFAULT").ok())
+        .as_deref()
+        .map(|v| v.trim().parse())
+        .transpose()
+        .map_err(|_| vot_cli::Error::InvalidArguments)?
+        .ok_or(vot_cli::Error::InvalidArguments)
+}
+
+fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
+    let package = if let Ok(address) = target.parse::<std::net::SocketAddr>() {
+        let pin = root.map(vot_cli::parse_package_root).transpose()?;
+        vot_cli::fetch_bundle(address, Path::new(bundle), pin)
+    } else {
+        let parsed_root = vot_cli::parse_package_root(target)?;
+        let service = rendezvous_service_address()?;
+        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), service)
+    }?;
     println!(
         "{} {} FETCHED",
         root_hex(&package.root),

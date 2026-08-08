@@ -214,9 +214,10 @@ fn serve(
     Ok(())
 }
 
-/// The rendezvous service a root-addressed fetch resolves at. Unset is an
-/// argument error: nothing resolves a root without one.
-fn rendezvous_service_address() -> Result<std::net::SocketAddr, vot_cli::Error> {
+/// Every address the rendezvous service a root-addressed fetch resolves at
+/// answers on. Unset is an argument error: nothing resolves a root without
+/// one.
+fn rendezvous_service_addresses() -> Result<Vec<std::net::SocketAddr>, vot_cli::Error> {
     let named = std::env::var("VOT_RENDEZVOUS").map_err(|_| vot_cli::Error::InvalidArguments)?;
     vot_cli::parse_rendezvous(&named)
 }
@@ -227,8 +228,8 @@ fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::
         vot_cli::fetch_bundle(address, Path::new(bundle), pin)
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
-        let service = rendezvous_service_address()?;
-        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), service)
+        let services = rendezvous_service_addresses()?;
+        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), &services)
     }?;
     println!(
         "{} {} FETCHED",
@@ -255,8 +256,8 @@ fn pull(
         vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
-        let service = rendezvous_service_address()?;
-        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), service)?;
+        let services = rendezvous_service_addresses()?;
+        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), &services)?;
     }
     let report = vot_cli::receive_bundle(
         Path::new(bundle),

@@ -72,21 +72,50 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
     Ok(root)
 }
 
-/// A rendezvous service as an `ADDR:PORT`, or a `NAME:PORT` the resolver
-/// knows. A name that answers with several addresses takes the first.
+/// Every address a rendezvous service answers at, given `ADDR:PORT` or
+/// `NAME:PORT`, or a comma-separated list of either, IPv6 first.
+///
+/// IPv6 leads because a global IPv6 address has no translation in front of
+/// it: nothing to punch, and no mapping to keep alive. A serve registers
+/// at all of them and a fetch tries them in this order.
+///
+/// The list is for a service whose families are not behind one name, which
+/// is every service two people point at each other without running DNS.
 ///
 /// # Errors
-/// Rejects a value that is neither an address nor a name that resolves.
-pub fn parse_rendezvous(value: &str) -> Result<std::net::SocketAddr, Error> {
+/// Rejects a value with any part that is neither an address nor a name
+/// that resolves.
+pub fn parse_rendezvous(value: &str) -> Result<Vec<std::net::SocketAddr>, Error> {
     // `to_socket_addrs` parses a literal itself and only reaches the resolver
     // for what is not one, so a literal costs no lookup.
     use std::net::ToSocketAddrs as _;
-    value
-        .trim()
-        .to_socket_addrs()
-        .map_err(|_| Error::InvalidArguments)?
-        .next()
-        .ok_or(Error::InvalidArguments)
+    let mut answered: Vec<std::net::SocketAddr> = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(Error::InvalidArguments);
+        }
+        answered.extend(
+            part.to_socket_addrs()
+                .map_err(|_| Error::InvalidArguments)?,
+        );
+    }
+    let mut ordered: Vec<std::net::SocketAddr> = Vec::new();
+    for address in answered
+        .iter()
+        .filter(|address| address.is_ipv6())
+        .chain(answered.iter().filter(|address| address.is_ipv4()))
+    {
+        // A name and a literal can answer with the same address, and trying
+        // it twice would spend the punch bound twice on one route.
+        if !ordered.contains(address) {
+            ordered.push(*address);
+        }
+    }
+    if ordered.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(ordered)
 }
 
 /// The seal's page digests by index, refusing a commitment list that does

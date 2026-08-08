@@ -161,8 +161,15 @@ impl Ephemeral {
 
 /// Creates a directory only this user can enter. A directory that takes the
 /// umask leaves the key inside it readable by anyone on the host.
-#[cfg(unix)]
 fn create_private_directory(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    return create_private_directory_unix(path);
+    #[cfg(not(unix))]
+    return create_private_directory_other(path);
+}
+
+#[cfg(unix)]
+fn create_private_directory_unix(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(path)?;
     Ok(())
@@ -171,7 +178,7 @@ fn create_private_directory(path: &Path) -> Result<(), Error> {
 /// Windows has no mode bits here. The per-user temp directory is the
 /// protection, and the unguessable name is the rest of it.
 #[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> Result<(), Error> {
+fn create_private_directory_other(path: &Path) -> Result<(), Error> {
     std::fs::create_dir(path)?;
     Ok(())
 }

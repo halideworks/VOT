@@ -384,7 +384,7 @@ fn worker_ranges(object_bytes: u64, workers: usize) -> Result<Vec<WorkerRange>, 
 /// 4 MiB range limit.
 const RECORDS_PER_BUNDLE: usize = 16;
 
-/// Largest record the ranged path accepts. Capped by the 256 KiB DATA_RECORD
+/// Largest record the ranged path accepts. Capped by the 256 KiB `DATA_RECORD`
 /// CBOR limit.
 const MAX_RANGED_RECORD_BYTES: usize = 3 * 65_536;
 
@@ -1018,7 +1018,7 @@ trait Carrier {
     fn wait(&mut self, bound: Duration);
 }
 
-/// Strips the envelope from a delivered DATA_RECORD frame. Anything that is
+/// Strips the envelope from a delivered `DATA_RECORD` frame. Anything that is
 /// not exactly one submitted frame is corruption.
 fn record_payload(frame: &[u8]) -> Result<&[u8], Error> {
     let limits = vot_codec::DecodeLimits {

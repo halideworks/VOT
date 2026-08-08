@@ -211,9 +211,8 @@ pub fn authorize(
         if crate::verify_signature(signed, &entry.key).is_err() {
             continue;
         }
-        let capability = Capability::from_canonical_bytes(&signed.capability).map_err(|error| {
-            Denial::Malformed(error)
-        })?;
+        let capability =
+            Capability::from_canonical_bytes(&signed.capability).map_err(Denial::Malformed)?;
         if capability.issuer != entry.issuer {
             issuer_known = true;
             continue;

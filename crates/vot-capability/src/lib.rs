@@ -1113,7 +1113,6 @@ mod tests {
 
     #[test]
     fn every_bound_is_tested_at_its_own_edge() {
-
         let adjacent = Scope {
             ranges: vec![
                 Range {

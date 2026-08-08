@@ -350,6 +350,9 @@ impl SettingsError {
 /// Decodes a bounded SETTINGS payload as identifier/value varint pairs.
 ///
 /// Unknown optional settings are ignored; unknown critical settings and duplicates terminate negotiation.
+///
+/// # Errors
+/// Rejects a malformed varint, an unknown critical setting, a duplicate, or a value outside its range.
 pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
     let mut settings = Settings::default();
     let mut seen = BTreeSet::new();

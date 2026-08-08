@@ -15,7 +15,7 @@ const IDLE_BOUND_MS: u64 = 50;
 const IDLE_BOUND: Duration = Duration::from_millis(IDLE_BOUND_MS);
 
 /// How long to wait when the carrier has backpressure. Shorter than
-/// IDLE_WAIT to avoid pacing the transfer at one drain per tick.
+/// `IDLE_WAIT` to avoid pacing the transfer at one drain per tick.
 const BUSY_BOUND_MS: u64 = 1;
 const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 

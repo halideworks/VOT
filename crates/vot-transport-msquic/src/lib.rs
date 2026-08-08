@@ -83,7 +83,7 @@ pub enum NativeDatagramSendState {
 
 const DEFAULT_COMMAND_BYTE_LIMIT: usize = vot_transport_queue::DEFAULT_BYTE_LIMIT;
 
-/// Bounded queue plus the MsQuic specifics: reserved lane identifiers and a
+/// Bounded queue plus the `MsQuic` specifics: reserved lane identifiers and a
 /// path sample read off a live connection.
 #[derive(Clone, Debug, Default)]
 pub struct MsQuicAdapter {

@@ -1,0 +1,14 @@
+constant vot_log::MAX_ENTRIES
+enum vot_log::Error
+function vot_log::leaf_hash
+function vot_log::note_key_hash
+function vot_log::sign_checkpoint
+function vot_log::verify_checkpoint
+function vot_log::verify_consistency
+function vot_log::verify_inclusion
+struct vot_log::Checkpoint
+struct vot_log::MerkleLog
+struct vot_log::NoteSignature
+struct vot_log::SignedCheckpoint
+struct vot_log::WitnessKey
+type_alias vot_log::Hash

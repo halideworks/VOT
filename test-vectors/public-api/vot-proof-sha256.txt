@@ -1,0 +1,11 @@
+constant vot_proof_sha256::LEAF_SIZE
+constant vot_proof_sha256::PIECE_SIZE
+enum vot_proof_sha256::Error
+function vot_proof_sha256::piece_layer
+function vot_proof_sha256::prove
+function vot_proof_sha256::prove_with
+function vot_proof_sha256::root
+function vot_proof_sha256::verify
+struct vot_proof_sha256::PieceHashes
+struct vot_proof_sha256::RangeCover
+struct vot_proof_sha256::RangeProof

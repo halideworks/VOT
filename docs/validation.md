@@ -32,6 +32,20 @@ only accepted cases would prove nothing about what the crate rejects.
 `validate_registries.py` compares `spec/registries.md` tables against `vot-codec`
 constants. It does not yet cover the error-code table.
 
+## Public API
+
+```sh
+python3 tools/check_public_api.py            # compare all crates
+python3 tools/check_public_api.py --update   # regenerate after an approved change
+```
+
+Compares every crate's importable public surface (paths and item kinds,
+re-exports resolved) against `test-vectors/public-api/`. Rustdoc JSON is
+nightly-only, so the tool pins `nightly-2026-07-15`, the toolchain the
+sanitizer and fuzz jobs already use. Signatures and trait impls are not in
+the snapshot; the workspace compile and test gates carry those. Regenerate a
+snapshot only when a PR deliberately changes the API, and say so in the PR.
+
 ## Rust
 
 ```sh

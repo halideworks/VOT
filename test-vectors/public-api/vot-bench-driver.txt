@@ -1,0 +1,11 @@
+enum vot_bench_driver::Error
+enum vot_bench_driver::Rails
+enum vot_bench_driver::SinkChoice
+function vot_bench_driver::cpu_times_ns
+function vot_bench_driver::measure
+function vot_bench_driver::memory_high_water_bytes
+function vot_bench_driver::parse_cpu_times
+function vot_bench_driver::parse_vm_hwm
+struct vot_bench_driver::Config
+struct vot_bench_driver::ImpairmentCase
+struct vot_bench_driver::Measurement

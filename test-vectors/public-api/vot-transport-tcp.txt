@@ -1,0 +1,10 @@
+constant vot_transport_tcp::INBOUND_BYTE_CAPACITY
+enum vot_transport_tcp::Carrier
+enum vot_transport_tcp::NativeEvent
+enum vot_transport_tcp::RaceAction
+enum vot_transport_tcp::TlsError
+struct vot_transport_tcp::CarrierRace
+struct vot_transport_tcp::DegradedUdpDetector
+struct vot_transport_tcp::TcpAdapter
+struct vot_transport_tcp::TlsClientCarrier
+use vot_transport_tcp::Command <- vot_transport_queue::Command

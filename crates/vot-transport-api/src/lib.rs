@@ -501,15 +501,18 @@ impl StagingCapacity {
         self.bdp_target = bdp_target;
     }
 
+    /// What is held. A poisoned ledger reports its whole limit, because what
+    /// it actually holds is no longer known and that is the answer that
+    /// grants nothing.
     #[must_use]
     pub const fn used(&self) -> u64 {
         self.used
     }
 
-    #[must_use]
     /// What is free. A poisoned ledger has nothing free: it does not know
     /// what it holds, and reporting the limit as available is how the
     /// over-release would become capacity somebody spends.
+    #[must_use]
     pub const fn remaining(&self) -> u64 {
         if self.poisoned {
             return 0;

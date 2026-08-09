@@ -115,6 +115,41 @@ impl PieceHashes {
     }
 }
 
+/// Request-to-cover geometry for one range proof: the aligned start, an end
+/// clipped to the object, and the first and past-the-end unit indices. One
+/// derivation for the cold and precomputed paths, so they cannot disagree on
+/// what a request covers.
+struct RangeGeometry {
+    covered_offset: u64,
+    covered_end: u64,
+    first: u64,
+    end: u64,
+}
+
+impl RangeGeometry {
+    fn of(object_len: u64, offset: u64, length: u64) -> Result<Self, Error> {
+        if length == 0 {
+            return Err(Error::EmptyRange);
+        }
+        let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
+        if request_end > object_len {
+            return Err(Error::OutOfBounds);
+        }
+        let covered_offset = offset / PIECE_SIZE * PIECE_SIZE;
+        let covered_end = request_end
+            .div_ceil(PIECE_SIZE)
+            .checked_mul(PIECE_SIZE)
+            .ok_or(Error::LengthOverflow)?
+            .min(object_len);
+        Ok(Self {
+            covered_offset,
+            covered_end,
+            first: covered_offset / PIECE_SIZE,
+            end: covered_end.div_ceil(PIECE_SIZE),
+        })
+    }
+}
+
 /// Proves a range from piece hashes. Byte-identical to [`prove`] for the
 /// same range.
 ///
@@ -122,21 +157,12 @@ impl PieceHashes {
 /// Rejects an empty range and one that runs past the object.
 pub fn prove_with(pieces: &PieceHashes, offset: u64, length: u64) -> Result<RangeCover, Error> {
     let object_len = pieces.length;
-    if length == 0 {
-        return Err(Error::EmptyRange);
-    }
-    let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
-    if request_end > object_len {
-        return Err(Error::OutOfBounds);
-    }
-    let covered_offset = offset / PIECE_SIZE * PIECE_SIZE;
-    let covered_end = request_end
-        .div_ceil(PIECE_SIZE)
-        .checked_mul(PIECE_SIZE)
-        .ok_or(Error::LengthOverflow)?
-        .min(object_len);
-    let first = covered_offset / PIECE_SIZE;
-    let end = covered_end.div_ceil(PIECE_SIZE);
+    let RangeGeometry {
+        covered_offset,
+        covered_end,
+        first,
+        end,
+    } = RangeGeometry::of(object_len, offset, length)?;
     Ok(RangeCover {
         covered_offset,
         covered_length: covered_end - covered_offset,
@@ -146,21 +172,12 @@ pub fn prove_with(pieces: &PieceHashes, offset: u64, length: u64) -> Result<Rang
 
 pub fn prove(data: &[u8], offset: u64, length: u64) -> Result<RangeProof, Error> {
     let object_len = data.len() as u64;
-    if length == 0 {
-        return Err(Error::EmptyRange);
-    }
-    let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
-    if request_end > object_len {
-        return Err(Error::OutOfBounds);
-    }
-    let covered_offset = offset / PIECE_SIZE * PIECE_SIZE;
-    let covered_end = request_end
-        .div_ceil(PIECE_SIZE)
-        .checked_mul(PIECE_SIZE)
-        .ok_or(Error::LengthOverflow)?;
-    let covered_end = covered_end.min(object_len);
-    let first = covered_offset / PIECE_SIZE;
-    let end = covered_end.div_ceil(PIECE_SIZE);
+    let RangeGeometry {
+        covered_offset,
+        covered_end,
+        first,
+        end,
+    } = RangeGeometry::of(object_len, offset, length)?;
     let pieces = piece_layer(data);
     let proof = encode_proof(&pieces, first, end);
     let start = usize::try_from(covered_offset).map_err(|_| Error::OutOfBounds)?;

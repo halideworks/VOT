@@ -1695,16 +1695,13 @@ mod tests {
 
     #[test]
     fn a_lock_that_cannot_be_opened_is_not_read_as_absent() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-resume-held-lock-{}", std::process::id()));
-        let _ = fs::remove_file(&directory);
-        fs::write(&directory, b"a file, not a directory").unwrap();
-        // A component of the path is a file, so opening the lock fails with
-        // something that is not NotFound. Treating that as "no lock file"
-        // would remove a store somebody may be holding.
-        let through_a_file = directory.join("store.lock");
-        assert!(matches!(held_lock(&through_a_file), Err(Error::Io(_))));
-        fs::remove_file(&directory).unwrap();
+        // A name no platform will open, and not because it is missing: an
+        // interior NUL is invalid input everywhere, where "a component of the
+        // path is a file" is NotADirectory on Unix and NotFound on Windows,
+        // which is the arm this test exists to rule out. Treating any failure
+        // as "no lock file" would remove a store somebody is holding.
+        let unopenable = Path::new("vot-resume-\0-lock");
+        assert!(matches!(held_lock(unopenable), Err(Error::Io(_))));
     }
 
     #[test]

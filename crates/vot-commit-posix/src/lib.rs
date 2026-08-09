@@ -221,18 +221,34 @@ impl<F: FaultInjector> PosixCommit<F> {
             .check(FaultPoint::Write)
             .and_then(|()| self.staging.write_all(bytes))
         {
-            self.machine.apply(Event::DataFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Io(error));
+            return Err(self.fail(
+                Event::DataFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Io(error),
+            ));
         }
         self.machine.apply(Event::TransitVerified)?;
         if let Err(error) = self.journal.append_durable(JOURNAL_TRANSIT_VERIFIED, &[]) {
-            self.machine.apply(Event::JournalFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Journal(error));
+            return Err(self.fail(
+                Event::JournalFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Journal(error),
+            ));
         }
         self.trace.push(TraceEvent::TransitVerified);
         Ok(())
+    }
+
+    /// Applies a failure event, records its trace, and hands back the error
+    /// to return. The call site chooses all three; this only keeps the
+    /// three-step order, and an event the model refuses is reported instead
+    /// of the mapped error, with no trace recorded, as before.
+    fn fail(&mut self, event: Event, trace: TraceEvent, error: Error) -> Error {
+        if let Err(model) = self.machine.apply(event) {
+            return model.into();
+        }
+        self.trace.push(trace);
+        error
     }
 
     pub fn publish(&mut self) -> Result<Receipt, Error> {
@@ -293,9 +309,11 @@ impl<F: FaultInjector> PosixCommit<F> {
             }
         }
         if let Err(error) = self.journal.append_durable(JOURNAL_AT_REST_VERIFIED, &[]) {
-            self.machine.apply(Event::JournalFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Journal(error));
+            return Err(self.fail(
+                Event::JournalFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Journal(error),
+            ));
         }
         self.trace.push(TraceEvent::AtRestVerified);
         self.publish_namespace()
@@ -322,21 +340,27 @@ impl<F: FaultInjector> PosixCommit<F> {
             .check(FaultPoint::DataFlush)
             .and_then(|()| self.staging.handle().sync_all())
         {
-            self.machine.apply(Event::DataFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Io(error));
+            return Err(self.fail(
+                Event::DataFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Io(error),
+            ));
         }
         self.machine.apply(Event::DataFlushSucceeded)?;
         self.trace.push(TraceEvent::DataFlushed);
         if let Err(error) = self.faults.check(FaultPoint::JournalFlush) {
-            self.machine.apply(Event::JournalFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Io(error));
+            return Err(self.fail(
+                Event::JournalFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Io(error),
+            ));
         }
         if let Err(error) = self.journal.append_durable(JOURNAL_DURABLE, &[]) {
-            self.machine.apply(Event::JournalFlushFailed)?;
-            self.trace.push(TraceEvent::Poisoned);
-            return Err(Error::Journal(error));
+            return Err(self.fail(
+                Event::JournalFlushFailed,
+                TraceEvent::Poisoned,
+                Error::Journal(error),
+            ));
         }
         self.machine.apply(Event::JournalFlushSucceeded)?;
         self.trace.push(TraceEvent::JournalDurable);
@@ -347,15 +371,19 @@ impl<F: FaultInjector> PosixCommit<F> {
         let sealed = match Identity::of_file(self.staging.handle()) {
             Ok(sealed) => sealed,
             Err(error) => {
-                self.machine.apply(Event::NamespaceLinkAmbiguous)?;
-                self.trace.push(TraceEvent::RecoveryRequired);
-                return Err(error);
+                return Err(self.fail(
+                    Event::NamespaceLinkAmbiguous,
+                    TraceEvent::RecoveryRequired,
+                    error,
+                ));
             }
         };
         if let Err(error) = self.link_destination(sealed) {
-            self.machine.apply(Event::NamespaceLinkAmbiguous)?;
-            self.trace.push(TraceEvent::RecoveryRequired);
-            return Err(error);
+            return Err(self.fail(
+                Event::NamespaceLinkAmbiguous,
+                TraceEvent::RecoveryRequired,
+                error,
+            ));
         }
         self.machine.apply(Event::NamespaceLinked)?;
         // Recovery compares this against the destination it finds, so it never
@@ -365,16 +393,20 @@ impl<F: FaultInjector> PosixCommit<F> {
             .journal
             .append_durable(JOURNAL_NAMESPACE_LINKED, &identity.0)
         {
-            self.machine.apply(Event::NamespaceFlushFailed)?;
-            self.trace.push(TraceEvent::RecoveryRequired);
-            return Err(Error::Journal(error));
+            return Err(self.fail(
+                Event::NamespaceFlushFailed,
+                TraceEvent::RecoveryRequired,
+                Error::Journal(error),
+            ));
         }
         self.trace.push(TraceEvent::NamespaceLinked);
 
         if let Err(error) = self.seal_namespace() {
-            self.machine.apply(Event::NamespaceFlushFailed)?;
-            self.trace.push(TraceEvent::RecoveryRequired);
-            return Err(error);
+            return Err(self.fail(
+                Event::NamespaceFlushFailed,
+                TraceEvent::RecoveryRequired,
+                error,
+            ));
         }
         self.trace.push(TraceEvent::DirectoryFlushed);
         let observation = self

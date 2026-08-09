@@ -2423,6 +2423,10 @@ mod tests {
             rendezvous_service(address, None, |_| {}),
             Err(Error::WireUnsupported)
         ));
+        assert!(matches!(
+            relay_service(address, None, |_| {}),
+            Err(Error::WireUnsupported)
+        ));
     }
 
     #[test]

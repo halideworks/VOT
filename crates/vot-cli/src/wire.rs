@@ -11,13 +11,14 @@ use vot_transport_quiche::live::{Config, CongestionControl, Listener, SideChanne
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession};
 
-/// The serve's stance: no authentication required, with a fresh nonce.
+/// The serve's stance for one session: what it asks of the peer, with a fresh
+/// nonce.
 ///
-/// Fresh because `vot_session::no_capability` says the nonce must be: a
-/// client that later binds to it must not find a constant. Nothing binds to
-/// it today, because the binding is `Binding::None`, so a constant is
-/// harmless right up until capability authentication is wired and then is
-/// not. Drawing it here means that change cannot inherit one.
+/// The nonce is drawn per session, which is what
+/// `vot_session::no_capability` says it must be: a client that later binds to
+/// it must not find a constant. With a requirement that is load bearing, and
+/// not a caution: the binding is proof of possession, so the nonce is what
+/// the holder signs and a constant would make one proof answer every session.
 ///
 /// Only the serve's. `Session::client` builds its negotiation with a
 /// constant and never looks at the nonce a client names, so drawing one
@@ -25,10 +26,15 @@ use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, Ser
 ///
 /// # Errors
 /// Reports [`Error::Randomness`] when the system will not give 32 bytes.
-fn serve_authentication() -> Result<vot_session::Authentication, Error> {
+fn serve_stance(
+    requirement: Option<&crate::authz::Requirement>,
+) -> Result<crate::authz::Stance<'_>, Error> {
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
-    Ok(vot_session::Authentication::NotRequired { nonce })
+    Ok(match requirement {
+        Some(requirement) => crate::authz::Stance::required(requirement, nonce),
+        None => crate::authz::Stance::open(nonce),
+    })
 }
 
 /// Inbound receive limits matched to the codec's default settings.
@@ -216,6 +222,53 @@ fn local_for(peer: SocketAddr) -> Result<SocketAddr, Error> {
     Ok(local)
 }
 
+/// The issuer key a serve accepts capabilities from, as a `KEY_SOURCE`.
+const SERVE_ISSUER: &str = "VOT_SERVE_ISSUER";
+
+/// The issuer name that key signs under.
+const SERVE_ISSUER_NAME: &str = "VOT_SERVE_ISSUER_NAME";
+
+/// The deployment a capability must name.
+const SERVE_AUDIENCE: &str = "VOT_SERVE_AUDIENCE";
+
+/// What a serve requires of a fetch, or nothing.
+///
+/// Takes the values rather than reading them, like every other reader here,
+/// so a test can hold both answers without an environment it cannot set.
+///
+/// All three or none. A serve given a key but no audience would accept a
+/// token minted for another deployment, and one given an audience but no key
+/// would accept nothing, which is a refusal that looks like a bug.
+///
+/// # Errors
+/// Rejects a partial configuration and a key source that is not an Ed25519
+/// public key.
+fn requirement_from(
+    issuer_source: Option<&str>,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    root: [u8; 32],
+) -> Result<Option<crate::authz::Requirement>, Error> {
+    match (issuer_source, issuer, audience) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(issuer), Some(audience)) => {
+            let crate::KeyMaterial::Verifying(key) = crate::load_key_spec(source)? else {
+                // A signing key here would let the serve mint what it checks,
+                // and a shared secret is not what a capability is signed with.
+                return Err(Error::InvalidArguments);
+            };
+            Ok(Some(crate::authz::Requirement::new(
+                issuer,
+                crate::authz::key_id_of(&key),
+                *key,
+                audience,
+                root,
+            )))
+        }
+        _ => Err(Error::InvalidArguments),
+    }
+}
+
 /// Serves `bundle` on `address` until stopped or `sessions` are answered.
 ///
 /// The bundle is opened and proved once upfront. All sessions share one
@@ -232,6 +285,14 @@ pub fn serve_bundle(
     mut listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let server = BundleServer::open(bundle)?;
+    // Read before the port is bound, so a misconfigured requirement is an
+    // argument error rather than a serve that listens and refuses everyone.
+    let requirement = requirement_from(
+        std::env::var(SERVE_ISSUER).ok().as_deref(),
+        std::env::var(SERVE_ISSUER_NAME).ok().as_deref(),
+        std::env::var(SERVE_AUDIENCE).ok().as_deref(),
+        server.package().root,
+    )?;
     let ephemeral = match credentials {
         Credentials::Ephemeral => Some(Ephemeral::generate()?),
         Credentials::Files { .. } => None,
@@ -273,7 +334,7 @@ pub fn serve_bundle(
     let outcome = crate::drive::serve_sessions(sessions, || {
         // Accept blocks until a connection arrives.
         let carrier = listener.accept().map_err(carrier_failure)?;
-        ServeSession::begin(&server, carrier, serve_authentication()?)
+        ServeSession::begin(&server, carrier, serve_stance(requirement.as_ref())?)
     });
     // Drop before surfacing the error so the socket is released.
     drop(registration);
@@ -582,11 +643,53 @@ fn fetch_railed(
 /// The configuration every fetch rail is opened with.
 fn client_config() -> Result<Config, Error> {
     let mut config = Config::client(limits()?);
-    // Channel is unauthenticated; proof verification catches forged servers.
+    // The channel is unauthenticated. What catches a forged server is the
+    // package root this fetch pinned, which every range proves to, and a
+    // capability decides who may fetch rather than who is serving.
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
     Ok(config)
+}
+
+/// The capability a fetch presents, as a path to what `vot capability issue`
+/// wrote.
+const FETCH_CAPABILITY: &str = "VOT_FETCH_CAPABILITY";
+
+/// The holder key that capability names, as a `KEY_SOURCE`.
+const FETCH_HOLDER_KEY: &str = "VOT_FETCH_HOLDER_KEY";
+
+/// The capability a fetch will present, or nothing.
+///
+/// Takes the values, for the reason [`requirement_from`] does.
+///
+/// Both or neither, for the reason a serve needs all three: a token with no
+/// key cannot be proved, and a key with no token proves nothing.
+///
+/// # Errors
+/// Rejects a partial configuration, a key source that is not an Ed25519
+/// secret, a token this build cannot read, and a key that is not the holder
+/// the token names.
+fn holder_from(
+    capability: Option<&str>,
+    key_source: Option<&str>,
+) -> Result<Option<std::sync::Arc<crate::authz::Holder>>, Error> {
+    match (capability, key_source) {
+        (None, None) => Ok(None),
+        (Some(path), Some(source)) => {
+            let crate::KeyMaterial::Signing(key) = crate::load_key_spec(source)? else {
+                // Proving possession needs the private half. A public key
+                // here is the labelling mistake the key sources exist to
+                // catch.
+                return Err(Error::InvalidArguments);
+            };
+            let token = std::fs::read(Path::new(path))?;
+            Ok(Some(std::sync::Arc::new(crate::authz::Holder::new(
+                token, *key,
+            )?)))
+        }
+        _ => Err(Error::InvalidArguments),
+    }
 }
 
 /// Fetches `bundle` over `rails` carriers that `connect` opens.
@@ -614,7 +717,15 @@ fn fetch_over<F>(
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
-    let mut fetcher = BundleFetcher::begin(primary, bundle, pin)?;
+    let mut fetcher = BundleFetcher::begin_with(
+        primary,
+        bundle,
+        pin,
+        holder_from(
+            std::env::var(FETCH_CAPABILITY).ok().as_deref(),
+            std::env::var(FETCH_HOLDER_KEY).ok().as_deref(),
+        )?,
+    )?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
     }
@@ -918,9 +1029,9 @@ mod tests {
     fn a_serve_draws_a_fresh_nonce_for_every_session() {
         let drawn = || {
             let vot_session::Authentication::NotRequired { nonce } =
-                serve_authentication().expect("a nonce")
+                serve_stance(None).expect("a nonce").authentication
             else {
-                panic!("the serve asks for no capability");
+                panic!("a serve with no requirement asks for no capability");
             };
             nonce
         };
@@ -1869,6 +1980,194 @@ mod tests {
     }
 
     #[test]
+    fn a_rail_is_handed_the_token_the_primary_holds() {
+        use ed25519_dalek::SigningKey;
+
+        // Every rail opens its own session and answers its own challenge, so
+        // a primary that kept its token to itself would leave every rail
+        // after the first refused.
+        let holder = SigningKey::from_bytes(&[24; 32]);
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &SigningKey::from_bytes(&[25; 32]),
+            holder.verifying_key().to_bytes(),
+            [6; 32],
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let held = std::sync::Arc::new(
+            crate::authz::Holder::new(token, holder).expect("a holder for that token"),
+        );
+        let output = crate::tests::temporary("rail-token");
+        let fetcher = BundleFetcher::begin_with(
+            crate::harness::Loopback::default(),
+            &output,
+            None,
+            Some(std::sync::Arc::clone(&held)),
+        )
+        .expect("a fetch holding a token");
+        let handed = fetcher.holder().expect("the token, for a rail");
+        assert!(
+            std::sync::Arc::ptr_eq(&handed, &held),
+            "a rail would have opened its session with no capability"
+        );
+
+        let without =
+            BundleFetcher::begin_with(crate::harness::Loopback::default(), &output, None, None)
+                .expect("a fetch holding none");
+        assert!(without.holder().is_none(), "a token appeared from nowhere");
+    }
+
+    #[test]
+    fn a_serve_requires_all_three_or_none_of_them() {
+        use ed25519_dalek::SigningKey;
+
+        let root = [4; 32];
+        let key = SigningKey::from_bytes(&[21; 32]);
+        let source = crate::tests::temporary("issuer-key");
+        std::fs::write(
+            &source,
+            format!(
+                "ed25519-public:{}",
+                crate::hex_of(&key.verifying_key().to_bytes())
+            ),
+        )
+        .expect("a key file");
+        let named = source.to_string_lossy().into_owned();
+
+        assert!(
+            requirement_from(None, None, None, root)
+                .expect("no requirement")
+                .is_none(),
+            "a serve given nothing required something"
+        );
+        assert!(
+            requirement_from(
+                Some(&named),
+                Some("you.example"),
+                Some("them.example"),
+                root
+            )
+            .expect("a requirement")
+            .is_some(),
+            "a serve given all three required nothing"
+        );
+        // Any partial configuration. A key with no audience would take a
+        // token minted for another deployment, and an audience with no key
+        // would refuse everyone, which reads as a bug rather than a policy.
+        for partial in [
+            (Some(named.as_str()), None, None),
+            (None, Some("you.example"), None),
+            (None, None, Some("them.example")),
+            (Some(named.as_str()), Some("you.example"), None),
+            (Some(named.as_str()), None, Some("them.example")),
+            (None, Some("you.example"), Some("them.example")),
+        ] {
+            assert!(
+                matches!(
+                    requirement_from(partial.0, partial.1, partial.2, root),
+                    Err(Error::InvalidArguments)
+                ),
+                "{partial:?} was not refused"
+            );
+        }
+        // A secret where the public half belongs would let a serve mint what
+        // it checks.
+        let secret = crate::tests::temporary("issuer-secret");
+        std::fs::write(
+            &secret,
+            format!("ed25519-secret:{}", crate::hex_of(&key.to_bytes())),
+        )
+        .expect("a key file");
+        assert!(matches!(
+            requirement_from(
+                Some(&secret.to_string_lossy()),
+                Some("you.example"),
+                Some("them.example"),
+                root
+            ),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            std::env::var(SERVE_ISSUER).is_err(),
+            "the suite owns no env"
+        );
+    }
+
+    #[test]
+    fn a_fetch_presents_both_or_neither() {
+        use ed25519_dalek::SigningKey;
+
+        let issuer = SigningKey::from_bytes(&[22; 32]);
+        let holder = SigningKey::from_bytes(&[23; 32]);
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &issuer,
+            holder.verifying_key().to_bytes(),
+            [4; 32],
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let token_path = crate::tests::temporary("holder-token");
+        std::fs::write(&token_path, &token).expect("a token file");
+        let named = token_path.to_string_lossy().into_owned();
+        let key_path = crate::tests::temporary("holder-key");
+        std::fs::write(
+            &key_path,
+            format!("ed25519-secret:{}", crate::hex_of(&holder.to_bytes())),
+        )
+        .expect("a key file");
+        let key_named = key_path.to_string_lossy().into_owned();
+
+        assert!(
+            holder_from(None, None).expect("no holder").is_none(),
+            "a fetch given nothing presented something"
+        );
+        assert!(
+            holder_from(Some(&named), Some(&key_named))
+                .expect("a holder")
+                .is_some(),
+            "a fetch given both presented nothing"
+        );
+        // A token with no key cannot be proved, and a key with no token
+        // proves nothing.
+        for partial in [
+            (Some(named.as_str()), None),
+            (None, Some(key_named.as_str())),
+        ] {
+            assert!(
+                matches!(
+                    holder_from(partial.0, partial.1),
+                    Err(Error::InvalidArguments)
+                ),
+                "{partial:?} was not refused"
+            );
+        }
+        // The public half cannot prove possession.
+        let public_path = crate::tests::temporary("holder-public");
+        std::fs::write(
+            &public_path,
+            format!(
+                "ed25519-public:{}",
+                crate::hex_of(&holder.verifying_key().to_bytes())
+            ),
+        )
+        .expect("a key file");
+        assert!(matches!(
+            holder_from(Some(&named), Some(&public_path.to_string_lossy())),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            std::env::var(FETCH_CAPABILITY).is_err(),
+            "the suite owns no env"
+        );
+    }
+
+    #[test]
     fn the_congestion_controller_is_the_value_given_or_bbr2() {
         assert_eq!(congestion_from(None).unwrap(), CongestionControl::Bbr2);
         assert_eq!(
@@ -2030,7 +2329,7 @@ mod tests {
         let serving = std::thread::spawn(move || {
             crate::drive::serve_sessions(Some(u32::try_from(RAILS).unwrap()), || {
                 let carrier = listener.accept().map_err(carrier_failure)?;
-                ServeSession::begin(&opened, carrier, serve_authentication()?)
+                ServeSession::begin(&opened, carrier, serve_stance(None)?)
             })
             .unwrap();
             opened.package()
@@ -2055,5 +2354,130 @@ mod tests {
             "every rail announced its own socket at the service"
         );
         crate::harness::discard(&[&source, &bundle, &fetched]);
+    }
+
+    #[test]
+    fn a_serve_that_requires_a_capability_answers_only_a_holder() {
+        // ADR-0036 end to end over a real QUIC socket: the same serve refuses
+        // a fetch with no token and completes one with the right token.
+        use ed25519_dalek::SigningKey;
+
+        let source = crate::tests::temporary("capability-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.bin"), crate::harness::patterned(200_000)).unwrap();
+        let bundle = crate::tests::temporary("capability-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        let issuer_key = SigningKey::from_bytes(&[11; 32]);
+        let holder_key = SigningKey::from_bytes(&[12; 32]);
+        let requirement = crate::authz::Requirement::new(
+            "issuer.example",
+            crate::authz::key_id_of(&issuer_key.verifying_key()),
+            issuer_key.verifying_key(),
+            "receiver.example",
+            built.root,
+        );
+        let token = crate::authz::issue(
+            "issuer.example",
+            "receiver.example",
+            &issuer_key,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let holder = Arc::new(
+            crate::authz::Holder::new(token, holder_key).expect("a holder for that token"),
+        );
+
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.accept_timeout_ms = 0;
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let at = listener.local_address();
+
+        let opened = BundleServer::open(&bundle).unwrap();
+        let refused_requirement = requirement.clone();
+        let refusing = std::thread::spawn(move || {
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = listener.accept().map_err(carrier_failure)?;
+                ServeSession::begin(&opened, carrier, serve_stance(Some(&refused_requirement))?)
+            })
+        });
+
+        // No token. `spec/wire.md` 1.1 says the format list lets a client
+        // holding none of the accepted formats fail immediately rather than
+        // after a rejected SESSION_OPEN, and this is that: the fetch stops on
+        // the challenge instead of waiting out a session it cannot open.
+        let refused_into = crate::tests::temporary("capability-refused");
+        let client = client_config().expect("a client config");
+        let carrier = Transport::connect(
+            local_for(at).expect("a local address"),
+            at,
+            Some("localhost"),
+            &client,
+        )
+        .expect("a carrier");
+        let mut naked = BundleFetcher::begin(carrier, &refused_into, Some(built.root))
+            .expect("a fetch with no token");
+        let refusal = crate::drive::drive(&mut naked).expect("a driven fetch");
+        assert_eq!(
+            refusal,
+            crate::FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
+            "a fetch with no capability was served, or refused for another reason"
+        );
+        assert!(naked.package().is_none(), "a bundle was written anyway");
+        drop(naked);
+        // The peer left mid-negotiation, which a bounded serve surfaces. An
+        // unbounded one outlives it, which is what a real serve is.
+        assert!(
+            refusing.join().expect("the refusing thread").is_err(),
+            "a session whose peer never presented was reported as served"
+        );
+
+        // The same bundle and the same requirement, with the token it asked
+        // for.
+        let opened = BundleServer::open(&bundle).unwrap();
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a second bind");
+        let at = listener.local_address();
+        let granting = std::thread::spawn(move || {
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = listener.accept().map_err(carrier_failure)?;
+                ServeSession::begin(&opened, carrier, serve_stance(Some(&requirement))?)
+            })
+        });
+        let fetched = crate::tests::temporary("capability-fetched");
+        let carrier = Transport::connect(
+            local_for(at).expect("a local address"),
+            at,
+            Some("localhost"),
+            &client,
+        )
+        .expect("a carrier");
+        let mut holding =
+            BundleFetcher::begin_with(carrier, &fetched, Some(built.root), Some(holder))
+                .expect("a fetch holding the token");
+        let status = crate::drive::drive(&mut holding).expect("a driven fetch");
+        assert_eq!(
+            status,
+            crate::FetchStatus::Complete,
+            "the holder was refused"
+        );
+        assert_eq!(holding.package().expect("a package"), built);
+        drop(holding);
+        granting
+            .join()
+            .expect("the granting thread")
+            .expect("served");
+
+        crate::harness::discard(&[&source, &bundle, &refused_into, &fetched]);
     }
 }

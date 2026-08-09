@@ -2313,6 +2313,7 @@ dependencies = [
  "getrandom 0.4.3",
  "rcgen",
  "rustix",
+ "vot-capability",
  "vot-codec",
  "vot-manifest",
  "vot-pack",

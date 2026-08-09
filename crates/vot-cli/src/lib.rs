@@ -22,6 +22,7 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+pub mod authz;
 mod drive;
 mod fetch;
 #[cfg(test)]
@@ -70,6 +71,73 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
         *slot = high * 16 + low;
     }
     Ok(root)
+}
+
+/// Mints a capability for one package and writes it.
+///
+/// ADR-0036. The token says who issued it, which deployment it is for, whose
+/// key may spend it, which package, and for how long. Everything a serve
+/// checks is in here or in the issuer key it was configured with.
+///
+/// # Errors
+/// Rejects a key source that is not an Ed25519 secret for the issuer or an
+/// Ed25519 public key for the holder, a root that is not one, a validity of
+/// no length, and a destination that already exists.
+pub fn issue_capability(
+    issuer_source: &str,
+    issuer: &str,
+    audience: &str,
+    holder_source: &str,
+    root: &str,
+    seconds: &str,
+    out: &Path,
+) -> Result<(), Error> {
+    let KeyMaterial::Signing(issuer_key) = load_key_spec(issuer_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let KeyMaterial::Verifying(holder_key) = load_key_spec(holder_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let token = authz::issue(
+        issuer,
+        audience,
+        &issuer_key,
+        holder_key.to_bytes(),
+        parse_package_root(root)?,
+        authz::now_seconds()?,
+        seconds.parse().map_err(|_| Error::InvalidArguments)?,
+    )?;
+    write_new_synced(out, &token)
+}
+
+/// A fresh Ed25519 keypair, as the two `KEY_SOURCE` strings it is used as.
+///
+/// The holder of a capability needs a key before one can be issued to them,
+/// and nothing else here makes one.
+///
+/// # Errors
+/// Reports [`Error::Randomness`] when the system will not give 32 bytes.
+pub fn generate_keypair() -> Result<(String, String), Error> {
+    let mut seed = [0_u8; 32];
+    getrandom::fill(&mut seed).map_err(|_| Error::Randomness)?;
+    let key = SigningKey::from_bytes(&seed);
+    Ok((
+        format!("ed25519-secret:{}", hex_of(&key.to_bytes())),
+        format!("ed25519-public:{}", hex_of(&key.verifying_key().to_bytes())),
+    ))
+}
+
+/// Lowercase hexadecimal, which is how every key and root is written here.
+///
+/// One writer, because a root the binary prints and a key this mints have to
+/// read the same to a caller pasting one into the other.
+#[must_use]
+pub fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 /// Set to fetch from an address without naming the package to accept.
@@ -2141,6 +2209,129 @@ mod tests {
             parse_package_root(&spoiled),
             Err(Error::InvalidArguments)
         ));
+    }
+
+    #[test]
+    fn issuing_writes_a_token_the_holder_can_spend() {
+        // The wrapper, not `authz::issue` underneath it: one that wrote
+        // nothing and reported success would leave an operator with no token
+        // and no error.
+        let (holder_secret, holder_public) = generate_keypair().expect("a holder pair");
+        let (issuer_secret, _) = generate_keypair().expect("an issuer pair");
+        let issuer_file = tests::temporary("issue-issuer");
+        std::fs::write(&issuer_file, &issuer_secret).expect("a key file");
+        let holder_file = tests::temporary("issue-holder");
+        std::fs::write(&holder_file, &holder_public).expect("a key file");
+        let out = tests::temporary("issue-token");
+        let root = "5c".repeat(32);
+
+        issue_capability(
+            &issuer_file.to_string_lossy(),
+            "you.example",
+            "them.example",
+            &holder_file.to_string_lossy(),
+            &root,
+            "3600",
+            &out,
+        )
+        .expect("a token");
+
+        let written = std::fs::read(&out).expect("the token file");
+        assert!(!written.is_empty(), "the token is empty");
+        let signed = vot_capability::decode(&written).expect("a capability of this format");
+        let capability = vot_capability::Capability::from_canonical_bytes(&signed.capability)
+            .expect("the claims");
+        assert_eq!(capability.audience, "them.example");
+        assert_eq!(capability.issuer, "you.example");
+        assert_eq!(capability.scope.root, [0x5c; 32], "another package");
+        assert_eq!(
+            capability.expiry - capability.not_before,
+            3_600,
+            "another window"
+        );
+        // The holder key in the token is the one that was named, so the
+        // secret half can prove it.
+        let seed: [u8; 32] = parse_package_root(
+            holder_secret
+                .strip_prefix("ed25519-secret:")
+                .expect("the label"),
+        )
+        .expect("32 bytes");
+        assert_eq!(
+            capability.holder_key,
+            SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            "the token names another holder"
+        );
+
+        // A destination that exists is not overwritten, and the labels are
+        // not interchangeable.
+        assert!(matches!(
+            issue_capability(
+                &issuer_file.to_string_lossy(),
+                "you.example",
+                "them.example",
+                &holder_file.to_string_lossy(),
+                &root,
+                "3600",
+                &out
+            ),
+            Err(Error::Io(_))
+        ));
+        let second = tests::temporary("issue-token-2");
+        assert!(
+            matches!(
+                issue_capability(
+                    &holder_file.to_string_lossy(),
+                    "you.example",
+                    "them.example",
+                    &holder_file.to_string_lossy(),
+                    &root,
+                    "3600",
+                    &second
+                ),
+                Err(Error::InvalidArguments)
+            ),
+            "a public key signed a token"
+        );
+        assert!(
+            matches!(
+                issue_capability(
+                    &issuer_file.to_string_lossy(),
+                    "you.example",
+                    "them.example",
+                    &issuer_file.to_string_lossy(),
+                    &root,
+                    "3600",
+                    &second
+                ),
+                Err(Error::InvalidArguments)
+            ),
+            "a secret key was taken as a holder"
+        );
+    }
+
+    #[test]
+    fn a_generated_pair_is_two_halves_of_one_key() {
+        let (secret, public) = generate_keypair().expect("a keypair");
+        let (again, _) = generate_keypair().expect("a second keypair");
+        assert_ne!(secret, again, "two calls gave the same key");
+
+        let seed = secret
+            .strip_prefix("ed25519-secret:")
+            .expect("the secret label");
+        let claimed = public
+            .strip_prefix("ed25519-public:")
+            .expect("the public label");
+        assert_eq!(seed.len(), 64, "{secret}");
+        assert_eq!(claimed.len(), 64, "{public}");
+        // The halves have to match, or a token issued to the public one is a
+        // token the secret cannot prove.
+        let bytes: [u8; 32] = parse_package_root(seed).expect("32 bytes of hex");
+        assert_eq!(
+            hex_of(&SigningKey::from_bytes(&bytes).verifying_key().to_bytes()),
+            claimed,
+            "the public half is not this secret's"
+        );
     }
 
     #[test]

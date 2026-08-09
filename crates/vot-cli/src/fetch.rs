@@ -549,6 +549,22 @@ impl FetchPlan {
     }
 }
 
+/// The stance a fetch takes on a challenge it has not seen yet.
+///
+/// Presenting when this fetch holds a capability, which is what makes
+/// `pending_presentation` fire and lets it answer. Without one it takes the
+/// stance that answers nothing, and `vot_session` ends the session on a
+/// challenge that names a format this end cannot supply, which is what the
+/// format list in `spec/wire.md` 1.1 is for.
+fn client_stance(holder: Option<&crate::authz::Holder>) -> Authentication {
+    if holder.is_some() {
+        Authentication::Presenting
+    } else {
+        // The client ignores the nonce; it is the server's freshness.
+        Authentication::NotRequired { nonce: [0; 32] }
+    }
+}
+
 /// One fetch: a client session, the receiver verifying its ranges, and the
 /// bundle directory being written.
 #[expect(
@@ -574,6 +590,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     resuming: bool,
     /// Whether this fetcher is a rail on another fetch's plan.
     secondary: bool,
+    /// The capability this fetch answers a challenge with, when it has one.
+    /// Shared, because every rail opens its own session and answers its own
+    /// challenge under the same token.
+    holder: Option<Arc<crate::authz::Holder>>,
     /// The object this rail has admitted to its own receiver, by plan
     /// index. Admission is per rail; the plan cannot do it.
     admitted: Option<(usize, SubjectId)>,
@@ -750,6 +770,19 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// and durable ranges are skipped. A destination without a store is
     /// refused.
     pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
+        Self::begin_with(adapter, bundle, pin, None)
+    }
+
+    /// [`Self::begin`] holding a capability to present.
+    ///
+    /// # Errors
+    /// As [`Self::begin`].
+    pub(crate) fn begin_with(
+        adapter: A,
+        bundle: &Path,
+        pin: Option<[u8; 32]>,
+        holder: Option<Arc<crate::authz::Holder>>,
+    ) -> Result<Self, Error> {
         let store_path = bundle.join(RESUME_STORE);
         let resuming = bundle.exists();
         if resuming {
@@ -785,8 +818,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             adapter,
             Settings::default(),
             BTreeSet::new(),
-            // The client ignores the nonce; it is the server's freshness.
-            Authentication::NotRequired { nonce: [0; 32] },
+            client_stance(holder.as_deref()),
         );
         session.begin()?;
         let receiver =
@@ -817,6 +849,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             store: Some(Arc::new(Mutex::new(store))),
             resuming,
             secondary: false,
+            holder,
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
@@ -847,14 +880,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// # Errors
     /// Surfaces a session or receiver that could not start.
     #[cfg(any(test, feature = "wire"))]
-    pub(crate) fn join(adapter: A, bundle: &Path, plan: SharedPlan) -> Result<Self, Error> {
+    pub(crate) fn join(
+        adapter: A,
+        bundle: &Path,
+        plan: SharedPlan,
+        holder: Option<Arc<crate::authz::Holder>>,
+    ) -> Result<Self, Error> {
         let root = plan.lock().map_err(|_| Error::InvalidBundle)?.summary.root;
         let mut session = Session::client(
             adapter,
             Settings::default(),
             BTreeSet::new(),
-            // The client ignores the nonce; it is the server's freshness.
-            Authentication::NotRequired { nonce: [0; 32] },
+            client_stance(holder.as_deref()),
         );
         session.begin()?;
         let receiver =
@@ -883,6 +920,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             store: None,
             resuming: false,
             secondary: true,
+            holder,
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
@@ -917,6 +955,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     #[cfg(any(test, feature = "wire"))]
     pub(crate) fn shared_plan(&self) -> Option<SharedPlan> {
         self.plan.clone()
+    }
+
+    /// The capability this fetch presents, for a rail that opens its own
+    /// session on the same plan.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn holder(&self) -> Option<Arc<crate::authz::Holder>> {
+        self.holder.clone()
     }
 
     /// The bundle directory this fetch writes.
@@ -1008,6 +1053,32 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.stopped = true;
     }
 
+    /// Answers a challenge that asks for a capability, once.
+    ///
+    /// A fetch with no capability answers nothing: the challenge fires only
+    /// on a session begun `Presenting`, and one begun without a holder is
+    /// not. That fetch ends on the challenge instead, which `vot_session`
+    /// does for it, so the failure is loud rather than a session that waits
+    /// on an answer it cannot give.
+    ///
+    /// # Errors
+    /// Surfaces a proof this end could not make and a carrier that would not
+    /// take the request. A refusal from the far end is not an error here; it
+    /// arrives as the session closing under its own code.
+    fn present_capability(&mut self) -> Result<(), Error> {
+        let Some(holder) = self.holder.clone() else {
+            return Ok(());
+        };
+        let request = {
+            let Some(challenge) = self.receiver.session().pending_presentation() else {
+                return Ok(());
+            };
+            holder.answer(challenge)?
+        };
+        self.receiver.session_mut().present(request)?;
+        Ok(())
+    }
+
     /// One pass over what the carrier holds: drains queued requests, takes
     /// every event, advances the object plan, and flushes. Never blocks;
     /// the caller waits on the adapter between passes.
@@ -1028,6 +1099,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
+        self.present_capability()?;
         self.drain()?;
         loop {
             match self.receiver.poll() {
@@ -1924,7 +1996,7 @@ mod tests {
         primary.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
 
         let (mut seq1, mut seq2) = (0, 0);
         // Admit the rail before the primary settles, so the handout is deterministic.
@@ -1982,7 +2054,7 @@ mod tests {
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
 
         abandon_plan(&plan);
         assert_eq!(primary.service().unwrap(), FetchStatus::Disconnected);
@@ -2001,7 +2073,7 @@ mod tests {
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
         assert!(secondary.secondary, "a joined fetcher is a rail");
         assert_eq!(
             secondary.pin,
@@ -2180,6 +2252,108 @@ mod tests {
         assert_eq!(plan.covered_bytes, 25, "an empty cover covers nothing");
         plan.cover(u64::MAX, 2);
         assert_eq!(plan.covered_bytes, 25, "an overflowing cover is refused");
+    }
+
+    #[test]
+    fn a_capability_decides_a_transfer_in_process() {
+        // The same thing the QUIC test asserts, over the in-process duplex.
+        // `wire.rs` is not compiled without the carrier feature, so the QUIC
+        // one measures nothing in the default mutation job, and the two hooks
+        // that make a capability decide anything live here and in `drive`.
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) =
+            built_bundle("in-process-capability", &[("a.bin", patterned(60_000))]);
+        let issuer = SigningKey::from_bytes(&[31; 32]);
+        let holder_key = SigningKey::from_bytes(&[32; 32]);
+        let requirement = crate::authz::Requirement::new(
+            "you.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "them.example",
+            built.root,
+        );
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let holder = Arc::new(
+            crate::authz::Holder::new(token, holder_key).expect("a holder for that token"),
+        );
+
+        // Holding the token: the serve grants and the bundle crosses.
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let granting_requirement = requirement.clone();
+        let granting = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::required(&granting_requirement, [7; 32]),
+                )
+            })
+        });
+        let output = temporary("in-process-granted");
+        let mut fetcher =
+            BundleFetcher::begin_with(client, &output, Some(built.root), Some(Arc::clone(&holder)))
+                .expect("a fetch holding the token");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            FetchStatus::Complete,
+            "the holder was refused"
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        assert!(
+            Arc::ptr_eq(&fetcher.holder().expect("the token"), &holder),
+            "a rail would have opened its session with no capability"
+        );
+        drop(fetcher);
+        granting
+            .join()
+            .expect("the granting thread")
+            .expect("served");
+
+        // Holding none: the fetch stops on the challenge rather than after a
+        // transfer, and writes no bundle.
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let refusing = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::required(&requirement, [8; 32]),
+                )
+            })
+        });
+        let refused_into = temporary("in-process-refused");
+        let mut naked = BundleFetcher::begin(client, &refused_into, Some(built.root))
+            .expect("a fetch with no token");
+        assert_eq!(
+            crate::drive::drive(&mut naked).expect("a driven fetch"),
+            FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
+            "a fetch with no capability was served, or refused for another reason"
+        );
+        assert!(naked.package().is_none(), "a bundle was written anyway");
+        drop(naked);
+        // The peer left mid-negotiation, which a bounded serve surfaces.
+        assert!(
+            refusing.join().expect("the refusing thread").is_err(),
+            "a session whose peer never presented was reported as served"
+        );
     }
 
     #[test]

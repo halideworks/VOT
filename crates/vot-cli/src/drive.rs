@@ -142,16 +142,21 @@ where
     };
     let bundle = primary.bundle().to_owned();
     let provers = primary.proving_threads();
+    // Every rail opens its own session and answers its own challenge, under
+    // the token the primary was given.
+    let holder = primary.holder();
     std::thread::scope(|scope| {
         let mut spawned = Vec::new();
         for _ in 1..rails {
             let plan = crate::fetch::SharedPlan::clone(&plan);
             let connect = &connect;
             let bundle = bundle.clone();
+            let holder = holder.clone();
             spawned.push(scope.spawn(move || {
                 let outcome = (|| {
                     let carrier = connect()?;
-                    let mut rail = crate::BundleFetcher::join(carrier, &bundle, plan.clone())?;
+                    let mut rail =
+                        crate::BundleFetcher::join(carrier, &bundle, plan.clone(), holder)?;
                     rail.set_proving_threads(provers)?;
                     match drive(&mut rail)? {
                         crate::FetchStatus::Complete => Ok(()),
@@ -217,30 +222,63 @@ pub struct ServeSession<'server, A: TransportAdapter> {
     server: &'server crate::BundleServer,
     session: vot_session::Session<A>,
     connection: crate::ServeConnection,
+    requirement: Option<&'server crate::authz::Requirement>,
 }
 
 impl<'server, A: TransportAdapter> ServeSession<'server, A> {
-    /// Begins a session on `carrier`, answered from `server`.
+    /// Begins a session on `carrier`, answered from `server`, under `stance`.
     ///
     /// # Errors
     /// Surfaces a session that could not send its opening frames.
     pub fn begin(
         server: &'server crate::BundleServer,
         carrier: A,
-        authentication: vot_session::Authentication,
+        stance: impl Into<crate::authz::Stance<'server>>,
     ) -> Result<Self, Error> {
+        let stance = stance.into();
+        let requirement = stance.requirement;
         let mut session = vot_session::Session::server(
             carrier,
             vot_codec::Settings::default(),
             std::collections::BTreeSet::new(),
-            authentication,
+            stance.authentication,
         );
         session.begin()?;
         Ok(Self {
             server,
             session,
             connection: crate::ServeConnection::new(),
+            requirement,
         })
+    }
+
+    /// Grants or refuses a capability the peer presented.
+    ///
+    /// A serve that requires nothing never sees one, because it advertised no
+    /// format and section 1.1 concludes the exchange at `AUTH_CONTEXT`. One
+    /// that does has to answer every attempt: the peer is waiting on a
+    /// decision, and the session carries no data until it arrives.
+    ///
+    /// # Errors
+    /// Surfaces a carrier that would not take the answer.
+    fn answer_authorization(&mut self) -> Result<(), Error> {
+        let Some(requirement) = self.requirement else {
+            return Ok(());
+        };
+        let decision = {
+            let Some((challenge, open)) = self.session.pending_authorization() else {
+                return Ok(());
+            };
+            requirement.decide(challenge, open, crate::authz::now_seconds()?)
+        };
+        match decision {
+            Some(scope) => self.session.grant(scope)?,
+            None => self.session.refuse(
+                crate::authz::REFUSAL_REASON,
+                crate::authz::REFUSAL_DETAIL.to_owned(),
+            )?,
+        }
+        Ok(())
     }
 }
 
@@ -475,6 +513,7 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
     type Status = crate::ServeStatus;
 
     fn service(&mut self) -> Result<Self::Status, Error> {
+        self.answer_authorization()?;
         self.server.service(&mut self.session, &mut self.connection)
     }
 

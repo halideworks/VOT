@@ -565,7 +565,7 @@ fn check_predecessor(receipt: &Receipt, observed: &[AssuranceLevel]) -> Result<(
     if receipt.assurance != AssuranceLevel::Published {
         return Ok(());
     }
-    let required = model_profile(receipt.profile).required_predecessor();
+    let required = model_assurance(required_predecessor(receipt.profile));
     if model_assurance(receipt.actual_predecessor) != required {
         return Err(Error::PredecessorTooWeak);
     }
@@ -576,6 +576,29 @@ fn check_predecessor(receipt: &Receipt, observed: &[AssuranceLevel]) -> Result<(
         return Err(Error::PredecessorNotObserved);
     }
     Ok(())
+}
+
+/// The assurance a publication under `profile` must have performed, in the
+/// receipt's own vocabulary.
+///
+/// The table lives in `vot_commit_model`, which is where the machine reads
+/// it. This is the one place the two vocabularies meet, so it is the one
+/// place the translation belongs: a second copy anywhere else can be edited
+/// into disagreeing with what the verifier will accept, without a compile
+/// error to say so.
+#[must_use]
+pub const fn required_predecessor(profile: CommitProfile) -> AssuranceLevel {
+    receipt_assurance(model_profile(profile).required_predecessor())
+}
+
+const fn receipt_assurance(level: vot_commit_model::Assurance) -> AssuranceLevel {
+    match level {
+        vot_commit_model::Assurance::Admitted => AssuranceLevel::Admitted,
+        vot_commit_model::Assurance::TransitVerified => AssuranceLevel::TransitVerified,
+        vot_commit_model::Assurance::Durable => AssuranceLevel::Durable,
+        vot_commit_model::Assurance::AtRestVerified => AssuranceLevel::AtRestVerified,
+        vot_commit_model::Assurance::Published => AssuranceLevel::Published,
+    }
 }
 
 const fn model_assurance(level: AssuranceLevel) -> vot_commit_model::Assurance {

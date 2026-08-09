@@ -94,16 +94,17 @@ pub const fn native_platform() -> Platform {
 
 pub fn claim(platform: Platform, profile: CommitProfile) -> Result<PublicationClaim, Error> {
     let capabilities = capabilities(platform).ok_or(Error::UnsupportedPlatform)?;
-    let actual_predecessor = match profile {
-        CommitProfile::Fast => AssuranceLevel::TransitVerified,
-        CommitProfile::Balanced => {
-            if !capabilities.balanced {
-                return Err(Error::UnsupportedProfile);
-            }
-            AssuranceLevel::Durable
+    match profile {
+        CommitProfile::Fast => {}
+        CommitProfile::Balanced if capabilities.balanced => {}
+        CommitProfile::Balanced | CommitProfile::Strict => {
+            return Err(Error::UnsupportedProfile);
         }
-        CommitProfile::Strict => return Err(Error::UnsupportedProfile),
-    };
+    }
+    // Read from the one table rather than repeated here. A receipt this
+    // emits with a weaker predecessor than the profile requires is one
+    // `vot_receipt::verify_chain` refuses, and nothing would have said so.
+    let actual_predecessor = vot_receipt::required_predecessor(profile);
     Ok(PublicationClaim {
         provider: capabilities.provider,
         profile,

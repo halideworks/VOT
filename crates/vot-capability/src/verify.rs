@@ -143,7 +143,7 @@ impl Denial {
 ///
 /// A raw identifier cannot be one, which is the whole point:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use vot_capability::verify::Request;
 ///
 /// let request = Request {
@@ -184,7 +184,7 @@ impl Authorized {
     /// Reports an operation the capability does not allow, another object, and a
     /// range outside its scope.
     pub fn allows(&self, request: Request) -> Result<(), Denial> {
-        if !self.capability.allows(request.operation.identifier()) {
+        if !self.capability.allows(request.operation) {
             return Err(Denial::OperationNotAllowed(request.operation.identifier()));
         }
         if request.suite != self.capability.scope.suite
@@ -744,13 +744,13 @@ mod tests {
         .expect("an unknown operation does not invalidate the token");
 
         assert!(
-            authorized.capability().allows(0x0004),
-            "the value survived the round trip, so the denial below is the type's doing"
+            authorized.capability().carries(0x0004),
+            "the value survived the round trip, so the refusal below is the type's doing"
         );
         assert_eq!(
-            vot_codec::Operation::try_from(0x0004_u64),
+            crate::Operation::try_from(0x0004_u64),
             Err(vot_codec::UnknownOperation(0x0004)),
-            "and no request can name it"
+            "and neither a request nor a grant can name it"
         );
 
         assert_eq!(

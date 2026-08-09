@@ -7,6 +7,10 @@
 
 pub mod verify;
 
+/// What a capability can authorize, re-exported so a caller need not depend
+/// on `vot-codec` to name one.
+pub use vot_codec::Operation;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// The format identifier `spec/registries.md` section 11 gives this format.
@@ -365,9 +369,33 @@ impl Capability {
     }
 
     /// Whether this capability allows `operation`.
+    ///
+    /// Takes a [`vot_codec::Operation`] rather than an identifier, because
+    /// this is where a grant is decided and `spec/registries.md` section 12
+    /// says an unknown identifier grants nothing. A closed argument is how
+    /// that is true rather than merely intended: there is no unregistered
+    /// value to ask about.
+    ///
+    /// ```compile_fail,E0308
+    /// # use vot_capability::Capability;
+    /// # fn check(capability: &Capability) -> bool {
+    /// capability.allows(0x0004)
+    /// # }
+    /// ```
     #[must_use]
-    pub fn allows(&self, operation: u64) -> bool {
-        self.operations.contains(&operation)
+    pub fn allows(&self, operation: vot_codec::Operation) -> bool {
+        self.operations.contains(&operation.identifier())
+    }
+
+    /// Whether the capability's operation set names `identifier`, registered
+    /// or not.
+    ///
+    /// For round-tripping and diagnostics. This answers what the token says,
+    /// not what it authorizes, and deliberately reads as neither: a grant
+    /// goes through [`Capability::allows`].
+    #[must_use]
+    pub fn carries(&self, identifier: u64) -> bool {
+        self.operations.contains(&identifier)
     }
 
     /// The ceiling this capability puts on `limit`, when it states one.
@@ -1199,9 +1227,16 @@ mod tests {
     #[test]
     fn what_a_capability_allows_and_limits_is_read_by_identifier() {
         let value = capability();
-        assert!(value.allows(1));
-        assert!(value.allows(3));
-        assert!(!value.allows(2), "an operation it does not name");
+        assert!(value.allows(vot_codec::Operation::Publish));
+        assert!(value.allows(vot_codec::Operation::ReadRanges));
+        assert!(
+            !value.allows(vot_codec::Operation::ReadManifest),
+            "an operation it does not name"
+        );
+        // The raw view answers about the set, not about a grant, so it sees
+        // what a later revision issued and `allows` cannot be asked.
+        assert!(value.carries(1));
+        assert!(!value.carries(0x0004));
         assert_eq!(value.limit(1), Some(4));
         assert_eq!(value.limit(2), Some(1 << 30));
         assert_eq!(value.limit(3), None, "a limit it does not state");

@@ -549,6 +549,21 @@ impl FetchPlan {
     }
 }
 
+/// The stance a fetch takes on a challenge it has not seen yet.
+///
+/// Presenting when this fetch holds a capability, which is what makes
+/// `pending_presentation` fire and lets it answer. Without one it takes the
+/// stance that answers nothing, and a serve that requires a capability
+/// refuses the session rather than this end failing quietly.
+fn client_stance(holder: Option<&crate::authz::Holder>) -> Authentication {
+    if holder.is_some() {
+        Authentication::Presenting
+    } else {
+        // The client ignores the nonce; it is the server's freshness.
+        Authentication::NotRequired { nonce: [0; 32] }
+    }
+}
+
 /// One fetch: a client session, the receiver verifying its ranges, and the
 /// bundle directory being written.
 #[expect(
@@ -574,6 +589,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     resuming: bool,
     /// Whether this fetcher is a rail on another fetch's plan.
     secondary: bool,
+    /// The capability this fetch answers a challenge with, when it has one.
+    /// Shared, because every rail opens its own session and answers its own
+    /// challenge under the same token.
+    holder: Option<Arc<crate::authz::Holder>>,
     /// The object this rail has admitted to its own receiver, by plan
     /// index. Admission is per rail; the plan cannot do it.
     admitted: Option<(usize, SubjectId)>,
@@ -750,6 +769,19 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// and durable ranges are skipped. A destination without a store is
     /// refused.
     pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
+        Self::begin_with(adapter, bundle, pin, None)
+    }
+
+    /// [`Self::begin`] holding a capability to present.
+    ///
+    /// # Errors
+    /// As [`Self::begin`].
+    pub(crate) fn begin_with(
+        adapter: A,
+        bundle: &Path,
+        pin: Option<[u8; 32]>,
+        holder: Option<Arc<crate::authz::Holder>>,
+    ) -> Result<Self, Error> {
         let store_path = bundle.join(RESUME_STORE);
         let resuming = bundle.exists();
         if resuming {
@@ -785,8 +817,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             adapter,
             Settings::default(),
             BTreeSet::new(),
-            // The client ignores the nonce; it is the server's freshness.
-            Authentication::NotRequired { nonce: [0; 32] },
+            client_stance(holder.as_deref()),
         );
         session.begin()?;
         let receiver =
@@ -817,6 +848,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             store: Some(Arc::new(Mutex::new(store))),
             resuming,
             secondary: false,
+            holder,
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
@@ -847,14 +879,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// # Errors
     /// Surfaces a session or receiver that could not start.
     #[cfg(any(test, feature = "wire"))]
-    pub(crate) fn join(adapter: A, bundle: &Path, plan: SharedPlan) -> Result<Self, Error> {
+    pub(crate) fn join(
+        adapter: A,
+        bundle: &Path,
+        plan: SharedPlan,
+        holder: Option<Arc<crate::authz::Holder>>,
+    ) -> Result<Self, Error> {
         let root = plan.lock().map_err(|_| Error::InvalidBundle)?.summary.root;
         let mut session = Session::client(
             adapter,
             Settings::default(),
             BTreeSet::new(),
-            // The client ignores the nonce; it is the server's freshness.
-            Authentication::NotRequired { nonce: [0; 32] },
+            client_stance(holder.as_deref()),
         );
         session.begin()?;
         let receiver =
@@ -883,6 +919,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             store: None,
             resuming: false,
             secondary: true,
+            holder,
             admitted: None,
             taken_bytes: 0,
             settled_bytes: 0,
@@ -917,6 +954,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     #[cfg(any(test, feature = "wire"))]
     pub(crate) fn shared_plan(&self) -> Option<SharedPlan> {
         self.plan.clone()
+    }
+
+    /// The capability this fetch presents, for a rail that opens its own
+    /// session on the same plan.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn holder(&self) -> Option<Arc<crate::authz::Holder>> {
+        self.holder.clone()
     }
 
     /// The bundle directory this fetch writes.
@@ -1011,6 +1055,31 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// One pass over what the carrier holds: drains queued requests, takes
     /// every event, advances the object plan, and flushes. Never blocks;
     /// the caller waits on the adapter between passes.
+    /// Answers a challenge that asks for a capability, once.
+    ///
+    /// A fetch with no capability answers nothing: the challenge fires only
+    /// on a session begun `Presenting`, and one begun without a holder is
+    /// not. A serve that wanted one then refuses, which is the loud failure
+    /// rather than a quiet unauthorized transfer.
+    ///
+    /// # Errors
+    /// Surfaces a proof this end could not make and a carrier that would not
+    /// take the request. A refusal from the far end is not an error here; it
+    /// arrives as the session closing under its own code.
+    fn present_capability(&mut self) -> Result<(), Error> {
+        let Some(holder) = self.holder.clone() else {
+            return Ok(());
+        };
+        let request = {
+            let Some(challenge) = self.receiver.session().pending_presentation() else {
+                return Ok(());
+            };
+            holder.answer(challenge)?
+        };
+        self.receiver.session_mut().present(request)?;
+        Ok(())
+    }
+
     pub fn service(&mut self) -> Result<FetchStatus, Error> {
         if let Some(code) = self.closed {
             return Ok(FetchStatus::Closed(code));
@@ -1028,6 +1097,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
+        self.present_capability()?;
         self.drain()?;
         loop {
             match self.receiver.poll() {
@@ -1921,7 +1991,7 @@ mod tests {
         primary.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
 
         let (mut seq1, mut seq2) = (0, 0);
         // Admit the rail before the primary settles, so the handout is deterministic.
@@ -1979,7 +2049,7 @@ mod tests {
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
 
         abandon_plan(&plan);
         assert_eq!(primary.service().unwrap(), FetchStatus::Disconnected);
@@ -1998,7 +2068,7 @@ mod tests {
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
         let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan)).unwrap();
+            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
         assert!(secondary.secondary, "a joined fetcher is a rail");
         assert_eq!(
             secondary.pin,

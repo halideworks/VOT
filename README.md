@@ -78,6 +78,51 @@ so the end holding the bundle hands over one line. A root in the address
 position pins itself. `VOT_FETCH_UNPINNED=1` fetches from a server whose
 package cannot be known in advance.
 
+### Who may fetch
+
+A serve answers anyone by default. Give it an issuer key and it requires a
+capability: a signed token naming one package, one holder key, and a validity
+window. ADR-0036.
+
+Every key below is a `KEY_SOURCE`, so it names where to read a key from and
+not the key itself: `env:NAME`, `-` for stdin, or a file path. What it reads
+is the labelled key, `ed25519-secret:HEX` or `ed25519-public:HEX`.
+
+```sh
+# The recipient makes a key and sends you the public half.
+vot capability keygen                      # prints the secret, then the public
+
+# You mint a token for your package under your own issuer key.
+export ISSUER_SECRET=ed25519-secret:...    # your key, however you store it
+export HOLDER_PUBLIC=ed25519-public:...    # theirs
+vot capability issue env:ISSUER_SECRET you.example them.example \
+  env:HOLDER_PUBLIC PACKAGE_ROOT 86400 token.cbor
+
+# Your serve requires one.
+export ISSUER_PUBLIC=ed25519-public:...    # the public half of yours
+export VOT_SERVE_ISSUER=env:ISSUER_PUBLIC
+export VOT_SERVE_ISSUER_NAME=you.example
+export VOT_SERVE_AUDIENCE=them.example
+vot serve BUNDLE_DIR 0.0.0.0:9000
+
+# Their fetch presents it.
+export HOLDER_SECRET=ed25519-secret:...
+export VOT_FETCH_CAPABILITY=token.cbor
+export VOT_FETCH_HOLDER_KEY=env:HOLDER_SECRET
+vot fetch ADDR BUNDLE_DIR PACKAGE_ROOT
+```
+
+A fetch without a token is refused on the challenge rather than after a
+transfer, and the refusal says the same thing whatever was wrong with the
+token, because the difference between an expired one and a forged one is an
+oracle.
+
+What the token decides is that whoever opened the session holds the key it
+names. It does not decide that the peer at the far end of the QUIC connection
+is that holder: the proof is over a nonce, so an interposer can forward it.
+Binding to the channel needs a keying-material exporter quiche does not
+expose. An interposer still cannot give you different bytes.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -88,6 +133,11 @@ package cannot be known in advance.
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
 | `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
+| `VOT_SERVE_ISSUER` | unset | Issuer public key a serve accepts capabilities from, as a `KEY_SOURCE`. With the two below, the serve requires one |
+| `VOT_SERVE_ISSUER_NAME` | unset | The issuer name that key signs under |
+| `VOT_SERVE_AUDIENCE` | unset | The deployment a capability must name |
+| `VOT_FETCH_CAPABILITY` | unset | Path to the token a fetch presents |
+| `VOT_FETCH_HOLDER_KEY` | unset | The holder secret that token names, as a `KEY_SOURCE` |
 
 ## Keys
 

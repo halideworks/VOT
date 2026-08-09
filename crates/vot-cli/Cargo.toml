@@ -17,6 +17,7 @@ wire = ["dep:vot-transport-quiche", "vot-transport-quiche/live", "dep:rcgen"]
 blake3.workspace = true
 ed25519-dalek.workspace = true
 getrandom = "=0.4.3"
+vot-capability = { path = "../vot-capability" }
 vot-codec = { path = "../vot-codec" }
 vot-manifest = { path = "../vot-manifest" }
 vot-pack = { path = "../vot-pack" }

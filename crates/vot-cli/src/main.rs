@@ -9,6 +9,9 @@ Usage:
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
   vot rendezvous LISTEN_ADDR
+  vot capability keygen
+  vot capability issue ISSUER_KEY_SOURCE ISSUER AUDIENCE HOLDER_PUBLIC
+                       PACKAGE_ROOT SECONDS OUT.cbor
   vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
   vot fetch ROOT BUNDLE_DIR
   vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
@@ -30,6 +33,18 @@ PACKAGE_ROOT, the 64 hex characters send printed, and refuses without one;
 serve prints the whole fetch command for the bundle it is serving. A ROOT in
 the address position pins itself. VOT_FETCH_UNPINNED=1 fetches from a server
 whose package cannot be known in advance.
+
+A serve requires a capability when VOT_SERVE_ISSUER, VOT_SERVE_ISSUER_NAME,
+and VOT_SERVE_AUDIENCE are all set, and requires none when none of them is.
+A fetch presents one when VOT_FETCH_CAPABILITY and VOT_FETCH_HOLDER_KEY are
+both set. `capability keygen` makes a holder a key, and `capability issue`
+mints a token for one package under an issuer key. Every key there is a
+KEY_SOURCE, so it says where to read a key from rather than being one.
+
+What the token decides is that whoever opened the session holds the key it
+names. It does not decide that the peer at the far end of the connection is
+that holder: the proof is over a nonce, so an attacker in the middle can
+forward it. See ADR-0036.
 
 SUITE is blake3 or sha256. The default is sha256.
 OBSERVED_AT is an RFC 3339 timestamp, for example 2026-07-31T20:00:00Z.
@@ -160,6 +175,32 @@ fn run() -> Result<(), vot_cli::Error> {
 fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
     match arguments {
         [_, command, address] if command == "rendezvous" => rendezvous(address),
+        [_, command, sub] if command == "capability" && sub == "keygen" => {
+            let (secret, public) = vot_cli::generate_keypair()?;
+            println!("{secret}");
+            println!("{public}");
+            Ok(())
+        }
+        [
+            _,
+            command,
+            sub,
+            issuer_source,
+            issuer,
+            audience,
+            holder_public,
+            root,
+            seconds,
+            out,
+        ] if command == "capability" && sub == "issue" => vot_cli::issue_capability(
+            issuer_source,
+            issuer,
+            audience,
+            holder_public,
+            root,
+            seconds,
+            Path::new(out),
+        ),
         [_, command, bundle, address] if command == "serve" => {
             serve(bundle, address, &vot_cli::Credentials::Ephemeral)
         }

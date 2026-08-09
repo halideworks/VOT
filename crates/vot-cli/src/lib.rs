@@ -22,6 +22,7 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+pub mod authz;
 mod drive;
 mod fetch;
 #[cfg(test)]
@@ -70,6 +71,69 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
         *slot = high * 16 + low;
     }
     Ok(root)
+}
+
+/// Mints a capability for one package and writes it.
+///
+/// ADR-0036. The token says who issued it, which deployment it is for, whose
+/// key may spend it, which package, and for how long. Everything a serve
+/// checks is in here or in the issuer key it was configured with.
+///
+/// # Errors
+/// Rejects a key source that is not an Ed25519 secret for the issuer or an
+/// Ed25519 public key for the holder, a root that is not one, a validity of
+/// no length, and a destination that already exists.
+pub fn issue_capability(
+    issuer_source: &str,
+    issuer: &str,
+    audience: &str,
+    holder_source: &str,
+    root: &str,
+    seconds: &str,
+    out: &Path,
+) -> Result<(), Error> {
+    let KeyMaterial::Signing(issuer_key) = load_key_spec(issuer_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let KeyMaterial::Verifying(holder_key) = load_key_spec(holder_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let token = authz::issue(
+        issuer,
+        audience,
+        &issuer_key,
+        holder_key.to_bytes(),
+        parse_package_root(root)?,
+        authz::now_seconds()?,
+        seconds.parse().map_err(|_| Error::InvalidArguments)?,
+    )?;
+    write_new_synced(out, &token)
+}
+
+/// A fresh Ed25519 keypair, as the two `KEY_SOURCE` strings it is used as.
+///
+/// The holder of a capability needs a key before one can be issued to them,
+/// and nothing else here makes one.
+///
+/// # Errors
+/// Reports [`Error::Randomness`] when the system will not give 32 bytes.
+pub fn generate_keypair() -> Result<(String, String), Error> {
+    let mut seed = [0_u8; 32];
+    getrandom::fill(&mut seed).map_err(|_| Error::Randomness)?;
+    let key = SigningKey::from_bytes(&seed);
+    Ok((
+        format!("ed25519-secret:{}", hex_of(&key.to_bytes())),
+        format!("ed25519-public:{}", hex_of(&key.verifying_key().to_bytes())),
+    ))
+}
+
+/// Lowercase hexadecimal, which is how every key and root is written here.
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 /// Set to fetch from an address without naming the package to accept.

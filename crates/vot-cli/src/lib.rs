@@ -261,18 +261,11 @@ const MANIFEST_SEAL: &str = "seal.cbor";
 const DEFAULT_LOGICAL_SUITE: Suite = Suite::Sha256Bep52;
 
 const fn suite_id(suite: Suite) -> u16 {
-    match suite {
-        Suite::Blake3Bao64 => 1,
-        Suite::Sha256Bep52 => 2,
-    }
+    suite.identifier()
 }
 
 fn suite_from_id(id: u16) -> Result<Suite, Error> {
-    match id {
-        1 => Ok(Suite::Blake3Bao64),
-        2 => Ok(Suite::Sha256Bep52),
-        _ => Err(Error::InvalidBundle),
-    }
+    Suite::try_from(id).map_err(|_| Error::InvalidBundle)
 }
 
 pub fn parse_suite(value: &str) -> Result<Suite, Error> {

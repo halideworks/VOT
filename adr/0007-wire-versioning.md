@@ -11,7 +11,7 @@ ALPN or allowing old parsers to misinterpret new critical behavior.
 
 ## Decision
 
-The prototype ALPN is `vot-draft-04`. Major incompatible changes use another
+The prototype ALPN is `vot-draft-05`. Major incompatible changes use another
 ALPN. Compatible behavior uses `SETTINGS`, registered extension identifiers, and
 length-delimited frames on the first client-initiated bidirectional stream.
 
@@ -31,7 +31,7 @@ occurs in `spec/registries.md`, and wire-visible changes require vectors.
 
 ## Revisions
 
-`vot-draft-03` to `vot-draft-04`, `draft_revision` 3 to 4. Two changes to the
+`vot-draft-03` to `vot-draft-05`, `draft_revision` 3 to 4. Two changes to the
 receipt authenticator broke the transcript under the frozen identifier: ADR-0017
 added the two-byte scheme, and binding the key identifier added its length and
 bytes. Either alone makes two peers advertising the same ALPN unable to check

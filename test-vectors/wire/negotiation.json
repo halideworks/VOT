@@ -1,7 +1,7 @@
 {
   "format": "vot-wire-negotiation-v1",
-  "alpn": "vot-draft-04",
-  "draft_revision": 4,
+  "alpn": "vot-draft-05",
+  "draft_revision": 5,
   "max_extensions_per_hello": 256,
   "max_settings_per_frame": 128,
   "note": "HELLO and SETTINGS payloads as spec/wire.md section 1 defines them. Payload bytes only; the frame envelope is covered by frame-envelope.json. Encoders must match every canonical case byte for byte. Extensions are written in ascending identifier order so one HELLO has exactly one encoding.",
@@ -45,20 +45,20 @@
   "hello": [
     {
       "name": "client-no-extensions",
-      "canonical_hex": "040000",
+      "canonical_hex": "050000",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 0,
         "extensions": []
       }
     },
     {
       "name": "client-three-extensions-ascending",
-      "canonical_hex": "040003000206",
+      "canonical_hex": "050003000206",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 0,
         "extensions": [
           0,
@@ -69,10 +69,10 @@
     },
     {
       "name": "extension-identifier-needing-a-wider-varint",
-      "canonical_hex": "0400014100",
+      "canonical_hex": "0500014100",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 0,
         "extensions": [
           256
@@ -81,10 +81,10 @@
     },
     {
       "name": "the-largest-legal-extension-identifier",
-      "canonical_hex": "040001ffffffffffffffff",
+      "canonical_hex": "050001ffffffffffffffff",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 0,
         "extensions": [
           4611686018427387903
@@ -93,10 +93,10 @@
     },
     {
       "name": "server-role-is-representable",
-      "canonical_hex": "040100",
+      "canonical_hex": "050100",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 1,
         "extensions": []
       },
@@ -113,16 +113,16 @@
     },
     {
       "name": "newer-draft-rejected",
-      "hex": "050000",
+      "hex": "060000",
       "expected": {
         "result": "error",
         "error": "UNSUPPORTED_VERSION",
-        "draft_revision": 5
+        "draft_revision": 6
       }
     },
     {
       "name": "role-out-of-range",
-      "hex": "040200",
+      "hex": "050200",
       "expected": {
         "result": "error",
         "error": "MALFORMED_FRAME"
@@ -130,7 +130,7 @@
     },
     {
       "name": "duplicate-extension",
-      "hex": "0400020303",
+      "hex": "0500020303",
       "expected": {
         "result": "error",
         "error": "MALFORMED_FRAME"
@@ -138,7 +138,7 @@
     },
     {
       "name": "extension-count-beyond-the-bound",
-      "hex": "04004101",
+      "hex": "05004101",
       "expected": {
         "result": "error",
         "error": "RESOURCE_LIMIT",
@@ -147,7 +147,7 @@
     },
     {
       "name": "truncated-inside-the-extension-list",
-      "hex": "04000203",
+      "hex": "05000203",
       "expected": {
         "result": "error",
         "error": "MALFORMED_FRAME"
@@ -155,7 +155,7 @@
     },
     {
       "name": "trailing-bytes-after-the-list",
-      "hex": "04000100ff",
+      "hex": "05000100ff",
       "expected": {
         "result": "error",
         "error": "MALFORMED_FRAME"
@@ -163,10 +163,10 @@
     },
     {
       "name": "non-minimal-revision-varint-is-accepted",
-      "hex": "40040000",
+      "hex": "40050000",
       "expected": {
         "result": "ok",
-        "draft_revision": 4,
+        "draft_revision": 5,
         "endpoint_role": 0,
         "extensions": []
       },
@@ -309,6 +309,21 @@
         }
       },
       "note": "ADR-0035 retired 0x22, which was optional, so it is ignored like any unknown optional setting."
+    },
+    {
+      "name": "the-other-retired-optional-setting-is-ignored",
+      "hex": "2041f4",
+      "expected": {
+        "result": "ok",
+        "settings": {
+          "1": 1048576,
+          "3": 262144,
+          "5": 1048576,
+          "7": 16,
+          "9": 90000
+        }
+      },
+      "note": "0x20 was COMPRESSION_MIN_GAIN_BPS. All three retired identifiers get a vector, because an implementation validated only against these could otherwise reassign the one that has none, which spec/registries.md says MUST NOT happen."
     },
     {
       "name": "identifier-without-a-value",

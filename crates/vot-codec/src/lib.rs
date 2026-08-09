@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_UNKNOWN_PAYLOAD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FRAMES_PER_BATCH: usize = 4096;
 pub const MAX_SETTINGS_PER_FRAME: usize = 128;
 pub const MAX_EXTENSIONS_PER_HELLO: usize = 256;
-pub const DRAFT_REVISION: u64 = 4;
+pub const DRAFT_REVISION: u64 = 5;
 
 pub mod setting_id {
     pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 0x01;

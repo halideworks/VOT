@@ -1,6 +1,6 @@
 {
   "format": "vot-receipt-signing-transcript-v1",
-  "alpn": "vot-draft-04",
+  "alpn": "vot-draft-05",
   "description": "Bytes a receipt authenticator covers, as spec/registries.md defines them: domain separator, two-byte scheme, key identifier behind a one-byte length, canonical receipt. An implementation that reproduces the authenticators below from the parts agrees with this one on the exact domain, byte order, length prefix, and canonical-receipt boundary.",
   "domain_separator_hex": "564f54207265636569707420763000",
   "domain_separator_ascii": "VOT receipt v0\u0000",

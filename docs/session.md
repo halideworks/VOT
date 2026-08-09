@@ -120,7 +120,7 @@ A carrier that cannot honour a method returns `Unsupported`, not `Ok`.
 
 ## Settings
 
-Eight settings are defined. Four are enforced by `vot-session`:
+Five settings are defined. Four are enforced by `vot-session`:
 
 | Setting | Enforced | Where |
 | --- | --- | --- |
@@ -128,18 +128,23 @@ Eight settings are defined. Four are enforced by `vot-session`:
 | `MAX_DATA_RECORD_PAYLOAD` | yes | payload limit table |
 | `MAX_MANIFEST_PAGE_PAYLOAD` | yes | payload limit table |
 | `RELIABLE_LANE_LIMIT` | yes | outbound in session, inbound in transport |
-| `IDLE_TIMEOUT_MS` | no | carrier's own timeout, from the same default |
+| `IDLE_TIMEOUT_MS` | no | see below |
 
-The four payload limits go through one table.
+The four payload limits go through one table. A proof (`PROOF_BUNDLE`) is on
+the control stream and bounded by the control ceiling, not the record limit.
 
 `IDLE_TIMEOUT_MS` is the one negotiated setting nothing installs, and
 ADR-0035 says why: QUIC fixes its idle timeout during the handshake, before
 VOT negotiates anything, and the session has no clock to enforce a deadline
-with instead. What closes an idle connection is the carrier's timeout, which
-takes its default from the registered one so the two numbers cannot drift.
-ADR-0035 retired the three settings that were not enforced anywhere and
-configured nothing that exists. A proof (`PROOF_BUNDLE`) is on
-the control stream and bounded by the control ceiling, not the record limit.
+with instead.
+
+What closes an idle connection is therefore the carrier's own timeout, and
+that is not the same number: quiche installs 30 seconds, deliberately shorter
+than the registered 90 so that `vot-cli`'s 30-second stall detector stays the
+backstop it is documented to be rather than the primary. The MsQuic carrier
+sets no idle timeout at all and closes on MsQuic's own default. A deployment
+that needs a specific idle behaviour configures its carrier; the negotiated
+setting does not deliver one.
 
 Lane limit is split: the session counts outbound lanes; the transport counts
 inbound peer streams. MsQuic counts concurrent streams; TCP counts distinct

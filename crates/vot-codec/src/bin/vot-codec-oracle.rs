@@ -337,14 +337,16 @@ mod tests {
     fn negotiation_lines_report_values_and_refusals() {
         // The oracle is what a validator written from the specification talks
         // to, so its own encoding of a result has to be exercised.
-        assert_eq!(hello_line("040000"), "ok|4|0|re=040000");
-        assert_eq!(hello_line("040003000206"), "ok|4|0|0|2|6|re=040003000206");
+        assert_eq!(hello_line("050000"), "ok|5|0|re=050000");
+        assert_eq!(hello_line("050003000206"), "ok|5|0|0|2|6|re=050003000206");
         // A server-role payload decodes rather than being reported as the role
         // mismatch a client-side session would see.
-        assert_eq!(hello_line("040100"), "ok|4|1|re=040100");
+        assert_eq!(hello_line("050100"), "ok|5|1|re=050100");
         assert_eq!(hello_line("030000"), "err|UNSUPPORTED_VERSION");
-        assert_eq!(hello_line("040200"), "err|MALFORMED_FRAME");
-        assert_eq!(hello_line("04004101"), "err|RESOURCE_LIMIT");
+        // The revision this build replaced is now one it will not speak.
+        assert_eq!(hello_line("040000"), "err|UNSUPPORTED_VERSION");
+        assert_eq!(hello_line("050200"), "err|MALFORMED_FRAME");
+        assert_eq!(hello_line("05004101"), "err|RESOURCE_LIMIT");
         assert_eq!(hello_line("0"), "err|INVALID_HEX");
 
         // Every registered setting reported, not only the first and last. A

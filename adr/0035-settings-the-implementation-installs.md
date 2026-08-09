@@ -35,12 +35,29 @@ nothing keeps.
 ## Decision
 
 **Retire `ACTIVE_KEEPALIVE_MS`, `COMPRESSION_MIN_GAIN_BPS`, and
-`TELEMETRY_LEVEL`.** They leave the registry, the `Settings` type, the
-negotiation vectors, and the abuse cases. Their identifiers `0x0b`, `0x20`,
-and `0x22` are recorded as retired and are not reassigned: a peer built
-against an earlier draft that still sends `0x0b` meets the rule for an unknown
-critical setting and the session closes, which is the correct answer to a peer
-asking for a keepalive this one does not have.
+`TELEMETRY_LEVEL`.** They leave the registry, the `Settings` type, and the
+negotiation vectors. Their identifiers `0x0b`, `0x20`, and `0x22` are recorded
+as retired and are not reassigned.
+
+(`security/abuse-cases.yaml` is untouched. Its `default_telemetry_level` is
+about what telemetry may record, not about the wire setting, and the two
+happen to share a word.)
+
+**The ALPN moves to `vot-draft-05`, and the draft revision to 5.** `0x0b` is
+odd, so it is critical, and criticality is derived from the identifier rather
+than declared: there is no way to retire it that an older peer treats as
+anything but an unknown critical setting. `Settings::advertised` sends every
+registered setting on every connection, so a peer built before this change
+puts `0x0b` in every `SETTINGS` frame and a peer built after it closes the
+session with `INVALID_SETTING`. `spec/wire.md` is normative that a major
+incompatible protocol change uses a new ALPN, and this is one.
+
+Without the bump both ends would complete the QUIC handshake, agree on the
+ALPN, exchange a `HELLO` that each accepted at revision 4, and only then tear
+down on the first `SETTINGS` frame, with the version machinery that exists to
+catch exactly this reporting a match. Upgrading one end of a working
+deployment would kill every session in both directions. With the bump they
+fail at ALPN negotiation, which is where a version mismatch belongs.
 
 Each returns when the thing it configures exists. A keepalive setting belongs
 with a keepalive timer, a compression threshold with a compressor, a telemetry

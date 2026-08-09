@@ -68,8 +68,6 @@ pub struct MockStore {
     next_upload: u64,
     uploads: BTreeMap<String, Upload>,
     objects: BTreeMap<String, CompletedObject>,
-    /// What a real backend holds and this double has to stand in for.
-    stored: BTreeMap<String, Vec<u8>>,
     leases: BTreeMap<String, u64>,
     tombstones: BTreeSet<String>,
 }
@@ -198,9 +196,6 @@ impl S3Compatible for MockStore {
             checksum_crc32c: vot_journal::crc32c(&bytes),
         };
         upload.completed = true;
-        // The double keeps the bytes a real backend would not, because tests
-        // read objects back and a real backend is asked to.
-        self.stored.insert(object.key.clone(), bytes);
         self.objects.insert(object.key.clone(), object.clone());
         Ok(object)
     }

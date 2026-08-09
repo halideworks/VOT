@@ -90,10 +90,10 @@ impl<S: S3Compatible> ObjectCommit<S> {
                 return Err(Error::Store(error));
             }
         };
-        if self.store.head(&self.key) != Some((object.length, object.checksum_crc32c)) {
-            self.machine.apply(Event::AtRestVerificationFailed)?;
-            return Err(Error::ChecksumMismatch);
-        }
+        // No second read here. `complete_multipart` streams the object back
+        // and compares it against what went up; asking `head` would stream it
+        // again to compare the answer with itself, so committing an object
+        // cost its size in egress twice.
         self.machine.apply(Event::AtRestVerified)?;
         self.machine.apply(Event::NamespaceLinked)?;
         let observation = self

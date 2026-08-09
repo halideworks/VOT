@@ -284,6 +284,13 @@ impl S3Compatible for AwsS3Store {
         })
     }
 
+    /// Costs a read of the whole object.
+    ///
+    /// The length alone would be a `HeadObject`, but this reports the
+    /// object's own CRC-32C, and what S3 stores for a multipart upload is a
+    /// checksum of the parts' checksums rather than of the bytes. A caller
+    /// that only wants to know the object is there should ask for something
+    /// cheaper than this.
     fn head(&self, key: &str) -> Option<(u64, u32)> {
         self.measure_object(key).ok()
     }
@@ -295,66 +302,8 @@ fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
     parts
         .values()
         .fold(vot_journal::CRC32C_EMPTY, |whole, part| {
-            crc32c_combine(whole, part.checksum_crc32c, part.length)
+            vot_journal::crc32c_combine(whole, part.checksum_crc32c, part.length)
         })
-}
-
-/// The CRC of `a` followed by `b`, given each one's CRC and the length of
-/// `b`. zlib's `crc32_combine` over the CRC-32C polynomial: advancing `a`'s
-/// remainder by `len_b` zero bytes is a linear map over GF(2), so squaring
-/// the operator gets there in a logarithmic number of steps rather than one
-/// per byte.
-fn crc32c_combine(a: u32, b: u32, len_b: u64) -> u32 {
-    if len_b == 0 {
-        return a;
-    }
-    let mut odd = [0_u32; 32];
-    // The operator for one zero bit: the polynomial, then the identity.
-    odd[0] = 0x82f6_3b78;
-    let mut row = 1_u32;
-    for entry in odd.iter_mut().skip(1) {
-        *entry = row;
-        row <<= 1;
-    }
-    let mut even = [0_u32; 32];
-    square(&mut even, &odd); // two zero bits
-    square(&mut odd, &even); // four, which is half a byte
-
-    let mut advanced = a;
-    let mut remaining = len_b;
-    // One pass per bit of the length, counted, because a shift that stopped
-    // shrinking would otherwise spin rather than answer wrongly.
-    for _ in 0..u64::BITS {
-        if remaining == 0 {
-            break;
-        }
-        square(&mut even, &odd);
-        if remaining & 1 != 0 {
-            advanced = apply(&even, advanced);
-        }
-        remaining >>= 1;
-        std::mem::swap(&mut even, &mut odd);
-    }
-    advanced ^ b
-}
-
-/// One GF(2) matrix applied to a vector, both of them 32 bits wide. The sum
-/// of the columns the vector selects.
-fn apply(matrix: &[u32; 32], vector: u32) -> u32 {
-    let mut sum = 0;
-    for (index, column) in matrix.iter().enumerate() {
-        if vector >> index & 1 != 0 {
-            sum ^= *column;
-        }
-    }
-    sum
-}
-
-/// The operator that does what `matrix` does twice.
-fn square(into: &mut [u32; 32], matrix: &[u32; 32]) {
-    for (slot, column) in into.iter_mut().zip(matrix.iter()) {
-        *slot = apply(matrix, *column);
-    }
 }
 
 fn service_error_may_be_completed(code: Option<&str>) -> bool {
@@ -1042,32 +991,27 @@ mod tests {
     }
 
     #[test]
-    fn a_combined_checksum_is_the_one_the_bytes_would_have_given() {
-        // The adapter no longer holds the parts, so this is what stands in
-        // for concatenating them. Every split of a run of bytes, including
-        // the empty ones at each end.
-        let whole: Vec<u8> = (0..=255_u8).cycle().take(1000).collect();
-        for split in [0, 1, 2, 255, 256, 257, 499, 500, 998, 999, 1000] {
-            let (head, tail) = whole.split_at(split);
-            assert_eq!(
-                crc32c_combine(
-                    vot_journal::crc32c(head),
-                    vot_journal::crc32c(tail),
-                    tail.len() as u64
-                ),
-                vot_journal::crc32c(&whole),
-                "split at {split}"
-            );
-        }
-        // Three pieces fold the same way completion folds parts.
-        let (a, rest) = whole.split_at(300);
-        let (b, c) = rest.split_at(300);
-        let folded = [a, b, c]
-            .into_iter()
-            .fold(vot_journal::CRC32C_EMPTY, |running, piece| {
-                crc32c_combine(running, vot_journal::crc32c(piece), piece.len() as u64)
-            });
-        assert_eq!(folded, vot_journal::crc32c(&whole));
+    fn measuring_adds_up_across_the_chunks_a_body_arrives_in() {
+        // Every other body here is a handful of bytes and arrives whole, so
+        // nothing exercised the accumulation. This one is large enough that
+        // the transport has to deliver it in pieces, which is what every real
+        // multipart object does.
+        static BIG: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| (0..=255_u8).cycle().take(4 * 1024 * 1024).collect());
+
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.method == "GET" {
+                response("200 OK", &[], &BIG)
+            } else {
+                service_error("500 Internal Server Error", "InternalError")
+            }
+        });
+        let store = endpoint.store();
+        assert_eq!(
+            store.measure_object("key").unwrap(),
+            (BIG.len() as u64, vot_journal::crc32c(&BIG)),
+            "the measurement is of the whole body, not of its last piece"
+        );
     }
 
     #[test]

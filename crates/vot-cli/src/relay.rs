@@ -191,12 +191,21 @@ impl Meter {
         }
     }
 
+    /// Whether this slot's lifetime is over at `now_ms`.
+    ///
+    /// Separate from [`Meter::take`] because a slot with nothing to forward
+    /// still has to notice its own expiry, and asking `take` would route a
+    /// stand-in address through the pairing rule and claim an end with it.
+    pub(crate) const fn expired(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+
     /// What to do with `length` bytes from `source` at `now_ms`.
     ///
     /// The ceiling is checked against the datagram that would cross it, not
     /// after it has: a slot forwards up to its ceiling and not one byte past.
     pub(crate) fn take(&mut self, source: SocketAddr, length: u64, now_ms: u64) -> Forward {
-        if now_ms >= self.expires_at_ms {
+        if self.expired(now_ms) {
             return Forward::Closed;
         }
         let (ends, to) = self.ends.route(source);
@@ -413,6 +422,27 @@ mod tests {
         assert_eq!(meter.forwarded(), 100);
         assert_eq!(meter.take(second, 1, 0), Forward::Closed, "one byte past");
         assert_eq!(meter.forwarded(), 100, "the refused byte was not counted");
+    }
+
+    #[test]
+    fn waiting_for_the_ends_does_not_claim_one() {
+        // A slot idles until its ends find it: the invitation has to reach
+        // the serving end first. Asking whether it has expired must not look
+        // like an arrival, or the first real end pairs with nothing and the
+        // second is a third address.
+        let first = at("198.51.100.7:9000");
+        let second = at("203.0.113.9:60123");
+        let mut meter = Meter::new(10_000, u64::MAX);
+        for tick in 0..50 {
+            assert!(!meter.expired(tick * 200), "closed early at {tick}");
+        }
+        assert_eq!(meter.take(first, 10, 0), Forward::Nowhere);
+        assert_eq!(
+            meter.take(second, 10, 0),
+            Forward::To(first),
+            "the ends did not pair after the slot waited for them"
+        );
+        assert_eq!(meter.take(first, 10, 0), Forward::To(second));
     }
 
     #[test]

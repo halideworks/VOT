@@ -596,8 +596,11 @@ fn run_slot(
                 if !waited_out(&error) {
                     return;
                 }
-                // Nothing arrived. The deadline still applies.
-                if meter.take(source_of_nothing(), 0, now_ms) == crate::relay::Forward::Closed {
+                // Nothing arrived. The deadline still applies, and asking
+                // about it must not look like an arrival: a slot waits for
+                // its ends and the first one to speak has to be the first
+                // end.
+                if meter.expired(now_ms) {
                     return close(&meter);
                 }
             }
@@ -609,15 +612,6 @@ fn run_slot(
 /// for and the only thing the relay ever says about one.
 fn close(meter: &crate::relay::Meter) {
     eprintln!("slot closed after {} bytes", meter.forwarded());
-}
-
-/// An address no peer has, for the idle check that only reads the clock.
-///
-/// `Meter::take` decides expiry before it looks at the source, so the value
-/// is never routed. Naming it here beats a second entry point that could
-/// drift from the one the forwarding path uses.
-const fn source_of_nothing() -> SocketAddr {
-    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
 }
 
 /// Milliseconds since `began`, saturating rather than wrapping.

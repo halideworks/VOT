@@ -636,9 +636,6 @@ const WARMING_WAIT: Duration = Duration::from_millis(1_500);
 /// else arrives on the socket cannot extend a wait without bound.
 const STRAY_READS: usize = 8;
 
-/// How long a read waits once something has already arrived.
-const STRAY_WAIT: Duration = Duration::from_millis(100);
-
 /// Retries a resolve when no serve is registered yet.
 const RESOLVE_RETRIES: u32 = 6;
 
@@ -700,7 +697,7 @@ fn punch_within(
             .map_err(|_| Error::CarrierUnavailable)?;
         if let Some(serve) = resolved(&socket, &mut buffer, key, service)? {
             open_toward(&socket, serve);
-            wait_warm(&socket, &mut buffer, warming)?;
+            wait_warm(&socket, &mut buffer, serve, warming)?;
             return Ok(Punched { socket, serve });
         }
         // A serve that has not registered yet is the case worth waiting on:
@@ -727,6 +724,42 @@ fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
     }
 }
 
+/// Reads datagrams until `accept` names a value, [`STRAY_READS`] have
+/// arrived, or `budget` is spent.
+///
+/// The budget is the whole wait and not the wait per read. A stranger
+/// sending to this port would otherwise buy back the full timeout with
+/// every datagram, so the read count alone does not bound the wall clock.
+fn read_until<T>(
+    socket: &std::net::UdpSocket,
+    buffer: &mut [u8; 128],
+    budget: Duration,
+    mut accept: impl FnMut(crate::rendezvous::Datagram, SocketAddr) -> Option<T>,
+) -> Result<Option<T>, Error> {
+    let began = std::time::Instant::now();
+    for _ in 0..STRAY_READS {
+        let left = budget.saturating_sub(began.elapsed());
+        // A zero read timeout is no timeout at all, so the spent budget
+        // has to end the wait rather than arm a blocking read.
+        if left.is_zero() {
+            return Ok(None);
+        }
+        socket
+            .set_read_timeout(Some(left))
+            .map_err(|_| Error::CarrierUnavailable)?;
+        let (length, source) = match socket.recv_from(buffer) {
+            Ok(arrival) => arrival,
+            Err(error) => return read_failure(&error).map_or(Ok(None), Err),
+        };
+        if let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) {
+            if let Some(found) = accept(datagram, source) {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Reads until `service` names a serve for `key` or the read runs out.
 /// Nothing named is a retry, not a failure.
 ///
@@ -734,47 +767,31 @@ fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
 /// only from the service that was asked. The key alone is not enough: a
 /// package root is not a secret, and anyone who can reach this port could
 /// otherwise point the rail at an address of their choosing. This is the
-/// check [`crate::rendezvous::Registrar::take`] already makes on the
-/// serving end.
+/// check [`crate::rendezvous::Registrar::take`] makes on the serving end,
+/// through the same [`crate::rendezvous::from_service`].
 ///
-/// Only the first read waits for the service to answer at all. Later ones
-/// wait [`STRAY_WAIT`], because anything after the first arrival is already
-/// on its way, and a stranger sending to this port must not be able to
-/// spend the whole timeout again per datagram.
+/// A service on a multi-homed host has to answer from the address it was
+/// asked at. One that answers from another of its own addresses is heard
+/// only if that address is among the ones the fetch was given.
 fn resolved(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
     key: [u8; 32],
     service: SocketAddr,
 ) -> Result<Option<SocketAddr>, Error> {
-    socket
-        .set_read_timeout(Some(RESOLVE_TIMEOUT))
-        .map_err(|_| Error::CarrierUnavailable)?;
-    for read in 0..STRAY_READS {
-        let (length, source) = match socket.recv_from(buffer) {
-            Ok(arrival) => arrival,
-            Err(error) => return read_failure(&error).map_or(Ok(None), Err),
-        };
-        if read == 0 {
-            socket
-                .set_read_timeout(Some(STRAY_WAIT))
-                .map_err(|_| Error::CarrierUnavailable)?;
+    let found = read_until(socket, buffer, RESOLVE_TIMEOUT, |datagram, source| {
+        if !crate::rendezvous::from_service(source, service) {
+            return None;
         }
-        if crate::rendezvous::canonical(source) != crate::rendezvous::canonical(service) {
-            continue;
+        match datagram {
+            crate::rendezvous::Datagram::Resolved {
+                key: answered,
+                serve,
+            } if answered == key => Some(serve),
+            _ => None,
         }
-        let Some(crate::rendezvous::Datagram::Resolved {
-            key: answered,
-            serve,
-        }) = crate::rendezvous::decode(&buffer[..length])
-        else {
-            continue;
-        };
-        if answered == key {
-            return Ok(serve);
-        }
-    }
-    Ok(None)
+    })?;
+    Ok(found.flatten())
 }
 
 /// Waits for the serve's warming, the one sign this end gets that the
@@ -784,30 +801,26 @@ fn resolved(
 /// nothing and the wait is a floor on how long the serve has had to open
 /// its side.
 ///
-/// The source is not checked here, unlike in [`resolved`]. A warming that
-/// arrives from a port other than the one the service reported is the
-/// unpunchable case, and the wait ending early there costs nothing: the
-/// warming decides no address, it only says the floor can end.
+/// The port is not checked, unlike in [`resolved`]: a warming from a port
+/// other than the one the service reported is the unpunchable case, and
+/// ending the floor there costs nothing, because the warming decides no
+/// address. The address is checked, because a warming from anywhere else
+/// is not evidence about this serve at all and a stranger must not be
+/// able to end the floor early.
+///
+/// `wait` is the whole floor. It is not restarted by what else arrives.
 fn wait_warm(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
+    serve: SocketAddr,
     wait: Duration,
 ) -> Result<(), Error> {
-    socket
-        .set_read_timeout(Some(wait))
-        .map_err(|_| Error::CarrierUnavailable)?;
-    // The wait is not shortened by what else arrives: it is the floor the
-    // serve needs, and [`STRAY_READS`] is what bounds the whole thing.
-    for _ in 0..STRAY_READS {
-        let Ok((length, _)) = socket.recv_from(buffer) else {
-            return Ok(());
-        };
-        if crate::rendezvous::decode(&buffer[..length])
-            == Some(crate::rendezvous::Datagram::Warming)
-        {
-            return Ok(());
-        }
-    }
+    read_until(socket, buffer, wait, |datagram, source| {
+        (datagram == crate::rendezvous::Datagram::Warming
+            && crate::rendezvous::canonical(source).ip()
+                == crate::rendezvous::canonical(serve).ip())
+        .then_some(())
+    })?;
     Ok(())
 }
 
@@ -1502,10 +1515,9 @@ mod tests {
     }
 
     #[test]
-    fn a_resolve_that_reads_nothing_of_its_own_gives_up_on_the_short_wait() {
-        // Only the first read waits for the service. Datagrams from anyone
-        // else buy [`STRAY_WAIT`] each, so the whole read budget cannot be
-        // spent at [`RESOLVE_TIMEOUT`] apiece.
+    fn a_stray_before_the_answer_does_not_deny_it() {
+        // The first arrival used to shorten every later read to 100ms, so a
+        // single stray datagram denied any answer slower than that.
         use crate::rendezvous::{Datagram, encode};
 
         let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
@@ -1513,20 +1525,67 @@ mod tests {
         let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
         let service = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
         let service_at = service.local_addr().expect("the service address");
+        let serve = "203.0.113.9:443".parse().expect("a serve address");
+
         stranger
             .send_to(&encode(&Datagram::Warming), at)
             .expect("something that is not an answer");
+        let answering = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            service
+                .send_to(
+                    &encode(&Datagram::Resolved {
+                        key: [5; 32],
+                        serve: Some(serve),
+                    }),
+                    at,
+                )
+                .expect("the answer");
+        });
         let mut buffer = [0_u8; 128];
-        let began = std::time::Instant::now();
         assert_eq!(
             resolved(&rail, &mut buffer, [5; 32], service_at).expect("a read"),
-            None,
-            "nothing named this key"
+            Some(serve),
+            "a stray spent the wait the answer needed"
         );
+        answering.join().expect("the service");
+    }
+
+    #[test]
+    fn a_wait_spends_one_budget_however_many_strays_arrive() {
+        // Each read used to arm the whole wait again, so eight strays turned
+        // a 250ms floor into a two second one.
+        use crate::rendezvous::{Datagram, encode};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
+        let at = rail.local_addr().expect("the rail address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let budget = Duration::from_millis(250);
+        let done = Arc::new(AtomicBool::new(false));
+        let sending = Arc::clone(&done);
+        // One stray just inside each read, so every read has something to
+        // take and only the spent budget can end the wait.
+        let straying = std::thread::spawn(move || {
+            for _ in 0..STRAY_READS {
+                if sending.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = stranger.send_to(&encode(&Datagram::Registered { key: [3; 32] }), at);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let mut buffer = [0_u8; 128];
+        let began = std::time::Instant::now();
+        let found = read_until(&rail, &mut buffer, budget, |_, _| None::<()>).expect("a read");
+        let spent = began.elapsed();
+        done.store(true, Ordering::Relaxed);
+        straying.join().expect("the stranger");
+        assert_eq!(found, None, "nothing was accepted");
         assert!(
-            began.elapsed() < RESOLVE_TIMEOUT,
-            "the read after the first arrival waited {:?}, not the short wait",
-            began.elapsed()
+            spent < Duration::from_secs(1),
+            "a {budget:?} budget under strays took {spent:?}"
         );
     }
 
@@ -1569,6 +1628,7 @@ mod tests {
         let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
         let at = rail.local_addr().expect("the rail address");
         let serve = UdpSocket::bind("127.0.0.1:0").expect("a serve socket");
+        let serve_at = serve.local_addr().expect("the serve address");
         serve
             .send_to(&encode(&Datagram::Registered { key: [1; 32] }), at)
             .expect("something that is not a warming");
@@ -1576,15 +1636,53 @@ mod tests {
             .send_to(&encode(&Datagram::Warming), at)
             .expect("a warming");
         let mut buffer = [0_u8; 128];
-        wait_warm(&rail, &mut buffer, Duration::from_secs(10)).expect("a wait");
+        wait_warm(&rail, &mut buffer, serve_at, Duration::from_secs(10)).expect("a wait");
         rail.set_nonblocking(true).expect("a peek");
         assert!(
             rail.recv_from(&mut buffer).is_err(),
             "the warming was read, not left for the session's socket"
         );
         rail.set_nonblocking(false).expect("a bounded wait");
-        wait_warm(&rail, &mut buffer, Duration::from_millis(50))
+        wait_warm(&rail, &mut buffer, serve_at, Duration::from_millis(50))
             .expect("a warming that never comes is not a failure");
+    }
+
+    #[test]
+    fn only_the_serve_ends_the_warming_floor() {
+        // The floor is what the serve gets to open its side. Anyone else
+        // ending it early hands the session a hole that is not open yet.
+        use crate::rendezvous::{Datagram, encode};
+
+        let rail = UdpSocket::bind("127.0.0.1:0").expect("a rail socket");
+        let at = rail.local_addr().expect("the rail address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let stranger_at = stranger.local_addr().expect("the stranger's address");
+        let elsewhere = "203.0.113.9:443".parse().expect("the serve's address");
+        let floor = Duration::from_millis(250);
+
+        stranger
+            .send_to(&encode(&Datagram::Warming), at)
+            .expect("a forged warming");
+        let mut buffer = [0_u8; 128];
+        let began = std::time::Instant::now();
+        wait_warm(&rail, &mut buffer, elsewhere, floor).expect("a wait");
+        assert!(
+            began.elapsed() >= Duration::from_millis(200),
+            "a warming from {stranger_at} ended a floor owed to {elsewhere}"
+        );
+
+        // The same datagram from the serve's own address does end it. A
+        // different port there is the unpunchable case, not a stranger.
+        stranger
+            .send_to(&encode(&Datagram::Warming), at)
+            .expect("the serve's warming");
+        let began = std::time::Instant::now();
+        let reported = SocketAddr::new(stranger_at.ip(), stranger_at.port().wrapping_add(1));
+        wait_warm(&rail, &mut buffer, reported, Duration::from_secs(10)).expect("a wait");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the serve's own warming did not end the floor"
+        );
     }
 
     #[test]

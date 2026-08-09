@@ -398,8 +398,11 @@ pub const REGISTERED_SETTINGS: [u64; 5] = [
     setting_id::IDLE_TIMEOUT_MS,
 ];
 
-/// Every registered operation, in identifier order. The one list; the closed
-/// [`Operation`] is reached from it through `try_from`.
+/// Every registered operation, in identifier order.
+///
+/// Written out rather than derived from [`Operation`], and held to it by
+/// test: an identifier here that names no variant, or a variant naming no
+/// identifier here, fails `no_unregistered_identifier_becomes_an_operation`.
 pub const REGISTERED_OPERATIONS: [u64; 3] = [
     operation::PUBLISH,
     operation::READ_MANIFEST,
@@ -1617,9 +1620,9 @@ mod tests {
                 Err(UnknownOperation(identifier))
             );
         }
-        // REGISTERED_OPERATIONS is derived from ALL, so what is worth
-        // holding is that the order is the identifier order the registry
-        // states, which the derivation does not enforce.
+        // The loop above already holds the closed set and the table in exact
+        // agreement across the registry's width. What it does not check is
+        // the order the table's own doc comment claims.
         assert!(
             REGISTERED_OPERATIONS
                 .windows(2)

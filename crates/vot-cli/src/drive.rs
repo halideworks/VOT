@@ -636,7 +636,7 @@ mod tests {
 
         let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
         let (client, half) = duplex_pair();
-        let serving_bundle = bundle.clone();
+        let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
             let server = crate::BundleServer::open(&serving_bundle)?;
             let mut half = Some(half);

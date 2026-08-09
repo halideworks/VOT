@@ -1832,7 +1832,7 @@ mod tests {
         let built = crate::build_bundle(&source, &bundle).unwrap();
 
         let (listening, address) = mpsc::channel();
-        let serving_bundle = bundle.clone();
+        let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
             serve_bundle(
                 &serving_bundle,
@@ -1930,6 +1930,9 @@ mod tests {
 
         let destination = crate::tests::temporary("wire-destination");
         let receipt = crate::tests::temporary("wire-receipt.cbor");
+        // receive_bundle writes a JSON summary beside the receipt, which the
+        // receipt's own guard does not know about.
+        let _summary = crate::tests::guarded(receipt.with_extension("json"));
         let report = crate::receive_bundle(
             &fetched,
             &destination,

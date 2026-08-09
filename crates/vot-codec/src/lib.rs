@@ -766,15 +766,16 @@ pub struct FrameEnvelope {
     pub skipped: bool,
 }
 
-/// Reads the next frame's envelope without requiring its payload present.
+/// The one envelope parser. Validates limits, reads both varints, applies the
+/// registered or unknown-payload bound, and rejects an unknown critical type,
+/// all without requiring the payload present. Both public entry points wrap
+/// it, so their envelope semantics cannot drift apart.
 ///
-/// Unlike [`decode_one`], allows a stream transport to reject or discard a
-/// frame before buffering its payload.
-///
-/// # Errors
-/// Returns `Incomplete` until both varints arrive; otherwise the same overflow,
-/// length, and unknown-critical errors as [`decode_one`].
-pub fn peek_envelope(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope, DecodeError> {
+/// The check order is contractual: the payload bound before the
+/// unknown-critical check, so an oversized frame closes as `FRAME_TOO_LARGE`
+/// whatever its type.
+#[inline]
+fn parse_envelope_prefix(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope, DecodeError> {
     validate_limits(limits)?;
     let (frame_type, type_width) = decode_varint(input)?;
     let (length, length_width) = decode_varint(&input[type_width..])?;
@@ -810,6 +811,18 @@ pub fn peek_envelope(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope
     })
 }
 
+/// Reads the next frame's envelope without requiring its payload present.
+///
+/// Unlike [`decode_one`], allows a stream transport to reject or discard a
+/// frame before buffering its payload.
+///
+/// # Errors
+/// Returns `Incomplete` until both varints arrive; otherwise the same overflow,
+/// length, and unknown-critical errors as [`decode_one`].
+pub fn peek_envelope(input: &[u8], limits: DecodeLimits) -> Result<FrameEnvelope, DecodeError> {
+    parse_envelope_prefix(input, limits)
+}
+
 /// Decodes one bounded frame without owning its payload.
 ///
 /// # Errors
@@ -818,56 +831,29 @@ pub fn decode_one(
     input: &[u8],
     limits: DecodeLimits,
 ) -> Result<(DecodedFrame<'_>, usize), DecodeError> {
-    validate_limits(limits)?;
-    let (frame_type, type_width) = decode_varint(input)?;
-    let (length, length_width) = decode_varint(&input[type_width..])?;
-    let known_limit = registered_payload_limit(frame_type);
-    let limit = min(
-        known_limit.unwrap_or(limits.max_unknown_payload),
-        HARD_MAX_FRAME_PAYLOAD,
-    );
-    let payload_length =
-        usize::try_from(length).map_err(|_| DecodeError::LengthOverflow(length))?;
-
-    if payload_length > limit {
-        return Err(DecodeError::FrameTooLarge {
-            frame_type,
-            length,
-            limit,
-        });
-    }
-    if known_limit.is_none() && is_critical(frame_type) {
-        return Err(DecodeError::UnknownCritical(frame_type));
-    }
-
-    let header_length = type_width
-        .checked_add(length_width)
-        .ok_or(DecodeError::LengthOverflow(length))?;
-    let total_length = header_length
-        .checked_add(payload_length)
-        .ok_or(DecodeError::LengthOverflow(length))?;
-    if input.len() < total_length {
+    let envelope = parse_envelope_prefix(input, limits)?;
+    if input.len() < envelope.total_length {
         return Err(DecodeError::Incomplete {
-            needed: total_length,
+            needed: envelope.total_length,
             available: input.len(),
         });
     }
 
-    if known_limit.is_some() && !is_grease(frame_type) {
+    if envelope.skipped {
         Ok((
-            DecodedFrame::Known {
-                frame_type,
-                payload: &input[header_length..total_length],
+            DecodedFrame::SkippedOptional {
+                frame_type: envelope.frame_type,
+                payload_length: envelope.payload_length,
             },
-            total_length,
+            envelope.total_length,
         ))
     } else {
         Ok((
-            DecodedFrame::SkippedOptional {
-                frame_type,
-                payload_length,
+            DecodedFrame::Known {
+                frame_type: envelope.frame_type,
+                payload: &input[envelope.header_length..envelope.total_length],
             },
-            total_length,
+            envelope.total_length,
         ))
     }
 }

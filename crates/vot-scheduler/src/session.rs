@@ -714,6 +714,17 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         // unchanged, which is what makes the bound on that memory harmless.
         self.receiver
             .receive_typed_bundle(subject, &bundle, &pending.records)?;
+        self.after_admission(id, delivered, subject)
+    }
+
+    /// The bookkeeping every admission path shares, after verification and
+    /// writing have already succeeded through their own entry points.
+    fn after_admission(
+        &mut self,
+        id: [u8; 16],
+        delivered: Delivered,
+        subject: SubjectId,
+    ) -> Result<(), Error> {
         // Remembered only once the receiver has accepted it. A bundle that
         // failed verification must stay retryable under its own identity.
         self.remember(id, delivered);
@@ -775,17 +786,11 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         written: crate::WrittenRange,
     ) -> Result<(), Error> {
         self.receiver.admit_written_range(written)?;
-        self.remember(
+        self.after_admission(
             completed.id,
             Delivered::of(completed.identity, &completed.records),
-        );
-        match self.receiver.finish_ranges(completed.subject) {
-            Ok(()) | Err(Error::LengthMismatch) => {}
-            Err(error) => return Err(error),
-        }
-        let credit = self.receiver.advertised_credit();
-        self.credit_applied = self.session.driver().set_receive_credit(credit).is_ok();
-        Ok(())
+            completed.subject,
+        )
     }
 
     /// Records a bundle identity, evicting the oldest when the bound is met.

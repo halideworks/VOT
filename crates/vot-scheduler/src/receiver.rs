@@ -3,7 +3,7 @@
 use super::{
     BTreeMap, BTreeSet, ConnectionId, Error, PathStats, RangeSink, RangeState, SinkError,
     StagingCapacity, StreamVerifier, SubjectId, TransportAck, VERIFIER_RESERVATION,
-    assemble_ordered, book_range, check_range, check_range_proof, suite, validate_typed_bundle,
+    assemble_ordered, check_range_proof, suite, validate_typed_bundle,
 };
 
 pub(super) struct ActiveObject {
@@ -181,7 +181,7 @@ impl ReliableReceiver {
             .range_active
             .get(&subject)
             .ok_or(Error::UnknownObject)?;
-        let Some(booking) = check_range(active, covered_offset, bytes)? else {
+        let Some(booking) = active.check(covered_offset, bytes)? else {
             return Ok(());
         };
         let reserved = if caller_reserved {
@@ -201,7 +201,7 @@ impl ReliableReceiver {
             .range_active
             .get_mut(&subject)
             .ok_or(Error::UnknownObject)?;
-        book_range(active, covered_offset, &booking);
+        active.book(covered_offset, &booking);
         Ok(())
     }
 
@@ -223,14 +223,14 @@ impl ReliableReceiver {
             .range_active
             .get(&range.subject)
             .ok_or(Error::UnknownObject)?;
-        let Some(booking) = check_range(active, range.covered_offset, range.bytes)? else {
+        let Some(booking) = active.check(range.covered_offset, range.bytes)? else {
             return Ok(());
         };
         let active = self
             .range_active
             .get_mut(&range.subject)
             .ok_or(Error::UnknownObject)?;
-        book_range(active, range.covered_offset, &booking);
+        active.book(range.covered_offset, &booking);
         Ok(())
     }
 

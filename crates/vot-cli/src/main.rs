@@ -177,6 +177,9 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
         [_, command, address] if command == "rendezvous" => rendezvous(address),
         [_, command, sub] if command == "capability" && sub == "keygen" => {
             let (secret, public) = vot_cli::generate_keypair()?;
+            // The warning goes to stderr so the two lines stdout carries are
+            // the two values, and a caller redirecting them still reads it.
+            eprintln!("vot: the first line is a secret key. It is printed once.");
             println!("{secret}");
             println!("{public}");
             Ok(())
@@ -370,12 +373,7 @@ fn reachable(at: std::net::SocketAddr) -> String {
 }
 
 fn root_hex(root: &[u8; 32]) -> String {
-    let mut output = String::with_capacity(64);
-    for byte in root {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    output
+    vot_cli::hex_of(root)
 }
 
 #[cfg(test)]

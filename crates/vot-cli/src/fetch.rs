@@ -553,8 +553,9 @@ impl FetchPlan {
 ///
 /// Presenting when this fetch holds a capability, which is what makes
 /// `pending_presentation` fire and lets it answer. Without one it takes the
-/// stance that answers nothing, and a serve that requires a capability
-/// refuses the session rather than this end failing quietly.
+/// stance that answers nothing, and `vot_session` ends the session on a
+/// challenge that names a format this end cannot supply, which is what the
+/// format list in `spec/wire.md` 1.1 is for.
 fn client_stance(holder: Option<&crate::authz::Holder>) -> Authentication {
     if holder.is_some() {
         Authentication::Presenting
@@ -1052,15 +1053,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.stopped = true;
     }
 
-    /// One pass over what the carrier holds: drains queued requests, takes
-    /// every event, advances the object plan, and flushes. Never blocks;
-    /// the caller waits on the adapter between passes.
     /// Answers a challenge that asks for a capability, once.
     ///
     /// A fetch with no capability answers nothing: the challenge fires only
     /// on a session begun `Presenting`, and one begun without a holder is
-    /// not. A serve that wanted one then refuses, which is the loud failure
-    /// rather than a quiet unauthorized transfer.
+    /// not. That fetch ends on the challenge instead, which `vot_session`
+    /// does for it, so the failure is loud rather than a session that waits
+    /// on an answer it cannot give.
     ///
     /// # Errors
     /// Surfaces a proof this end could not make and a carrier that would not
@@ -1080,6 +1079,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(())
     }
 
+    /// One pass over what the carrier holds: drains queued requests, takes
+    /// every event, advances the object plan, and flushes. Never blocks;
+    /// the caller waits on the adapter between passes.
     pub fn service(&mut self) -> Result<FetchStatus, Error> {
         if let Some(code) = self.closed {
             return Ok(FetchStatus::Closed(code));

@@ -128,7 +128,11 @@ pub fn generate_keypair() -> Result<(String, String), Error> {
 }
 
 /// Lowercase hexadecimal, which is how every key and root is written here.
-fn hex_of(bytes: &[u8]) -> String {
+///
+/// One writer, because a root the binary prints and a key this mints have to
+/// read the same to a caller pasting one into the other.
+#[must_use]
+pub fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut text, byte| {
         let _ = write!(text, "{byte:02x}");
@@ -2160,6 +2164,30 @@ mod tests {
             parse_package_root(&spoiled),
             Err(Error::InvalidArguments)
         ));
+    }
+
+    #[test]
+    fn a_generated_pair_is_two_halves_of_one_key() {
+        let (secret, public) = generate_keypair().expect("a keypair");
+        let (again, _) = generate_keypair().expect("a second keypair");
+        assert_ne!(secret, again, "two calls gave the same key");
+
+        let seed = secret
+            .strip_prefix("ed25519-secret:")
+            .expect("the secret label");
+        let claimed = public
+            .strip_prefix("ed25519-public:")
+            .expect("the public label");
+        assert_eq!(seed.len(), 64, "{secret}");
+        assert_eq!(claimed.len(), 64, "{public}");
+        // The halves have to match, or a token issued to the public one is a
+        // token the secret cannot prove.
+        let bytes: [u8; 32] = parse_package_root(seed).expect("32 bytes of hex");
+        assert_eq!(
+            hex_of(&SigningKey::from_bytes(&bytes).verifying_key().to_bytes()),
+            claimed,
+            "the public half is not this secret's"
+        );
     }
 
     #[test]

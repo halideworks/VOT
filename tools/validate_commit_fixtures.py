@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Execute the public commit transition fixtures independently."""
+"""Execute the public commit transition fixtures independently.
+
+Walks each fixture's events through `commit_relation`, the same relation
+`validate_commit_transitions.py` compares the Rust model against. This file
+used to carry its own copy, and the copy had drifted: it had no `Abort`
+branch, so a legal abort read as an invalid transition, which no fixture
+happened to exercise.
+"""
 
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TERMINAL = {"Published", "Poisoned", "Aborted"}
-REQUIRED = {"Fast": "TransitVerified", "Balanced": "Durable", "Strict": "AtRestVerified"}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from commit_relation import REQUIRED, step  # noqa: E402
 
 
 def execute(fixture):
@@ -15,33 +23,11 @@ def execute(fixture):
     performed = []
     error = None
     for event in fixture["events"]:
-        if state in TERMINAL:
-            error = "Terminal"
+        error, state, recovery_state, _, performed = step(
+            fixture["profile"], state, event, recovery_state, performed
+        )
+        if error:
             break
-        transition = {
-            ("New", "Admit"): ("Admitted", "Admitted"),
-            ("Admitted", "TransitVerified"): ("TransitVerified", "TransitVerified"),
-            ("TransitVerified", "DataFlushSucceeded"): ("DataFlushed", None),
-            ("DataFlushed", "JournalFlushSucceeded"): ("Durable", "Durable"),
-            ("Durable", "AtRestVerified"): ("AtRestVerified", "AtRestVerified"),
-            ("NamespaceLinked", "NamespaceDurable"): ("Published", "Published"),
-        }.get((state, event))
-        if event in {"DataFlushFailed", "JournalFlushFailed", "AtRestVerificationFailed"}:
-            transition = ("Poisoned", None)
-        elif event in {"NamespaceLinkAmbiguous", "NamespaceFlushFailed", "Crash"}:
-            recovery_state = state
-            transition = ("RecoveryRequired", None)
-        elif event == "Recover" and state == "RecoveryRequired" and recovery_state:
-            transition = (recovery_state, None)
-            recovery_state = None
-        elif event == "NamespaceLinked" and state == REQUIRED[fixture["profile"]]:
-            transition = ("NamespaceLinked", None)
-        if transition is None:
-            error = "InvalidTransition"
-            break
-        state, receipt = transition
-        if receipt:
-            performed.append(receipt)
     assert state == fixture["state"], fixture["name"]
     assert error == fixture.get("error"), fixture["name"]
     if "receipts" in fixture:

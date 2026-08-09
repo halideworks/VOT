@@ -241,6 +241,9 @@ impl Machine {
 
 impl Event {
     /// Every event, so a walk over the relation cannot miss one by omission.
+    ///
+    /// [`Event::position`] is what makes that true rather than hopeful: a new
+    /// variant fails to compile there until it is added here too.
     pub const ALL: [Self; 15] = [
         Self::Admit,
         Self::TransitVerified,
@@ -261,6 +264,22 @@ impl Event {
 }
 
 impl Profile {
+    /// Every profile, for the same reason [`Event::ALL`] exists: a walk that
+    /// seeds from a literal list is one a new profile escapes.
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Strict];
+
+    /// Where this sits in [`Profile::ALL`]. Compiled with the tests, which is
+    /// where the enrolment is checked. Exhaustive so a new variant
+    /// cannot be added without enrolling it.
+    #[cfg(test)]
+    const fn position(self) -> usize {
+        match self {
+            Self::Fast => 0,
+            Self::Balanced => 1,
+            Self::Strict => 2,
+        }
+    }
+
     /// The assurance a publication under this profile must already have
     /// performed. One home for the rule: a receipt chain checks the same
     /// table the machine enforces.
@@ -328,6 +347,31 @@ impl State {
 }
 
 impl Event {
+    /// Where this sits in [`Event::ALL`]. Compiled with the tests, which is
+    /// where the enrolment is checked. Exhaustive on purpose: adding a
+    /// variant without enrolling it in the walk is a compile error rather
+    /// than a silently smaller corpus.
+    #[cfg(test)]
+    const fn position(self) -> usize {
+        match self {
+            Self::Admit => 0,
+            Self::TransitVerified => 1,
+            Self::DataFlushSucceeded => 2,
+            Self::DataFlushFailed => 3,
+            Self::JournalFlushSucceeded => 4,
+            Self::JournalFlushFailed => 5,
+            Self::AtRestVerified => 6,
+            Self::AtRestVerificationFailed => 7,
+            Self::NamespaceLinked => 8,
+            Self::NamespaceLinkAmbiguous => 9,
+            Self::NamespaceDurable => 10,
+            Self::NamespaceFlushFailed => 11,
+            Self::Crash => 12,
+            Self::Recover => 13,
+            Self::Abort => 14,
+        }
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -377,6 +421,14 @@ pub struct TransitionRow {
     pub next_state: State,
     pub next_recovery_state: Option<State>,
     pub observation: Option<Assurance>,
+    /// What the machine has performed afterwards.
+    ///
+    /// Without this a second implementation can only check the row against
+    /// itself: the observation says what was emitted, and the guard that
+    /// reads `performed` is checking something the row does not report. A
+    /// model that emits the right observation and records the wrong
+    /// assurance would agree with every row it produced.
+    pub next_performed: Vec<Assurance>,
 }
 
 impl std::fmt::Display for TransitionRow {
@@ -397,7 +449,7 @@ impl std::fmt::Display for TransitionRow {
                 "{{\"profile\": \"{}\", \"state\": \"{}\", \"current\": {}, ",
                 "\"recovery_state\": {}, \"performed\": [{}], \"event\": \"{}\", ",
                 "\"error\": {}, \"next_state\": \"{}\", \"next_recovery_state\": {}, ",
-                "\"observation\": {}}}"
+                "\"observation\": {}, \"next_performed\": [{}]}}"
             ),
             self.profile.name(),
             self.state.name(),
@@ -409,6 +461,11 @@ impl std::fmt::Display for TransitionRow {
             self.next_state.name(),
             quoted(self.next_recovery_state.map(State::name)),
             quoted(self.observation.map(Assurance::name)),
+            self.next_performed
+                .iter()
+                .map(|level| format!("\"{}\"", level.name()))
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 }
@@ -435,6 +492,7 @@ pub fn transition_corpus() -> Vec<TransitionRow> {
                 next_state: candidate.state,
                 next_recovery_state: candidate.recovery_state,
                 observation: outcome.ok().flatten().map(|seen| seen.level),
+                next_performed: candidate.performed.clone(),
             });
         }
     }
@@ -456,6 +514,14 @@ fn corpus_machines() -> Vec<Machine> {
             let mut thinner = machine.clone();
             thinner.performed.remove(dropped);
             weakened.push(thinner);
+        }
+        // A crash that lost what it saved. Not reachable through accepted
+        // events either, and the guard that refuses to recover into a state
+        // nobody recorded is unreachable without it.
+        if machine.state == State::RecoveryRequired && machine.recovery_state.is_some() {
+            let mut forgotten = machine.clone();
+            forgotten.recovery_state = None;
+            weakened.push(forgotten);
         }
     }
     let mut all = reachable;
@@ -484,20 +550,23 @@ fn reachable_machines() -> Vec<Machine> {
     let mut seen = std::collections::BTreeSet::new();
     let mut frontier: Vec<Machine> = Vec::new();
     let mut found = Vec::new();
-    for profile in [Profile::Fast, Profile::Balanced, Profile::Strict] {
+    for profile in Profile::ALL {
         let machine = Machine::new(profile);
         seen.insert(shape(&machine));
         found.push(machine.clone());
         frontier.push(machine);
     }
-    for _ in 0..Event::ALL.len() {
+    'walk: for _ in 0..Event::ALL.len() {
         let mut next = Vec::new();
         for machine in &frontier {
             for event in Event::ALL {
                 // Counted in the loop's own body, so a walk that stopped
-                // deduplicating would stop rather than run away.
+                // deduplicating would stop rather than run away. Breaking
+                // rather than returning, because returning here would skip
+                // the stale variants below and quietly drop half the
+                // relation instead of shortening the walk.
                 if found.len() >= MAX_MACHINES {
-                    return found;
+                    break 'walk;
                 }
                 let mut candidate = machine.clone();
                 if candidate.apply(event).is_err() {
@@ -533,12 +602,11 @@ mod tests {
 
     #[test]
     fn a_rejected_event_leaves_the_machine_untouched() {
+        // Exact, not a floor. A floor cannot tell a corpus that shrank from
+        // one that grew, and both mean the walk changed: update this number
+        // when that is deliberate, and look when it is not.
+        assert_eq!(corpus_machines().len(), 648);
         let machines = corpus_machines();
-        assert!(
-            machines.len() > 20,
-            "the search found only {} machines",
-            machines.len()
-        );
         let mut rejections = 0_u32;
         for machine in &machines {
             for event in EVENTS {
@@ -553,7 +621,22 @@ mod tests {
                 }
             }
         }
-        assert!(rejections > 100, "only {rejections} events were rejected");
+        assert!(rejections > 8_000, "only {rejections} events were rejected");
+    }
+
+    #[test]
+    fn every_variant_is_enrolled_in_the_walk() {
+        // `position` is exhaustive, so a new variant does not compile until
+        // it is placed. These assertions are what make the placement have to
+        // be the right one: a variant added to the match but not to ALL, or
+        // added to ALL in the wrong slot, fails here rather than quietly
+        // shrinking the corpus.
+        for (index, event) in Event::ALL.into_iter().enumerate() {
+            assert_eq!(event.position(), index, "{event:?} is out of place");
+        }
+        for (index, profile) in Profile::ALL.into_iter().enumerate() {
+            assert_eq!(profile.position(), index, "{profile:?} is out of place");
+        }
     }
 
     #[test]
@@ -655,8 +738,7 @@ mod tests {
     fn the_corpus_holds_the_whole_relation() {
         let rows = transition_corpus();
         // Every event against every machine, so the count divides.
-        assert_eq!(rows.len() % EVENTS.len(), 0);
-        assert!(rows.len() > 5_000, "the corpus shrank to {}", rows.len());
+        assert_eq!(rows.len(), 648 * EVENTS.len());
 
         for event in EVENTS {
             assert!(
@@ -691,6 +773,14 @@ mod tests {
             "no row reaches the publication defense"
         );
         assert!(rows.iter().any(|row| !row.current_incarnation));
+        // The other machine no accepted walk produces: a crash that lost
+        // what it saved. Without it the guard refusing to recover into a
+        // state nobody recorded is unreachable.
+        assert!(
+            rows.iter()
+                .any(|row| row.state == State::RecoveryRequired && row.recovery_state.is_none()),
+            "no row reaches the recovery guard"
+        );
 
         for row in &rows {
             if row.error.is_some() {
@@ -721,13 +811,26 @@ mod tests {
             "{\"profile\": \"Balanced\", \"state\": \"RecoveryRequired\", \"current\": true, \
              \"recovery_state\": \"Admitted\", \"performed\": [\"Admitted\"], \
              \"event\": \"Recover\", \"error\": null, \"next_state\": \"Admitted\", \
-             \"next_recovery_state\": null, \"observation\": null}"
+             \"next_recovery_state\": null, \"observation\": null, \
+             \"next_performed\": [\"Admitted\"]}"
         );
     }
 
     #[test]
     fn the_last_sequence_rejects_every_event_without_mutating() {
-        let machine = Machine {
+        // Two machines, because one state cannot reach every pre-mutation
+        // the overflow used to run past. `Admitted` never enters the recover
+        // branch, so a machine that has something saved is needed to prove
+        // the saved state survives an overflow there.
+        let waiting = Machine {
+            profile: Profile::Fast,
+            state: State::RecoveryRequired,
+            current_incarnation: true,
+            recovery_state: Some(State::Admitted),
+            sequence: u64::MAX,
+            performed: vec![Assurance::Admitted],
+        };
+        let admitted = Machine {
             profile: Profile::Fast,
             state: State::Admitted,
             current_incarnation: true,
@@ -735,10 +838,16 @@ mod tests {
             sequence: u64::MAX,
             performed: vec![Assurance::Admitted],
         };
-        for event in EVENTS {
-            let mut candidate = machine.clone();
-            assert_eq!(candidate.apply(event), Err(Error::InvalidTransition));
-            assert_eq!(candidate, machine, "{event:?} at the last sequence");
+        for machine in [&waiting, &admitted] {
+            for event in EVENTS {
+                let mut candidate = machine.clone();
+                assert_eq!(candidate.apply(event), Err(Error::InvalidTransition));
+                assert_eq!(
+                    &candidate, machine,
+                    "{event:?} at the last sequence from {:?}",
+                    machine.state
+                );
+            }
         }
     }
 

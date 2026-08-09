@@ -21,6 +21,14 @@ RUST_CONSTANT = re.compile(
     r"^\s*pub const (?P<name>[A-Z0-9_]+): u64 = (?P<value>0x[0-9a-f]+);$",
     re.MULTILINE,
 )
+ERROR_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| (?P<class>[a-z/ ]+) \|$",
+    re.MULTILINE,
+)
+RUST_U16_CONSTANT = re.compile(
+    r"^\s*pub const (?P<name>[A-Z0-9_]+): u16 = (?P<value>0x[0-9a-f]+);$",
+    re.MULTILINE,
+)
 OPERATION_ROW = re.compile(
     r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| (?P<status>[a-z ]+) \|$",
     re.MULTILINE,
@@ -268,6 +276,51 @@ def validate(root: Path) -> None:
     grease_values = range(0x1F00, 0x1FFF, 2)
     assert all(value % 2 == 0 for value in grease_values)
     assert not set(values).intersection(grease_values)
+
+    error_text = numbered_section(registry_text, "## 8. Error codes")
+    error_rows = [
+        (int(match["value"], 16), match["name"], match["class"].strip())
+        for match in ERROR_ROW.finditer(error_text)
+    ]
+    error_table_lines = sum(
+        1 for line in error_text.splitlines() if line.startswith("| `")
+    )
+    assert error_rows, "no error-code registry rows parsed"
+    assert len(error_rows) == error_table_lines, (
+        f"parsed {len(error_rows)} of {error_table_lines} error-code rows"
+    )
+    error_values = [value for value, _, _ in error_rows]
+    error_names = [name for _, name, _ in error_rows]
+    assert len(error_values) == len(set(error_values)), "duplicate error value"
+    assert len(error_names) == len(set(error_names)), "duplicate error name"
+    # Section 8: error classes occupy 0x0100 blocks. One block per class,
+    # one class per block, rows in ascending value order.
+    block_class: dict[int, str] = {}
+    for value, name, cls in error_rows:
+        assert block_class.setdefault(value >> 8, cls) == cls, (
+            f"{name}: block {value >> 8:#x} holds class "
+            f"{block_class[value >> 8]!r}, row says {cls!r}"
+        )
+    class_blocks = list(block_class.values())
+    assert len(class_blocks) == len(set(class_blocks)), "class spans two blocks"
+    assert error_values == sorted(error_values), "error table not ascending"
+
+    # The Rust table names only the codes the codec layer sends; the registry
+    # may reserve more. Every Rust code must match the registry exactly.
+    error_rust_rows = {
+        match["name"]: int(match["value"], 16)
+        for match in RUST_U16_CONSTANT.finditer(rust_module(rust_text, "error_code"))
+    }
+    assert error_rust_rows, "no error_code constants parsed"
+    error_registry_rows = {name: value for value, name, _ in error_rows}
+    rust_only = error_rust_rows.keys() - error_registry_rows.keys()
+    assert not rust_only, f"error codes in Rust but not the registry: {rust_only}"
+    mismatched = {
+        name: (value, error_registry_rows[name])
+        for name, value in error_rust_rows.items()
+        if error_registry_rows[name] != value
+    }
+    assert not mismatched, f"error-code value mismatch (rust, registry): {mismatched}"
 
 
 def main() -> int:

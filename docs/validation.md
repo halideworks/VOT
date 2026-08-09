@@ -30,7 +30,8 @@ the Rust crates through oracle binaries (`vot-codec-oracle`,
 only accepted cases would prove nothing about what the crate rejects.
 
 `validate_registries.py` compares `spec/registries.md` tables against `vot-codec`
-constants. It does not yet cover the error-code table.
+constants, including the error-code table: block/class structure, ascending
+order, and a value-exact subset check for the Rust constants.
 
 ## Public API
 

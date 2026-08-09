@@ -855,17 +855,13 @@ mod tests {
         let missing = directory.join("missing");
         assert!(!same_file(&one, &missing).unwrap());
         assert!(!same_file(&missing, &one).unwrap());
-        // Anything else is the filesystem failing and has to surface: a
-        // component of the path is a file, so this is not NotFound.
-        let through_a_file = one.join("child");
-        assert!(matches!(
-            same_file(&through_a_file, &one),
-            Err(Error::Io(_))
-        ));
-        assert!(matches!(
-            same_file(&one, &through_a_file),
-            Err(Error::Io(_))
-        ));
+        // Anything else is the filesystem failing and has to surface. An
+        // interior NUL is invalid input on every platform, where "a component
+        // of the path is a file" is NotADirectory on Unix and NotFound on
+        // Windows, and NotFound is the arm this is ruling out.
+        let unreadable = Path::new("vot-posix-\0-name");
+        assert!(matches!(same_file(unreadable, &one), Err(Error::Io(_))));
+        assert!(matches!(same_file(&one, unreadable), Err(Error::Io(_))));
         fs::remove_dir_all(directory).unwrap();
     }
 

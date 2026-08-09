@@ -2252,6 +2252,108 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_decides_a_transfer_in_process() {
+        // The same thing the QUIC test asserts, over the in-process duplex.
+        // `wire.rs` is not compiled without the carrier feature, so the QUIC
+        // one measures nothing in the default mutation job, and the two hooks
+        // that make a capability decide anything live here and in `drive`.
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) =
+            built_bundle("in-process-capability", &[("a.bin", patterned(60_000))]);
+        let issuer = SigningKey::from_bytes(&[31; 32]);
+        let holder_key = SigningKey::from_bytes(&[32; 32]);
+        let requirement = crate::authz::Requirement::new(
+            "you.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "them.example",
+            built.root,
+        );
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let holder = Arc::new(
+            crate::authz::Holder::new(token, holder_key).expect("a holder for that token"),
+        );
+
+        // Holding the token: the serve grants and the bundle crosses.
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let granting_requirement = requirement.clone();
+        let granting = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::required(&granting_requirement, [7; 32]),
+                )
+            })
+        });
+        let output = temporary("in-process-granted");
+        let mut fetcher =
+            BundleFetcher::begin_with(client, &output, Some(built.root), Some(Arc::clone(&holder)))
+                .expect("a fetch holding the token");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            FetchStatus::Complete,
+            "the holder was refused"
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        assert!(
+            Arc::ptr_eq(&fetcher.holder().expect("the token"), &holder),
+            "a rail would have opened its session with no capability"
+        );
+        drop(fetcher);
+        granting
+            .join()
+            .expect("the granting thread")
+            .expect("served");
+
+        // Holding none: the fetch stops on the challenge rather than after a
+        // transfer, and writes no bundle.
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let refusing = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::required(&requirement, [8; 32]),
+                )
+            })
+        });
+        let refused_into = temporary("in-process-refused");
+        let mut naked = BundleFetcher::begin(client, &refused_into, Some(built.root))
+            .expect("a fetch with no token");
+        assert_eq!(
+            crate::drive::drive(&mut naked).expect("a driven fetch"),
+            FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
+            "a fetch with no capability was served, or refused for another reason"
+        );
+        assert!(naked.package().is_none(), "a bundle was written anyway");
+        drop(naked);
+        // The peer left mid-negotiation, which a bounded serve surfaces.
+        assert!(
+            refusing.join().expect("the refusing thread").is_err(),
+            "a session whose peer never presented was reported as served"
+        );
+    }
+
+    #[test]
     fn a_striped_fetch_over_threads_completes_and_spawns_its_rails() {
         // The connect count pins that the rail was spawned; width one
         // would pass every other assertion.

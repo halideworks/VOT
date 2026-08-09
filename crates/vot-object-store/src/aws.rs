@@ -12,8 +12,14 @@ use tokio::runtime::Runtime;
 
 use crate::{CompletedObject, Error, PartReceipt, S3Compatible};
 
+/// What the adapter remembers about a part it has uploaded.
+///
+/// Not the bytes. A multipart upload of a large object would otherwise hold
+/// every part until completion, so peak memory scaled with the object rather
+/// than with a part. The length and the checksum are all completion needs,
+/// and the two together combine into the whole object's checksum.
 struct LivePart {
-    bytes: Vec<u8>,
+    length: u64,
     checksum_crc32c: u32,
     etag: String,
 }
@@ -68,8 +74,13 @@ impl AwsS3Store {
         Ok(())
     }
 
-    fn read_object(&self, key: &str) -> Result<Vec<u8>, Error> {
-        let output = self
+    /// Reads an object back and reports only its length and checksum.
+    ///
+    /// Chunk by chunk, so peak memory is one chunk of the backend's choosing
+    /// rather than the object. Nothing here needs the bytes: the caller is
+    /// checking that what landed is what went up.
+    fn measure_object(&self, key: &str) -> Result<(u64, u32), Error> {
+        let mut output = self
             .runtime
             .block_on(
                 self.client
@@ -79,11 +90,19 @@ impl AwsS3Store {
                     .send(),
             )
             .map_err(|_| Error::Backend)?;
-        let body = self
-            .runtime
-            .block_on(output.body.collect())
-            .map_err(|_| Error::Backend)?;
-        Ok(body.into_bytes().to_vec())
+        // One entry into the runtime for the whole body, not one per chunk.
+        self.runtime.block_on(async {
+            let mut length = 0_u64;
+            let mut checksum = vot_journal::CRC32C_EMPTY;
+            while let Some(chunk) = output.body.next().await {
+                let chunk = chunk.map_err(|_| Error::Backend)?;
+                length = length
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(Error::Backend)?;
+                checksum = vot_journal::crc32c_update(checksum, &chunk);
+            }
+            Ok((length, checksum))
+        })
     }
 }
 
@@ -154,7 +173,7 @@ impl S3Compatible for AwsS3Store {
             .insert(
                 number,
                 LivePart {
-                    bytes: bytes.to_vec(),
+                    length: bytes.len() as u64,
                     checksum_crc32c,
                     etag,
                 },
@@ -181,9 +200,10 @@ impl S3Compatible for AwsS3Store {
             self.uploads.insert(upload_id.to_owned(), upload);
             return Err(Error::CompletionMismatch);
         }
-        let expected_length = upload.parts.values().try_fold(0_u64, |total, part| {
-            total.checked_add(part.bytes.len() as u64)
-        });
+        let expected_length = upload
+            .parts
+            .values()
+            .try_fold(0_u64, |total, part| total.checked_add(part.length));
         let Some(expected_length) = expected_length else {
             self.uploads.insert(upload_id.to_owned(), upload);
             return Err(Error::CompletionMismatch);
@@ -195,9 +215,7 @@ impl S3Compatible for AwsS3Store {
                 self.uploads.insert(upload_id.to_owned(), upload);
                 return Err(Error::CompletionMismatch);
             };
-            if receipt.length != part.bytes.len() as u64
-                || receipt.checksum_crc32c != part.checksum_crc32c
-            {
+            if receipt.length != part.length || receipt.checksum_crc32c != part.checksum_crc32c {
                 self.uploads.insert(upload_id.to_owned(), upload);
                 return Err(Error::CompletionMismatch);
             }
@@ -238,15 +256,14 @@ impl S3Compatible for AwsS3Store {
             }
             Err(_) => true,
         };
-        let Ok(bytes) = self.read_object(&upload.key) else {
+        let Ok((actual_length, actual_checksum)) = self.measure_object(&upload.key) else {
             self.uploads.insert(upload_id.to_owned(), upload);
             return Err(Error::CompletionAmbiguous);
         };
-        let actual_checksum = vot_journal::crc32c(&bytes);
         if !read_back_matches(
             expected_length,
             expected_checksum,
-            bytes.len() as u64,
+            actual_length,
             actual_checksum,
         ) {
             self.uploads.insert(upload_id.to_owned(), upload);
@@ -256,29 +273,33 @@ impl S3Compatible for AwsS3Store {
                 Error::ChecksumMismatch
             });
         }
-        let object = CompletedObject {
+        Ok(CompletedObject {
             key: upload.key,
+            length: actual_length,
             checksum_crc32c: actual_checksum,
-            bytes,
-        };
-        Ok(object)
+        })
     }
 
+    /// Costs a read of the whole object.
+    ///
+    /// The length alone would be a `HeadObject`, but this reports the
+    /// object's own CRC-32C, and what S3 stores for a multipart upload is a
+    /// checksum of the parts' checksums rather than of the bytes. A caller
+    /// that only wants to know the object is there should ask for something
+    /// cheaper than this.
     fn head(&self, key: &str) -> Option<(u64, u32)> {
-        let bytes = self.read_object(key).ok()?;
-        Some((bytes.len() as u64, vot_journal::crc32c(&bytes)))
+        self.measure_object(key).ok()
     }
 }
 
+/// The checksum of the parts concatenated in number order, from their own
+/// checksums and lengths. The bytes are long gone by completion.
 fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
-    let mut crc = !0_u32;
-    for byte in parts.values().flat_map(|part| part.bytes.iter()) {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    parts
+        .values()
+        .fold(vot_journal::CRC32C_EMPTY, |whole, part| {
+            vot_journal::crc32c_combine(whole, part.checksum_crc32c, part.length)
+        })
 }
 
 fn service_error_may_be_completed(code: Option<&str>) -> bool {
@@ -512,6 +533,12 @@ mod tests {
         }
     }
 
+    /// Whether a completion describes exactly these bytes. The adapter does
+    /// not hand back an object, so this is what stands in for comparing it.
+    fn is_object(object: &CompletedObject, bytes: &[u8]) -> bool {
+        object.length == bytes.len() as u64 && object.checksum_crc32c == vot_journal::crc32c(bytes)
+    }
+
     fn upload_one_part(store: &mut AwsS3Store, bytes: &[u8]) -> (String, PartReceipt) {
         let upload_id = store.create_multipart("key", 0).expect("an upload");
         let receipt = store
@@ -543,7 +570,7 @@ mod tests {
             object,
             CompletedObject {
                 key: "key".to_owned(),
-                bytes: b"payload".to_vec(),
+                length: b"payload".len() as u64,
                 checksum_crc32c: vot_journal::crc32c(b"payload"),
             }
         );
@@ -777,7 +804,7 @@ mod tests {
         let object = store
             .complete_multipart(&upload_id, &[one, two])
             .expect("the completion that matches");
-        assert_eq!(object.bytes, b"onetwo");
+        assert!(is_object(&object, b"onetwo"));
         assert_eq!(object.checksum_crc32c, vot_journal::crc32c(b"onetwo"));
     }
 
@@ -826,7 +853,7 @@ mod tests {
         let object = store
             .complete_multipart(&upload_id, &[receipt])
             .expect("an upload that had already landed");
-        assert_eq!(object.bytes, b"payload");
+        assert!(is_object(&object, b"payload"));
 
         let wrong = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
@@ -908,7 +935,7 @@ mod tests {
         let object = store
             .complete_multipart(&upload_id, &[receipt])
             .expect("an object the endpoint never confirmed but did store");
-        assert_eq!(object.bytes, b"payload");
+        assert!(is_object(&object, b"payload"));
     }
 
     #[test]
@@ -960,12 +987,36 @@ mod tests {
     }
 
     #[test]
+    fn measuring_adds_up_across_the_chunks_a_body_arrives_in() {
+        // Every other body here is a handful of bytes and arrives whole, so
+        // nothing exercised the accumulation. This one is large enough that
+        // the transport has to deliver it in pieces, which is what every real
+        // multipart object does.
+        static BIG: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| (0..=255_u8).cycle().take(4 * 1024 * 1024).collect());
+
+        let endpoint = FakeS3::new(|request: &Request| {
+            if request.method == "GET" {
+                response("200 OK", &[], &BIG)
+            } else {
+                service_error("500 Internal Server Error", "InternalError")
+            }
+        });
+        let store = endpoint.store();
+        assert_eq!(
+            store.measure_object("key").unwrap(),
+            (BIG.len() as u64, vot_journal::crc32c(&BIG)),
+            "the measurement is of the whole body, not of its last piece"
+        );
+    }
+
+    #[test]
     fn retained_parts_detect_stable_read_back_corruption() {
         let mut parts = BTreeMap::new();
         parts.insert(
             2,
             LivePart {
-                bytes: b"two".to_vec(),
+                length: b"two".len() as u64,
                 checksum_crc32c: vot_journal::crc32c(b"two"),
                 etag: "two".to_owned(),
             },
@@ -973,7 +1024,7 @@ mod tests {
         parts.insert(
             1,
             LivePart {
-                bytes: b"one".to_vec(),
+                length: b"one".len() as u64,
                 checksum_crc32c: vot_journal::crc32c(b"one"),
                 etag: "one".to_owned(),
             },

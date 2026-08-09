@@ -66,13 +66,113 @@ fn event_payload_len(event: &Event) -> usize {
     }
 }
 
+/// The bytes an item costs against its queue's budget.
+trait QueueCost {
+    fn queue_cost(&self) -> usize;
+}
+
+impl QueueCost for Command {
+    fn queue_cost(&self) -> usize {
+        self.payload_len()
+    }
+}
+
+impl QueueCost for Event {
+    fn queue_cost(&self) -> usize {
+        event_payload_len(self)
+    }
+}
+
+/// Why a queue refused an item. The caller names the direction; the queue
+/// only knows the arithmetic.
+enum Refusal {
+    Overflow,
+    Full,
+}
+
+/// A deque that owns its own byte accounting, so items and their charged
+/// bytes cannot drift apart. Only `try_push` charges and only `pop` releases.
+#[derive(Clone, Debug)]
+struct BoundedQueue<T> {
+    items: VecDeque<T>,
+    bytes: usize,
+    count_limit: usize,
+    byte_limit: usize,
+}
+
+impl<T: QueueCost> BoundedQueue<T> {
+    const fn new(count_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            bytes: 0,
+            count_limit,
+            byte_limit,
+        }
+    }
+
+    /// Whether `added` more items weighing `added_bytes` would fit, changing
+    /// nothing. Overflow is reported apart from fullness because callers
+    /// surface it as arithmetic, not backpressure.
+    fn preflight(&self, added: usize, added_bytes: usize) -> Result<(), Refusal> {
+        let next_bytes = self
+            .bytes
+            .checked_add(added_bytes)
+            .ok_or(Refusal::Overflow)?;
+        let next_count = self
+            .items
+            .len()
+            .checked_add(added)
+            .ok_or(Refusal::Overflow)?;
+        if next_count > self.count_limit || next_bytes > self.byte_limit {
+            return Err(Refusal::Full);
+        }
+        Ok(())
+    }
+
+    /// Takes the item or hands it back with the reason, changing nothing on
+    /// refusal.
+    fn try_push(&mut self, item: T) -> Result<(), (T, Refusal)> {
+        let Some(next_bytes) = self.bytes.checked_add(item.queue_cost()) else {
+            return Err((item, Refusal::Overflow));
+        };
+        if self.items.len() >= self.count_limit || next_bytes > self.byte_limit {
+            return Err((item, Refusal::Full));
+        }
+        self.items.push_back(item);
+        self.bytes = next_bytes;
+        self.assert_accounted();
+        Ok(())
+    }
+
+    /// Hands back the front item, releasing exactly its cost.
+    fn pop(&mut self) -> Option<T> {
+        let item = self.items.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(item.queue_cost());
+        self.assert_accounted();
+        Some(item)
+    }
+
+    fn front(&self) -> Option<&T> {
+        self.items.front()
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// The charged bytes recomputed from the items, in tests and debug builds.
+    fn assert_accounted(&self) {
+        debug_assert_eq!(
+            self.bytes,
+            self.items.iter().map(QueueCost::queue_cost).sum::<usize>()
+        );
+    }
+}
+
 /// Submissions out, events in, both bounded by count and bytes.
 #[derive(Clone, Debug)]
 pub struct Queue {
-    commands: VecDeque<Command>,
-    command_bytes: usize,
-    command_count_limit: usize,
-    command_byte_limit: usize,
+    commands: BoundedQueue<Command>,
     /// The peer's bound on what this endpoint sends.
     control_send_limit: usize,
     /// What this endpoint accepts, which is what it advertised. Separate from
@@ -80,26 +180,17 @@ pub struct Queue {
     control_receive_limit: usize,
     /// What this endpoint advertised, once it has been configured.
     receive_limits: Option<ReceiveLimits>,
-    events: VecDeque<Event>,
-    event_bytes: usize,
-    event_count_limit: usize,
-    event_byte_limit: usize,
+    events: BoundedQueue<Event>,
 }
 
 impl Default for Queue {
     fn default() -> Self {
         Self {
-            commands: VecDeque::new(),
-            command_bytes: 0,
-            command_count_limit: DEFAULT_COUNT_LIMIT,
-            command_byte_limit: DEFAULT_BYTE_LIMIT,
+            commands: BoundedQueue::new(DEFAULT_COUNT_LIMIT, DEFAULT_BYTE_LIMIT),
             control_send_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
             receive_limits: None,
-            events: VecDeque::new(),
-            event_bytes: 0,
-            event_count_limit: DEFAULT_COUNT_LIMIT,
-            event_byte_limit: DEFAULT_BYTE_LIMIT,
+            events: BoundedQueue::new(DEFAULT_COUNT_LIMIT, DEFAULT_BYTE_LIMIT),
         }
     }
 }
@@ -116,10 +207,8 @@ impl Queue {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            command_count_limit: count,
-            command_byte_limit: bytes,
-            event_count_limit: count,
-            event_byte_limit: bytes,
+            commands: BoundedQueue::new(count, bytes),
+            events: BoundedQueue::new(count, bytes),
             ..Self::default()
         })
     }
@@ -142,7 +231,7 @@ impl Queue {
     /// Rejects a limit outside the protocol's range.
     pub fn set_control_send_limit(&mut self, limit: usize) -> Result<(), Error> {
         validate_control_payload_limit(limit)?;
-        self.control_send_limit = effective_send_limit(limit, self.command_byte_limit);
+        self.control_send_limit = effective_send_limit(limit, self.commands.byte_limit);
         Ok(())
     }
 
@@ -213,31 +302,23 @@ impl Queue {
     /// Rejects an oversized record, arithmetic overflow, or a batch the queue
     /// cannot hold whole.
     pub fn preflight_reliable_batch(&self, records: &[Payload]) -> Result<(), Error> {
-        let next_bytes = records
-            .iter()
-            .try_fold(self.command_bytes, |bytes, record| {
-                validate_data_record(record)?;
-                bytes
-                    .checked_add(record.len())
-                    .ok_or(Error::ArithmeticOverflow)
-            })?;
-        let next_count = self
-            .commands
-            .len()
-            .checked_add(records.len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if next_count > self.command_count_limit || next_bytes > self.command_byte_limit {
-            Err(Error::OutboundQueueFull)
-        } else {
-            Ok(())
-        }
+        let added_bytes = records.iter().try_fold(0_usize, |bytes, record| {
+            validate_data_record(record)?;
+            bytes
+                .checked_add(record.len())
+                .ok_or(Error::ArithmeticOverflow)
+        })?;
+        self.commands
+            .preflight(records.len(), added_bytes)
+            .map_err(|refusal| match refusal {
+                Refusal::Overflow => Error::ArithmeticOverflow,
+                Refusal::Full => Error::OutboundQueueFull,
+            })
     }
 
     /// Hands back the next submission, releasing what it held.
     pub fn next_command(&mut self) -> Option<Command> {
-        let command = self.commands.pop_front()?;
-        self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
-        Some(command)
+        self.commands.pop()
     }
 
     /// Gives a driver one submission at a time. Failed submissions stay queued.
@@ -250,10 +331,7 @@ impl Queue {
     {
         while let Some(command) = self.commands.front().cloned() {
             submit(command)?;
-            let Some(command) = self.commands.pop_front() else {
-                break;
-            };
-            self.command_bytes = self.command_bytes.saturating_sub(command.payload_len());
+            self.commands.pop();
         }
         Ok(())
     }
@@ -280,9 +358,7 @@ impl Queue {
     /// Rejects an oversized payload, arithmetic overflow, or a full inbound
     /// queue.
     pub fn admit_event(&mut self, event: Event) -> Result<(), Error> {
-        let next_bytes = self.admit(&event)?;
-        self.accept(event, next_bytes);
-        Ok(())
+        self.try_admit_event(event).map_err(|(_, error)| error)
     }
 
     /// Delivers an event, handing it back when the inbound queue is full.
@@ -290,20 +366,21 @@ impl Queue {
     /// # Errors
     /// Returns the event alongside the reason it was refused.
     pub fn try_admit_event(&mut self, event: Event) -> Result<(), (Event, Error)> {
-        match self.admit(&event) {
-            Ok(next_bytes) => {
-                self.accept(event, next_bytes);
-                Ok(())
-            }
-            Err(error) => Err((event, error)),
+        if let Err(error) = self.validate_event(&event) {
+            return Err((event, error));
         }
+        self.events.try_push(event).map_err(|(event, refusal)| {
+            let error = match refusal {
+                Refusal::Overflow => Error::ArithmeticOverflow,
+                Refusal::Full => Error::InboundQueueFull,
+            };
+            (event, error)
+        })
     }
 
     /// Hands back the next event, releasing what it held.
     pub fn poll(&mut self) -> Option<Event> {
-        let event = self.events.pop_front()?;
-        self.event_bytes = self.event_bytes.saturating_sub(event_payload_len(&event));
-        Some(event)
+        self.events.pop()
     }
 
     /// Events delivered but not yet taken.
@@ -312,37 +389,13 @@ impl Queue {
         self.events.len()
     }
 
-    /// Checks an event against the protocol and memory bounds, returning the
-    /// queue size it would produce.
-    fn admit(&self, event: &Event) -> Result<usize, Error> {
-        self.validate_event(event)?;
-        let next_bytes = self
-            .event_bytes
-            .checked_add(event_payload_len(event))
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.events.len() >= self.event_count_limit || next_bytes > self.event_byte_limit {
-            return Err(Error::InboundQueueFull);
-        }
-        Ok(next_bytes)
-    }
-
-    /// Takes the space an admitted event was measured for.
-    fn accept(&mut self, event: Event, next_bytes: usize) {
-        self.events.push_back(event);
-        self.event_bytes = next_bytes;
-    }
-
     fn enqueue(&mut self, command: Command) -> Result<(), Error> {
-        let next_bytes = self
-            .command_bytes
-            .checked_add(command.payload_len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.commands.len() >= self.command_count_limit || next_bytes > self.command_byte_limit {
-            return Err(Error::OutboundQueueFull);
-        }
-        self.commands.push_back(command);
-        self.command_bytes = next_bytes;
-        Ok(())
+        self.commands
+            .try_push(command)
+            .map_err(|(_, refusal)| match refusal {
+                Refusal::Overflow => Error::ArithmeticOverflow,
+                Refusal::Full => Error::OutboundQueueFull,
+            })
     }
 }
 
@@ -919,6 +972,18 @@ mod tests {
             queue.pending_commands() + queue.pending_events() > 0,
             "the script ended with work in flight, so refusals were exercised"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn a_drifted_byte_total_fails_the_recomputation() {
+        let mut queue = BoundedQueue::<Command>::new(4, 64);
+        queue
+            .try_push(Command::Control(shared_payload(b"frame")))
+            .ok();
+        // The only way bytes and items can disagree is a bug; simulate one.
+        queue.bytes += 1;
+        queue.assert_accounted();
     }
 
     #[test]

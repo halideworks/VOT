@@ -913,12 +913,19 @@ fn valid_raw_component(component: &[u8]) -> bool {
     // "." and ".." are not names, they are directions. A raw path that can
     // say either is a path that can leave the destination it was extracted
     // into, and the portable profile has refused them all along.
+    //
+    // The backslash goes with the slash for the same reason. A component is
+    // a component on every host that extracts the package, and one holding
+    // a separator stops being one the moment it lands on Windows. This
+    // refuses a legal POSIX filename, which is the trade: the portable
+    // profile is where such a name belongs.
     !component.is_empty()
         && component.len() <= 255
         && component != b"."
         && component != b".."
         && !component.contains(&0)
         && !component.contains(&b'/')
+        && !component.contains(&b'\\')
 }
 
 fn encode_entry(out: &mut Vec<u8>, entry: &ManifestEntry) {
@@ -1656,6 +1663,8 @@ mod tests {
             ("one byte past the bound", vec![b'a'; 256]),
             ("a name holding a zero byte", b"a\0b".to_vec()),
             ("a name holding a separator", b"a/b".to_vec()),
+            ("a name holding the other separator", b"a\\b".to_vec()),
+            ("a name that is only the other separator", b"\\".to_vec()),
             ("this directory", b".".to_vec()),
             ("the one above", b"..".to_vec()),
         ] {
@@ -1667,6 +1676,64 @@ mod tests {
         assert!(valid_raw_component(b"..."));
         assert!(valid_raw_component(b".hidden"));
         assert!(valid_raw_component(b"..a"));
+    }
+
+    /// The hex strings in one array of the published path corpus.
+    ///
+    /// Scanned rather than parsed, for the reason
+    /// `crates/vot-receipt` scans its own vector: the file is flat and
+    /// machine-written, and `tools/verify_manifest_pack_vectors.py` parses it
+    /// properly. That tool is the second implementation of the rule below;
+    /// this test is what makes the corpus bind the first one too.
+    fn corpus_array(name: &str) -> Vec<Vec<u8>> {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/manifest/path-collisions.json"
+        ))
+        .expect("the path corpus is missing");
+        let key = format!("\"{name}\": [");
+        let from = text.find(&key).unwrap_or_else(|| panic!("no array {name}")) + key.len();
+        let body = &text[from..from + text[from..].find(']').expect("unterminated array")];
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|value| {
+                assert!(value.len() % 2 == 0, "{name} holds an odd hex string");
+                value
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let digit = |byte: u8| match byte {
+                            b'0'..=b'9' => byte - b'0',
+                            b'a'..=b'f' => byte - b'a' + 10,
+                            _ => panic!("{name} is not hexadecimal"),
+                        };
+                        digit(pair[0]) * 16 + digit(pair[1])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_published_corpus_is_the_raw_rule_this_enforces() {
+        let invalid = corpus_array("raw_posix_invalid_hex");
+        let valid = corpus_array("raw_posix_valid_hex");
+        // A scan that found nothing would agree with anything.
+        assert!(invalid.len() >= 8, "{} invalid cases", invalid.len());
+        assert!(valid.len() >= 7, "{} valid cases", valid.len());
+        for component in &invalid {
+            assert!(
+                !valid_raw_component(component),
+                "the corpus calls {component:?} invalid and this accepts it"
+            );
+        }
+        for component in &valid {
+            assert!(
+                valid_raw_component(component),
+                "the corpus calls {component:?} valid and this refuses it"
+            );
+        }
     }
 
     #[test]

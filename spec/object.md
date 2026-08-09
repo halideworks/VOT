@@ -124,13 +124,22 @@ The portable profile additionally rejects:
 - collisions after Unicode normalization and platform case folding; and
 - components or total paths above declared portable limits.
 
-The raw-POSIX profile carries nonempty byte-string components excluding NUL and
-`/`. A receiver MUST preflight collisions and target-policy validity before
-creating any path. Sanitization does not silently merge two manifest entries;
+The raw-POSIX profile carries byte-string components of 1 to 255 bytes. It
+excludes NUL, `/`, and `\`, and the components `.` and `..` exactly. A name
+that merely begins with a dot is a name. Excluding `\` refuses a filename that
+is legal on POSIX, because a component holding a separator stops being one
+component on a host that extracts with that separator; such a name belongs in
+the portable profile. A path is at most 256 components. A receiver MUST
+preflight collisions and target-policy validity before creating any path. Sanitization does not silently merge two manifest entries;
 the package is rejected or an explicit, audited materialization mapping is used.
 Portable collision keys conservatively fold the Turkish dotted and dotless I
 pairs to the same key. This is locale independent and prevents a package that is
 distinct on one host from colliding under a Turkish locale on another.
+
+The raw-POSIX rules for `.`, `..`, and `\` narrowed in draft revision 5. A
+manifest written before it that used any of them decodes as invalid rather
+than as a path, which is the intended outcome: those are the components that
+let an extraction leave its destination.
 
 ## 7. Pack objects
 

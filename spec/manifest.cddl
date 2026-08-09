@@ -19,7 +19,9 @@ manifest-entry = {
   ? 4: file-metadata,
 }
 
-package-path = [1* path-component]
+; Component values carry rules CDDL cannot state: no NUL, no "/", no "\",
+; and neither "." nor "..". See object.md section 6.
+package-path = [1*256 path-component]
 path-component = tstr .size (1..255) / bstr .size (1..255)
 path-profile = 0 / 1            ; portable / raw POSIX
 entry-kind = 0 / 1              ; regular file / directory

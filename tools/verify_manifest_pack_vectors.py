@@ -103,6 +103,23 @@ def portable_key(value: str) -> str:
     return folded
 
 
+def raw_valid(component: bytes) -> bool:
+    """Whether the raw-POSIX profile carries this component.
+
+    spec/object.md section 6. Written out rather than expressed as "holds a
+    NUL or a slash", which is what this file used to assert and which agrees
+    with any implementation that forgot the rest of the rule.
+    """
+    return (
+        len(component) > 0
+        and len(component) <= 255
+        and component not in {b".", b".."}
+        and b"\0" not in component
+        and b"/" not in component
+        and b"\\" not in component
+    )
+
+
 def verify_manifest() -> None:
     vector = json.loads((ROOT / "test-vectors/manifest/page.json").read_text())
     encoded = encode_manifest(vector)
@@ -121,7 +138,12 @@ def verify_manifest() -> None:
             raise AssertionError(f"invalid portable path accepted: {value!r}")
     for encoded_hex in corpus["raw_posix_invalid_hex"]:
         value = bytes.fromhex(encoded_hex)
-        assert not value or b"\0" in value or b"/" in value
+        assert not raw_valid(value), f"invalid raw component accepted: {value!r}"
+    # The valid half is what keeps the invalid half meaningful: a rule that
+    # rejected everything would satisfy the loop above on its own.
+    for encoded_hex in corpus["raw_posix_valid_hex"]:
+        value = bytes.fromhex(encoded_hex)
+        assert raw_valid(value), f"valid raw component rejected: {value!r}"
     for encoded_hex in corpus["portable_invalid_utf8_hex"]:
         try:
             bytes.fromhex(encoded_hex).decode("utf-8")

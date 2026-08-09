@@ -688,9 +688,6 @@ pub fn relay_service(
     let began = std::time::Instant::now();
     let mut slots = crate::relay::Slots::default();
     let mut buffer = [0_u8; 128];
-    // Counted in the loop's own body rather than by a clock, and only for a
-    // request actually answered.
-    let mut answered = 0_u64;
     // Slots run on their own threads and are joined when the relay stops, so
     // a bounded run leaves nothing behind.
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -700,9 +697,10 @@ pub fn relay_service(
         stopping: &stopping,
         threads: Vec::new(),
     };
-    // An iterator rather than a comparison. `answered < bound` inverts into a
-    // relay that never stops, which hangs a test rather than failing it, and a
-    // bound nothing can turn into an unbounded loop is worth the box.
+    // An iterator rather than a counter compared against the bound. That
+    // comparison inverts into a relay that never stops, which hangs a test
+    // rather than failing it, and one pull per answer spends the bound only
+    // on a request actually answered rather than on a read that timed out.
     let mut answers: Box<dyn Iterator<Item = ()>> = match datagrams {
         Some(bound) => Box::new(std::iter::repeat_n((), usize::try_from(bound).unwrap_or(0))),
         None => Box::new(std::iter::repeat(())),
@@ -736,7 +734,6 @@ pub fn relay_service(
             &crate::relay::encode(&crate::relay::Datagram::Slot { key, at }),
             source,
         );
-        answered = answered.saturating_add(1);
     }
     stopping.store(true, Ordering::Relaxed);
     for slot in running.threads {

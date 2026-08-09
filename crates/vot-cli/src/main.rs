@@ -9,9 +9,11 @@ Usage:
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
   vot rendezvous LISTEN_ADDR
-  vot fetch CONNECT_ADDR|ROOT BUNDLE_DIR [PACKAGE_ROOT]
-  vot pull CONNECT_ADDR|ROOT BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
-           OBSERVED_AT [PACKAGE_ROOT]
+  vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
+  vot fetch ROOT BUNDLE_DIR
+  vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
+           OBSERVED_AT PACKAGE_ROOT
+  vot pull ROOT BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE OBSERVED_AT
 
 serve and fetch move a bundle over the wire; fetch writes a bundle directory
 that receive consumes unchanged, and pull is the two in one invocation.
@@ -21,8 +23,13 @@ The channel is NOT authenticated. The server presents a throwaway certificate
 and the client does not verify it, so anyone in the middle can see what you
 fetch and can refuse to serve it. What they cannot do is give you different
 bytes: every range proves to its object's root, every root is named by the
-manifest, and the manifest proves to the seal. Give fetch a PACKAGE_ROOT, as
-printed by send, to say which package you will accept.
+manifest, and the manifest proves to the seal.
+
+That holds only for the package you named. A fetch at an address takes a
+PACKAGE_ROOT, the 64 hex characters send printed, and refuses without one;
+serve prints the whole fetch command for the bundle it is serving. A ROOT in
+the address position pins itself. VOT_FETCH_UNPINNED=1 fetches from a server
+whose package cannot be known in advance.
 
 SUITE is blake3 or sha256. The default is sha256.
 OBSERVED_AT is an RFC 3339 timestamp, for example 2026-07-31T20:00:00Z.
@@ -52,6 +59,25 @@ it at whatever service the two ends share, which `vot rendezvous` runs.
 Both ends must name the same one.
 ";
 
+const UNPINNED_HELP: &str = "\
+An address says where to fetch from, not what to fetch.
+
+The channel is not authenticated. Without a PACKAGE_ROOT, a server can hand
+you a different package and every range will still prove, to whatever root
+that package declares. The root is what makes the proofs mean the package you
+asked for.
+
+  vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
+
+The root is the 64 hex characters `vot send` printed. `vot serve` prints the
+whole fetch command for the bundle it is serving, so the end that has the
+bundle can hand over one line. A root in the address position needs nothing
+further: it is resolved through the rendezvous and pins itself.
+
+Set VOT_FETCH_UNPINNED=1 to fetch from a server whose package you cannot know
+in advance.
+";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("vot: {error:?}");
@@ -61,6 +87,12 @@ fn main() {
         if matches!(error, vot_cli::Error::InvalidArguments) {
             eprintln!();
             eprintln!("{USAGE}");
+        }
+        // Its own text, because the answer is a value the caller has to go
+        // and get rather than an argument they spelled wrong.
+        if matches!(error, vot_cli::Error::UnpinnedFetch) {
+            eprintln!();
+            eprintln!("{UNPINNED_HELP}");
         }
         std::process::exit(1);
     }
@@ -203,9 +235,18 @@ fn serve(
     let address = address
         .parse()
         .map_err(|_| vot_cli::Error::InvalidArguments)?;
-    let package = vot_cli::serve_bundle(Path::new(bundle), address, credentials, None, |at| {
-        println!("listening {at}");
-    })?;
+    let package =
+        vot_cli::serve_bundle(Path::new(bundle), address, credentials, None, |at, root| {
+            println!("listening {at}");
+            // The whole command, because a fetch has to name the root and this
+            // is the only place it is printed while the serve is still up. A
+            // reader who has to go and find it is a reader who fetches unpinned.
+            println!(
+                "fetch it with: vot fetch {} BUNDLE_DIR {}",
+                reachable(at),
+                root_hex(&root)
+            );
+        })?;
     println!(
         "{} {} SERVED",
         root_hex(&package.root),
@@ -224,8 +265,7 @@ fn rendezvous_service_addresses() -> Result<Vec<std::net::SocketAddr>, vot_cli::
 
 fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
     let package = if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        let pin = root.map(vot_cli::parse_package_root).transpose()?;
-        vot_cli::fetch_bundle(address, Path::new(bundle), pin)
+        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -252,8 +292,7 @@ fn pull(
     // The key is loaded before a byte crosses the wire.
     let key = vot_cli::load_key_spec(key)?;
     if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        let pin = root.map(vot_cli::parse_package_root).transpose()?;
-        vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
+        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)?;
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -274,6 +313,21 @@ fn pull(
     Ok(())
 }
 
+/// How to name this listener in a command someone else runs.
+///
+/// A wildcard bind answers on every address this host has and is not one of
+/// them: `0.0.0.0` reaches this host from this host and nowhere else. Naming
+/// it in a fetch command would be an instruction that works where it is
+/// printed and fails everywhere it is pasted, so the host part is left for
+/// the reader to fill in.
+fn reachable(at: std::net::SocketAddr) -> String {
+    if at.ip().is_unspecified() {
+        format!("THIS_HOST:{}", at.port())
+    } else {
+        at.to_string()
+    }
+}
+
 fn root_hex(root: &[u8; 32]) -> String {
     let mut output = String::with_capacity(64);
     for byte in root {
@@ -281,4 +335,28 @@ fn root_hex(root: &[u8; 32]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_bind_is_not_an_address_to_hand_out() {
+        let named = |text: &str| reachable(text.parse().expect("an address"));
+        assert_eq!(named("0.0.0.0:9000"), "THIS_HOST:9000");
+        assert_eq!(named("[::]:9000"), "THIS_HOST:9000");
+        assert_eq!(named("127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(named("198.51.100.7:9000"), "198.51.100.7:9000");
+        assert_eq!(named("[2001:db8::7]:9000"), "[2001:db8::7]:9000");
+    }
+
+    #[test]
+    fn a_root_is_lowercase_hexadecimal_of_the_whole_root() {
+        assert_eq!(root_hex(&[0; 32]), "0".repeat(64));
+        assert_eq!(root_hex(&[0xab; 32]), "ab".repeat(32));
+        let mut counted = [0_u8; 32];
+        counted[31] = 0x0f;
+        assert_eq!(root_hex(&counted), format!("{}0f", "00".repeat(31)));
+    }
 }

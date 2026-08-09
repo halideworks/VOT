@@ -11,7 +11,7 @@ pub fn serve_bundle(
     _address: SocketAddr,
     _credentials: &Credentials,
     _sessions: Option<u32>,
-    _listening: impl FnMut(SocketAddr),
+    _listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }

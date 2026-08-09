@@ -43,12 +43,12 @@ Wire commands need the `wire` feature (builds BoringSSL via cmake):
 # Serve a bundle. Supports concurrent sessions.
 vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
 
-# Fetch a bundle from a server.
-vot fetch CONNECT_ADDR BUNDLE_DIR [PACKAGE_ROOT]
+# Fetch a bundle from a server. The root is what says which package to accept.
+vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
 
 # Fetch and receive in one step.
 vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE \
-  OBSERVED_AT [PACKAGE_ROOT]
+  OBSERVED_AT PACKAGE_ROOT
 
 # Run a rendezvous service (ADR-0033).
 vot rendezvous LISTEN_ADDR
@@ -69,8 +69,14 @@ vot fetch ROOT BUNDLE_DIR                 # resolves that root, no address
 The channel is not authenticated. The server presents a throwaway certificate
 and the client does not verify it. What an attacker cannot do is serve different
 bytes: every range proves to its object root, every root is named by the
-manifest, and the manifest proves to the seal. An optional PACKAGE_ROOT pins
-which package the fetcher will accept.
+manifest, and the manifest proves to the seal.
+
+That argument holds for the package the fetch named, and says nothing about
+which package it got. So a fetch at an address requires the `PACKAGE_ROOT`,
+and `vot serve` prints the whole fetch command for the bundle it is serving,
+so the end holding the bundle hands over one line. A root in the address
+position pins itself. `VOT_FETCH_UNPINNED=1` fetches from a server whose
+package cannot be known in advance.
 
 ### Environment variables
 
@@ -81,6 +87,7 @@ which package the fetcher will accept.
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
+| `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
 
 ## Keys
 

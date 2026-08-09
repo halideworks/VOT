@@ -2107,12 +2107,57 @@ mod tests {
         }
     }
 
-    pub(crate) fn temporary(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+    /// A path that takes whatever is written at it with it.
+    ///
+    /// Cleaning up in a `Drop` is the only version a later test cannot
+    /// forget. A sweep runs this suite once per mutant, so one leftover
+    /// directory per test per mutant is tens of thousands of them in the
+    /// shared temp directory, which is what has killed mutation runners here
+    /// before.
+    pub(crate) struct Temporary(PathBuf);
+
+    impl std::ops::Deref for Temporary {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Temporary {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for Temporary {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A guard over a path something else chose.
+    ///
+    /// For a second file the code under test writes beside the one the test
+    /// named, such as the JSON summary `receive_bundle` puts next to a
+    /// receipt. The guard over the receipt does not know about it.
+    pub(crate) fn guarded(path: PathBuf) -> Temporary {
+        Temporary(path)
+    }
+
+    pub(crate) fn temporary(name: &str) -> Temporary {
+        Temporary(std::env::temp_dir().join(format!(
             "vot-cli-{}-{}-{name}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+        )))
     }
 
     /// The call has to reach the filesystem on the platforms that have it.

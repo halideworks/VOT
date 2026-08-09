@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use vot_resume::{
     CarefulResumeCache, CarrierNeutralState, Observation, PathReject, Reconnaissance,
@@ -16,8 +16,45 @@ fn subject() -> SubjectId {
     }
 }
 
-fn path(case: u8) -> PathBuf {
-    std::env::temp_dir().join(format!("vot-e-resume-{}-{case}", std::process::id()))
+/// A store path that takes its own files with it.
+///
+/// `ResumeStore::open` mints a lock file beside the store, and a test that
+/// removed only the store left it. A sweep runs this suite once per mutant,
+/// so one lock per case per mutant is thousands of files in the shared temp
+/// directory, which is what has killed mutation runners here before.
+/// Cleaning up in a `Drop` is the only version a later test cannot forget.
+struct TempStore(PathBuf);
+
+impl std::ops::Deref for TempStore {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempStore {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempStore {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for TempStore {
+    fn drop(&mut self) {
+        // The store, its lock, and any temporary beside it. `remove_files`
+        // is the one place that knows what those are.
+        let _ = vot_resume::remove_files(&self.0, true);
+    }
+}
+
+fn path(case: u8) -> TempStore {
+    TempStore(std::env::temp_dir().join(format!("vot-e-resume-{}-{case}", std::process::id())))
 }
 
 #[test]
@@ -42,9 +79,6 @@ fn random_process_kills_at_every_percent_keep_waste_bounded() {
             restarted.missing_units().take(101).count(),
             100 - usize::try_from(kill_percent / 8 * 8).unwrap()
         );
-        if store_path.exists() {
-            fs::remove_file(store_path).unwrap();
-        }
     }
 }
 
@@ -178,5 +212,4 @@ fn source_loss_allows_alternate_source_for_same_identity() {
     let alternate = ResumeTracker::discover(&mut alternate_store, subject(), 100, 4).unwrap();
     assert!(alternate.is_checkpointed(0));
     assert_eq!(alternate.missing_units().take(101).count(), 96);
-    fs::remove_file(store_path).unwrap();
 }

@@ -1934,6 +1934,9 @@ mod tests {
 
         let destination = temporary("trip-destination");
         let receipt = temporary("trip-receipt.cbor");
+        // receive_bundle writes a JSON summary beside the receipt, which the
+        // receipt's own guard does not know about.
+        let _summary = crate::tests::guarded(receipt.with_extension("json"));
         let report = receive_bundle(
             &output,
             &destination,
@@ -2367,7 +2370,7 @@ mod tests {
         let output = temporary("threaded-fetched");
         let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let serving_halves = Arc::clone(&halves);
-        let serving_bundle = bundle.clone();
+        let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
             let server = BundleServer::open(&serving_bundle)?;
             crate::drive::serve_sessions(Some(2), || {
@@ -2896,6 +2899,10 @@ mod tests {
         let mut skip = BTreeMap::new();
         // A resumed hole pattern: the middle span is durable.
         skip.insert(MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE);
+        // Held for the test, not for the expression that makes the sink: the
+        // guard removes the directory when it goes, and the sink needs it.
+        let output = temporary("handout-skip");
+        fs::create_dir_all(&output).unwrap();
         let plan = FetchPlan {
             summary: PackageSummary {
                 root: [0; 32],
@@ -2905,16 +2912,7 @@ mod tests {
             objects: vec![PlannedObject::fresh(object)],
             current: 0,
             active: Some(Arc::new(
-                CountingSink::create(
-                    &{
-                        let output = temporary("handout-skip");
-                        fs::create_dir_all(&output).unwrap();
-                        output.join("s.obj")
-                    },
-                    object.length,
-                    None,
-                )
-                .unwrap(),
+                CountingSink::create(&output.join("s.obj"), object.length, None).unwrap(),
             )),
             placed_before: 0,
             next_offset: 0,
@@ -3732,7 +3730,7 @@ mod tests {
             .map(|(name, bytes)| (name.as_str(), bytes.clone()))
             .collect();
         let (bundle, _) = built_bundle("pageorder", &named);
-        let discarded = bundle.clone();
+        let discarded = bundle.to_path_buf();
         let pages: Vec<Vec<u8>> = (0..2)
             .map(|index| {
                 fs::read(crate::manifest_page_path(

@@ -4,7 +4,6 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::path::PathBuf;
 
 use vot_codec::DecodeLimits;
 use vot_codec::frames::{self, TypedFrame};
@@ -236,7 +235,10 @@ impl TransportAdapter for Duplex {
     }
 }
 
-pub(crate) fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, PackageSummary) {
+pub(crate) fn built_bundle(
+    name: &str,
+    files: &[(&str, Vec<u8>)],
+) -> (crate::tests::Temporary, PackageSummary) {
     let source = temporary(&format!("{name}-source"));
     let bundle = temporary(&format!("{name}-bundle"));
     fs::create_dir_all(&source).unwrap();
@@ -248,6 +250,7 @@ pub(crate) fn built_bundle(name: &str, files: &[(&str, Vec<u8>)]) -> (PathBuf, P
         fs::write(path, bytes).unwrap();
     }
     let summary = build_bundle(&source, &bundle).unwrap();
+    // The source has served its purpose; the bundle goes with its guard.
     fs::remove_dir_all(&source).unwrap();
     (bundle, summary)
 }

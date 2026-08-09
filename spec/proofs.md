@@ -1,6 +1,6 @@
 # VOT v0.3 Proof Profiles
 
-Status: normative byte-format freeze for `vot-draft-04`
+Status: normative byte-format freeze for `vot-draft-05`
 
 ## 1. Common range-proof bundle
 

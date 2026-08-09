@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_UNKNOWN_PAYLOAD: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FRAMES_PER_BATCH: usize = 4096;
 pub const MAX_SETTINGS_PER_FRAME: usize = 128;
 pub const MAX_EXTENSIONS_PER_HELLO: usize = 256;
-pub const DRAFT_REVISION: u64 = 4;
+pub const DRAFT_REVISION: u64 = 5;
 
 pub mod setting_id {
     pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 0x01;
@@ -22,10 +22,18 @@ pub mod setting_id {
     pub const MAX_MANIFEST_PAGE_PAYLOAD: u64 = 0x05;
     pub const RELIABLE_LANE_LIMIT: u64 = 0x07;
     pub const IDLE_TIMEOUT_MS: u64 = 0x09;
-    pub const ACTIVE_KEEPALIVE_MS: u64 = 0x0b;
-    pub const COMPRESSION_MIN_GAIN_BPS: u64 = 0x20;
-    pub const TELEMETRY_LEVEL: u64 = 0x22;
+
+    /// Identifiers ADR-0035 retired, kept here so nothing reassigns them.
+    /// `0x0b` was `ACTIVE_KEEPALIVE_MS`, `0x20` `COMPRESSION_MIN_GAIN_BPS`,
+    /// and `0x22` `TELEMETRY_LEVEL`. Each returns with the thing it
+    /// configures, and `0x0b` was critical, so a peer still sending it meets
+    /// the unknown-critical rule and the session closes.
+    pub const RETIRED: [u64; 3] = [0x0b, 0x20, 0x22];
 }
+
+/// The registered default for `IDLE_TIMEOUT_MS`, named so the carrier that
+/// installs its own idle timeout can take this one rather than repeat it.
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 90_000;
 
 /// What a capability authorizes.
 pub mod operation {
@@ -184,10 +192,12 @@ pub struct Settings {
     pub max_data_record_payload: u64,
     pub max_manifest_page_payload: u64,
     pub reliable_lane_limit: u64,
+    /// Negotiated and validated, but not installed. QUIC fixes its own idle
+    /// timeout during the handshake, before this is negotiated, and the
+    /// session has no clock to enforce it with. ADR-0035 says so in full;
+    /// what closes an idle connection is the carrier's timeout, taken from
+    /// [`Settings::default`].
     pub idle_timeout_ms: u64,
-    pub active_keepalive_ms: u64,
-    pub compression_min_gain_bps: u64,
-    pub telemetry_level: u64,
 }
 
 impl Default for Settings {
@@ -197,10 +207,7 @@ impl Default for Settings {
             max_data_record_payload: 256 * 1024,
             max_manifest_page_payload: 1024 * 1024,
             reliable_lane_limit: 16,
-            idle_timeout_ms: 90_000,
-            active_keepalive_ms: 20_000,
-            compression_min_gain_bps: 500,
-            telemetry_level: 1,
+            idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
         }
     }
 }
@@ -208,7 +215,7 @@ impl Default for Settings {
 impl Settings {
     /// Registered settings and their advertised values, in identifier order.
     #[must_use]
-    pub const fn advertised(&self) -> [(u64, u64); 8] {
+    pub const fn advertised(&self) -> [(u64, u64); 5] {
         use setting_id as id;
 
         [
@@ -223,9 +230,6 @@ impl Settings {
             ),
             (id::RELIABLE_LANE_LIMIT, self.reliable_lane_limit),
             (id::IDLE_TIMEOUT_MS, self.idle_timeout_ms),
-            (id::ACTIVE_KEEPALIVE_MS, self.active_keepalive_ms),
-            (id::COMPRESSION_MIN_GAIN_BPS, self.compression_min_gain_bps),
-            (id::TELEMETRY_LEVEL, self.telemetry_level),
         ]
     }
 }
@@ -386,15 +390,12 @@ pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
 }
 
 /// Every registered setting, in identifier order.
-pub const REGISTERED_SETTINGS: [u64; 8] = [
+pub const REGISTERED_SETTINGS: [u64; 5] = [
     setting_id::MAX_CONTROL_FRAME_PAYLOAD,
     setting_id::MAX_DATA_RECORD_PAYLOAD,
     setting_id::MAX_MANIFEST_PAGE_PAYLOAD,
     setting_id::RELIABLE_LANE_LIMIT,
     setting_id::IDLE_TIMEOUT_MS,
-    setting_id::ACTIVE_KEEPALIVE_MS,
-    setting_id::COMPRESSION_MIN_GAIN_BPS,
-    setting_id::TELEMETRY_LEVEL,
 ];
 
 /// Every registered operation, in identifier order.
@@ -488,9 +489,6 @@ pub const fn setting_range(identifier: u64) -> Option<(u64, u64)> {
         id::MAX_MANIFEST_PAGE_PAYLOAD => Some((64 * 1024, 1024 * 1024)),
         id::RELIABLE_LANE_LIMIT => Some((1, 256)),
         id::IDLE_TIMEOUT_MS => Some((1000, 600_000)),
-        id::ACTIVE_KEEPALIVE_MS => Some((10_000, 30_000)),
-        id::COMPRESSION_MIN_GAIN_BPS => Some((0, 10_000)),
-        id::TELEMETRY_LEVEL => Some((0, 2)),
         _ => None,
     }
 }
@@ -505,9 +503,6 @@ fn setting_field(settings: &mut Settings, identifier: u64) -> Option<&mut u64> {
         id::MAX_MANIFEST_PAGE_PAYLOAD => Some(&mut settings.max_manifest_page_payload),
         id::RELIABLE_LANE_LIMIT => Some(&mut settings.reliable_lane_limit),
         id::IDLE_TIMEOUT_MS => Some(&mut settings.idle_timeout_ms),
-        id::ACTIVE_KEEPALIVE_MS => Some(&mut settings.active_keepalive_ms),
-        id::COMPRESSION_MIN_GAIN_BPS => Some(&mut settings.compression_min_gain_bps),
-        id::TELEMETRY_LEVEL => Some(&mut settings.telemetry_level),
         _ => None,
     }
 }
@@ -1227,8 +1222,8 @@ mod tests {
         let settings = decode_settings(&payload).unwrap();
         assert_eq!(settings.reliable_lane_limit, 32);
         assert_eq!(
-            settings.telemetry_level,
-            Settings::default().telemetry_level
+            settings.idle_timeout_ms,
+            Settings::default().idle_timeout_ms
         );
     }
 
@@ -1324,12 +1319,12 @@ mod tests {
 
         let mut duplicate = Vec::new();
         for _ in 0..2 {
-            encode_varint(setting_id::TELEMETRY_LEVEL, &mut duplicate).unwrap();
-            encode_varint(1, &mut duplicate).unwrap();
+            encode_varint(setting_id::IDLE_TIMEOUT_MS, &mut duplicate).unwrap();
+            encode_varint(60_000, &mut duplicate).unwrap();
         }
         assert_eq!(
             decode_settings(&duplicate),
-            Err(SettingsError::Duplicate(setting_id::TELEMETRY_LEVEL))
+            Err(SettingsError::Duplicate(setting_id::IDLE_TIMEOUT_MS))
         );
 
         let mut invalid = Vec::new();
@@ -1663,14 +1658,14 @@ mod tests {
         use setting_id as id;
 
         let out_of_range = Settings {
-            telemetry_level: 3,
+            idle_timeout_ms: 999,
             ..Settings::default()
         };
         assert_eq!(
             encode_settings(&out_of_range, &mut Vec::new()),
             Err(SettingsError::InvalidValue {
-                setting: setting_id::TELEMETRY_LEVEL,
-                value: 3,
+                setting: setting_id::IDLE_TIMEOUT_MS,
+                value: 999,
             })
         );
         assert_eq!(
@@ -1687,16 +1682,13 @@ mod tests {
         );
         assert_eq!(setting_range(id::RELIABLE_LANE_LIMIT), Some((1, 256)));
         assert_eq!(setting_range(id::IDLE_TIMEOUT_MS), Some((1000, 600_000)));
-        assert_eq!(
-            setting_range(id::ACTIVE_KEEPALIVE_MS),
-            Some((10_000, 30_000))
-        );
-        assert_eq!(
-            setting_range(id::COMPRESSION_MIN_GAIN_BPS),
-            Some((0, 10_000))
-        );
-        assert_eq!(setting_range(id::TELEMETRY_LEVEL), Some((0, 2)));
         assert_eq!(setting_range(0x02), None);
+        // ADR-0035 retired these three. A range would mean something still
+        // reads them.
+        for retired in id::RETIRED {
+            assert_eq!(setting_range(retired), None, "{retired:#04x}");
+            assert!(!REGISTERED_SETTINGS.contains(&retired), "{retired:#04x}");
+        }
 
         for identifier in REGISTERED_SETTINGS {
             let (low, high) = setting_range(identifier).expect("a registered setting has a range");

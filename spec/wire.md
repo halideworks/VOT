@@ -1,10 +1,10 @@
 # VOT v0.3 Wire Protocol
 
-Status: frozen envelope for prototype ALPN `vot-draft-04`
+Status: frozen envelope for prototype ALPN `vot-draft-05`
 
 ## 1. Transport binding and versioning
 
-The prototype ALPN is the ASCII string `vot-draft-04`. Implementations MUST NOT
+The prototype ALPN is the ASCII string `vot-draft-05`. Implementations MUST NOT
 advertise or claim registration of `vot/1`. A major incompatible protocol change
 uses a new ALPN. Compatible additions use settings, extension negotiation, and
 optional length-delimited frames.
@@ -18,7 +18,7 @@ requires an authenticated session becomes valid.
 The `HELLO` payload is:
 
 ```text
-QUIC-varint draft_revision       ; 4 for vot-draft-04
+QUIC-varint draft_revision       ; 5 for vot-draft-05
 QUIC-varint endpoint_role        ; 0 client, 1 server
 QUIC-varint extension_count      ; at most 256
 extension_count * QUIC-varint extension_id

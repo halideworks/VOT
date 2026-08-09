@@ -177,7 +177,7 @@ audit metadata only.
 
 ## 6. Wire and transport architecture
 
-The prototype ALPN is `vot-draft-04`. It MUST NOT claim the unregistered
+The prototype ALPN is `vot-draft-05`. It MUST NOT claim the unregistered
 `vot/1` ALPN. A major incompatible version uses a new ALPN; compatible features
 use `SETTINGS`, registered extension identifiers, and optional frames.
 
@@ -206,9 +206,9 @@ Datagram mode begins with zero credit. A monotonic `credit_epoch` supersedes
 older credit and places absolute caps on unretired bytes, active generations,
 and decode work. Wall-clock expiry is not a correctness mechanism.
 
-Default connection settings are a 90-second idle timeout and a 20-second
-active-transfer keepalive. Keepalive is disabled without an active reservation
-or resumable lease; deployments may configure it within 10--30 seconds. Server
+The default connection idle timeout is 90 seconds. There is no keepalive:
+ADR-0035 retired the setting that configured one, because nothing implemented
+a keepalive timer, and it returns with the timer rather than before it. Server
 connection IDs are opaque to application logic. The default relay profile uses
 a nonzero 16-byte server CID and transport adapters support a deployment-supplied
 CID generator or router.
@@ -270,9 +270,8 @@ end-to-end deadline certificate.
 | Manifest page maximum | 1 MiB canonical bytes |
 | Session/incarnation identifier | 128 random bits |
 | Default reliable lane count | 16, locally tunable |
-| Prototype ALPN | `vot-draft-04` |
-| Default idle timeout | 90 s |
-| Active keepalive | 20 s |
+| Prototype ALPN | `vot-draft-05` |
+| Default idle timeout | 90 s, negotiated; see ADR-0035 for what installs it |
 | Online VCRC objective | CVaR95 |
 | Initial VCRC scenarios | 256, adaptively expanded |
 | Datagram FEC field | GF(2^8) |
@@ -290,7 +289,7 @@ stable implementation record. All are accepted; none are waived.
 | R3: Risk certificate and exhaustion | Accept | First-wave frontier event and monotonic spend-down ledger; reliable-only behavior at exhaustion; no automatic reset. See ADR-0002. |
 | R4: Congestion-control scope | Accept | Production does not depend on custom CC; clean-room controller remains simulator-only pending safety, coexistence, and legal review. |
 | R5: Proof suites and transport | Accept | Exactly two v1 suites and in-band range proofs; no mandatory proof-index bootstrap. See ADR-0003. |
-| R6: Versioning and extensions | Accept | `vot-draft-04`, length-delimited frames, critical/optional handling, greasing, and registries. |
+| R6: Versioning and extensions | Accept | `vot-draft-05`, length-delimited frames, critical/optional handling, greasing, and registries. |
 | R7: Connection, CID, and credit behavior | Accept | Fixed initial timeout/keepalive defaults, opaque deployable CIDs, bounded reliable flow control, monotonic datagram credit epochs. |
 | R8: Rail policy and restored requirements | Accept | Single production public rail per bottleneck; provisioned multi-rail by policy; restored commit, resume, pack, compression, legal, security, GC, and telemetry gates remain normative. See ADR-0004. |
 

@@ -198,9 +198,6 @@ fn setting_value(settings: &Settings, identifier: u64) -> u64 {
         id::MAX_MANIFEST_PAGE_PAYLOAD => settings.max_manifest_page_payload,
         id::RELIABLE_LANE_LIMIT => settings.reliable_lane_limit,
         id::IDLE_TIMEOUT_MS => settings.idle_timeout_ms,
-        id::ACTIVE_KEEPALIVE_MS => settings.active_keepalive_ms,
-        id::COMPRESSION_MIN_GAIN_BPS => settings.compression_min_gain_bps,
-        id::TELEMETRY_LEVEL => settings.telemetry_level,
         _ => u64::MAX,
     }
 }
@@ -340,14 +337,16 @@ mod tests {
     fn negotiation_lines_report_values_and_refusals() {
         // The oracle is what a validator written from the specification talks
         // to, so its own encoding of a result has to be exercised.
-        assert_eq!(hello_line("040000"), "ok|4|0|re=040000");
-        assert_eq!(hello_line("040003000206"), "ok|4|0|0|2|6|re=040003000206");
+        assert_eq!(hello_line("050000"), "ok|5|0|re=050000");
+        assert_eq!(hello_line("050003000206"), "ok|5|0|0|2|6|re=050003000206");
         // A server-role payload decodes rather than being reported as the role
         // mismatch a client-side session would see.
-        assert_eq!(hello_line("040100"), "ok|4|1|re=040100");
+        assert_eq!(hello_line("050100"), "ok|5|1|re=050100");
         assert_eq!(hello_line("030000"), "err|UNSUPPORTED_VERSION");
-        assert_eq!(hello_line("040200"), "err|MALFORMED_FRAME");
-        assert_eq!(hello_line("04004101"), "err|RESOURCE_LIMIT");
+        // The revision this build replaced is now one it will not speak.
+        assert_eq!(hello_line("040000"), "err|UNSUPPORTED_VERSION");
+        assert_eq!(hello_line("050200"), "err|MALFORMED_FRAME");
+        assert_eq!(hello_line("05004101"), "err|RESOURCE_LIMIT");
         assert_eq!(hello_line("0"), "err|INVALID_HEX");
 
         // Every registered setting reported, not only the first and last. A
@@ -355,11 +354,22 @@ mod tests {
         // thought it was and still passing.
         assert_eq!(
             settings_line(""),
-            "ok|1=1048576|3=262144|5=1048576|7=16|9=90000|11=20000|32=500|34=1\
-             |re=01801000000380040000058010000007100980015f900b80004e202041f42201"
+            "ok|1=1048576|3=262144|5=1048576|7=16|9=90000\
+             |re=01801000000380040000058010000007100980015f90"
                 .replace(' ', "")
         );
         assert_eq!(settings_line("410101"), "err|INVALID_SETTING");
+        // ADR-0035 retired 0x0b, 0x20, and 0x22. The first was critical, so a
+        // peer still sending it closes the session under the same code any
+        // unknown critical setting closes under; the other two are optional
+        // and are ignored, which is what forward compatibility means.
+        assert_eq!(settings_line("0b80004e20"), "err|INVALID_SETTING");
+        assert_eq!(
+            settings_line("2041f4"),
+            settings_line(""),
+            "a retired optional setting changes nothing"
+        );
+        assert_eq!(settings_line("2201"), settings_line(""));
         assert_eq!(settings_line("07100710"), "err|DUPLICATE_SETTING");
         assert_eq!(settings_line("01"), "err|MALFORMED_FRAME");
         assert_eq!(settings_line("0"), "err|INVALID_HEX");

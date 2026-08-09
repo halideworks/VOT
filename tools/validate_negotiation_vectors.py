@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 MAX_VARINT = (1 << 62) - 1
-DRAFT_REVISION = 4
+DRAFT_REVISION = 5
 MAX_EXTENSIONS_PER_HELLO = 256
 MAX_SETTINGS_PER_FRAME = 128
 
@@ -141,7 +141,7 @@ def validate(path: Path) -> None:
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["format"] == "vot-wire-negotiation-v1"
     assert document["draft_revision"] == DRAFT_REVISION
-    assert document["alpn"] == "vot-draft-04"
+    assert document["alpn"] == "vot-draft-05"
     assert document["max_extensions_per_hello"] == MAX_EXTENSIONS_PER_HELLO
     assert document["max_settings_per_frame"] == MAX_SETTINGS_PER_FRAME
 
@@ -149,7 +149,7 @@ def validate(path: Path) -> None:
     assert registry, "no settings registry entries"
     for entry in registry.values():
         assert entry["min"] <= entry["default"] <= entry["max"], entry["name"]
-        assert entry["min"] < entry["max"] or entry["name"] == "TELEMETRY_LEVEL", entry["name"]
+        assert entry["min"] < entry["max"], entry["name"]
         # spec/wire.md section 2 puts criticality in the least-significant bit,
         # and the settings registry uses the same convention: a peer that does
         # not know an odd identifier must stop rather than carry on.

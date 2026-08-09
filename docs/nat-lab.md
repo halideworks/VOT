@@ -14,6 +14,15 @@ tools/nat_lab.sh --matrix
 tools/nat_lab.sh --serve-nat permissive --fetch-nat cone
 ```
 
+A single run exits 0 when the fetch completed and 1 when it did not, so it can
+gate something. A matrix is a report and exits 0 whatever its rows say. Either
+exits 2 when the rig itself failed, which is not a NAT verdict: an unbuildable
+topology stops the lab rather than printing a row that reads like a result.
+
+`--bundle` moves a bundle the lab did not build, and needs `--root` with it,
+because nothing reads a root back off a bundle directory. Without them the lab
+builds a 1 MiB bundle and takes the root from the send that built it.
+
 ## What the flavours model
 
 | Flavour | Rules | What it is |
@@ -28,21 +37,29 @@ differently, which is the lab's main result. See below.
 
 ## The matrix
 
-Measured 2026-08-08 on erebus, a 256 KiB bundle, one rail. Times are the whole
-fetch including resolve.
+Measured 2026-08-08 on erebus by `tools/nat_lab.sh --matrix`, which is a 1 MiB
+bundle at four rails. Times are the whole fetch including resolve. The rail
+count is pinned in the script rather than taken from the machine, so a row's
+elapsed time means the same thing on another host.
 
 | Serve | Fetch | Outcome | Elapsed |
 |---|---|---|---|
-| direct | direct | fetched | 0.62s |
+| direct | direct | fetched | 0.63s |
 | direct | cone | fetched | 0.62s |
-| direct | permissive | fetched | 0.63s |
-| direct | symmetric | fetched | 3.64s |
+| direct | permissive | fetched | 0.62s |
+| direct | symmetric | fetched | 3.59s |
 | cone | direct | fetched | 1.15s |
-| cone | cone | fetched | 1.15s |
+| cone | cone | fetched | 1.14s |
 | cone | permissive | fetched | 1.15s |
-| cone | symmetric | failed | 17.01s |
-| permissive | any | failed | 15-17s |
-| symmetric | any | failed | 15-17s |
+| cone | symmetric | failed | 17.07s |
+| permissive | direct | failed | 15.51s |
+| permissive | cone | failed | 17.04s |
+| permissive | permissive | failed | 17.04s |
+| permissive | symmetric | failed | 17.01s |
+| symmetric | direct | failed | 15.51s |
+| symmetric | cone | failed | 17.05s |
+| symmetric | permissive | failed | 17.02s |
+| symmetric | symmetric | failed | 17.07s |
 
 Two things fall out of it.
 

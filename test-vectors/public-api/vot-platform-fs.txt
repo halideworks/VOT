@@ -1,0 +1,3 @@
+function vot_platform_fs::allow_unordered_writes
+function vot_platform_fs::atomic_replace
+function vot_platform_fs::same_file_regular

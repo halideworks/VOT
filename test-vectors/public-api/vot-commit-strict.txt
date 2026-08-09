@@ -1,0 +1,11 @@
+constant vot_commit_strict::DIRECT_READ_BUFFER_BYTES
+constant vot_commit_strict::MAX_DIRECT_ALIGNMENT
+enum vot_commit_strict::DirectHash
+enum vot_commit_strict::DirectIdentity
+enum vot_commit_strict::Error
+enum vot_commit_strict::VerificationOutcome
+function vot_commit_strict::verify
+function vot_commit_strict::verify_and_advance
+struct vot_commit_strict::LinuxDirectReader
+trait vot_commit_strict::ReadBack
+use vot_commit_strict::Suite <- vot_verifier::Suite

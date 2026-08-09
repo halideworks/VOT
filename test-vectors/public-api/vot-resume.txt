@@ -1,0 +1,16 @@
+constant vot_resume::units::MAX_UNIT
+enum vot_resume::Error
+enum vot_resume::PathReject
+enum vot_resume::units::RunError
+function vot_resume::remove_files
+module vot_resume::units
+struct vot_resume::CarefulResumeCache
+struct vot_resume::CarrierNeutralState
+struct vot_resume::Observation
+struct vot_resume::Reconnaissance
+struct vot_resume::RemoteEndpoint
+struct vot_resume::ResumePermit
+struct vot_resume::ResumeStore
+struct vot_resume::ResumeTracker
+struct vot_resume::UnitRanges
+struct vot_resume::units::UnitRanges

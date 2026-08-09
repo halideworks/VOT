@@ -1,0 +1,5 @@
+constant vot_transport_queue::DEFAULT_BYTE_LIMIT
+constant vot_transport_queue::DEFAULT_COUNT_LIMIT
+constant vot_transport_queue::INBOUND_BYTE_CAPACITY
+enum vot_transport_queue::Command
+struct vot_transport_queue::Queue

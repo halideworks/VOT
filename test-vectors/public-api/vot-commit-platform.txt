@@ -1,0 +1,11 @@
+constant vot_commit_platform::MACOS_PROVIDER
+constant vot_commit_platform::WINDOWS_PROVIDER
+enum vot_commit_platform::Error
+enum vot_commit_platform::NamespaceOperation
+enum vot_commit_platform::Platform
+function vot_commit_platform::capabilities
+function vot_commit_platform::claim
+function vot_commit_platform::native_platform
+function vot_commit_platform::publish_native
+struct vot_commit_platform::Capabilities
+struct vot_commit_platform::PublicationClaim

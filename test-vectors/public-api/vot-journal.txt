@@ -1,0 +1,10 @@
+constant vot_journal::CRC32C_EMPTY
+enum vot_journal::Error
+function vot_journal::crc32c
+function vot_journal::crc32c_combine
+function vot_journal::crc32c_update
+function vot_journal::replay
+struct vot_journal::DurableWitness
+struct vot_journal::Journal
+struct vot_journal::Record
+struct vot_journal::Replay

@@ -1,0 +1,3 @@
+enum vot_commit_object::Error
+struct vot_commit_object::ObjectCommit
+struct vot_commit_object::Receipt

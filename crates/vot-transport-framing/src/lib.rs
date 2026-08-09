@@ -631,6 +631,64 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_charge_always_equals_the_bytes_held() {
+        // Characterization for the accounting refactor: after every accept,
+        // whatever its outcome, the shared budget holds exactly what the
+        // framer buffers. A skipped frame charges nothing at any point.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&frame(64));
+        vot_codec::encode_frame(0x1f00, &vec![0x11; 900], &mut stream)
+            .expect("an unknown optional frame");
+        stream.extend_from_slice(&frame(1));
+        stream.extend_from_slice(&frame(700));
+        vot_codec::encode_frame(0x1ffe, &[], &mut stream).expect("an empty grease frame");
+        stream.extend_from_slice(&frame(0));
+        stream.extend_from_slice(&frame(333));
+
+        let expected = vec![frame(64), frame(1), frame(700), frame(0), frame(333)];
+        for chunk in [1_usize, 2, 3, 5, 16, 64, 641, stream.len()] {
+            let shared = budget();
+            let mut framing =
+                Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
+            let mut delivered = Vec::new();
+            for piece in stream.chunks(chunk) {
+                framing
+                    .accept(piece, |frame| {
+                        delivered.push(frame.to_vec());
+                        Ok(())
+                    })
+                    .expect("a well-formed stream");
+                assert_eq!(shared.held(), framing.buffered(), "chunk size {chunk}");
+            }
+            assert_eq!(delivered, expected, "chunk size {chunk}");
+            assert_eq!(shared.held(), 0, "chunk size {chunk}");
+        }
+        // A refused frame leaves the charge equal to what is still held, and
+        // release returns every charged byte.
+        let narrow = Arc::new(StandaloneBudget::new(100));
+        let mut framing = Framing::new(StreamKind::Control, Arc::clone(&narrow), control_limit());
+        let whole = frame(400);
+        assert_eq!(
+            collect(&mut framing, &whole[..300]),
+            Err(FrameFault::exhausted())
+        );
+        assert_eq!(narrow.held(), framing.buffered());
+        framing.release();
+        assert_eq!(narrow.held(), 0);
+        assert_eq!(framing.buffered(), 0);
+
+        // An emit refusal mid-batch keeps the invariant too.
+        let shared = budget();
+        let mut framing = Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
+        let mut coalesced = frame(8);
+        coalesced.extend_from_slice(&frame(16));
+        coalesced.extend_from_slice(&frame(24)[..10]);
+        let outcome = framing.accept(&coalesced, |_| Err(FrameFault::exhausted()));
+        assert_eq!(outcome, Err(FrameFault::exhausted()));
+        assert_eq!(shared.held(), framing.buffered());
+    }
+
+    #[test]
     fn a_malformed_frame_closes_under_the_code_the_registry_gives_it() {
         let mut framing = Framing::new(StreamKind::Control, budget(), control_limit());
         let mut malformed = Vec::new();

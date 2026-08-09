@@ -1,0 +1,12 @@
+constant vot_pack::CANDIDATE_MAX
+constant vot_pack::HARD_MAX
+constant vot_pack::MAX_ENTRIES_PER_PACK
+constant vot_pack::TARGET_SIZE
+enum vot_pack::Error
+function vot_pack::build
+function vot_pack::build_with_suite
+function vot_pack::extract
+struct vot_pack::LogicalFile
+struct vot_pack::Pack
+struct vot_pack::PackedEntry
+struct vot_pack::StreamingPacker

@@ -1,0 +1,9 @@
+enum vot_commit_model::Assurance
+enum vot_commit_model::Error
+enum vot_commit_model::Event
+enum vot_commit_model::Profile
+enum vot_commit_model::State
+function vot_commit_model::transition_corpus
+struct vot_commit_model::Machine
+struct vot_commit_model::Observation
+struct vot_commit_model::TransitionRow

@@ -1,0 +1,14 @@
+constant vot_session::DEFAULT_PENDING_RECORD_BYTES
+constant vot_session::DEFAULT_PENDING_RECORD_COUNT
+constant vot_session::MAX_AUTHENTICATION_ATTEMPTS
+enum vot_session::Accepted
+enum vot_session::Authentication
+enum vot_session::ErrorKind
+enum vot_session::Lane
+enum vot_session::PresentationError
+enum vot_session::Side
+enum vot_session::State
+function vot_session::no_capability
+struct vot_session::Error
+struct vot_session::Negotiation
+struct vot_session::Session

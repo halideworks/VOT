@@ -1,0 +1,9 @@
+enum vot_commit_posix::Error
+enum vot_commit_posix::FaultPoint
+enum vot_commit_posix::RecoveryDisposition
+enum vot_commit_posix::TraceEvent
+function vot_commit_posix::recover
+struct vot_commit_posix::NoFaults
+struct vot_commit_posix::PosixCommit
+struct vot_commit_posix::Receipt
+trait vot_commit_posix::FaultInjector

@@ -1,0 +1,6 @@
+enum vot_object_store::Error
+struct vot_object_store::CompletedObject
+struct vot_object_store::MockStore
+struct vot_object_store::PartReceipt
+struct vot_object_store::S3Adapter
+trait vot_object_store::S3Compatible

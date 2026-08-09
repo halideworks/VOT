@@ -90,23 +90,19 @@ impl AwsS3Store {
                     .send(),
             )
             .map_err(|_| Error::Backend)?;
-        let mut length = 0_u64;
-        let mut checksum = vot_journal::CRC32C_EMPTY;
-        loop {
-            let chunk = self
-                .runtime
-                .block_on(output.body.next())
-                .transpose()
-                .map_err(|_| Error::Backend)?;
-            let Some(chunk) = chunk else {
-                break;
-            };
-            length = length
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::Backend)?;
-            checksum = vot_journal::crc32c_update(checksum, &chunk);
-        }
-        Ok((length, checksum))
+        // One entry into the runtime for the whole body, not one per chunk.
+        self.runtime.block_on(async {
+            let mut length = 0_u64;
+            let mut checksum = vot_journal::CRC32C_EMPTY;
+            while let Some(chunk) = output.body.next().await {
+                let chunk = chunk.map_err(|_| Error::Backend)?;
+                length = length
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(Error::Backend)?;
+                checksum = vot_journal::crc32c_update(checksum, &chunk);
+            }
+            Ok((length, checksum))
+        })
     }
 }
 

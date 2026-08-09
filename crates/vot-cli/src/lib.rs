@@ -72,6 +72,51 @@ pub fn parse_package_root(value: &str) -> Result<[u8; 32], Error> {
     Ok(root)
 }
 
+/// Set to fetch from an address without naming the package to accept.
+pub const UNPINNED: &str = "VOT_FETCH_UNPINNED";
+
+/// The package root a fetch at an address will accept.
+///
+/// Required. An address says where to fetch from, not what to fetch, and the
+/// channel is not authenticated, so the root is the only thing that decides
+/// which package this is. A root-addressed fetch does not come through here:
+/// it already named one to resolve.
+///
+/// [`UNPINNED`] is the way out, for a server whose package the caller cannot
+/// know in advance.
+///
+/// Here rather than in the binary because the binary is excluded from
+/// mutation testing, and this is a decision rather than a dispatch.
+///
+/// # Errors
+/// Reports [`Error::UnpinnedFetch`] for no root without the override, and
+/// [`Error::InvalidArguments`] for a root that is not one.
+pub fn address_pin(root: Option<&str>) -> Result<Option<[u8; 32]>, Error> {
+    pin_for_address(
+        root,
+        unpinned_allowed(std::env::var_os(UNPINNED).as_deref()),
+    )
+}
+
+/// Whether [`UNPINNED`] says to fetch without a root.
+///
+/// Set and empty is not permission. A variable that carries nothing is what
+/// an unset one expands to in a shell, so reading it as yes would turn
+/// `VOT_FETCH_UNPINNED=$MAYBE` into a silent waiver.
+fn unpinned_allowed(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+/// [`address_pin`] with the override as an argument, so a test can hold both
+/// answers without setting a variable every parallel test would see.
+fn pin_for_address(root: Option<&str>, unpinned_allowed: bool) -> Result<Option<[u8; 32]>, Error> {
+    match root {
+        Some(root) => parse_package_root(root).map(Some),
+        None if unpinned_allowed => Ok(None),
+        None => Err(Error::UnpinnedFetch),
+    }
+}
+
 /// Every address a rendezvous service answers at, given `ADDR:PORT` or
 /// `NAME:PORT`, or a comma-separated list of either, IPv6 first.
 ///
@@ -2051,6 +2096,48 @@ mod tests {
             parse_package_root(&spoiled),
             Err(Error::InvalidArguments)
         ));
+    }
+
+    #[test]
+    fn a_fetch_at_an_address_names_the_package_or_says_it_will_not() {
+        let root = "11".repeat(32);
+        assert_eq!(
+            pin_for_address(Some(&root), false).expect("a root"),
+            Some([0x11; 32]),
+            "a named root is the pin, override or not"
+        );
+        assert_eq!(
+            pin_for_address(Some(&root), true).expect("a root"),
+            Some([0x11; 32])
+        );
+        assert!(
+            matches!(pin_for_address(None, false), Err(Error::UnpinnedFetch)),
+            "an address alone does not say which package to accept"
+        );
+        assert_eq!(
+            pin_for_address(None, true).expect("the override"),
+            None,
+            "and the override is what makes it a choice rather than an accident"
+        );
+        // A root that is not one is the argument error it always was, not the
+        // refusal this adds.
+        assert!(matches!(
+            pin_for_address(Some("nonsense"), false),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn only_a_variable_that_carries_something_waives_the_pin() {
+        use std::ffi::OsStr;
+
+        assert!(unpinned_allowed(Some(OsStr::new("1"))));
+        assert!(unpinned_allowed(Some(OsStr::new("no"))), "any value is yes");
+        assert!(!unpinned_allowed(None), "unset is not a waiver");
+        assert!(
+            !unpinned_allowed(Some(OsStr::new(""))),
+            "set and empty is what an unset variable expands to, not a waiver"
+        );
     }
 
     /// Without the carrier the wire commands say which feature they need,

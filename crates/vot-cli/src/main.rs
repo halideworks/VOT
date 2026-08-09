@@ -242,7 +242,8 @@ fn serve(
             // is the only place it is printed while the serve is still up. A
             // reader who has to go and find it is a reader who fetches unpinned.
             println!(
-                "fetch it with: vot fetch {at} BUNDLE_DIR {}",
+                "fetch it with: vot fetch {} BUNDLE_DIR {}",
+                reachable(at),
                 root_hex(&root)
             );
         })?;
@@ -262,41 +263,9 @@ fn rendezvous_service_addresses() -> Result<Vec<std::net::SocketAddr>, vot_cli::
     vot_cli::parse_rendezvous(&named)
 }
 
-/// Set to fetch from an address without naming the package to accept.
-const UNPINNED: &str = "VOT_FETCH_UNPINNED";
-
-/// The package root a fetch at an address will accept.
-///
-/// Required. An address says where to fetch from, not what to fetch, and the
-/// channel is not authenticated, so the root is the only thing that decides
-/// which package this is. A root-addressed fetch does not come through here:
-/// it already named one to resolve.
-///
-/// [`UNPINNED`] is the way out, for a server whose package the caller cannot
-/// know in advance.
-fn address_pin(root: Option<&str>) -> Result<Option<[u8; 32]>, vot_cli::Error> {
-    pin_for_address(
-        root,
-        std::env::var_os(UNPINNED).is_some_and(|value| !value.is_empty()),
-    )
-}
-
-/// [`address_pin`] with the override as an argument, so a test can hold both
-/// answers without setting a variable every parallel test would see.
-fn pin_for_address(
-    root: Option<&str>,
-    unpinned_allowed: bool,
-) -> Result<Option<[u8; 32]>, vot_cli::Error> {
-    match root {
-        Some(root) => vot_cli::parse_package_root(root).map(Some),
-        None if unpinned_allowed => Ok(None),
-        None => Err(vot_cli::Error::UnpinnedFetch),
-    }
-}
-
 fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
     let package = if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        vot_cli::fetch_bundle(address, Path::new(bundle), address_pin(root)?)
+        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -323,7 +292,7 @@ fn pull(
     // The key is loaded before a byte crosses the wire.
     let key = vot_cli::load_key_spec(key)?;
     if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        vot_cli::fetch_bundle(address, Path::new(bundle), address_pin(root)?)?;
+        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)?;
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -344,6 +313,21 @@ fn pull(
     Ok(())
 }
 
+/// How to name this listener in a command someone else runs.
+///
+/// A wildcard bind answers on every address this host has and is not one of
+/// them: `0.0.0.0` reaches this host from this host and nowhere else. Naming
+/// it in a fetch command would be an instruction that works where it is
+/// printed and fails everywhere it is pasted, so the host part is left for
+/// the reader to fill in.
+fn reachable(at: std::net::SocketAddr) -> String {
+    if at.ip().is_unspecified() {
+        format!("THIS_HOST:{}", at.port())
+    } else {
+        at.to_string()
+    }
+}
+
 fn root_hex(root: &[u8; 32]) -> String {
     let mut output = String::with_capacity(64);
     for byte in root {
@@ -358,35 +342,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_fetch_at_an_address_names_the_package_or_says_it_will_not() {
-        let root = "11".repeat(32);
-        assert_eq!(
-            pin_for_address(Some(&root), false).expect("a root"),
-            Some([0x11; 32]),
-            "a named root is the pin, override or not"
-        );
-        assert_eq!(
-            pin_for_address(Some(&root), true).expect("a root"),
-            Some([0x11; 32])
-        );
-        assert!(
-            matches!(
-                pin_for_address(None, false),
-                Err(vot_cli::Error::UnpinnedFetch)
-            ),
-            "an address alone does not say which package to accept"
-        );
-        assert_eq!(
-            pin_for_address(None, true).expect("the override"),
-            None,
-            "and the override is what makes it a choice rather than an accident"
-        );
-        // A root that is not one is the argument error it always was, not
-        // the refusal this adds.
-        assert!(matches!(
-            pin_for_address(Some("nonsense"), false),
-            Err(vot_cli::Error::InvalidArguments)
-        ));
+    fn a_wildcard_bind_is_not_an_address_to_hand_out() {
+        let named = |text: &str| reachable(text.parse().expect("an address"));
+        assert_eq!(named("0.0.0.0:9000"), "THIS_HOST:9000");
+        assert_eq!(named("[::]:9000"), "THIS_HOST:9000");
+        assert_eq!(named("127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(named("198.51.100.7:9000"), "198.51.100.7:9000");
+        assert_eq!(named("[2001:db8::7]:9000"), "[2001:db8::7]:9000");
     }
 
     #[test]

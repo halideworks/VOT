@@ -231,7 +231,10 @@ const SERVE_ISSUER_NAME: &str = "VOT_SERVE_ISSUER_NAME";
 /// The deployment a capability must name.
 const SERVE_AUDIENCE: &str = "VOT_SERVE_AUDIENCE";
 
-/// What this serve requires of a fetch, or nothing.
+/// What a serve requires of a fetch, or nothing.
+///
+/// Takes the values rather than reading them, like every other reader here,
+/// so a test can hold both answers without an environment it cannot set.
 ///
 /// All three or none. A serve given a key but no audience would accept a
 /// token minted for another deployment, and one given an audience but no key
@@ -240,23 +243,25 @@ const SERVE_AUDIENCE: &str = "VOT_SERVE_AUDIENCE";
 /// # Errors
 /// Rejects a partial configuration and a key source that is not an Ed25519
 /// public key.
-fn requirement_from_env(root: [u8; 32]) -> Result<Option<crate::authz::Requirement>, Error> {
-    let named =
-        [SERVE_ISSUER, SERVE_ISSUER_NAME, SERVE_AUDIENCE].map(|name| std::env::var(name).ok());
-    let [issuer_source, issuer_name, audience] = named;
-    match (issuer_source, issuer_name, audience) {
+fn requirement_from(
+    issuer_source: Option<&str>,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    root: [u8; 32],
+) -> Result<Option<crate::authz::Requirement>, Error> {
+    match (issuer_source, issuer, audience) {
         (None, None, None) => Ok(None),
         (Some(source), Some(issuer), Some(audience)) => {
-            let crate::KeyMaterial::Verifying(key) = crate::load_key_spec(&source)? else {
+            let crate::KeyMaterial::Verifying(key) = crate::load_key_spec(source)? else {
                 // A signing key here would let the serve mint what it checks,
                 // and a shared secret is not what a capability is signed with.
                 return Err(Error::InvalidArguments);
             };
             Ok(Some(crate::authz::Requirement::new(
-                &issuer,
+                issuer,
                 crate::authz::key_id_of(&key),
                 *key,
-                &audience,
+                audience,
                 root,
             )))
         }
@@ -282,7 +287,12 @@ pub fn serve_bundle(
     let server = BundleServer::open(bundle)?;
     // Read before the port is bound, so a misconfigured requirement is an
     // argument error rather than a serve that listens and refuses everyone.
-    let requirement = requirement_from_env(server.package().root)?;
+    let requirement = requirement_from(
+        std::env::var(SERVE_ISSUER).ok().as_deref(),
+        std::env::var(SERVE_ISSUER_NAME).ok().as_deref(),
+        std::env::var(SERVE_AUDIENCE).ok().as_deref(),
+        server.package().root,
+    )?;
     let ephemeral = match credentials {
         Credentials::Ephemeral => Some(Ephemeral::generate()?),
         Credentials::Files { .. } => None,
@@ -649,7 +659,9 @@ const FETCH_CAPABILITY: &str = "VOT_FETCH_CAPABILITY";
 /// The holder key that capability names, as a `KEY_SOURCE`.
 const FETCH_HOLDER_KEY: &str = "VOT_FETCH_HOLDER_KEY";
 
-/// The capability this fetch will present, or nothing.
+/// The capability a fetch will present, or nothing.
+///
+/// Takes the values, for the reason [`requirement_from`] does.
 ///
 /// Both or neither, for the reason a serve needs all three: a token with no
 /// key cannot be proved, and a key with no token proves nothing.
@@ -658,20 +670,20 @@ const FETCH_HOLDER_KEY: &str = "VOT_FETCH_HOLDER_KEY";
 /// Rejects a partial configuration, a key source that is not an Ed25519
 /// secret, a token this build cannot read, and a key that is not the holder
 /// the token names.
-fn holder_from_env() -> Result<Option<std::sync::Arc<crate::authz::Holder>>, Error> {
-    match (
-        std::env::var(FETCH_CAPABILITY).ok(),
-        std::env::var(FETCH_HOLDER_KEY).ok(),
-    ) {
+fn holder_from(
+    capability: Option<&str>,
+    key_source: Option<&str>,
+) -> Result<Option<std::sync::Arc<crate::authz::Holder>>, Error> {
+    match (capability, key_source) {
         (None, None) => Ok(None),
         (Some(path), Some(source)) => {
-            let crate::KeyMaterial::Signing(key) = crate::load_key_spec(&source)? else {
+            let crate::KeyMaterial::Signing(key) = crate::load_key_spec(source)? else {
                 // Proving possession needs the private half. A public key
                 // here is the labelling mistake the key sources exist to
                 // catch.
                 return Err(Error::InvalidArguments);
             };
-            let token = std::fs::read(Path::new(&path))?;
+            let token = std::fs::read(Path::new(path))?;
             Ok(Some(std::sync::Arc::new(crate::authz::Holder::new(
                 token, *key,
             )?)))
@@ -705,7 +717,15 @@ fn fetch_over<F>(
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
-    let mut fetcher = BundleFetcher::begin_with(primary, bundle, pin, holder_from_env()?)?;
+    let mut fetcher = BundleFetcher::begin_with(
+        primary,
+        bundle,
+        pin,
+        holder_from(
+            std::env::var(FETCH_CAPABILITY).ok().as_deref(),
+            std::env::var(FETCH_HOLDER_KEY).ok().as_deref(),
+        )?,
+    )?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
     }
@@ -1957,6 +1977,194 @@ mod tests {
         };
         assert_eq!(objects(&bundle), objects(&fetched));
         crate::harness::discard(&[&source, &bundle, &fetched]);
+    }
+
+    #[test]
+    fn a_rail_is_handed_the_token_the_primary_holds() {
+        use ed25519_dalek::SigningKey;
+
+        // Every rail opens its own session and answers its own challenge, so
+        // a primary that kept its token to itself would leave every rail
+        // after the first refused.
+        let holder = SigningKey::from_bytes(&[24; 32]);
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &SigningKey::from_bytes(&[25; 32]),
+            holder.verifying_key().to_bytes(),
+            [6; 32],
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let held = std::sync::Arc::new(
+            crate::authz::Holder::new(token, holder).expect("a holder for that token"),
+        );
+        let output = crate::tests::temporary("rail-token");
+        let fetcher = BundleFetcher::begin_with(
+            crate::harness::Loopback::default(),
+            &output,
+            None,
+            Some(std::sync::Arc::clone(&held)),
+        )
+        .expect("a fetch holding a token");
+        let handed = fetcher.holder().expect("the token, for a rail");
+        assert!(
+            std::sync::Arc::ptr_eq(&handed, &held),
+            "a rail would have opened its session with no capability"
+        );
+
+        let without =
+            BundleFetcher::begin_with(crate::harness::Loopback::default(), &output, None, None)
+                .expect("a fetch holding none");
+        assert!(without.holder().is_none(), "a token appeared from nowhere");
+    }
+
+    #[test]
+    fn a_serve_requires_all_three_or_none_of_them() {
+        use ed25519_dalek::SigningKey;
+
+        let root = [4; 32];
+        let key = SigningKey::from_bytes(&[21; 32]);
+        let source = crate::tests::temporary("issuer-key");
+        std::fs::write(
+            &source,
+            format!(
+                "ed25519-public:{}",
+                crate::hex_of(&key.verifying_key().to_bytes())
+            ),
+        )
+        .expect("a key file");
+        let named = source.to_string_lossy().into_owned();
+
+        assert!(
+            requirement_from(None, None, None, root)
+                .expect("no requirement")
+                .is_none(),
+            "a serve given nothing required something"
+        );
+        assert!(
+            requirement_from(
+                Some(&named),
+                Some("you.example"),
+                Some("them.example"),
+                root
+            )
+            .expect("a requirement")
+            .is_some(),
+            "a serve given all three required nothing"
+        );
+        // Any partial configuration. A key with no audience would take a
+        // token minted for another deployment, and an audience with no key
+        // would refuse everyone, which reads as a bug rather than a policy.
+        for partial in [
+            (Some(named.as_str()), None, None),
+            (None, Some("you.example"), None),
+            (None, None, Some("them.example")),
+            (Some(named.as_str()), Some("you.example"), None),
+            (Some(named.as_str()), None, Some("them.example")),
+            (None, Some("you.example"), Some("them.example")),
+        ] {
+            assert!(
+                matches!(
+                    requirement_from(partial.0, partial.1, partial.2, root),
+                    Err(Error::InvalidArguments)
+                ),
+                "{partial:?} was not refused"
+            );
+        }
+        // A secret where the public half belongs would let a serve mint what
+        // it checks.
+        let secret = crate::tests::temporary("issuer-secret");
+        std::fs::write(
+            &secret,
+            format!("ed25519-secret:{}", crate::hex_of(&key.to_bytes())),
+        )
+        .expect("a key file");
+        assert!(matches!(
+            requirement_from(
+                Some(&secret.to_string_lossy()),
+                Some("you.example"),
+                Some("them.example"),
+                root
+            ),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            std::env::var(SERVE_ISSUER).is_err(),
+            "the suite owns no env"
+        );
+    }
+
+    #[test]
+    fn a_fetch_presents_both_or_neither() {
+        use ed25519_dalek::SigningKey;
+
+        let issuer = SigningKey::from_bytes(&[22; 32]);
+        let holder = SigningKey::from_bytes(&[23; 32]);
+        let token = crate::authz::issue(
+            "you.example",
+            "them.example",
+            &issuer,
+            holder.verifying_key().to_bytes(),
+            [4; 32],
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        let token_path = crate::tests::temporary("holder-token");
+        std::fs::write(&token_path, &token).expect("a token file");
+        let named = token_path.to_string_lossy().into_owned();
+        let key_path = crate::tests::temporary("holder-key");
+        std::fs::write(
+            &key_path,
+            format!("ed25519-secret:{}", crate::hex_of(&holder.to_bytes())),
+        )
+        .expect("a key file");
+        let key_named = key_path.to_string_lossy().into_owned();
+
+        assert!(
+            holder_from(None, None).expect("no holder").is_none(),
+            "a fetch given nothing presented something"
+        );
+        assert!(
+            holder_from(Some(&named), Some(&key_named))
+                .expect("a holder")
+                .is_some(),
+            "a fetch given both presented nothing"
+        );
+        // A token with no key cannot be proved, and a key with no token
+        // proves nothing.
+        for partial in [
+            (Some(named.as_str()), None),
+            (None, Some(key_named.as_str())),
+        ] {
+            assert!(
+                matches!(
+                    holder_from(partial.0, partial.1),
+                    Err(Error::InvalidArguments)
+                ),
+                "{partial:?} was not refused"
+            );
+        }
+        // The public half cannot prove possession.
+        let public_path = crate::tests::temporary("holder-public");
+        std::fs::write(
+            &public_path,
+            format!(
+                "ed25519-public:{}",
+                crate::hex_of(&holder.verifying_key().to_bytes())
+            ),
+        )
+        .expect("a key file");
+        assert!(matches!(
+            holder_from(Some(&named), Some(&public_path.to_string_lossy())),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            std::env::var(FETCH_CAPABILITY).is_err(),
+            "the suite owns no env"
+        );
     }
 
     #[test]

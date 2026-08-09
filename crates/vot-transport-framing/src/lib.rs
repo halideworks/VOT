@@ -225,16 +225,34 @@ impl<B: AssemblyBudget> Framing<B> {
             self.reserved += bytes.len();
         }
         self.pending.extend_from_slice(bytes);
+        debug_assert_eq!(self.reserved, self.pending.len());
         Ok(())
     }
 
-    /// Drops the buffered frame and returns its cost to the budget.
-    pub fn release(&mut self) {
-        self.pending.clear();
+    /// Returns the buffer's whole charge to the budget. `hold` and this are
+    /// the only places the reservation moves; everything that empties the
+    /// buffer settles through here so the two cannot drift.
+    fn settle_charge(&mut self) {
         if self.reserved != 0 {
             self.budget.release(self.reserved);
             self.reserved = 0;
         }
+        debug_assert_eq!(self.reserved, self.pending.len());
+    }
+
+    /// Hands over the completed frame with its charge already returned, so a
+    /// frame is never both charged and emitted.
+    fn take_pending(&mut self) -> Vec<u8> {
+        let complete = std::mem::take(&mut self.pending);
+        self.settle_charge();
+        complete
+    }
+
+    /// Drops the buffered frame and returns its cost to the budget. The
+    /// buffer keeps its capacity for the next partial frame.
+    pub fn release(&mut self) {
+        self.pending.clear();
+        self.settle_charge();
     }
 
     /// Feeds received bytes to `emit`, one complete frame at a time. Only
@@ -291,9 +309,11 @@ impl<B: AssemblyBudget> Framing<B> {
                 if self.pending.len() < envelope.total_length {
                     return Ok(());
                 }
-                // Release budget before queueing to avoid double charge.
-                let complete = std::mem::take(&mut self.pending);
-                self.release();
+                // Release budget before queueing to avoid double charge. The
+                // loop's progress depends on the buffer emptying here: were it
+                // left full, this branch would repeat forever.
+                let complete = self.take_pending();
+                debug_assert!(self.pending.is_empty(), "take_pending left bytes behind");
                 emit(&complete)?;
                 continue;
             }

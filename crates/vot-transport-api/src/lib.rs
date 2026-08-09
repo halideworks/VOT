@@ -117,12 +117,25 @@ pub enum Error {
 
 /// A batch that stopped part way through.
 ///
-/// The records before `accepted` reached the backend and cannot be unsent.
-/// A caller retrying the batch resends from `accepted`, never from zero.
+/// `admitted` is how many records the adapter took, which is not the same as
+/// how many went out: every adapter here submits into a queue that a later
+/// `flush` drains, and a carrier torn down before that flush drops what it
+/// still holds. So this says which records the adapter now owns, and a
+/// caller deciding what to resend has to know whether the carrier survived.
+/// Resending from zero duplicates; resending from `admitted` after a
+/// teardown loses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchFailure {
-    /// How many records of the batch the backend took.
-    pub accepted: usize,
+    /// How many records of the batch the adapter took ownership of.
+    ///
+    /// Zero for every adapter this workspace ships, because they share one
+    /// preflight that checks the whole batch's count and bytes before any of
+    /// it is submitted, and nothing between that check and the loop can
+    /// fail. The field exists for an adapter whose backend can refuse part
+    /// way, and reporting it is how such an adapter says so rather than
+    /// silently leaving the caller to guess. This crate's tests build one to
+    /// hold the default implementation to that.
+    pub admitted: usize,
     /// What stopped the rest.
     pub error: Error,
 }
@@ -228,24 +241,25 @@ pub trait TransportAdapter {
     /// Not atomic. Preflight rejects the whole batch before anything is
     /// submitted, but a backend that fails part way has already taken the
     /// records before it, and no default implementation over a per-record
-    /// send can unsend them. [`BatchFailure::accepted`] says how many, so a
-    /// caller retries the rest rather than duplicating the lot. An adapter
-    /// whose backend can submit atomically should override this and report
-    /// `accepted: 0` on every failure.
+    /// send can unsend them. [`BatchFailure::admitted`] says how many, and
+    /// its documentation says what that does and does not mean. An adapter
+    /// whose backend submits atomically overrides this and reports
+    /// `admitted: 0` on every failure, which is what every adapter here
+    /// does by construction.
     ///
     /// # Errors
     /// Reports the first backend or protocol limit failure, with the count
-    /// of records already submitted. Preflight failures report zero.
+    /// of records the adapter took. Preflight failures report zero.
     fn send_reliable_batch(
         &mut self,
         stream: StreamId,
         records: &[Payload],
     ) -> Result<(), BatchFailure> {
         self.preflight_reliable_batch(stream, records)
-            .map_err(|error| BatchFailure { accepted: 0, error })?;
-        for (accepted, record) in records.iter().enumerate() {
+            .map_err(|error| BatchFailure { admitted: 0, error })?;
+        for (admitted, record) in records.iter().enumerate() {
             self.send_reliable_shared(stream, record.clone())
-                .map_err(|error| BatchFailure { accepted, error })?;
+                .map_err(|error| BatchFailure { admitted, error })?;
         }
         Ok(())
     }
@@ -442,15 +456,38 @@ impl StagingCapacity {
     ///
     /// Releasing more than is held is a bug in the caller's accounting, not a
     /// condition to absorb: subtracting to zero would hand out capacity
-    /// nobody earned. The ledger poisons instead, and grants nothing
-    /// afterwards. This returns nothing because one of its callers is a
-    /// `Drop`, which has nowhere to put a failure.
+    /// nobody earned. The ledger poisons instead and grants nothing
+    /// afterwards, until [`StagingCapacity::rebuilt`] replaces it. This
+    /// returns nothing because one of its callers is a `Drop`, which has
+    /// nowhere to put a failure.
+    ///
+    /// A poisoned ledger reads as fully used rather than fully free. What is
+    /// actually outstanding is no longer known, and of the two wrong answers
+    /// the one that grants nothing is the safe one.
     pub const fn release(&mut self, bytes: u64) {
         if let Some(used) = self.used.checked_sub(bytes) {
             self.used = used;
         } else {
-            self.used = 0;
+            self.used = self.limit;
             self.poisoned = true;
+        }
+    }
+
+    /// A ledger with this one's configuration and nothing outstanding.
+    ///
+    /// The way back from a poisoned ledger, and the only one: what it holds
+    /// cannot be trusted, so recovery means starting the accounting over
+    /// rather than adjusting it. Only for a caller that has torn down
+    /// everything holding a reservation, since every live permit is
+    /// forgotten.
+    #[must_use]
+    pub const fn rebuilt(&self) -> Self {
+        Self {
+            limit: self.limit,
+            used: 0,
+            bdp_target: self.bdp_target,
+            configured_max: self.configured_max,
+            poisoned: false,
         }
     }
 
@@ -465,23 +502,29 @@ impl StagingCapacity {
         self.bdp_target = bdp_target;
     }
 
+    /// What is held. A poisoned ledger reports its whole limit, because what
+    /// it actually holds is no longer known and that is the answer that
+    /// grants nothing.
     #[must_use]
     pub const fn used(&self) -> u64 {
         self.used
     }
 
+    /// What is free. A poisoned ledger has nothing free: it does not know
+    /// what it holds, and reporting the limit as available is how the
+    /// over-release would become capacity somebody spends.
     #[must_use]
     pub const fn remaining(&self) -> u64 {
-        self.limit.saturating_sub(self.used)
-    }
-
-    /// Credit is a pure function of the current staging state. A poisoned
-    /// ledger advertises none: its remaining count is not evidence.
-    #[must_use]
-    pub fn advertised_credit(&self) -> u64 {
         if self.poisoned {
             return 0;
         }
+        self.limit.saturating_sub(self.used)
+    }
+
+    /// Credit is a pure function of the current staging state, and a
+    /// poisoned ledger has no remaining capacity to derive it from.
+    #[must_use]
+    pub fn advertised_credit(&self) -> u64 {
         let target = self.bdp_target.min(self.configured_max);
         self.remaining().min(target)
     }
@@ -615,13 +658,32 @@ mod tests {
         // 400 bytes nobody earned.
         staging.release(400);
         assert!(staging.is_poisoned());
-        assert_eq!(staging.used(), 0);
         assert_eq!(
-            staging.advertised_credit(),
-            0,
-            "a poisoned ledger's remaining count is not evidence"
+            (
+                staging.used(),
+                staging.remaining(),
+                staging.advertised_credit()
+            ),
+            (1024, 0, 0),
+            "a poisoned ledger reads as fully used, not fully free"
         );
         assert_eq!(staging.reserve(1), Err(Error::AccountingPoisoned));
+
+        // From a nonzero hold, so the assignment on the poisoning branch is
+        // observed doing something rather than confirming what was already
+        // true.
+        let mut holding = StagingCapacity::new(1024, 800, 900).unwrap();
+        holding.reserve(400).unwrap();
+        holding.release(700);
+        assert!(holding.is_poisoned());
+        assert_eq!(holding.used(), 1024, "the over-release read as free space");
+
+        // And the way back, which is a new ledger rather than an adjusted
+        // one: what a poisoned ledger holds is not known well enough to fix.
+        let fresh = holding.rebuilt();
+        assert!(!fresh.is_poisoned());
+        assert_eq!(fresh.used(), 0);
+        assert_eq!(fresh.advertised_credit(), 800);
     }
 
     #[test]
@@ -638,7 +700,7 @@ mod tests {
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
             Err(BatchFailure {
-                accepted: 2,
+                admitted: 2,
                 error: Error::Backend
             })
         );
@@ -852,7 +914,7 @@ mod tests {
         assert_eq!(
             preflight.send_reliable_batch(StreamId(8), &invalid_records),
             Err(BatchFailure {
-                accepted: 0,
+                admitted: 0,
                 error: Error::RecordTooLarge
             })
         );

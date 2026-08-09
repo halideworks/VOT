@@ -286,6 +286,24 @@ pub struct ReliableReceiver {
 }
 
 impl ReliableReceiver {
+    /// Whether the staging ledger has stopped granting, and the way back.
+    ///
+    /// An over-release poisons the ledger, which is a bug in this crate's
+    /// accounting rather than anything a peer did, and a poisoned ledger
+    /// refuses every later reservation. Rebuilding forgets what is
+    /// outstanding, so it is only safe with nothing outstanding: this
+    /// refuses while any object is in flight, which is the only moment the
+    /// receiver can tell that no permit is live.
+    ///
+    /// Returns whether the ledger was rebuilt.
+    pub fn recover_accounting(&mut self) -> bool {
+        if !self.staging.is_poisoned() || !self.active.is_empty() || !self.range_active.is_empty() {
+            return false;
+        }
+        self.staging = self.staging.rebuilt();
+        true
+    }
+
     /// # Errors
     /// Rejects invalid staging configuration.
     pub fn new(staging_limit: u64, bdp_target: u64, configured_max: u64) -> Result<Self, Error> {
@@ -859,6 +877,28 @@ mod tests {
     use vot_transport_api::{Event, StreamId, TransportAdapter};
     use vot_transport_sim::{Impairment, SimulatorAdapter};
 
+    #[test]
+    fn a_poisoned_ledger_recovers_only_with_nothing_in_flight() {
+        let mut receiver = ReliableReceiver::new(1 << 20, 800, 900).unwrap();
+        assert!(
+            !receiver.recover_accounting(),
+            "a healthy ledger has nothing to recover"
+        );
+
+        let held = subject(b"in flight");
+        receiver.begin(held).unwrap();
+        receiver.staging.release(u64::MAX);
+        assert!(receiver.staging.is_poisoned());
+        assert!(
+            !receiver.recover_accounting(),
+            "rebuilt while an object was still in flight"
+        );
+
+        receiver.active.clear();
+        assert!(receiver.recover_accounting());
+        assert!(!receiver.staging.is_poisoned());
+        assert!(!receiver.recover_accounting(), "and only once");
+    }
     fn subject(bytes: &[u8]) -> SubjectId {
         SubjectId {
             suite: 1,

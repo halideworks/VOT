@@ -215,7 +215,7 @@ pub fn serve_bundle(
     address: SocketAddr,
     credentials: &Credentials,
     sessions: Option<u32>,
-    mut listening: impl FnMut(SocketAddr),
+    mut listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let server = BundleServer::open(bundle)?;
     let ephemeral = match credentials {
@@ -248,7 +248,9 @@ pub fn serve_bundle(
 
     // The loop and its failure policy are in `drive`.
     let mut listener = Listener::bind(address, &config).map_err(carrier_failure)?;
-    listening(listener.local_address());
+    // The root goes with the address because a fetch needs both, and the
+    // only place they are known together is here.
+    listening(listener.local_address(), server.package().root);
     let registration = start_registration(
         &services,
         listener.take_side_channel(),
@@ -1810,7 +1812,7 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
                 &Credentials::Ephemeral,
                 Some(2),
-                |at| {
+                |at, _| {
                     let _ = listening.send(at);
                 },
             )
@@ -1886,13 +1888,19 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
                 &Credentials::Ephemeral,
                 Some(1),
-                |at| {
-                    let _ = listening.send(at);
+                |at, root| {
+                    let _ = listening.send((at, root));
                 },
             )
         });
 
-        let at = address.recv().expect("the server reported its address");
+        let (at, announced) = address.recv().expect("the server reported its address");
+        // The address and the root together, because a fetch needs both and
+        // a caller that has to go and find the second one fetches unpinned.
+        assert_eq!(
+            announced, built.root,
+            "the serve announced a root that is not the bundle's"
+        );
         let fetched = crate::tests::temporary("wire-fetched");
         let package = fetch_bundle(at, &fetched, Some(built.root)).expect("a fetched bundle");
         assert_eq!(package, built);

@@ -196,6 +196,12 @@ pub enum Error {
     /// produces. A literal address still reaches a serve that forwards a
     /// port.
     RendezvousUnpunched,
+    /// A fetch at an address that named no package root.
+    ///
+    /// The channel is not authenticated, so the root is the only thing that
+    /// says which package this is. Every range proves without it, to
+    /// whatever root the server chose.
+    UnpinnedFetch,
 }
 
 impl From<io::Error> for Error {
@@ -2055,7 +2061,7 @@ mod tests {
         let address = "127.0.0.1:1".parse().unwrap();
         let bundle = temporary("unsupported");
         assert!(matches!(
-            serve_bundle(&bundle, address, &Credentials::Ephemeral, None, |_| {}),
+            serve_bundle(&bundle, address, &Credentials::Ephemeral, None, |_, _| {}),
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(

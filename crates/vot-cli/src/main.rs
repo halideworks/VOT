@@ -9,9 +9,11 @@ Usage:
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
   vot rendezvous LISTEN_ADDR
-  vot fetch CONNECT_ADDR|ROOT BUNDLE_DIR [PACKAGE_ROOT]
-  vot pull CONNECT_ADDR|ROOT BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
-           OBSERVED_AT [PACKAGE_ROOT]
+  vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
+  vot fetch ROOT BUNDLE_DIR
+  vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
+           OBSERVED_AT PACKAGE_ROOT
+  vot pull ROOT BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE OBSERVED_AT
 
 serve and fetch move a bundle over the wire; fetch writes a bundle directory
 that receive consumes unchanged, and pull is the two in one invocation.
@@ -21,8 +23,13 @@ The channel is NOT authenticated. The server presents a throwaway certificate
 and the client does not verify it, so anyone in the middle can see what you
 fetch and can refuse to serve it. What they cannot do is give you different
 bytes: every range proves to its object's root, every root is named by the
-manifest, and the manifest proves to the seal. Give fetch a PACKAGE_ROOT, as
-printed by send, to say which package you will accept.
+manifest, and the manifest proves to the seal.
+
+That holds only for the package you named. A fetch at an address takes a
+PACKAGE_ROOT, the 64 hex characters send printed, and refuses without one;
+serve prints the whole fetch command for the bundle it is serving. A ROOT in
+the address position pins itself. VOT_FETCH_UNPINNED=1 fetches from a server
+whose package cannot be known in advance.
 
 SUITE is blake3 or sha256. The default is sha256.
 OBSERVED_AT is an RFC 3339 timestamp, for example 2026-07-31T20:00:00Z.
@@ -52,6 +59,25 @@ it at whatever service the two ends share, which `vot rendezvous` runs.
 Both ends must name the same one.
 ";
 
+const UNPINNED_HELP: &str = "\
+An address says where to fetch from, not what to fetch.
+
+The channel is not authenticated. Without a PACKAGE_ROOT, a server can hand
+you a different package and every range will still prove, to whatever root
+that package declares. The root is what makes the proofs mean the package you
+asked for.
+
+  vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
+
+The root is the 64 hex characters `vot send` printed. `vot serve` prints the
+whole fetch command for the bundle it is serving, so the end that has the
+bundle can hand over one line. A root in the address position needs nothing
+further: it is resolved through the rendezvous and pins itself.
+
+Set VOT_FETCH_UNPINNED=1 to fetch from a server whose package you cannot know
+in advance.
+";
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("vot: {error:?}");
@@ -61,6 +87,12 @@ fn main() {
         if matches!(error, vot_cli::Error::InvalidArguments) {
             eprintln!();
             eprintln!("{USAGE}");
+        }
+        // Its own text, because the answer is a value the caller has to go
+        // and get rather than an argument they spelled wrong.
+        if matches!(error, vot_cli::Error::UnpinnedFetch) {
+            eprintln!();
+            eprintln!("{UNPINNED_HELP}");
         }
         std::process::exit(1);
     }
@@ -203,9 +235,17 @@ fn serve(
     let address = address
         .parse()
         .map_err(|_| vot_cli::Error::InvalidArguments)?;
-    let package = vot_cli::serve_bundle(Path::new(bundle), address, credentials, None, |at| {
-        println!("listening {at}");
-    })?;
+    let package =
+        vot_cli::serve_bundle(Path::new(bundle), address, credentials, None, |at, root| {
+            println!("listening {at}");
+            // The whole command, because a fetch has to name the root and this
+            // is the only place it is printed while the serve is still up. A
+            // reader who has to go and find it is a reader who fetches unpinned.
+            println!(
+                "fetch it with: vot fetch {at} BUNDLE_DIR {}",
+                root_hex(&root)
+            );
+        })?;
     println!(
         "{} {} SERVED",
         root_hex(&package.root),
@@ -222,10 +262,41 @@ fn rendezvous_service_addresses() -> Result<Vec<std::net::SocketAddr>, vot_cli::
     vot_cli::parse_rendezvous(&named)
 }
 
+/// Set to fetch from an address without naming the package to accept.
+const UNPINNED: &str = "VOT_FETCH_UNPINNED";
+
+/// The package root a fetch at an address will accept.
+///
+/// Required. An address says where to fetch from, not what to fetch, and the
+/// channel is not authenticated, so the root is the only thing that decides
+/// which package this is. A root-addressed fetch does not come through here:
+/// it already named one to resolve.
+///
+/// [`UNPINNED`] is the way out, for a server whose package the caller cannot
+/// know in advance.
+fn address_pin(root: Option<&str>) -> Result<Option<[u8; 32]>, vot_cli::Error> {
+    pin_for_address(
+        root,
+        std::env::var_os(UNPINNED).is_some_and(|value| !value.is_empty()),
+    )
+}
+
+/// [`address_pin`] with the override as an argument, so a test can hold both
+/// answers without setting a variable every parallel test would see.
+fn pin_for_address(
+    root: Option<&str>,
+    unpinned_allowed: bool,
+) -> Result<Option<[u8; 32]>, vot_cli::Error> {
+    match root {
+        Some(root) => vot_cli::parse_package_root(root).map(Some),
+        None if unpinned_allowed => Ok(None),
+        None => Err(vot_cli::Error::UnpinnedFetch),
+    }
+}
+
 fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
     let package = if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        let pin = root.map(vot_cli::parse_package_root).transpose()?;
-        vot_cli::fetch_bundle(address, Path::new(bundle), pin)
+        vot_cli::fetch_bundle(address, Path::new(bundle), address_pin(root)?)
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -252,8 +323,7 @@ fn pull(
     // The key is loaded before a byte crosses the wire.
     let key = vot_cli::load_key_spec(key)?;
     if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        let pin = root.map(vot_cli::parse_package_root).transpose()?;
-        vot_cli::fetch_bundle(address, Path::new(bundle), pin)?;
+        vot_cli::fetch_bundle(address, Path::new(bundle), address_pin(root)?)?;
     } else {
         let parsed_root = vot_cli::parse_package_root(target)?;
         let services = rendezvous_service_addresses()?;
@@ -281,4 +351,50 @@ fn root_hex(root: &[u8; 32]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fetch_at_an_address_names_the_package_or_says_it_will_not() {
+        let root = "11".repeat(32);
+        assert_eq!(
+            pin_for_address(Some(&root), false).expect("a root"),
+            Some([0x11; 32]),
+            "a named root is the pin, override or not"
+        );
+        assert_eq!(
+            pin_for_address(Some(&root), true).expect("a root"),
+            Some([0x11; 32])
+        );
+        assert!(
+            matches!(
+                pin_for_address(None, false),
+                Err(vot_cli::Error::UnpinnedFetch)
+            ),
+            "an address alone does not say which package to accept"
+        );
+        assert_eq!(
+            pin_for_address(None, true).expect("the override"),
+            None,
+            "and the override is what makes it a choice rather than an accident"
+        );
+        // A root that is not one is the argument error it always was, not
+        // the refusal this adds.
+        assert!(matches!(
+            pin_for_address(Some("nonsense"), false),
+            Err(vot_cli::Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn a_root_is_lowercase_hexadecimal_of_the_whole_root() {
+        assert_eq!(root_hex(&[0; 32]), "0".repeat(64));
+        assert_eq!(root_hex(&[0xab; 32]), "ab".repeat(32));
+        let mut counted = [0_u8; 32];
+        counted[31] = 0x0f;
+        assert_eq!(root_hex(&counted), format!("{}0f", "00".repeat(31)));
+    }
 }

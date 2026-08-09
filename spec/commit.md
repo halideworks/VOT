@@ -116,6 +116,29 @@ emitted. Recovery inspects both namespace and journal, validates identity, and
 either completes the durability step or constructs a new incarnation. It never
 infers success from visibility alone.
 
+### 6.1 Recording the published object's identity
+
+A provider whose publication removes the staging name cannot let recovery
+compare the two names afterwards, because one of them is gone. Its
+`NAMESPACE_LINKED` and `PUBLISHED` journal records therefore carry the
+identity of the object the namespace now holds, and recovery compares that
+against what it finds at the destination.
+
+The identity is whatever the platform uses to say two names are one file, and
+nothing more. On POSIX it is the device and inode, sixteen bytes, little
+endian, device first. It MUST NOT include the object's length: a profile that
+claims no durability before publication may find a different length on disk
+after a crash, and recovery would then reject the provider's own object.
+
+A record whose payload is empty carries no identity. Recovery MUST treat that
+as unknown rather than as a mismatch, and fall back to whichever evidence the
+provider still has, so a journal written before this section existed still
+recovers.
+
+An identity is not a subject. It says the destination is the file this
+incarnation linked; it says nothing about the bytes. A provider that must
+prove the bytes verifies them.
+
 ## 7. Strict POSIX provider
 
 The Strict sequence is ADR-0001:

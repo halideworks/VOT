@@ -12,6 +12,19 @@
 #
 #   tools/nat_lab.sh --matrix
 #   tools/nat_lab.sh --serve-nat symmetric --fetch-nat cone
+#   tools/nat_lab.sh --bundle path/to/bundle --root <hex>
+#
+# Options:
+#   --serve-nat, --fetch-nat  the flavour at each end, cone by default
+#   --binary                  the vot-cli to run, target/debug/vot-cli by default
+#   --bundle, --root          a bundle to move and the root it publishes.
+#                             Both or neither: without them the lab builds a
+#                             1 MiB bundle of its own and reads the root off
+#                             the send that built it.
+#   --matrix                  every flavour against every flavour
+#
+# Exit status: 0 when the fetch completed, 1 when it did not, 2 when the rig
+# itself failed. A matrix is a report, so it exits 0 whatever the rows say.
 #
 # NAT flavours:
 #   direct      no translation, the site is routable. Models IPv6.
@@ -40,12 +53,18 @@ SERVE_NAT=cone
 FETCH_NAT=cone
 BINARY=
 BUNDLE=
+ROOT=
 MATRIX=no
 SERVICE_PORT=7777
 FETCH_TIMEOUT=40
+# Pinned, because the default is the machine's core count and a row's elapsed
+# time is not comparable across two machines that punched a different number
+# of times for it.
+RAILS=4
 
+# The whole header comment, however long it grows.
 usage() {
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     exit "${1:-0}"
 }
 
@@ -55,11 +74,22 @@ while [ $# -gt 0 ]; do
         --fetch-nat) FETCH_NAT=$2; shift 2 ;;
         --binary) BINARY=$2; shift 2 ;;
         --bundle) BUNDLE=$2; shift 2 ;;
+        --root) ROOT=$2; shift 2 ;;
         --matrix) MATRIX=yes; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
 done
+
+# A bundle the lab did not build is a bundle whose root it cannot know.
+if [ -n "$BUNDLE" ] && [ -z "$ROOT" ]; then
+    echo "--bundle needs --root: the lab cannot read a root off a bundle" >&2
+    exit 2
+fi
+if [ -n "$ROOT" ] && [ -z "$BUNDLE" ]; then
+    echo "--root names the bundle at --bundle, and there is none" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------- outside
 
@@ -71,11 +101,14 @@ if [ "${NAT_LAB_INSIDE:-}" != "1" ]; then
         exit 2
     fi
     if [ -z "$BUNDLE" ]; then
-        BUNDLE=$(mktemp -d)
-        mkdir -p "$BUNDLE/source"
-        head -c 1048576 /dev/urandom > "$BUNDLE/source/payload"
-        "$BINARY" send blake3 "$BUNDLE/source" "$BUNDLE/bundle" > "$BUNDLE/send.txt"
-        BUNDLE=$BUNDLE/bundle
+        work=$(mktemp -d)
+        mkdir -p "$work/source"
+        head -c 1048576 /dev/urandom > "$work/source/payload"
+        ROOT=$("$BINARY" send blake3 "$work/source" "$work/bundle" | cut -d" " -f1)
+        BUNDLE=$work/bundle
+        # Named because nothing removes it: the lab replaces itself with the
+        # unshare below, so no trap of this process outlives the build.
+        echo "bundle at $work" >&2
     fi
     if ! unshare --user --map-root-user --net --mount --fork true 2>/dev/null; then
         echo "unprivileged user namespaces are unavailable on this kernel" >&2
@@ -84,7 +117,7 @@ if [ "${NAT_LAB_INSIDE:-}" != "1" ]; then
     export NAT_LAB_INSIDE=1
     exec unshare --user --map-root-user --net --mount --fork --pid --mount-proc \
         "$0" --serve-nat "$SERVE_NAT" --fetch-nat "$FETCH_NAT" \
-        --binary "$BINARY" --bundle "$BUNDLE" \
+        --binary "$BINARY" --bundle "$BUNDLE" --root "$ROOT" \
         $([ "$MATRIX" = yes ] && echo --matrix)
 fi
 
@@ -162,8 +195,14 @@ site() {
 
 teardown() {
     for pid in $SERVICE_PID $SERVE_PID; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        kill "$pid" 2>/dev/null || true
     done
+    # Reaped, not only signalled. The next topology binds the same service
+    # port, and a process that still holds it fails that bind.
+    for pid in $SERVICE_PID $SERVE_PID; do
+        wait "$pid" 2>/dev/null || true
+    done
+    SERVICE_PID= SERVE_PID=
     for ns in serve serve-nat fetch fetch-nat; do
         ip netns del "$ns" 2>/dev/null || true
     done
@@ -175,10 +214,16 @@ teardown() {
 }
 
 # `run SERVE_FLAVOUR FETCH_FLAVOUR` builds one topology, moves a bundle across
-# it, and prints one result row.
+# it, prints one result row, and leaves the outcome in `RUN_OUTCOME`.
+#
+# The outcome goes in a variable rather than the return status because a
+# caller that tested the status would suppress `set -e` for everything this
+# runs, and a topology that failed to build would then be reported as a NAT
+# verdict. A rig failure exits the lab instead.
 run() {
-    SERVICE_PID= SERVE_PID=
-    trap teardown EXIT INT TERM
+    SERVICE_PID= SERVE_PID= RUN_OUTCOME=
+    trap teardown EXIT
+    trap 'teardown; exit 130' INT TERM
 
     ip link set lo up
     sysctl -qw net.ipv4.ip_forward=1
@@ -201,19 +246,18 @@ run() {
         sleep 0.2
     done
     if [ "$ready" != yes ]; then
-        echo "the service never came up"
-        sed 's/^/    /' "$work/service.log"
-        return 1
+        echo "the service never came up" >&2
+        sed 's/^/    /' "$work/service.log" >&2
+        exit 2
     fi
 
-    root=$(cut -d" " -f1 "$(dirname "$BUNDLE")/send.txt")
     ip netns exec serve env VOT_RENDEZVOUS="$service" \
         "$BINARY" serve "$BUNDLE" 10.1.0.2:0 > "$work/serve.log" 2>&1 &
     SERVE_PID=$!
 
     began=$(date +%s.%N)
-    if ip netns exec fetch env VOT_RENDEZVOUS="$service" \
-        timeout "$FETCH_TIMEOUT" "$BINARY" fetch "$root" "$work/out" "$root" \
+    if ip netns exec fetch env VOT_RENDEZVOUS="$service" VOT_FETCH_RAILS="$RAILS" \
+        timeout "$FETCH_TIMEOUT" "$BINARY" fetch "$ROOT" "$work/out" "$ROOT" \
         > "$work/fetch.log" 2>&1
     then
         outcome=fetched
@@ -234,16 +278,19 @@ run() {
 
     teardown
     trap - EXIT INT TERM
+    RUN_OUTCOME=$outcome
 }
 
+printf '%-10s %-10s %-8s %s\n' serve fetch outcome elapsed
 if [ "$MATRIX" = yes ]; then
-    printf '%-10s %-10s %-8s %s\n' serve fetch outcome elapsed
     for s in direct cone permissive symmetric; do
         for f in direct cone permissive symmetric; do
-            run "$s" "$f" || true
+            run "$s" "$f"
         done
     done
+    # A matrix is a report. Which rows fetched is its content, and the rig
+    # failing is what exits non-zero, from inside `run`.
 else
-    printf '%-10s %-10s %-8s %s\n' serve fetch outcome elapsed
     run "$SERVE_NAT" "$FETCH_NAT"
+    [ "$RUN_OUTCOME" = fetched ] || exit 1
 fi

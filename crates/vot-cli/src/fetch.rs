@@ -689,9 +689,8 @@ fn refusal_code(error: &vot_scheduler::Error) -> u16 {
 /// and all, so the completed bundle looks exactly as one fetched without
 /// a store.
 fn remove_store_files(bundle: &Path) -> Result<(), Error> {
-    ResumeStore::open(bundle.join(RESUME_STORE))
-        .and_then(ResumeStore::remove_unshared)
-        .map_err(resume_failure)
+    // No need to decode a store in order to delete it.
+    vot_resume::remove_files(&bundle.join(RESUME_STORE), true).map_err(resume_failure)
 }
 
 /// What a store's refusal means to the fetch that asked.

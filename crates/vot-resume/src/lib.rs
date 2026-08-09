@@ -161,31 +161,16 @@ impl ResumeStore {
     /// empty lock file beside no store is the cost of the name meaning one
     /// thing.
     pub fn remove(self) -> Result<(), Error> {
-        self.remove_within(false)
+        remove_files(&self.path, false)
     }
 
     /// [`Self::remove`], and the lock file with it.
     ///
     /// Only for a caller that owns the containing directory and knows no
     /// other process has this store open, such as a fetch tidying up its own
-    /// finished output. The lock is released before the lock file goes,
-    /// because Windows will not unlink an open one, so a process that had
-    /// been waiting on the lock could take it in between and then hold an
-    /// inode with no name while the next process opens a fresh one.
+    /// finished output.
     pub fn remove_unshared(self) -> Result<(), Error> {
-        self.remove_within(true)
-    }
-
-    fn remove_within(self, lock_file_too: bool) -> Result<(), Error> {
-        let lock_file = lock_path(&self.path)?;
-        let lock = lock_store(&self.path)?;
-        let removal = remove_if_present(&self.path)
-            .and_then(|()| remove_if_present(&temporary_path(&self.path)?));
-        drop(lock);
-        if lock_file_too && removal.is_ok() {
-            return remove_if_present(&lock_file);
-        }
-        removal
+        remove_files(&self.path, true)
     }
 
     /// Reserves a batch of immutable objects in one compacted transaction.
@@ -1202,6 +1187,66 @@ fn lock_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(path.with_file_name(lock))
 }
 
+/// Removes a store's files without opening it.
+///
+/// The lock is taken only when there is a lock file to take, because
+/// creating one in order to remove a store would both mint the file this
+/// declines to delete and fail outright when the containing directory has
+/// already gone. Nothing can be holding a store whose lock file does not
+/// exist.
+///
+/// # Errors
+/// Surfaces anything but a name that is already gone.
+pub fn remove_files(path: &Path, lock_file_too: bool) -> Result<(), Error> {
+    let lock_file = lock_path(path)?;
+    let Some(lock) = held_lock(&lock_file)? else {
+        return remove_if_present(path).and_then(|()| remove_if_present(&temporary_path(path)?));
+    };
+    let removal = remove_if_present(path).and_then(|()| remove_if_present(&temporary_path(path)?));
+    if !lock_file_too || removal.is_err() {
+        drop(lock);
+        return removal;
+    }
+    remove_lock_file(lock, &lock_file)
+}
+
+/// Unlinks a lock file this thread holds.
+///
+/// On Unix the name goes while the lock is still held, so no waiter can
+/// acquire the inode in between and end up holding a lock nothing else can
+/// reach. Windows refuses to unlink an open file, so there the lock is
+/// released first.
+fn remove_lock_file(lock: File, lock_file: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    return remove_lock_file_unix(lock, lock_file);
+    #[cfg(not(unix))]
+    return remove_lock_file_other(lock, lock_file);
+}
+
+#[cfg(unix)]
+fn remove_lock_file_unix(lock: File, lock_file: &Path) -> Result<(), Error> {
+    let removal = remove_if_present(lock_file);
+    drop(lock);
+    removal
+}
+
+#[cfg(not(unix))]
+fn remove_lock_file_other(lock: File, lock_file: &Path) -> Result<(), Error> {
+    drop(lock);
+    remove_if_present(lock_file)
+}
+
+/// The store's lock, or nothing when there is no lock file to hold.
+fn held_lock(lock_file: &Path) -> Result<Option<File>, Error> {
+    let lock = match OpenOptions::new().read(true).write(true).open(lock_file) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    fs4::FileExt::lock(&lock)?;
+    Ok(Some(lock))
+}
+
 /// Removes a name, treating one that is already gone as the outcome wanted.
 /// Every other failure surfaces.
 fn remove_if_present(path: &Path) -> Result<(), Error> {
@@ -1250,12 +1295,54 @@ mod tests {
         set
     }
 
-    fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+    /// A store path that takes its own files with it.
+    ///
+    /// Every one of these names three files, and a test that removed only
+    /// the store left the lock behind. One sweep runs the suite once per
+    /// mutant, so a lock per test per mutant is thousands of files in the
+    /// shared temp directory, which is what has killed mutation runners here
+    /// before. Cleaning up in a `Drop` is the only version of this a later
+    /// test cannot forget.
+    struct TempStore(PathBuf);
+
+    impl std::ops::Deref for TempStore {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempStore {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for TempStore {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            if let Ok(lock) = lock_path(&self.0) {
+                let _ = fs::remove_file(lock);
+            }
+            if let Ok(temporary) = temporary_path(&self.0) {
+                let _ = fs::remove_file(temporary);
+            }
+        }
+    }
+
+    fn temp_path(name: &str) -> TempStore {
+        TempStore(std::env::temp_dir().join(format!(
             "vot-resume-{name}-{}-{}",
             std::process::id(),
             subject(name.as_bytes()[0]).root[0]
-        ))
+        )))
     }
 
     fn write_raw(path: &Path, payload: &[u8]) {
@@ -1588,6 +1675,58 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_store_that_is_already_gone_is_not_a_failure() {
+        let path = temp_path("remove-absent");
+        // Nothing there at all: no store, no lock, nothing to lock against.
+        assert!(!path.exists());
+        remove_files(&path, true).unwrap();
+        assert!(
+            !lock_path(&path).unwrap().exists(),
+            "removal minted the lock file it was asked to delete"
+        );
+
+        // And a whole directory that has gone, which is what a caller tearing
+        // down a fetch whose output was deleted underneath it sees.
+        let vanished = std::env::temp_dir()
+            .join("vot-resume-no-such-dir")
+            .join("s");
+        remove_files(&vanished, true).unwrap();
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_opened_is_not_read_as_absent() {
+        let directory =
+            std::env::temp_dir().join(format!("vot-resume-held-lock-{}", std::process::id()));
+        let _ = fs::remove_file(&directory);
+        fs::write(&directory, b"a file, not a directory").unwrap();
+        // A component of the path is a file, so opening the lock fails with
+        // something that is not NotFound. Treating that as "no lock file"
+        // would remove a store somebody may be holding.
+        let through_a_file = directory.join("store.lock");
+        assert!(matches!(held_lock(&through_a_file), Err(Error::Io(_))));
+        fs::remove_file(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_removal_that_fails_keeps_the_lock_file() {
+        let path = temp_path("remove-keeps-lock");
+        let store = ResumeStore::create(&path).unwrap();
+        drop(store);
+        // A temporary that will not go, so the removal fails part way.
+        let temporary = temporary_path(&path).unwrap();
+        fs::create_dir(&temporary).unwrap();
+        fs::write(temporary.join("held"), b"x").unwrap();
+
+        assert!(remove_files(&path, true).is_err());
+        assert!(
+            lock_path(&path).unwrap().exists(),
+            "a failed removal took the lock with it"
+        );
+        fs::remove_file(temporary.join("held")).unwrap();
+        fs::remove_dir(&temporary).unwrap();
+    }
+
+    #[test]
     fn removal_waits_for_the_store_transaction_lock() {
         use std::sync::mpsc::{self, RecvTimeoutError};
         use std::time::Duration;
@@ -1655,7 +1794,7 @@ mod tests {
         let held = lock_store(&path).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
-        let open_path = path.clone();
+        let open_path = path.to_path_buf();
         let reader = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             finished_tx.send(ResumeStore::open(open_path)).unwrap();

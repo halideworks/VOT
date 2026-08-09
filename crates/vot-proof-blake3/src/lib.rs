@@ -154,6 +154,41 @@ impl GroupCvs {
     }
 }
 
+/// Request-to-cover geometry for one range proof: the aligned start, an end
+/// clipped to the object, and the first and past-the-end unit indices. One
+/// derivation for the cold and precomputed paths, so they cannot disagree on
+/// what a request covers.
+struct RangeGeometry {
+    covered_offset: u64,
+    covered_end: u64,
+    first: u64,
+    end: u64,
+}
+
+impl RangeGeometry {
+    fn of(object_len: u64, offset: u64, length: u64) -> Result<Self, Error> {
+        if length == 0 {
+            return Err(Error::EmptyRange);
+        }
+        let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
+        if request_end > object_len {
+            return Err(Error::OutOfBounds);
+        }
+        let covered_offset = offset / GROUP_SIZE * GROUP_SIZE;
+        let covered_end = request_end
+            .div_ceil(GROUP_SIZE)
+            .checked_mul(GROUP_SIZE)
+            .ok_or(Error::LengthOverflow)?
+            .min(object_len);
+        Ok(Self {
+            covered_offset,
+            covered_end,
+            first: covered_offset / GROUP_SIZE,
+            end: covered_end.div_ceil(GROUP_SIZE),
+        })
+    }
+}
+
 /// Proves a range from chaining values. Byte-identical to [`prove`] for the
 /// same range.
 ///
@@ -161,21 +196,12 @@ impl GroupCvs {
 /// Rejects an empty range and one that runs past the object.
 pub fn prove_with(cvs: &GroupCvs, offset: u64, length: u64) -> Result<RangeCover, Error> {
     let object_len = cvs.length;
-    if length == 0 {
-        return Err(Error::EmptyRange);
-    }
-    let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
-    if request_end > object_len {
-        return Err(Error::OutOfBounds);
-    }
-    let covered_offset = offset / GROUP_SIZE * GROUP_SIZE;
-    let covered_end = request_end
-        .div_ceil(GROUP_SIZE)
-        .checked_mul(GROUP_SIZE)
-        .ok_or(Error::LengthOverflow)?
-        .min(object_len);
-    let first = covered_offset / GROUP_SIZE;
-    let end = covered_end.div_ceil(GROUP_SIZE);
+    let RangeGeometry {
+        covered_offset,
+        covered_end,
+        first,
+        end,
+    } = RangeGeometry::of(object_len, offset, length)?;
     let mut proof = Vec::new();
     encode_selected_from(
         Node {
@@ -196,21 +222,12 @@ pub fn prove_with(cvs: &GroupCvs, offset: u64, length: u64) -> Result<RangeCover
 
 pub fn prove(data: &[u8], offset: u64, length: u64) -> Result<RangeProof, Error> {
     let object_len = data.len() as u64;
-    if length == 0 {
-        return Err(Error::EmptyRange);
-    }
-    let request_end = offset.checked_add(length).ok_or(Error::LengthOverflow)?;
-    if request_end > object_len {
-        return Err(Error::OutOfBounds);
-    }
-    let covered_offset = offset / GROUP_SIZE * GROUP_SIZE;
-    let covered_end = request_end
-        .div_ceil(GROUP_SIZE)
-        .checked_mul(GROUP_SIZE)
-        .ok_or(Error::LengthOverflow)?;
-    let covered_end = covered_end.min(object_len);
-    let first = covered_offset / GROUP_SIZE;
-    let end = covered_end.div_ceil(GROUP_SIZE);
+    let RangeGeometry {
+        covered_offset,
+        covered_end,
+        first,
+        end,
+    } = RangeGeometry::of(object_len, offset, length)?;
     let mut proof = Vec::new();
     let groups = group_count(object_len);
     encode_selected(

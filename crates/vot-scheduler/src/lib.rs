@@ -59,7 +59,7 @@ mod sink;
 
 #[cfg(test)]
 use coverage::MAX_RANGE_FRAGMENTS;
-use coverage::{RangeState, book_range, check_range};
+use coverage::RangeState;
 pub use planner::*;
 use proof::{assemble_ordered, check_range_proof, suite, validate_typed_bundle};
 pub use receiver::*;

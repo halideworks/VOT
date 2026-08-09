@@ -8,6 +8,20 @@ on:
 permissions:
   contents: read
 
+# One run per ref. A pull request's older run is cancelled when a new commit
+# arrives, because it measures code that no longer exists. A push to main is
+# not cancelled once it is running, since its mutation sweep is the record for
+# that commit, but a newer push supersedes any run still pending, which is
+# what keeps a run of merges from queueing a sweep each and starving the pull
+# requests behind them.
+#
+# A cancelled run is therefore two things now: a superseded one, and the
+# killed runner that an unbounded loop or a leaked temp file produces. Check
+# which before reading a cancelled mutation job as a defect.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     runs-on: ubuntu-24.04

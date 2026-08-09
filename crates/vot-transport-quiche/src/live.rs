@@ -636,30 +636,35 @@ impl Drop for Transport {
     }
 }
 
+/// Methods that only relay to the in-process adapter, written once. What has
+/// carrier behavior of its own (flush, poll's inbound drain, waiting,
+/// closing, the credit and control-limit notes) stays handwritten below.
+macro_rules! forward_to_adapter {
+    (&mut self: $(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) -> $ret {
+            self.adapter.$name($($arg),*)
+        })*
+    };
+    (&self: $(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $(fn $name(&self, $($arg: $ty),*) -> $ret {
+            self.adapter.$name($($arg),*)
+        })*
+    };
+}
+
 impl TransportAdapter for Transport {
-    fn send_control(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.adapter.send_control(frame)
-    }
-
-    fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
-        self.adapter.send_control_shared(frame)
-    }
-
-    fn send_reliable(&mut self, stream: StreamId, record: &[u8]) -> Result<(), Error> {
-        self.adapter.send_reliable(stream, record)
-    }
-
-    fn send_reliable_shared(&mut self, stream: StreamId, record: Payload) -> Result<(), Error> {
-        self.adapter.send_reliable_shared(stream, record)
-    }
-
-    fn preflight_reliable_batch(&self, stream: StreamId, records: &[Payload]) -> Result<(), Error> {
-        self.adapter.preflight_reliable_batch(stream, records)
-    }
-
-    fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
-        self.adapter.send_datagram(context, payload)
-    }
+    forward_to_adapter!(&mut self:
+        fn send_control(frame: &[u8]) -> Result<(), Error>;
+        fn send_control_shared(frame: Payload) -> Result<(), Error>;
+        fn send_reliable(stream: StreamId, record: &[u8]) -> Result<(), Error>;
+        fn send_reliable_shared(stream: StreamId, record: Payload) -> Result<(), Error>;
+        fn send_datagram(context: u64, payload: &[u8]) -> Result<(), Error>;
+    );
+    forward_to_adapter!(&self:
+        fn preflight_reliable_batch(stream: StreamId, records: &[Payload]) -> Result<(), Error>;
+        fn receive_limits() -> Option<ReceiveLimits>;
+        fn path_stats() -> Option<PathStats>;
+    );
 
     /// Hands submissions to the driver.
     ///
@@ -711,14 +716,6 @@ impl TransportAdapter for Transport {
         // The reassembly bound follows the send bound only in that both are the
         // peer's business; what is stored here is what this endpoint accepts.
         Ok(())
-    }
-
-    fn receive_limits(&self) -> Option<ReceiveLimits> {
-        self.adapter.receive_limits()
-    }
-
-    fn path_stats(&self) -> Option<PathStats> {
-        self.adapter.path_stats()
     }
 
     /// Ends the session under a registered code.

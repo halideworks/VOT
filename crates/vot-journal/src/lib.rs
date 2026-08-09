@@ -42,6 +42,9 @@ pub enum Error {
     Locked,
     /// The journal is larger than a replay will hold.
     TooLarge,
+    /// One more record would carry the journal past what a replay will hold.
+    /// Check point it, which replaces it with one record.
+    Full,
 }
 
 impl From<io::Error> for Error {
@@ -59,6 +62,11 @@ pub struct Replay {
 
 pub struct Journal {
     file: File,
+    /// What the journal holds now, so an append that would carry it past the
+    /// replay ceiling is refused rather than written. Without this the file
+    /// could grow past what any later replay would read, and the only thing
+    /// that shrinks it is a compaction that has to read it.
+    bytes: u64,
     path: PathBuf,
     /// The writer lease, held for as long as this journal exists. It is a
     /// separate file because compaction replaces the journal's inode, and a
@@ -117,6 +125,7 @@ impl Journal {
         File::open(parent_directory(path))?.sync_all()?;
         Ok(Self {
             file,
+            bytes: 0,
             path: path.to_path_buf(),
             _lease: lease,
             incarnation,
@@ -137,10 +146,11 @@ impl Journal {
             file.set_len(replay.valid_bytes)?;
             file.sync_data()?;
         }
-        file.seek(SeekFrom::End(0))?;
+        let bytes = file.seek(SeekFrom::End(0))?;
         Ok((
             Self {
                 file,
+                bytes,
                 path: path.to_path_buf(),
                 _lease: lease,
                 incarnation,
@@ -174,6 +184,7 @@ impl Journal {
             checkpoint: false,
         };
         let encoded = encode(&record)?;
+        let grown = grown_within_ceiling(self.bytes, encoded.len() as u64)?;
         if let Err(error) = self
             .file
             .write_all(&encoded)
@@ -182,6 +193,7 @@ impl Journal {
             self.poisoned = true;
             return Err(Error::Io(error));
         }
+        self.bytes = grown;
         self.next_sequence = following;
         Ok(sequence)
     }
@@ -205,8 +217,12 @@ impl Journal {
     ///
     /// Takes `&mut self` so the writer lease spans the replacement. The
     /// rename retires the journal's inode, and a compaction that released
-    /// the lease in between would let a second writer open the new one. A
-    /// rejected compaction changes nothing.
+    /// the lease in between would let a second writer open the new one.
+    ///
+    /// A compaction rejected before the rename changes nothing. One that
+    /// fails after it poisons the journal, because the handle then points at
+    /// an inode with no name and an append into it would be a record that
+    /// survives no restart.
     pub fn compact_checkpoint(&mut self, state: u8, payload: &[u8]) -> Result<(), Error> {
         if state & CHECKPOINT_FLAG != 0 {
             return Err(Error::InvalidState);
@@ -214,9 +230,13 @@ impl Journal {
         if payload.len() > MAX_PAYLOAD {
             return Err(Error::PayloadTooLarge);
         }
-        let replayed = replay(&self.path, self.incarnation)?;
-        let sequence = replayed.records.last().ok_or(Error::Empty)?.sequence;
-        let next_sequence = sequence.checked_add(1).ok_or(Error::SequenceGap)?;
+        // The sequence to check point at is the last one written, which this
+        // journal already holds. Replaying the file to learn it would be work
+        // proportional to the journal, and worse: it would put compaction
+        // behind the replay ceiling, so the one thing that shrinks a journal
+        // would be refused exactly when the journal had grown too big.
+        let next_sequence = self.next_sequence;
+        let sequence = next_sequence.checked_sub(1).ok_or(Error::Empty)?;
         let record = Record {
             incarnation: self.incarnation,
             sequence,
@@ -245,14 +265,44 @@ impl Journal {
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, &self.path)?;
+        // Past this point the journal this handle holds is unlinked, so a
+        // failure cannot leave the caller appending into it. Anything that
+        // goes wrong from here poisons.
+        self.finish_compaction(next_sequence).inspect_err(|_| {
+            self.poisoned = true;
+        })
+    }
+
+    /// Adopts the journal a rename just put in place, having proved it reads
+    /// back. Compaction used to end by reopening through `open_current`,
+    /// which replayed the new file; opening it and seeking to the end does
+    /// not, so a compaction that landed an unreadable journal would report
+    /// success and the corruption would surface only at recovery.
+    fn finish_compaction(&mut self, next_sequence: u64) -> Result<(), Error> {
         File::open(parent_directory(&self.path))?.sync_all()?;
         let mut replacement = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        replacement.seek(SeekFrom::End(0))?;
+        let replayed = replay_reader(&mut replacement, self.incarnation)?;
+        if replayed.torn_tail || replayed.records.len() != 1 {
+            return Err(Error::InvalidHeader);
+        }
+        let bytes = replacement.seek(SeekFrom::End(0))?;
         self.file = replacement;
+        self.bytes = bytes;
         self.next_sequence = next_sequence;
         self.poisoned = false;
         Ok(())
     }
+}
+
+/// The journal's size once `added` more bytes land, or [`Error::Full`] when
+/// that would carry it past what a replay will read. Exactly the ceiling is
+/// inside it; one byte more is not.
+fn grown_within_ceiling(bytes: u64, added: u64) -> Result<u64, Error> {
+    let grown = bytes.checked_add(added).ok_or(Error::Full)?;
+    if grown > MAX_JOURNAL_BYTES {
+        return Err(Error::Full);
+    }
+    Ok(grown)
 }
 
 /// The sequence a journal ending at `last` writes next, or [`Error::SequenceGap`]
@@ -620,6 +670,122 @@ mod tests {
         ));
         assert!(!journal.is_poisoned());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "nothing landed");
+        drop(journal);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(lease_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_ceiling_admits_exactly_itself_and_no_more() {
+        assert_eq!(grown_within_ceiling(0, 0).unwrap(), 0);
+        assert_eq!(
+            grown_within_ceiling(MAX_JOURNAL_BYTES - 1, 1).unwrap(),
+            MAX_JOURNAL_BYTES
+        );
+        assert_eq!(
+            grown_within_ceiling(0, MAX_JOURNAL_BYTES).unwrap(),
+            MAX_JOURNAL_BYTES
+        );
+        assert!(matches!(
+            grown_within_ceiling(MAX_JOURNAL_BYTES, 1),
+            Err(Error::Full)
+        ));
+        assert!(matches!(
+            grown_within_ceiling(MAX_JOURNAL_BYTES - 1, 2),
+            Err(Error::Full)
+        ));
+        assert!(matches!(
+            grown_within_ceiling(u64::MAX, 1),
+            Err(Error::Full)
+        ));
+    }
+
+    #[test]
+    fn a_full_journal_refuses_the_append_and_check_points_out_of_it() {
+        let path = temp_path("full");
+        let mut journal = Journal::create(&path, [3; 16]).unwrap();
+        // Fill it to just under the ceiling with the largest records it takes.
+        let payload = vec![0; MAX_PAYLOAD];
+        let mut written = 0;
+        while journal.append_durable(1, &payload).is_ok() {
+            written += 1;
+            assert!(written < 100, "the ceiling never arrived");
+        }
+        assert!(matches!(
+            journal.append_durable(1, &payload),
+            Err(Error::Full)
+        ));
+        assert!(!journal.is_poisoned(), "a full journal is not a broken one");
+        assert!(journal.bytes <= MAX_JOURNAL_BYTES);
+
+        // The way out is the one operation that shrinks it, and it works on a
+        // journal this size because it no longer replays to find its place.
+        journal.compact_checkpoint(2, b"sealed").unwrap();
+        assert!(journal.bytes < u64::from(u16::MAX), "still one record");
+        assert_eq!(journal.append_durable(1, b"after").unwrap(), written);
+
+        drop(journal);
+        let (reopened, replayed) = Journal::open_current(&path, [3; 16]).unwrap();
+        assert_eq!(
+            replayed.records.len(),
+            2,
+            "the checkpoint and what followed"
+        );
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(lease_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_compaction_that_cannot_adopt_what_it_renamed_poisons() {
+        let path = temp_path("compaction-unreadable");
+        let mut journal = Journal::create(&path, [3; 16]).unwrap();
+        journal.append_durable(1, b"one").unwrap();
+
+        // What a rename that landed an unreadable file leaves behind.
+        // Adopting it without reading it back would report success and the
+        // corruption would surface only at recovery.
+        std::fs::write(&path, b"not a journal at all").unwrap();
+        assert!(journal.finish_compaction(2).is_err());
+
+        // One record is what a checkpoint leaves. Anything else means the
+        // rename put something there that this did not write.
+        let two = temp_path("compaction-two-records");
+        let mut bytes = encode(&record(0, 1, Vec::new(), true)).unwrap();
+        bytes.extend_from_slice(&encode(&record(1, 1, Vec::new(), false)).unwrap());
+        std::fs::write(&two, &bytes).unwrap();
+        let mut pair = Journal::create(&temp_path("compaction-pair"), [2; 16]).unwrap();
+        pair.path = two.clone();
+        assert!(matches!(
+            pair.finish_compaction(2),
+            Err(Error::InvalidHeader)
+        ));
+
+        // A tail that stops mid-record is one record and torn, so both arms
+        // of the check have to hold on their own.
+        bytes.truncate(encode(&record(0, 1, Vec::new(), true)).unwrap().len() + 4);
+        std::fs::write(&two, &bytes).unwrap();
+        assert!(matches!(
+            pair.finish_compaction(1),
+            Err(Error::InvalidHeader)
+        ));
+        drop(pair);
+        std::fs::remove_file(&two).unwrap();
+
+        // And the same failure reached through compaction poisons, because
+        // the handle is on an inode the rename retired: an append into it
+        // returns Ok and survives no restart. Reaching it needs the adopt to
+        // fail, which a journal whose name is gone by then does.
+        let mut poisoning = Journal::create(&temp_path("compaction-poison"), [3; 16]).unwrap();
+        poisoning.append_durable(1, b"one").unwrap();
+        let vanished = poisoning.path.with_file_name("no-such-directory/j");
+        poisoning.path = vanished;
+        assert!(poisoning.compact_checkpoint(2, b"sealed").is_err());
+        assert!(
+            !poisoning.is_poisoned(),
+            "failing before the rename changes nothing"
+        );
+
         drop(journal);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(lease_path(&path).unwrap()).unwrap();

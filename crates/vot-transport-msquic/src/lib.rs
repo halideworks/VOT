@@ -4751,7 +4751,7 @@ mod tests {
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
             Err(BatchFailure {
-                accepted: 0,
+                admitted: 0,
                 error: Error::OutboundQueueFull
             })
         );
@@ -4787,7 +4787,7 @@ mod tests {
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
             Err(BatchFailure {
-                accepted: 0,
+                admitted: 0,
                 error: Error::OutboundQueueFull
             })
         );

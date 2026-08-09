@@ -2212,6 +2212,105 @@ mod tests {
     }
 
     #[test]
+    fn issuing_writes_a_token_the_holder_can_spend() {
+        // The wrapper, not `authz::issue` underneath it: one that wrote
+        // nothing and reported success would leave an operator with no token
+        // and no error.
+        let (holder_secret, holder_public) = generate_keypair().expect("a holder pair");
+        let (issuer_secret, _) = generate_keypair().expect("an issuer pair");
+        let issuer_file = tests::temporary("issue-issuer");
+        std::fs::write(&issuer_file, &issuer_secret).expect("a key file");
+        let holder_file = tests::temporary("issue-holder");
+        std::fs::write(&holder_file, &holder_public).expect("a key file");
+        let out = tests::temporary("issue-token");
+        let root = "5c".repeat(32);
+
+        issue_capability(
+            &issuer_file.to_string_lossy(),
+            "you.example",
+            "them.example",
+            &holder_file.to_string_lossy(),
+            &root,
+            "3600",
+            &out,
+        )
+        .expect("a token");
+
+        let written = std::fs::read(&out).expect("the token file");
+        assert!(!written.is_empty(), "the token is empty");
+        let signed = vot_capability::decode(&written).expect("a capability of this format");
+        let capability = vot_capability::Capability::from_canonical_bytes(&signed.capability)
+            .expect("the claims");
+        assert_eq!(capability.audience, "them.example");
+        assert_eq!(capability.issuer, "you.example");
+        assert_eq!(capability.scope.root, [0x5c; 32], "another package");
+        assert_eq!(
+            capability.expiry - capability.not_before,
+            3_600,
+            "another window"
+        );
+        // The holder key in the token is the one that was named, so the
+        // secret half can prove it.
+        let seed: [u8; 32] = parse_package_root(
+            holder_secret
+                .strip_prefix("ed25519-secret:")
+                .expect("the label"),
+        )
+        .expect("32 bytes");
+        assert_eq!(
+            capability.holder_key,
+            SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            "the token names another holder"
+        );
+
+        // A destination that exists is not overwritten, and the labels are
+        // not interchangeable.
+        assert!(matches!(
+            issue_capability(
+                &issuer_file.to_string_lossy(),
+                "you.example",
+                "them.example",
+                &holder_file.to_string_lossy(),
+                &root,
+                "3600",
+                &out
+            ),
+            Err(Error::Io(_))
+        ));
+        let second = tests::temporary("issue-token-2");
+        assert!(
+            matches!(
+                issue_capability(
+                    &holder_file.to_string_lossy(),
+                    "you.example",
+                    "them.example",
+                    &holder_file.to_string_lossy(),
+                    &root,
+                    "3600",
+                    &second
+                ),
+                Err(Error::InvalidArguments)
+            ),
+            "a public key signed a token"
+        );
+        assert!(
+            matches!(
+                issue_capability(
+                    &issuer_file.to_string_lossy(),
+                    "you.example",
+                    "them.example",
+                    &issuer_file.to_string_lossy(),
+                    &root,
+                    "3600",
+                    &second
+                ),
+                Err(Error::InvalidArguments)
+            ),
+            "a secret key was taken as a holder"
+        );
+    }
+
+    #[test]
     fn a_generated_pair_is_two_halves_of_one_key() {
         let (secret, public) = generate_keypair().expect("a keypair");
         let (again, _) = generate_keypair().expect("a second keypair");

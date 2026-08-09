@@ -6,6 +6,8 @@ use vot_manifest::{PackagePath, PathProfile, canonical_path_key};
 use vot_verifier::Suite;
 
 pub const CANDIDATE_MAX: usize = 262_144;
+/// Every entry starts on an 8-byte boundary; the gap is zero-filled.
+const ENTRY_ALIGNMENT: usize = 8;
 pub const TARGET_SIZE: usize = 67_108_864;
 pub const HARD_MAX: usize = 134_217_728;
 pub const MAX_ENTRIES_PER_PACK: usize = 8192;
@@ -121,8 +123,7 @@ impl StreamingPacker {
         }
         self.last_key = Some(key);
 
-        let padding = (8 - self.bytes.len() % 8) % 8;
-        let needed = padding
+        let needed = padding_to_alignment(self.bytes.len())
             .checked_add(file.bytes.len())
             .ok_or(Error::PackTooLarge)?;
         let must_flush = !self.entries.is_empty()
@@ -136,10 +137,7 @@ impl StreamingPacker {
             )
         });
 
-        let padding = (8 - self.bytes.len() % 8) % 8;
-        self.bytes.resize(self.bytes.len() + padding, 0);
-        let offset = self.bytes.len();
-        self.bytes.extend_from_slice(&file.bytes);
+        let offset = append_aligned(&mut self.bytes, &file.bytes);
         self.entries.push(PackedEntry {
             path: file.path,
             offset: offset as u64,
@@ -206,6 +204,19 @@ fn build_with_target_and_suite(
         packs.push(pack);
     }
     Ok(packs)
+}
+
+/// Zero bytes needed to reach the next entry boundary from `length`.
+const fn padding_to_alignment(length: usize) -> usize {
+    (ENTRY_ALIGNMENT - length % ENTRY_ALIGNMENT) % ENTRY_ALIGNMENT
+}
+
+/// Pads to the entry boundary, appends, and returns the entry's offset.
+fn append_aligned(bytes: &mut Vec<u8>, entry: &[u8]) -> usize {
+    bytes.resize(bytes.len() + padding_to_alignment(bytes.len()), 0);
+    let offset = bytes.len();
+    bytes.extend_from_slice(entry);
+    offset
 }
 
 fn finish_pack(bytes: Vec<u8>, entries: Vec<PackedEntry>, suite: Suite) -> Pack {

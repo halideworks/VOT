@@ -22,73 +22,51 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-TERMINAL = {"Published", "Poisoned", "Aborted"}
-# The assurance a profile must have performed before it can publish, and the
-# only state it may link a namespace from.
-REQUIRED = {"Fast": "TransitVerified", "Balanced": "Durable", "Strict": "AtRestVerified"}
-POISONING = {"DataFlushFailed", "JournalFlushFailed", "AtRestVerificationFailed"}
-RECOVERING = {"NamespaceLinkAmbiguous", "NamespaceFlushFailed", "Crash"}
-ABORTABLE = {
-    "New",
-    "Admitted",
-    "TransitVerified",
-    "DataFlushed",
-    "Durable",
-    "AtRestVerified",
-}
-ADVANCES = {
-    ("New", "Admit"): ("Admitted", "Admitted"),
-    ("Admitted", "TransitVerified"): ("TransitVerified", "TransitVerified"),
-    ("TransitVerified", "DataFlushSucceeded"): ("DataFlushed", None),
-    ("DataFlushed", "JournalFlushSucceeded"): ("Durable", "Durable"),
-    ("Durable", "AtRestVerified"): ("AtRestVerified", "AtRestVerified"),
-    ("NamespaceLinked", "NamespaceDurable"): ("Published", "Published"),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from commit_relation import TERMINAL, step  # noqa: E402
 
 
 def relation(row):
-    """What this implementation says the machine in `row` does with its event.
+    """The shared relation, applied to one emitted row."""
+    return step(
+        row["profile"],
+        row["state"],
+        row["event"],
+        row["recovery_state"],
+        row["performed"],
+        row["current"],
+    )
 
-    Returns (error, next_state, next_recovery_state, observation). A rejection
-    leaves the machine exactly as it was, which is the property the whole
-    comparison exists to hold both implementations to.
-    """
-    state = row["state"]
-    event = row["event"]
-    recovery = row["recovery_state"]
-    unchanged = (state, recovery, None)
 
-    if not row["current"]:
-        return ("StaleIncarnation", *unchanged)
-    if state in TERMINAL:
-        return ("Terminal", *unchanged)
+# What a whole corpus contains. Every one of these was absent from a corpus
+# that a mutant shrank while the comparison still passed.
+MINIMUM_ROWS = 9000
+REQUIRED_ARMS = {
+    "a stale machine": lambda row: not row["current"],
+    "a terminal state": lambda row: row["state"] in TERMINAL,
+    "a rejected publication": lambda row: row["error"] == "MissingPredecessor",
+    "a recovery with nothing saved": lambda row: row["state"] == "RecoveryRequired"
+    and row["recovery_state"] is None,
+    "an accepted publication": lambda row: row["observation"] == "Published",
+    "a poisoning": lambda row: row["next_state"] == "Poisoned" and not row["error"],
+    "an abort": lambda row: row["next_state"] == "Aborted" and not row["error"],
+    "a recovery": lambda row: row["event"] == "Recover" and not row["error"],
+}
 
-    if event == "Recover":
-        if state != "RecoveryRequired" or recovery is None:
-            return ("InvalidTransition", *unchanged)
-        return (None, recovery, None, None)
-    if event in POISONING:
-        return (None, "Poisoned", recovery, None)
-    if event in RECOVERING:
-        if state == "RecoveryRequired":
-            return ("InvalidTransition", *unchanged)
-        return (None, "RecoveryRequired", state, None)
-    if event == "Abort":
-        if state not in ABORTABLE:
-            return ("InvalidTransition", *unchanged)
-        return (None, "Aborted", recovery, None)
-    if event == "NamespaceLinked":
-        if state != REQUIRED[row["profile"]]:
-            return ("InvalidTransition", *unchanged)
-        return (None, "NamespaceLinked", recovery, None)
 
-    advance = ADVANCES.get((state, event))
-    if advance is None:
-        return ("InvalidTransition", *unchanged)
-    next_state, observation = advance
-    if observation == "Published" and REQUIRED[row["profile"]] not in row["performed"]:
-        return ("MissingPredecessor", *unchanged)
-    return (None, next_state, recovery, observation)
+def corpus_shortfall(rows):
+    """What a whole corpus would have that this one does not."""
+    missing = [name for name, holds in REQUIRED_ARMS.items() if not any(map(holds, rows))]
+    reported = [f"no row shows {name}" for name in missing]
+    if len(rows) < MINIMUM_ROWS:
+        reported.append(f"{len(rows)} rows, fewer than the {MINIMUM_ROWS} expected")
+    events = {row["event"] for row in rows}
+    profiles = {row["profile"] for row in rows}
+    if len(events) != 15:
+        reported.append(f"{len(events)} distinct events, not 15")
+    if len(profiles) != 3:
+        reported.append(f"{len(profiles)} distinct profiles, not 3")
+    return reported
 
 
 def rust_rows():
@@ -115,8 +93,15 @@ def main() -> int:
         print(f"commit relation cross-check failed to run: {error}", file=sys.stderr)
         return 1
 
-    if not rows:
-        print("commit relation cross-check: no rows", file=sys.stderr)
+    # A floor, because "the rows agreed" says nothing about how much of the
+    # relation was there to agree about. A model change that shrinks the
+    # corpus would otherwise certify a fraction of it as complete: dropping
+    # one recorded assurance took it from 9720 rows to 7290 and still passed.
+    shortfall = corpus_shortfall(rows)
+    if shortfall:
+        for line in shortfall:
+            print(f"  {line}", file=sys.stderr)
+        print("commit relation cross-check: the corpus is not whole", file=sys.stderr)
         return 1
 
     disagreements = []
@@ -128,14 +113,16 @@ def main() -> int:
             row["next_state"],
             row["next_recovery_state"],
             row["observation"],
+            row["next_performed"],
         )
         if row["error"] is not None:
             rejections += 1
             # A rejection that changed anything is the defect this catches
             # whichever implementation it lands in.
-            if (row["next_state"], row["next_recovery_state"]) != (
+            if (row["next_state"], row["next_recovery_state"], row["next_performed"]) != (
                 row["state"],
                 row["recovery_state"],
+                row["performed"],
             ):
                 disagreements.append((row, "rejected but changed the machine", actual))
                 continue

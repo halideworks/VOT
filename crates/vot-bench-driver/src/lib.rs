@@ -482,10 +482,7 @@ fn prover_layer_and_subject(config: &Config) -> Result<(SubjectId, ProverLayer),
         }
     }
     let subject = SubjectId {
-        suite: match config.suite {
-            Suite::Blake3Bao64 => 1,
-            Suite::Sha256Bep52 => 2,
-        },
+        suite: config.suite.identifier(),
         root: verifier.finish()?,
         length: config.object_bytes,
     };
@@ -831,10 +828,7 @@ fn subject_of(config: &Config) -> Result<SubjectId, Error> {
         verifier.update(&record)?;
     }
     Ok(SubjectId {
-        suite: match config.suite {
-            Suite::Blake3Bao64 => 1,
-            Suite::Sha256Bep52 => 2,
-        },
+        suite: config.suite.identifier(),
         root: verifier.finish()?,
         length: config.object_bytes,
     })

@@ -15,6 +15,34 @@ pub enum Suite {
     Sha256Bep52,
 }
 
+/// A suite identifier this revision cannot name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnknownSuite(pub u16);
+
+impl Suite {
+    /// The registered wire identifier, the authority every layer converts
+    /// through.
+    #[must_use]
+    pub const fn identifier(self) -> u16 {
+        match self {
+            Self::Blake3Bao64 => 1,
+            Self::Sha256Bep52 => 2,
+        }
+    }
+}
+
+impl TryFrom<u16> for Suite {
+    type Error = UnknownSuite;
+
+    fn try_from(identifier: u16) -> Result<Self, Self::Error> {
+        match identifier {
+            1 => Ok(Self::Blake3Bao64),
+            2 => Ok(Self::Sha256Bep52),
+            other => Err(UnknownSuite(other)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerifyError {
     GroupOutOfOrder,
@@ -33,19 +61,53 @@ pub trait GroupVerifier: Sized {
 }
 
 pub struct Verifier {
+    sequence: GroupSequence,
     inner: VerifierInner,
+}
+
+/// Group ordering and finality, owned once for both suites. `check` and
+/// `commit` are separate so the feed order stays explicit: validate, update
+/// the suite backend, then commit, and a backend error leaves the sequence
+/// where it was.
+#[derive(Default)]
+struct GroupSequence {
+    next: u64,
+    saw_final: bool,
+}
+
+impl GroupSequence {
+    fn check(&self, group_index: u64, bytes: &[u8]) -> Result<(), VerifyError> {
+        if group_index != self.next {
+            return Err(VerifyError::GroupOutOfOrder);
+        }
+        if self.saw_final {
+            return Err(VerifyError::GroupAfterFinal);
+        }
+        if bytes.is_empty() || bytes.len() > GROUP_SIZE {
+            return Err(VerifyError::InvalidGroupLength);
+        }
+        Ok(())
+    }
+
+    /// Records the accepted group. Finality is recorded before the index
+    /// advance, so an index overflow leaves `saw_final` already set, as it
+    /// always has.
+    fn commit(&mut self, bytes: &[u8]) -> Result<(), VerifyError> {
+        self.saw_final = bytes.len() < GROUP_SIZE;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(VerifyError::LengthOverflow)?;
+        Ok(())
+    }
 }
 
 enum VerifierInner {
     Blake3 {
         hasher: Box<blake3::Hasher>,
-        next_group: u64,
-        saw_final: bool,
     },
     Sha256 {
         tree: MerkleAccumulator,
-        next_group: u64,
-        saw_final: bool,
         single_root: Option<Root>,
     },
 }
@@ -53,96 +115,59 @@ enum VerifierInner {
 impl Verifier {
     #[must_use]
     pub fn new(suite: Suite) -> Self {
-        match suite {
-            Suite::Blake3Bao64 => Self {
-                inner: VerifierInner::Blake3 {
-                    hasher: Box::new(blake3::Hasher::new()),
-                    next_group: 0,
-                    saw_final: false,
-                },
+        let inner = match suite {
+            Suite::Blake3Bao64 => VerifierInner::Blake3 {
+                hasher: Box::new(blake3::Hasher::new()),
             },
-            Suite::Sha256Bep52 => Self {
-                inner: VerifierInner::Sha256 {
-                    tree: MerkleAccumulator::default(),
-                    next_group: 0,
-                    saw_final: false,
-                    single_root: None,
-                },
+            Suite::Sha256Bep52 => VerifierInner::Sha256 {
+                tree: MerkleAccumulator::default(),
+                single_root: None,
             },
+        };
+        Self {
+            sequence: GroupSequence::default(),
+            inner,
         }
+    }
+
+    /// Feeds the next expected group, reading the authoritative index instead
+    /// of mirroring it.
+    fn feed_next(&mut self, bytes: &[u8]) -> Result<(), VerifyError> {
+        self.feed(self.sequence.next, bytes)
     }
 }
 
 impl GroupVerifier for Verifier {
     fn feed(&mut self, group_index: u64, bytes: &[u8]) -> Result<(), VerifyError> {
+        self.sequence.check(group_index, bytes)?;
         match &mut self.inner {
-            VerifierInner::Blake3 {
-                hasher,
-                next_group,
-                saw_final,
-            } => {
-                validate_group(*next_group, *saw_final, group_index, bytes)?;
+            VerifierInner::Blake3 { hasher } => {
                 hasher.update(bytes);
-                *saw_final = bytes.len() < GROUP_SIZE;
-                *next_group = next_group
-                    .checked_add(1)
-                    .ok_or(VerifyError::LengthOverflow)?;
             }
-            VerifierInner::Sha256 {
-                tree,
-                next_group,
-                saw_final,
-                single_root,
-            } => {
-                validate_group(*next_group, *saw_final, group_index, bytes)?;
+            VerifierInner::Sha256 { tree, single_root } => {
                 tree.add_leaf(piece_hash(bytes))?;
-                if *next_group == 0 {
+                if self.sequence.next == 0 {
                     *single_root = Some(single_group_root(bytes));
                 }
-                *saw_final = bytes.len() < GROUP_SIZE;
-                *next_group = next_group
-                    .checked_add(1)
-                    .ok_or(VerifyError::LengthOverflow)?;
             }
         }
-        Ok(())
+        self.sequence.commit(bytes)
     }
 
     fn finish(self) -> Result<Root, VerifyError> {
         match self.inner {
-            VerifierInner::Blake3 { hasher, .. } => Ok(*hasher.finalize().as_bytes()),
-            VerifierInner::Sha256 {
-                next_group: 1,
-                single_root,
-                ..
-            } => single_root.ok_or(VerifyError::LengthOverflow),
+            VerifierInner::Blake3 { hasher } => Ok(*hasher.finalize().as_bytes()),
+            VerifierInner::Sha256 { single_root, .. } if self.sequence.next == 1 => {
+                single_root.ok_or(VerifyError::LengthOverflow)
+            }
             VerifierInner::Sha256 { tree, .. } => tree.finish(),
         }
     }
 }
 
-fn validate_group(
-    next_group: u64,
-    saw_final: bool,
-    group_index: u64,
-    bytes: &[u8],
-) -> Result<(), VerifyError> {
-    if group_index != next_group {
-        return Err(VerifyError::GroupOutOfOrder);
-    }
-    if saw_final {
-        return Err(VerifyError::GroupAfterFinal);
-    }
-    if bytes.is_empty() || bytes.len() > GROUP_SIZE {
-        return Err(VerifyError::InvalidGroupLength);
-    }
-    Ok(())
-}
-
 pub struct StreamVerifier {
     verifier: Verifier,
     pending: Vec<u8>,
-    next_group: u64,
 }
 
 impl StreamVerifier {
@@ -151,7 +176,6 @@ impl StreamVerifier {
         Self {
             verifier: Verifier::new(suite),
             pending: Vec::with_capacity(GROUP_SIZE),
-            next_group: 0,
         }
     }
 
@@ -178,12 +202,7 @@ impl StreamVerifier {
     }
 
     fn feed_group(&mut self, group: &[u8]) -> Result<(), VerifyError> {
-        self.verifier.feed(self.next_group, group)?;
-        self.next_group = self
-            .next_group
-            .checked_add(1)
-            .ok_or(VerifyError::LengthOverflow)?;
-        Ok(())
+        self.verifier.feed_next(group)
     }
 
     /// Feeds the buffered group, leaving the buffer empty but allocated.
@@ -201,7 +220,7 @@ impl StreamVerifier {
     /// Propagates final-group or tree accumulator errors.
     pub fn finish(mut self) -> Result<Root, VerifyError> {
         if !self.pending.is_empty() {
-            self.verifier.feed(self.next_group, &self.pending)?;
+            self.verifier.feed_next(&self.pending)?;
         }
         self.verifier.finish()
     }
@@ -364,6 +383,16 @@ mod tests {
             assert_eq!(split.buffered_bytes(), 0);
             assert_eq!(split.finish().unwrap(), root(suite, &data).unwrap());
         }
+    }
+
+    #[test]
+    fn suite_identifiers_are_the_registered_ones() {
+        assert_eq!(Suite::Blake3Bao64.identifier(), 1);
+        assert_eq!(Suite::Sha256Bep52.identifier(), 2);
+        assert_eq!(Suite::try_from(1), Ok(Suite::Blake3Bao64));
+        assert_eq!(Suite::try_from(2), Ok(Suite::Sha256Bep52));
+        assert_eq!(Suite::try_from(0), Err(UnknownSuite(0)));
+        assert_eq!(Suite::try_from(3), Err(UnknownSuite(3)));
     }
 
     #[test]

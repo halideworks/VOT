@@ -821,11 +821,7 @@ fn check_range_proof(
 }
 
 fn suite(id: u16) -> Result<Suite, Error> {
-    match id {
-        1 => Ok(Suite::Blake3Bao64),
-        2 => Ok(Suite::Sha256Bep52),
-        _ => Err(Error::UnknownObject),
-    }
+    Suite::try_from(id).map_err(|_| Error::UnknownObject)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

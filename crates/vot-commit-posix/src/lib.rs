@@ -96,11 +96,14 @@ impl From<vot_commit_model::Error> for Error {
     }
 }
 
-/// A filesystem object, as `(device, inode, length)`. The length is there
-/// because an unlinked inode number can be handed straight back to the next
-/// file created in the same directory.
+/// A filesystem object, as `(device, inode)`.
+///
+/// Not the length. The Fast profile makes no durability claim before
+/// publication, so after a crash the size on disk need not be the size that
+/// was linked, and comparing it would make recovery reject this provider's
+/// own object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Identity([u8; 24]);
+struct Identity([u8; 16]);
 
 impl Identity {
     fn of_path(path: &Path) -> Result<Self, Error> {
@@ -112,13 +115,14 @@ impl Identity {
     }
 
     fn of_metadata(metadata: &fs::Metadata) -> Self {
-        let mut bytes = [0; 24];
+        let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&metadata.dev().to_le_bytes());
-        bytes[8..16].copy_from_slice(&metadata.ino().to_le_bytes());
-        bytes[16..].copy_from_slice(&metadata.len().to_le_bytes());
+        bytes[8..].copy_from_slice(&metadata.ino().to_le_bytes());
         Self(bytes)
     }
 
+    /// The identity a journal record carries, or nothing for a record from
+    /// before publication recorded one.
     fn from_payload(payload: &[u8]) -> Option<Self> {
         payload.try_into().ok().map(Self)
     }
@@ -340,26 +344,23 @@ impl<F: FaultInjector> PosixCommit<F> {
     }
 
     fn publish_namespace(&mut self) -> Result<Receipt, Error> {
-        if let Err(error) = self
-            .faults
-            .check(FaultPoint::NamespaceLink)
-            .and_then(|()| fs::hard_link(&self.staging_path, &self.destination))
-        {
-            self.machine.apply(Event::NamespaceLinkAmbiguous)?;
-            self.trace.push(TraceEvent::RecoveryRequired);
-            return Err(Error::Io(error));
-        }
-        self.machine.apply(Event::NamespaceLinked)?;
-        // Recovery compares this against the destination it finds, so it never
-        // has to infer identity from a staging name that publication removes.
-        let identity = match Identity::of_path(&self.destination) {
-            Ok(identity) => identity,
+        let sealed = match Identity::of_file(self.staging.handle()) {
+            Ok(sealed) => sealed,
             Err(error) => {
-                self.machine.apply(Event::NamespaceFlushFailed)?;
+                self.machine.apply(Event::NamespaceLinkAmbiguous)?;
                 self.trace.push(TraceEvent::RecoveryRequired);
                 return Err(error);
             }
         };
+        if let Err(error) = self.link_destination(sealed) {
+            self.machine.apply(Event::NamespaceLinkAmbiguous)?;
+            self.trace.push(TraceEvent::RecoveryRequired);
+            return Err(error);
+        }
+        self.machine.apply(Event::NamespaceLinked)?;
+        // Recovery compares this against the destination it finds, so it never
+        // has to infer identity from a staging name that publication removes.
+        let identity = sealed;
         if let Err(error) = self
             .journal
             .append_durable(JOURNAL_NAMESPACE_LINKED, &identity.0)
@@ -391,6 +392,39 @@ impl<F: FaultInjector> PosixCommit<F> {
         })
     }
 
+    /// Links the destination to the sealed object, and proves it.
+    ///
+    /// The link goes by name because that is the only portable way to make
+    /// one, but a name is not what was sealed. Anything could have replaced
+    /// the staging name since, and on the Strict profile the window is the
+    /// whole at-rest read. So the destination is compared against the handle
+    /// that was actually sealed, and a destination that is anything else is
+    /// unlinked again rather than published.
+    ///
+    /// A destination that is already the sealed object is this same call
+    /// having run before, which makes publication retryable after a later
+    /// step failed.
+    fn link_destination(&mut self, sealed: Identity) -> Result<(), Error> {
+        self.faults.check(FaultPoint::NamespaceLink)?;
+        if let Err(error) = fs::hard_link(&self.staging_path, &self.destination) {
+            // Why it failed does not decide anything; whether the destination
+            // is already the sealed object does. That is this call having run
+            // before, whatever the link says about it now.
+            return if Identity::of_path(&self.destination).is_ok_and(|found| found == sealed) {
+                Ok(())
+            } else {
+                Err(Error::Io(error))
+            };
+        }
+        if Identity::of_path(&self.destination)? == sealed {
+            return Ok(());
+        }
+        // The name resolved to something else. Take back the link rather than
+        // publish and receipt bytes this provider never wrote.
+        remove_alias(&self.destination)?;
+        Err(Error::StagingIdentityMismatch)
+    }
+
     /// Makes the destination link durable, then removes the staging name so
     /// nothing can reach the published inode through it, then makes that
     /// removal durable too. The order never leaves the object unreachable:
@@ -403,9 +437,11 @@ impl<F: FaultInjector> PosixCommit<F> {
             .check(FaultPoint::DirectoryFlush)
             .and_then(|()| File::open(destination_parent)?.sync_all())?;
         remove_alias(&self.staging_path)?;
-        if let Some(staging_parent) = staging_parent {
-            File::open(staging_parent)?.sync_all()?;
-        }
+        // Always, not only when the two differ. When they are one directory
+        // the sync above happened before the unlink, so without this the
+        // removal is only in the page cache and a power loss brings the alias
+        // back, still linked to the published inode.
+        File::open(staging_parent)?.sync_all()?;
         Ok(())
     }
 
@@ -436,16 +472,28 @@ pub fn recover(
     let replay = vot_journal::replay(journal_path, incarnation)?;
     let last = replay.records.last();
     if destination.exists() {
-        // A destination this incarnation never linked is somebody else's
-        // file. That is a definite conflict, not something to recover.
-        let Some(record) = last
-            .filter(|record| matches!(record.state, JOURNAL_NAMESPACE_LINKED | JOURNAL_PUBLISHED))
-        else {
-            return Err(Error::DestinationIdentityMismatch);
+        let found = Identity::of_path(destination)?;
+        let linked = last
+            .filter(|record| matches!(record.state, JOURNAL_NAMESPACE_LINKED | JOURNAL_PUBLISHED));
+        // The link happens before the record of it, so a crash in that window
+        // leaves a destination this incarnation did link and a journal that
+        // does not say so. The staging alias is still there in that window and
+        // is the evidence: the two names share an inode. It also covers a
+        // journal written before publication recorded an identity at all.
+        let Some(record) = linked else {
+            return if same_file(staging_path, destination)? {
+                Ok(RecoveryDisposition::FinishDirectoryFlush)
+            } else {
+                Err(Error::DestinationIdentityMismatch)
+            };
         };
-        let recorded =
-            Identity::from_payload(&record.payload).ok_or(Error::DestinationIdentityMismatch)?;
-        if recorded != Identity::of_path(destination)? {
+        // A record from before publication carried an identity has none to
+        // compare, and falls back to the alias the same way.
+        let agrees = match Identity::from_payload(&record.payload) {
+            Some(recorded) => recorded == found,
+            None => same_file(staging_path, destination)?,
+        };
+        if !agrees {
             return Err(Error::DestinationIdentityMismatch);
         }
         return Ok(if record.state == JOURNAL_PUBLISHED {
@@ -463,28 +511,38 @@ pub fn recover(
     )))
 }
 
-/// The destination's parent, and the staging parent when it is a different
-/// directory. Publication changes the names in both, and one sync covers both
-/// only when they are one directory.
+/// The parents of the two names publication changes. Both are synced, and
+/// both are synced even when they are the same directory: the destination's
+/// sync happens before the staging unlink, so that one cannot cover it.
 fn flushed_directories<'a>(
     destination: &'a Path,
     staging: &'a Path,
-) -> Result<(&'a Path, Option<&'a Path>), Error> {
-    let destination_parent = parent_of(destination)?;
-    let staging_parent = parent_of(staging)?;
-    Ok((
-        destination_parent,
-        (staging_parent != destination_parent).then_some(staging_parent),
-    ))
+) -> Result<(&'a Path, &'a Path), Error> {
+    Ok((parent_of(destination)?, parent_of(staging)?))
+}
+
+/// The directory holding `path`. A bare relative name lives in the current
+/// directory, which `Path::parent` reports as the empty path, and opening
+/// that fails.
+/// Whether two names are one file. A name that is not there is not it.
+fn same_file(left: &Path, right: &Path) -> Result<bool, Error> {
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => Ok(Identity::of_metadata(&left) == Identity::of_metadata(&right)),
+        (Err(error), _) | (_, Err(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        (Err(error), _) | (_, Err(error)) => Err(Error::Io(error)),
+    }
 }
 
 fn parent_of(path: &Path) -> Result<&Path, Error> {
-    path.parent().ok_or_else(|| {
-        Error::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path has no parent",
-        ))
-    })
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .or_else(|| path.file_name().map(|_| Path::new(".")))
+        .ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path has no parent",
+            ))
+        })
 }
 
 /// Removes a name that is already published under another. A name somebody
@@ -644,21 +702,25 @@ mod tests {
     }
 
     #[test]
-    fn only_a_separate_staging_directory_is_flushed_twice() {
+    fn both_parents_are_flushed_even_when_they_are_one_directory() {
+        // Named separately even when equal: the destination's sync happens
+        // before the staging unlink, so it cannot stand in for the staging
+        // one afterwards.
         assert_eq!(
             flushed_directories(Path::new("/a/object"), Path::new("/a/stage")).unwrap(),
-            (Path::new("/a"), None)
+            (Path::new("/a"), Path::new("/a"))
         );
         assert_eq!(
             flushed_directories(Path::new("/a/object"), Path::new("/b/stage")).unwrap(),
-            (Path::new("/a"), Some(Path::new("/b")))
+            (Path::new("/a"), Path::new("/b"))
+        );
+        // A bare relative name lives in the current directory.
+        assert_eq!(
+            flushed_directories(Path::new("object"), Path::new("stage")).unwrap(),
+            (Path::new("."), Path::new("."))
         );
         assert!(matches!(
             flushed_directories(Path::new("/"), Path::new("/a/stage")),
-            Err(Error::Io(_))
-        ));
-        assert!(matches!(
-            flushed_directories(Path::new("/a/object"), Path::new("/")),
             Err(Error::Io(_))
         ));
     }
@@ -764,6 +826,132 @@ mod tests {
         // The crash cut between the destination flush and the staging flush:
         // the alias is unlinked but the journal has not reached PUBLISHED.
         fs::remove_file(directory.join("stage")).unwrap();
+        assert_eq!(
+            recover(
+                &directory.join("journal"),
+                [4; 16],
+                &directory.join("stage"),
+                &directory.join("object")
+            )
+            .unwrap(),
+            RecoveryDisposition::FinishDirectoryFlush
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn same_file_answers_only_for_two_names_it_could_read() {
+        let directory = directory("same-file");
+        let one = directory.join("one");
+        let two = directory.join("two");
+        fs::write(&one, b"x").unwrap();
+        fs::write(&two, b"x").unwrap();
+        let linked = directory.join("linked");
+        fs::hard_link(&one, &linked).unwrap();
+
+        assert!(same_file(&one, &linked).unwrap(), "two names, one inode");
+        assert!(!same_file(&one, &two).unwrap(), "same bytes, two inodes");
+        // A name that is not there is not the other one, either way round.
+        let missing = directory.join("missing");
+        assert!(!same_file(&one, &missing).unwrap());
+        assert!(!same_file(&missing, &one).unwrap());
+        // Anything else is the filesystem failing and has to surface. An
+        // interior NUL is invalid input on every platform, where "a component
+        // of the path is a file" is NotADirectory on Unix and NotFound on
+        // Windows, and NotFound is the arm this is ruling out.
+        let unreadable = Path::new("vot-posix-\0-name");
+        assert!(matches!(same_file(unreadable, &one), Err(Error::Io(_))));
+        assert!(matches!(same_file(&one, unreadable), Err(Error::Io(_))));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_link_that_fails_for_another_reason_is_not_read_as_a_retry() {
+        let directory = directory("link-failure");
+        let mut commit = provider(&directory, Profile::Balanced, None);
+        commit.write_transit_verified(b"bytes").unwrap();
+        commit.staging.seal(&directory.join("stage")).unwrap();
+        let sealed = Identity::of_file(commit.staging.handle()).unwrap();
+        // A destination whose parent does not exist fails with NotFound, not
+        // AlreadyExists, so it is a failure rather than this call having run
+        // before.
+        commit.destination = directory.join("absent").join("object");
+        assert!(matches!(
+            commit.link_destination(sealed),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        drop(commit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_name_swapped_after_sealing_is_never_published() {
+        let directory = directory("swapped-after-seal");
+        let mut commit = provider(&directory, Profile::Balanced, None);
+        commit
+            .write_transit_verified(b"the verified bytes")
+            .unwrap();
+        // Seal, which is what publish does first, then take the name away.
+        // On Strict the window between these two is the whole at-rest read.
+        commit.staging.seal(&directory.join("stage")).unwrap();
+        fs::remove_file(directory.join("stage")).unwrap();
+        fs::write(directory.join("stage"), b"somebody else's file").unwrap();
+
+        assert!(
+            matches!(commit.publish(), Err(Error::StagingIdentityMismatch)),
+            "a swapped name published"
+        );
+        assert!(
+            !directory.join("object").exists(),
+            "the impostor reached the destination"
+        );
+        drop(commit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_is_retryable_once_the_destination_is_the_sealed_object() {
+        let clash_directory = directory("retry-publish-clash");
+        let directory = directory("retry-publish");
+        let mut commit = provider(&directory, Profile::Balanced, None);
+        commit.write_transit_verified(b"linked once").unwrap();
+        commit.staging.seal(&directory.join("stage")).unwrap();
+        let sealed = Identity::of_file(commit.staging.handle()).unwrap();
+        // The link is already in place, as it would be after a failure in a
+        // later step. Linking again gives AlreadyExists, and the destination
+        // being the sealed object is what makes that the same call succeeding
+        // rather than somebody else's file.
+        fs::hard_link(directory.join("stage"), directory.join("object")).unwrap();
+        commit.link_destination(sealed).expect("its own link");
+
+        // A destination that exists and is somebody else's is a conflict, not
+        // a retry.
+        let mut clash = provider(&clash_directory, Profile::Balanced, None);
+        clash.write_transit_verified(b"clashing").unwrap();
+        clash.staging.seal(&clash_directory.join("stage")).unwrap();
+        let clash_sealed = Identity::of_file(clash.staging.handle()).unwrap();
+        fs::write(clash_directory.join("object"), b"not ours").unwrap();
+        assert!(matches!(
+            clash.link_destination(clash_sealed),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        drop(commit);
+        drop(clash);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(clash_directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_finishes_a_link_the_journal_never_recorded() {
+        let directory = directory("link-before-record");
+        let mut commit = provider(&directory, Profile::Fast, None);
+        commit.write_transit_verified(b"linked").unwrap();
+        commit.staging.seal(&directory.join("stage")).unwrap();
+        // The crash window between the hard link and the record of it. The
+        // journal's last state is TRANSIT_VERIFIED, and the two names sharing
+        // an inode is the evidence recovery has.
+        fs::hard_link(directory.join("stage"), directory.join("object")).unwrap();
+        drop(commit);
         assert_eq!(
             recover(
                 &directory.join("journal"),

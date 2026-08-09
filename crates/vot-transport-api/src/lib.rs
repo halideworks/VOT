@@ -128,12 +128,13 @@ pub enum Error {
 pub struct BatchFailure {
     /// How many records of the batch the adapter took ownership of.
     ///
-    /// Zero for every adapter in this workspace, because they share one
+    /// Zero for every adapter this workspace ships, because they share one
     /// preflight that checks the whole batch's count and bytes before any of
     /// it is submitted, and nothing between that check and the loop can
     /// fail. The field exists for an adapter whose backend can refuse part
     /// way, and reporting it is how such an adapter says so rather than
-    /// silently leaving the caller to guess.
+    /// silently leaving the caller to guess. This crate's tests build one to
+    /// hold the default implementation to that.
     pub admitted: usize,
     /// What stopped the rest.
     pub error: Error,

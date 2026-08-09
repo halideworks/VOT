@@ -873,6 +873,9 @@ impl Planner {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use vot_transport_api::{Event, StreamId, TransportAdapter};
+    use vot_transport_sim::{Impairment, SimulatorAdapter};
 
     #[test]
     fn a_poisoned_ledger_recovers_only_with_nothing_in_flight() {
@@ -896,10 +899,6 @@ mod tests {
         assert!(!receiver.staging.is_poisoned());
         assert!(!receiver.recover_accounting(), "and only once");
     }
-    use super::*;
-    use vot_transport_api::{Event, StreamId, TransportAdapter};
-    use vot_transport_sim::{Impairment, SimulatorAdapter};
-
     fn subject(bytes: &[u8]) -> SubjectId {
         SubjectId {
             suite: 1,

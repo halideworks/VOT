@@ -20,12 +20,6 @@
 gitignore = true
 minimum_test_timeout = 60.0
 timeout_multiplier = 4.0
-# A serve's private credential directory is created differently on Unix and
-# elsewhere. Only one of the two compiles on any host, and a mutant of the
-# other changes nothing a test can see, so it is reported missed rather than
-# unviable. The Unix one is measured here.
-exclude_re = ["create_private_directory_other"]
-
 exclude_globs = [
   # This configuration is run with a feature on, so the file holding what
   # the wire commands answer without it compiles nowhere here.

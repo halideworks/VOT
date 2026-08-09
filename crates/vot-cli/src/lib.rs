@@ -750,7 +750,28 @@ fn read_bounded_file(path: &Path, maximum: usize) -> Result<Vec<u8>, Error> {
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    write_new_synced_with_mode(path, bytes, None)
+}
+
+/// Writes a new file and syncs it, optionally restricting who may read it.
+///
+/// One writer rather than two: a credential file wants mode 0600 and nothing
+/// else does, which is one argument rather than a second copy of the same
+/// create, write, and sync that a later durability change would miss.
+/// `mode` is ignored where the platform has no mode bits.
+fn write_new_synced_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    #[allow(unused_variables)] mode: Option<u32>,
+) -> Result<(), Error> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())

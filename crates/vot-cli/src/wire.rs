@@ -160,42 +160,31 @@ impl Ephemeral {
 }
 
 /// Creates a directory only this user can enter. A directory that takes the
-/// umask leaves the key inside it readable by anyone on the host.
+/// umask leaves the key inside it readable by anyone on the host. Windows has
+/// no mode bits here, so there the per-user temp directory and the
+/// unguessable name are the protection.
+///
+/// Any missing parents are created first, without the mode: they are the
+/// temp root, shared by everything, and only the leaf holds a key. Creating
+/// just the leaf was a regression, because a `TMPDIR` whose tree does not
+/// exist yet then aborts a serve before it binds.
 fn create_private_directory(path: &Path) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    return create_private_directory_unix(path);
-    #[cfg(not(unix))]
-    return create_private_directory_other(path);
-}
-
-#[cfg(unix)]
-fn create_private_directory_unix(path: &Path) -> Result<(), Error> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(path)?;
-    Ok(())
-}
-
-/// Windows has no mode bits here. The per-user temp directory is the
-/// protection, and the unguessable name is the rest of it.
-#[cfg(not(unix))]
-fn create_private_directory_other(path: &Path) -> Result<(), Error> {
-    std::fs::create_dir(path)?;
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
     Ok(())
 }
 
 /// Writes a new file only this user can read, and syncs it.
 fn write_private_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    std::io::Write::write_all(&mut file, bytes)?;
-    file.sync_all()?;
-    Ok(())
+    crate::write_new_synced_with_mode(path, bytes, Some(0o600))
 }
 
 /// Finds the local source address for reaching `peer`. quiche rejects
@@ -910,13 +899,24 @@ mod tests {
             .expect("a name")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(name.len(), "vot-serve-".len() + 32);
+        // The shape, not the absence of the process ID as a substring: a
+        // 32-character hex string contains a short decimal by chance most of
+        // the time, and a one-digit PID is exactly what a PID namespace
+        // gives, which is the case this change exists for. Hex throughout
+        // says no decimal identifier is in there at all.
+        let suffix = name
+            .strip_prefix("vot-serve-")
+            .expect("the credential prefix");
+        assert_eq!(suffix.len(), 32, "{name}");
         assert!(
-            !name.contains(&std::process::id().to_string()),
-            "the name still says which process wrote it: {name}"
+            suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "the name carries something that is not the random suffix: {name}"
         );
         assert!(first.certificate.exists() && first.key.exists());
 
+        // Unix-only because that is where mode bits decide it. Elsewhere the
+        // per-user temp directory is what keeps the key private, and the
+        // assertions above cover the part this change controls.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -935,6 +935,27 @@ mod tests {
         let directory = first.directory.clone();
         drop(first);
         assert!(!directory.exists(), "the key outlived its serve");
+
+        // A temp root that does not exist yet is built rather than refused:
+        // creating only the leaf aborted a serve before it bound, on any
+        // TMPDIR whose tree the caller expects to be made on demand.
+        let root = std::env::temp_dir().join(format!("vot-serve-root-{suffix}"));
+        let leaf = root.join("deeper").join("credentials");
+        create_private_directory(&leaf).expect("a tree that did not exist yet");
+        assert!(leaf.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| {
+                std::fs::metadata(path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&leaf), 0o700, "only the leaf holds a key");
+        }
+        std::fs::remove_dir_all(&root).expect("the tree");
     }
 
     #[test]

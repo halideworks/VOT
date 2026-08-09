@@ -19,8 +19,9 @@ use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, Ser
 /// harmless right up until capability authentication is wired and then is
 /// not. Drawing it here means that change cannot inherit one.
 ///
-/// Only the serve's. A client's own nonce is replaced by the challenge it
-/// reads, so it is never sent and never compared.
+/// Only the serve's. `Session::client` builds its negotiation with a
+/// constant and never looks at the nonce a client names, so drawing one
+/// there would be work with no wire effect.
 ///
 /// # Errors
 /// Reports [`Error::Randomness`] when the system will not give 32 bytes.

@@ -135,8 +135,10 @@ pub enum Error {
     ChainBroken,
     /// An entry in the chain is about a different subject.
     ChainSubjectMismatch,
-    /// An entry was authenticated under a different key than the chain's
-    /// first. Two issuers signing in turn is not one issuer's record.
+    /// An entry was checked by something other than what checked the chain's
+    /// first: another key, or another scheme. Two issuers signing in turn is
+    /// not one issuer's record, and neither is a signature followed by a MAC
+    /// the reader could have minted.
     ChainIssuerMismatch,
     /// An entry names a different provider, session, or incarnation. A chain
     /// is one incarnation's account of one object.
@@ -145,8 +147,13 @@ pub enum Error {
     /// scoped to one incarnation, and the relation performs each level once
     /// within one, so a repeat is as wrong as a step backwards.
     AssuranceDidNotAdvance,
-    /// A publication names a predecessor weaker than its profile requires.
+    /// A publication names a predecessor that is not the one its profile
+    /// requires.
     PredecessorTooWeak,
+    /// A publication names the right predecessor, but no entry before it in
+    /// the chain observed that assurance. The field is the issuer's own word;
+    /// the chain is what checks it.
+    PredecessorNotObserved,
     /// A chain with no observations proves nothing.
     EmptyChain,
     InvalidEncoding,
@@ -431,6 +438,24 @@ fn subject_identity(receipt: &Receipt) -> (SubjectKind, u16, [u8; 32], u64) {
 #[derive(Clone, Debug)]
 pub struct VerifiedReceipt {
     authenticated: AuthenticatedReceipt,
+    by: VerifiedBy,
+}
+
+/// What actually checked a receipt, as opposed to the `key_id` label the
+/// receipt carries about itself.
+///
+/// A chain is scoped to one of these. The label cannot do that job: two keys
+/// may share one, and a chain mixing schemes would let an entry the reader
+/// could have minted sit inside a record presented as third-party evidence.
+/// That is the rule [`verify_witness`] already applies to a witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedBy {
+    /// The public key the signature verified under, so two keys sharing a
+    /// label are two issuers.
+    Ed25519(Box<[u8; 32]>),
+    /// A shared secret. Whoever can check it can mint it, so a chain of these
+    /// is one domain's own record rather than evidence for anybody else.
+    HmacSha256,
 }
 
 impl VerifiedReceipt {
@@ -444,10 +469,10 @@ impl VerifiedReceipt {
         &self.authenticated
     }
 
-    /// What authenticated it. A chain is scoped to one of these.
+    /// What actually checked this receipt. A chain is scoped to one of these.
     #[must_use]
-    pub fn key_id(&self) -> &[u8] {
-        &self.authenticated.key_id
+    pub const fn verified_by(&self) -> &VerifiedBy {
+        &self.by
     }
 }
 
@@ -467,9 +492,11 @@ fn chain_scope(receipt: &Receipt) -> (u16, [u16; 3], [u8; 16], [u8; 16]) {
 /// subject, advance the issuer sequence, and come from the same issuer key,
 /// provider, session, and incarnation. The first entry must not link.
 ///
-/// Assurance advances at every step, and a `Published`
-/// observation must name the predecessor its profile requires, which is the
-/// same table `vot_commit_model` holds the machine to.
+/// Assurance advances at every step, and a `Published` observation must name
+/// exactly the predecessor its profile requires, from the table
+/// `vot_commit_model` holds the machine to, and an earlier entry must have
+/// observed it. The field alone would only say the receipt agrees with
+/// itself.
 ///
 /// The elements are `VerifiedReceipt` rather than `AuthenticatedReceipt`
 /// because an unbroken chain of forgeries is not evidence of anything, and a
@@ -490,11 +517,12 @@ pub fn verify_chain(chain: &[VerifiedReceipt]) -> Result<(), Error> {
     // out would let a chain mix two of them.
     let subject = subject_identity(first.receipt());
     let scope = chain_scope(first.receipt());
-    let key_id = first.key_id().to_vec();
+    let by = first.verified_by().clone();
     let mut previous_digest = first.authenticated().digest()?;
     let mut previous_sequence = first.receipt().sequence;
     let mut previous_assurance = first.receipt().assurance;
-    check_predecessor(first.receipt())?;
+    let mut observed = vec![first.receipt().assurance];
+    check_predecessor(first.receipt(), &[])?;
     for entry in chain.iter().skip(1) {
         let receipt = entry.receipt();
         if receipt.previous != Some(previous_digest) {
@@ -503,7 +531,7 @@ pub fn verify_chain(chain: &[VerifiedReceipt]) -> Result<(), Error> {
         if subject_identity(receipt) != subject {
             return Err(Error::ChainSubjectMismatch);
         }
-        if entry.key_id() != key_id {
+        if entry.verified_by() != &by {
             return Err(Error::ChainIssuerMismatch);
         }
         if chain_scope(receipt) != scope {
@@ -515,7 +543,8 @@ pub fn verify_chain(chain: &[VerifiedReceipt]) -> Result<(), Error> {
         if model_assurance(receipt.assurance) <= model_assurance(previous_assurance) {
             return Err(Error::AssuranceDidNotAdvance);
         }
-        check_predecessor(receipt)?;
+        check_predecessor(receipt, &observed)?;
+        observed.push(receipt.assurance);
         previous_digest = entry.authenticated().digest()?;
         previous_sequence = receipt.sequence;
         previous_assurance = receipt.assurance;
@@ -523,16 +552,28 @@ pub fn verify_chain(chain: &[VerifiedReceipt]) -> Result<(), Error> {
     Ok(())
 }
 
-/// A publication must name the assurance its profile requires. Anything
-/// weaker is a receipt claiming an assurance the commit relation would not
-/// have produced.
-fn check_predecessor(receipt: &Receipt) -> Result<(), Error> {
+/// A publication must name exactly the assurance its profile requires, and
+/// the chain must contain an observation of it.
+///
+/// Exactly, not at least: the machine gates publication on `performed` of
+/// that level, which is membership rather than an ordering, so `>=` would
+/// accept a publication naming itself as its own predecessor. And `observed`
+/// rather than the receipt's own word for it, because `actual_predecessor` is
+/// a field the issuer fills in: without the chain to check it against, a
+/// passing chain would say only that a receipt agrees with itself.
+fn check_predecessor(receipt: &Receipt, observed: &[AssuranceLevel]) -> Result<(), Error> {
     if receipt.assurance != AssuranceLevel::Published {
         return Ok(());
     }
     let required = model_profile(receipt.profile).required_predecessor();
-    if model_assurance(receipt.actual_predecessor) < required {
+    if model_assurance(receipt.actual_predecessor) != required {
         return Err(Error::PredecessorTooWeak);
+    }
+    if !observed
+        .iter()
+        .any(|level| model_assurance(*level) == required)
+    {
+        return Err(Error::PredecessorNotObserved);
     }
     Ok(())
 }
@@ -625,6 +666,7 @@ pub fn verify_ed25519(
         .map_err(|_| Error::Authentication)?;
     Ok(VerifiedReceipt {
         authenticated: receipt.clone(),
+        by: VerifiedBy::Ed25519(Box::new(key.to_bytes())),
     })
 }
 
@@ -675,6 +717,7 @@ pub fn verify_hmac_sha256(
         .map_err(|_| Error::Authentication)?;
     Ok(VerifiedReceipt {
         authenticated: receipt.clone(),
+        by: VerifiedBy::HmacSha256,
     })
 }
 
@@ -1379,7 +1422,12 @@ mod tests {
     #[test]
     fn a_chain_cannot_lose_assurance_or_publish_without_its_predecessor() {
         let key = signing_key();
-        let signed = chain(&key, &[AssuranceLevel::Durable, AssuranceLevel::Published]);
+        // Strict, so the publication's predecessor is the at-rest read, and
+        // the chain has to contain one.
+        let signed = chain(
+            &key,
+            &[AssuranceLevel::AtRestVerified, AssuranceLevel::Published],
+        );
         verify_chain(&verified(&signed, &key)).unwrap();
 
         // Going backwards. Every field but the assurance is the one the chain
@@ -1409,6 +1457,9 @@ mod tests {
             (CommitProfile::Balanced, AssuranceLevel::TransitVerified),
             (CommitProfile::Strict, AssuranceLevel::Durable),
             (CommitProfile::Fast, AssuranceLevel::Admitted),
+            // Not merely weaker: the machine gates on membership, so a
+            // publication naming itself is as wrong as one naming too little.
+            (CommitProfile::Fast, AssuranceLevel::Published),
         ] {
             let mut published = signed[1].receipt.clone();
             published.profile = profile;

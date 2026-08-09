@@ -228,12 +228,10 @@ impl Machine {
     }
 
     fn can_publish_from(&self, state: State) -> bool {
-        matches!(
-            (self.profile, state),
-            (Profile::Fast, State::TransitVerified)
-                | (Profile::Balanced, State::Durable)
-                | (Profile::Strict, State::AtRestVerified)
-        )
+        // Derived rather than written again: the state a namespace may be
+        // linked from is the one standing at the assurance publication
+        // requires, and one table decides both.
+        state == self.profile.required_predecessor().state()
     }
 
     fn required_predecessor_performed(&self) -> bool {
@@ -286,6 +284,18 @@ impl Profile {
 }
 
 impl Assurance {
+    /// The state a machine stands in once it has performed this.
+    #[must_use]
+    pub const fn state(self) -> State {
+        match self {
+            Self::Admitted => State::Admitted,
+            Self::TransitVerified => State::TransitVerified,
+            Self::Durable => State::Durable,
+            Self::AtRestVerified => State::AtRestVerified,
+            Self::Published => State::Published,
+        }
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

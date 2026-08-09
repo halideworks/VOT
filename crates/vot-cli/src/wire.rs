@@ -11,10 +11,23 @@ use vot_transport_quiche::live::{Config, CongestionControl, Listener, SideChanne
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession};
 
-/// Returns unauthenticated session credentials. The nonce is handshake
-/// freshness, not a secret.
-fn authentication() -> vot_session::Authentication {
-    vot_session::Authentication::NotRequired { nonce: [0; 32] }
+/// The serve's stance: no authentication required, with a fresh nonce.
+///
+/// Fresh because `vot_session::no_capability` says the nonce must be: a
+/// client that later binds to it must not find a constant. Nothing binds to
+/// it today, because the binding is `Binding::None`, so a constant is
+/// harmless right up until capability authentication is wired and then is
+/// not. Drawing it here means that change cannot inherit one.
+///
+/// Only the serve's. A client's own nonce is replaced by the challenge it
+/// reads, so it is never sent and never compared.
+///
+/// # Errors
+/// Reports [`Error::Randomness`] when the system will not give 32 bytes.
+fn serve_authentication() -> Result<vot_session::Authentication, Error> {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| Error::Randomness)?;
+    Ok(vot_session::Authentication::NotRequired { nonce })
 }
 
 /// Inbound receive limits matched to the codec's default settings.
@@ -257,7 +270,7 @@ pub fn serve_bundle(
     let outcome = crate::drive::serve_sessions(sessions, || {
         // Accept blocks until a connection arrives.
         let carrier = listener.accept().map_err(carrier_failure)?;
-        ServeSession::begin(&server, carrier, authentication())
+        ServeSession::begin(&server, carrier, serve_authentication()?)
     });
     // Drop before surfacing the error so the socket is released.
     drop(registration);
@@ -897,6 +910,21 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn a_serve_draws_a_fresh_nonce_for_every_session() {
+        let drawn = || {
+            let vot_session::Authentication::NotRequired { nonce } =
+                serve_authentication().expect("a nonce")
+            else {
+                panic!("the serve asks for no capability");
+            };
+            nonce
+        };
+        let first = drawn();
+        assert_ne!(first, drawn(), "two sessions advertised the same nonce");
+        assert_ne!(first, [0; 32], "the nonce is the constant it used to be");
+    }
 
     #[test]
     fn ephemeral_credentials_are_unguessable_and_unreadable_by_others() {
@@ -1990,7 +2018,7 @@ mod tests {
         let serving = std::thread::spawn(move || {
             crate::drive::serve_sessions(Some(u32::try_from(RAILS).unwrap()), || {
                 let carrier = listener.accept().map_err(carrier_failure)?;
-                ServeSession::begin(&opened, carrier, authentication())
+                ServeSession::begin(&opened, carrier, serve_authentication()?)
             })
             .unwrap();
             opened.package()

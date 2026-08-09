@@ -31,6 +31,11 @@ exclude_globs = [
   # `wire` feature to compile would be measured nowhere: put such code in
   # `wire.rs`, which this configuration does measure.
   "crates/vot-cli/src/rendezvous.rs",
+  # The relay module is `cfg(any(test, feature = "wire"))` for the same
+  # reason and is measured in the same place, so it is excluded here for the
+  # same reason. Code in it that needs the feature to compile belongs in
+  # `wire.rs`.
+  "crates/vot-cli/src/relay.rs",
   "crates/vot-cli/src/main.rs",
   "crates/vot-bench-driver/src/main.rs",
   "crates/vot-capability/src/bin/*",

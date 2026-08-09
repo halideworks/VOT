@@ -35,6 +35,15 @@ pub fn rendezvous_service(
 }
 
 /// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn relay_service(
+    _address: SocketAddr,
+    _datagrams: Option<u64>,
+    _listening: impl FnMut(SocketAddr),
+) -> Result<(), Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
 pub fn fetch_via_rendezvous(
     _root: [u8; 32],
     _bundle: &Path,

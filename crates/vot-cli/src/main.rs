@@ -9,6 +9,7 @@ Usage:
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
   vot rendezvous LISTEN_ADDR
+  vot relay LISTEN_ADDR
   vot capability keygen
   vot capability issue ISSUER_KEY_SOURCE ISSUER AUDIENCE HOLDER_PUBLIC
                        PACKAGE_ROOT SECONDS OUT.cbor
@@ -67,6 +68,10 @@ A receipt signed with ed25519-secret can be checked by anyone holding only the
 matching ed25519-public key. A shared secret cannot: whoever can check it can
 also forge it, so verify-receipt reports SHARED-SECRET rather than
 THIRD-PARTY-VERIFIABLE.
+
+A relay forwards datagrams between two ends that cannot punch, and reads none
+of them: it sees ciphertext, two addresses, and byte counts. VOT_RELAY_SLOTS,
+VOT_RELAY_TTL_MS, and VOT_RELAY_BYTES bound what one donates. See ADR-0034.
 
 A ROOT in the address position is resolved through the rendezvous service
 VOT_RENDEZVOUS names, as ADDR:PORT or NAME:PORT. There is no default: point
@@ -175,6 +180,7 @@ fn run() -> Result<(), vot_cli::Error> {
 fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
     match arguments {
         [_, command, address] if command == "rendezvous" => rendezvous(address),
+        [_, command, address] if command == "relay" => relay(address),
         [_, command, sub] if command == "capability" && sub == "keygen" => {
             let (secret, public) = vot_cli::generate_keypair()?;
             // The warning goes to stderr so the two lines stdout carries are
@@ -267,6 +273,16 @@ fn rendezvous(address: &str) -> Result<(), vot_cli::Error> {
         .map_err(|_| vot_cli::Error::InvalidArguments)?;
     vot_cli::rendezvous_service(address, None, |at| {
         println!("rendezvous {at}");
+    })
+}
+
+/// Forwards datagrams between the two ends of a slot until it is stopped.
+fn relay(address: &str) -> Result<(), vot_cli::Error> {
+    let address = address
+        .parse()
+        .map_err(|_| vot_cli::Error::InvalidArguments)?;
+    vot_cli::relay_service(address, None, |at| {
+        println!("relay {at}");
     })
 }
 

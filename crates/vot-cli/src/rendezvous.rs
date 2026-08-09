@@ -133,7 +133,7 @@ fn padded_key(rest: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Appends an optional address: a family byte, then the bytes it names.
-fn push_address(wire: &mut Vec<u8>, address: Option<SocketAddr>) {
+pub(crate) fn push_address(wire: &mut Vec<u8>, address: Option<SocketAddr>) {
     match address {
         None => wire.push(0),
         Some(SocketAddr::V4(v4)) => {
@@ -151,7 +151,11 @@ fn push_address(wire: &mut Vec<u8>, address: Option<SocketAddr>) {
 
 /// What an address slot held: bytes that encode no address at all, the
 /// explicit no-address marker, or an address.
-enum AddressSlot {
+///
+/// Shared with the relay, which carries an address in the same shape for the
+/// same reason: one codec, so a fetch that can read one service's answer can
+/// read the other's.
+pub(crate) enum AddressSlot {
     Invalid,
     Empty,
     Held(SocketAddr),
@@ -181,7 +185,7 @@ pub(crate) fn from_service(source: SocketAddr, service: SocketAddr) -> bool {
 }
 
 /// The inverse of [`push_address`].
-fn pull_address(bytes: &[u8]) -> AddressSlot {
+pub(crate) fn pull_address(bytes: &[u8]) -> AddressSlot {
     let held = |ip, port| AddressSlot::Held(canonical(SocketAddr::new(ip, port)));
     match bytes {
         [0] => AddressSlot::Empty,

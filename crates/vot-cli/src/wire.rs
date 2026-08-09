@@ -502,6 +502,256 @@ pub fn rendezvous_service(
     Ok(())
 }
 
+/// Slots this relay opens at once, its slot lifetime in milliseconds, and the
+/// bytes one slot forwards. Each is a hard bound the operator sets.
+const RELAY_SLOTS: &str = "VOT_RELAY_SLOTS";
+const RELAY_TTL_MS: &str = "VOT_RELAY_TTL_MS";
+const RELAY_BYTES: &str = "VOT_RELAY_BYTES";
+
+/// The relay's bounds, from the environment or the defaults.
+///
+/// Every value is parsed and rejected here rather than clamped: an operator
+/// who wrote a number this cannot read has said something, and guessing what
+/// would be a donation they did not agree to.
+///
+/// # Errors
+/// Rejects a value that is not a number, and a zero, which would be a relay
+/// that opens no slots or closes them the instant they open.
+fn relay_limits_from(
+    slots: Option<&str>,
+    ttl_ms: Option<&str>,
+    bytes: Option<&str>,
+) -> Result<crate::relay::Limits, Error> {
+    let default = crate::relay::Limits::default();
+    let read = |value: Option<&str>| -> Result<Option<u64>, Error> {
+        value
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| Error::InvalidArguments)
+            })
+            .transpose()
+            .and_then(|parsed| match parsed {
+                Some(0) => Err(Error::InvalidArguments),
+                other => Ok(other),
+            })
+    };
+    let concurrent = match read(slots)? {
+        Some(value) => usize::try_from(value).map_err(|_| Error::InvalidArguments)?,
+        None => default.concurrent,
+    };
+    Ok(crate::relay::Limits {
+        concurrent,
+        ttl_ms: read(ttl_ms)?.unwrap_or(default.ttl_ms),
+        bytes: read(bytes)?.unwrap_or(default.bytes),
+    })
+}
+
+/// How long a slot thread waits on its socket before checking its deadline.
+///
+/// A slot that carries nothing still has to notice its own expiry, and this
+/// is how often it looks. Short enough that a closed slot releases its port
+/// promptly, long enough that an idle slot is not a spinning thread.
+const SLOT_TICK: Duration = Duration::from_millis(200);
+
+/// The widest datagram a slot forwards. A relayed datagram is exactly the
+/// size of a direct one, so this is the carrier's own ceiling.
+const SLOT_DATAGRAM_BYTES: usize = vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+
+/// Forwards one slot's datagrams until it spends its time or its bytes.
+///
+/// Owns its socket and its whole accounting, so no two slots share state and
+/// the relay's bound is a count of threads rather than a lock.
+fn run_slot(
+    socket: &std::net::UdpSocket,
+    mut meter: crate::relay::Meter,
+    began: std::time::Instant,
+    stopping: &std::sync::atomic::AtomicBool,
+) {
+    if socket.set_read_timeout(Some(SLOT_TICK)).is_err() {
+        return;
+    }
+    let mut buffer = vec![0_u8; SLOT_DATAGRAM_BYTES];
+    loop {
+        // The relay stopping ends its slots. Without this a bounded run
+        // returns and then waits out every slot's whole lifetime.
+        if stopping.load(Ordering::Relaxed) {
+            return close(&meter);
+        }
+        let now_ms = elapsed_ms(began);
+        match socket.recv_from(&mut buffer) {
+            Ok((length, source)) => {
+                match meter.take(source, length as u64, now_ms) {
+                    crate::relay::Forward::To(peer) => {
+                        // A refused send is the far end gone, which the other
+                        // end learns from its own session rather than here.
+                        let _ = socket.send_to(&buffer[..length], peer);
+                    }
+                    crate::relay::Forward::Nowhere => {}
+                    crate::relay::Forward::Closed => return close(&meter),
+                }
+            }
+            Err(error) => {
+                if !waited_out(&error) {
+                    return;
+                }
+                // Nothing arrived. The deadline still applies.
+                if meter.take(source_of_nothing(), 0, now_ms) == crate::relay::Forward::Closed {
+                    return close(&meter);
+                }
+            }
+        }
+    }
+}
+
+/// Reports what a slot carried, which is the donation an operator is paying
+/// for and the only thing the relay ever says about one.
+fn close(meter: &crate::relay::Meter) {
+    eprintln!("slot closed after {} bytes", meter.forwarded());
+}
+
+/// An address no peer has, for the idle check that only reads the clock.
+///
+/// `Meter::take` decides expiry before it looks at the source, so the value
+/// is never routed. Naming it here beats a second entry point that could
+/// drift from the one the forwarding path uses.
+const fn source_of_nothing() -> SocketAddr {
+    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+}
+
+/// Milliseconds since `began`, saturating rather than wrapping.
+fn elapsed_ms(began: std::time::Instant) -> u64 {
+    u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Runs the relay on `address` until stopped, or until it has answered
+/// `datagrams` requests for a slot when bounded.
+///
+/// The bound counts answers rather than loop passes, so a relay nobody asks
+/// runs until it is stopped and a bounded one is not spent by its own read
+/// timeouts.
+///
+/// The relay answers `Take` on this socket and opens one port per slot. It
+/// never reads what a slot carries: ADR-0034.
+///
+/// # Errors
+/// Surfaces a socket that will not bind, and a control socket that fails for
+/// a reason other than its own read timeout.
+pub fn relay_service(
+    address: SocketAddr,
+    datagrams: Option<u64>,
+    mut listening: impl FnMut(SocketAddr),
+) -> Result<(), Error> {
+    let limits = relay_limits_from(
+        std::env::var(RELAY_SLOTS).ok().as_deref(),
+        std::env::var(RELAY_TTL_MS).ok().as_deref(),
+        std::env::var(RELAY_BYTES).ok().as_deref(),
+    )?;
+    let socket = std::net::UdpSocket::bind(address).map_err(|_| Error::CarrierUnavailable)?;
+    socket
+        .set_read_timeout(Some(SERVICE_TICK))
+        .map_err(|_| Error::CarrierUnavailable)?;
+    let listening_at = socket.local_addr().map_err(|_| Error::CarrierUnavailable)?;
+    listening(listening_at);
+    // The relay's own configuration, on stderr because it is what an
+    // operator agreed to donate and the one thing they need to see is that
+    // the numbers running are the numbers they set.
+    eprintln!(
+        "relay slots {} ttl {}ms bytes {}",
+        limits.concurrent, limits.ttl_ms, limits.bytes
+    );
+    let began = std::time::Instant::now();
+    let mut slots = crate::relay::Slots::default();
+    let mut buffer = [0_u8; 128];
+    // Counted in the loop's own body rather than by a clock, and only for a
+    // request actually answered.
+    let mut answered = 0_u64;
+    // Slots run on their own threads and are joined when the relay stops, so
+    // a bounded run leaves nothing behind.
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut running = Running {
+        limits,
+        began,
+        stopping: &stopping,
+        threads: Vec::new(),
+    };
+    while datagrams.is_none_or(|bound| answered < bound) {
+        let (length, source) = match socket.recv_from(&mut buffer) {
+            Ok(arrival) => arrival,
+            Err(error) => {
+                if waited_out(&error) {
+                    slots.retire(elapsed_ms(began));
+                    continue;
+                }
+                return Err(Error::Io(error));
+            }
+        };
+        let Some(crate::relay::Datagram::Take { key }) = crate::relay::decode(&buffer[..length])
+        else {
+            continue;
+        };
+        let now_ms = elapsed_ms(began);
+        let at = if let Some(held) = slots.held(key, now_ms) {
+            // The same key asking again is answered with the slot it already
+            // has, so a repeated Take costs one datagram rather than a port.
+            Some(held)
+        } else if slots.admit(key, now_ms, limits) {
+            open_slot(&socket, &mut slots, key, now_ms, &mut running)
+        } else {
+            None
+        };
+        let _ = socket.send_to(
+            &crate::relay::encode(&crate::relay::Datagram::Slot { key, at }),
+            source,
+        );
+        answered = answered.saturating_add(1);
+    }
+    stopping.store(true, Ordering::Relaxed);
+    for slot in running.threads {
+        let _ = slot.join();
+    }
+    Ok(())
+}
+
+/// What every slot this relay opens shares: the bounds it runs under, the
+/// clock it measures against, the flag that ends it, and the handles the
+/// relay joins.
+///
+/// One value because they travel together and separately they are five
+/// arguments to a function that opens a socket.
+struct Running<'a> {
+    limits: crate::relay::Limits,
+    began: std::time::Instant,
+    stopping: &'a std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Opens one slot beside `control`, in the same family, and starts its
+/// thread. Nothing is recorded if the socket will not bind.
+fn open_slot(
+    control: &std::net::UdpSocket,
+    slots: &mut crate::relay::Slots,
+    key: [u8; 32],
+    now_ms: u64,
+    running: &mut Running<'_>,
+) -> Option<SocketAddr> {
+    let local = control.local_addr().ok()?;
+    let mut any = local;
+    any.set_port(0);
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    let at = socket.local_addr().ok()?;
+    let expires_at_ms = now_ms.saturating_add(running.limits.ttl_ms);
+    let meter = crate::relay::Meter::new(expires_at_ms, running.limits.bytes);
+    let began = running.began;
+    let stopping = std::sync::Arc::clone(running.stopping);
+    running.threads.push(std::thread::spawn(move || {
+        run_slot(&socket, meter, began, &stopping);
+    }));
+    slots.opened(key, at, expires_at_ms);
+    Some(crate::rendezvous::canonical(at))
+}
+
 /// Rendezvous service address. Unset means no registration.
 const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
 
@@ -2479,5 +2729,151 @@ mod tests {
             .expect("served");
 
         crate::harness::discard(&[&source, &bundle, &refused_into, &fetched]);
+    }
+
+    #[test]
+    fn a_relay_slot_carries_bytes_between_two_ends_and_nobody_else() {
+        // ADR-0034 step 2 on loopback: take a slot, pair on it, and see the
+        // bytes cross unchanged in both directions while a third address
+        // gets nothing.
+        use crate::relay::{Datagram, decode, encode};
+
+        let (listening, address) = mpsc::channel();
+        // Two answers: the take below, and one more at the end that releases
+        // the relay once the assertions are done. A relay that stopped after
+        // the first would close the slot before anything crossed it, which is
+        // what stopping means.
+        let relaying = std::thread::spawn(move || {
+            relay_service("127.0.0.1:0".parse().unwrap(), Some(2), |at| {
+                let _ = listening.send(at);
+            })
+        });
+        let at = address.recv().expect("the relay reported its address");
+
+        let taker = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        taker
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        let key = [0x5a; 32];
+        taker
+            .send_to(&encode(&Datagram::Take { key }), at)
+            .expect("a take");
+        let mut buffer = [0_u8; 128];
+        let (length, from) = taker.recv_from(&mut buffer).expect("an answer");
+        assert_eq!(from, at, "the answer came from somewhere else");
+        let Some(Datagram::Slot {
+            key: answered,
+            at: Some(slot),
+        }) = decode(&buffer[..length])
+        else {
+            panic!("the relay gave no slot: {:?}", decode(&buffer[..length]));
+        };
+        assert_eq!(answered, key, "the answer named another key");
+        assert_ne!(slot, at, "the slot is its own port, not the control one");
+
+        // Two ends and a stranger, each with a bounded wait.
+        let ends: Vec<UdpSocket> = (0..3)
+            .map(|_| {
+                let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("a bounded wait");
+                socket
+            })
+            .collect();
+        // The first arrival pairs nothing: there is nobody to send it to.
+        ends[0].send_to(b"first", slot).expect("the first end");
+        // The second pairs, and its bytes go to the first.
+        ends[1].send_to(b"second", slot).expect("the second end");
+        let mut carried = [0_u8; 64];
+        let (length, from) = ends[0].recv_from(&mut carried).expect("the pairing");
+        assert_eq!(&carried[..length], b"second", "the bytes changed");
+        assert_eq!(from, slot, "not from the slot");
+
+        // And back the other way, unchanged.
+        ends[0]
+            .send_to(b"reply", slot)
+            .expect("the first end again");
+        let (length, _) = ends[1].recv_from(&mut carried).expect("the reply");
+        assert_eq!(&carried[..length], b"reply");
+
+        // A third address is not part of this slot.
+        ends[2].send_to(b"stranger", slot).expect("a stranger");
+        assert!(
+            ends[0].recv_from(&mut carried).is_err() && ends[1].recv_from(&mut carried).is_err(),
+            "a third address was forwarded to an end of the slot"
+        );
+
+        // Release the relay, which stops its slots with it.
+        taker
+            .send_to(&encode(&Datagram::Take { key }), at)
+            .expect("the releasing take");
+        let _ = taker.recv_from(&mut buffer);
+        relaying
+            .join()
+            .expect("the relay thread")
+            .expect("a relay that answered its bound");
+    }
+
+    #[test]
+    fn a_relay_refuses_past_its_bound_and_repeats_the_slot_it_gave() {
+        use crate::relay::{Datagram, decode, encode};
+
+        let (listening, address) = mpsc::channel();
+        // Three control turns: two distinct keys and one repeat.
+        let relaying = std::thread::spawn(move || {
+            relay_service("127.0.0.1:0".parse().unwrap(), Some(3), |at| {
+                let _ = listening.send(at);
+            })
+        });
+        let at = address.recv().expect("the relay reported its address");
+        let taker = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        taker
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a bounded wait");
+        let mut buffer = [0_u8; 128];
+        let mut ask = |key: [u8; 32]| -> Option<SocketAddr> {
+            taker
+                .send_to(&encode(&Datagram::Take { key }), at)
+                .expect("a take");
+            let (length, _) = taker.recv_from(&mut buffer).expect("an answer");
+            match decode(&buffer[..length]) {
+                Some(Datagram::Slot { at, .. }) => at,
+                other => panic!("not a slot answer: {other:?}"),
+            }
+        };
+        let first = ask([1; 32]).expect("a slot");
+        assert_eq!(ask([1; 32]), Some(first), "the same key got a second port");
+        assert!(ask([2; 32]).is_some(), "a second key was refused early");
+        relaying
+            .join()
+            .expect("the relay thread")
+            .expect("a relay that answered its bound");
+    }
+
+    #[test]
+    fn the_relay_bounds_are_the_numbers_given_or_the_defaults() {
+        let default = crate::relay::Limits::default();
+        assert_eq!(relay_limits_from(None, None, None).unwrap(), default);
+        assert_eq!(
+            relay_limits_from(Some(" 2\n"), Some("500"), Some("1024")).unwrap(),
+            crate::relay::Limits {
+                concurrent: 2,
+                ttl_ms: 500,
+                bytes: 1024
+            },
+            "given, trimmed, taken"
+        );
+        // Zero is not a bound anyone meant: a relay with no slots, or one
+        // that closes them the instant they open.
+        for zero in [
+            relay_limits_from(Some("0"), None, None),
+            relay_limits_from(None, Some("0"), None),
+            relay_limits_from(None, None, Some("0")),
+        ] {
+            assert!(matches!(zero, Err(Error::InvalidArguments)));
+        }
+        assert!(relay_limits_from(Some("many"), None, None).is_err());
+        assert!(std::env::var(RELAY_SLOTS).is_err(), "the suite owns no env");
     }
 }

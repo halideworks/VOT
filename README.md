@@ -52,7 +52,18 @@ vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE \
 
 # Run a rendezvous service (ADR-0033).
 vot rendezvous LISTEN_ADDR
+
+# Run a relay, for two ends that cannot punch (ADR-0034).
+vot relay LISTEN_ADDR
 ```
+
+A relay forwards datagrams between the two ends of a slot and reads none of
+them: it sees ciphertext, two addresses, and byte counts. A slot is a port, so
+a relayed datagram is exactly the size of a direct one and nothing is wrapped.
+Both ends reach it outbound, which is why it works where a punch does not.
+Slots are keyed by the same hash of the root the rendezvous pairs on, so a
+relay never learns a root either, and each carries a lifetime and a byte
+ceiling its operator sets.
 
 A fetch may name the package root where an address goes, which removes the
 port-forward on an unmanaged network. Both ends point `VOT_RENDEZVOUS` at the
@@ -138,6 +149,9 @@ expose. An interposer still cannot give you different bytes.
 | `VOT_SERVE_AUDIENCE` | unset | The deployment a capability must name |
 | `VOT_FETCH_CAPABILITY` | unset | Path to the token a fetch presents |
 | `VOT_FETCH_HOLDER_KEY` | unset | The holder secret that token names, as a `KEY_SOURCE` |
+| `VOT_RELAY_SLOTS` | 8 | Slots a relay opens at once |
+| `VOT_RELAY_TTL_MS` | 600000 | How long one slot lives |
+| `VOT_RELAY_BYTES` | 8589934592 | Bytes one slot forwards before it closes |
 
 ## Keys
 

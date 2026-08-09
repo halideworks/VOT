@@ -30,6 +30,8 @@ mod harness;
 #[cfg(not(feature = "wire"))]
 mod nowire;
 #[cfg(any(test, feature = "wire"))]
+mod relay;
+#[cfg(any(test, feature = "wire"))]
 mod rendezvous;
 mod serve;
 #[cfg(feature = "wire")]
@@ -38,10 +40,14 @@ mod wire;
 pub use drive::{Engine, ServeSession, drive};
 pub use fetch::{BundleFetcher, FetchStatus};
 #[cfg(not(feature = "wire"))]
-pub use nowire::{fetch_bundle, fetch_via_rendezvous, rendezvous_service, serve_bundle};
+pub use nowire::{
+    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+};
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
-pub use wire::{fetch_bundle, fetch_via_rendezvous, rendezvous_service, serve_bundle};
+pub use wire::{
+    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+};
 
 /// The certificate and key a server presents.
 ///
@@ -2415,6 +2421,10 @@ mod tests {
         ));
         assert!(matches!(
             rendezvous_service(address, None, |_| {}),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            relay_service(address, None, |_| {}),
             Err(Error::WireUnsupported)
         ));
     }

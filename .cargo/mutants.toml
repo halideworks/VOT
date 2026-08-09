@@ -10,7 +10,7 @@ timeout_multiplier = 4.0
 # configuration does not enable, so every mutant in it would be unviable here.
 # `.cargo/mutants-live.toml` is the same configuration without that exclusion,
 # and the msquic-mutation job runs it with the feature on.
-exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "VerifiedRange::is_empty"]
+exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "VerifiedRange::is_empty", "remove_lock_file_other"]
 # Binaries whose correctness a different check establishes. vot-capability's
 # oracle exists to be compared against an independent Python implementation of
 # spec/capability.cddl, which validate_capability_vectors.py does on every run and

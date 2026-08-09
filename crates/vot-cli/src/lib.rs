@@ -2099,6 +2099,28 @@ mod tests {
     }
 
     #[test]
+    fn the_refusal_survives_the_wrapper_that_reads_the_environment() {
+        // `pin_for_address` below holds the decision, and this holds the one
+        // caller: a wrapper that returned `Ok(None)` whatever it was given
+        // would waive every unpinned fetch while the decision underneath
+        // still read correctly.
+        assert!(
+            std::env::var_os(UNPINNED).is_none(),
+            "the suite owns no env"
+        );
+        assert!(
+            matches!(address_pin(None), Err(Error::UnpinnedFetch)),
+            "an address alone was accepted"
+        );
+        let root = "11".repeat(32);
+        assert_eq!(
+            address_pin(Some(&root)).expect("a root"),
+            Some([0x11; 32]),
+            "a named root did not reach the caller"
+        );
+    }
+
+    #[test]
     fn a_fetch_at_an_address_names_the_package_or_says_it_will_not() {
         let root = "11".repeat(32);
         assert_eq!(

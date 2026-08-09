@@ -577,7 +577,8 @@ fn run_slot(
         // The relay stopping ends its slots. Without this a bounded run
         // returns and then waits out every slot's whole lifetime.
         if stopping.load(Ordering::Relaxed) {
-            return close(&meter);
+            eprintln!("{}", closing_line(&meter));
+            return;
         }
         let now_ms = elapsed_ms(began);
         match socket.recv_from(&mut buffer) {
@@ -589,7 +590,10 @@ fn run_slot(
                         let _ = socket.send_to(&buffer[..length], peer);
                     }
                     crate::relay::Forward::Nowhere => {}
-                    crate::relay::Forward::Closed => return close(&meter),
+                    crate::relay::Forward::Closed => {
+                        eprintln!("{}", closing_line(&meter));
+                        return;
+                    }
                 }
             }
             // Nothing arrived. The deadline still applies, and asking about
@@ -597,7 +601,10 @@ fn run_slot(
             // the first one to speak has to be the first end.
             Err(error) => match idle_after(&error, meter.expired(now_ms)) {
                 Idle::Ended => return,
-                Idle::Expired => return close(&meter),
+                Idle::Expired => {
+                    eprintln!("{}", closing_line(&meter));
+                    return;
+                }
                 Idle::Waiting => {}
             },
         }
@@ -608,14 +615,11 @@ fn run_slot(
 /// the only thing the relay ever says about one.
 ///
 /// The line rather than the printing, so a test can read what an operator
-/// would.
+/// would. Printed at each of the three ways a slot ends rather than through
+/// a helper: a function that only prints is one whose absence nothing in
+/// this process can see, so no test can hold it.
 fn closing_line(meter: &crate::relay::Meter) -> String {
     format!("slot closed after {} bytes", meter.forwarded())
-}
-
-/// Says it, and ends the slot's thread.
-fn close(meter: &crate::relay::Meter) {
-    eprintln!("{}", closing_line(meter));
 }
 
 /// Milliseconds since `began`, saturating rather than wrapping.

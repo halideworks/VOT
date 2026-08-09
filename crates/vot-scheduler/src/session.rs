@@ -101,6 +101,190 @@ impl Pending {
             .as_ref()
             .is_some_and(|bundle| self.records.len() as u64 == bundle.data_record_count)
     }
+
+    /// Which budget this entry occupies: a record without its proof names no
+    /// subject, so nothing has authorized it yet.
+    fn is_orphan(&self) -> bool {
+        self.bundle.is_none()
+    }
+}
+
+/// The pending map and its two budgets, admitted and orphan, owned together.
+/// Every insertion, migration, and removal is a transition here that settles
+/// the counters it affects, and a recomputation assertion holds them to the
+/// map after each one. Callers never touch the map directly.
+struct PendingBundles {
+    entries: BTreeMap<[u8; 16], Pending>,
+    admitted_bundles: usize,
+    admitted_bytes: usize,
+    orphan_bundles: usize,
+    orphan_bytes: usize,
+    bundle_limit: usize,
+    byte_limit: usize,
+    orphan_bundle_limit: usize,
+    orphan_byte_limit: usize,
+}
+
+impl Default for PendingBundles {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            admitted_bundles: 0,
+            admitted_bytes: 0,
+            orphan_bundles: 0,
+            orphan_bytes: 0,
+            bundle_limit: DEFAULT_PENDING_BUNDLES,
+            byte_limit: DEFAULT_PENDING_BUNDLE_BYTES,
+            orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
+            orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
+        }
+    }
+}
+
+impl PendingBundles {
+    fn get(&self, id: &[u8; 16]) -> Option<&Pending> {
+        self.entries.get(id)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Bytes held across both budgets.
+    fn bytes(&self) -> usize {
+        self.admitted_bytes + self.orphan_bytes
+    }
+
+    const fn orphan_count(&self) -> usize {
+        self.orphan_bundles
+    }
+
+    /// Refuses `bytes` more in one budget, counting a new entry unless the
+    /// identity already occupies that budget. Checked before any mutation, so
+    /// a refused frame changes nothing.
+    fn refuse_over_budget(&self, id: &[u8; 16], bytes: usize, orphan: bool) -> Result<(), Error> {
+        let (count_limit, byte_limit, count, held) = if orphan {
+            (
+                self.orphan_bundle_limit,
+                self.orphan_byte_limit,
+                self.orphan_bundles,
+                self.orphan_bytes,
+            )
+        } else {
+            (
+                self.bundle_limit,
+                self.byte_limit,
+                self.admitted_bundles,
+                self.admitted_bytes,
+            )
+        };
+        let known = self
+            .entries
+            .get(id)
+            .is_some_and(|pending| pending.is_orphan() == orphan);
+        if !known && count >= count_limit {
+            return Err(Error::PendingBundlesExhausted);
+        }
+        let next = held.checked_add(bytes).ok_or(Error::LengthExceeded)?;
+        if next > byte_limit {
+            return Err(Error::PendingBundlesExhausted);
+        }
+        Ok(())
+    }
+
+    /// Attaches a proof to its entry, migrating any records held under the
+    /// orphan budget into the admitted one along with it. The admitted budget
+    /// is checked for the proof and the carried records together, so the
+    /// reservation covers the whole entry rather than the frame that happens
+    /// to complete it.
+    fn attach_bundle(&mut self, bundle: ProofBundle, identity: [u8; 32]) -> Result<(), Error> {
+        let id = bundle.bundle_id;
+        let carried = self.entries.get(&id).map_or(0, Pending::bytes);
+        let bytes = bundle
+            .proof
+            .len()
+            .checked_add(carried)
+            .ok_or(Error::LengthExceeded)?;
+        self.refuse_over_budget(&id, bytes, false)?;
+        let entry = self.entries.entry(id).or_default();
+        let was_orphan = entry.is_orphan();
+        let existed = entry.bundle.is_some() || !entry.records.is_empty();
+        entry.bundle = Some(bundle);
+        entry.identity = Some(identity);
+        if existed && was_orphan {
+            self.orphan_bundles -= 1;
+            self.orphan_bytes -= carried;
+        }
+        self.admitted_bundles += 1;
+        self.admitted_bytes += bytes;
+        self.assert_accounted();
+        Ok(())
+    }
+
+    /// Holds one record under whichever budget its entry occupies.
+    fn append_record(&mut self, record: DataRecord) -> Result<(), Error> {
+        let id = record.bundle_id;
+        let orphan = self.entries.get(&id).is_none_or(Pending::is_orphan);
+        let bytes = record.encoded.len();
+        self.refuse_over_budget(&id, bytes, orphan)?;
+        let entry = self.entries.entry(id).or_default();
+        let opened = entry.bundle.is_none() && entry.records.is_empty();
+        entry.records.push(record);
+        if orphan {
+            self.orphan_bundles += usize::from(opened);
+            self.orphan_bytes += bytes;
+        } else {
+            self.admitted_bytes += bytes;
+        }
+        self.assert_accounted();
+        Ok(())
+    }
+
+    /// Removes an entry whose contents can no longer be used, releasing its
+    /// whole budget.
+    fn remove(&mut self, id: &[u8; 16]) -> Option<Pending> {
+        let pending = self.entries.remove(id)?;
+        if pending.is_orphan() {
+            self.orphan_bundles -= 1;
+            self.orphan_bytes -= pending.bytes();
+        } else {
+            self.admitted_bundles -= 1;
+            self.admitted_bytes -= pending.bytes();
+        }
+        self.assert_accounted();
+        Some(pending)
+    }
+
+    /// Takes an entry only once every record its bundle declares has arrived.
+    fn take_complete(&mut self, id: &[u8; 16]) -> Option<Pending> {
+        if !self.get(id).is_some_and(Pending::complete) {
+            return None;
+        }
+        self.remove(id)
+    }
+
+    /// The counters recomputed from the map, in tests and debug builds.
+    fn assert_accounted(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let orphan: (usize, usize) = self
+                .entries
+                .values()
+                .filter(|pending| pending.is_orphan())
+                .fold((0, 0), |(count, bytes), pending| {
+                    (count + 1, bytes + pending.bytes())
+                });
+            let admitted: (usize, usize) = self
+                .entries
+                .values()
+                .filter(|pending| !pending.is_orphan())
+                .fold((0, 0), |(count, bytes), pending| {
+                    (count + 1, bytes + pending.bytes())
+                });
+            debug_assert_eq!((self.orphan_bundles, self.orphan_bytes), orphan);
+            debug_assert_eq!((self.admitted_bundles, self.admitted_bytes), admitted);
+        }
+    }
 }
 
 /// Whether a control frame is the proof that describes a range.
@@ -151,11 +335,7 @@ pub struct SessionReceiver<A> {
     completed: VecDeque<CompletedBundle>,
     deferred_limit: usize,
     deferring: bool,
-    pending: BTreeMap<[u8; 16], Pending>,
-    pending_bundle_limit: usize,
-    pending_byte_limit: usize,
-    orphan_bundle_limit: usize,
-    orphan_byte_limit: usize,
+    pending: PendingBundles,
     remembered_bundle_limit: usize,
     /// Subjects the caller has authorised. Nothing here decides that: the
     /// authentication and authorization frames are unimplemented, so a subject
@@ -175,11 +355,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             completed: VecDeque::new(),
             deferred_limit: DEFAULT_DEFERRED_BUNDLES,
             deferring: false,
-            pending: BTreeMap::new(),
-            pending_bundle_limit: DEFAULT_PENDING_BUNDLES,
-            pending_byte_limit: DEFAULT_PENDING_BUNDLE_BYTES,
-            orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
-            orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
+            pending: PendingBundles::default(),
             remembered_bundle_limit: REMEMBERED_BUNDLES,
             admitted: BTreeSet::new(),
             delivered: VecDeque::new(),
@@ -198,8 +374,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 vot_transport_api::Error::InvalidConfiguration,
             ));
         }
-        self.pending_bundle_limit = bundles;
-        self.pending_byte_limit = bytes;
+        self.pending.bundle_limit = bundles;
+        self.pending.byte_limit = bytes;
         Ok(())
     }
 
@@ -234,8 +410,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 vot_transport_api::Error::InvalidConfiguration,
             ));
         }
-        self.orphan_bundle_limit = bundles;
-        self.orphan_byte_limit = bytes;
+        self.pending.orphan_bundle_limit = bundles;
+        self.pending.orphan_byte_limit = bytes;
         Ok(())
     }
 
@@ -300,13 +476,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// caller that derives it can hold the derivation to account.
     #[must_use]
     pub const fn pending_byte_limit(&self) -> usize {
-        self.pending_byte_limit
+        self.pending.byte_limit
     }
 
     /// The byte bound on records that arrived before their proof.
     #[must_use]
     pub const fn orphan_byte_limit(&self) -> usize {
-        self.orphan_byte_limit
+        self.pending.orphan_byte_limit
     }
 
     /// The bound on what [`Self::take_completed`] may owe at once.
@@ -324,13 +500,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// Bundles holding records whose proof has not arrived.
     #[must_use]
     pub fn orphan_bundles(&self) -> usize {
-        self.held(true).0
+        self.pending.orphan_count()
     }
 
     /// Bytes held for bundles that are not complete.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.pending.values().map(Pending::bytes).sum()
+        self.pending.bytes()
     }
 
     /// Returns the next event the application should see.
@@ -457,19 +633,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             self.pending.remove(&id);
             return Err(Error::ProofInvalid);
         }
-        // The records already held move to the admitted budget along with the
-        // proof, so the reservation covers the whole entry rather than the
-        // frame that happens to complete it.
-        let carried = self.pending.get(&id).map_or(0, Pending::bytes);
-        let bytes = bundle
-            .proof
-            .len()
-            .checked_add(carried)
-            .ok_or(Error::LengthExceeded)?;
-        self.reserve(&id, bytes, false)?;
-        let pending = self.pending.entry(id).or_default();
-        pending.bundle = Some(bundle);
-        pending.identity = Some(identity);
+        self.pending.attach_bundle(bundle, identity)?;
         self.deliver(id)
     }
 
@@ -485,10 +649,6 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 Err(Error::ProofInvalid)
             };
         }
-        let orphan = self
-            .pending
-            .get(&id)
-            .is_none_or(|pending| pending.bundle.is_none());
         if let Some(pending) = self.pending.get(&id) {
             if let Some(held) = pending
                 .records
@@ -512,56 +672,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 return Err(Error::ProofInvalid);
             }
         }
-        self.reserve(&id, record.encoded.len(), orphan)?;
-        self.pending.entry(id).or_default().records.push(record);
+        self.pending.append_record(record)?;
         self.deliver(id)
-    }
-
-    /// Counts the entries in one budget and the bytes they hold.
-    fn held(&self, orphan: bool) -> (usize, usize) {
-        self.pending
-            .values()
-            .filter(|pending| pending.bundle.is_none() == orphan)
-            .fold((0, 0), |(count, bytes), pending| {
-                (count + 1, bytes + pending.bytes())
-            })
-    }
-
-    /// Reserves room for a frame belonging to `id`.
-    ///
-    /// Records that arrive before their proof name no subject, so nothing can
-    /// authorise them. They hold their own budget, and a peer filling it with
-    /// records for bundles it never sends cannot crowd out an admitted one.
-    fn reserve(&mut self, id: &[u8; 16], bytes: usize, orphan: bool) -> Result<(), Error> {
-        let (count_limit, byte_limit) = if orphan {
-            (self.orphan_bundle_limit, self.orphan_byte_limit)
-        } else {
-            (self.pending_bundle_limit, self.pending_byte_limit)
-        };
-        let (count, held) = self.held(orphan);
-        let known = self
-            .pending
-            .get(id)
-            .is_some_and(|pending| pending.bundle.is_none() == orphan);
-        if !known && count >= count_limit {
-            return Err(Error::PendingBundlesExhausted);
-        }
-        let next = held.checked_add(bytes).ok_or(Error::LengthExceeded)?;
-        if next > byte_limit {
-            return Err(Error::PendingBundlesExhausted);
-        }
-        Ok(())
     }
 
     /// Hands a complete bundle to the receiver.
     fn deliver(&mut self, id: [u8; 16]) -> Result<(), Error> {
-        let Some(pending) = self.pending.get(&id) else {
-            return Ok(());
-        };
-        if !pending.complete() {
-            return Ok(());
-        }
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.take_complete(&id) else {
             return Ok(());
         };
         let (Some(bundle), Some(identity)) = (pending.bundle, pending.identity) else {
@@ -1093,6 +1210,18 @@ mod tests {
             .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
         assert_eq!(driver.poll().unwrap_err(), Error::UnknownObject);
         assert_eq!(driver.pending_bundles(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn a_drifted_budget_fails_the_recomputation() {
+        let mut pending = PendingBundles::default();
+        let (_, _, records) = object();
+        pending.append_record(records[0].clone()).unwrap();
+        // The only way the counters and the map can disagree is a bug;
+        // simulate one.
+        pending.orphan_bytes += 1;
+        pending.assert_accounted();
     }
 
     #[test]

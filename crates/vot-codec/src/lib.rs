@@ -80,58 +80,88 @@ pub mod extension_id {
     pub const MULTIPATH_QUIC: u64 = 0x06;
 }
 
-/// The extension a known frame needs before it may be used.
-#[must_use]
-pub const fn required_extension(frame_type: u64) -> Option<u64> {
-    use crate::frame_type as ty;
+/// One row per registered frame: identifier, payload ceiling, whether an
+/// authenticated session is required to send it, and the extension it needs.
+/// `tools/validate_registries.py` parses these rows and holds every column to
+/// `spec/registries.md` section 2 and the `spec/wire.md` frame table, so a
+/// row that drifts from either specification fails validation. The macro
+/// generates only mechanical lookups; nothing semantic hides in it.
+macro_rules! frame_registry {
+    ($($name:ident = $value:literal, limit: $limit:expr, auth: $auth:ident, extension: $extension:ident;)*) => {
+        pub mod frame_type {
+            $(pub const $name: u64 = $value;)*
+        }
 
-    match frame_type {
-        ty::DATAGRAM_CREDIT
-        | ty::CODING_EPOCH_OPEN
-        | ty::GEN_STATE
-        | ty::GEN_DONE
-        | ty::CODING_EPOCH_CLOSE => Some(extension_id::DATAGRAM_FEC),
-        _ => None,
-    }
+        #[must_use]
+        pub const fn registered_payload_limit(frame_type: u64) -> Option<usize> {
+            match frame_type {
+                $(frame_type::$name => Some($limit),)*
+                _ => None,
+            }
+        }
+
+        /// The extension a known frame needs before it may be used.
+        #[must_use]
+        pub const fn required_extension(frame_type: u64) -> Option<u64> {
+            match frame_type {
+                $(frame_type::$name => frame_registry!(@extension $extension),)*
+                _ => None,
+            }
+        }
+
+        /// Whether a frame type requires an authenticated session.
+        ///
+        /// Session-setup frames are exempt: requiring auth to send them would
+        /// block reaching a session. `ERROR` is never refused so a peer can
+        /// report a fault before authenticating. Unregistered types answer
+        /// true (fail-closed).
+        #[must_use]
+        pub const fn requires_authentication(frame_type: u64) -> bool {
+            match frame_type {
+                $(frame_type::$name => frame_registry!(@auth $auth),)*
+                _ => true,
+            }
+        }
+    };
+    (@extension none) => { None };
+    (@extension $extension:ident) => { Some(extension_id::$extension) };
+    (@auth exempt) => { false };
+    (@auth required) => { true };
 }
 
-pub mod frame_type {
-    pub const HELLO: u64 = 0x01;
-    pub const SETTINGS: u64 = 0x03;
-    pub const SETTINGS_ACK: u64 = 0x05;
-    pub const AUTH_CONTEXT: u64 = 0x07;
-    pub const SESSION_OPEN: u64 = 0x09;
-    pub const SESSION_ACCEPT: u64 = 0x0b;
-    pub const SESSION_REJECT: u64 = 0x0d;
-
-    pub const PACKAGE_DESCRIPTOR: u64 = 0x21;
-    pub const MANIFEST_REQUEST: u64 = 0x23;
-    pub const MANIFEST_PAGE: u64 = 0x25;
-    pub const PROGRESSIVE_PAGE: u64 = 0x27;
-    pub const SEAL: u64 = 0x29;
-    pub const HAVE: u64 = 0x2b;
-    pub const RANGE_REQUEST: u64 = 0x2d;
-    pub const PROOF_BUNDLE: u64 = 0x2f;
-    pub const DATA_RECORD: u64 = 0x31;
-    pub const RANGE_CANCEL: u64 = 0x33;
-
-    pub const CAPACITY: u64 = 0x40;
-    pub const TRANSIT_VERIFIED: u64 = 0x43;
-    pub const CHUNK_DURABLE: u64 = 0x45;
-    pub const CHUNK_AT_REST_VERIFIED: u64 = 0x47;
-    pub const PUBLISH_RECEIPT: u64 = 0x49;
-
-    pub const DATAGRAM_CREDIT: u64 = 0x60;
-    pub const CODING_EPOCH_OPEN: u64 = 0x62;
-    pub const GEN_STATE: u64 = 0x64;
-    pub const GEN_DONE: u64 = 0x66;
-    pub const CODING_EPOCH_CLOSE: u64 = 0x68;
-
-    pub const PING: u64 = 0x80;
-    pub const GOAWAY: u64 = 0x83;
-    pub const ERROR: u64 = 0x85;
-    pub const SOURCE_SCORE_HINT: u64 = 0x86;
-    pub const JOB_PRIORITY_UPDATE: u64 = 0x89;
+frame_registry! {
+    HELLO = 0x01, limit: 4 * 1024, auth: exempt, extension: none;
+    SETTINGS = 0x03, limit: 16 * 1024, auth: exempt, extension: none;
+    SETTINGS_ACK = 0x05, limit: 0, auth: exempt, extension: none;
+    AUTH_CONTEXT = 0x07, limit: 64 * 1024, auth: exempt, extension: none;
+    SESSION_OPEN = 0x09, limit: 64 * 1024, auth: exempt, extension: none;
+    SESSION_ACCEPT = 0x0b, limit: 64 * 1024, auth: exempt, extension: none;
+    SESSION_REJECT = 0x0d, limit: 64 * 1024, auth: exempt, extension: none;
+    PACKAGE_DESCRIPTOR = 0x21, limit: 1024 * 1024, auth: required, extension: none;
+    MANIFEST_REQUEST = 0x23, limit: 64 * 1024, auth: required, extension: none;
+    MANIFEST_PAGE = 0x25, limit: 1024 * 1024, auth: required, extension: none;
+    PROGRESSIVE_PAGE = 0x27, limit: 1024 * 1024, auth: required, extension: none;
+    SEAL = 0x29, limit: 256 * 1024, auth: required, extension: none;
+    HAVE = 0x2b, limit: 4 * 1024 * 1024, auth: required, extension: none;
+    RANGE_REQUEST = 0x2d, limit: 1024 * 1024, auth: required, extension: none;
+    PROOF_BUNDLE = 0x2f, limit: HARD_MAX_FRAME_PAYLOAD, auth: required, extension: none;
+    DATA_RECORD = 0x31, limit: 256 * 1024, auth: required, extension: none;
+    RANGE_CANCEL = 0x33, limit: 64 * 1024, auth: required, extension: none;
+    CAPACITY = 0x40, limit: 4 * 1024, auth: required, extension: none;
+    TRANSIT_VERIFIED = 0x43, limit: 64 * 1024, auth: required, extension: none;
+    CHUNK_DURABLE = 0x45, limit: 64 * 1024, auth: required, extension: none;
+    CHUNK_AT_REST_VERIFIED = 0x47, limit: 64 * 1024, auth: required, extension: none;
+    PUBLISH_RECEIPT = 0x49, limit: 64 * 1024, auth: required, extension: none;
+    DATAGRAM_CREDIT = 0x60, limit: 4 * 1024, auth: required, extension: DATAGRAM_FEC;
+    CODING_EPOCH_OPEN = 0x62, limit: 64 * 1024, auth: required, extension: DATAGRAM_FEC;
+    GEN_STATE = 0x64, limit: 64 * 1024, auth: required, extension: DATAGRAM_FEC;
+    GEN_DONE = 0x66, limit: 64 * 1024, auth: required, extension: DATAGRAM_FEC;
+    CODING_EPOCH_CLOSE = 0x68, limit: 64 * 1024, auth: required, extension: DATAGRAM_FEC;
+    PING = 0x80, limit: 0, auth: exempt, extension: none;
+    GOAWAY = 0x83, limit: 4 * 1024, auth: required, extension: none;
+    ERROR = 0x85, limit: 64 * 1024, auth: exempt, extension: none;
+    SOURCE_SCORE_HINT = 0x86, limit: 64 * 1024, auth: required, extension: none;
+    JOB_PRIORITY_UPDATE = 0x89, limit: 64 * 1024, auth: required, extension: none;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -609,64 +639,6 @@ pub const fn is_critical(frame_type: u64) -> bool {
 #[must_use]
 pub const fn is_grease(frame_type: u64) -> bool {
     frame_type >= 0x1f00 && frame_type <= 0x1ffe && frame_type & 1 == 0
-}
-
-/// Whether a frame type requires an authenticated session.
-///
-/// Session-setup frames are exempt: requiring auth to send them would block
-/// reaching a session. `ERROR` is never refused so a peer can report a fault
-/// before authenticating. Unregistered types answer true (fail-closed).
-#[must_use]
-pub const fn requires_authentication(frame_type: u64) -> bool {
-    use crate::frame_type as ty;
-
-    !matches!(
-        frame_type,
-        ty::HELLO
-            | ty::SETTINGS
-            | ty::SETTINGS_ACK
-            | ty::AUTH_CONTEXT
-            | ty::SESSION_OPEN
-            | ty::SESSION_ACCEPT
-            | ty::SESSION_REJECT
-            | ty::PING
-            | ty::ERROR
-    )
-}
-
-#[must_use]
-pub const fn registered_payload_limit(frame_type: u64) -> Option<usize> {
-    use crate::frame_type as ty;
-
-    match frame_type {
-        ty::HELLO | ty::CAPACITY | ty::DATAGRAM_CREDIT | ty::GOAWAY => Some(4 * 1024),
-        ty::SETTINGS => Some(16 * 1024),
-        ty::SETTINGS_ACK | ty::PING => Some(0),
-        ty::AUTH_CONTEXT
-        | ty::SESSION_OPEN
-        | ty::SESSION_ACCEPT
-        | ty::SESSION_REJECT
-        | ty::MANIFEST_REQUEST
-        | ty::RANGE_CANCEL
-        | ty::TRANSIT_VERIFIED
-        | ty::CHUNK_DURABLE
-        | ty::CHUNK_AT_REST_VERIFIED
-        | ty::PUBLISH_RECEIPT
-        | ty::CODING_EPOCH_OPEN
-        | ty::GEN_STATE
-        | ty::GEN_DONE
-        | ty::CODING_EPOCH_CLOSE
-        | ty::ERROR
-        | ty::SOURCE_SCORE_HINT
-        | ty::JOB_PRIORITY_UPDATE => Some(64 * 1024),
-        ty::SEAL | ty::DATA_RECORD => Some(256 * 1024),
-        ty::PACKAGE_DESCRIPTOR | ty::MANIFEST_PAGE | ty::PROGRESSIVE_PAGE | ty::RANGE_REQUEST => {
-            Some(1024 * 1024)
-        }
-        ty::HAVE => Some(4 * 1024 * 1024),
-        ty::PROOF_BUNDLE => Some(HARD_MAX_FRAME_PAYLOAD),
-        _ => None,
-    }
 }
 
 #[must_use]

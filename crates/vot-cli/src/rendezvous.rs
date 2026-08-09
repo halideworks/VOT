@@ -172,6 +172,14 @@ pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Whether `source` is `service`, whichever family each was observed in.
+///
+/// A dual-stack socket reports an IPv4 peer as `::ffff:a.b.c.d`, so the
+/// two are compared as [`canonical`] forms rather than as they arrived.
+pub(crate) fn from_service(source: SocketAddr, service: SocketAddr) -> bool {
+    canonical(source) == canonical(service)
+}
+
 /// The inverse of [`push_address`].
 fn pull_address(bytes: &[u8]) -> AddressSlot {
     let held = |ip, port| AddressSlot::Held(canonical(SocketAddr::new(ip, port)));
@@ -306,9 +314,12 @@ impl Registrar {
     /// Processes a datagram from `source`. Only the service is heard, and
     /// only about this serve's key. Earned warmings are queued.
     pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr) {
-        if !self.services.contains(&source) {
+        if !self.services.iter().any(|held| from_service(source, *held)) {
             return;
         }
+        // A serve bound dual-stack reads a loopback service as
+        // `::ffff:127.0.0.1`, which `warmable` would not know is near.
+        let source = canonical(source);
         let Datagram::Coming { key, fetch } = datagram else {
             return;
         };
@@ -654,6 +665,62 @@ mod tests {
             "another root, another key"
         );
         assert_ne!(key_of(&[0; 32]), [0; 32], "the key is not the root");
+    }
+
+    #[test]
+    fn a_service_is_itself_in_either_family() {
+        let plain = v4("198.51.100.7:9000");
+        let mapped = v4("[::ffff:198.51.100.7]:9000");
+        let six = v4("[2001:db8::7]:9000");
+        for (source, service) in [
+            (plain, mapped),
+            (mapped, plain),
+            (plain, plain),
+            (mapped, mapped),
+            (six, six),
+        ] {
+            assert!(
+                from_service(source, service),
+                "{source} is {service} in the family that is really its own"
+            );
+        }
+        for (source, service) in [
+            (plain, v4("198.51.100.7:9001")),
+            (plain, v4("198.51.100.8:9000")),
+            (six, plain),
+            (v4("[::ffff:198.51.100.8]:9000"), plain),
+        ] {
+            assert!(!from_service(source, service), "{source} is not {service}");
+        }
+    }
+
+    #[test]
+    fn a_dual_stack_serve_hears_the_service_it_was_configured_with() {
+        // A serve bound to `[::]` reads an IPv4 service as `::ffff:a.b.c.d`,
+        // which matches none of its configured addresses byte for byte.
+        for (service, mapped, fetch) in [
+            (
+                v4("198.51.100.7:9000"),
+                v4("[::ffff:198.51.100.7]:9000"),
+                v4("203.0.113.9:60123"),
+            ),
+            (
+                v4("127.0.0.1:9000"),
+                v4("[::ffff:127.0.0.1]:9000"),
+                v4("127.0.0.1:60123"),
+            ),
+        ] {
+            let root = [9; 32];
+            let key = key_of(&root);
+            let mut registrar = Registrar::new(&root, &[service]);
+            registrar.due(0);
+            registrar.take(Datagram::Coming { key, fetch }, mapped);
+            assert_eq!(
+                registrar.due(1),
+                vec![(fetch, Datagram::Warming)],
+                "{mapped} is {service}, so the Coming it carried is owed a warming"
+            );
+        }
     }
 
     #[test]

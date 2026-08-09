@@ -2,13 +2,54 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+/// One list per enum: the variants, their `ALL` walk, their test positions,
+/// and their display names all come from the same rows, so none can drift.
+/// Only mechanical facts are generated; the transition relation in
+/// [`Machine::apply`] stays an explicit match. `tools/validate_commit_model_sync.py`
+/// parses the `Event` rows and holds them to the TLA actions.
+macro_rules! enum_metadata {
+    (walked $(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident),* $(,)? }) => {
+        enum_metadata!(named $(#[$attr])* $vis enum $name { $($variant),* });
+
+        impl $name {
+            /// Every variant, so a walk over the relation cannot miss one by
+            /// omission: the list and the enum are the same declaration.
+            pub const ALL: [Self; [$(stringify!($variant)),*].len()] = [$(Self::$variant),*];
+
+            /// Where this sits in [`Self::ALL`]: the declaration ordinal,
+            /// which is what `ALL` is built from.
+            #[cfg(test)]
+            const fn position(self) -> usize {
+                self as usize
+            }
+        }
+    };
+    (named $(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident),* $(,)? }) => {
+        $(#[$attr])*
+        $vis enum $name {
+            $($variant),*
+        }
+
+        impl $name {
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => stringify!($variant)),*
+                }
+            }
+        }
+    };
+}
+
+enum_metadata!(walked
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Profile {
     Fast,
     Balanced,
     Strict,
-}
+});
 
+enum_metadata!(named
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Assurance {
     Admitted,
@@ -16,8 +57,9 @@ pub enum Assurance {
     Durable,
     AtRestVerified,
     Published,
-}
+});
 
+enum_metadata!(named
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum State {
     New,
@@ -31,8 +73,9 @@ pub enum State {
     RecoveryRequired,
     Poisoned,
     Aborted,
-}
+});
 
+enum_metadata!(walked
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Admit,
@@ -50,15 +93,16 @@ pub enum Event {
     Crash,
     Recover,
     Abort,
-}
+});
 
+enum_metadata!(named
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     StaleIncarnation,
     Terminal,
     InvalidTransition,
     MissingPredecessor,
-}
+});
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Observation {
@@ -239,47 +283,7 @@ impl Machine {
     }
 }
 
-impl Event {
-    /// Every event, so a walk over the relation cannot miss one by omission.
-    ///
-    /// [`Event::position`] is what makes that true rather than hopeful: a new
-    /// variant fails to compile there until it is added here too.
-    pub const ALL: [Self; 15] = [
-        Self::Admit,
-        Self::TransitVerified,
-        Self::DataFlushSucceeded,
-        Self::DataFlushFailed,
-        Self::JournalFlushSucceeded,
-        Self::JournalFlushFailed,
-        Self::AtRestVerified,
-        Self::AtRestVerificationFailed,
-        Self::NamespaceLinked,
-        Self::NamespaceLinkAmbiguous,
-        Self::NamespaceDurable,
-        Self::NamespaceFlushFailed,
-        Self::Crash,
-        Self::Recover,
-        Self::Abort,
-    ];
-}
-
 impl Profile {
-    /// Every profile, for the same reason [`Event::ALL`] exists: a walk that
-    /// seeds from a literal list is one a new profile escapes.
-    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Strict];
-
-    /// Where this sits in [`Profile::ALL`]. Compiled with the tests, which is
-    /// where the enrolment is checked. Exhaustive so a new variant
-    /// cannot be added without enrolling it.
-    #[cfg(test)]
-    const fn position(self) -> usize {
-        match self {
-            Self::Fast => 0,
-            Self::Balanced => 1,
-            Self::Strict => 2,
-        }
-    }
-
     /// The assurance a publication under this profile must already have
     /// performed. One home for the rule: a receipt chain checks the same
     /// table the machine enforces.
@@ -289,15 +293,6 @@ impl Profile {
             Self::Fast => Assurance::TransitVerified,
             Self::Balanced => Assurance::Durable,
             Self::Strict => Assurance::AtRestVerified,
-        }
-    }
-
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Fast => "Fast",
-            Self::Balanced => "Balanced",
-            Self::Strict => "Strict",
         }
     }
 }
@@ -312,96 +307,6 @@ impl Assurance {
             Self::Durable => State::Durable,
             Self::AtRestVerified => State::AtRestVerified,
             Self::Published => State::Published,
-        }
-    }
-
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Admitted => "Admitted",
-            Self::TransitVerified => "TransitVerified",
-            Self::Durable => "Durable",
-            Self::AtRestVerified => "AtRestVerified",
-            Self::Published => "Published",
-        }
-    }
-}
-
-impl State {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::New => "New",
-            Self::Admitted => "Admitted",
-            Self::TransitVerified => "TransitVerified",
-            Self::DataFlushed => "DataFlushed",
-            Self::Durable => "Durable",
-            Self::AtRestVerified => "AtRestVerified",
-            Self::NamespaceLinked => "NamespaceLinked",
-            Self::Published => "Published",
-            Self::RecoveryRequired => "RecoveryRequired",
-            Self::Poisoned => "Poisoned",
-            Self::Aborted => "Aborted",
-        }
-    }
-}
-
-impl Event {
-    /// Where this sits in [`Event::ALL`]. Compiled with the tests, which is
-    /// where the enrolment is checked. Exhaustive on purpose: adding a
-    /// variant without enrolling it in the walk is a compile error rather
-    /// than a silently smaller corpus.
-    #[cfg(test)]
-    const fn position(self) -> usize {
-        match self {
-            Self::Admit => 0,
-            Self::TransitVerified => 1,
-            Self::DataFlushSucceeded => 2,
-            Self::DataFlushFailed => 3,
-            Self::JournalFlushSucceeded => 4,
-            Self::JournalFlushFailed => 5,
-            Self::AtRestVerified => 6,
-            Self::AtRestVerificationFailed => 7,
-            Self::NamespaceLinked => 8,
-            Self::NamespaceLinkAmbiguous => 9,
-            Self::NamespaceDurable => 10,
-            Self::NamespaceFlushFailed => 11,
-            Self::Crash => 12,
-            Self::Recover => 13,
-            Self::Abort => 14,
-        }
-    }
-
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Admit => "Admit",
-            Self::TransitVerified => "TransitVerified",
-            Self::DataFlushSucceeded => "DataFlushSucceeded",
-            Self::DataFlushFailed => "DataFlushFailed",
-            Self::JournalFlushSucceeded => "JournalFlushSucceeded",
-            Self::JournalFlushFailed => "JournalFlushFailed",
-            Self::AtRestVerified => "AtRestVerified",
-            Self::AtRestVerificationFailed => "AtRestVerificationFailed",
-            Self::NamespaceLinked => "NamespaceLinked",
-            Self::NamespaceLinkAmbiguous => "NamespaceLinkAmbiguous",
-            Self::NamespaceDurable => "NamespaceDurable",
-            Self::NamespaceFlushFailed => "NamespaceFlushFailed",
-            Self::Crash => "Crash",
-            Self::Recover => "Recover",
-            Self::Abort => "Abort",
-        }
-    }
-}
-
-impl Error {
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::StaleIncarnation => "StaleIncarnation",
-            Self::Terminal => "Terminal",
-            Self::InvalidTransition => "InvalidTransition",
-            Self::MissingPredecessor => "MissingPredecessor",
         }
     }
 }

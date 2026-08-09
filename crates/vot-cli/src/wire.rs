@@ -592,31 +592,61 @@ fn run_slot(
                     crate::relay::Forward::Closed => return close(&meter),
                 }
             }
-            Err(error) => {
-                if !waited_out(&error) {
-                    return;
-                }
-                // Nothing arrived. The deadline still applies, and asking
-                // about it must not look like an arrival: a slot waits for
-                // its ends and the first one to speak has to be the first
-                // end.
-                if meter.expired(now_ms) {
-                    return close(&meter);
-                }
-            }
+            // Nothing arrived. The deadline still applies, and asking about
+            // it must not look like an arrival: a slot waits for its ends and
+            // the first one to speak has to be the first end.
+            Err(error) => match idle_after(&error, meter.expired(now_ms)) {
+                Idle::Ended => return,
+                Idle::Expired => return close(&meter),
+                Idle::Waiting => {}
+            },
         }
     }
 }
 
-/// Reports what a slot carried, which is the donation an operator is paying
-/// for and the only thing the relay ever says about one.
+/// What a slot carried, which is the donation an operator is paying for and
+/// the only thing the relay ever says about one.
+///
+/// The line rather than the printing, so a test can read what an operator
+/// would.
+fn closing_line(meter: &crate::relay::Meter) -> String {
+    format!("slot closed after {} bytes", meter.forwarded())
+}
+
+/// Says it, and ends the slot's thread.
 fn close(meter: &crate::relay::Meter) {
-    eprintln!("slot closed after {} bytes", meter.forwarded());
+    eprintln!("{}", closing_line(meter));
 }
 
 /// Milliseconds since `began`, saturating rather than wrapping.
 fn elapsed_ms(began: std::time::Instant) -> u64 {
     u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What a slot does about a read that gave it nothing.
+///
+/// Pure, because the branch matters: a real socket error ends the slot and a
+/// timeout does not, and reaching either through an actual socket failure is
+/// not something a test can arrange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Idle {
+    /// The socket failed. Nothing more will arrive on it.
+    Ended,
+    /// Nothing came, and the slot has outlived its window.
+    Expired,
+    /// Nothing came, and the slot is still open.
+    Waiting,
+}
+
+/// Which of the three a read error and the clock mean.
+fn idle_after(error: &std::io::Error, expired: bool) -> Idle {
+    if !waited_out(error) {
+        Idle::Ended
+    } else if expired {
+        Idle::Expired
+    } else {
+        Idle::Waiting
+    }
 }
 
 /// Runs the relay on `address` until stopped, or until it has answered
@@ -670,7 +700,14 @@ pub fn relay_service(
         stopping: &stopping,
         threads: Vec::new(),
     };
-    while datagrams.is_none_or(|bound| answered < bound) {
+    // An iterator rather than a comparison. `answered < bound` inverts into a
+    // relay that never stops, which hangs a test rather than failing it, and a
+    // bound nothing can turn into an unbounded loop is worth the box.
+    let mut answers: Box<dyn Iterator<Item = ()>> = match datagrams {
+        Some(bound) => Box::new(std::iter::repeat_n((), usize::try_from(bound).unwrap_or(0))),
+        None => Box::new(std::iter::repeat(())),
+    };
+    while answers.next().is_some() {
         let (length, source) = match socket.recv_from(&mut buffer) {
             Ok(arrival) => arrival,
             Err(error) => {
@@ -2843,6 +2880,57 @@ mod tests {
             .join()
             .expect("the relay thread")
             .expect("a relay that answered its bound");
+    }
+
+    #[test]
+    fn a_slot_that_heard_nothing_ends_only_when_it_should() {
+        use std::io::{Error, ErrorKind};
+
+        // A socket that failed is over whatever the clock says.
+        let broken = Error::from(ErrorKind::ConnectionReset);
+        assert_eq!(idle_after(&broken, false), Idle::Ended);
+        assert_eq!(idle_after(&broken, true), Idle::Ended);
+        // A read that waited out is not a failure: the slot keeps its port
+        // until its own window closes.
+        for waited in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let error = Error::from(waited);
+            assert_eq!(
+                idle_after(&error, false),
+                Idle::Waiting,
+                "{waited:?} ended a slot that was still open"
+            );
+            assert_eq!(idle_after(&error, true), Idle::Expired);
+        }
+    }
+
+    #[test]
+    fn a_closing_slot_says_what_it_carried() {
+        let mut meter = crate::relay::Meter::new(u64::MAX, u64::MAX);
+        assert_eq!(closing_line(&meter), "slot closed after 0 bytes");
+        let first = "198.51.100.7:9000".parse().expect("an address");
+        let second = "203.0.113.9:60123".parse().expect("an address");
+        meter.take(first, 40, 0);
+        meter.take(second, 60, 0);
+        assert_eq!(
+            closing_line(&meter),
+            "slot closed after 60 bytes",
+            "the number an operator reads is not what the slot forwarded"
+        );
+    }
+
+    #[test]
+    fn the_clock_a_slot_reads_is_the_clock() {
+        // A reading stuck at zero would make every slot immortal: nothing
+        // ever reaches its deadline.
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("a clock with five seconds behind it");
+        let seen = elapsed_ms(past);
+        assert!(
+            (5_000..60_000).contains(&seen),
+            "{seen}ms is not five seconds ago"
+        );
+        assert!(elapsed_ms(std::time::Instant::now()) < 5_000);
     }
 
     #[test]

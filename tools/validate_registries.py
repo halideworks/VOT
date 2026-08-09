@@ -9,12 +9,21 @@ from pathlib import Path
 
 ROW = re.compile(
     r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_-]+)` "
-    r"\| (?P<handling>critical|optional) \|",
+    r"\| (?P<handling>critical|optional) \| (?P<status>draft|experimental) \|",
     re.MULTILINE,
 )
+FRAME_DECLARATION_ROW = re.compile(
+    r"^\s*(?P<name>[A-Z0-9_]+) = (?P<value>0x[0-9a-f]+), "
+    r"limit: (?P<limit>[0-9 *]+|HARD_MAX_FRAME_PAYLOAD), "
+    r"auth: (?P<auth>exempt|required), "
+    r"extension: (?P<extension>none|[A-Z0-9_]+);$",
+    re.MULTILINE,
+)
+SPEC_LIMIT = re.compile(r"^(?P<amount>\d+)(?: (?P<unit>KiB|MiB))?$")
 SETTING_ROW = re.compile(r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_-]+)` \|.*\| (?P<handling>critical|optional) \|$", re.MULTILINE)
 BEHAVIOR_ROW = re.compile(
-    r"^\| `(?P<name>[A-Z0-9_]+)` \|[^|]*\|[^|]*\| (?P<auth>yes|no|depends on phase) \|",
+    r"^\| `(?P<name>[A-Z0-9_]+)` \| (?P<maximum>\d+(?: KiB| MiB)?) "
+    r"\|[^|]*\| (?P<auth>yes|no|depends on phase) \|",
     re.MULTILINE,
 )
 RUST_CONSTANT = re.compile(
@@ -73,6 +82,7 @@ def validate(root: Path) -> None:
         for match in ROW.finditer(frame_text)
     ]
     assert rows, "no frame registry rows parsed"
+    frame_status = {match["name"]: match["status"] for match in ROW.finditer(frame_text)}
 
     values = [value for value, _, _ in rows]
     names = [name for _, name, _ in rows]
@@ -86,9 +96,22 @@ def validate(root: Path) -> None:
     rust_text = (root / "crates" / "vot-codec" / "src" / "lib.rs").read_text(
         encoding="utf-8"
     )
+    declaration_start = rust_text.index("frame_registry! {")
+    declaration_text = rust_text[
+        declaration_start : rust_text.index("\n}", declaration_start)
+    ]
+    declarations = {
+        match["name"]: match
+        for match in FRAME_DECLARATION_ROW.finditer(declaration_text)
+    }
+    declaration_lines = sum(
+        1 for line in declaration_text.splitlines() if " = 0x" in line
+    )
+    assert len(declarations) == declaration_lines, (
+        f"parsed {len(declarations)} of {declaration_lines} frame declaration rows"
+    )
     frame_rust_rows = {
-        match["name"]: int(match["value"], 16)
-        for match in RUST_CONSTANT.finditer(rust_module(rust_text, "frame_type"))
+        name: int(match["value"], 16) for name, match in declarations.items()
     }
     registry_rows = {name: value for value, name, _ in rows}
     assert frame_rust_rows == registry_rows, (
@@ -240,7 +263,8 @@ def validate(root: Path) -> None:
         wire_text, "## 5. Frame behavior registry", "## 6. State and assurance"
     )
     behavior_rows = {
-        match["name"]: match["auth"] for match in BEHAVIOR_ROW.finditer(behavior_text)
+        match["name"]: (match["maximum"], match["auth"])
+        for match in BEHAVIOR_ROW.finditer(behavior_text)
     }
     assert behavior_rows, "no frame behavior rows parsed"
     # Every table line parsed, so a row the regex silently skips cannot make
@@ -254,24 +278,39 @@ def validate(root: Path) -> None:
         f"registry-only={registry_rows.keys() - behavior_rows.keys()}, "
         f"behavior-only={behavior_rows.keys() - registry_rows.keys()}"
     )
-    exempt = re.search(
-        r"pub const fn requires_authentication\(frame_type: u64\) -> bool \{"
-        r".*?!matches!\((?P<body>.*?)\)\n\}",
-        rust_text,
-        re.DOTALL,
-    )
-    assert exempt, "requires_authentication not found"
-    exempt_names = set(re.findall(r"ty::([A-Z0-9_]+)", exempt["body"]))
-    for name, auth in behavior_rows.items():
+    unit_bytes = {None: 1, "KiB": 1024, "MiB": 1024 * 1024}
+    for name, (maximum, auth) in behavior_rows.items():
+        declaration = declarations[name]
         # A phase-dependent frame is never refused: a peer has to be able to
         # report a fault before it authenticates.
         expected_exempt = auth in ("no", "depends on phase")
-        assert (name in exempt_names) == expected_exempt, (
+        assert (declaration["auth"] == "exempt") == expected_exempt, (
             f"{name}: wire.md says auth {auth!r}, "
-            f"requires_authentication says {name not in exempt_names}"
+            f"the declaration says {declaration['auth']}"
         )
-    unknown = exempt_names - behavior_rows.keys()
-    assert not unknown, f"requires_authentication exempts unlisted frames: {unknown}"
+        spec_limit = SPEC_LIMIT.fullmatch(maximum)
+        assert spec_limit, f"{name}: unparsed wire.md maximum {maximum!r}"
+        spec_bytes = int(spec_limit["amount"]) * unit_bytes[spec_limit["unit"]]
+        declared = declaration["limit"].strip()
+        if declared == "HARD_MAX_FRAME_PAYLOAD":
+            declared = "16 * 1024 * 1024"
+        # The row regex admits only digits, spaces, and `*`: a product.
+        declared_bytes = 1
+        for factor in declared.split("*"):
+            declared_bytes *= int(factor)
+        assert declared_bytes == spec_bytes, (
+            f"{name}: wire.md maximum is {spec_bytes} bytes, "
+            f"the declaration says {declared_bytes}"
+        )
+        # spec/wire.md section 5: experimental frames need their extension
+        # negotiated; every experimental frame here is DATAGRAM_FEC's.
+        expected_extension = (
+            "DATAGRAM_FEC" if frame_status[name] == "experimental" else "none"
+        )
+        assert declaration["extension"] == expected_extension, (
+            f"{name}: registry status {frame_status[name]!r} expects extension "
+            f"{expected_extension}, the declaration says {declaration['extension']}"
+        )
 
     grease_values = range(0x1F00, 0x1FFF, 2)
     assert all(value % 2 == 0 for value in grease_values)

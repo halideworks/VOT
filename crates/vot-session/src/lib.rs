@@ -425,6 +425,15 @@ impl Negotiation {
             .collect()
     }
 
+    /// Whether one extension is in the negotiated intersection, without
+    /// building it. What the per-frame checks ask instead of
+    /// [`negotiated_extensions`](Self::negotiated_extensions).
+    fn extension_is_negotiated(&self, extension: u64) -> bool {
+        self.peer_hello.as_ref().is_some_and(|hello| {
+            self.extensions.contains(&extension) && hello.extensions.contains(&extension)
+        })
+    }
+
     /// What the peer said about itself.
     #[must_use]
     pub const fn peer_hello(&self) -> Option<&Hello> {
@@ -1046,15 +1055,81 @@ pub struct Session<A> {
     /// Records the peer sent before this endpoint reached `Ready`. Held here
     /// rather than in the adapter, whose single queue would block the control
     /// frames readiness is waiting for.
-    pending: VecDeque<Event>,
+    pending: PendingEvents,
     /// Lanes this endpoint has sent on, bounded by the peer's advertised
     /// `RELIABLE_LANE_LIMIT`.
     lanes: BTreeSet<StreamId>,
-    pending_bytes: usize,
-    pending_byte_limit: usize,
-    pending_count_limit: usize,
     /// Whether the peer's control-frame limit reached the backend.
     control_limit_applied: bool,
+}
+
+/// The pre-readiness event buffer with its own accounting: an event's cost is
+/// computed once on hold and released exactly once on pop, so the queue and
+/// its byte total cannot drift.
+struct PendingEvents {
+    events: VecDeque<Event>,
+    bytes: usize,
+    byte_limit: usize,
+    count_limit: usize,
+}
+
+impl Default for PendingEvents {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            bytes: 0,
+            byte_limit: DEFAULT_PENDING_RECORD_BYTES,
+            count_limit: DEFAULT_PENDING_RECORD_COUNT,
+        }
+    }
+}
+
+impl PendingEvents {
+    fn cost(event: &Event) -> usize {
+        match event {
+            Event::Reliable { bytes, .. } => bytes.len(),
+            _ => 0,
+        }
+    }
+
+    fn try_hold(&mut self, event: Event) -> Result<(), Error> {
+        let next = self
+            .bytes
+            .checked_add(Self::cost(&event))
+            .ok_or_else(|| self.exhausted_error())?;
+        if next > self.byte_limit || self.events.len() >= self.count_limit {
+            return Err(self.exhausted_error());
+        }
+        self.bytes = next;
+        self.events.push_back(event);
+        self.assert_accounted();
+        Ok(())
+    }
+
+    fn pop_front(&mut self) -> Option<Event> {
+        let event = self.events.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(Self::cost(&event));
+        self.assert_accounted();
+        Some(event)
+    }
+
+    fn exhausted_error(&self) -> Error {
+        Error::new(
+            ErrorKind::PendingRecordsExhausted {
+                bytes: self.bytes,
+                count: self.events.len(),
+            },
+            error_code::RESOURCE_LIMIT,
+        )
+    }
+
+    /// The charged bytes recomputed from the events, in tests and debug builds.
+    fn assert_accounted(&self) {
+        debug_assert_eq!(
+            self.bytes,
+            self.events.iter().map(Self::cost).sum::<usize>()
+        );
+    }
 }
 
 impl<A: TransportAdapter> Session<A> {
@@ -1108,11 +1183,8 @@ impl<A: TransportAdapter> Session<A> {
             negotiation,
             authentication,
             outbound: VecDeque::new(),
-            pending: VecDeque::new(),
+            pending: PendingEvents::default(),
             lanes: BTreeSet::new(),
-            pending_bytes: 0,
-            pending_byte_limit: DEFAULT_PENDING_RECORD_BYTES,
-            pending_count_limit: DEFAULT_PENDING_RECORD_COUNT,
             control_limit_applied: false,
         }
     }
@@ -1129,8 +1201,8 @@ impl<A: TransportAdapter> Session<A> {
                 error_code::RESOURCE_LIMIT,
             ));
         }
-        self.pending_byte_limit = bytes;
-        self.pending_count_limit = count;
+        self.pending.byte_limit = bytes;
+        self.pending.count_limit = count;
         Ok(())
     }
 
@@ -1514,20 +1586,7 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     fn hold(&mut self, record: Event) -> Result<(), Error> {
-        let bytes = match &record {
-            Event::Reliable { bytes, .. } => bytes.len(),
-            _ => 0,
-        };
-        let next = self
-            .pending_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| self.pending_exhausted())?;
-        if next > self.pending_byte_limit || self.pending.len() >= self.pending_count_limit {
-            return Err(self.pending_exhausted());
-        }
-        self.pending_bytes = next;
-        self.pending.push_back(record);
-        Ok(())
+        self.pending.try_hold(record)
     }
 
     /// Lifecycle events only. The caller still has to learn the carrier
@@ -1543,21 +1602,7 @@ impl<A: TransportAdapter> Session<A> {
     }
 
     fn take_pending(&mut self) -> Option<Event> {
-        let event = self.pending.pop_front()?;
-        if let Event::Reliable { bytes, .. } = &event {
-            self.pending_bytes = self.pending_bytes.saturating_sub(bytes.len());
-        }
-        Some(event)
-    }
-
-    fn pending_exhausted(&self) -> Error {
-        Error::new(
-            ErrorKind::PendingRecordsExhausted {
-                bytes: self.pending_bytes,
-                count: self.pending.len(),
-            },
-            error_code::RESOURCE_LIMIT,
-        )
+        self.pending.pop_front()
     }
 
     /// Whether the application may put a frame on the carrier.
@@ -1591,13 +1636,7 @@ impl<A: TransportAdapter> Session<A> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        check_frame(
-            frame,
-            &peer,
-            &self.negotiation.usable_extensions(),
-            lane,
-            Side::Peer,
-        )
+        check_frame(frame, &peer, ExtensionPolicy::None, lane, Side::Peer)
     }
 
     /// Checks a frame the peer sent against the limits this endpoint
@@ -1606,7 +1645,7 @@ impl<A: TransportAdapter> Session<A> {
         check_frame(
             frame,
             &self.negotiation.local_settings(),
-            &self.negotiation.negotiated_extensions(),
+            ExtensionPolicy::Negotiated(&self.negotiation),
             lane,
             Side::Local,
         )
@@ -1745,10 +1784,28 @@ pub enum Side {
 
 /// Checks one encoded frame against the limits `settings` gives its type.
 /// The one place a negotiated payload limit is applied, in both directions.
+/// Which extensions a frame check consults, answered without building the
+/// intersection set. `None` is the outbound policy: the usable set is
+/// intentionally empty, see [`Negotiation::usable_extensions`].
+#[derive(Clone, Copy)]
+enum ExtensionPolicy<'a> {
+    None,
+    Negotiated(&'a Negotiation),
+}
+
+impl ExtensionPolicy<'_> {
+    fn contains(self, extension: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::Negotiated(negotiation) => negotiation.extension_is_negotiated(extension),
+        }
+    }
+}
+
 fn check_frame(
     frame: &[u8],
     settings: &Settings,
-    extensions: &BTreeSet<u64>,
+    extensions: ExtensionPolicy<'_>,
     lane: Lane,
     side: Side,
 ) -> Result<(), Error> {
@@ -1799,7 +1856,7 @@ fn check_frame(
     // spec/wire.md section 5: an experimental frame is invalid unless its
     // extension was negotiated, whichever side it came from.
     if let Some(extension) = vot_codec::required_extension(envelope.frame_type)
-        && !extensions.contains(&extension)
+        && !extensions.contains(extension)
     {
         return Err(Error::new(
             ErrorKind::ExperimentNotNegotiated {
@@ -3668,7 +3725,7 @@ mod tests {
             server.adapter.events.push_back(record(lane, &payload));
         }
         assert_eq!(server.poll().unwrap(), None);
-        assert_eq!(server.pending_bytes, 4 * record_wire_len(1024));
+        assert_eq!(server.pending.bytes, 4 * record_wire_len(1024));
 
         let mut exact = Session::server(
             Loopback::default(),
@@ -3677,12 +3734,12 @@ mod tests {
             Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         exact.begin().unwrap();
-        exact.pending_byte_limit = 2 * record_wire_len(1024);
+        exact.pending.byte_limit = 2 * record_wire_len(1024);
         for lane in 0..2 {
             exact.adapter.events.push_back(record(lane, &payload));
         }
         assert_eq!(exact.poll().unwrap(), None, "the bound itself is allowed");
-        assert_eq!(exact.pending_bytes, 2 * record_wire_len(1024));
+        assert_eq!(exact.pending.bytes, 2 * record_wire_len(1024));
 
         exact.adapter.events.push_back(record(2, b"x"));
         let error = exact.poll().unwrap_err();
@@ -4297,7 +4354,7 @@ mod tests {
                 check_frame(
                     &frame_of(frame_type, limit),
                     &settings,
-                    &BTreeSet::new(),
+                    ExtensionPolicy::None,
                     lane,
                     side,
                 )
@@ -4305,7 +4362,7 @@ mod tests {
                 let error = check_frame(
                     &frame_of(frame_type, limit + 1),
                     &settings,
-                    &BTreeSet::new(),
+                    ExtensionPolicy::None,
                     lane,
                     side,
                 )
@@ -4509,6 +4566,55 @@ mod tests {
             server.adapter().closed.is_empty(),
             "a local refusal does not close the carrier"
         );
+
+        // The negotiated side accepts the frame inbound: membership answers
+        // true only through the intersection.
+        server.adapter.events.push_back(control(&credit));
+        assert!(
+            matches!(server.poll().unwrap(), Some(Event::Control(_))),
+            "a negotiated experimental frame is delivered"
+        );
+
+        // One-sided advertisement is not negotiation: the client offered the
+        // extension, this server did not, and the intersection is empty.
+        let mut unextended = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        unextended.begin().unwrap();
+        let mut offering = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        offering.begin().unwrap();
+        for frame in std::mem::take(&mut offering.adapter.sent) {
+            unextended.adapter.events.push_back(control(&frame));
+        }
+        unextended.poll().unwrap();
+        assert!(unextended.negotiation.negotiated_extensions().is_empty());
+        unextended.adapter.events.push_back(control(&credit));
+        let error = unextended.poll().unwrap_err();
+        assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn a_drifted_pending_byte_total_fails_the_recomputation() {
+        let mut pending = PendingEvents::default();
+        pending
+            .try_hold(Event::Reliable {
+                stream: StreamId(1),
+                sequence: 1,
+                bytes: vot_transport_api::shared_payload(b"record"),
+            })
+            .unwrap();
+        // The only way bytes and events can disagree is a bug; simulate one.
+        pending.bytes += 1;
+        pending.assert_accounted();
     }
 
     #[test]

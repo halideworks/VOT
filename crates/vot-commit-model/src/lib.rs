@@ -228,21 +228,14 @@ impl Machine {
     }
 
     fn can_publish_from(&self, state: State) -> bool {
-        matches!(
-            (self.profile, state),
-            (Profile::Fast, State::TransitVerified)
-                | (Profile::Balanced, State::Durable)
-                | (Profile::Strict, State::AtRestVerified)
-        )
+        // Derived rather than written again: the state a namespace may be
+        // linked from is the one standing at the assurance publication
+        // requires, and one table decides both.
+        state == self.profile.required_predecessor().state()
     }
 
     fn required_predecessor_performed(&self) -> bool {
-        let required = match self.profile {
-            Profile::Fast => Assurance::TransitVerified,
-            Profile::Balanced => Assurance::Durable,
-            Profile::Strict => Assurance::AtRestVerified,
-        };
-        self.performed(required)
+        self.performed(self.profile.required_predecessor())
     }
 }
 
@@ -268,6 +261,18 @@ impl Event {
 }
 
 impl Profile {
+    /// The assurance a publication under this profile must already have
+    /// performed. One home for the rule: a receipt chain checks the same
+    /// table the machine enforces.
+    #[must_use]
+    pub const fn required_predecessor(self) -> Assurance {
+        match self {
+            Self::Fast => Assurance::TransitVerified,
+            Self::Balanced => Assurance::Durable,
+            Self::Strict => Assurance::AtRestVerified,
+        }
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -279,6 +284,18 @@ impl Profile {
 }
 
 impl Assurance {
+    /// The state a machine stands in once it has performed this.
+    #[must_use]
+    pub const fn state(self) -> State {
+        match self {
+            Self::Admitted => State::Admitted,
+            Self::TransitVerified => State::TransitVerified,
+            Self::Durable => State::Durable,
+            Self::AtRestVerified => State::AtRestVerified,
+            Self::Published => State::Published,
+        }
+    }
+
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {

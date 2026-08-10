@@ -582,6 +582,23 @@ mod tests {
     const BUSY_PASSES: u64 = STALLED_WAIT_MS / BUSY_BOUND_MS;
 
     #[test]
+    fn every_terminal_status_names_its_error() {
+        assert!(fetch_verdict(crate::FetchStatus::Complete).is_ok());
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Closed(7)),
+            Err(Error::PeerClosed(7))
+        ));
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Disconnected),
+            Err(Error::CarrierUnavailable)
+        ));
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Active),
+            Err(Error::InvalidBundle)
+        ));
+    }
+
+    #[test]
     fn an_unbounded_serve_outlives_a_failed_session() {
         use crate::harness::{Loopback, built_bundle, not_required, patterned};
         use vot_transport_api::{ConnectionId, Event};

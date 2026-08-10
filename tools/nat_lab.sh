@@ -12,6 +12,10 @@
 #
 #   tools/nat_lab.sh --matrix
 #   tools/nat_lab.sh --serve-nat symmetric --fetch-nat cone
+#
+# --relay runs a relay beside the service and names it to the fetch, which
+# is ADR-0034's last rung: the row that cannot punch should then fetch
+# through the slot instead of failing.
 #   tools/nat_lab.sh --bundle path/to/bundle --root <hex>
 #
 # Options:
@@ -55,7 +59,9 @@ BINARY=
 BUNDLE=
 ROOT=
 MATRIX=no
+RELAY=no
 SERVICE_PORT=7777
+RELAY_PORT=7778
 FETCH_TIMEOUT=40
 # Pinned, because the default is the machine's core count and a row's elapsed
 # time is not comparable across two machines that punched a different number
@@ -76,6 +82,7 @@ while [ $# -gt 0 ]; do
         --bundle) BUNDLE=$2; shift 2 ;;
         --root) ROOT=$2; shift 2 ;;
         --matrix) MATRIX=yes; shift ;;
+        --relay) RELAY=yes; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -118,7 +125,8 @@ if [ "${NAT_LAB_INSIDE:-}" != "1" ]; then
     exec unshare --user --map-root-user --net --mount --fork --pid --mount-proc \
         "$0" --serve-nat "$SERVE_NAT" --fetch-nat "$FETCH_NAT" \
         --binary "$BINARY" --bundle "$BUNDLE" --root "$ROOT" \
-        $([ "$MATRIX" = yes ] && echo --matrix)
+        $([ "$MATRIX" = yes ] && echo --matrix) \
+        $([ "$RELAY" = yes ] && echo --relay)
 fi
 
 # ----------------------------------------------------------------- inside
@@ -194,15 +202,15 @@ site() {
 }
 
 teardown() {
-    for pid in $SERVICE_PID $SERVE_PID; do
+    for pid in $SERVICE_PID $SERVE_PID $RELAY_PID; do
         kill "$pid" 2>/dev/null || true
     done
     # Reaped, not only signalled. The next topology binds the same service
     # port, and a process that still holds it fails that bind.
-    for pid in $SERVICE_PID $SERVE_PID; do
+    for pid in $SERVICE_PID $SERVE_PID $RELAY_PID; do
         wait "$pid" 2>/dev/null || true
     done
-    SERVICE_PID= SERVE_PID=
+    SERVICE_PID= SERVE_PID= RELAY_PID=
     for ns in serve serve-nat fetch fetch-nat; do
         ip netns del "$ns" 2>/dev/null || true
     done
@@ -221,7 +229,7 @@ teardown() {
 # runs, and a topology that failed to build would then be reported as a NAT
 # verdict. A rig failure exits the lab instead.
 run() {
-    SERVICE_PID= SERVE_PID= RUN_OUTCOME=
+    SERVICE_PID= SERVE_PID= RELAY_PID= RUN_OUTCOME=
     trap teardown EXIT
     trap 'teardown; exit 130' INT TERM
 
@@ -251,12 +259,34 @@ run() {
         exit 2
     fi
 
+    relay_env=
+    if [ "$RELAY" = yes ]; then
+        relay="192.168.1.1:$RELAY_PORT"
+        "$BINARY" relay "$relay" > "$work/relay.log" 2>&1 &
+        RELAY_PID=$!
+        ready=no
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if grep -q "relay slots" "$work/relay.log" 2>/dev/null; then
+                ready=yes
+                break
+            fi
+            sleep 0.2
+        done
+        if [ "$ready" != yes ]; then
+            echo "the relay never came up" >&2
+            sed 's/^/    /' "$work/relay.log" >&2
+            exit 2
+        fi
+        relay_env="VOT_RELAY=$relay"
+    fi
+
     ip netns exec serve env VOT_RENDEZVOUS="$service" \
         "$BINARY" serve "$BUNDLE" 10.1.0.2:0 > "$work/serve.log" 2>&1 &
     SERVE_PID=$!
 
     began=$(date +%s.%N)
     if ip netns exec fetch env VOT_RENDEZVOUS="$service" VOT_FETCH_RAILS="$RAILS" \
+        $relay_env \
         timeout "$FETCH_TIMEOUT" "$BINARY" fetch "$ROOT" "$work/out" "$ROOT" \
         > "$work/fetch.log" 2>&1
     then

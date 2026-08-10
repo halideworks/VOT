@@ -141,7 +141,7 @@ pub(crate) fn take_slot_within(
 ///
 /// A relay with no slot to give answers `Slot { at: None }`; that is a
 /// retry, because a TTL may free one, and the retry loop is what bounds it.
-fn slot_answered(
+pub(crate) fn slot_answered(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
     key: [u8; 32],

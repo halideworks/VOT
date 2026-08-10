@@ -868,6 +868,66 @@ mod tests {
     }
 
     #[test]
+    fn only_the_relay_that_was_asked_names_a_slot_and_only_for_the_key() {
+        use crate::relay::{Datagram, encode};
+
+        let taker = UdpSocket::bind("127.0.0.1:0").expect("a taker socket");
+        let at = taker.local_addr().expect("the taker address");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("a relay socket");
+        let relay_at = relay.local_addr().expect("the relay address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let steered = "203.0.113.9:443".parse().expect("an address to be sent to");
+        let mut buffer = [0_u8; 128];
+
+        // The right shape from the wrong host, then the wrong key from the
+        // right host: neither may steer the fetch to a slot.
+        let forged = encode(&Datagram::Slot {
+            key: [7; 32],
+            at: Some(steered),
+        });
+        stranger.send_to(&forged, at).expect("a forged slot");
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [8; 32],
+                    at: Some(steered),
+                }),
+                at,
+            )
+            .expect("another key's slot");
+        assert_eq!(
+            slot_answered(&taker, &mut buffer, [7; 32], relay_at).expect("a read"),
+            None,
+            "a slot nobody asked this relay for steered the fetch"
+        );
+
+        // The right key from the relay that was asked is taken, and a
+        // relay with nothing to give is a retry, not an answer.
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [7; 32],
+                    at: None,
+                }),
+                at,
+            )
+            .expect("a full relay");
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [7; 32],
+                    at: Some(steered),
+                }),
+                at,
+            )
+            .expect("the real slot");
+        assert_eq!(
+            slot_answered(&taker, &mut buffer, [7; 32], relay_at).expect("a read"),
+            Some(steered)
+        );
+    }
+
+    #[test]
     fn a_rail_reads_its_warming_and_gives_up_without_one() {
         use crate::rendezvous::{Datagram, encode};
 

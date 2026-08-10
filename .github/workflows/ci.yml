@@ -585,13 +585,21 @@ jobs:
   # the mutation matrix cannot measure it: that job builds every package
   # featureless, and adding the feature there put a BoringSSL build in front
   # of sixty-five mutants and took the runner down with it. Its own job
-  # instead, the way the pumps have theirs, with one worker rather than two
-  # because the build is what is heavy here and not the tests.
+  # instead, the way the pumps have theirs, at the same two workers the
+  # pumps run: one worker measured a whole-crate diff at over two hours.
   wire-mutation:
-    name: wire-mutation
+    name: wire-mutation (${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    # Sized for a diff that spans the crate, which a module-split PR is: the
-    # in-diff run then approximates the full sweep.
+    # Sharded by area because a diff that spans the crate approximates the
+    # full sweep, and one serial sweep of it does not fit any sane budget on
+    # these runners. Each shard carries the same zero-survivor policy.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { shard: fetch, args: "-f src/fetch*" }
+          - { shard: serve, args: "-f src/serve* -f src/drive.rs -f src/wire.rs -f src/nowire.rs" }
+          - { shard: core, args: "-e src/fetch* -e src/serve* -e src/drive.rs -e src/wire.rs -e src/nowire.rs" }
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
@@ -636,9 +644,10 @@ jobs:
             git diff "origin/$BASE_REF...HEAD" > changed.diff
             scope=(--in-diff changed.diff)
           fi
+          # shellcheck disable=SC2086: the shard args are word lists.
           cargo +1.88.0 mutants --package vot-cli --features wire \
-            --config .cargo/mutants-live.toml --timeout 120 --jobs 1 \
-            "${scope[@]}"
+            --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
+            ${{ matrix.args }} "${scope[@]}"
 
   mutation:
     name: mutation (${{ matrix.package }})

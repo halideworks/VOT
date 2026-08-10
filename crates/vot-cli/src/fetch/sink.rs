@@ -67,40 +67,46 @@ impl DurableHook {
     }
 }
 
+/// The stride crossing after `placed`: where the next flush is due.
+pub(crate) const fn stride_after(placed: u64) -> u64 {
+    placed
+        .saturating_sub(placed % FLUSH_STRIDE_BYTES)
+        .saturating_add(FLUSH_STRIDE_BYTES)
+}
+
 impl CountingSink {
+    /// Counters seeded from `placed`, so pacing and reporting start true
+    /// whether the file is fresh or reopened.
+    fn opened(file: FileSink, placed: u64, durable: Option<DurableHook>) -> Self {
+        Self {
+            file,
+            placed: AtomicU64::new(placed),
+            flush_due: AtomicU64::new(stride_after(placed)),
+            flushes: AtomicU64::new(0),
+            durable,
+        }
+    }
+
     pub(crate) fn create(
         path: &Path,
         length: u64,
         durable: Option<DurableHook>,
     ) -> std::io::Result<Self> {
-        Ok(Self {
-            file: FileSink::create(path, length)?,
-            placed: AtomicU64::new(0),
-            flush_due: AtomicU64::new(FLUSH_STRIDE_BYTES),
-            flushes: AtomicU64::new(0),
-            durable,
-        })
+        Ok(Self::opened(FileSink::create(path, length)?, 0, durable))
     }
 
-    /// Reopens a partial object, its counters seeded with what the last
-    /// fetch already placed so pacing and reporting start true.
+    /// Reopens a partial object with what the last fetch already placed.
     pub(crate) fn resume(
         path: &Path,
         length: u64,
         placed: u64,
         durable: Option<DurableHook>,
     ) -> std::io::Result<Self> {
-        Ok(Self {
-            file: FileSink::resume(path, length)?,
-            placed: AtomicU64::new(placed),
-            flush_due: AtomicU64::new(
-                placed
-                    .saturating_sub(placed % FLUSH_STRIDE_BYTES)
-                    .saturating_add(FLUSH_STRIDE_BYTES),
-            ),
-            flushes: AtomicU64::new(0),
+        Ok(Self::opened(
+            FileSink::resume(path, length)?,
+            placed,
             durable,
-        })
+        ))
     }
 
     pub(crate) fn placed(&self) -> u64 {
@@ -123,9 +129,7 @@ impl vot_scheduler::RangeSink for CountingSink {
                     due,
                     // The crossing after what is placed, however many
                     // strides this write spanned.
-                    placed
-                        .saturating_sub(placed % FLUSH_STRIDE_BYTES)
-                        .saturating_add(FLUSH_STRIDE_BYTES),
+                    stride_after(placed),
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )

@@ -12,7 +12,8 @@
 
 use std::net::SocketAddr;
 
-use crate::rendezvous::{AddressSlot, canonical, pull_address, push_address};
+use crate::side_channel::address::{AddressSlot, canonical, pull_address, push_address};
+use crate::side_channel::padded::padded_key;
 
 /// Lead byte for relay control datagrams. Below the QUIC range and distinct
 /// from the rendezvous magic, so a datagram sent to the wrong service is shed
@@ -68,20 +69,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram> {
         return None;
     };
     match kind {
-        1 => {
-            if rest.len() != REQUEST_BYTES - 3 {
-                return None;
-            }
-            let (key, padding) = rest.split_at_checked(32)?;
-            // Padding that carried bytes would be a covert channel through
-            // the relay's logs.
-            if padding.iter().any(|byte| *byte != 0) {
-                return None;
-            }
-            Some(Datagram::Take {
-                key: key.try_into().ok()?,
-            })
-        }
+        1 => Some(Datagram::Take {
+            key: padded_key(rest, REQUEST_BYTES)?,
+        }),
         2 => {
             let (key, address) = rest.split_at_checked(32)?;
             let at = match pull_address(address) {

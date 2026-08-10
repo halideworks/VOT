@@ -2,7 +2,12 @@
 //! Socket-independent; time is injected so expiry is testable.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
+
+use crate::side_channel::address::{
+    AddressSlot, canonical, from_service, pull_address, push_address,
+};
+use crate::side_channel::padded::padded_key;
 
 /// Lead byte for rendezvous datagrams. Below QUIC range (0x00..=0x3F) so
 /// the router distinguishes them by one byte.
@@ -84,13 +89,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram> {
     };
     match (kind, rest.len()) {
         (1, _) => Some(Datagram::Register {
-            key: padded_key(rest)?,
+            key: padded_key(rest, REQUEST_BYTES)?,
         }),
         (2, 32) => Some(Datagram::Registered {
             key: rest.try_into().ok()?,
         }),
         (3, _) => Some(Datagram::Resolve {
-            key: padded_key(rest)?,
+            key: padded_key(rest, REQUEST_BYTES)?,
         }),
         (4, _) => {
             let (key, address) = rest.split_at_checked(32)?;
@@ -116,98 +121,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram> {
         }
         (6, 0) => Some(Datagram::Warming),
         _ => None,
-    }
-}
-
-/// A request's key with its padding held to zero: padding that carries
-/// bytes would be a covert channel through the service's logs.
-fn padded_key(rest: &[u8]) -> Option<[u8; 32]> {
-    if rest.len() != REQUEST_BYTES - 3 {
-        return None;
-    }
-    let (key, padding) = rest.split_at_checked(32)?;
-    if padding.iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    key.try_into().ok()
-}
-
-/// Appends an optional address: a family byte, then the bytes it names.
-pub(crate) fn push_address(wire: &mut Vec<u8>, address: Option<SocketAddr>) {
-    match address {
-        None => wire.push(0),
-        Some(SocketAddr::V4(v4)) => {
-            wire.push(4);
-            wire.extend_from_slice(&v4.ip().octets());
-            wire.extend_from_slice(&v4.port().to_be_bytes());
-        }
-        Some(SocketAddr::V6(v6)) => {
-            wire.push(6);
-            wire.extend_from_slice(&v6.ip().octets());
-            wire.extend_from_slice(&v6.port().to_be_bytes());
-        }
-    }
-}
-
-/// What an address slot held: bytes that encode no address at all, the
-/// explicit no-address marker, or an address.
-///
-/// Shared with the relay, which carries an address in the same shape for the
-/// same reason: one codec, so a fetch that can read one service's answer can
-/// read the other's.
-pub(crate) enum AddressSlot {
-    Invalid,
-    Empty,
-    Held(SocketAddr),
-}
-
-/// An address by the family that is really its own.
-///
-/// A socket bound to `[::]` observes an IPv4 peer as `::ffff:a.b.c.d` and
-/// would hand that back as the peer's mapping, which the peer cannot then
-/// connect to from the IPv4 socket it announced.
-pub(crate) fn canonical(address: SocketAddr) -> SocketAddr {
-    let SocketAddr::V6(v6) = address else {
-        return address;
-    };
-    match v6.ip().to_ipv4_mapped() {
-        Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
-        None => address,
-    }
-}
-
-/// Whether `source` is `service`, whichever family each was observed in.
-///
-/// A dual-stack socket reports an IPv4 peer as `::ffff:a.b.c.d`, so the
-/// two are compared as [`canonical`] forms rather than as they arrived.
-pub(crate) fn from_service(source: SocketAddr, service: SocketAddr) -> bool {
-    canonical(source) == canonical(service)
-}
-
-/// The inverse of [`push_address`].
-pub(crate) fn pull_address(bytes: &[u8]) -> AddressSlot {
-    let held = |ip, port| AddressSlot::Held(canonical(SocketAddr::new(ip, port)));
-    match bytes {
-        [0] => AddressSlot::Empty,
-        [4, rest @ ..] if rest.len() == 6 => {
-            let Ok(ip) = <[u8; 4]>::try_from(&rest[..4]) else {
-                return AddressSlot::Invalid;
-            };
-            let Ok(port) = <[u8; 2]>::try_from(&rest[4..6]) else {
-                return AddressSlot::Invalid;
-            };
-            held(IpAddr::V4(Ipv4Addr::from(ip)), u16::from_be_bytes(port))
-        }
-        [6, rest @ ..] if rest.len() == 18 => {
-            let Ok(ip) = <[u8; 16]>::try_from(&rest[..16]) else {
-                return AddressSlot::Invalid;
-            };
-            let Ok(port) = <[u8; 2]>::try_from(&rest[16..18]) else {
-                return AddressSlot::Invalid;
-            };
-            held(IpAddr::V6(Ipv6Addr::from(ip)), u16::from_be_bytes(port))
-        }
-        _ => AddressSlot::Invalid,
     }
 }
 

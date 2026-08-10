@@ -1,0 +1,228 @@
+//! Bounded environment parsing and carrier configuration.
+
+use super::{Config, CongestionControl, Error, Path, ReceiveLimits, SocketAddr};
+
+/// Inbound receive limits matched to the codec's default settings.
+pub(crate) fn limits() -> Result<ReceiveLimits, Error> {
+    ReceiveLimits::advertised(
+        &vot_codec::Settings::default(),
+        vot_transport_quiche::INBOUND_BYTE_CAPACITY,
+    )
+    .map_err(|_| Error::InvalidArguments)
+}
+
+/// The environment variable that pins the datagram ceiling.
+pub(crate) const DATAGRAM_BYTES: &str = "VOT_DATAGRAM_BYTES";
+
+/// Opens the datagram ceiling to the maximum and lets PMTU discovery
+/// settle it. [`DATAGRAM_BYTES`] overrides if set.
+///
+/// # Errors
+/// Rejects a value that is not a number. The carrier rejects one outside
+/// what it can carry.
+pub(crate) fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
+    config.max_datagram_bytes = vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+    let Ok(value) = std::env::var(DATAGRAM_BYTES) else {
+        return Ok(());
+    };
+    apply_datagram_value(config, &value)
+}
+
+/// Parses and validates [`DATAGRAM_BYTES`] against the carrier's bounds.
+pub(crate) fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
+    let bytes: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    let bounds = vot_transport_quiche::live::MIN_DATAGRAM_SIZE
+        ..=vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
+    if !bounds.contains(&bytes) {
+        return Err(Error::InvalidArguments);
+    }
+    config.max_datagram_bytes = bytes;
+    Ok(())
+}
+
+/// The environment variable that picks the congestion controller.
+pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
+
+/// The environment variable that sets how many rails a fetch runs.
+pub(crate) const FETCH_RAILS: &str = "VOT_FETCH_RAILS";
+
+/// Maximum fetch rails. Capped at the serve-side session limit because
+/// excess rails stall waiting for accepts.
+pub(crate) const MAX_FETCH_RAILS: usize = crate::drive::CONCURRENT_SESSIONS;
+
+/// The width [`FETCH_RAILS`] names, or `min(4, available cores)` when unset.
+///
+/// # Errors
+/// Rejects a value that is not a number, zero, or a width past the bound.
+pub(crate) fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error> {
+    let Some(value) = pin else {
+        return Ok(4.min(cores.max(1)));
+    };
+    let rails: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    if !(1..=MAX_FETCH_RAILS).contains(&rails) {
+        return Err(Error::InvalidArguments);
+    }
+    Ok(rails)
+}
+
+/// The controller [`CONGESTION`] names, or bbr2 when unset.
+///
+/// # Errors
+/// Rejects a value naming neither controller.
+pub(crate) fn congestion_from(pin: Option<&str>) -> Result<CongestionControl, Error> {
+    match pin.map(str::trim) {
+        None | Some("bbr2") => Ok(CongestionControl::Bbr2),
+        Some("cubic") => Ok(CongestionControl::Cubic),
+        Some(_) => Err(Error::InvalidArguments),
+    }
+}
+
+/// Bytes between progress lines. 256 MiB: visible on both fast and slow links.
+pub(crate) const PROGRESS_QUANTUM_BYTES: u64 = 268_435_456;
+
+/// The issuer key a serve accepts capabilities from, as a `KEY_SOURCE`.
+pub(crate) const SERVE_ISSUER: &str = "VOT_SERVE_ISSUER";
+
+/// The issuer name that key signs under.
+pub(crate) const SERVE_ISSUER_NAME: &str = "VOT_SERVE_ISSUER_NAME";
+
+/// The deployment a capability must name.
+pub(crate) const SERVE_AUDIENCE: &str = "VOT_SERVE_AUDIENCE";
+
+/// What a serve requires of a fetch, or nothing.
+///
+/// Takes the values rather than reading them, like every other reader here,
+/// so a test can hold both answers without an environment it cannot set.
+///
+/// All three or none. A serve given a key but no audience would accept a
+/// token minted for another deployment, and one given an audience but no key
+/// would accept nothing, which is a refusal that looks like a bug.
+///
+/// # Errors
+/// Rejects a partial configuration and a key source that is not an Ed25519
+/// public key.
+pub(crate) fn requirement_from(
+    issuer_source: Option<&str>,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    root: [u8; 32],
+) -> Result<Option<crate::authz::Requirement>, Error> {
+    match (issuer_source, issuer, audience) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(issuer), Some(audience)) => {
+            let crate::KeyMaterial::Verifying(key) = crate::load_key_spec(source)? else {
+                // A signing key here would let the serve mint what it checks,
+                // and a shared secret is not what a capability is signed with.
+                return Err(Error::InvalidArguments);
+            };
+            Ok(Some(crate::authz::Requirement::new(
+                issuer,
+                crate::authz::key_id_of(&key),
+                *key,
+                audience,
+                root,
+            )))
+        }
+        _ => Err(Error::InvalidArguments),
+    }
+}
+
+/// Slots this relay opens at once, its slot lifetime in milliseconds, and the
+/// bytes one slot forwards. Each is a hard bound the operator sets.
+pub(crate) const RELAY_SLOTS: &str = "VOT_RELAY_SLOTS";
+
+pub(crate) const RELAY_TTL_MS: &str = "VOT_RELAY_TTL_MS";
+
+pub(crate) const RELAY_BYTES: &str = "VOT_RELAY_BYTES";
+
+/// The relay's bounds, from the environment or the defaults.
+///
+/// Every value is parsed and rejected here rather than clamped: an operator
+/// who wrote a number this cannot read has said something, and guessing what
+/// would be a donation they did not agree to.
+///
+/// # Errors
+/// Rejects a value that is not a number, and a zero, which would be a relay
+/// that opens no slots or closes them the instant they open.
+pub(crate) fn relay_limits_from(
+    slots: Option<&str>,
+    ttl_ms: Option<&str>,
+    bytes: Option<&str>,
+) -> Result<crate::relay::Limits, Error> {
+    let default = crate::relay::Limits::default();
+    let read = |value: Option<&str>| -> Result<Option<u64>, Error> {
+        value
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| Error::InvalidArguments)
+            })
+            .transpose()
+            .and_then(|parsed| match parsed {
+                Some(0) => Err(Error::InvalidArguments),
+                other => Ok(other),
+            })
+    };
+    let concurrent = match read(slots)? {
+        Some(value) => usize::try_from(value).map_err(|_| Error::InvalidArguments)?,
+        None => default.concurrent,
+    };
+    Ok(crate::relay::Limits {
+        concurrent,
+        ttl_ms: read(ttl_ms)?.unwrap_or(default.ttl_ms),
+        bytes: read(bytes)?.unwrap_or(default.bytes),
+    })
+}
+
+/// Rendezvous service address. Unset means no registration.
+pub(crate) const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
+
+/// Every address the service [`RENDEZVOUS`] names, or none when it is
+/// unset.
+///
+/// # Errors
+/// Rejects a value that is neither an address nor a name that resolves.
+pub(crate) fn rendezvous_from(pin: Option<&str>) -> Result<Vec<SocketAddr>, Error> {
+    pin.map_or_else(|| Ok(Vec::new()), crate::parse_rendezvous)
+}
+
+/// The capability a fetch presents, as a path to what `vot capability issue`
+/// wrote.
+pub(crate) const FETCH_CAPABILITY: &str = "VOT_FETCH_CAPABILITY";
+
+/// The holder key that capability names, as a `KEY_SOURCE`.
+pub(crate) const FETCH_HOLDER_KEY: &str = "VOT_FETCH_HOLDER_KEY";
+
+/// The capability a fetch will present, or nothing.
+///
+/// Takes the values, for the reason [`requirement_from`] does.
+///
+/// Both or neither, for the reason a serve needs all three: a token with no
+/// key cannot be proved, and a key with no token proves nothing.
+///
+/// # Errors
+/// Rejects a partial configuration, a key source that is not an Ed25519
+/// secret, a token this build cannot read, and a key that is not the holder
+/// the token names.
+pub(crate) fn holder_from(
+    capability: Option<&str>,
+    key_source: Option<&str>,
+) -> Result<Option<std::sync::Arc<crate::authz::Holder>>, Error> {
+    match (capability, key_source) {
+        (None, None) => Ok(None),
+        (Some(path), Some(source)) => {
+            let crate::KeyMaterial::Signing(key) = crate::load_key_spec(source)? else {
+                // Proving possession needs the private half. A public key
+                // here is the labelling mistake the key sources exist to
+                // catch.
+                return Err(Error::InvalidArguments);
+            };
+            let token = std::fs::read(Path::new(path))?;
+            Ok(Some(std::sync::Arc::new(crate::authz::Holder::new(
+                token, *key,
+            )?)))
+        }
+        _ => Err(Error::InvalidArguments),
+    }
+}

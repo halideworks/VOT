@@ -603,8 +603,14 @@ jobs:
           # single-quoted so the runner shell passes them to cargo-mutants
           # as patterns: unquoted, bash expands them into file names the
           # moment the directory exists.
-          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f 'crates/vot-cli/src/fetch/**'" }
-          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f 'crates/vot-cli/src/serve/**' -f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/wire.rs -f crates/vot-cli/src/nowire.rs" }
+          # Sized so no shard holds two large modules: a module-split PR
+          # sweeps its whole area, and the split PRs still to come (drive,
+          # wire) should pay for their own area rather than a neighbor's.
+          - { shard: fetch-protocol, args: "-f crates/vot-cli/src/fetch/protocol.rs" }
+          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/fetch/protocol.rs" }
+          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f 'crates/vot-cli/src/serve/**'" }
+          - { shard: drive, args: "-f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/nowire.rs" }
+          - { shard: wire, args: "-f crates/vot-cli/src/wire.rs" }
           # Command-line globs replace the config file's exclude_globs, so
           # the core shard restates them: main.rs (the binary is untested
           # under wire, its Ok(()) mutants are unkillable by design) and the

@@ -99,6 +99,21 @@ pub fn drive_until<E: Engine>(
     }
 }
 
+/// The error a terminal fetch status names, or completion.
+///
+/// One mapping for the primary and every rail; what a completion yields
+/// (the package, or nothing for a rail) stays with the caller.
+#[cfg(any(test, feature = "wire"))]
+fn fetch_verdict(status: crate::FetchStatus) -> Result<(), Error> {
+    match status {
+        crate::FetchStatus::Complete => Ok(()),
+        // Preserve the original error code for the caller.
+        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
+        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
+        crate::FetchStatus::Active => Err(Error::InvalidBundle),
+    }
+}
+
 /// Ends whatever the loop answered as this end's own outcome: the package
 /// for a complete fetch, and the error that names why for anything else.
 #[cfg(any(test, feature = "wire"))]
@@ -106,13 +121,7 @@ fn fetched<A: TransportAdapter>(
     fetcher: &crate::BundleFetcher<A>,
     status: crate::FetchStatus,
 ) -> Result<crate::PackageSummary, Error> {
-    match status {
-        crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
-        // Preserve the original error code for the caller.
-        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
-        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-        crate::FetchStatus::Active => Err(Error::InvalidBundle),
-    }
+    fetch_verdict(status).and_then(|()| fetcher.package().ok_or(Error::InvalidBundle))
 }
 
 /// Fetches at `rails` width. The primary builds the plan; rails join it
@@ -158,12 +167,7 @@ where
                     let mut rail =
                         crate::BundleFetcher::join(carrier, &bundle, plan.clone(), holder)?;
                     rail.set_proving_threads(provers)?;
-                    match drive(&mut rail)? {
-                        crate::FetchStatus::Complete => Ok(()),
-                        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
-                        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-                        crate::FetchStatus::Active => Err(Error::InvalidBundle),
-                    }
+                    fetch_verdict(drive(&mut rail)?)
                 })();
                 if outcome.is_err() {
                     crate::fetch::abandon_plan(&plan);
@@ -302,55 +306,7 @@ where
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
 {
     std::thread::scope(|scope| {
-        let mut running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, _>)> =
-            std::collections::VecDeque::new();
-        // Wait for any session to finish, not the oldest: a vanished client
-        // only settles at the carrier idle timeout.
-        let (ended, endings) = std::sync::mpsc::channel::<u64>();
-        let mut spawned: u64 = 0;
-        // First failure under a bounded serve. Later sessions still finish
-        // before the error surfaces.
-        let mut failed = Ok(());
-        // Waits for the next session to finish. Wakes periodically to detect
-        // a lost announcement, which would otherwise hang forever.
-        let reap = |running: &mut std::collections::VecDeque<(
-            u64,
-            std::thread::ScopedJoinHandle<'_, _>,
-        )>,
-                    failed: &mut Result<(), Error>| {
-            assert!(
-                !running.is_empty(),
-                "a slot is only reaped from a serve that holds one"
-            );
-            let done = loop {
-                match endings.recv_timeout(REAP_TICK) {
-                    Ok(done) => break done,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let finished = running
-                            .iter()
-                            .filter(|(_, handle)| handle.is_finished())
-                            .count();
-                        match reap_wake(finished, endings.try_recv().ok()) {
-                            ReapWake::Take(done) => break done,
-                            ReapWake::Wait => {}
-                            ReapWake::Breach => {
-                                panic!("{finished} sessions finished without announcing")
-                            }
-                        }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        unreachable!("the serve holds a sender")
-                    }
-                }
-            };
-            let at = running
-                .iter()
-                .position(|(id, _)| *id == done)
-                .expect("an announced session is still held");
-            let (_, handle) = running.remove(at).expect("the position was just found");
-            let settled = handle.join().expect("a session thread never panics");
-            settle_session(sessions, settled, failed);
-        };
+        let mut running = RunningSessions::begin(sessions);
         let mut turns = turns(sessions);
         while turns.next().is_some() {
             // Accept blocks here, so factory errors are ordered after prior sessions.
@@ -359,38 +315,137 @@ where
             // Reap a finished session and retry. Each attempt shrinks
             // `running`, so the loop is bounded.
             while accepted.is_err() && !running.is_empty() {
-                reap(&mut running, &mut failed);
+                let held = running.len();
+                running.reap_one();
+                debug_assert_eq!(running.len(), held - 1, "a reap must release its slot");
                 accepted = next();
             }
             while running.len() >= CONCURRENT_SESSIONS {
-                reap(&mut running, &mut failed);
+                let held = running.len();
+                running.reap_one();
+                debug_assert_eq!(running.len(), held - 1, "a reap must release its slot");
             }
             let mut session = match accepted {
                 Ok(session) => session,
-                Err(error) => {
-                    drain(running, sessions, &mut failed);
-                    return failed.and(Err(error));
-                }
+                Err(error) => return running.finish().and(Err(error)),
             };
-            let id = spawned;
-            spawned += 1;
-            let announce = Announcement {
-                id,
-                ended: ended.clone(),
-            };
-            running.push_back((
-                id,
-                scope.spawn(move || {
-                    // Announced via Drop so the reap never waits on a dead thread,
-                    // even on panic.
-                    let _announce = announce;
-                    drive(&mut session).map(|_| ())
-                }),
-            ));
+            running.spawn(scope, move || drive(&mut session).map(|_| ()));
         }
-        drain(running, sessions, &mut failed);
-        failed
+        running.finish()
     })
+}
+
+/// The sessions a serve is driving: their slots, their end announcements,
+/// and the first failure the policy will surface.
+#[cfg(any(test, feature = "wire"))]
+struct RunningSessions<'scope, T> {
+    running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'scope, T>)>,
+    /// Wait for any session to finish, not the oldest: a vanished client
+    /// only settles at the carrier idle timeout.
+    ended: std::sync::mpsc::Sender<u64>,
+    endings: std::sync::mpsc::Receiver<u64>,
+    spawned: u64,
+    /// The serve's bound, which is also its failure policy.
+    sessions: Option<u32>,
+    /// First failure under a bounded serve. Later sessions still finish
+    /// before the error surfaces.
+    failed: Result<(), Error>,
+}
+
+#[cfg(any(test, feature = "wire"))]
+impl<'scope> RunningSessions<'scope, Result<(), Error>> {
+    fn begin(sessions: Option<u32>) -> Self {
+        let (ended, endings) = std::sync::mpsc::channel::<u64>();
+        Self {
+            running: std::collections::VecDeque::new(),
+            ended,
+            endings,
+            spawned: 0,
+            sessions,
+            failed: Ok(()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Starts one session's thread, announced via Drop so the reap never
+    /// waits on a dead thread, even on panic.
+    fn spawn<'env, W>(&mut self, scope: &'scope std::thread::Scope<'scope, 'env>, work: W)
+    where
+        W: FnOnce() -> Result<(), Error> + Send + 'scope,
+    {
+        let id = self.spawned;
+        self.spawned += 1;
+        let announce = Announcement {
+            id,
+            ended: self.ended.clone(),
+        };
+        self.running.push_back((
+            id,
+            scope.spawn(move || {
+                let _announce = announce;
+                work()
+            }),
+        ));
+    }
+
+    /// Waits for the next session to finish and settles it. Wakes
+    /// periodically to detect a lost announcement, which would otherwise
+    /// hang forever.
+    fn reap_one(&mut self) {
+        assert!(
+            !self.running.is_empty(),
+            "a slot is only reaped from a serve that holds one"
+        );
+        let done = loop {
+            match self.endings.recv_timeout(REAP_TICK) {
+                Ok(done) => break done,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let finished = self
+                        .running
+                        .iter()
+                        .filter(|(_, handle)| handle.is_finished())
+                        .count();
+                    match reap_wake(finished, self.endings.try_recv().ok()) {
+                        ReapWake::Take(done) => break done,
+                        ReapWake::Wait => {}
+                        ReapWake::Breach => {
+                            panic!("{finished} sessions finished without announcing")
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    unreachable!("the serve holds a sender")
+                }
+            }
+        };
+        let at = self
+            .running
+            .iter()
+            .position(|(id, _)| *id == done)
+            .expect("an announced session is still held");
+        let (_, handle) = self
+            .running
+            .remove(at)
+            .expect("the position was just found");
+        let settled = handle.join().expect("a session thread never panics");
+        settle_session(self.sessions, settled, &mut self.failed);
+    }
+
+    /// Joins every running session and answers with the policy's verdict.
+    fn finish(mut self) -> Result<(), Error> {
+        for (_, handle) in std::mem::take(&mut self.running) {
+            let settled = handle.join().expect("a session thread never panics");
+            settle_session(self.sessions, settled, &mut self.failed);
+        }
+        self.failed
+    }
 }
 
 /// How often the reap wakes to check for lost announcements.
@@ -441,22 +496,6 @@ fn turns(sessions: Option<u32>) -> Box<dyn Iterator<Item = ()>> {
     match sessions {
         Some(bound) => Box::new(std::iter::repeat_n((), bound as usize)),
         None => Box::new(std::iter::repeat(())),
-    }
-}
-
-/// Joins all running sessions and folds outcomes into the policy.
-#[cfg(any(test, feature = "wire"))]
-fn drain<T>(
-    running: std::collections::VecDeque<(u64, std::thread::ScopedJoinHandle<'_, Result<T, Error>>)>,
-    sessions: Option<u32>,
-    failed: &mut Result<(), Error>,
-) {
-    for (_, handle) in running {
-        let settled = handle
-            .join()
-            .expect("a session thread never panics")
-            .map(|_| ());
-        settle_session(sessions, settled, failed);
     }
 }
 
@@ -541,6 +580,23 @@ mod tests {
     /// Passes the budget allows at each bound.
     const IDLE_PASSES: u64 = STALLED_WAIT_MS / IDLE_BOUND_MS;
     const BUSY_PASSES: u64 = STALLED_WAIT_MS / BUSY_BOUND_MS;
+
+    #[test]
+    fn every_terminal_status_names_its_error() {
+        assert!(fetch_verdict(crate::FetchStatus::Complete).is_ok());
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Closed(7)),
+            Err(Error::PeerClosed(7))
+        ));
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Disconnected),
+            Err(Error::CarrierUnavailable)
+        ));
+        assert!(matches!(
+            fetch_verdict(crate::FetchStatus::Active),
+            Err(Error::InvalidBundle)
+        ));
+    }
 
     #[test]
     fn an_unbounded_serve_outlives_a_failed_session() {

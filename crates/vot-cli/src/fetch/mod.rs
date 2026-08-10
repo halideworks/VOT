@@ -1109,6 +1109,15 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn the_stride_crossing_is_exact_at_its_edges() {
+        assert_eq!(stride_after(0), FLUSH_STRIDE_BYTES);
+        assert_eq!(stride_after(1), FLUSH_STRIDE_BYTES);
+        assert_eq!(stride_after(FLUSH_STRIDE_BYTES - 1), FLUSH_STRIDE_BYTES);
+        assert_eq!(stride_after(FLUSH_STRIDE_BYTES), 2 * FLUSH_STRIDE_BYTES);
+        assert_eq!(stride_after(FLUSH_STRIDE_BYTES + 1), 2 * FLUSH_STRIDE_BYTES);
+    }
+
+    #[test]
     pub(crate) fn a_resumed_sinks_flush_mark_starts_past_what_is_placed() {
         // The seed arms the next stride above resumed bytes, so the first
         // flush is new work.

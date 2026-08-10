@@ -599,15 +599,18 @@ jobs:
         include:
           # Globs anchor at the tree root and a name* glob does not descend
           # into a directory of that name, so each area names both its
-          # single-file and its module-directory form.
-          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f crates/vot-cli/src/fetch/**" }
-          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f crates/vot-cli/src/serve/** -f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/wire.rs -f crates/vot-cli/src/nowire.rs" }
+          # single-file and its module-directory form. The ** globs are
+          # single-quoted so the runner shell passes them to cargo-mutants
+          # as patterns: unquoted, bash expands them into file names the
+          # moment the directory exists.
+          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f 'crates/vot-cli/src/fetch/**'" }
+          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f 'crates/vot-cli/src/serve/**' -f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/wire.rs -f crates/vot-cli/src/nowire.rs" }
           # Command-line globs replace the config file's exclude_globs, so
           # the core shard restates them: main.rs (the binary is untested
           # under wire, its Ok(()) mutants are unkillable by design) and the
           # rendezvous and relay modules the featureless matrix already
           # measures.
-          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e crates/vot-cli/src/fetch/** -e crates/vot-cli/src/serve.rs -e crates/vot-cli/src/serve/** -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e crates/vot-cli/src/relay.rs" }
+          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e crates/vot-cli/src/relay.rs" }
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

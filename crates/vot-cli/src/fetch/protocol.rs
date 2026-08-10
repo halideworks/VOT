@@ -1052,7 +1052,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.covered.clear();
                 plan.covered_bytes = 0;
                 plan.skip.clear();
+                // A cursor that stands still here re-fetches the object it
+                // just settled, forever and over the wire; failing at once
+                // is what keeps that spin out of every suite's budget.
+                let done = plan.current + 1;
                 plan.current += 1;
+                debug_assert_eq!(plan.current, done, "the settled object was not left behind");
                 continue;
             }
             if plan.current == plan.objects.len() {

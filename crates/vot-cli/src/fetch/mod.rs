@@ -504,6 +504,60 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn the_handout_commits_forward() {
+        let mut plan = FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: Vec::new(),
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: None,
+            finished: false,
+        };
+        plan.take(5, 5).unwrap();
+        assert_eq!(plan.next_offset, 10, "a committed span moves the handout");
+        plan.take(10, 5).unwrap();
+        assert_eq!(plan.next_offset, 15);
+    }
+
+    #[test]
+    #[should_panic(expected = "backwards")]
+    #[cfg(debug_assertions)]
+    pub(crate) fn a_span_behind_the_handout_panics_instead_of_spinning() {
+        let mut plan = FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: Vec::new(),
+            current: 0,
+            active: None,
+            placed_before: 0,
+            next_offset: 0,
+            covered: BTreeMap::new(),
+            covered_bytes: 0,
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: None,
+            finished: false,
+        };
+        plan.take(0, 8).unwrap();
+        let _ = plan.take(0, 8);
+    }
+
+    #[test]
     pub(crate) fn coverage_counts_every_byte_once() {
         // Coalescing counts each byte once, so a duplicate range cannot
         // complete an object with a hole.

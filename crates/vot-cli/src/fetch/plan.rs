@@ -141,6 +141,12 @@ impl FetchPlan {
     /// Called only once the span's frame is queued: committing before the
     /// frame exists would consume it on a failure that leaves a hole.
     pub(crate) fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
+        // A span behind the cursor would be asked for again forever; failing
+        // here turns that spin into a panic the suite sees immediately.
+        debug_assert!(
+            offset >= self.next_offset,
+            "a committed span moved the handout backwards"
+        );
         self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
         Ok(())
     }

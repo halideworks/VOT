@@ -1509,6 +1509,11 @@ mod tests {
         // entered by hand because a loopback punch would succeed and the
         // ladder would rightly never get here.
         const SERVICE_READS: usize = 400;
+        // The relay's control budget covers the fetch's whole retry bound
+        // plus the releases at the end: a retried Take under suite load is
+        // answered with the held slot, but it still spends the budget, and
+        // a budget of two once stopped the relay mid-transfer here.
+        const CONTROL_DATAGRAMS: u64 = 8;
 
         let source = crate::tests::temporary("relay-rung-source");
         std::fs::create_dir_all(&source).unwrap();
@@ -1549,11 +1554,6 @@ mod tests {
             }
         });
 
-        // The relay's control budget covers the fetch's whole retry bound
-        // plus the releases at the end: a retried Take under suite load is
-        // answered with the held slot, but it still spends the budget, and
-        // a budget of two once stopped the relay mid-transfer here.
-        const CONTROL_DATAGRAMS: u64 = 8;
         let (listening, address) = mpsc::channel();
         let relaying = std::thread::spawn(move || {
             relay_service(

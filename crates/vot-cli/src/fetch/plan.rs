@@ -62,6 +62,84 @@ pub(crate) fn abandon_plan(plan: &SharedPlan) {
     }
 }
 
+/// Disjoint settled extents and the exact bytes they span.
+///
+/// Coalescing counts each byte once, so a duplicate range from another
+/// rail cannot complete an object that still has a hole.
+pub(crate) struct CoverageMap {
+    /// Extents by start offset, disjoint and coalesced.
+    extents: BTreeMap<u64, u64>,
+    /// Bytes the extents span, kept exact by [`CoverageMap::insert`].
+    bytes: u64,
+}
+
+impl CoverageMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            extents: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// A map seeded with already-durable extents, disjoint by construction.
+    pub(crate) fn seeded(extents: BTreeMap<u64, u64>) -> Self {
+        let bytes = extents.values().sum();
+        Self { extents, bytes }
+    }
+
+    /// Books an extent, coalescing and counting each byte once.
+    pub(crate) fn insert(&mut self, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let Some(mut end) = offset.checked_add(length) else {
+            return;
+        };
+        let mut start = offset;
+        let mut absorbed: u64 = 0;
+        // Walk right to left from the extent at or before `end`; extents
+        // are disjoint and sorted, so the first gap ends the merge.
+        let overlapping: Vec<(u64, u64)> = self
+            .extents
+            .range(..=end)
+            .rev()
+            .take_while(|(at, len)| at.saturating_add(**len) >= start)
+            .map(|(at, len)| (*at, *len))
+            .collect();
+        for (at, len) in overlapping {
+            self.extents.remove(&at);
+            absorbed = absorbed.saturating_add(len);
+            start = start.min(at);
+            end = end.max(at.saturating_add(len));
+        }
+        self.extents.insert(start, end - start);
+        self.bytes = self
+            .bytes
+            .saturating_add((end - start).saturating_sub(absorbed));
+        debug_assert_eq!(
+            self.bytes,
+            self.extents.values().sum::<u64>(),
+            "coverage bytes drifted from the extents"
+        );
+    }
+
+    /// Bytes covered, each counted once.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether coverage spans an object of `length` whole.
+    pub(crate) fn is_complete(&self, length: u64) -> bool {
+        self.bytes == length
+    }
+
+    /// The extents themselves, for accounts seeded from this map.
+    pub(crate) fn extents(&self) -> &BTreeMap<u64, u64> {
+        &self.extents
+    }
+}
+
 /// What a [`SharedPlan`] holds.
 pub(crate) struct FetchPlan {
     pub(crate) summary: PackageSummary,
@@ -75,12 +153,10 @@ pub(crate) struct FetchPlan {
     pub(crate) placed_before: u64,
     /// Where the current object's next range request starts.
     pub(crate) next_offset: u64,
-    /// Settled extents of the current object, coalesced; completion is
-    /// full coverage.
-    pub(crate) covered: BTreeMap<u64, u64>,
-    /// Bytes [`FetchPlan::covered`] spans, each counted once however many
-    /// rails a misbehaving server answers with the same range.
-    pub(crate) covered_bytes: u64,
+    /// Settled extents of the current object; completion is full coverage,
+    /// each byte counted once however many rails a misbehaving server
+    /// answers with the same range.
+    pub(crate) covered: CoverageMap,
     /// Raised by the rail that saw the current object whole and is syncing
     /// it outside this lock, so no second rail syncs or advances over it.
     pub(crate) syncing: bool,
@@ -152,37 +228,8 @@ impl FetchPlan {
     }
 
     /// Books a settled cover into the current object's coverage.
-    ///
-    /// Coalescing counts each byte once, so a duplicate range from another
-    /// rail cannot complete an object that still has a hole.
     pub(crate) fn cover(&mut self, offset: u64, length: u64) {
-        if length == 0 {
-            return;
-        }
-        let Some(mut end) = offset.checked_add(length) else {
-            return;
-        };
-        let mut start = offset;
-        let mut absorbed: u64 = 0;
-        // Walk right to left from the extent at or before `end`; extents
-        // are disjoint and sorted, so the first gap ends the merge.
-        let overlapping: Vec<(u64, u64)> = self
-            .covered
-            .range(..=end)
-            .rev()
-            .take_while(|(at, len)| at.saturating_add(**len) >= start)
-            .map(|(at, len)| (*at, *len))
-            .collect();
-        for (at, len) in overlapping {
-            self.covered.remove(&at);
-            absorbed = absorbed.saturating_add(len);
-            start = start.min(at);
-            end = end.max(at.saturating_add(len));
-        }
-        self.covered.insert(start, end - start);
-        self.covered_bytes = self
-            .covered_bytes
-            .saturating_add((end - start).saturating_sub(absorbed));
+        self.covered.insert(offset, length);
     }
 }
 

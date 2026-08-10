@@ -610,13 +610,13 @@ jobs:
           - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/fetch/protocol.rs" }
           - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f 'crates/vot-cli/src/serve/**'" }
           - { shard: drive, args: "-f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/nowire.rs" }
-          - { shard: wire, args: "-f crates/vot-cli/src/wire.rs" }
+          - { shard: wire, args: "-f crates/vot-cli/src/wire.rs -f 'crates/vot-cli/src/wire/**'" }
           # Command-line globs replace the config file's exclude_globs, so
           # the core shard restates them: main.rs (the binary is untested
           # under wire, its Ok(()) mutants are unkillable by design) and the
           # rendezvous and relay modules the featureless matrix already
           # measures.
-          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e 'crates/vot-cli/src/rendezvous/**' -e crates/vot-cli/src/relay.rs -e 'crates/vot-cli/src/relay/**'" }
+          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e 'crates/vot-cli/src/wire/**' -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e 'crates/vot-cli/src/rendezvous/**' -e crates/vot-cli/src/relay.rs -e 'crates/vot-cli/src/relay/**'" }
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

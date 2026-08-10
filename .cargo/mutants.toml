@@ -49,6 +49,7 @@ exclude_re = ["live::","(windows|unsupported)_rename_noreplace", "NativeOperatio
 exclude_globs = [
   "crates/vot-bench-driver/src/cycles.rs",
   "crates/vot-cli/src/wire.rs",
+  "crates/vot-cli/src/wire/**",
   "crates/vot-transport-quiche/src/live.rs",
   "crates/vot-bench-driver/src/backend_msquic.rs",
   "crates/vot-bench-driver/src/backend_quiche.rs",

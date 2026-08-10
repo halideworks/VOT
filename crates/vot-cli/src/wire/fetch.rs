@@ -2,9 +2,9 @@
 
 use super::{
     BundleFetcher, CONGESTION, Config, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY, FETCH_RAILS,
-    PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, SocketAddr, Transport,
+    PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr, Transport,
     apply_datagram_bytes, carrier_failure, congestion_from, holder_from, limits, local_for, punch,
-    rails_from,
+    rails_from, rendezvous_from, take_slot,
 };
 
 /// Fetches a bundle from `address` into `bundle`.
@@ -66,7 +66,7 @@ where
 
 /// [`fetch_with`] with the first carrier already open, for a caller that
 /// opened one to find out which route works.
-fn fetch_over<F>(
+pub(crate) fn fetch_over<F>(
     primary: Transport,
     connect: F,
     bundle: &Path,
@@ -118,14 +118,23 @@ pub fn fetch_via_rendezvous(
         std::env::var(FETCH_RAILS).ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
     )?;
-    fetch_via_rendezvous_railed(root, bundle, services, rails)
+    // Parsed like the rendezvous it mirrors: a name, resolved to every
+    // address it has.
+    let relays = rendezvous_from(std::env::var(RELAY).ok().as_deref())?;
+    fetch_via_rendezvous_railed(root, bundle, services, &relays, rails)
 }
 
 /// Fetches through a rendezvous at an explicit rail width.
+///
+/// The relay is the ladder's last rung, taken only when every punchable
+/// route refused and one is named. It runs at width one: a slot pairs
+/// exactly two ends, and a wider fetch through a donated path would
+/// multiply the donation.
 pub(crate) fn fetch_via_rendezvous_railed(
     root: [u8; 32],
     bundle: &Path,
     services: &[SocketAddr],
+    relays: &[SocketAddr],
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
@@ -141,9 +150,44 @@ pub(crate) fn fetch_via_rendezvous_railed(
             Err(Error::RendezvousUnpunched)
         }
     };
-    let (primary, service) = first_route(services, &open)?;
-    let connect = || open(service).map(|(carrier, _)| carrier);
-    fetch_over(primary, connect, bundle, Some(root), rails)
+    match first_route(services, &open) {
+        Ok((primary, service)) => {
+            let connect = || open(service).map(|(carrier, _)| carrier);
+            fetch_over(primary, connect, bundle, Some(root), rails)
+        }
+        Err(refused) => {
+            let Some(primary) = relay_route(key, relays, services, &config)? else {
+                return Err(refused);
+            };
+            let connect = || Err(Error::RelayUnavailable);
+            fetch_over(primary, connect, bundle, Some(root), 1)
+        }
+    }
+}
+
+/// Opens a carrier through the first relay that gives a slot and pairs.
+///
+/// Nothing found answers `None`, so the caller reports the punch's own
+/// refusal rather than this rung's: the ladder failed where it failed.
+pub(crate) fn relay_route(
+    key: [u8; 32],
+    relays: &[SocketAddr],
+    services: &[SocketAddr],
+    config: &Config,
+) -> Result<Option<Transport>, Error> {
+    for relay in relays {
+        let Ok(taken) = take_slot(key, *relay, services) else {
+            continue;
+        };
+        let slot = taken.serve;
+        let carrier = Transport::connect_on(taken.socket, slot, Some("localhost"), config)
+            .map_err(carrier_failure)?;
+        if carrier.connected_within(PUNCH_WAIT) {
+            eprintln!("route {slot} relayed");
+            return Ok(Some(carrier));
+        }
+    }
+    Ok(None)
 }
 
 /// Opens a carrier by the first service address that gives one, and

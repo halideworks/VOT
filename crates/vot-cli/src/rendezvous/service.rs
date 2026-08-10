@@ -63,6 +63,22 @@ impl Mappings {
             .flatten()
             .any(|entry| entry.live(now_ms))
     }
+
+    /// A live mapping in `address`'s family, or the other family's:
+    /// delivery is what matters, and any live mapping is a path the serve
+    /// itself keeps open.
+    fn live_preferring(&self, address: SocketAddr, now_ms: u64) -> Option<SocketAddr> {
+        self.live_like(address, now_ms).or_else(|| {
+            let other = match address {
+                SocketAddr::V4(_) => "[::]:0",
+                SocketAddr::V6(_) => "0.0.0.0:0",
+            };
+            other
+                .parse()
+                .ok()
+                .and_then(|other| self.live_like(other, now_ms))
+        })
+    }
 }
 
 /// Service-side pairing table. Time is injected so expiry is testable.
@@ -120,6 +136,19 @@ impl Pairings {
                 Answer {
                     reply: Some(Datagram::Resolved { key, serve }),
                     notify: serve.map(|mapping| (mapping, Datagram::Coming { key, fetch: source })),
+                }
+            }
+            Datagram::Invite { key, at } => {
+                // Passed along for a registered key and dropped otherwise,
+                // with no reply either way: the asker learns nothing, and
+                // the one notify is never larger than the padded request.
+                let serve = self
+                    .registered
+                    .get(&key)
+                    .and_then(|mappings| mappings.live_preferring(source, now_ms));
+                Answer {
+                    reply: None,
+                    notify: serve.map(|mapping| (mapping, Datagram::Invite { key, at })),
                 }
             }
             Datagram::Registered { .. }

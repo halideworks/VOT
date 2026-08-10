@@ -68,7 +68,15 @@ inferred.**
   works where a punch does not: neither end has to accept a packet it did
   not ask for. The fetch takes a slot and the invitation travels to the
   serve by the path the rendezvous service already uses to say a fetch is
-  coming.
+  coming. On the serving end an invitation is exactly a Coming whose
+  address is the relay slot: the same warmings, from the same socket,
+  claim the slot's first end, under the same source check and the same
+  per-cadence budget, so an invitation cannot make a serve a reflector
+  any more than a Coming can. The service passes one invitation to one
+  live mapping and answers the asker nothing, so the invite leg amplifies
+  nothing either. The slot pairs its first two distinct sources in
+  whichever order they arrive, so neither end waits on the other to go
+  first.
 - **A slot is keyed by the rendezvous key, bounded, and short.** The
   relay never learns a root, exactly as the rendezvous service never
   does. A slot carries a TTL and a byte ceiling, and a relay refuses new
@@ -80,6 +88,10 @@ inferred.**
   does today, by name. A deployment may run a relay and a rendezvous
   service on one host, but the rendezvous service does not relay by
   default: pairing costs a datagram and relaying costs a transfer.
+- **The relay rung runs at width one.** A slot pairs exactly two ends,
+  and a wider fetch through a donated path would multiply the donation
+  without adding a path. Rails are for routes this end can open for
+  itself.
 
 ## Consequences
 

@@ -85,6 +85,85 @@ pub(crate) fn punch_within(
     Err(Error::RendezvousUnresolved)
 }
 
+/// Takes a relay slot for `key` and stands at it: the invitation sent
+/// through every service address, this end's warmings claiming the slot's
+/// first end, and the serve's warmings, forwarded by the slot, waited for.
+pub(crate) fn take_slot(
+    key: [u8; 32],
+    relay: SocketAddr,
+    services: &[SocketAddr],
+) -> Result<Punched, Error> {
+    take_slot_within(key, relay, services, RESOLVE_RETRY_WAIT, WARMING_WAIT)
+}
+
+/// [`take_slot`] with its two waits as arguments, so a test spends neither.
+pub(crate) fn take_slot_within(
+    key: [u8; 32],
+    relay: SocketAddr,
+    services: &[SocketAddr],
+    retry: Duration,
+    warming: Duration,
+) -> Result<Punched, Error> {
+    // Bound toward the relay: the slot observes this socket's mapping, and
+    // every datagram of the session has to leave under the same one.
+    let socket =
+        std::net::UdpSocket::bind(local_for(relay)?).map_err(|_| Error::CarrierUnavailable)?;
+    let mut buffer = [0_u8; 128];
+    for _ in 0..RESOLVE_RETRIES {
+        socket
+            .send_to(
+                &crate::relay::encode(&crate::relay::Datagram::Take { key }),
+                relay,
+            )
+            .map_err(|_| Error::CarrierUnavailable)?;
+        if let Some(at) = slot_answered(&socket, &mut buffer, key, relay)? {
+            // The serve is told where to meet before this end warms the
+            // slot, so the floor below waits on both legs at once. A lost
+            // invite costs one loop turn and nothing else: a repeated Take
+            // is answered with the slot the key already holds.
+            let invite =
+                crate::rendezvous::encode(&crate::rendezvous::Datagram::Invite { key, at });
+            for service in services {
+                let _ = socket.send_to(&invite, *service);
+            }
+            open_toward(&socket, at);
+            wait_warm(&socket, &mut buffer, at, warming)?;
+            return Ok(Punched { socket, serve: at });
+        }
+        std::thread::sleep(retry);
+    }
+    Err(Error::RelayUnavailable)
+}
+
+/// Reads until `relay` answers a slot for `key`, the way [`resolved`]
+/// reads a serve: only the relay that was asked is heard, for the same
+/// reason only the service that was asked is.
+///
+/// A relay with no slot to give answers `Slot { at: None }`; that is a
+/// retry, because a TTL may free one, and the retry loop is what bounds it.
+fn slot_answered(
+    socket: &std::net::UdpSocket,
+    buffer: &mut [u8; 128],
+    key: [u8; 32],
+    relay: SocketAddr,
+) -> Result<Option<SocketAddr>, Error> {
+    read_until(
+        socket,
+        buffer,
+        RESOLVE_TIMEOUT,
+        crate::relay::decode,
+        |datagram, source| {
+            if !crate::side_channel::address::from_service(source, relay) {
+                return None;
+            }
+            match datagram {
+                crate::relay::Datagram::Slot { key: answered, at } if answered == key => at,
+                _ => None,
+            }
+        },
+    )
+}
+
 /// Sends this end's own warming toward the serve, before waiting for the
 /// serve's.
 ///
@@ -108,11 +187,12 @@ fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
 /// The budget is the whole wait and not the wait per read. A stranger
 /// sending to this port would otherwise buy back the full timeout with
 /// every datagram, so the read count alone does not bound the wall clock.
-pub(crate) fn read_until<T>(
+pub(crate) fn read_until<D, T>(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8; 128],
     budget: Duration,
-    mut accept: impl FnMut(crate::rendezvous::Datagram, SocketAddr) -> Option<T>,
+    decode: impl Fn(&[u8]) -> Option<D>,
+    mut accept: impl FnMut(D, SocketAddr) -> Option<T>,
 ) -> Result<Option<T>, Error> {
     let began = std::time::Instant::now();
     for _ in 0..STRAY_READS {
@@ -129,7 +209,7 @@ pub(crate) fn read_until<T>(
             Ok(arrival) => arrival,
             Err(error) => return read_failure(&error).map_or(Ok(None), Err),
         };
-        if let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) {
+        if let Some(datagram) = decode(&buffer[..length]) {
             if let Some(found) = accept(datagram, source) {
                 return Ok(Some(found));
             }
@@ -157,18 +237,24 @@ pub(crate) fn resolved(
     key: [u8; 32],
     service: SocketAddr,
 ) -> Result<Option<SocketAddr>, Error> {
-    let found = read_until(socket, buffer, RESOLVE_TIMEOUT, |datagram, source| {
-        if !crate::side_channel::address::from_service(source, service) {
-            return None;
-        }
-        match datagram {
-            crate::rendezvous::Datagram::Resolved {
-                key: answered,
-                serve,
-            } if answered == key => Some(serve),
-            _ => None,
-        }
-    })?;
+    let found = read_until(
+        socket,
+        buffer,
+        RESOLVE_TIMEOUT,
+        crate::rendezvous::decode,
+        |datagram, source| {
+            if !crate::side_channel::address::from_service(source, service) {
+                return None;
+            }
+            match datagram {
+                crate::rendezvous::Datagram::Resolved {
+                    key: answered,
+                    serve,
+                } if answered == key => Some(serve),
+                _ => None,
+            }
+        },
+    )?;
     Ok(found.flatten())
 }
 
@@ -193,11 +279,17 @@ pub(crate) fn wait_warm(
     serve: SocketAddr,
     wait: Duration,
 ) -> Result<(), Error> {
-    read_until(socket, buffer, wait, |datagram, source| {
-        (datagram == crate::rendezvous::Datagram::Warming
-            && crate::side_channel::address::canonical(source).ip()
-                == crate::side_channel::address::canonical(serve).ip())
-        .then_some(())
-    })?;
+    read_until(
+        socket,
+        buffer,
+        wait,
+        crate::rendezvous::decode,
+        |datagram, source| {
+            (datagram == crate::rendezvous::Datagram::Warming
+                && crate::side_channel::address::canonical(source).ip()
+                    == crate::side_channel::address::canonical(serve).ip())
+            .then_some(())
+        },
+    )?;
     Ok(())
 }

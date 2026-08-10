@@ -96,6 +96,8 @@ pub enum Error {
     /// produces. A literal address still reaches a serve that forwards a
     /// port.
     RendezvousUnpunched,
+    /// The named relay answered no slot: full, unreachable, or refusing.
+    RelayUnavailable,
     /// A fetch at an address that named no package root.
     ///
     /// The channel is not authenticated, so the root is the only thing that

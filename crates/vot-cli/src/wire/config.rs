@@ -180,6 +180,11 @@ pub(crate) fn relay_limits_from(
 /// Rendezvous service address. Unset means no registration.
 pub(crate) const RENDEZVOUS: &str = "VOT_RENDEZVOUS";
 
+/// Relay address, named the way [`RENDEZVOUS`] names a service and parsed
+/// by the same [`rendezvous_from`]. Unset means the ladder ends at the
+/// punch, by name, as it did before relays existed.
+pub(crate) const RELAY: &str = "VOT_RELAY";
+
 /// Every address the service [`RENDEZVOUS`] names, or none when it is
 /// unset.
 ///

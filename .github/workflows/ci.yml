@@ -590,7 +590,9 @@ jobs:
   wire-mutation:
     name: wire-mutation
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Sized for a diff that spans the crate, which a module-split PR is: the
+    # in-diff run then approximates the full sweep.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -641,7 +643,8 @@ jobs:
   mutation:
     name: mutation (${{ matrix.package }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Sized for a diff that spans a whole package, which a module-split PR is.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

@@ -39,6 +39,11 @@ pub(crate) enum Datagram {
     /// nothing; arriving is its whole job, and the fetch's router or
     /// socket sheds it.
     Warming,
+    /// A fetch that took a relay slot, asking the service to pass the
+    /// slot's address to the serve. Travels both legs in this one shape:
+    /// fetch to service as a padded request, service to serve as the
+    /// notify, which is never larger than the request that earned it.
+    Invite { key: [u8; 32], at: SocketAddr },
 }
 
 /// Encodes one datagram.
@@ -70,6 +75,14 @@ pub(crate) fn encode(datagram: &Datagram) -> Vec<u8> {
             push_address(&mut wire, Some(*fetch));
         }
         Datagram::Warming => wire.push(6),
+        Datagram::Invite { key, at } => {
+            wire.push(7);
+            wire.extend_from_slice(key);
+            push_address(&mut wire, Some(*at));
+            // Padded to the fixed request size, so the notify leg cannot
+            // exceed the request leg and the service amplifies nothing.
+            wire.resize(REQUEST_BYTES, 0);
+        }
     }
     wire
 }
@@ -116,6 +129,36 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram> {
             })
         }
         (6, 0) => Some(Datagram::Warming),
+        (7, _) => {
+            if rest.len() != REQUEST_BYTES - 3 {
+                return None;
+            }
+            let (key, slot) = rest.split_at_checked(32)?;
+            let at = pull_padded_address(slot)?;
+            Some(Datagram::Invite {
+                key: key.try_into().ok()?,
+                at,
+            })
+        }
         _ => None,
     }
+}
+
+/// An address slot followed by padding held to zero, as [`Datagram::Invite`]
+/// carries it: padding that carried bytes would be a covert channel through
+/// the service.
+fn pull_padded_address(bytes: &[u8]) -> Option<SocketAddr> {
+    let held = match bytes.first()? {
+        4 => 7,
+        6 => 19,
+        _ => return None,
+    };
+    let (address, padding) = bytes.split_at_checked(held)?;
+    if padding.iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let AddressSlot::Held(at) = pull_address(address) else {
+        return None;
+    };
+    Some(at)
 }

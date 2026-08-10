@@ -100,10 +100,16 @@ impl Registrar {
         // A serve bound dual-stack reads a loopback service as
         // `::ffff:127.0.0.1`, which `warmable` would not know is near.
         let source = canonical(source);
-        let Datagram::Coming { key, fetch } = datagram else {
-            return;
+        // An invitation is a Coming whose address is the relay slot: the
+        // same warmings, from the same socket, claim the slot's first end.
+        // One guard and one budget, so neither shape can make this serve
+        // a reflector toward an address the service never observed.
+        let fetch = match datagram {
+            Datagram::Coming { key, fetch } if key == self.key => fetch,
+            Datagram::Invite { key, at } if key == self.key => at,
+            _ => return,
         };
-        if key != self.key || !warmable(fetch, source) {
+        if !warmable(fetch, source) {
             return;
         }
         let room = WARMINGS_PER_CADENCE.saturating_sub(self.warmed);

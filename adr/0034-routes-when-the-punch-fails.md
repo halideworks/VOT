@@ -68,7 +68,15 @@ inferred.**
   works where a punch does not: neither end has to accept a packet it did
   not ask for. The fetch takes a slot and the invitation travels to the
   serve by the path the rendezvous service already uses to say a fetch is
-  coming.
+  coming. On the serving end an invitation is exactly a Coming whose
+  address is the relay slot: the same warmings, from the same socket,
+  claim the slot's first end, under the same source check and the same
+  per-cadence budget, so an invitation cannot make a serve a reflector
+  any more than a Coming can. The service passes one invitation to one
+  live mapping and answers the asker nothing, so the invite leg amplifies
+  nothing either. The slot pairs its first two distinct sources in
+  whichever order they arrive, so neither end waits on the other to go
+  first.
 - **A slot is keyed by the rendezvous key, bounded, and short.** The
   relay never learns a root, exactly as the rendezvous service never
   does. A slot carries a TTL and a byte ceiling, and a relay refuses new
@@ -80,6 +88,10 @@ inferred.**
   does today, by name. A deployment may run a relay and a rendezvous
   service on one host, but the rendezvous service does not relay by
   default: pairing costs a datagram and relaying costs a transfer.
+- **The relay rung runs at width one.** A slot pairs exactly two ends,
+  and a wider fetch through a donated path would multiply the donation
+  without adding a path. Rails are for routes this end can open for
+  itself.
 
 ## Consequences
 
@@ -105,6 +117,8 @@ inferred.**
 
 ## Sequence
 
+All four steps are done.
+
 1. One mapping per family per key, and the ordered ladder without a
    relay: `VOT_RENDEZVOUS` names a service by every address it has,
    a serve registers at each, a resolve is answered in the family it
@@ -113,6 +127,10 @@ inferred.**
 2. The relay protocol and the `vot relay` verb: slot allocation keyed by
    the rendezvous key, forwarding, the TTL and byte ceilings, loopback
    tests, and the bounds held by construction rather than by policy.
-3. Fetch and serve take a relay as the last rung when one is named.
-4. Validation on a network that cannot punch, which is the measured
-   symmetric NAT of step 4, end to end and logged.
+3. Fetch and serve take a relay as the last rung when one is named. The
+   invitation is one new rendezvous datagram, and on the serving end it
+   is handled as a Coming whose address is the slot.
+4. Validated on the NAT lab's full matrix with `--relay`
+   (`docs/nat-lab.md`): all sixteen topologies fetch, including the nine
+   the punch cannot serve, each reporting `route ... relayed`. The
+   punchable rows kept their routes and their times.

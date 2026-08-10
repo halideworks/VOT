@@ -817,7 +817,14 @@ mod tests {
         });
         let mut buffer = [0_u8; 128];
         let began = std::time::Instant::now();
-        let found = read_until(&rail, &mut buffer, budget, |_, _| None::<()>).expect("a read");
+        let found = read_until(
+            &rail,
+            &mut buffer,
+            budget,
+            crate::rendezvous::decode,
+            |_, _| None::<()>,
+        )
+        .expect("a read");
         let spent = began.elapsed();
         done.store(true, Ordering::Relaxed);
         straying.join().expect("the stranger");
@@ -856,6 +863,66 @@ mod tests {
         service.send_to(&answer, at).expect("the real answer");
         assert_eq!(
             resolved(&rail, &mut buffer, [7; 32], service_at).expect("a read"),
+            Some(steered)
+        );
+    }
+
+    #[test]
+    fn only_the_relay_that_was_asked_names_a_slot_and_only_for_the_key() {
+        use crate::relay::{Datagram, encode};
+
+        let taker = UdpSocket::bind("127.0.0.1:0").expect("a taker socket");
+        let at = taker.local_addr().expect("the taker address");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("a relay socket");
+        let relay_at = relay.local_addr().expect("the relay address");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("a stranger's socket");
+        let steered = "203.0.113.9:443".parse().expect("an address to be sent to");
+        let mut buffer = [0_u8; 128];
+
+        // The right shape from the wrong host, then the wrong key from the
+        // right host: neither may steer the fetch to a slot.
+        let forged = encode(&Datagram::Slot {
+            key: [7; 32],
+            at: Some(steered),
+        });
+        stranger.send_to(&forged, at).expect("a forged slot");
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [8; 32],
+                    at: Some(steered),
+                }),
+                at,
+            )
+            .expect("another key's slot");
+        assert_eq!(
+            slot_answered(&taker, &mut buffer, [7; 32], relay_at).expect("a read"),
+            None,
+            "a slot nobody asked this relay for steered the fetch"
+        );
+
+        // The right key from the relay that was asked is taken, and a
+        // relay with nothing to give is a retry, not an answer.
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [7; 32],
+                    at: None,
+                }),
+                at,
+            )
+            .expect("a full relay");
+        relay
+            .send_to(
+                &encode(&Datagram::Slot {
+                    key: [7; 32],
+                    at: Some(steered),
+                }),
+                at,
+            )
+            .expect("the real slot");
+        assert_eq!(
+            slot_answered(&taker, &mut buffer, [7; 32], relay_at).expect("a read"),
             Some(steered)
         );
     }
@@ -1414,7 +1481,7 @@ mod tests {
 
         // Fetch via rendezvous: resolve root -> connect -> transfer.
         let fetched = crate::tests::temporary("rendezvous-wire-fetched");
-        let package = fetch_via_rendezvous_railed(built.root, &fetched, &[service], RAILS)
+        let package = fetch_via_rendezvous_railed(built.root, &fetched, &[service], &[], RAILS)
             .expect("a fetch via rendezvous");
         assert_eq!(package, built);
 
@@ -1430,6 +1497,135 @@ mod tests {
             RAILS,
             "every rail announced its own socket at the service"
         );
+        crate::harness::discard(&[&source, &bundle, &fetched]);
+    }
+
+    #[test]
+    fn a_fetch_with_no_route_left_crosses_a_relay_slot() {
+        // ADR-0034 step 3 on loopback: the fetch takes a slot, the
+        // invitation travels through the service, the serve warms the slot
+        // it was told about, and the whole session crosses the relay with
+        // neither end accepting a packet it did not ask for. The rung is
+        // entered by hand because a loopback punch would succeed and the
+        // ladder would rightly never get here.
+        const SERVICE_READS: usize = 400;
+        // The relay's control budget covers the fetch's whole retry bound
+        // plus the releases at the end: a retried Take under suite load is
+        // answered with the held slot, but it still spends the budget, and
+        // a budget of two once stopped the relay mid-transfer here.
+        const CONTROL_DATAGRAMS: u64 = 8;
+
+        let source = crate::tests::temporary("relay-rung-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.bin"), vec![0x3c; 200_000]).unwrap();
+        let bundle = crate::tests::temporary("relay-rung-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        // The real pairing policy, forwarding invitations like everything else.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a service socket");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("a bounded wait");
+        let service = socket.local_addr().expect("the service address");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let service_thread = std::thread::spawn(move || {
+            let mut pairings = crate::rendezvous::Pairings::default();
+            let began = std::time::Instant::now();
+            let mut buffer = [0_u8; 128];
+            for _ in 0..SERVICE_READS {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok((length, from)) = socket.recv_from(&mut buffer) else {
+                    continue;
+                };
+                let Some(datagram) = crate::rendezvous::decode(&buffer[..length]) else {
+                    continue;
+                };
+                let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let answer = pairings.take(datagram, from, now_ms);
+                if let Some(reply) = answer.reply {
+                    let _ = socket.send_to(&crate::rendezvous::encode(&reply), from);
+                }
+                if let Some((mapping, notice)) = answer.notify {
+                    let _ = socket.send_to(&crate::rendezvous::encode(&notice), mapping);
+                }
+            }
+        });
+
+        let (listening, address) = mpsc::channel();
+        let relaying = std::thread::spawn(move || {
+            relay_service(
+                "127.0.0.1:0".parse().unwrap(),
+                Some(CONTROL_DATAGRAMS),
+                |at| {
+                    let _ = listening.send(at);
+                },
+            )
+        });
+        let relay = address.recv().expect("the relay reported its address");
+
+        // A serve with rendezvous registration and nothing else: it learns
+        // the slot only from the invitation.
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.side_channel_lead = Some(crate::rendezvous::MAGIC);
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let side = listener.take_side_channel().expect("a side channel");
+        let registration =
+            Registration::begin(side, built.root, &[service]).expect("a registration");
+
+        let opened = BundleServer::open(&bundle).unwrap();
+        let serving = std::thread::spawn(move || {
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = listener.accept().map_err(carrier_failure)?;
+                ServeSession::begin(&opened, carrier, serve_stance(None)?)
+            })
+            .unwrap();
+            opened.package()
+        });
+
+        let client = client_config().unwrap();
+        let key = crate::rendezvous::key_of(&built.root);
+        let carrier = relay_route(key, &[relay], &[service], &client)
+            .expect("the rung ran")
+            .expect("a relayed carrier");
+        let fetched = crate::tests::temporary("relay-rung-fetched");
+        let package = fetch_over(
+            carrier,
+            || Err(Error::RelayUnavailable),
+            &fetched,
+            Some(built.root),
+            1,
+        )
+        .expect("a fetch through the slot");
+        assert_eq!(package, built);
+
+        drop(registration);
+        let served = serving.join().expect("the serving thread");
+        assert_eq!(served, built);
+        stop.store(true, Ordering::Relaxed);
+        service_thread.join().expect("the service thread");
+        // Whatever the fetch left of the budget, the releases spend: one
+        // key, so the first opens a slot and the rest re-answer it.
+        let release = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        for _ in 0..CONTROL_DATAGRAMS {
+            let _ = release.send_to(
+                &crate::relay::encode(&crate::relay::Datagram::Take { key: [1; 32] }),
+                relay,
+            );
+        }
+        relaying
+            .join()
+            .expect("the relay thread")
+            .expect("a clean relay stop");
         crate::harness::discard(&[&source, &bundle, &fetched]);
     }
 

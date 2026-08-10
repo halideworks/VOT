@@ -52,6 +52,14 @@ mod tests {
                 fetch: v4("192.0.2.2:5000"),
             },
             Datagram::Warming,
+            Datagram::Invite {
+                key,
+                at: v4("192.0.2.3:7000"),
+            },
+            Datagram::Invite {
+                key,
+                at: "[2001:db8::3]:7000".parse().expect("an address"),
+            },
         ];
         for datagram in cases {
             let wire = encode(&datagram);
@@ -83,6 +91,28 @@ mod tests {
             coming_widest, register,
             "the notification is exactly the registration that earned it"
         );
+        for at in [v4("192.0.2.3:7000"), "[2001:db8::3]:7000".parse().unwrap()] {
+            assert_eq!(
+                encode(&Datagram::Invite { key, at }).len(),
+                REQUEST_BYTES,
+                "an invite is one fixed-size request in either family"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invite_sheds_padding_that_carries_bytes() {
+        let key = [7; 32];
+        let at = v4("192.0.2.3:7000");
+        let mut dirty = encode(&Datagram::Invite { key, at });
+        *dirty.last_mut().expect("padding exists") = 1;
+        assert_eq!(decode(&dirty), None, "padding that carries bytes");
+        let mut short = encode(&Datagram::Invite { key, at });
+        short.pop();
+        assert_eq!(decode(&short), None, "a truncated invite");
+        let mut wrong = encode(&Datagram::Invite { key, at });
+        wrong[35] = 9;
+        assert_eq!(decode(&wrong), None, "a family that is not one");
     }
 
     #[test]
@@ -365,6 +395,93 @@ mod tests {
                 "{datagram:?} from {source} earned a warming"
             );
         }
+    }
+
+    #[test]
+    fn an_invite_earns_the_slot_the_warmings_a_coming_earns_a_fetch() {
+        // The same guard and the same budget: an invitation is a Coming
+        // whose address is the relay slot, so warming the slot claims its
+        // first end and nothing the service never observed gets warmed.
+        let service = v4("198.51.100.7:9000");
+        let slot = v4("192.0.2.44:7001");
+        let root = [9; 32];
+        let mut registrar = Registrar::new(&root, &[service]);
+        let key = key_of(&root);
+        registrar.due(0);
+
+        registrar.take(Datagram::Invite { key, at: slot }, service);
+        for pass in 0..WARMING_DATAGRAMS {
+            assert_eq!(
+                registrar.due(0),
+                vec![(slot, Datagram::Warming)],
+                "pass {pass} owes the slot exactly one warming"
+            );
+        }
+        assert_eq!(registrar.due(0), Vec::new(), "and no more than it owes");
+
+        let refused = [
+            (Datagram::Invite { key, at: slot }, slot),
+            (
+                Datagram::Invite {
+                    key: [0xAB; 32],
+                    at: slot,
+                },
+                service,
+            ),
+            (
+                Datagram::Invite {
+                    key,
+                    at: v4("0.0.0.0:7001"),
+                },
+                service,
+            ),
+        ];
+        for (datagram, source) in refused {
+            registrar.take(datagram, source);
+            assert_eq!(
+                registrar.due(0),
+                Vec::new(),
+                "{datagram:?} from {source} earned a warming"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invite_is_passed_to_a_live_mapping_and_answers_nobody() {
+        let mut pairings = Pairings::default();
+        let key = [7; 32];
+        let slot = v4("192.0.2.44:7001");
+        let asker = v4("203.0.113.9:60123");
+
+        let unknown = pairings.take(Datagram::Invite { key, at: slot }, asker, 0);
+        assert_eq!(unknown, Answer::default(), "an unregistered key is silence");
+
+        let serve = v4("198.51.100.20:4433");
+        pairings.take(Datagram::Register { key }, serve, 0);
+        let passed = pairings.take(Datagram::Invite { key, at: slot }, asker, 0);
+        assert_eq!(passed.reply, None, "the asker learns nothing either way");
+        assert_eq!(
+            passed.notify,
+            Some((serve, Datagram::Invite { key, at: slot })),
+            "the slot travels to the serve's mapping verbatim"
+        );
+
+        // The asker's family has no mapping: the other family's live one
+        // still gets the invite, since any live mapping is a delivery path.
+        let over_v6: SocketAddr = "[2001:db8::9]:60123".parse().expect("an address");
+        let routed = pairings.take(Datagram::Invite { key, at: slot }, over_v6, 0);
+        assert_eq!(
+            routed.notify,
+            Some((serve, Datagram::Invite { key, at: slot })),
+            "a v6 asker still reaches a v4-registered serve"
+        );
+
+        let expired = pairings.take(
+            Datagram::Invite { key, at: slot },
+            asker,
+            REGISTRATION_TTL_MS,
+        );
+        assert_eq!(expired, Answer::default(), "an expired mapping is silence");
     }
 
     #[test]

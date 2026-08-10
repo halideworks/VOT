@@ -323,14 +323,42 @@ fn rendezvous_service_addresses() -> Result<Vec<std::net::SocketAddr>, vot_cli::
     vot_cli::parse_rendezvous(&named)
 }
 
+/// What the address position named: somewhere to fetch from, or a root that
+/// pins itself and is resolved through the rendezvous services.
+enum Target {
+    Address(std::net::SocketAddr),
+    Root([u8; 32]),
+}
+
+fn parse_target(target: &str) -> Result<Target, vot_cli::Error> {
+    if let Ok(address) = target.parse() {
+        return Ok(Target::Address(address));
+    }
+    Ok(Target::Root(vot_cli::parse_package_root(target)?))
+}
+
+/// One fetch for both commands. An address takes the existing pin policy; a
+/// root pins itself and needs the configured rendezvous services.
+fn fetch_target(
+    target: &str,
+    bundle: &str,
+    explicit_pin: Option<&str>,
+) -> Result<vot_cli::PackageSummary, vot_cli::Error> {
+    match parse_target(target)? {
+        Target::Address(address) => vot_cli::fetch_bundle(
+            address,
+            Path::new(bundle),
+            vot_cli::address_pin(explicit_pin)?,
+        ),
+        Target::Root(root) => {
+            let services = rendezvous_service_addresses()?;
+            vot_cli::fetch_via_rendezvous(root, Path::new(bundle), &services)
+        }
+    }
+}
+
 fn fetch(target: &str, bundle: &str, root: Option<&str>) -> Result<(), vot_cli::Error> {
-    let package = if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)
-    } else {
-        let parsed_root = vot_cli::parse_package_root(target)?;
-        let services = rendezvous_service_addresses()?;
-        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), &services)
-    }?;
+    let package = fetch_target(target, bundle, root)?;
     println!(
         "{} {} FETCHED",
         root_hex(&package.root),
@@ -351,13 +379,7 @@ fn pull(
 ) -> Result<(), vot_cli::Error> {
     // The key is loaded before a byte crosses the wire.
     let key = vot_cli::load_key_spec(key)?;
-    if let Ok(address) = target.parse::<std::net::SocketAddr>() {
-        vot_cli::fetch_bundle(address, Path::new(bundle), vot_cli::address_pin(root)?)?;
-    } else {
-        let parsed_root = vot_cli::parse_package_root(target)?;
-        let services = rendezvous_service_addresses()?;
-        vot_cli::fetch_via_rendezvous(parsed_root, Path::new(bundle), &services)?;
-    }
+    fetch_target(target, bundle, root)?;
     let report = vot_cli::receive_bundle(
         Path::new(bundle),
         Path::new(destination),

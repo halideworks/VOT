@@ -295,15 +295,16 @@ impl Measurement {
 /// Escapes the note string for JSON. Notes are driver-authored and contain no
 /// control characters, but escaping is cheaper than trusting that.
 fn escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            '"' => vec!['\\', '"'],
-            '\\' => vec!['\\', '\\'],
-            control if control.is_control() => vec![' '],
-            other => vec![other],
-        })
-        .collect()
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            control if control.is_control() => escaped.push(' '),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Deterministic object bytes for a seed. Generated one record at a time
@@ -2900,6 +2901,9 @@ mod tests {
         assert_eq!(escape("a\"b"), "a\\\"b");
         assert_eq!(escape("a\\b"), "a\\\\b");
         assert_eq!(escape("a\nb"), "a b");
+        assert_eq!(escape("a\tb\u{7f}c"), "a b c");
+        assert_eq!(escape("naïve €42 \u{1F600}"), "naïve €42 \u{1F600}");
+        assert_eq!(escape(""), "");
     }
 
     /// The complete set of variables the runner sets, as strings.

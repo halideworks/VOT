@@ -118,6 +118,11 @@ impl OutboundQueue {
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Answers still queued.
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 /// Request identities this session remembers, FIFO at a fixed bound.
@@ -224,7 +229,15 @@ impl ServeConnection {
         while let Some(outbound) = self.outbound.front() {
             match outbound.send(session) {
                 Ok(()) => {
+                    // The loop's progress depends on the front leaving here:
+                    // were it kept, a taken answer would be sent forever.
+                    let held = self.outbound.len();
                     self.outbound.pop_sent();
+                    debug_assert_eq!(
+                        self.outbound.len(),
+                        held - 1,
+                        "a sent answer must leave the queue"
+                    );
                     // Progress even under a stalled budget.
                     self.handed_over = self.handed_over.saturating_add(1);
                 }

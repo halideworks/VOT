@@ -111,7 +111,7 @@ impl BundleServer {
             if let Err(fault) = self.pump_manifest(connection) {
                 return fail(fault, session, connection);
             }
-            if connection.pending_bytes >= connection.budget {
+            if connection.outbound.bytes() >= connection.budget {
                 break;
             }
             match session.poll() {
@@ -222,7 +222,7 @@ impl BundleServer {
     /// Queues owed manifest pages while the outbound budget lasts.
     pub(crate) fn pump_manifest(&self, connection: &mut ServeConnection) -> Result<(), Fault> {
         while let Some((next, end)) = connection.manifest_cursor {
-            if connection.pending_bytes >= connection.budget {
+            if connection.outbound.bytes() >= connection.budget {
                 break;
             }
             let bytes = crate::read_bounded_file(

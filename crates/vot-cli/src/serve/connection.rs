@@ -15,9 +15,8 @@ pub(crate) const REMEMBERED_REQUESTS: usize = 64;
 /// Per-session serving state, fresh for every accepted carrier.
 pub struct ServeConnection {
     pub(crate) announced: bool,
-    pub(crate) remembered: VecDeque<Remembered>,
-    pub(crate) pending: VecDeque<Outbound>,
-    pub(crate) pending_bytes: u64,
+    pub(crate) replay: ReplayWindow,
+    pub(crate) outbound: OutboundQueue,
     /// Owed manifest pages as `(next, end)`. Paced rather than queued at once;
     /// a request may name thousands of pages.
     pub(crate) manifest_cursor: Option<(u64, u64)>,
@@ -33,9 +32,8 @@ impl Default for ServeConnection {
     fn default() -> Self {
         Self {
             announced: false,
-            remembered: VecDeque::new(),
-            pending: VecDeque::new(),
-            pending_bytes: 0,
+            replay: ReplayWindow::default(),
+            outbound: OutboundQueue::default(),
             manifest_cursor: None,
             budget: OUTBOUND_BUDGET_BYTES,
             closed: None,
@@ -56,34 +54,87 @@ pub(crate) enum Outbound {
     Record(Payload),
 }
 
-impl ServeConnection {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+impl Outbound {
+    /// The answer's bytes, whichever lane carries it.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Control(frame) => frame.len(),
+            Self::Record(record) => record.len(),
+        }
     }
 
-    /// Answer bytes queued but not yet accepted by the carrier.
-    #[must_use]
-    pub fn pending_answer_bytes(&self) -> u64 {
-        self.pending_bytes
+    /// Hands the answer to its lane: control frames as control, records
+    /// shared on the record lane.
+    pub(crate) fn send<A: TransportAdapter>(
+        &self,
+        session: &mut Session<A>,
+    ) -> Result<(), vot_session::Error> {
+        match self {
+            Self::Control(frame) => session.send_control(frame),
+            Self::Record(record) => session.send_reliable_shared(RECORD_LANE, record.clone()),
+        }
+    }
+}
+
+/// The queued answers and the bytes they hold, kept exactly together.
+#[derive(Default)]
+pub(crate) struct OutboundQueue {
+    queue: VecDeque<Outbound>,
+    bytes: u64,
+}
+
+impl OutboundQueue {
+    pub(crate) fn push(&mut self, outbound: Outbound) {
+        self.bytes = self.bytes.saturating_add(outbound.len() as u64);
+        self.queue.push_back(outbound);
+        debug_assert_eq!(
+            self.bytes,
+            self.queue.iter().map(|held| held.len() as u64).sum::<u64>(),
+            "outbound bytes drifted from the queue"
+        );
     }
 
-    /// Whether answers are still owed: queued frames or unpaged manifest pages.
-    #[must_use]
-    pub fn has_backlog(&self) -> bool {
-        !self.pending.is_empty() || self.manifest_cursor.is_some()
+    pub(crate) fn front(&self) -> Option<&Outbound> {
+        self.queue.front()
     }
 
-    /// Records the close and drops pending answers.
-    pub(crate) fn close_with(&mut self, code: u16) {
-        self.closed = Some(code);
-        self.pending.clear();
-        self.pending_bytes = 0;
-        self.manifest_cursor = None;
+    /// Retires the front answer once the carrier took it.
+    pub(crate) fn pop_sent(&mut self) {
+        if let Some(sent) = self.queue.pop_front() {
+            self.bytes = self.bytes.saturating_sub(sent.len() as u64);
+        }
+        debug_assert_eq!(
+            self.bytes,
+            self.queue.iter().map(|held| held.len() as u64).sum::<u64>(),
+            "outbound bytes drifted from the queue"
+        );
     }
 
+    /// Answer bytes queued and not yet taken.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Answers still queued.
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// Request identities this session remembers, FIFO at a fixed bound.
+#[derive(Default)]
+pub(crate) struct ReplayWindow {
+    remembered: VecDeque<Remembered>,
+}
+
+impl ReplayWindow {
     /// Admits a request as new or an exact replay, which is re-answered.
-    pub(crate) fn admit_request(
+    /// The same identity over different bytes is the replay that is refused.
+    pub(crate) fn admit(
         &mut self,
         frame_type: u64,
         request_id: [u8; 16],
@@ -111,6 +162,42 @@ impl ServeConnection {
         });
         Ok(())
     }
+}
+
+impl ServeConnection {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer bytes queued but not yet accepted by the carrier.
+    #[must_use]
+    pub fn pending_answer_bytes(&self) -> u64 {
+        self.outbound.bytes()
+    }
+
+    /// Whether answers are still owed: queued frames or unpaged manifest pages.
+    #[must_use]
+    pub fn has_backlog(&self) -> bool {
+        !self.outbound.is_empty() || self.manifest_cursor.is_some()
+    }
+
+    /// Records the close and drops pending answers.
+    pub(crate) fn close_with(&mut self, code: u16) {
+        self.closed = Some(code);
+        self.outbound = OutboundQueue::default();
+        self.manifest_cursor = None;
+    }
+
+    /// Admits a request as new or an exact replay, which is re-answered.
+    pub(crate) fn admit_request(
+        &mut self,
+        frame_type: u64,
+        request_id: [u8; 16],
+        bytes: &[u8],
+    ) -> Result<(), Fault> {
+        self.replay.admit(frame_type, request_id, bytes)
+    }
 
     /// Queued plus handed-over answers, only ever increasing. Both are needed:
     /// the outbound budget can stall queuing while the carrier still drains,
@@ -120,16 +207,18 @@ impl ServeConnection {
         self.progress.saturating_add(self.handed_over)
     }
 
-    pub(crate) fn queue_control(&mut self, frame: Payload) {
+    /// One booked answer, whichever lane: progress and bytes move together.
+    fn queue(&mut self, outbound: Outbound) {
         self.progress = self.progress.saturating_add(1);
-        self.pending_bytes = self.pending_bytes.saturating_add(frame.len() as u64);
-        self.pending.push_back(Outbound::Control(frame));
+        self.outbound.push(outbound);
+    }
+
+    pub(crate) fn queue_control(&mut self, frame: Payload) {
+        self.queue(Outbound::Control(frame));
     }
 
     pub(crate) fn queue_record(&mut self, record: Payload) {
-        self.progress = self.progress.saturating_add(1);
-        self.pending_bytes = self.pending_bytes.saturating_add(record.len() as u64);
-        self.pending.push_back(Outbound::Record(record));
+        self.queue(Outbound::Record(record));
     }
 
     /// Hands queued answers to the session until the carrier refuses one.
@@ -137,22 +226,18 @@ impl ServeConnection {
         &mut self,
         session: &mut Session<A>,
     ) -> Result<(), Error> {
-        while let Some(outbound) = self.pending.front() {
-            let result = match outbound {
-                Outbound::Control(frame) => session.send_control(frame),
-                Outbound::Record(record) => {
-                    session.send_reliable_shared(RECORD_LANE, record.clone())
-                }
-            };
-            match result {
+        while let Some(outbound) = self.outbound.front() {
+            match outbound.send(session) {
                 Ok(()) => {
-                    if let Some(sent) = self.pending.pop_front() {
-                        let bytes = match sent {
-                            Outbound::Control(frame) => frame.len(),
-                            Outbound::Record(record) => record.len(),
-                        };
-                        self.pending_bytes = self.pending_bytes.saturating_sub(bytes as u64);
-                    }
+                    // The loop's progress depends on the front leaving here:
+                    // were it kept, a taken answer would be sent forever.
+                    let held = self.outbound.len();
+                    self.outbound.pop_sent();
+                    debug_assert_eq!(
+                        self.outbound.len(),
+                        held - 1,
+                        "a sent answer must leave the queue"
+                    );
                     // Progress even under a stalled budget.
                     self.handed_over = self.handed_over.saturating_add(1);
                 }

@@ -288,7 +288,7 @@ mod tests {
 
         let output = temporary("striped-fetched");
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        primary.window_bytes = MAX_REQUESTED_RANGE;
+        primary.rail.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         let mut secondary =
             BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
@@ -303,7 +303,7 @@ mod tests {
                 &mut secondary,
                 &mut seq2,
             );
-            if secondary.taken_bytes > 0 {
+            if secondary.rail.taken_bytes > 0 {
                 break;
             }
         }
@@ -329,8 +329,8 @@ mod tests {
             }
         }
         assert!(settled, "the rails never finished the fetch");
-        assert_eq!(primary.taken_bytes, MAX_REQUESTED_RANGE);
-        assert_eq!(secondary.taken_bytes, MAX_REQUESTED_RANGE);
+        assert_eq!(primary.rail.taken_bytes, MAX_REQUESTED_RANGE);
+        assert_eq!(secondary.rail.taken_bytes, MAX_REQUESTED_RANGE);
         assert!(!primary.has_backlog());
         assert!(!secondary.has_backlog());
         assert_eq!(primary.package(), Some(built));
@@ -448,7 +448,7 @@ mod tests {
         })));
         fetcher.advance().unwrap();
         assert_eq!(
-            fetcher.admitted,
+            fetcher.rail.admitted,
             Some((0, s0)),
             "the first object is this rail's"
         );
@@ -461,7 +461,7 @@ mod tests {
         }
         fetcher.advance().unwrap();
         assert_eq!(
-            fetcher.admitted,
+            fetcher.rail.admitted,
             Some((1, s1)),
             "the current object is admitted"
         );
@@ -865,7 +865,7 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(
-            resumed.taken_bytes, second_length,
+            resumed.rail.taken_bytes, second_length,
             "the resumed fetch asked for the unplaced object and nothing more"
         );
         assert!(
@@ -953,7 +953,7 @@ mod tests {
             .map(|planned| planned.object.length)
             .sum();
         assert_eq!(
-            resumed.taken_bytes, total,
+            resumed.rail.taken_bytes, total,
             "everything was re-requested, the stale claim bought nothing"
         );
         assert_eq!(resumed.package(), Some(built));
@@ -1424,7 +1424,7 @@ mod tests {
                 fetcher.session_mut().driver(),
                 &mut sequence,
             );
-            if fetcher.plan.is_some() && fetcher.next_request > 0 {
+            if fetcher.plan.is_some() && fetcher.rail.next_request > 0 {
                 break;
             }
         }
@@ -1456,9 +1456,13 @@ mod tests {
 
         // The decisive pass must wait, not spin; set now so the earlier
         // rounds are not slowed.
-        fetcher.prover_wait = std::time::Duration::from_secs(5);
+        fetcher.proving.wait = std::time::Duration::from_secs(5);
         fetcher.pump_provers().unwrap();
-        let pool = fetcher.pool.as_ref().expect("the pass started the pool");
+        let pool = fetcher
+            .proving
+            .pool
+            .as_ref()
+            .expect("the pass started the pool");
         assert!(
             pool.witnesses >= 1,
             "the pass that handed a bundle out did not book its witness"
@@ -1472,7 +1476,7 @@ mod tests {
         let output = temporary("width-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         // The default width, wired through the same call a caller uses.
-        assert_eq!(fetcher.proving_threads, DEFAULT_PROVING_THREADS);
+        assert_eq!(fetcher.proving.width, DEFAULT_PROVING_THREADS);
         assert_eq!(
             fetcher.receiver.deferred_limit(),
             DEFAULT_PROVING_THREADS + 1
@@ -1488,12 +1492,12 @@ mod tests {
         );
         // A narrower pool: the bound follows the width.
         fetcher.set_proving_threads(2).unwrap();
-        assert_eq!(fetcher.proving_threads, 2);
+        assert_eq!(fetcher.proving.width, 2);
         assert_eq!(fetcher.receiver.deferred_limit(), 3);
         // Inline: the width is recorded and the bound is left alone, since
         // nothing is deferred to be bounded.
         fetcher.set_proving_threads(0).unwrap();
-        assert_eq!(fetcher.proving_threads, 0);
+        assert_eq!(fetcher.proving.width, 0);
         assert_eq!(fetcher.receiver.deferred_limit(), 3, "no width, no change");
         discard(&[&bundle, &output]);
     }
@@ -1711,7 +1715,7 @@ mod tests {
         // Bytes past the frame the envelope declared are malformed.
         let mut trailing = Vec::new();
         frames::encode(
-            &TypedFrame::PackageDescriptor(fetcher.descriptor.clone().expect("announced")),
+            &TypedFrame::PackageDescriptor(fetcher.manifest.descriptor.clone().expect("announced")),
             &mut trailing,
         )
         .unwrap();
@@ -1750,7 +1754,7 @@ mod tests {
             &mut sequence,
         );
         fetcher.service().unwrap();
-        let descriptor = fetcher.descriptor.clone().expect("announced");
+        let descriptor = fetcher.manifest.descriptor.clone().expect("announced");
 
         // An exact duplicate descriptor is idempotent.
         fetcher
@@ -1789,7 +1793,7 @@ mod tests {
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
         assert!(fetcher.has_backlog(), "the manifest request is held");
 
-        let mut conflicting = fetcher.descriptor.clone().expect("announced");
+        let mut conflicting = fetcher.manifest.descriptor.clone().expect("announced");
         conflicting.page_count += 1;
         fetcher
             .session_mut()
@@ -1825,7 +1829,7 @@ mod tests {
             &mut sequence,
         );
         fetcher.service().unwrap();
-        assert!(fetcher.seal_bytes.is_some(), "announcement taken");
+        assert!(fetcher.manifest.seal_bytes.is_some(), "announcement taken");
 
         // A well-formed page from a different manifest fails the digest.
         let (other, _) = built_bundle("badpage-other", &[("b.txt", patterned(2000))]);
@@ -1915,7 +1919,11 @@ mod tests {
     pub(crate) fn queued_manifest_request(
         fetcher: &mut BundleFetcher<Loopback>,
     ) -> ManifestRequest {
-        let frame = fetcher.pending.pop_front().expect("a request was queued");
+        let frame = fetcher
+            .rail
+            .pending
+            .pop_front()
+            .expect("a request was queued");
         match decode_control(&frame) {
             TypedFrame::ManifestRequest(request) => request,
             other => panic!("not a manifest request: {other:?}"),
@@ -1928,7 +1936,7 @@ mod tests {
         // driven directly.
         let output = temporary("manifest-spans");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        fetcher.descriptor = Some(PackageDescriptor {
+        fetcher.manifest.descriptor = Some(PackageDescriptor {
             package: frames::ObjectId {
                 suite: 1,
                 root: [4; 32],
@@ -1937,39 +1945,51 @@ mod tests {
             manifest_id: [5; 16],
             page_count: 2 * MAX_MANIFEST_REQUEST_PAGES + 3,
         });
-        fetcher.spans = manifest_spans(2 * MAX_MANIFEST_REQUEST_PAGES + 3);
-        assert_eq!(fetcher.spans.len(), 3);
+        fetcher.manifest.spans = manifest_spans(2 * MAX_MANIFEST_REQUEST_PAGES + 3);
+        assert_eq!(fetcher.manifest.spans.len(), 3);
 
         // The first span is asked for, and nothing beyond it.
         fetcher.request_pages().map_err(|_| ()).unwrap();
         let first = queued_manifest_request(&mut fetcher);
         assert_eq!(first.manifest_id, [5; 16]);
-        assert_eq!((first.first_page, first.page_count), fetcher.spans[0]);
+        assert_eq!(
+            (first.first_page, first.page_count),
+            fetcher.manifest.spans[0]
+        );
         fetcher.request_pages().map_err(|_| ()).unwrap();
         assert!(
-            fetcher.pending.is_empty(),
+            fetcher.rail.pending.is_empty(),
             "the next span waits on the pages of this one"
         );
 
         // The next span waits for prior pages (arrival order indexes the digest check).
-        fetcher.pages_received = MAX_MANIFEST_REQUEST_PAGES - 1;
+        fetcher.manifest.pages_received = MAX_MANIFEST_REQUEST_PAGES - 1;
         fetcher.request_pages().map_err(|_| ()).unwrap();
-        assert!(fetcher.pending.is_empty(), "one page short is still short");
-        fetcher.pages_received = MAX_MANIFEST_REQUEST_PAGES;
+        assert!(
+            fetcher.rail.pending.is_empty(),
+            "one page short is still short"
+        );
+        fetcher.manifest.pages_received = MAX_MANIFEST_REQUEST_PAGES;
         fetcher.request_pages().map_err(|_| ()).unwrap();
         let second = queued_manifest_request(&mut fetcher);
-        assert_eq!((second.first_page, second.page_count), fetcher.spans[1]);
+        assert_eq!(
+            (second.first_page, second.page_count),
+            fetcher.manifest.spans[1]
+        );
         assert_ne!(second.request_id, first.request_id, "identities are fresh");
 
         // And the short final span, after which nothing more is owed.
-        fetcher.pages_received = 2 * MAX_MANIFEST_REQUEST_PAGES;
+        fetcher.manifest.pages_received = 2 * MAX_MANIFEST_REQUEST_PAGES;
         fetcher.request_pages().map_err(|_| ()).unwrap();
         let third = queued_manifest_request(&mut fetcher);
-        assert_eq!((third.first_page, third.page_count), fetcher.spans[2]);
-        fetcher.pages_received = fetcher.descriptor.as_ref().unwrap().page_count;
+        assert_eq!(
+            (third.first_page, third.page_count),
+            fetcher.manifest.spans[2]
+        );
+        fetcher.manifest.pages_received = fetcher.manifest.descriptor.as_ref().unwrap().page_count;
         fetcher.request_pages().map_err(|_| ()).unwrap();
         assert!(
-            fetcher.pending.is_empty(),
+            fetcher.rail.pending.is_empty(),
             "the manifest is fully asked for"
         );
         discard(&[&output]);
@@ -2008,7 +2028,7 @@ mod tests {
         ] {
             let output = temporary(&format!("sealfields-{name}"));
             let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-            fetcher.descriptor = Some(descriptor);
+            fetcher.manifest.descriptor = Some(descriptor);
             let outcome = fetcher.take_seal(seal_bytes.clone());
             assert!(
                 matches!(outcome, Err(Fault::Peer(code)) if code == error_code::MANIFEST_INVALID),
@@ -2019,7 +2039,7 @@ mod tests {
         // And the descriptor it does answer is taken, pages and all.
         let output = temporary("sealfields-answered");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        fetcher.descriptor = Some(truth);
+        fetcher.manifest.descriptor = Some(truth);
         assert!(fetcher.take_seal(seal_bytes).is_ok());
         assert!(fetcher.has_backlog(), "the manifest is asked for");
         discard(&[&bundle, &output]);
@@ -2033,7 +2053,7 @@ mod tests {
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         announce(&server, &mut session, &mut connection, &mut fetcher);
         fetcher.service().unwrap();
-        let seal = fetcher.seal_bytes.clone().expect("announced");
+        let seal = fetcher.manifest.seal_bytes.clone().expect("announced");
         let asked = fetcher.session_mut().driver().control.len();
         assert!(asked > 0, "the manifest was asked for");
 
@@ -2099,7 +2119,7 @@ mod tests {
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &early, None).unwrap();
         announce(&server, &mut session, &mut connection, &mut fetcher);
         fetcher.service().unwrap();
-        assert_eq!(fetcher.pages_received, 0);
+        assert_eq!(fetcher.manifest.pages_received, 0);
         fetcher
             .session_mut()
             .driver()
@@ -2124,7 +2144,7 @@ mod tests {
                 .push_back(control_event(&TypedFrame::ManifestPage(pages[0].clone())));
         }
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
-        assert_eq!(fetcher.pages_received, 1, "the repeat was counted");
+        assert_eq!(fetcher.manifest.pages_received, 1, "the repeat was counted");
         assert!(fetcher.plan.is_none(), "a page short of the manifest");
         discard(&[&discarded, &early, &twice]);
     }
@@ -2177,7 +2197,7 @@ mod tests {
         // However many passes, and however readily the carrier takes them.
         for _ in 0..16 {
             fetcher.issue_ranges().unwrap();
-            fetcher.pending.clear();
+            fetcher.rail.pending.clear();
         }
         assert_eq!(
             fetcher.locked_plan().unwrap().next_offset,
@@ -2187,7 +2207,7 @@ mod tests {
 
         // Pacing is per rail; asking on another's arrivals overdraws both receivers.
         sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
-        fetcher.settled_bytes = MAX_REQUESTED_RANGE;
+        fetcher.rail.settled_bytes = MAX_REQUESTED_RANGE;
         fetcher.issue_ranges().unwrap();
         assert_eq!(
             fetcher.locked_plan().unwrap().next_offset,
@@ -2199,9 +2219,9 @@ mod tests {
 
         // A span is committed only once its frame is queued, or a failure
         // leaves a hole nobody re-requests.
-        fetcher.settled_bytes = 2 * MAX_REQUESTED_RANGE;
+        fetcher.rail.settled_bytes = 2 * MAX_REQUESTED_RANGE;
         let owed = fetcher.locked_plan().unwrap().next_offset;
-        fetcher.next_request = u64::MAX;
+        fetcher.rail.next_request = u64::MAX;
         assert!(
             fetcher.issue_ranges().is_err(),
             "the identifier space ended"
@@ -2214,8 +2234,8 @@ mod tests {
 
         // The shared sink is not this rail's account; a full window blocks
         // regardless of placement.
-        fetcher.next_request = 0;
-        fetcher.settled_bytes = MAX_REQUESTED_RANGE;
+        fetcher.rail.next_request = 0;
+        fetcher.rail.settled_bytes = MAX_REQUESTED_RANGE;
         sink.placed
             .store(40 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
         fetcher.issue_ranges().unwrap();

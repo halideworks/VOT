@@ -44,21 +44,11 @@ pub(crate) fn client_stance(holder: Option<&crate::authz::Holder>) -> Authentica
 
 /// One fetch: a client session, the receiver verifying its ranges, and the
 /// bundle directory being written.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each flag is an independent fact about one fetch: what it is (a rail, a resume) and what has already happened to it (disconnected, stopped); folding them into states would cross the two"
-)]
 pub struct BundleFetcher<A: TransportAdapter> {
     pub(crate) receiver: SessionReceiver<A>,
     pub(crate) bundle: PathBuf,
     pub(crate) pin: Option<[u8; 32]>,
-    pub(crate) descriptor: Option<PackageDescriptor>,
-    pub(crate) seal_bytes: Option<Vec<u8>>,
-    pub(crate) page_digests: Vec<[u8; 32]>,
-    pub(crate) pages_received: u64,
-    /// Manifest request spans still to issue, and the next one due.
-    pub(crate) spans: Vec<(u64, u64)>,
-    pub(crate) next_span: usize,
+    pub(crate) manifest: ManifestPhase,
     pub(crate) plan: Option<SharedPlan>,
     /// Resume store, held until the manifest hands it to the plan.
     pub(crate) store: Option<Arc<Mutex<ResumeStore>>>,
@@ -71,6 +61,26 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// Shared, because every rail opens its own session and answers its own
     /// challenge under the same token.
     pub(crate) holder: Option<Arc<crate::authz::Holder>>,
+    pub(crate) rail: RailProgress,
+    pub(crate) terminal: Terminal,
+    pub(crate) report: ProgressReport,
+    pub(crate) proving: ProvingConfig,
+}
+
+/// The manifest being fetched: identity answered, pages owed and taken.
+#[derive(Default)]
+pub(crate) struct ManifestPhase {
+    pub(crate) descriptor: Option<PackageDescriptor>,
+    pub(crate) seal_bytes: Option<Vec<u8>>,
+    pub(crate) page_digests: Vec<[u8; 32]>,
+    pub(crate) pages_received: u64,
+    /// Manifest request spans still to issue, and the next one due.
+    pub(crate) spans: Vec<(u64, u64)>,
+    pub(crate) next_span: usize,
+}
+
+/// What this rail has asked for, settled, and may still have outstanding.
+pub(crate) struct RailProgress {
     /// The object this rail has admitted to its own receiver, by plan
     /// index. Admission is per rail; the plan cannot do it.
     pub(crate) admitted: Option<(usize, SubjectId)>,
@@ -86,25 +96,62 @@ pub struct BundleFetcher<A: TransportAdapter> {
     pub(crate) window_bytes: u64,
     pub(crate) pending: VecDeque<Vec<u8>>,
     pub(crate) next_request: u64,
+}
+
+impl Default for RailProgress {
+    fn default() -> Self {
+        Self {
+            admitted: None,
+            taken_bytes: 0,
+            settled_bytes: 0,
+            window_bytes: OUTSTANDING_REQUEST_BYTES,
+            pending: VecDeque::new(),
+            next_request: 0,
+        }
+    }
+}
+
+/// What has already ended, one independent fact per field.
+#[derive(Default)]
+pub(crate) struct Terminal {
     pub(crate) closed: Option<u16>,
     /// Set once the carrier reported it had gone, so every later pass says
     /// so too rather than only the pass that saw it.
     pub(crate) disconnected: bool,
     /// Set once nothing further will be asked for, whatever ended it.
     pub(crate) stopped: bool,
+}
+
+/// What a driving loop and a caller are told about this fetch.
+#[derive(Default)]
+pub(crate) struct ProgressReport {
     /// Everything this end has taken or asked for, only ever going up.
     ///
     /// A driving loop reads it to tell a slow transfer from a stuck one.
     pub(crate) progress: u64,
+    /// Where placed-byte crossings are reported, if anywhere.
+    pub(crate) placed: Option<PlacedReport>,
+}
+
+/// The provers this fetch may start, and how a pass waits on them.
+pub(crate) struct ProvingConfig {
     /// The provers, started with the first cover so a fetch that carries
     /// none starts no threads.
     pub(crate) pool: Option<ProvingPool>,
     /// How many provers to start, or none for proving on this thread.
-    pub(crate) proving_threads: usize,
+    pub(crate) width: usize,
     /// How long a pass waits for a witness it is owed. Overridden in tests.
-    pub(crate) prover_wait: std::time::Duration,
-    /// Where placed-byte crossings are reported, if anywhere.
-    pub(crate) placed_report: Option<PlacedReport>,
+    pub(crate) wait: std::time::Duration,
+}
+
+impl Default for ProvingConfig {
+    fn default() -> Self {
+        Self {
+            pool: None,
+            width: 0,
+            wait: PROVER_WAIT,
+        }
+    }
 }
 
 /// Page spans of at most what one `MANIFEST_REQUEST` may name.
@@ -177,7 +224,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // a resumed fetch completes on coverage they feed.
             return Err(Error::InvalidArguments);
         }
-        self.proving_threads = threads;
+        self.proving.width = threads;
         self.receiver.defer_proving(threads > 0);
         if threads > 0 {
             // Room for every prover to hold one and one more to be waiting,
@@ -265,31 +312,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             receiver,
             bundle: bundle.to_owned(),
             pin,
-            descriptor: None,
-            seal_bytes: None,
-            page_digests: Vec::new(),
-            pages_received: 0,
-            spans: Vec::new(),
-            next_span: 0,
+            manifest: ManifestPhase::default(),
             plan: None,
             store: Some(Arc::new(Mutex::new(store))),
             resuming,
             secondary: false,
             holder,
-            admitted: None,
-            taken_bytes: 0,
-            settled_bytes: 0,
-            window_bytes: OUTSTANDING_REQUEST_BYTES,
-            pending: VecDeque::new(),
-            next_request: 0,
-            closed: None,
-            disconnected: false,
-            stopped: false,
-            progress: 0,
-            pool: None,
-            proving_threads: 0,
-            prover_wait: PROVER_WAIT,
-            placed_report: None,
+            rail: RailProgress::default(),
+            terminal: Terminal::default(),
+            report: ProgressReport::default(),
+            proving: ProvingConfig::default(),
         };
         // Through the one place the deferred wiring lives, so the default
         // width and a caller's cannot come apart.
@@ -336,31 +368,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             receiver,
             bundle: bundle.to_owned(),
             pin: Some(root),
-            descriptor: None,
-            seal_bytes: None,
-            page_digests: Vec::new(),
-            pages_received: 0,
-            spans: Vec::new(),
-            next_span: 0,
+            manifest: ManifestPhase::default(),
             plan: Some(plan),
             store: None,
             resuming: false,
             secondary: true,
             holder,
-            admitted: None,
-            taken_bytes: 0,
-            settled_bytes: 0,
-            window_bytes: OUTSTANDING_REQUEST_BYTES,
-            pending: VecDeque::new(),
-            next_request: 0,
-            closed: None,
-            disconnected: false,
-            stopped: false,
-            progress: 0,
-            pool: None,
-            proving_threads: 0,
-            prover_wait: PROVER_WAIT,
-            placed_report: None,
+            rail: RailProgress::default(),
+            terminal: Terminal::default(),
+            report: ProgressReport::default(),
+            proving: ProvingConfig::default(),
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
         Ok(fetcher)
@@ -399,14 +416,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// How many provers this fetch runs.
     #[cfg(any(test, feature = "wire"))]
     pub(crate) const fn proving_threads(&self) -> usize {
-        self.proving_threads
+        self.proving.width
     }
 
     /// Everything this end has settled, only ever going up: frames taken,
     /// requests issued, and every byte placed.
     #[must_use]
     pub fn progress(&self) -> u64 {
-        self.progress.saturating_add(self.placed_bytes())
+        self.report.progress.saturating_add(self.placed_bytes())
     }
 
     /// Bytes verified and placed into the bundle, only ever going up.
@@ -440,7 +457,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if quantum == 0 {
             return Err(Error::InvalidArguments);
         }
-        self.placed_report = Some(PlacedReport {
+        self.report.placed = Some(PlacedReport {
             quantum,
             next_at: quantum,
             observer,
@@ -452,7 +469,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     pub(crate) fn note_placed(&mut self) {
         let placed = self.placed_bytes();
         let total = self.locked_plan().map(|plan| plan.summary.logical_length);
-        let Some(report) = &mut self.placed_report else {
+        let Some(report) = &mut self.report.placed else {
             return;
         };
         let Some(next) = crossing(placed, report.next_at, report.quantum) else {
@@ -469,14 +486,15 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// answers coming back. A stopped fetch owes nothing.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.stopped
-            && (!self.pending.is_empty() || self.pool.as_ref().is_some_and(ProvingPool::busy))
+        !self.terminal.stopped
+            && (!self.rail.pending.is_empty()
+                || self.proving.pool.as_ref().is_some_and(ProvingPool::busy))
     }
 
     /// Forgets what is owed, because nothing more will be asked or answered.
     pub(crate) fn stop(&mut self) {
-        self.pending.clear();
-        self.stopped = true;
+        self.rail.pending.clear();
+        self.terminal.stopped = true;
     }
 
     /// Answers a challenge that asks for a capability, once.
@@ -509,13 +527,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// every event, advances the object plan, and flushes. Never blocks;
     /// the caller waits on the adapter between passes.
     pub fn service(&mut self) -> Result<FetchStatus, Error> {
-        if let Some(code) = self.closed {
+        if let Some(code) = self.terminal.closed {
             return Ok(FetchStatus::Closed(code));
         }
         if self.complete() {
             return Ok(FetchStatus::Complete);
         }
-        if self.disconnected {
+        if self.terminal.disconnected {
             // Recorded, so a carrier that has gone is gone for every later
             // pass rather than only the one that saw it go.
             return Ok(FetchStatus::Disconnected);
@@ -530,16 +548,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         loop {
             match self.receiver.poll() {
                 Ok(Some(Event::Control(bytes))) => {
-                    self.progress = self.progress.saturating_add(1);
+                    self.report.progress = self.report.progress.saturating_add(1);
                     if let Err(fault) = self.dispatch(&bytes) {
                         return self.fail(fault);
                     }
                 }
                 Ok(Some(Event::Disconnected(_))) => {
-                    self.disconnected = true;
+                    self.terminal.disconnected = true;
                     break;
                 }
-                Ok(Some(_)) => self.progress = self.progress.saturating_add(1),
+                Ok(Some(_)) => self.report.progress = self.report.progress.saturating_add(1),
                 Ok(None) => break,
                 Err(error) => return self.receive_failed(error),
             }
@@ -560,7 +578,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             self.stop();
             return Ok(FetchStatus::Complete);
         }
-        if self.disconnected {
+        if self.terminal.disconnected {
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
@@ -601,13 +619,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Proof happens off this thread; what returns is a witness the
     /// receiver admits like the inline path does.
     pub(crate) fn pump_provers(&mut self) -> Result<(), vot_scheduler::Error> {
-        if self.proving_threads == 0 {
+        if self.proving.width == 0 {
             return Ok(());
         }
         let mut pool = self
+            .proving
             .pool
             .take()
-            .unwrap_or_else(|| ProvingPool::start(self.proving_threads));
+            .unwrap_or_else(|| ProvingPool::start(self.proving.width));
         // Handed over while there is room, so what is out with a prover is a
         // few covers rather than an object.
         while pool.has_room() {
@@ -639,14 +658,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // otherwise book nothing. A pass that returned without it would spin.
         if pool.in_flight == 0 {
             // Nothing is out, so there is nothing to wait for or book.
-            self.pool = Some(pool);
+            self.proving.pool = Some(pool);
             return Ok(());
         }
         let mut outcome = Ok(());
         // The first witness is waited for (this end's own work, already in
         // hand); the rest are taken as found. Bounded by construction:
         // one bounded wait, then at most what is out with a prover.
-        let first = pool.proved.recv_timeout(self.prover_wait).ok();
+        let first = pool.proved.recv_timeout(self.proving.wait).ok();
         let ready: Vec<_> = first
             .into_iter()
             .chain(pool.proved.try_iter())
@@ -664,7 +683,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     let bundle = proved.completed.bundle();
                     // Earned back against this rail's window: what was
                     // taken is settled, so the next span may be asked for.
-                    self.settled_bytes = self.settled_bytes.saturating_add(bundle.covered_length);
+                    self.rail.settled_bytes = self
+                        .rail
+                        .settled_bytes
+                        .saturating_add(bundle.covered_length);
                     // Booked into shared coverage, which completes the object.
                     // The subject check drops stragglers.
                     if let Some(mut plan) = self.locked_plan() {
@@ -681,14 +703,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
             }
         }
-        self.pool = Some(pool);
+        self.proving.pool = Some(pool);
         outcome
     }
 
     /// Closes the carrier under `code` and stops asking for anything.
     pub(crate) fn close_under(&mut self, code: u16) {
         let _ = self.receiver.session_mut().driver().close(code);
-        self.closed = Some(code);
+        self.terminal.closed = Some(code);
         self.stop();
     }
 
@@ -713,10 +735,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// Hands queued requests to the session until the carrier refuses one.
     pub(crate) fn drain(&mut self) -> Result<(), Error> {
-        while let Some(frame) = self.pending.front() {
+        while let Some(frame) = self.rail.pending.front() {
             match self.receiver.session_mut().send_control(frame) {
                 Ok(()) => {
-                    self.pending.pop_front();
+                    self.rail.pending.pop_front();
                 }
                 Err(error) if is_backpressure(&error) => break,
                 Err(error) => return Err(error.into()),
@@ -771,7 +793,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     pub(crate) fn take_descriptor(&mut self, descriptor: PackageDescriptor) -> Result<(), Fault> {
-        if let Some(existing) = &self.descriptor {
+        if let Some(existing) = &self.manifest.descriptor {
             if *existing == descriptor {
                 // An exact re-announcement is idempotent, per the registry.
                 return Ok(());
@@ -788,17 +810,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // suite is not a package this CLI builds or receives.
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
-        self.descriptor = Some(descriptor);
+        self.manifest.descriptor = Some(descriptor);
         Ok(())
     }
 
     pub(crate) fn take_seal(&mut self, seal_bytes: Vec<u8>) -> Result<(), Fault> {
-        let Some(descriptor) = &self.descriptor else {
+        let Some(descriptor) = &self.manifest.descriptor else {
             // The descriptor leads the announcement; a seal without one is
             // out of sequence.
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
         };
-        if let Some(existing) = &self.seal_bytes {
+        if let Some(existing) = &self.manifest.seal_bytes {
             if *existing == seal_bytes {
                 return Ok(());
             }
@@ -817,13 +839,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if self.secondary {
             // A rail already has the manifest through its plan; nothing
             // further is asked.
-            self.seal_bytes = Some(seal_bytes);
+            self.manifest.seal_bytes = Some(seal_bytes);
             return Ok(());
         }
-        self.page_digests = crate::seal_page_digests(&seal)
+        self.manifest.page_digests = crate::seal_page_digests(&seal)
             .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
-        self.spans = manifest_spans(seal.final_page_count);
-        self.seal_bytes = Some(seal_bytes);
+        self.manifest.spans = manifest_spans(seal.final_page_count);
+        self.manifest.seal_bytes = Some(seal_bytes);
         self.request_pages()?;
         Ok(())
     }
@@ -831,16 +853,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Issues the next manifest span, one at a time: page arrival order is
     /// what indexes the digest check, so spans stay strictly sequential.
     pub(crate) fn request_pages(&mut self) -> Result<(), Fault> {
-        let Some(descriptor) = &self.descriptor else {
+        let Some(descriptor) = &self.manifest.descriptor else {
             return Ok(());
         };
         let manifest_id = descriptor.manifest_id;
-        if let Some((first_page, page_count)) = self.spans.get(self.next_span).copied() {
-            if self.pages_received == first_page {
+        if let Some((first_page, page_count)) =
+            self.manifest.spans.get(self.manifest.next_span).copied()
+        {
+            if self.manifest.pages_received == first_page {
                 let request_id =
-                    Self::request_identifier(&mut self.next_request).map_err(Fault::Local)?;
+                    Self::request_identifier(&mut self.rail.next_request).map_err(Fault::Local)?;
                 Self::queue_request(
-                    &mut self.pending,
+                    &mut self.rail.pending,
                     &TypedFrame::ManifestRequest(ManifestRequest {
                         request_id,
                         manifest_id,
@@ -849,7 +873,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     }),
                 )
                 .map_err(Fault::Local)?;
-                self.next_span += 1;
+                self.manifest.next_span += 1;
             }
         }
         Ok(())
@@ -861,25 +885,25 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // the primary's and already validated.
             return Ok(());
         }
-        if self.seal_bytes.is_none() {
+        if self.manifest.seal_bytes.is_none() {
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
         }
         let page = vot_manifest::decode_page(page_bytes)
             .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
         let index = page.index;
         let slot = usize::try_from(index).map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
-        let Some(committed) = self.page_digests.get(slot) else {
+        let Some(committed) = self.manifest.page_digests.get(slot) else {
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         };
         if committed != blake3::hash(page_bytes).as_bytes() {
             // Not the page the seal committed to at this index.
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
-        if index < self.pages_received {
+        if index < self.manifest.pages_received {
             // An exact duplicate of a page already taken is idempotent.
             return Ok(());
         }
-        if index > self.pages_received {
+        if index > self.manifest.pages_received {
             // The control stream is ordered; a gap is the server's doing.
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
@@ -888,12 +912,15 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             page_bytes,
         )
         .map_err(Fault::Local)?;
-        self.pages_received = self
+        self.manifest.pages_received = self
+            .manifest
             .pages_received
             .checked_add(1)
             .ok_or(Fault::Local(Error::InvalidBundle))?;
         self.request_pages()?;
-        if Some(self.pages_received) == self.descriptor.as_ref().map(|d| d.page_count) {
+        if Some(self.manifest.pages_received)
+            == self.manifest.descriptor.as_ref().map(|d| d.page_count)
+        {
             self.finish_manifest()?;
         }
         Ok(())
@@ -903,6 +930,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// does, and plans the objects it names.
     pub(crate) fn finish_manifest(&mut self) -> Result<(), Fault> {
         let seal_bytes = self
+            .manifest
             .seal_bytes
             .as_ref()
             .ok_or(Fault::Local(Error::InvalidBundle))?;
@@ -984,7 +1012,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
         };
-        if self.secondary && self.descriptor.is_none() {
+        if self.secondary && self.manifest.descriptor.is_none() {
             // A rail admits and asks only once the server has answered
             // for the pinned package.
             return Ok(());
@@ -1002,21 +1030,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // Forget partial accounts for objects the plan left behind, so
             // the receiver is bounded by what is current, not everything
             // this rail touched.
-            if let Some((index, subject)) = self.admitted {
+            if let Some((index, subject)) = self.rail.admitted {
                 if index != plan.current {
                     if !self.receiver.is_verified(subject) {
                         self.receiver.abandon(subject);
                     }
-                    self.admitted = None;
+                    self.rail.admitted = None;
                 }
             }
             if let Some(sink) = plan.active.clone() {
                 let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
                 let subject = subject_of(planned);
                 let length = planned.object.length;
-                if self.admitted != Some((plan.current, subject)) {
+                if self.rail.admitted != Some((plan.current, subject)) {
                     self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
-                    self.admitted = Some((plan.current, subject));
+                    self.rail.admitted = Some((plan.current, subject));
                 }
                 // Complete when shared coverage spans the object, or this
                 // rail's receiver verified it.
@@ -1135,7 +1163,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 CountingSink::create(&path, object.length, durable)?
             });
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
-            self.admitted = Some((plan.current, subject));
+            self.rail.admitted = Some((plan.current, subject));
             plan.active = Some(sink);
             plan.next_offset = 0;
             // The resumed extents seed both accounts: coverage, so the
@@ -1166,28 +1194,30 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
         };
-        if self.secondary && self.descriptor.is_none() {
+        if self.secondary && self.manifest.descriptor.is_none() {
             return Ok(());
         }
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
         for _ in 0..OUTSTANDING_COVERS {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            let outstanding = if self.proving_threads == 0 {
+            let outstanding = if self.proving.width == 0 {
                 plan.next_offset
                     .saturating_sub(plan.active.as_ref().map_or(0, |sink| sink.placed()))
             } else {
-                self.taken_bytes.saturating_sub(self.settled_bytes)
+                self.rail
+                    .taken_bytes
+                    .saturating_sub(self.rail.settled_bytes)
             };
-            if outstanding >= self.window_bytes {
+            if outstanding >= self.rail.window_bytes {
                 return Ok(());
             }
             let Some((object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
-            let request_id = Self::request_identifier(&mut self.next_request)?;
+            let request_id = Self::request_identifier(&mut self.rail.next_request)?;
             Self::queue_request(
-                &mut self.pending,
+                &mut self.rail.pending,
                 &TypedFrame::RangeRequest(RangeRequest {
                     request_id,
                     object,
@@ -1196,8 +1226,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }),
             )?;
             plan.take(offset, length)?;
-            self.taken_bytes = self.taken_bytes.saturating_add(length);
-            self.progress = self.progress.saturating_add(1);
+            self.rail.taken_bytes = self.rail.taken_bytes.saturating_add(length);
+            self.report.progress = self.report.progress.saturating_add(1);
         }
         Ok(())
     }

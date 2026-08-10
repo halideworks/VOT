@@ -439,8 +439,7 @@ mod tests {
             active: Some(sink0),
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -490,8 +489,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -516,8 +514,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -545,8 +542,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -572,8 +568,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -581,26 +576,26 @@ mod tests {
             finished: false,
         };
         plan.cover(0, 10);
-        assert_eq!(plan.covered_bytes, 10);
+        assert_eq!(plan.covered.bytes(), 10);
         plan.cover(5, 10);
-        assert_eq!(plan.covered_bytes, 15, "the overlap counts once");
+        assert_eq!(plan.covered.bytes(), 15, "the overlap counts once");
         plan.cover(5, 5);
-        assert_eq!(plan.covered_bytes, 15, "a duplicate counts never");
+        assert_eq!(plan.covered.bytes(), 15, "a duplicate counts never");
         plan.cover(20, 5);
-        assert_eq!(plan.covered_bytes, 20, "a gap stays a gap");
+        assert_eq!(plan.covered.bytes(), 20, "a gap stays a gap");
         plan.cover(15, 5);
-        assert_eq!(plan.covered_bytes, 25, "the gap filled exactly");
+        assert_eq!(plan.covered.bytes(), 25, "the gap filled exactly");
         assert_eq!(
-            plan.covered.iter().collect::<Vec<_>>(),
+            plan.covered.extents().iter().collect::<Vec<_>>(),
             vec![(&0, &25)],
             "adjacent extents coalesce to one"
         );
         plan.cover(0, 25);
-        assert_eq!(plan.covered_bytes, 25, "the whole again changes nothing");
+        assert_eq!(plan.covered.bytes(), 25, "the whole again changes nothing");
         plan.cover(30, 0);
-        assert_eq!(plan.covered_bytes, 25, "an empty cover covers nothing");
+        assert_eq!(plan.covered.bytes(), 25, "an empty cover covers nothing");
         plan.cover(u64::MAX, 2);
-        assert_eq!(plan.covered_bytes, 25, "an overflowing cover is refused");
+        assert_eq!(plan.covered.bytes(), 25, "an overflowing cover is refused");
     }
 
     #[test]
@@ -1182,8 +1177,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered,
-            covered_bytes: 2 * unit + 5,
+            covered: CoverageMap::seeded(covered),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -1224,7 +1218,7 @@ mod tests {
             let mut plan = plan.lock().unwrap();
             plan.objects.push(other);
             plan.current = 1;
-            plan.covered.clear();
+            plan.covered = CoverageMap::new();
             plan.covered.insert(0, unit);
         }
         let before = store.lock().unwrap().checkpointed(subject).unwrap().count();
@@ -1265,8 +1259,7 @@ mod tests {
             )),
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip,
@@ -1662,8 +1655,7 @@ mod tests {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -2165,8 +2157,7 @@ mod tests {
             active: Some(Arc::clone(&sink)),
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),

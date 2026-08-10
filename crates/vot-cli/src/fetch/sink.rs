@@ -46,7 +46,7 @@ impl DurableHook {
             // Coverage is the current object's; a sink outliving its
             // object flushes without a claim to make.
             (plan.objects.get(plan.current).map(subject_of) == Some(self.subject))
-                .then(|| plan.covered.clone())
+                .then(|| plan.covered.extents().clone())
         });
         if file.file().sync_data().is_err() {
             // Nothing durable to claim; the completion sync will tell

@@ -1,12 +1,12 @@
 //! Session and frame dispatch: the [`BundleFetcher`] passes.
 
 use super::{
-    Arc, Authentication, BTreeMap, BTreeSet, CountingSink, DEFAULT_PROVING_THREADS, DecodeLimits,
-    DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY, MANIFEST_SEAL,
-    MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestReader,
-    ManifestRequest, Mutex, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES, PROVER_WAIT,
-    PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject, Proving,
-    ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
+    Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap, DEFAULT_PROVING_THREADS,
+    DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY,
+    MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE,
+    ManifestReader, ManifestRequest, Mutex, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
+    PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject,
+    Proving, ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
     SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter, TypedFrame,
     UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
     remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
@@ -962,8 +962,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             active: None,
             placed_before: 0,
             next_offset: 0,
-            covered: BTreeMap::new(),
-            covered_bytes: 0,
+            covered: CoverageMap::new(),
             syncing: false,
             abandoned: false,
             skip: BTreeMap::new(),
@@ -1021,7 +1020,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 // Complete when shared coverage spans the object, or this
                 // rail's receiver verified it.
-                let whole = plan.covered_bytes == length || self.receiver.is_verified(subject);
+                let whole = plan.covered.is_complete(length) || self.receiver.is_verified(subject);
                 if !whole || plan.syncing {
                     return Ok(());
                 }
@@ -1049,8 +1048,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 synced?;
                 plan.placed_before = plan.placed_before.saturating_add(length);
                 plan.active = None;
-                plan.covered.clear();
-                plan.covered_bytes = 0;
+                plan.covered = CoverageMap::new();
                 plan.skip.clear();
                 // A cursor that stands still here re-fetches the object it
                 // just settled, forever and over the wire; failing at once
@@ -1143,8 +1141,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // The resumed extents seed both accounts: coverage, so the
             // object completes when the gaps do, and the skip set, so the
             // handout never asks for what is already placed.
-            plan.covered = resumed.clone();
-            plan.covered_bytes = seeded;
+            plan.covered = CoverageMap::seeded(resumed.clone());
             plan.skip = resumed;
             // Released before the requests are issued: the handout takes
             // the same lock, and holding it here would deadlock this

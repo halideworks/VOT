@@ -597,14 +597,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { shard: fetch, args: "-f src/fetch*" }
-          - { shard: serve, args: "-f src/serve* -f src/drive.rs -f src/wire.rs -f src/nowire.rs" }
+          # Globs anchor at the tree root and a name* glob does not descend
+          # into a directory of that name, so each area names both its
+          # single-file and its module-directory form.
+          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f crates/vot-cli/src/fetch/**" }
+          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f crates/vot-cli/src/serve/** -f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/wire.rs -f crates/vot-cli/src/nowire.rs" }
           # Command-line globs replace the config file's exclude_globs, so
           # the core shard restates them: main.rs (the binary is untested
           # under wire, its Ok(()) mutants are unkillable by design) and the
           # rendezvous and relay modules the featureless matrix already
           # measures.
-          - { shard: core, args: "-e src/fetch* -e src/serve* -e src/drive.rs -e src/wire.rs -e src/nowire.rs -e src/main.rs -e src/rendezvous.rs -e src/relay.rs" }
+          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e crates/vot-cli/src/fetch/** -e crates/vot-cli/src/serve.rs -e crates/vot-cli/src/serve/** -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e crates/vot-cli/src/relay.rs" }
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

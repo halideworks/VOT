@@ -34,6 +34,8 @@ mod relay;
 #[cfg(any(test, feature = "wire"))]
 mod rendezvous;
 mod serve;
+#[cfg(any(test, feature = "wire"))]
+mod side_channel;
 #[cfg(feature = "wire")]
 mod wire;
 

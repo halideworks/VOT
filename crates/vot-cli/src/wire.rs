@@ -483,7 +483,7 @@ pub fn rendezvous_service(
         // records and hands out is the address that peer can be reached at
         // from its own family; what it sends to goes back through this
         // socket's family.
-        let source = crate::rendezvous::canonical(source);
+        let source = crate::side_channel::address::canonical(source);
         let now_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
         let answer = pairings.take(datagram, source, now_ms);
         if let Some(reply) = answer.reply {
@@ -781,7 +781,7 @@ fn open_slot(
         run_slot(&socket, meter, began, &stopping);
     }));
     slots.opened(key, at, expires_at_ms);
-    Some(crate::rendezvous::canonical(at))
+    Some(crate::side_channel::address::canonical(at))
 }
 
 /// Rendezvous service address. Unset means no registration.
@@ -801,7 +801,7 @@ const REGISTRAR_TICK: Duration = Duration::from_millis(200);
 
 /// `target` as a socket bound in `local`'s family can address it. A
 /// dual-stack socket takes an IPv4 destination only in its mapped form,
-/// which is the inverse of what [`crate::rendezvous::canonical`] undoes.
+/// which is the inverse of what [`crate::side_channel::address::canonical`] undoes.
 fn for_socket(target: SocketAddr, local: SocketAddr) -> SocketAddr {
     match (local, target) {
         (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
@@ -1166,7 +1166,7 @@ fn read_until<T>(
 /// package root is not a secret, and anyone who can reach this port could
 /// otherwise point the rail at an address of their choosing. This is the
 /// check [`crate::rendezvous::Registrar::take`] makes on the serving end,
-/// through the same [`crate::rendezvous::from_service`].
+/// through the same [`crate::side_channel::address::from_service`].
 ///
 /// A service on a multi-homed host has to answer from the address it was
 /// asked at. One that answers from another of its own addresses is heard
@@ -1178,7 +1178,7 @@ fn resolved(
     service: SocketAddr,
 ) -> Result<Option<SocketAddr>, Error> {
     let found = read_until(socket, buffer, RESOLVE_TIMEOUT, |datagram, source| {
-        if !crate::rendezvous::from_service(source, service) {
+        if !crate::side_channel::address::from_service(source, service) {
             return None;
         }
         match datagram {
@@ -1215,8 +1215,8 @@ fn wait_warm(
 ) -> Result<(), Error> {
     read_until(socket, buffer, wait, |datagram, source| {
         (datagram == crate::rendezvous::Datagram::Warming
-            && crate::rendezvous::canonical(source).ip()
-                == crate::rendezvous::canonical(serve).ip())
+            && crate::side_channel::address::canonical(source).ip()
+                == crate::side_channel::address::canonical(serve).ip())
         .then_some(())
     })?;
     Ok(())
@@ -1718,9 +1718,9 @@ mod tests {
         let mapped: SocketAddr = "[::ffff:192.0.2.7]:4433".parse().expect("an address");
         let plain: SocketAddr = "192.0.2.7:4433".parse().expect("an address");
         let six: SocketAddr = "[2001:db8::1]:4433".parse().expect("an address");
-        assert_eq!(crate::rendezvous::canonical(mapped), plain);
-        assert_eq!(crate::rendezvous::canonical(plain), plain);
-        assert_eq!(crate::rendezvous::canonical(six), six);
+        assert_eq!(crate::side_channel::address::canonical(mapped), plain);
+        assert_eq!(crate::side_channel::address::canonical(plain), plain);
+        assert_eq!(crate::side_channel::address::canonical(six), six);
 
         let v6_socket: SocketAddr = "[::]:9999".parse().expect("an address");
         let v4_socket: SocketAddr = "0.0.0.0:9999".parse().expect("an address");

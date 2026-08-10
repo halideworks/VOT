@@ -616,7 +616,7 @@ jobs:
           # under wire, its Ok(()) mutants are unkillable by design) and the
           # rendezvous and relay modules the featureless matrix already
           # measures.
-          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e crates/vot-cli/src/relay.rs" }
+          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e 'crates/vot-cli/src/rendezvous/**' -e crates/vot-cli/src/relay.rs" }
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1

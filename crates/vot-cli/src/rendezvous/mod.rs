@@ -1,376 +1,22 @@
 //! Rendezvous protocol: pairing serve and fetch by the package root.
 //! Socket-independent; time is injected so expiry is testable.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+mod key;
+mod registrar;
+mod service;
+mod wire;
 
-use crate::side_channel::address::{
-    AddressSlot, canonical, from_service, pull_address, push_address,
-};
-use crate::side_channel::padded::padded_key;
-
-/// Lead byte for rendezvous datagrams. Below QUIC range (0x00..=0x3F) so
-/// the router distinguishes them by one byte.
-pub(crate) const MAGIC: u8 = 0x1F;
-
-/// The version after the magic, so the exchange can change shape later
-/// without a flag day at the service.
-const VERSION: u8 = 1;
-
-/// Every request is padded to the widest reply so the service amplifies nothing.
-const REQUEST_BYTES: usize = 3 + 32 + 1 + 16 + 2;
-
-/// What one rendezvous datagram says. Replies are never larger than requests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Datagram {
-    /// A serve's mapping claim: the source address the service observes
-    /// is the mapping for exactly the socket sessions arrive at.
-    Register { key: [u8; 32] },
-    /// The service's answer to a register, so the serve knows it is
-    /// findable and its cadence is landing.
-    Registered { key: [u8; 32] },
-    /// A fetch asking where the key's serve is.
-    Resolve { key: [u8; 32] },
-    /// The service's answer: the serve's mapping, or nothing yet.
-    Resolved {
-        key: [u8; 32],
-        serve: Option<SocketAddr>,
-    },
-    /// The service telling the serve a fetch is coming, so the serve
-    /// can open its own NAT toward the fetch before the Initial.
-    Coming { key: [u8; 32], fetch: SocketAddr },
-    /// The serve's warming datagram toward a fetch's mapping. Carries
-    /// nothing; arriving is its whole job, and the fetch's router or
-    /// socket sheds it.
-    Warming,
-}
-
-/// Encodes one datagram.
-pub(crate) fn encode(datagram: &Datagram) -> Vec<u8> {
-    let mut wire = vec![MAGIC, VERSION];
-    match datagram {
-        Datagram::Register { key } => {
-            wire.push(1);
-            wire.extend_from_slice(key);
-            wire.resize(REQUEST_BYTES, 0);
-        }
-        Datagram::Registered { key } => {
-            wire.push(2);
-            wire.extend_from_slice(key);
-        }
-        Datagram::Resolve { key } => {
-            wire.push(3);
-            wire.extend_from_slice(key);
-            wire.resize(REQUEST_BYTES, 0);
-        }
-        Datagram::Resolved { key, serve } => {
-            wire.push(4);
-            wire.extend_from_slice(key);
-            push_address(&mut wire, *serve);
-        }
-        Datagram::Coming { key, fetch } => {
-            wire.push(5);
-            wire.extend_from_slice(key);
-            push_address(&mut wire, Some(*fetch));
-        }
-        Datagram::Warming => wire.push(6),
-    }
-    wire
-}
-
-/// Decodes one datagram, or nothing for bytes that are not one.
-///
-/// Nothing here is a peer fault: a stray or malformed datagram on an
-/// open UDP port is weather, and the caller sheds it.
-#[must_use]
-pub(crate) fn decode(bytes: &[u8]) -> Option<Datagram> {
-    let [MAGIC, VERSION, kind, rest @ ..] = bytes else {
-        return None;
-    };
-    match (kind, rest.len()) {
-        (1, _) => Some(Datagram::Register {
-            key: padded_key(rest, REQUEST_BYTES)?,
-        }),
-        (2, 32) => Some(Datagram::Registered {
-            key: rest.try_into().ok()?,
-        }),
-        (3, _) => Some(Datagram::Resolve {
-            key: padded_key(rest, REQUEST_BYTES)?,
-        }),
-        (4, _) => {
-            let (key, address) = rest.split_at_checked(32)?;
-            let serve = match pull_address(address) {
-                AddressSlot::Invalid => return None,
-                AddressSlot::Empty => None,
-                AddressSlot::Held(address) => Some(address),
-            };
-            Some(Datagram::Resolved {
-                key: key.try_into().ok()?,
-                serve,
-            })
-        }
-        (5, _) => {
-            let (key, address) = rest.split_at_checked(32)?;
-            let AddressSlot::Held(fetch) = pull_address(address) else {
-                return None;
-            };
-            Some(Datagram::Coming {
-                key: key.try_into().ok()?,
-                fetch,
-            })
-        }
-        (6, 0) => Some(Datagram::Warming),
-        _ => None,
-    }
-}
-
-/// The context string the rendezvous key is derived under, which is what
-/// keeps that derivation from colliding with any other use of the root.
-const KEY_CONTEXT: &str = "VOT 2026-08 rendezvous key v1";
-
-/// Derives the rendezvous key from a package root. Must stay this exact
-/// derivation forever (protocol identity).
-pub(crate) fn key_of(root: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key(KEY_CONTEXT, root)
-}
-
-/// How long a registration stands without refresh. A dead serve ages out
-/// in about a minute.
-pub(crate) const REGISTRATION_TTL_MS: u64 = 90_000;
-
-/// Registrations one service holds at most, which bounds its memory by
-/// a constant however many keys are thrown at it.
-pub(crate) const MAX_REGISTRATIONS: usize = 65_536;
-
-/// How often a serve re-registers, which is also what keeps its NAT
-/// mapping alive. Several refreshes fit inside [`REGISTRATION_TTL_MS`],
-/// so a lost datagram costs findability for one cadence and no more.
-pub(crate) const REGISTER_CADENCE_MS: u64 = 20_000;
-
-/// Warming datagrams per Coming. Sent one per pass to avoid sharing a
-/// single path's fate.
-pub(crate) const WARMING_DATAGRAMS: usize = 3;
-
-/// Total warming datagrams per cadence. One Coming earns at most
-/// [`WARMING_DATAGRAMS`], and this bounds the total regardless of how many
-/// Comings arrive, so a forged Coming cannot make a serve a reflector.
-/// Sized for two fetches at the widest rail count inside one cadence,
-/// since each of a fetch's rails punches for itself.
-pub(crate) const WARMINGS_PER_CADENCE: usize = 48;
-
-/// Whether to warm `fetch` based on a Coming from `service`. Rejects
-/// addresses that cannot be an observed source mapping.
-fn warmable(fetch: SocketAddr, service: SocketAddr) -> bool {
-    if fetch.port() == 0 {
-        return false;
-    }
-    let near = service.ip().is_loopback();
-    match fetch.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && (near || !ip.is_loopback())
-        }
-        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast() && (near || !ip.is_loopback()),
-    }
-}
-
-/// The serve-side rendezvous state: what to send and when. Owns no socket.
-///
-/// One registrar covers every address the service has, because a serve is
-/// findable in each family it can reach the service over, and because the
-/// warming bound is the serve's, not one service address's.
-pub(crate) struct Registrar {
-    key: [u8; 32],
-    services: Vec<SocketAddr>,
-    /// When the next registration is due, which is immediately at first.
-    due_at_ms: u64,
-    /// Mappings owed warmings, and how many each is still owed. Drained one
-    /// mapping per pass and rotated, so a rail waiting on its first warming
-    /// never waits behind another rail's second.
-    warming: std::collections::VecDeque<(SocketAddr, usize)>,
-    /// Warmings this cadence has already earned, against the bound.
-    warmed: usize,
-}
-
-impl Registrar {
-    /// A serve registering `root` with the service at every one of
-    /// `services`, which are the addresses one service answers at.
-    pub(crate) fn new(root: &[u8; 32], services: &[SocketAddr]) -> Self {
-        Self {
-            key: key_of(root),
-            services: services.to_vec(),
-            due_at_ms: 0,
-            warming: std::collections::VecDeque::new(),
-            warmed: 0,
-        }
-    }
-
-    /// What to send at `now_ms` with nothing having arrived: a
-    /// registration to every service address when the cadence is due, and
-    /// one warming a pass toward whatever fetches are still owed them.
-    pub(crate) fn due(&mut self, now_ms: u64) -> Vec<(SocketAddr, Datagram)> {
-        let mut sends = Vec::new();
-        if let Some((fetch, owed)) = self.warming.pop_front() {
-            sends.push((fetch, Datagram::Warming));
-            if owed > 1 {
-                self.warming.push_back((fetch, owed - 1));
-            }
-        }
-        if now_ms >= self.due_at_ms {
-            self.due_at_ms = now_ms.saturating_add(REGISTER_CADENCE_MS);
-            self.warmed = 0;
-            for service in &self.services {
-                sends.push((*service, Datagram::Register { key: self.key }));
-            }
-        }
-        sends
-    }
-
-    /// Processes a datagram from `source`. Only the service is heard, and
-    /// only about this serve's key. Earned warmings are queued.
-    pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr) {
-        if !self.services.iter().any(|held| from_service(source, *held)) {
-            return;
-        }
-        // A serve bound dual-stack reads a loopback service as
-        // `::ffff:127.0.0.1`, which `warmable` would not know is near.
-        let source = canonical(source);
-        let Datagram::Coming { key, fetch } = datagram else {
-            return;
-        };
-        if key != self.key || !warmable(fetch, source) {
-            return;
-        }
-        let room = WARMINGS_PER_CADENCE.saturating_sub(self.warmed);
-        let owed = WARMING_DATAGRAMS.min(room);
-        self.warmed = self.warmed.saturating_add(owed);
-        if owed > 0 {
-            self.warming.push_back((fetch, owed));
-        }
-    }
-}
-
-/// One registered serve: where it is, and until when it is believed.
-#[derive(Clone, Copy)]
-struct Registration {
-    mapping: SocketAddr,
-    expires_at_ms: u64,
-}
-
-impl Registration {
-    /// Whether this registration is still believed at `now_ms`.
-    const fn live(&self, now_ms: u64) -> bool {
-        self.expires_at_ms > now_ms
-    }
-}
-
-/// What one key is registered at: at most one mapping per family, because
-/// a serve reaches the service in each family it has and each of those
-/// arrives under an address only that family can use.
-#[derive(Default)]
-struct Mappings {
-    v4: Option<Registration>,
-    v6: Option<Registration>,
-}
-
-impl Mappings {
-    /// The slot an address belongs in. IPv4-mapped IPv6 is made canonical
-    /// where addresses are read, so this is the family it will be used in.
-    const fn slot(&mut self, address: SocketAddr) -> &mut Option<Registration> {
-        match address {
-            SocketAddr::V4(_) => &mut self.v4,
-            SocketAddr::V6(_) => &mut self.v6,
-        }
-    }
-
-    /// What is registered in `address`'s family and still believed.
-    fn live_like(&self, address: SocketAddr, now_ms: u64) -> Option<SocketAddr> {
-        let held = match address {
-            SocketAddr::V4(_) => self.v4,
-            SocketAddr::V6(_) => self.v6,
-        };
-        held.filter(|entry| entry.live(now_ms))
-            .map(|entry| entry.mapping)
-    }
-
-    /// Whether any family still holds a believed registration.
-    fn live(&self, now_ms: u64) -> bool {
-        [self.v4, self.v6]
-            .into_iter()
-            .flatten()
-            .any(|entry| entry.live(now_ms))
-    }
-}
-
-/// Service-side pairing table. Time is injected so expiry is testable.
-#[derive(Default)]
-pub(crate) struct Pairings {
-    registered: HashMap<[u8; 32], Mappings>,
-}
-
-/// Service reply: zero or one reply to the source, plus at most one
-/// notification to a registered serve.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct Answer {
-    /// Sent back to the datagram's own source.
-    pub reply: Option<Datagram>,
-    /// Sent to a registered serve's mapping: the fetch that is coming.
-    pub notify: Option<(SocketAddr, Datagram)>,
-}
-
-impl Pairings {
-    /// Takes one datagram as the service, from `source`, at `now_ms`.
-    ///
-    /// Everything the service does is here: register and refresh under
-    /// the bound, resolve to whatever is live, pair the two ends, and
-    /// shed what is expired, malformed, or not the service's to answer.
-    pub(crate) fn take(&mut self, datagram: Datagram, source: SocketAddr, now_ms: u64) -> Answer {
-        match datagram {
-            Datagram::Register { key } => {
-                if self.registered.len() >= MAX_REGISTRATIONS && !self.registered.contains_key(&key)
-                {
-                    // The only sweep. Expiry is read at every lookup, so a
-                    // table with room costs nothing to hold, and no datagram
-                    // pays for the table's size. A key goes only when every
-                    // family it holds has expired.
-                    self.registered.retain(|_, mappings| mappings.live(now_ms));
-                    if self.registered.len() >= MAX_REGISTRATIONS {
-                        return Answer::default();
-                    }
-                }
-                *self.registered.entry(key).or_default().slot(source) = Some(Registration {
-                    mapping: source,
-                    expires_at_ms: now_ms.saturating_add(REGISTRATION_TTL_MS),
-                });
-                Answer {
-                    reply: Some(Datagram::Registered { key }),
-                    notify: None,
-                }
-            }
-            Datagram::Resolve { key } => {
-                // Answered in the family it arrived over: that is the only
-                // family the asker can reach a mapping in.
-                let serve = self
-                    .registered
-                    .get(&key)
-                    .and_then(|mappings| mappings.live_like(source, now_ms));
-                Answer {
-                    reply: Some(Datagram::Resolved { key, serve }),
-                    notify: serve.map(|mapping| (mapping, Datagram::Coming { key, fetch: source })),
-                }
-            }
-            Datagram::Registered { .. }
-            | Datagram::Resolved { .. }
-            | Datagram::Coming { .. }
-            | Datagram::Warming => Answer::default(),
-        }
-    }
-}
+pub(crate) use key::*;
+pub(crate) use registrar::*;
+pub(crate) use service::*;
+pub(crate) use wire::*;
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use crate::side_channel::address::from_service;
+
     use super::*;
 
     fn v4(text: &str) -> SocketAddr {
@@ -910,12 +556,42 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_register_below_the_cap_keeps_what_expired() {
+        // The sweep waits for the cap: an expired key stays until a full
+        // table forces the walk, so no datagram pays for the table's size.
+        let mut pairings = Pairings::default();
+        pairings.take(Datagram::Register { key: [1; 32] }, v4("192.0.2.1:1000"), 0);
+        pairings.take(
+            Datagram::Register { key: [2; 32] },
+            v4("192.0.2.2:2000"),
+            REGISTRATION_TTL_MS + 1,
+        );
+        assert_eq!(
+            pairings.registered.len(),
+            2,
+            "an expired key is kept until the cap forces the sweep"
+        );
+    }
+
+    #[test]
     fn the_table_is_bounded_and_full_is_shed_not_evicted() {
         let mut pairings = Pairings::default();
+        // Filled directly: through take() a hostile mutant of the cap check
+        // makes this fill quadratic, and the boundary below still crosses
+        // the real path.
         for index in 0..MAX_REGISTRATIONS {
             let mut key = [0; 32];
             key[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            pairings.take(Datagram::Register { key }, v4("192.0.2.1:1000"), 0);
+            pairings.registered.insert(
+                key,
+                Mappings {
+                    v4: Some(Registration {
+                        mapping: v4("192.0.2.1:1000"),
+                        expires_at_ms: REGISTRATION_TTL_MS,
+                    }),
+                    v6: None,
+                },
+            );
         }
         assert_eq!(pairings.registered.len(), MAX_REGISTRATIONS);
         let extra = pairings.take(

@@ -188,24 +188,18 @@ fn note_rail_paths(rails: &[Option<vot_transport_api::PathStats>], notes: &mut S
         let Some(stats) = stats else {
             continue;
         };
-        if let Some(lost) = stats.lost_packets {
-            let _ = write!(notes, ";rail{rail}_lost={lost}");
-        }
-        if let Some(spurious) = stats.spurious_lost_packets {
-            let _ = write!(notes, ";rail{rail}_spurious={spurious}");
-        }
-        if let Some(sent) = stats.packets_sent {
-            let _ = write!(notes, ";rail{rail}_sent={sent}");
-        }
-        if let Some(received) = stats.packets_received {
-            let _ = write!(notes, ";rail{rail}_recv={received}");
-        }
-        if let Some(rtt) = stats.smoothed_rtt_us {
-            let _ = write!(notes, ";rail{rail}_rtt_us={rtt}");
-        }
-        if let Some(cwnd) = stats.congestion_window_bytes {
-            let _ = write!(notes, ";rail{rail}_cwnd={cwnd}");
-        }
+        // Field names, order, and omission are the output contract.
+        let mut put = |name: &str, value: Option<u64>| {
+            if let Some(value) = value {
+                let _ = write!(notes, ";rail{rail}_{name}={value}");
+            }
+        };
+        put("lost", stats.lost_packets);
+        put("spurious", stats.spurious_lost_packets);
+        put("sent", stats.packets_sent);
+        put("recv", stats.packets_received);
+        put("rtt_us", stats.smoothed_rtt_us);
+        put("cwnd", stats.congestion_window_bytes);
     }
 }
 
@@ -227,21 +221,33 @@ fn tell_the_sender(adapter: &mut dyn TransportAdapter) -> Result<(), Error> {
 /// Drives one receive rail: its own endpoint, its own reassembly, its own
 /// proving, and nothing shared with its siblings but the admission lock and
 /// the running total.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "every argument is one strand of the shared rail state"
-)]
-fn drive_receive_rail(
-    endpoint: &mut Endpoint,
+/// What every receive rail shares: the subject, the admission lock, the
+/// sink, the witness ledger, and the running totals. Borrowed, so ownership
+/// and synchronization stay exactly where they were.
+struct ReceiveShared<'shared> {
     subject: SubjectId,
     object_bytes: u64,
-    receiver: &std::sync::Mutex<ReliableReceiver>,
-    sink: &dyn vot_scheduler::RangeSink,
-    witnesses: &WitnessLedger,
-    delivered: &std::sync::atomic::AtomicU64,
-    failed: &std::sync::atomic::AtomicBool,
+    receiver: &'shared std::sync::Mutex<ReliableReceiver>,
+    sink: &'shared dyn vot_scheduler::RangeSink,
+    witnesses: &'shared WitnessLedger,
+    delivered: &'shared std::sync::atomic::AtomicU64,
+    failed: &'shared std::sync::atomic::AtomicBool,
+}
+
+fn drive_receive_rail(
+    endpoint: &mut Endpoint,
+    shared: &ReceiveShared<'_>,
     budget: u64,
 ) -> Result<(Tally, u64), Error> {
+    let ReceiveShared {
+        subject,
+        object_bytes,
+        receiver,
+        sink,
+        witnesses,
+        delivered,
+        failed,
+    } = *shared;
     let mut tally = Tally::default();
     // A bundle's frames stay together on their lane, so one incomplete
     // bundle is all a rail can hold.
@@ -305,12 +311,16 @@ fn drive_receive_rail(
 /// Rails bind before any handshake where the backend allows it, or the
 /// sender's next Initial races the next bind. The clock starts at the first
 /// accepted connection.
-#[expect(clippy::type_complexity, reason = "the clock rides with what it times")]
-fn accept_rails(
-    config: &Config,
-    base: SocketAddr,
-    workers: usize,
-) -> Result<(Vec<Endpoint>, Option<(u64, u64)>, Instant), Error> {
+/// Every rail accepted, the CPU sample taken before the clock, and the
+/// moment the clock started. A clarity type: the clock rides with what it
+/// times.
+struct AcceptedRails {
+    endpoints: Vec<Endpoint>,
+    cpu_before: Option<(u64, u64)>,
+    started: Instant,
+}
+
+fn accept_rails(config: &Config, base: SocketAddr, workers: usize) -> Result<AcceptedRails, Error> {
     let mut endpoints = Vec::with_capacity(workers);
     let cpu_before;
     let started;
@@ -334,7 +344,11 @@ fn accept_rails(
             endpoints.push(listen_endpoint(config, rail_address(base, rail)?)?);
         }
     }
-    Ok((endpoints, cpu_before, started))
+    Ok(AcceptedRails {
+        endpoints,
+        cpu_before,
+        started,
+    })
 }
 
 /// The address rail `rail` uses: the configured port plus the rail's index.
@@ -655,7 +669,11 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     receiver.begin_ranges(subject, Box::new(sink.clone()))?;
     let mut reassembly = BundleReassembly::new(workers);
 
-    let (mut endpoints, cpu_before, started) = accept_rails(config, base, workers)?;
+    let AcceptedRails {
+        mut endpoints,
+        cpu_before,
+        started,
+    } = accept_rails(config, base, workers)?;
     let mut credit = Credit::Constructed;
     for endpoint in &mut endpoints {
         credit = enforced_credit(endpoint.adapter.as_mut(), receiver.advertised_credit())?;
@@ -669,27 +687,24 @@ fn receive_ranged(config: &Config, base: SocketAddr) -> Result<Measurement, Erro
     let failed = std::sync::atomic::AtomicBool::new(false);
     let mut tally = Tally::default();
     let mut bundles = 0_u64;
+    // One context for every rail: everything in it is shared by reference,
+    // and the sink is Sync by its trait bound.
+    let shared = ReceiveShared {
+        subject,
+        object_bytes: config.object_bytes,
+        receiver: &receiver,
+        sink: sink.as_ref(),
+        witnesses: &witnesses,
+        delivered: &delivered,
+        failed: &failed,
+    };
+    let shared = &shared;
     let outcome = std::thread::scope(|scope| -> Result<(), Error> {
         let mut rails = Vec::with_capacity(workers);
         for endpoint in &mut endpoints {
-            let receiver = &receiver;
-            let sink = sink.clone();
-            let witnesses = &witnesses;
-            let delivered = &delivered;
-            let failed = &failed;
             rails.push(scope.spawn(move || {
-                let mut alarm = Alarm(failed, true);
-                let outcome = drive_receive_rail(
-                    endpoint,
-                    subject,
-                    config.object_bytes,
-                    receiver,
-                    sink.as_ref(),
-                    witnesses,
-                    delivered,
-                    failed,
-                    budget,
-                );
+                let mut alarm = Alarm(shared.failed, true);
+                let outcome = drive_receive_rail(endpoint, shared, budget);
                 alarm.1 = outcome.is_err();
                 outcome
             }));

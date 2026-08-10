@@ -73,6 +73,40 @@ answer for the rest.
 **Every failure is the named one.** `RendezvousUnpunched` after the punch
 wait, never a hang and never a wrong-bytes result.
 
+## The matrix with a relay
+
+Measured 2026-08-10 on erebus by `tools/nat_lab.sh --matrix --relay`, which
+runs a relay beside the service and names it to the fetch. Same bundle,
+same rails, same machine.
+
+| Serve | Fetch | Outcome | Elapsed |
+|---|---|---|---|
+| direct | direct | fetched | 0.63s |
+| direct | cone | fetched | 0.63s |
+| direct | permissive | fetched | 0.63s |
+| direct | symmetric | fetched | 3.63s |
+| cone | direct | fetched | 1.15s |
+| cone | cone | fetched | 1.15s |
+| cone | permissive | fetched | 1.15s |
+| cone | symmetric | fetched | 17.11s |
+| permissive | direct | fetched | 15.55s |
+| permissive | cone | fetched | 17.07s |
+| permissive | permissive | fetched | 17.27s |
+| permissive | symmetric | fetched | 17.11s |
+| symmetric | direct | fetched | 15.75s |
+| symmetric | cone | fetched | 17.11s |
+| symmetric | permissive | fetched | 17.07s |
+| symmetric | symmetric | fetched | 17.10s |
+
+Every row fetches. The punchable rows kept their times, because a route
+that works is taken before the relay is asked for anything, and the nine
+rows that could not punch land at the punch wait plus one slot: the
+ladder fails its way down at full price and then the transfer crosses.
+The fetch prints `route ADDRESS relayed` on those rows, so which rung
+carried it is a fact in the log rather than an inference from the time.
+This is ADR-0034 step 4: the topology the punch cannot serve, measured
+end to end.
+
 ## Why a permissive router cannot be punched
 
 This is the lab's finding, and it explains punch failures that look random.

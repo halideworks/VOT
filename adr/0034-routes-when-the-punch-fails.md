@@ -117,6 +117,8 @@ inferred.**
 
 ## Sequence
 
+All four steps are done.
+
 1. One mapping per family per key, and the ordered ladder without a
    relay: `VOT_RENDEZVOUS` names a service by every address it has,
    a serve registers at each, a resolve is answered in the family it
@@ -125,6 +127,10 @@ inferred.**
 2. The relay protocol and the `vot relay` verb: slot allocation keyed by
    the rendezvous key, forwarding, the TTL and byte ceilings, loopback
    tests, and the bounds held by construction rather than by policy.
-3. Fetch and serve take a relay as the last rung when one is named.
-4. Validation on a network that cannot punch, which is the measured
-   symmetric NAT of step 4, end to end and logged.
+3. Fetch and serve take a relay as the last rung when one is named. The
+   invitation is one new rendezvous datagram, and on the serving end it
+   is handled as a Coming whose address is the slot.
+4. Validated on the NAT lab's full matrix with `--relay`
+   (`docs/nat-lab.md`): all sixteen topologies fetch, including the nine
+   the punch cannot serve, each reporting `route ... relayed`. The
+   punchable rows kept their routes and their times.

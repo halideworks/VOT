@@ -99,6 +99,21 @@ pub fn drive_until<E: Engine>(
     }
 }
 
+/// The error a terminal fetch status names, or completion.
+///
+/// One mapping for the primary and every rail; what a completion yields
+/// (the package, or nothing for a rail) stays with the caller.
+#[cfg(any(test, feature = "wire"))]
+fn fetch_verdict(status: crate::FetchStatus) -> Result<(), Error> {
+    match status {
+        crate::FetchStatus::Complete => Ok(()),
+        // Preserve the original error code for the caller.
+        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
+        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
+        crate::FetchStatus::Active => Err(Error::InvalidBundle),
+    }
+}
+
 /// Ends whatever the loop answered as this end's own outcome: the package
 /// for a complete fetch, and the error that names why for anything else.
 #[cfg(any(test, feature = "wire"))]
@@ -106,13 +121,7 @@ fn fetched<A: TransportAdapter>(
     fetcher: &crate::BundleFetcher<A>,
     status: crate::FetchStatus,
 ) -> Result<crate::PackageSummary, Error> {
-    match status {
-        crate::FetchStatus::Complete => fetcher.package().ok_or(Error::InvalidBundle),
-        // Preserve the original error code for the caller.
-        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
-        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-        crate::FetchStatus::Active => Err(Error::InvalidBundle),
-    }
+    fetch_verdict(status).and_then(|()| fetcher.package().ok_or(Error::InvalidBundle))
 }
 
 /// Fetches at `rails` width. The primary builds the plan; rails join it
@@ -158,12 +167,7 @@ where
                     let mut rail =
                         crate::BundleFetcher::join(carrier, &bundle, plan.clone(), holder)?;
                     rail.set_proving_threads(provers)?;
-                    match drive(&mut rail)? {
-                        crate::FetchStatus::Complete => Ok(()),
-                        crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
-                        crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-                        crate::FetchStatus::Active => Err(Error::InvalidBundle),
-                    }
+                    fetch_verdict(drive(&mut rail)?)
                 })();
                 if outcome.is_err() {
                     crate::fetch::abandon_plan(&plan);

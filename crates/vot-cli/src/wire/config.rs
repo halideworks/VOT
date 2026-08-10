@@ -30,14 +30,33 @@ pub(crate) fn apply_datagram_bytes(config: &mut Config) -> Result<(), Error> {
 
 /// Parses and validates [`DATAGRAM_BYTES`] against the carrier's bounds.
 pub(crate) fn apply_datagram_value(config: &mut Config, value: &str) -> Result<(), Error> {
-    let bytes: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
-    let bounds = vot_transport_quiche::live::MIN_DATAGRAM_SIZE
-        ..=vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE;
-    if !bounds.contains(&bytes) {
+    config.max_datagram_bytes = bounded(
+        value,
+        vot_transport_quiche::live::MIN_DATAGRAM_SIZE
+            ..=vot_transport_quiche::live::LARGEST_DATAGRAM_SIZE,
+    )?;
+    Ok(())
+}
+
+/// A number `bounds` admits, however it was spaced.
+///
+/// Every environment number here is rejected rather than clamped: an
+/// operator who wrote a value this cannot read has said something, and
+/// guessing is not reading it.
+fn bounded(value: &str, bounds: std::ops::RangeInclusive<usize>) -> Result<usize, Error> {
+    let parsed = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
+    if !bounds.contains(&parsed) {
         return Err(Error::InvalidArguments);
     }
-    config.max_datagram_bytes = bytes;
-    Ok(())
+    Ok(parsed)
+}
+
+/// A positive count, of anything zero would disable.
+fn positive(value: &str) -> Result<u64, Error> {
+    match value.trim().parse().map_err(|_| Error::InvalidArguments)? {
+        0 => Err(Error::InvalidArguments),
+        value => Ok(value),
+    }
 }
 
 /// The environment variable that picks the congestion controller.
@@ -58,11 +77,7 @@ pub(crate) fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error
     let Some(value) = pin else {
         return Ok(4.min(cores.max(1)));
     };
-    let rails: usize = value.trim().parse().map_err(|_| Error::InvalidArguments)?;
-    if !(1..=MAX_FETCH_RAILS).contains(&rails) {
-        return Err(Error::InvalidArguments);
-    }
-    Ok(rails)
+    bounded(value, 1..=MAX_FETCH_RAILS)
 }
 
 /// The controller [`CONGESTION`] names, or bbr2 when unset.
@@ -150,20 +165,7 @@ pub(crate) fn relay_limits_from(
     bytes: Option<&str>,
 ) -> Result<crate::relay::Limits, Error> {
     let default = crate::relay::Limits::default();
-    let read = |value: Option<&str>| -> Result<Option<u64>, Error> {
-        value
-            .map(|value| {
-                value
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| Error::InvalidArguments)
-            })
-            .transpose()
-            .and_then(|parsed| match parsed {
-                Some(0) => Err(Error::InvalidArguments),
-                other => Ok(other),
-            })
-    };
+    let read = |value: Option<&str>| value.map(positive).transpose();
     let concurrent = match read(slots)? {
         Some(value) => usize::try_from(value).map_err(|_| Error::InvalidArguments)?,
         None => default.concurrent,

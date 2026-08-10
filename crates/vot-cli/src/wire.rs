@@ -2599,7 +2599,8 @@ mod tests {
             written.key.to_str().expect("a path").to_owned(),
         );
         config.side_channel_lead = Some(crate::rendezvous::MAGIC);
-        config.accept_timeout_ms = 0;
+        // The default accept bound stays: a fetch broken enough never to
+        // connect must fail this test, not hang the suite on the join.
         config.congestion = congestion_from(None).unwrap();
         apply_datagram_bytes(&mut config).unwrap();
         let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
@@ -2679,7 +2680,6 @@ mod tests {
             written.certificate.to_str().expect("a path").to_owned(),
             written.key.to_str().expect("a path").to_owned(),
         );
-        config.accept_timeout_ms = 0;
         config.congestion = congestion_from(None).unwrap();
         apply_datagram_bytes(&mut config).unwrap();
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");

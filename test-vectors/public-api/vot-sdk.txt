@@ -4,6 +4,7 @@ constant vot_sdk::proof::HEADER_LENGTH
 constant vot_sdk::proof::INDEX_ENTRY_LENGTH
 constant vot_sdk::proof::RANGE_LENGTH
 enum vot_sdk::ErrorCode
+enum vot_sdk::coverage::CoverageCheck
 enum vot_sdk::coverage::CoverageUpdate
 enum vot_sdk::package::EntryStorage
 enum vot_sdk::receipt::AssuranceLevel
@@ -23,6 +24,7 @@ module vot_sdk::receipt
 module vot_sdk::resume
 module vot_sdk::verify
 struct vot_sdk::Error
+struct vot_sdk::coverage::CoverageBooking
 struct vot_sdk::coverage::ObjectCoverage
 struct vot_sdk::object::InMemoryObjectBuilder
 struct vot_sdk::object::InMemoryPreparedObject

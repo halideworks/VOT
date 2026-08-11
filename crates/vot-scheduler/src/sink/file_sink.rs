@@ -22,6 +22,24 @@ impl FileSink {
         Ok(Self { file })
     }
 
+    /// Exclusively creates and sizes a new destination.
+    ///
+    /// Unlike [`Self::create`], this never follows or truncates an existing
+    /// filesystem entry.
+    ///
+    /// # Errors
+    /// Surfaces an existing path or the platform's refusal to create or size
+    /// the file.
+    pub fn create_new(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
+        let file = vot_platform_fs::create_staging_file(path)?;
+        if let Err(error) = file.set_len(length) {
+            let _ = vot_platform_fs::remove_file_handle(&file, path);
+            return Err(error);
+        }
+        let _ = vot_platform_fs::allow_unordered_writes(&file);
+        Ok(Self { file })
+    }
+
     /// Opens an existing destination without truncating what it holds,
     /// sized to the object, so a fetch continuing a partial bundle keeps
     /// every byte a previous fetch placed (ADR-0032).
@@ -147,5 +165,29 @@ mod tests {
             "the last fetch's bytes survived the reopen"
         );
         assert!(written[..unit].iter().all(|byte| *byte == 0x41));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_creation_rejects_unsafe_parent_without_an_artifact() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = std::env::temp_dir().join(format!(
+            "vot-file-sink-unsafe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("staging");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = match FileSink::create_new(&path, 1) {
+            Ok(_) => panic!("unsafe parent admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

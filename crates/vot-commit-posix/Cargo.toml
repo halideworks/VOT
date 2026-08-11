@@ -10,6 +10,7 @@ publish = false
 blake3.workspace = true
 vot-commit-model = { path = "../vot-commit-model" }
 vot-journal = { path = "../vot-journal" }
+vot-platform-fs = { path = "../vot-platform-fs" }
 vot-commit-strict = { path = "../vot-commit-strict" }
 
 [lints]

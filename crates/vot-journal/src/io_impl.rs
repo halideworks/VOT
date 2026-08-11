@@ -31,6 +31,8 @@ pub struct Journal {
     pub(super) incarnation: [u8; 16],
     pub(super) next_sequence: u64,
     pub(super) poisoned: bool,
+    #[cfg(test)]
+    pub(super) fail_next_repair_sync: bool,
 }
 
 /// Claims a journal for one writer, on the journal itself.
@@ -61,13 +63,21 @@ pub struct DurableWitness(());
 
 impl Journal {
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
+        vot_platform_fs::validate_removal_parent(path)?;
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(path)?;
-        claim(&file)?;
-        File::open(parent_directory(path))?.sync_all()?;
+        let prepared = claim(&file).and_then(|()| {
+            File::open(parent_directory(path))?
+                .sync_all()
+                .map_err(Error::Io)
+        });
+        if let Err(error) = prepared {
+            let _ = vot_platform_fs::remove_file_handle(&file, path);
+            return Err(error);
+        }
         Ok(Self {
             file,
             bytes: 0,
@@ -75,6 +85,8 @@ impl Journal {
             incarnation,
             next_sequence: 0,
             poisoned: false,
+            #[cfg(test)]
+            fail_next_repair_sync: false,
         })
     }
 
@@ -99,6 +111,8 @@ impl Journal {
                 incarnation,
                 next_sequence,
                 poisoned: false,
+                #[cfg(test)]
+                fail_next_repair_sync: false,
             },
             replay,
         ))
@@ -148,6 +162,40 @@ impl Journal {
     ) -> Result<(u64, DurableWitness), Error> {
         self.append_durable(state, payload)
             .map(|sequence| (sequence, DurableWitness(())))
+    }
+
+    /// Repairs this writer after an ambiguous append using its held lock.
+    pub fn repair_poisoned(&mut self) -> Result<Replay, Error> {
+        if !self.poisoned {
+            return Err(Error::InvalidState);
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        let replay = replay_reader(&mut self.file, self.incarnation)?;
+        if replay.torn_tail {
+            self.file.set_len(replay.valid_bytes)?;
+        }
+        // A complete record can still be the result of a failed sync. It is
+        // readable now, but not a durable recovery fact until this succeeds.
+        self.sync_repair_file()?;
+        let bytes = self.file.seek(SeekFrom::End(0))?;
+        let next_sequence = next_sequence_after(replay.records.last())?;
+        self.bytes = bytes;
+        self.next_sequence = next_sequence;
+        self.poisoned = false;
+        Ok(replay)
+    }
+
+    fn sync_repair_file(&mut self) -> Result<(), Error> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_repair_sync) {
+            return Err(Error::Io(io::Error::other("injected repair sync failure")));
+        }
+        self.file.sync_data().map_err(Error::Io)
+    }
+
+    /// Removes this journal only while its retained handle still owns its name.
+    pub fn remove_owned(self) -> Result<(), Error> {
+        vot_platform_fs::remove_file_handle(&self.file, &self.path).map_err(Error::Io)
     }
 
     #[must_use]

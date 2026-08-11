@@ -520,6 +520,69 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn create_rejects_unsafe_parent_before_creating_a_journal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("vot-journal-unsafe-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("journal");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            Journal::create(&path, [2; 16]),
+            Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!path.exists());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_poisoned_writer_repairs_its_held_file_before_appending() {
+        let path = temp_path("repair-poisoned");
+        let mut journal = Journal::create(&path, [2; 16]).unwrap();
+        journal.append_durable(1, b"before").unwrap();
+        journal.poisoned = true;
+        let replay = journal.repair_poisoned().unwrap();
+        assert_eq!(replay.records.len(), 1);
+        assert!(!journal.is_poisoned());
+        assert_eq!(journal.append_durable(2, b"after").unwrap(), 1);
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repair_keeps_a_complete_record_poisoned_until_resync_succeeds() {
+        let path = temp_path("repair-resync");
+        let mut journal = Journal::create(&path, [2; 16]).unwrap();
+        journal.append_durable(1, b"complete").unwrap();
+        journal.poisoned = true;
+        journal.fail_next_repair_sync = true;
+        assert!(matches!(journal.repair_poisoned(), Err(Error::Io(_))));
+        assert!(journal.is_poisoned());
+        assert_eq!(replay(&path, [2; 16]).unwrap().records.len(), 1);
+        assert_eq!(journal.repair_poisoned().unwrap().records.len(), 1);
+        assert!(!journal.is_poisoned());
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn owned_removal_preserves_a_substituted_name() {
+        let path = temp_path("owned-removal");
+        let held = path.with_extension("held");
+        let journal = Journal::create(&path, [2; 16]).unwrap();
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(journal.remove_owned().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(held).unwrap();
+    }
+
     #[test]
     fn minimum_record_and_header_fields_are_validated_independently() {
         let encoded = encode(&record(0, 1, Vec::new(), false)).unwrap();

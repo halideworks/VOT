@@ -7,6 +7,10 @@ on:
       - ".github/workflows/proof-store-native.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/vot-commit-model/**"
+      - "crates/vot-commit-platform/**"
+      - "crates/vot-commit-posix/**"
+      - "crates/vot-commit-strict/**"
       - "crates/vot-journal/**"
       - "crates/vot-manifest/**"
       - "crates/vot-object/**"
@@ -15,12 +19,21 @@ on:
       - "crates/vot-proof-sha256/**"
       - "crates/vot-proof-store/**"
       - "crates/vot-proof-store-file/**"
+      - "crates/vot-platform-fs/**"
+      - "crates/vot-receipt/**"
+      - "crates/vot-scheduler/**"
+      - "crates/vot-sdk/**"
+      - "crates/vot-sdk-file/**"
       - "crates/vot-verifier/**"
   pull_request:
     paths:
       - ".github/workflows/proof-store-native.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/vot-commit-model/**"
+      - "crates/vot-commit-platform/**"
+      - "crates/vot-commit-posix/**"
+      - "crates/vot-commit-strict/**"
       - "crates/vot-journal/**"
       - "crates/vot-manifest/**"
       - "crates/vot-object/**"
@@ -29,6 +42,11 @@ on:
       - "crates/vot-proof-sha256/**"
       - "crates/vot-proof-store/**"
       - "crates/vot-proof-store-file/**"
+      - "crates/vot-platform-fs/**"
+      - "crates/vot-receipt/**"
+      - "crates/vot-scheduler/**"
+      - "crates/vot-sdk/**"
+      - "crates/vot-sdk-file/**"
       - "crates/vot-verifier/**"
   workflow_dispatch:
 
@@ -56,5 +74,5 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
-      - name: Test native proof storage
-        run: cargo +1.88.0 test -p vot-proof-store-file --locked
+      - name: Test native storage adapters
+        run: cargo +1.88.0 test -p vot-proof-store-file -p vot-sdk-file --locked

@@ -14,6 +14,26 @@ pub enum CoverageUpdate {
     Replay,
 }
 
+/// Result of checking an authenticated range before accepting its bytes.
+#[derive(Debug)]
+pub enum CoverageCheck<'coverage> {
+    Replay,
+    New(CoverageBooking<'coverage>),
+}
+
+/// A checked authenticated range that has not yet entered verified coverage.
+#[derive(Debug)]
+pub struct CoverageBooking<'coverage> {
+    inner: vot_coverage::Booking<'coverage>,
+}
+
+impl CoverageBooking<'_> {
+    /// Records the range after its bytes have been accepted by the caller.
+    pub fn commit(self) {
+        self.inner.commit();
+    }
+}
+
 /// Coverage that accepts authenticated ranges for exactly one object.
 #[derive(Debug)]
 pub struct ObjectCoverage {
@@ -35,8 +55,11 @@ impl ObjectCoverage {
         &self.object
     }
 
-    /// Accepts one already authenticated range for this exact object.
-    pub fn accept(&mut self, verified: &VerifiedSlice<'_>) -> Result<CoverageUpdate, Error> {
+    /// Checks one authenticated range without changing coverage.
+    ///
+    /// A new range returns a booking that the caller commits only after its
+    /// fallible destination write succeeds.
+    pub fn check(&mut self, verified: &VerifiedSlice<'_>) -> Result<CoverageCheck<'_>, Error> {
         if verified.object_id() != self.object {
             return Err(Error::new(ErrorCode::IdentityMismatch));
         }
@@ -47,8 +70,16 @@ impl ObjectCoverage {
             .check(verified.covered_offset(), length)
             .map_err(error::coverage)?
         {
-            vot_coverage::Check::Replay => Ok(CoverageUpdate::Replay),
-            vot_coverage::Check::New(booking) => {
+            vot_coverage::Check::Replay => Ok(CoverageCheck::Replay),
+            vot_coverage::Check::New(inner) => Ok(CoverageCheck::New(CoverageBooking { inner })),
+        }
+    }
+
+    /// Accepts one already authenticated range for this exact object.
+    pub fn accept(&mut self, verified: &VerifiedSlice<'_>) -> Result<CoverageUpdate, Error> {
+        match self.check(verified)? {
+            CoverageCheck::Replay => Ok(CoverageUpdate::Replay),
+            CoverageCheck::New(booking) => {
                 booking.commit();
                 Ok(CoverageUpdate::Accepted)
             }

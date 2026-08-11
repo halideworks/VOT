@@ -54,6 +54,7 @@ enum DirectBackend {
     Unsupported,
 }
 
+#[cfg(target_os = "linux")]
 enum CapabilityFailure {
     Unsupported,
     Hard(Error),
@@ -72,6 +73,24 @@ impl LinuxDirectReader {
     /// An `EINVAL` during this capability probe means the backend is unsupported.
     /// Any `EINVAL` after a successful probe is returned as a hard I/O error.
     pub fn open(path: &Path, logical_length: u64, alignment: usize) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::open_linux(path, logical_length, alignment)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Ok(Self {
+                backend: DirectBackend::Unsupported,
+                logical_length,
+                alignment,
+                buffer_size: checked_buffer_size(alignment)?,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_linux(path: &Path, logical_length: u64, alignment: usize) -> Result<Self, Error> {
         let buffer_size = checked_buffer_size(alignment)?;
         let descriptor =
             match rustix::fs::open(path, direct_open_flags(), rustix::fs::Mode::empty()) {
@@ -160,10 +179,12 @@ impl ReadBack for LinuxDirectReader {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn io_error(error: rustix::io::Errno) -> Error {
     Error::Io(std::io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
+#[cfg(target_os = "linux")]
 fn direct_open_flags() -> rustix::fs::OFlags {
     let mut flags = rustix::fs::OFlags::RDONLY;
     flags.insert(rustix::fs::OFlags::DIRECT);
@@ -188,6 +209,7 @@ fn short_read() -> Error {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn capability_unsupported(error: rustix::io::Errno) -> bool {
     matches!(
         error,
@@ -195,6 +217,7 @@ fn capability_unsupported(error: rustix::io::Errno) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn classify_open_failure(error: rustix::io::Errno) -> CapabilityFailure {
     if capability_unsupported(error) {
         CapabilityFailure::Unsupported
@@ -203,6 +226,7 @@ fn classify_open_failure(error: rustix::io::Errno) -> CapabilityFailure {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn classify_probe_failure(error: std::io::Error) -> CapabilityFailure {
     let unsupported = error.raw_os_error().is_some_and(|raw| {
         matches!(
@@ -396,6 +420,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn direct_flags_and_capability_classification_are_exact() {
         let flags = direct_open_flags();
@@ -436,6 +461,26 @@ mod tests {
             CapabilityFailure::Hard(Error::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound
         ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn direct_reader_is_explicitly_unsupported_off_linux() {
+        let missing = path();
+        let reader = LinuxDirectReader::open(&missing, 6, 4096).unwrap();
+        assert_eq!(
+            reader.hash(Suite::Blake3Bao64).unwrap(),
+            DirectHash::Unsupported
+        );
+
+        let staged_path = path();
+        fs::write(&staged_path, b"staged").unwrap();
+        let staged = File::open(&staged_path).unwrap();
+        assert_eq!(
+            reader.identity(&staged).unwrap(),
+            DirectIdentity::Unsupported
+        );
+        fs::remove_file(staged_path).unwrap();
     }
 
     fn durable_machine() -> Machine {

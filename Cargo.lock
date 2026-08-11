@@ -2431,6 +2431,7 @@ dependencies = [
  "vot-commit-model",
  "vot-commit-strict",
  "vot-journal",
+ "vot-platform-fs",
 ]
 
 [[package]]
@@ -2452,6 +2453,7 @@ name = "vot-journal"
 version = "0.0.1"
 dependencies = [
  "fs4",
+ "vot-platform-fs",
 ]
 
 [[package]]
@@ -2516,6 +2518,7 @@ dependencies = [
 name = "vot-platform-fs"
 version = "0.0.1"
 dependencies = [
+ "rustix",
  "windows-sys 0.61.2",
 ]
 
@@ -2638,6 +2641,21 @@ dependencies = [
  "vot-receipt",
  "vot-resume-core",
  "vot-verified-range",
+]
+
+[[package]]
+name = "vot-sdk-file"
+version = "0.0.1"
+dependencies = [
+ "vot-commit-model",
+ "vot-commit-platform",
+ "vot-commit-posix",
+ "vot-commit-strict",
+ "vot-journal",
+ "vot-platform-fs",
+ "vot-receipt",
+ "vot-scheduler",
+ "vot-sdk",
 ]
 
 [[package]]

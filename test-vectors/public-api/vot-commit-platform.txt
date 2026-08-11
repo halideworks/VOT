@@ -7,5 +7,6 @@ function vot_commit_platform::capabilities
 function vot_commit_platform::claim
 function vot_commit_platform::native_platform
 function vot_commit_platform::publish_native
+function vot_commit_platform::publish_native_file
 struct vot_commit_platform::Capabilities
 struct vot_commit_platform::PublicationClaim

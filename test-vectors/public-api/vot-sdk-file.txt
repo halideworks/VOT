@@ -1,0 +1,7 @@
+enum vot_sdk_file::CommitProfile
+enum vot_sdk_file::ErrorKind
+enum vot_sdk_file::RangeStatus
+struct vot_sdk_file::Acceptance
+struct vot_sdk_file::Error
+struct vot_sdk_file::NativeFile
+struct vot_sdk_file::Progress

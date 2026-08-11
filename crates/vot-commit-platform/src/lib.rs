@@ -3,9 +3,12 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io;
 use std::path::Path;
+
+#[cfg(test)]
+use std::fs;
 
 use vot_receipt::{AssuranceLevel, CommitProfile};
 
@@ -123,11 +126,46 @@ pub fn publish_native(
     destination: &Path,
     profile: CommitProfile,
 ) -> Result<PublicationClaim, Error> {
-    publish_for(native_platform(), staging, destination, profile)
+    let staging_file = vot_platform_fs::guard_staging_file(staging)?;
+    publish_native_file(&staging_file, staging, destination, profile)
 }
 
+/// Publishes a same-directory staged file bound to an already trusted handle.
+///
+/// The staging name and destination are checked against `staging_file` before
+/// publication and again before the staging name is removed. On Windows,
+/// callers must retain the no-share-delete handle returned by
+/// `vot_platform_fs::create_staging_file` or `guard_staging_file`.
+pub fn publish_native_file(
+    staging_file: &File,
+    staging: &Path,
+    destination: &Path,
+    profile: CommitProfile,
+) -> Result<PublicationClaim, Error> {
+    vot_platform_fs::validate_removal_parent(staging)?;
+    publish_file_for(
+        native_platform(),
+        staging_file,
+        staging,
+        destination,
+        profile,
+    )
+}
+
+#[cfg(test)]
 fn publish_for(
     platform: Platform,
+    staging: &Path,
+    destination: &Path,
+    profile: CommitProfile,
+) -> Result<PublicationClaim, Error> {
+    let staging_file = vot_platform_fs::guard_staging_file(staging)?;
+    publish_file_for(platform, &staging_file, staging, destination, profile)
+}
+
+fn publish_file_for(
+    platform: Platform,
+    staging_file: &File,
     staging: &Path,
     destination: &Path,
     profile: CommitProfile,
@@ -137,7 +175,7 @@ fn publish_for(
         staging,
         destination,
         profile,
-        &mut NativeOperations,
+        &mut NativeOperations { staging_file },
     )
 }
 
@@ -149,41 +187,51 @@ trait Operations {
     fn sync_parent(&mut self, path: &Path) -> Result<(), Error>;
 }
 
-struct NativeOperations;
+struct NativeOperations<'a> {
+    staging_file: &'a File,
+}
 
-impl Operations for NativeOperations {
-    fn sync_file(&mut self, path: &Path) -> Result<(), Error> {
-        File::open(path)?.sync_all()?;
+impl Operations for NativeOperations<'_> {
+    fn sync_file(&mut self, _path: &Path) -> Result<(), Error> {
+        self.staging_file.sync_all()?;
         Ok(())
     }
 
-    fn same_file(&mut self, source: &Path, destination: &Path) -> Result<bool, Error> {
-        vot_platform_fs::same_file_regular(source, destination).map_err(Error::Io)
+    fn same_file(&mut self, _source: &Path, destination: &Path) -> Result<bool, Error> {
+        vot_platform_fs::same_file_handle(self.staging_file, destination).map_err(Error::Io)
     }
 
     fn link(&mut self, source: &Path, destination: &Path) -> Result<(), Error> {
-        fs::hard_link(source, destination)?;
+        vot_platform_fs::link_file_handle(self.staging_file, source, destination)?;
         Ok(())
     }
 
     fn remove(&mut self, path: &Path) -> Result<(), Error> {
-        fs::remove_file(path)?;
+        vot_platform_fs::remove_file_handle(self.staging_file, path)?;
         Ok(())
     }
 
     fn sync_parent(&mut self, path: &Path) -> Result<(), Error> {
-        #[cfg(unix)]
-        {
-            let parent = path.parent().ok_or(Error::InvalidLayout)?;
-            File::open(parent)?.sync_all()?;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(Error::UnsupportedPlatform)
-        }
+        let parent = containing_directory(path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
     }
+}
+
+fn containing_directory(path: &Path) -> Result<&Path, Error> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .or_else(|| path.file_name().map(|_| Path::new(".")))
+        .ok_or(Error::InvalidLayout)
+}
+
+fn validate_layout(staging: &Path, destination: &Path) -> Result<(), Error> {
+    if containing_directory(staging)? != containing_directory(destination)?
+        || staging.file_name() == destination.file_name()
+    {
+        return Err(Error::InvalidLayout);
+    }
+    Ok(())
 }
 
 fn publish_with(
@@ -194,22 +242,27 @@ fn publish_with(
     operations: &mut impl Operations,
 ) -> Result<PublicationClaim, Error> {
     let claim = claim(platform, profile)?;
-    if staging.parent() != destination.parent() || staging == destination {
+    validate_layout(staging, destination)?;
+    if !operations.same_file(staging, staging)? {
         return Err(Error::InvalidLayout);
     }
     if profile == CommitProfile::Balanced {
         operations.sync_file(staging)?;
     }
-    let already_linked = matches!(platform, Platform::Windows | Platform::MacOs)
-        && operations.same_file(staging, destination)?;
-    if !already_linked {
+    if !operations.same_file(staging, destination)? {
         operations.link(staging, destination)?;
+    }
+    if !operations.same_file(staging, destination)? {
+        return Err(Error::InvalidLayout);
     }
     if platform == Platform::MacOs {
         operations.sync_parent(destination)?;
         if !operations.same_file(staging, destination)? {
             return Err(Error::InvalidLayout);
         }
+    }
+    if !operations.same_file(staging, staging)? {
+        return Err(Error::InvalidLayout);
     }
     operations.remove(staging)?;
     Ok(claim)
@@ -219,9 +272,26 @@ fn publish_with(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn directory(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("vot-platform-{}-{name}", std::process::id()))
+        let path = std::env::temp_dir().join(format!(
+            "vot-platform-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&path).unwrap();
+        path
     }
 
     #[derive(Default)]
@@ -236,9 +306,14 @@ mod tests {
             Ok(())
         }
 
-        fn same_file(&mut self, _source: &Path, _destination: &Path) -> Result<bool, Error> {
-            self.trace.push("same-file");
-            Ok(self.linked)
+        fn same_file(&mut self, source: &Path, destination: &Path) -> Result<bool, Error> {
+            if source == destination {
+                self.trace.push("same-staging");
+                Ok(true)
+            } else {
+                self.trace.push("same-destination");
+                Ok(self.linked)
+            }
         }
 
         fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
@@ -274,6 +349,8 @@ mod tests {
     struct FaultOperations {
         trace: Vec<&'static str>,
         linked: bool,
+        same_file_results: Vec<bool>,
+        same_file_index: usize,
         sync_behavior: SyncBehavior,
         remove_behavior: RemoveBehavior,
         removed: bool,
@@ -287,7 +364,9 @@ mod tests {
 
         fn same_file(&mut self, _source: &Path, _destination: &Path) -> Result<bool, Error> {
             self.trace.push("same-file");
-            Ok(self.linked)
+            let result = self.same_file_results[self.same_file_index];
+            self.same_file_index += 1;
+            Ok(result)
         }
 
         fn link(&mut self, _source: &Path, _destination: &Path) -> Result<(), Error> {
@@ -362,7 +441,6 @@ mod tests {
     #[test]
     fn macos_balanced_claim_follows_native_commit_operations() {
         let root = directory("macos");
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"verified bytes").unwrap();
@@ -379,18 +457,48 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn handle_bound_publication_rejects_a_swapped_staging_name() {
+        let root = directory("handle-bound-swap");
+        let staging = root.join("staging");
+        let trusted_alias = root.join("trusted-alias");
+        let destination = root.join("published");
+        fs::write(&staging, b"verified bytes").unwrap();
+        let held = File::open(&staging).unwrap();
+        fs::hard_link(&staging, &trusted_alias).unwrap();
+        fs::remove_file(&staging).unwrap();
+        fs::write(&staging, b"replacement bytes").unwrap();
+
+        assert!(matches!(
+            publish_file_for(
+                Platform::MacOs,
+                &held,
+                &staging,
+                &destination,
+                CommitProfile::Balanced,
+            ),
+            Err(Error::InvalidLayout)
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(trusted_alias).unwrap(), b"verified bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn native_same_file_identity_is_exact() {
         let root = directory("same-file");
-        fs::create_dir(&root).unwrap();
         let source = root.join("source");
         let linked = root.join("linked");
         let other = root.join("other");
         fs::write(&source, b"source").unwrap();
         fs::hard_link(&source, &linked).unwrap();
         fs::write(&other, b"other").unwrap();
-        let mut operations = NativeOperations;
+        let source_file = File::open(&source).unwrap();
+        let mut operations = NativeOperations {
+            staging_file: &source_file,
+        };
         assert!(operations.same_file(&source, &linked).unwrap());
         assert!(!operations.same_file(&source, &other).unwrap());
         #[cfg(unix)]
@@ -418,10 +526,34 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn public_file_publisher_rejects_unsafe_parent_before_linking() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = directory("unsafe-parent");
+        let staging = root.join("staging");
+        let destination = root.join("published");
+        fs::write(&staging, b"verified bytes").unwrap();
+        let file = File::open(&staging).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(matches!(
+            publish_native_file(
+                &file,
+                &staging,
+                &destination,
+                CommitProfile::Fast
+            ),
+            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(!destination.exists());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn publication_is_no_overwrite_and_profile_checked_first() {
         let root = directory("no-overwrite");
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"new").unwrap();
@@ -450,7 +582,33 @@ mod tests {
             publish_for(Platform::Windows, &staging, &staging, CommitProfile::Fast),
             Err(Error::InvalidLayout)
         ));
+        assert!(matches!(
+            publish_for(
+                Platform::Windows,
+                &staging,
+                &root.join("other").join("published"),
+                CommitProfile::Fast
+            ),
+            Err(Error::InvalidLayout)
+        ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bare_relative_paths_use_the_current_directory_layout() {
+        assert_eq!(
+            containing_directory(Path::new("object")).unwrap(),
+            Path::new(".")
+        );
+        assert!(validate_layout(Path::new("./stage"), Path::new("object")).is_ok());
+        assert!(matches!(
+            validate_layout(Path::new("./object"), Path::new("object")),
+            Err(Error::InvalidLayout)
+        ));
+        assert!(matches!(
+            validate_layout(Path::new("other/stage"), Path::new("object")),
+            Err(Error::InvalidLayout)
+        ));
     }
 
     #[test]
@@ -466,7 +624,17 @@ mod tests {
             &mut windows,
         )
         .unwrap();
-        assert_eq!(windows.trace, ["same-file", "link", "remove"]);
+        assert_eq!(
+            windows.trace,
+            [
+                "same-staging",
+                "same-destination",
+                "link",
+                "same-destination",
+                "same-staging",
+                "remove",
+            ]
+        );
 
         let mut macos = RecordingOperations::default();
         publish_with(
@@ -480,11 +648,14 @@ mod tests {
         assert_eq!(
             macos.trace,
             [
+                "same-staging",
                 "sync-file",
-                "same-file",
+                "same-destination",
                 "link",
+                "same-destination",
                 "sync-parent",
-                "same-file",
+                "same-destination",
+                "same-staging",
                 "remove",
             ]
         );
@@ -495,6 +666,8 @@ mod tests {
         let mut operations = FaultOperations {
             trace: Vec::new(),
             linked: false,
+            same_file_results: vec![true, false, true, true, true, true, true, true],
+            same_file_index: 0,
             sync_behavior: SyncBehavior::Fail,
             remove_behavior: RemoveBehavior::Succeed,
             removed: false,
@@ -524,13 +697,18 @@ mod tests {
         assert_eq!(
             operations.trace,
             [
+                "same-file",
                 "sync-file",
                 "same-file",
                 "link",
-                "sync-parent",
-                "sync-file",
                 "same-file",
                 "sync-parent",
+                "same-file",
+                "sync-file",
+                "same-file",
+                "same-file",
+                "sync-parent",
+                "same-file",
                 "same-file",
                 "remove",
             ]
@@ -542,6 +720,8 @@ mod tests {
         let mut replaced = FaultOperations {
             trace: Vec::new(),
             linked: false,
+            same_file_results: vec![true, false, true, false],
+            same_file_index: 0,
             sync_behavior: SyncBehavior::ReplaceDestination,
             remove_behavior: RemoveBehavior::Succeed,
             removed: false,
@@ -560,10 +740,60 @@ mod tests {
     }
 
     #[test]
+    fn publication_rejects_destination_identity_loss_after_link() {
+        let mut operations = FaultOperations {
+            trace: Vec::new(),
+            linked: false,
+            same_file_results: vec![true, false, false],
+            same_file_index: 0,
+            sync_behavior: SyncBehavior::Succeed,
+            remove_behavior: RemoveBehavior::Succeed,
+            removed: false,
+        };
+        assert!(matches!(
+            publish_with(
+                Platform::Windows,
+                Path::new("root/staging"),
+                Path::new("root/destination"),
+                CommitProfile::Fast,
+                &mut operations,
+            ),
+            Err(Error::InvalidLayout)
+        ));
+        assert!(!operations.removed);
+    }
+
+    #[test]
+    fn publication_rejects_staging_identity_loss_before_cleanup() {
+        let mut operations = FaultOperations {
+            trace: Vec::new(),
+            linked: false,
+            same_file_results: vec![true, false, true, false],
+            same_file_index: 0,
+            sync_behavior: SyncBehavior::Succeed,
+            remove_behavior: RemoveBehavior::Succeed,
+            removed: false,
+        };
+        assert!(matches!(
+            publish_with(
+                Platform::Windows,
+                Path::new("root/staging"),
+                Path::new("root/destination"),
+                CommitProfile::Fast,
+                &mut operations,
+            ),
+            Err(Error::InvalidLayout)
+        ));
+        assert!(!operations.removed);
+    }
+
+    #[test]
     fn windows_cleanup_failure_recovers_the_existing_link() {
         let mut operations = FaultOperations {
             trace: Vec::new(),
             linked: false,
+            same_file_results: vec![true, false, true, true, true, true, true, true],
+            same_file_index: 0,
             sync_behavior: SyncBehavior::Succeed,
             remove_behavior: RemoveBehavior::Fail,
             removed: false,
@@ -592,7 +822,19 @@ mod tests {
         assert!(operations.removed);
         assert_eq!(
             operations.trace,
-            ["same-file", "link", "remove", "same-file", "remove"]
+            [
+                "same-file",
+                "same-file",
+                "link",
+                "same-file",
+                "same-file",
+                "remove",
+                "same-file",
+                "same-file",
+                "same-file",
+                "same-file",
+                "remove",
+            ]
         );
     }
 
@@ -621,8 +863,6 @@ mod tests {
     #[test]
     fn native_provider_publishes_at_its_claimed_level() {
         let root = directory("native");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"verified bytes").unwrap();

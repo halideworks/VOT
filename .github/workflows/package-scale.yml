@@ -26,8 +26,6 @@ jobs:
     name: package builder 1 TiB
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      VOT_TEST_TEMP: ${{ runner.temp }}/vot-package-scale
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -37,6 +35,8 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Run bounded-memory package scale evidence
+        env:
+          VOT_TEST_TEMP: ${{ runner.temp }}/vot-package-scale
         run: >-
           cargo +1.88.0 test -p vot-package --test package_builder_scale
           --locked -- --ignored --exact

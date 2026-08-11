@@ -167,6 +167,10 @@ visibility to the same state machine. A successful HTTP response alone is not a
 durability or integrity guarantee; the provider profile declares the exact
 backend semantics relied upon.
 
+Multipart completion, metadata observation, and full readback are distinct
+operations. Metadata observation MUST NOT read the object body, and neither
+metadata nor completion alone is at-rest verification evidence.
+
 Multipart mismatch, failed completion, or ambiguous timeout enters poisoning or
 recovery as declared by whether prior state can be proven. Active authenticated
 leases prevent orphan collection during recovery.

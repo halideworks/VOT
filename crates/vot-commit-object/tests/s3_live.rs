@@ -2,7 +2,7 @@
 
 use vot_commit_object::{Error as CommitError, ObjectCommit};
 use vot_object_store::aws::AwsS3Store;
-use vot_object_store::{Error as StoreError, MockStore, S3Compatible};
+use vot_object_store::{Error as StoreError, MockStore, MultipartObjectStore};
 
 #[test]
 fn minio_and_mock_emit_identical_assurance_receipts() {
@@ -28,8 +28,10 @@ fn minio_and_mock_emit_identical_assurance_receipts() {
     assert_eq!(live_object, mock_object);
     assert_eq!(live_receipt, mock_receipt);
     assert_eq!(
-        live.store().head(&key),
-        Some((mock_object.length, mock_object.checksum_crc32c))
+        live.store().stat_object(&key),
+        Ok(Some(vot_object_store::ObjectMetadata::new(
+            mock_object.length
+        )))
     );
     let conflict_store =
         AwsS3Store::new(&endpoint, &bucket, "us-east-1", &access_key, &secret_key).unwrap();

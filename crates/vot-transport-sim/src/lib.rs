@@ -7,7 +7,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fmt::Write as _;
 
-use vot_transport_api::{Error as TransportError, Event as TransportEvent, Payload, StreamId};
+use vot_transport_api::{
+    ChannelBinding, Error as TransportError, Event as TransportEvent, Payload, StreamId,
+};
 
 pub const MAX_SCENARIO_BYTES: usize = 1024 * 1024;
 pub const MAX_ACTIONS: usize = 4096;
@@ -133,6 +135,7 @@ fn reorder_across_lanes(delivered: &mut Vec<TransportEvent>, depth: usize) {
 pub struct SimulatorAdapter {
     submissions: VecDeque<Submission>,
     events: VecDeque<TransportEvent>,
+    channel_binding: Option<ChannelBinding>,
     next_sequence: u64,
     receive_credit: u64,
     /// What the peer said it would accept, so it bounds what is sent.
@@ -159,6 +162,7 @@ impl Default for SimulatorAdapter {
         Self {
             submissions: VecDeque::new(),
             events: VecDeque::new(),
+            channel_binding: None,
             next_sequence: 0,
             receive_credit: 0,
             control_payload_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
@@ -201,6 +205,11 @@ impl SimulatorAdapter {
     #[must_use]
     pub const fn receive_credit(&self) -> u64 {
         self.receive_credit
+    }
+
+    /// Installs the deterministic binding a featureless session test observes.
+    pub const fn set_channel_binding(&mut self, binding: ChannelBinding) {
+        self.channel_binding = Some(binding);
     }
 
     /// Reorders and duplicates one flush worth of events in place.
@@ -338,6 +347,10 @@ impl SimulatorAdapter {
 }
 
 impl vot_transport_api::TransportAdapter for SimulatorAdapter {
+    fn channel_binding(&self) -> Result<ChannelBinding, TransportError> {
+        self.channel_binding.ok_or(TransportError::Unsupported)
+    }
+
     /// Applies the peer-negotiated control-frame payload ceiling.
     ///
     /// On the trait rather than beside it. An inherent method of the same name
@@ -1562,6 +1575,20 @@ mod tests {
             Err(TransportError::RecordTooLarge),
             "one byte past the bound the peer advertised"
         );
+    }
+
+    #[test]
+    fn channel_binding_is_explicitly_injected() {
+        let mut adapter = SimulatorAdapter::default();
+        assert_eq!(
+            adapter.channel_binding(),
+            Err(TransportError::Unsupported),
+            "a featureless carrier must not invent security capability"
+        );
+
+        let binding = ChannelBinding::from_bytes([0x27; vot_transport_api::CHANNEL_BINDING_LEN]);
+        adapter.set_channel_binding(binding);
+        assert_eq!(adapter.channel_binding(), Ok(binding));
     }
 
     #[test]

@@ -13,7 +13,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use vot_transport_api::{
-    ConnectionId, Error, Event, PathStats, Payload, ReceiveLimits, StreamId, TransportAdapter,
+    CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ChannelBinding, ConnectionId, Error,
+    Event, PathStats, Payload, ReceiveLimits, StreamId, TransportAdapter,
 };
 use vot_transport_framing::{AssemblyBudget, FrameFault, Framing, StreamKind};
 
@@ -352,6 +353,7 @@ pub struct Transport {
     adapter: QuicheAdapter,
     commands: mpsc::SyncSender<Command>,
     inbound: Arc<Mutex<Inbound>>,
+    channel_binding: Arc<Mutex<Option<ChannelBinding>>>,
     /// The most recent path sample the driver read. Copied into the adapter
     /// before events are drained, so the disconnect that clears it is seen after
     /// the sample it belongs to rather than before.
@@ -462,10 +464,12 @@ impl Transport {
         // submission queued rather than dropped.
         let (commands, receiver) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
         let path = Arc::new(Mutex::new(None));
+        let channel_binding = Arc::new(Mutex::new(None));
         let driver_inbound = Arc::clone(&inbound);
         let driver_close = Arc::clone(&close);
         let driver_control = Arc::clone(&control_limit);
         let driver_path = Arc::clone(&path);
+        let driver_binding = Arc::clone(&channel_binding);
         let connection = ConnectionId(u64::from(local.port()));
         let datagram_bytes = config.max_datagram_bytes;
         let accept_timeout_ms = config.accept_timeout_ms;
@@ -487,10 +491,14 @@ impl Transport {
                     &driver_close,
                     &driver_control,
                     &driver_path,
+                    &driver_binding,
                     connection.0,
                     datagram_bytes,
                     accept_timeout_ms,
                 );
+                if let Ok(mut binding) = driver_binding.lock() {
+                    *binding = None;
+                }
                 // A driver that stops for any reason still owes the caller the
                 // disconnect, or the caller waits for a peer that has gone.
                 if let Ok(mut inbound) = driver_inbound.lock() {
@@ -503,6 +511,7 @@ impl Transport {
             adapter,
             commands,
             inbound,
+            channel_binding,
             path,
             close,
             held: None,
@@ -665,6 +674,11 @@ impl TransportAdapter for Transport {
         fn receive_limits() -> Option<ReceiveLimits>;
         fn path_stats() -> Option<PathStats>;
     );
+
+    fn channel_binding(&self) -> Result<ChannelBinding, Error> {
+        let binding = self.channel_binding.lock().map_err(|_| Error::Backend)?;
+        (*binding).ok_or(Error::Backend)
+    }
 
     /// Hands submissions to the driver.
     ///
@@ -829,6 +843,7 @@ fn drive(
     close: &Arc<AtomicU64>,
     control_limit: &Arc<AtomicUsize>,
     path: &Arc<Mutex<Option<PathStats>>>,
+    channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
     connection: u64,
     datagram_bytes: usize,
     accept_timeout_ms: u64,
@@ -874,6 +889,7 @@ fn drive(
         close,
         control_limit,
         path,
+        channel_binding,
         connection,
         datagram_bytes,
         buffer,
@@ -923,6 +939,7 @@ fn run(
     close: &Arc<AtomicU64>,
     control_limit: &Arc<AtomicUsize>,
     path: &Arc<Mutex<Option<PathStats>>>,
+    channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
     connection: u64,
     datagram_bytes: usize,
     mut buffer: Vec<u8>,
@@ -962,6 +979,12 @@ fn run(
         };
 
         if conn.is_established() && !announced {
+            let mut bytes = [0; CHANNEL_BINDING_LEN];
+            conn.export_keying_material(&mut bytes, CHANNEL_BINDING_EXPORTER_LABEL, None)
+                .map_err(|_| Error::Backend)?;
+            let mut binding = channel_binding.lock().map_err(|_| Error::Backend)?;
+            *binding = Some(ChannelBinding::from_bytes(bytes));
+            drop(binding);
             announced = true;
             if let Ok(mut queue) = inbound.lock() {
                 queue.push_lifecycle(NativeEvent::Connected(connection));
@@ -1447,6 +1470,7 @@ fn accept_routed(
     let (commands, submissions) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
     let (router_side, packets) = mpsc::sync_channel(ROUTED_READS);
     let path = Arc::new(Mutex::new(None));
+    let channel_binding = Arc::new(Mutex::new(None));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
@@ -1456,6 +1480,7 @@ fn accept_routed(
     let pump_close = Arc::clone(&close);
     let pump_control = Arc::clone(&control_limit);
     let pump_path = Arc::clone(&path);
+    let pump_binding = Arc::clone(&channel_binding);
     let pump_done = Arc::clone(&done);
     let driver = std::thread::Builder::new()
         .name(format!("vot-quiche-{}-{index}", local.port()))
@@ -1473,12 +1498,16 @@ fn accept_routed(
                 &pump_close,
                 &pump_control,
                 &pump_path,
+                &pump_binding,
                 connection.0,
                 datagram_bytes,
                 buffer,
                 out,
                 offload_available(),
             );
+            if let Ok(mut binding) = pump_binding.lock() {
+                *binding = None;
+            }
             // However the pump ends, the router stops routing to it and
             // the caller still hears the disconnect.
             pump_done.store(true, Ordering::Relaxed);
@@ -1493,6 +1522,7 @@ fn accept_routed(
             adapter,
             commands,
             inbound,
+            channel_binding,
             path,
             close,
             held: None,
@@ -3053,6 +3083,22 @@ mod tests {
         assert!(
             carried.contains(&hello),
             "the frame sent before the handshake was lost"
+        );
+    }
+
+    #[test]
+    fn connected_peers_expose_the_same_channel_binding() {
+        let (client, server) = pair();
+        assert!(client.connected_within(Duration::from_secs(5)));
+        assert!(server.connected_within(Duration::from_secs(5)));
+
+        let client_binding = client.channel_binding().expect("client binding");
+        let server_binding = server.channel_binding().expect("server binding");
+        assert_eq!(client_binding, server_binding);
+        assert_ne!(
+            client_binding.as_bytes(),
+            &[0; CHANNEL_BINDING_LEN],
+            "the carrier returned an uninitialized binding"
         );
     }
 

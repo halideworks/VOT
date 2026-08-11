@@ -10,6 +10,8 @@ pub const MIN_CONTROL_FRAME_PAYLOAD: usize = vot_codec::MIN_CONTROL_FRAME_PAYLOA
 pub const MAX_CONTROL_FRAME_PAYLOAD: usize = vot_codec::DEFAULT_MAX_UNKNOWN_PAYLOAD;
 pub const MAX_DATA_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_DATAGRAM_BYTES: usize = 64 * 1024;
+pub const CHANNEL_BINDING_LEN: usize = 32;
+pub const CHANNEL_BINDING_EXPORTER_LABEL: &[u8] = b"EXPORTER-VOT-Channel-Binding";
 /// A VOT frame has at most two eight-byte QUIC-varint envelope fields.
 pub const MAX_FRAME_ENVELOPE_BYTES: usize = 16;
 pub const MAX_CONTROL_FRAME_WIRE_BYTES: usize =
@@ -27,6 +29,28 @@ pub struct SubjectId {
     pub suite: u16,
     pub root: [u8; 32],
     pub length: u64,
+}
+
+/// Carrier-derived material that binds authentication to one connection.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ChannelBinding([u8; CHANNEL_BINDING_LEN]);
+
+impl ChannelBinding {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; CHANNEL_BINDING_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; CHANNEL_BINDING_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ChannelBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ChannelBinding([redacted])")
+    }
 }
 
 /// A transport acknowledgement is delivery evidence only.
@@ -196,6 +220,15 @@ impl EventSignal {
 }
 
 pub trait TransportAdapter {
+    /// Returns material that identifies this connected carrier session.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unsupported`] when the carrier cannot derive a binding,
+    /// and a backend error when a supporting carrier is not connected.
+    fn channel_binding(&self) -> Result<ChannelBinding, Error> {
+        Err(Error::Unsupported)
+    }
+
     /// # Errors
     /// Reports a backend or protocol limit failure.
     fn send_control(&mut self, frame: &[u8]) -> Result<(), Error>;
@@ -876,6 +909,13 @@ mod tests {
     }
 
     #[test]
+    fn channel_binding_is_fixed_width_and_redacted() {
+        let binding = ChannelBinding::from_bytes([0x27; CHANNEL_BINDING_LEN]);
+        assert_eq!(binding.as_bytes(), &[0x27; CHANNEL_BINDING_LEN]);
+        assert_eq!(format!("{binding:?}"), "ChannelBinding([redacted])");
+    }
+
+    #[test]
     fn default_transport_methods_delegate_and_bound_batches() {
         assert_eq!(ALPN, b"vot-draft-05");
         assert_eq!(
@@ -888,6 +928,7 @@ mod tests {
         assert_eq!(&*payload, b"control");
 
         let mut adapter = ContractAdapter::default();
+        assert_eq!(adapter.channel_binding(), Err(Error::Unsupported));
         adapter.send_control_shared(payload).unwrap();
         assert_eq!(adapter.controls, vec![b"control".to_vec()]);
 

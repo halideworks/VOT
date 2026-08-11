@@ -1,0 +1,45 @@
+name: pure-wasm
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && 'full-sweep' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pure-wasm:
+    name: pure wasm (${{ matrix.package }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - vot-verified-range
+          - vot-resume-core
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.88.0 --profile minimal
+          --target wasm32-unknown-unknown
+
+      - name: Check pure crate
+        run: >-
+          cargo +1.88.0 check --package "${{ matrix.package }}"
+          --target wasm32-unknown-unknown --locked

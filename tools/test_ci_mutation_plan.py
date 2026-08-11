@@ -54,6 +54,13 @@ class MutationPlanTests(unittest.TestCase):
             [{"package": "vot-object-store", "required": True, "features": "s3-live"}],
         )
 
+    def test_crate_manifest_selects_only_its_package(self) -> None:
+        result = plan(["crates/vot-object-store/Cargo.toml"])
+        self.assertEqual(
+            result["packages"],
+            [{"package": "vot-object-store", "required": True, "features": "s3-live"}],
+        )
+
     def test_feature_gated_live_sources_select_their_own_jobs(self) -> None:
         quiche = plan(["crates/vot-transport-quiche/src/live.rs"])
         self.assertTrue(quiche["quiche"])
@@ -84,6 +91,20 @@ class MutationPlanTests(unittest.TestCase):
             {"packages": [], "wire": [], "quiche": False, "msquic": False},
         )
 
+    def test_pure_wasm_and_workspace_metadata_start_no_mutation_jobs(self) -> None:
+        self.assertEqual(
+            plan(
+                [
+                    ".github/workflows/pure-wasm.yml",
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    "test-vectors/public-api/vot-verified-range.txt",
+                    "tools/ci_mutation_packages.py",
+                ]
+            ),
+            {"packages": [], "wire": [], "quiche": False, "msquic": False},
+        )
+
     def test_registry_change_plus_crate_source_selects_only_that_package(self) -> None:
         result = plan(
             [
@@ -102,8 +123,10 @@ class MutationPlanTests(unittest.TestCase):
                 "tools/ci_mutation_packages.py",
                 "Cargo.toml",
                 "Cargo.lock",
+                ".github/workflows/pure-wasm.yml",
                 "crates/vot-object-store/Cargo.toml",
                 "crates/vot-object-store/src/lib.rs",
+                "test-vectors/public-api/vot-object-store.txt",
             ]
         )
         self.assertEqual(

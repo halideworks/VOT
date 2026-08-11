@@ -52,7 +52,9 @@ MSQUIC_EVIDENCE = "test-vectors/mutants/the_live_transport_is_mutation_tested.md
 def _package(path: str) -> str | None:
     parts = path.split("/")
     if len(parts) >= 3 and parts[0] == "crates" and parts[1] in PACKAGES:
-        if parts[-1].endswith(".rs"):
+        if parts[-1].endswith(".rs") or (
+            len(parts) == 3 and parts[2] == "Cargo.toml"
+        ):
             return parts[1]
     return None
 

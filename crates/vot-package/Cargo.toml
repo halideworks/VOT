@@ -11,5 +11,8 @@ blake3 = { workspace = true, features = ["std"] }
 vot-manifest = { path = "../vot-manifest" }
 vot-verifier = { path = "../vot-verifier" }
 
+[dev-dependencies]
+cap = "=0.1.2"
+
 [lints]
 workspace = true

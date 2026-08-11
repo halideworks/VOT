@@ -165,22 +165,25 @@ fn map_read_error(error: &io::Error) -> StoreError {
     }
 }
 
-#[cfg(unix)]
 fn read_some_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::unix::fs::FileExt as _;
-    file.read_at(bytes, offset)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt as _;
+        file.read_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt as _;
+        file.seek_read(bytes, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut file = file.try_clone()?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(bytes)
+    }
 }
 
-#[cfg(windows)]
-fn read_some_at_windows(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-    use std::os::windows::fs::FileExt as _;
-    file.seek_read(bytes, offset)
-}
-
-#[cfg(windows)]
-use read_some_at_windows as read_some_at;
-
-#[cfg(any(unix, windows))]
 fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     read_exact_with(bytes, offset, |bytes, offset| {
         read_some_at(file, bytes, offset)
@@ -216,32 +219,25 @@ fn read_exact_with(
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
-fn read_exact_at_unsupported(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(bytes)
-}
-
-#[cfg(not(any(unix, windows)))]
-use read_exact_at_unsupported as read_exact_at;
-
-#[cfg(unix)]
 fn write_some_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
-    use std::os::unix::fs::FileExt as _;
-    file.write_at(bytes, offset)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt as _;
+        file.write_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt as _;
+        file.seek_write(bytes, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut file = file.try_clone()?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write(bytes)
+    }
 }
 
-#[cfg(windows)]
-fn write_some_at_windows(file: &File, bytes: &[u8], offset: u64) -> io::Result<usize> {
-    use std::os::windows::fs::FileExt as _;
-    file.seek_write(bytes, offset)
-}
-
-#[cfg(windows)]
-use write_some_at_windows as write_some_at;
-
-#[cfg(any(unix, windows))]
 fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
     write_all_with(bytes, offset, |bytes, offset| {
         write_some_at(file, bytes, offset)
@@ -265,16 +261,6 @@ fn write_all_with(
     }
     Ok(())
 }
-
-#[cfg(not(any(unix, windows)))]
-fn write_all_at_unsupported(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(any(unix, windows)))]
-use write_all_at_unsupported as write_all_at;
 
 #[cfg(test)]
 mod tests {

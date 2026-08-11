@@ -1,0 +1,60 @@
+name: proof-store-native
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/proof-store-native.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/vot-journal/**"
+      - "crates/vot-manifest/**"
+      - "crates/vot-object/**"
+      - "crates/vot-proof-blake3/**"
+      - "crates/vot-proof-catalog/**"
+      - "crates/vot-proof-sha256/**"
+      - "crates/vot-proof-store/**"
+      - "crates/vot-proof-store-file/**"
+      - "crates/vot-verifier/**"
+  pull_request:
+    paths:
+      - ".github/workflows/proof-store-native.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/vot-journal/**"
+      - "crates/vot-manifest/**"
+      - "crates/vot-object/**"
+      - "crates/vot-proof-blake3/**"
+      - "crates/vot-proof-catalog/**"
+      - "crates/vot-proof-sha256/**"
+      - "crates/vot-proof-store/**"
+      - "crates/vot-proof-store-file/**"
+      - "crates/vot-verifier/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  native:
+    name: native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Test native proof storage
+        run: cargo +1.88.0 test -p vot-proof-store-file --locked

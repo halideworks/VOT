@@ -1,0 +1,43 @@
+name: package-scale
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/package-scale.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/vot-manifest/**"
+      - "crates/vot-package/**"
+      - "crates/vot-verifier/**"
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package-builder:
+    name: package builder 1 TiB
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      VOT_TEST_TEMP: ${{ runner.temp }}/vot-package-scale
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Run bounded-memory package scale evidence
+        run: >-
+          cargo +1.88.0 test -p vot-package --test package_builder_scale
+          --locked -- --ignored --exact
+          million_entry_package_stays_below_allocation_cap --nocapture

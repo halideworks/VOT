@@ -1,9 +1,11 @@
 //! Authentication schemes and their signature operations.
 
 use super::{
-    DOMAIN, Digest, Error, Hmac, KeyInit, Mac, Receipt, Sha256, Signature, Signer, SigningKey,
-    VerifiedBy, VerifiedReceipt, VerifyingKey, encode_authenticated,
+    DOMAIN, Digest, Error, Receipt, Sha256, Signature, Signer, SigningKey, VerifiedBy,
+    VerifiedReceipt, VerifyingKey, encode_authenticated,
 };
+#[cfg(any(feature = "hmac", test))]
+use super::{Hmac, KeyInit, Mac};
 
 /// Registered receipt authentication schemes.
 ///
@@ -147,6 +149,7 @@ pub fn verify_ed25519(
 ///
 /// # Errors
 /// Rejects an invalid receipt, key identifier, or short key.
+#[cfg(any(feature = "hmac", test))]
 pub fn authenticate_hmac_sha256(
     receipt: Receipt,
     key_id: &[u8],
@@ -170,6 +173,7 @@ pub fn authenticate_hmac_sha256(
 /// # Errors
 /// Rejects a receipt authenticated under another scheme, a short key, or a MAC
 /// that does not verify.
+#[cfg(any(feature = "hmac", test))]
 pub fn verify_hmac_sha256(
     receipt: &AuthenticatedReceipt,
     key: &[u8],

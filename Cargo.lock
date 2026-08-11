@@ -2379,6 +2379,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-coverage"
+version = "0.0.1"
+
+[[package]]
 name = "vot-journal"
 version = "0.0.1"
 dependencies = [
@@ -2540,6 +2544,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "vot-codec",
+ "vot-coverage",
  "vot-platform-fs",
  "vot-proof-blake3",
  "vot-proof-sha256",

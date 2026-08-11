@@ -16,6 +16,7 @@ PACKAGES = (
     "vot-proof-sha256",
     "vot-proof-catalog",
     "vot-verified-range",
+    "vot-coverage",
     "vot-codec",
     "vot-verifier",
     "vot-manifest",

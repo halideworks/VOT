@@ -1,0 +1,5 @@
+constant vot_coverage::MAX_FRAGMENTS
+enum vot_coverage::Check
+enum vot_coverage::Error
+struct vot_coverage::Booking
+struct vot_coverage::Coverage

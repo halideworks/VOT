@@ -1,9 +1,9 @@
 //! Root-verified receive state, keyed by subject identity.
 
 use super::{
-    BTreeMap, BTreeSet, ConnectionId, Error, PathStats, RangeSink, RangeState, SinkError,
+    BTreeMap, BTreeSet, Check, ConnectionId, Error, PathStats, RangeSink, RangeState, SinkError,
     StagingCapacity, StreamVerifier, SubjectId, TransportAck, VERIFIER_RESERVATION,
-    assemble_ordered, check_range_proof, subject_id, suite, validate_typed_bundle,
+    assemble_ordered, check_range_proof, coverage_error, subject_id, suite, validate_typed_bundle,
     verify_typed_bundle,
 };
 
@@ -119,14 +119,7 @@ impl ReliableReceiver {
         }
         self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        self.range_active.insert(
-            subject,
-            RangeState {
-                extents: BTreeMap::new(),
-                bytes: 0,
-                sink,
-            },
-        );
+        self.range_active.insert(subject, RangeState::new(sink));
         Ok(())
     }
 
@@ -180,9 +173,13 @@ impl ReliableReceiver {
         let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
         let active = self
             .range_active
-            .get(&subject)
+            .get_mut(&subject)
             .ok_or(Error::UnknownObject)?;
-        let Some(booking) = active.check(covered_offset, bytes)? else {
+        let Check::New(booking) = active
+            .coverage
+            .check(covered_offset, bytes)
+            .map_err(coverage_error)?
+        else {
             return Ok(());
         };
         let reserved = if caller_reserved {
@@ -198,11 +195,7 @@ impl ReliableReceiver {
         self.peak_staging = self.peak_staging.max(hold.staging.used());
         active.sink.write_at(covered_offset, data)?;
         drop(hold);
-        let active = self
-            .range_active
-            .get_mut(&subject)
-            .ok_or(Error::UnknownObject)?;
-        active.book(covered_offset, &booking);
+        booking.commit();
         Ok(())
     }
 
@@ -222,16 +215,16 @@ impl ReliableReceiver {
         }
         let active = self
             .range_active
-            .get(&range.subject)
-            .ok_or(Error::UnknownObject)?;
-        let Some(booking) = active.check(range.covered_offset, range.bytes)? else {
-            return Ok(());
-        };
-        let active = self
-            .range_active
             .get_mut(&range.subject)
             .ok_or(Error::UnknownObject)?;
-        active.book(range.covered_offset, &booking);
+        let Check::New(booking) = active
+            .coverage
+            .check(range.covered_offset, range.bytes)
+            .map_err(coverage_error)?
+        else {
+            return Ok(());
+        };
+        booking.commit();
         Ok(())
     }
 
@@ -307,7 +300,7 @@ impl ReliableReceiver {
         let complete = self
             .range_active
             .get(&subject)
-            .map(|active| active.bytes == subject.length)
+            .map(|active| active.coverage.is_complete(subject.length))
             .ok_or(Error::UnknownObject)?;
         if !complete {
             return Err(Error::LengthMismatch);

@@ -27,6 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         package:
+          - vot-coverage
           - vot-verified-range
           - vot-resume-core
     steps:

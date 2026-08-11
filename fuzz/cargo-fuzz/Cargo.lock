@@ -611,6 +611,7 @@ version = "0.0.0"
 dependencies = [
  "cap",
  "vot-fuzz-mutator",
+ "vot-object",
  "vot-proof-catalog",
 ]
 

@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 cap = "=0.1.2"
 vot-fuzz-mutator = { path = "../mutator" }
+vot-object = { path = "../../crates/vot-object" }
 vot-proof-catalog = { path = "../../crates/vot-proof-catalog" }
 
 [workspace]

@@ -3,9 +3,10 @@
 
 #![forbid(unsafe_code)]
 
+use vot_object::{ObjectBuilder, Suite};
 use vot_proof_catalog::{
-    Error, HEADER_LENGTH, INDEX_ENTRY_LENGTH, ObjectId, RANGE_LENGTH, decode_header,
-    validate_complete,
+    CatalogEncoder, Error, HEADER_LENGTH, INDEX_ENTRY_LENGTH, ObjectId, RANGE_LENGTH,
+    decode_header, validate_complete,
 };
 
 /// Largest catalog candidate accepted by either driver.
@@ -60,9 +61,51 @@ fn vector_data(offset: u64, length: u64) -> Option<Vec<u8>> {
     )
 }
 
-/// Exercises complete and selected-entry catalog parsing with bounded input and
-/// at most one fixed-size profile range of synthesized object data.
+fn exercise_multi_record_encoder(input: &[u8]) {
+    const CHUNK_LENGTH: usize = 64 * 1024;
+
+    let selected = selector(input);
+    let suite = if selected & 0x100 == 0 {
+        Suite::Blake3Bao64
+    } else {
+        Suite::Sha256Bep52
+    };
+    let final_record_length = 1 + (selected >> 16) % CHUNK_LENGTH as u64;
+    let object_length = RANGE_LENGTH + final_record_length;
+    let mut builder = ObjectBuilder::new(suite, Some(object_length)).unwrap();
+    let chunk = vec![selected as u8; CHUNK_LENGTH];
+    let mut remaining = object_length;
+    while remaining != 0 {
+        let length = usize::try_from(remaining.min(CHUNK_LENGTH as u64)).unwrap();
+        builder.update(&chunk[..length]).unwrap();
+        remaining -= length as u64;
+    }
+    let prepared = builder.finish().unwrap();
+    let mut encoder = CatalogEncoder::new(&prepared).unwrap();
+    let mut proof_offset = HEADER_LENGTH as u64 + 2 * INDEX_ENTRY_LENGTH as u64;
+    for ordinal in 0..2 {
+        let record = encoder.next_record().unwrap().unwrap();
+        assert_eq!(record.ordinal(), ordinal);
+        assert_eq!(
+            record.index_offset(),
+            HEADER_LENGTH as u64 + ordinal * INDEX_ENTRY_LENGTH as u64
+        );
+        assert_eq!(record.proof_offset(), proof_offset);
+        proof_offset += u64::try_from(record.proof().len()).unwrap();
+    }
+    assert!(encoder.next_record().unwrap().is_none());
+    let finished = encoder.finish().unwrap();
+    assert_eq!(finished.record_count(), 2);
+    assert_eq!(finished.catalog_length(), proof_offset);
+}
+
+/// Exercises complete and selected-entry parsing with bounded input and a
+/// sparsely selected synthesized object slightly larger than one profile range.
 pub fn exercise(input: &[u8]) {
+    if selector(input) & 0xff == 0 {
+        exercise_multi_record_encoder(input);
+    }
+
     let Some(expected) = expected_identity(input) else {
         return;
     };
@@ -101,7 +144,7 @@ pub fn exercise(input: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::exercise;
+    use super::{exercise, exercise_multi_record_encoder};
 
     #[test]
     fn degenerate_inputs_do_not_panic() {
@@ -114,5 +157,10 @@ mod tests {
     fn committed_suite_catalogs_do_not_panic() {
         exercise(include_bytes!("../corpus/blake3-65537.bin"));
         exercise(include_bytes!("../corpus/sha256-65537.bin"));
+    }
+
+    #[test]
+    fn sparse_multi_record_encoder_path_is_bounded() {
+        exercise_multi_record_encoder(&[0; 8]);
     }
 }

@@ -6,7 +6,7 @@ mod decode;
 mod encode;
 
 pub use decode::{CatalogHeader, SelectedEntry, decode_header, validate_complete};
-pub use encode::encode;
+pub use encode::{CatalogEncoder, CatalogRecord, FinishedCatalog, encode};
 pub use vot_object::ObjectId;
 
 pub const HEADER_LENGTH: usize = 128;

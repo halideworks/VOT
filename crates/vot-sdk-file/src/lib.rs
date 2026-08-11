@@ -370,7 +370,15 @@ fn destination_parent(destination: &Path) -> Result<&Path, Error> {
 fn reject_existing(path: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(Error::plain(ErrorKind::AlreadyExists)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            destination_parent(path)?;
+            Ok(())
+        }
         Err(error) => Err(Error::io(error)),
     }
 }
@@ -671,6 +679,12 @@ mod tests {
         );
         assert_eq!(
             reject_existing(&missing.join("child")).unwrap_err().kind(),
+            ErrorKind::InvalidDestination
+        );
+        assert_eq!(
+            reject_existing(Path::new("invalid\0destination"))
+                .unwrap_err()
+                .kind(),
             ErrorKind::Io
         );
         fs::remove_dir_all(directory).unwrap();

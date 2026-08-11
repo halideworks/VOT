@@ -219,6 +219,8 @@ pub fn same_file_regular_windows_create(path: &Path) -> io::Result<File> {
     };
 
     std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .create_new(true)
         .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)

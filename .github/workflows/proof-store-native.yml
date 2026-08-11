@@ -80,3 +80,7 @@ jobs:
       - name: Test strict unsupported path
         if: runner.os == 'macOS'
         run: cargo +1.88.0 test -p vot-commit-strict --locked
+
+      - name: Test Windows platform file handles
+        if: runner.os == 'Windows'
+        run: cargo +1.88.0 test -p vot-platform-fs --locked

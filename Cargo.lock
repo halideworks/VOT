@@ -2473,6 +2473,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-proof-catalog"
+version = "0.0.1"
+dependencies = [
+ "vot-object",
+ "vot-proof-blake3",
+ "vot-proof-sha256",
+]
+
+[[package]]
 name = "vot-proof-sha256"
 version = "0.0.1"
 dependencies = [

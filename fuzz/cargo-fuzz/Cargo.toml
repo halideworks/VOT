@@ -13,6 +13,7 @@ cap = "=0.1.2"
 libfuzzer-sys = "=0.4.13"
 vot-frame-fuzz-driver = { path = "../frame_codec" }
 vot-manifest-fuzz-driver = { path = "../manifest" }
+vot-proof-catalog-fuzz-driver = { path = "../static-proof-catalog" }
 
 [[bin]]
 name = "frame_codec"
@@ -24,6 +25,13 @@ bench = false
 [[bin]]
 name = "manifest"
 path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "static_proof_catalog"
+path = "fuzz_targets/static_proof_catalog.rs"
 test = false
 doc = false
 bench = false

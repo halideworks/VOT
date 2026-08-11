@@ -1,0 +1,13 @@
+constant vot_proof_catalog::GROUP_LENGTH
+constant vot_proof_catalog::HEADER_LENGTH
+constant vot_proof_catalog::INDEX_ENTRY_LENGTH
+constant vot_proof_catalog::MAX_OBJECT_LENGTH
+constant vot_proof_catalog::MAX_PROOF_LENGTH
+constant vot_proof_catalog::RANGE_LENGTH
+enum vot_proof_catalog::Error
+function vot_proof_catalog::decode_header
+function vot_proof_catalog::encode
+function vot_proof_catalog::validate_complete
+struct vot_proof_catalog::CatalogHeader
+struct vot_proof_catalog::SelectedEntry
+use vot_proof_catalog::ObjectId <- vot_object::ObjectId

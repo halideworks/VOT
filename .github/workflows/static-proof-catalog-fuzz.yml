@@ -1,0 +1,63 @@
+name: static-proof-catalog-fuzz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/static-proof-catalog-fuzz.yml"
+      - "Cargo.toml"
+      - "crates/vot-manifest/**"
+      - "crates/vot-object/**"
+      - "crates/vot-proof-blake3/**"
+      - "crates/vot-proof-catalog/**"
+      - "crates/vot-proof-sha256/**"
+      - "crates/vot-verifier/**"
+      - "fuzz/mutator/**"
+      - "fuzz/static-proof-catalog/**"
+      - "test-vectors/static-proof-catalog/**"
+  pull_request:
+    paths:
+      - ".github/workflows/static-proof-catalog-fuzz.yml"
+      - "Cargo.toml"
+      - "crates/vot-manifest/**"
+      - "crates/vot-object/**"
+      - "crates/vot-proof-blake3/**"
+      - "crates/vot-proof-catalog/**"
+      - "crates/vot-proof-sha256/**"
+      - "crates/vot-verifier/**"
+      - "fuzz/mutator/**"
+      - "fuzz/static-proof-catalog/**"
+      - "test-vectors/static-proof-catalog/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bounded-fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Build standalone proof catalog fuzz driver
+        run: >-
+          cargo +1.88.0 build
+          --manifest-path fuzz/static-proof-catalog/Cargo.toml --locked
+
+      - name: Run bounded proof catalog fuzz smoke test
+        run: |
+          set -euo pipefail
+          for seed in fuzz/static-proof-catalog/corpus/*; do
+            fuzz/static-proof-catalog/target/debug/vot-proof-catalog-fuzz-driver \
+              --iterations 256 --corpus fuzz/static-proof-catalog/corpus < "$seed"
+          done

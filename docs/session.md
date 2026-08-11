@@ -80,11 +80,10 @@ before sending.
 
 ## Asymmetric gate
 
-Sending application data before local readiness is refused. Receiving it before
-local readiness is not: QUIC does not order the negotiation stream relative to
-application lanes, so records may arrive before the peer knows this endpoint is
-ready. Early records are held in a bounded buffer and released once readiness
-is reached.
+Sending application data before local readiness is refused. QUIC does not order
+the negotiation stream relative to application lanes, so remote records may
+arrive before local readiness. They remain in a bounded buffer until the gate
+opens.
 
 The buffer is bounded by bytes and count. Exceeding it fails with
 `RESOURCE_LIMIT`. `Session::set_pending_limits` adjusts the bounds.
@@ -133,18 +132,10 @@ Five settings are defined. Four are enforced by `vot-session`:
 The four payload limits go through one table. A proof (`PROOF_BUNDLE`) is on
 the control stream and bounded by the control ceiling, not the record limit.
 
-`IDLE_TIMEOUT_MS` is the one negotiated setting nothing installs, and
-ADR-0035 says why: QUIC fixes its idle timeout during the handshake, before
-VOT negotiates anything, and the session has no clock to enforce a deadline
-with instead.
-
-What closes an idle connection is therefore the carrier's own timeout, and
-that is not the same number: quiche installs 30 seconds, deliberately shorter
-than the registered 90 so that `vot-cli`'s 30-second stall detector stays the
-backstop it is documented to be rather than the primary. The MsQuic carrier
-sets no idle timeout at all and closes on MsQuic's own default. A deployment
-that needs a specific idle behaviour configures its carrier; the negotiated
-setting does not deliver one.
+`IDLE_TIMEOUT_MS` is negotiated but not installed. QUIC configures its timeout
+before VOT negotiation, and `vot-session` has no timer. Quiche uses 30 seconds;
+MsQuic uses its default. Configure the carrier when a deployment requires a
+specific timeout. See ADR-0035.
 
 Lane limit is split: the session counts outbound lanes; the transport counts
 inbound peer streams. MsQuic counts concurrent streams; TCP counts distinct

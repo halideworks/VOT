@@ -70,19 +70,13 @@ vot rendezvous LISTEN_ADDR
 vot relay LISTEN_ADDR
 ```
 
-A relay forwards datagrams between the two ends of a slot and reads none of
-them: it sees ciphertext, two addresses, and byte counts. A slot is a port, so
-a relayed datagram is exactly the size of a direct one and nothing is wrapped.
-Both ends reach it outbound, which is why it works where a punch does not.
-Slots are keyed by the same hash of the root the rendezvous pairs on, so a
-relay never learns a root either, and each carries a lifetime and a byte
-ceiling its operator sets.
+A relay forwards ciphertext between two endpoints. It observes addresses and
+byte counts, not package roots or plaintext. Slots are keyed by a root hash and
+bounded by operator-configured lifetimes and byte limits.
 
-A fetch may name the package root where an address goes, which removes the
-port-forward on an unmanaged network. Both ends point `VOT_RENDEZVOUS` at the
-same service: the serve registers under a hash of the root, the fetch resolves
-it, and each end punches the other's NAT. Symmetric and carrier-grade NAT
-defeat the punch by construction, and the fetch says so rather than hanging.
+With `VOT_RENDEZVOUS`, the serve registers a package-root hash, the fetch
+resolves it, and both peers attempt NAT traversal. Symmetric and carrier-grade
+NAT may require a relay.
 
 ```sh
 export VOT_RENDEZVOUS=rendezvous.example:9999
@@ -90,17 +84,11 @@ vot serve BUNDLE_DIR 0.0.0.0:0            # registers under the bundle's root
 vot fetch ROOT BUNDLE_DIR                 # resolves that root, no address
 ```
 
-The channel is not authenticated. The server presents a throwaway certificate
-and the client does not verify it. What an attacker cannot do is serve different
-bytes: every range proves to its object root, every root is named by the
-manifest, and the manifest proves to the seal.
-
-That argument holds for the package the fetch named, and says nothing about
-which package it got. So a fetch at an address requires the `PACKAGE_ROOT`,
-and `vot serve` prints the whole fetch command for the bundle it is serving,
-so the end holding the bundle hands over one line. A root in the address
-position pins itself. `VOT_FETCH_UNPINNED=1` fetches from a server whose
-package cannot be known in advance.
+Transport certificates are ephemeral and are not verified. Content is instead
+authenticated against the requested package root: ranges prove to object
+roots, and the manifest proves those roots to the package seal. Address-based
+fetches therefore require `PACKAGE_ROOT`. Set `VOT_FETCH_UNPINNED=1` only when
+the remote package is intentionally accepted without a trusted root.
 
 ### Who may fetch
 
@@ -136,18 +124,13 @@ export VOT_FETCH_HOLDER_KEY=env:HOLDER_SECRET
 vot fetch ADDR BUNDLE_DIR PACKAGE_ROOT
 ```
 
-A fetch without a token is refused on the challenge rather than after a
-transfer, and the refusal says the same thing whatever was wrong with the
-token, because the difference between an expired one and a forged one is an
-oracle.
+Authentication completes before transfer. Token validation failures use the
+same refusal to avoid exposing token state.
 
-What the token decides is that whoever opened the session holds the key it
-names on the TLS session carrying the request. The proof covers the session
-challenge and the TLS exporter value, so an interposer that terminates TLS has a
-different binding and cannot forward the proof. Capability authentication fails
-closed on a carrier without that exporter. The exporter does not authenticate
-the serve's identity to the fetch; anonymous mode authenticates received content
-against the trusted root instead. See ADR-0037.
+The capability proof binds the holder key to the session challenge and TLS
+exporter. Authentication fails closed when the carrier cannot provide that
+binding. The exporter does not authenticate the server; the package root
+authenticates received content. See ADR-0037.
 
 ### Environment variables
 

@@ -16,6 +16,7 @@ PACKAGES = (
     "vot-verifier",
     "vot-manifest",
     "vot-pack",
+    "vot-package",
     "vot-object-store",
     "vot-commit-object",
     "vot-receipt",

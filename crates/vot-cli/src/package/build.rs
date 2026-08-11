@@ -1,13 +1,13 @@
 //! Package construction from a source tree.
 
 use crate::{
-    CANDIDATE_MAX, Component, DEFAULT_LOGICAL_SUITE, EntryKind, Error, File, LogicalFile,
+    CANDIDATE_MAX, Component, DEFAULT_LOGICAL_SUITE, EntryRecord, Error, File, LogicalFile,
     MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_DATA_RECORD_BYTES, ManifestEntry, ManifestPage,
-    ObjectId, OpenOptions, PACKAGE_DOMAIN, Pack, PackagePath, PackageSummary, PageCommitment, Path,
-    PathBuf, PathProfile, Read, Seal, StorageRef, StreamVerifier, StreamingPacker, Suite, Write,
-    canonical_path_key, decode_page, encode_page, encode_path, encode_seal, file_matches_bytes, fs,
-    manifest_page_path, manifest_spool_path, object_name, read_bounded_file, suite_from_id,
-    suite_id, sync_directory, u32_len, write_new_synced,
+    ObjectId, OpenOptions, Pack, PackagePath, PackageRootBuilder, PackageSummary, PageCommitment,
+    Path, PathBuf, PathProfile, Read, Seal, Storage, StreamVerifier, StreamingPacker, Suite, Write,
+    canonical_path_key, decode_page, encode_page, encode_seal, file_matches_bytes, fs,
+    manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
+    write_new_synced,
 };
 
 pub(crate) struct SourceFile {
@@ -15,164 +15,6 @@ pub(crate) struct SourceFile {
     pub(crate) key: Vec<u8>,
     pub(crate) source: PathBuf,
     pub(crate) length: u64,
-}
-
-#[derive(Clone)]
-pub(crate) enum Storage {
-    Direct,
-    Pack {
-        root: [u8; 32],
-        length: u64,
-        offset: u64,
-    },
-}
-
-pub(crate) struct EntryRecord {
-    pub(crate) path: PackagePath,
-    pub(crate) suite: Suite,
-    pub(crate) logical_root: [u8; 32],
-    pub(crate) logical_length: u64,
-    pub(crate) storage: Storage,
-}
-
-impl EntryRecord {
-    pub(crate) fn manifest_entry(&self) -> ManifestEntry {
-        let logical = ObjectId {
-            suite: suite_id(self.suite),
-            root: self.logical_root,
-            length: self.logical_length,
-        };
-        let storage = match self.storage {
-            Storage::Direct => StorageRef::Direct(logical.clone()),
-            Storage::Pack {
-                root,
-                length,
-                offset,
-            } => StorageRef::Pack {
-                pack: ObjectId {
-                    suite: suite_id(self.suite),
-                    root,
-                    length,
-                },
-                offset,
-                length: self.logical_length,
-                logical,
-            },
-        };
-        ManifestEntry {
-            path: self.path.clone(),
-            kind: EntryKind::File,
-            length: Some(self.logical_length),
-            storage: Some(storage),
-            metadata: None,
-        }
-    }
-
-    pub(crate) fn from_manifest(entry: ManifestEntry) -> Result<Self, Error> {
-        if entry.kind != EntryKind::File {
-            return Err(Error::InvalidBundle);
-        }
-        if entry.metadata.is_some() {
-            return Err(Error::InvalidBundle);
-        }
-        let logical_length = entry.length.ok_or(Error::InvalidBundle)?;
-        let storage = entry.storage.ok_or(Error::InvalidBundle)?;
-        let (logical_root, suite, storage) = match storage {
-            StorageRef::Direct(object) => {
-                let suite = suite_from_id(object.suite)?;
-                if object.length != logical_length {
-                    return Err(Error::InvalidBundle);
-                }
-                (object.root, suite, Storage::Direct)
-            }
-            StorageRef::Pack {
-                pack,
-                offset,
-                length,
-                logical,
-            } => {
-                let pack_suite = suite_from_id(pack.suite)?;
-                let logical_suite = suite_from_id(logical.suite)?;
-                if pack_suite != logical_suite
-                    || length != logical_length
-                    || logical.length != logical_length
-                {
-                    return Err(Error::InvalidBundle);
-                }
-                (
-                    logical.root,
-                    logical_suite,
-                    Storage::Pack {
-                        root: pack.root,
-                        length: pack.length,
-                        offset,
-                    },
-                )
-            }
-        };
-        Ok(Self {
-            path: entry.path,
-            suite,
-            logical_root,
-            logical_length,
-            storage,
-        })
-    }
-}
-
-pub(crate) struct PackageRootBuilder {
-    pub(crate) verifier: StreamVerifier,
-    pub(crate) last_key: Option<Vec<u8>>,
-    pub(crate) logical_length: u64,
-    pub(crate) entries: u64,
-}
-
-impl PackageRootBuilder {
-    pub(crate) fn new() -> Result<Self, Error> {
-        let mut verifier = StreamVerifier::new(Suite::Blake3Bao64);
-        verifier.update(PACKAGE_DOMAIN)?;
-        Ok(Self {
-            verifier,
-            last_key: None,
-            logical_length: 0,
-            entries: 0,
-        })
-    }
-
-    pub(crate) fn push(&mut self, record: &EntryRecord) -> Result<(), Error> {
-        let encoded_path = encode_path(&record.path)?;
-        let key = canonical_path_key(&record.path, PathProfile::Portable)
-            .map_err(|_| Error::InvalidPath)?;
-        if self
-            .last_key
-            .as_ref()
-            .is_some_and(|last| key.as_slice() <= last.as_slice())
-        {
-            return Err(Error::InvalidBundle);
-        }
-        self.last_key = Some(key);
-        self.verifier
-            .update(&u32_len(encoded_path.len())?.to_be_bytes())?;
-        self.verifier.update(&encoded_path)?;
-        self.verifier
-            .update(&suite_id(record.suite).to_be_bytes())?;
-        self.verifier.update(&record.logical_length.to_be_bytes())?;
-        self.verifier.update(&record.logical_root)?;
-        self.logical_length = self
-            .logical_length
-            .checked_add(record.logical_length)
-            .ok_or(Error::InvalidBundle)?;
-        self.entries = self.entries.checked_add(1).ok_or(Error::InvalidBundle)?;
-        Ok(())
-    }
-
-    pub(crate) fn finish(self) -> Result<PackageSummary, Error> {
-        Ok(PackageSummary {
-            root: self.verifier.finish()?,
-            logical_length: self.logical_length,
-            entries: self.entries,
-        })
-    }
 }
 
 pub(crate) struct ManifestSpool {
@@ -423,7 +265,7 @@ pub(crate) fn emit_pack(
             },
         };
         package.push(&record)?;
-        manifest.push(record.manifest_entry())?;
+        manifest.push(record.manifest_entry()?)?;
     }
     Ok(())
 }
@@ -452,7 +294,7 @@ pub(crate) fn emit_direct(
         storage: Storage::Direct,
     };
     package.push(&record)?;
-    manifest.push(record.manifest_entry())?;
+    manifest.push(record.manifest_entry()?)?;
     Ok(())
 }
 

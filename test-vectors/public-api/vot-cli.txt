@@ -33,7 +33,6 @@ function vot_cli::verify_receipt_file
 module vot_cli::authz
 struct vot_cli::BundleFetcher
 struct vot_cli::BundleServer
-struct vot_cli::PackageSummary
 struct vot_cli::ReceiveReport
 struct vot_cli::ServeConnection
 struct vot_cli::ServeSession
@@ -42,3 +41,4 @@ struct vot_cli::authz::Holder
 struct vot_cli::authz::Requirement
 struct vot_cli::authz::Stance
 trait vot_cli::Engine
+use vot_cli::PackageSummary <- vot_package::PackageSummary

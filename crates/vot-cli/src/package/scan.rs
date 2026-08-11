@@ -55,7 +55,7 @@ impl ManifestReader {
     pub(crate) fn next_record(&mut self) -> Result<Option<EntryRecord>, Error> {
         loop {
             if let Some(entry) = self.entries.next() {
-                return EntryRecord::from_manifest(entry).map(Some);
+                return Ok(Some(EntryRecord::from_manifest(entry)?));
             }
             if self.next_page == self.seal.final_page_count {
                 if self.previous_digest != self.seal.final_page_digest {

@@ -21,6 +21,7 @@ vot-capability = { path = "../vot-capability" }
 vot-codec = { path = "../vot-codec" }
 vot-manifest = { path = "../vot-manifest" }
 vot-pack = { path = "../vot-pack" }
+vot-package = { path = "../vot-package" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-receipt = { path = "../vot-receipt" }

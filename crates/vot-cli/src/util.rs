@@ -200,10 +200,6 @@ pub(crate) fn sync_directories(root: &Path) -> Result<usize, Error> {
     Ok(count)
 }
 
-pub(crate) fn u32_len(length: usize) -> Result<u32, Error> {
-    u32::try_from(length).map_err(|_| Error::InvalidBundle)
-}
-
 pub(crate) fn link_or_match(
     prepared: &Path,
     destination: &Path,

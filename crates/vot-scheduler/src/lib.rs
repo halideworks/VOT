@@ -728,6 +728,41 @@ mod tests {
     }
 
     #[test]
+    fn the_verified_slice_reaches_the_sink_before_coverage_commits() {
+        #[derive(Default)]
+        struct RefusingSink(std::sync::Mutex<Option<(u64, Vec<u8>)>>);
+
+        impl RangeSink for RefusingSink {
+            fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+                *self.0.lock().unwrap() = Some((offset, data.to_vec()));
+                Err(SinkError)
+            }
+        }
+
+        let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x89; unit * 2];
+        let object = subject(&bytes);
+        let proof = vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let sink = std::sync::Arc::new(RefusingSink::default());
+        let staging = 2 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
+        let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
+        receiver
+            .begin_ranges(object, Box::new(sink.clone()))
+            .unwrap();
+
+        assert_eq!(
+            receiver.receive_range(object, proof.covered_offset, &proof.data, &proof.proof,),
+            Err(Error::Sink)
+        );
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            Some((proof.covered_offset, proof.data))
+        );
+        assert_eq!(receiver.range_active[&object].coverage.covered_bytes(), 0);
+        assert_eq!(receiver.range_active[&object].coverage.fragment_count(), 0);
+    }
+
+    #[test]
     fn a_panicking_sink_does_not_strand_staging() {
         struct PanicOnceSink(std::sync::atomic::AtomicBool);
         impl RangeSink for PanicOnceSink {

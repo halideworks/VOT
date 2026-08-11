@@ -150,7 +150,11 @@ impl SelectedEntry<'_> {
 
     /// # Errors
     /// Reports absent proof bytes or data/proof that fails suite verification.
-    pub fn verify(&self, data: &[u8], proof: &[u8]) -> Result<(), Error> {
+    pub fn verify<'data>(
+        &self,
+        data: &'data [u8],
+        proof: &[u8],
+    ) -> Result<vot_verified_range::VerifiedSlice<'data>, Error> {
         let proof_length = u64::try_from(proof.len()).map_err(|_| Error::MalformedCatalog)?;
         if proof_length < self.proof_length {
             return Err(Error::CatalogUnavailable);
@@ -161,24 +165,13 @@ impl SelectedEntry<'_> {
         if u64::try_from(data.len()).ok() != Some(self.data_length) {
             return Err(Error::ProofInvalid);
         }
-        match self.header.suite {
-            Suite::Blake3Bao64 => vot_proof_blake3::verify(
-                &self.header.object.root,
-                self.header.object.length,
-                self.data_offset,
-                data,
-                proof,
-            )
-            .map_err(|_| Error::ProofInvalid),
-            Suite::Sha256Bep52 => vot_proof_sha256::verify(
-                &self.header.object.root,
-                self.header.object.length,
-                self.data_offset,
-                data,
-                proof,
-            )
-            .map_err(|_| Error::ProofInvalid),
-        }
+        let object = vot_codec::frames::ObjectId {
+            suite: self.header.suite.identifier(),
+            root: self.header.object.root,
+            length: self.header.object.length,
+        };
+        vot_verified_range::verify_range(object, self.data_offset, data, proof)
+            .map_err(|_| Error::ProofInvalid)
     }
 }
 

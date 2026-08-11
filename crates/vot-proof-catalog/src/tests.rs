@@ -191,7 +191,12 @@ fn every_committed_catalog_is_reproduced_and_verifies() {
             let length = usize::try_from(entry.data_length()).unwrap();
             let data_range = &data[start..start + length];
             let proof_bytes = proof(&entry, &catalog);
-            entry.verify(data_range, proof_bytes).unwrap();
+            let verified = entry.verify(data_range, proof_bytes).unwrap();
+            assert_eq!(verified.object().suite, prepared.object_id().suite);
+            assert_eq!(verified.object().root, prepared.object_id().root);
+            assert_eq!(verified.object().length, prepared.object_id().length);
+            assert_eq!(verified.covered_offset(), entry.data_offset());
+            assert!(std::ptr::eq(verified.data(), data_range));
             let cold = match case.suite {
                 Suite::Blake3Bao64 => {
                     vot_proof_blake3::prove(&data, entry.data_offset(), entry.data_length())
@@ -430,8 +435,8 @@ fn proof_limit_is_inclusive_before_proof_verification() {
     let header = validate_complete(&exact, &expected).unwrap();
     let entry = selected(&header, &exact, 0);
     assert_eq!(
-        entry.verify(&[0], proof(&entry, &exact)),
-        Err(Error::ProofInvalid)
+        entry.verify(&[0], proof(&entry, &exact)).unwrap_err(),
+        Error::ProofInvalid
     );
     let over = with_single_proof(base, 8_193);
     assert_eq!(
@@ -449,8 +454,8 @@ fn corrupt_data_and_proofs_fail_for_both_suites() {
         let mut data = pattern(65_536);
         data[0] ^= 1;
         assert_eq!(
-            entry.verify(&data, proof(&entry, fixture)),
-            Err(Error::ProofInvalid)
+            entry.verify(&data, proof(&entry, fixture)).unwrap_err(),
+            Error::ProofInvalid
         );
     }
     for fixture in [vector!("blake3-4m-plus-1"), vector!("sha256-4m-plus-1")] {
@@ -460,13 +465,13 @@ fn corrupt_data_and_proofs_fail_for_both_suites() {
         let mut proof_bytes = proof(&entry, fixture).to_vec();
         proof_bytes[0] ^= 1;
         assert_eq!(
-            entry.verify(&pattern(4_194_304), &proof_bytes),
-            Err(Error::ProofInvalid)
+            entry.verify(&pattern(4_194_304), &proof_bytes).unwrap_err(),
+            Error::ProofInvalid
         );
         proof_bytes.pop();
         assert_eq!(
-            entry.verify(&pattern(4_194_304), &proof_bytes),
-            Err(Error::CatalogUnavailable)
+            entry.verify(&pattern(4_194_304), &proof_bytes).unwrap_err(),
+            Error::CatalogUnavailable
         );
     }
 }

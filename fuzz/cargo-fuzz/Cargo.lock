@@ -611,9 +611,11 @@ dependencies = [
 name = "vot-proof-catalog"
 version = "0.0.1"
 dependencies = [
+ "vot-codec",
  "vot-object",
  "vot-proof-blake3",
  "vot-proof-sha256",
+ "vot-verified-range",
 ]
 
 [[package]]
@@ -658,6 +660,16 @@ dependencies = [
  "vot-object",
  "vot-proof-catalog",
  "vot-proof-store",
+]
+
+[[package]]
+name = "vot-verified-range"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+ "vot-proof-blake3",
+ "vot-proof-sha256",
+ "vot-verifier",
 ]
 
 [[package]]

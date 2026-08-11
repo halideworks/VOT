@@ -18,12 +18,12 @@ pub(super) fn assemble_ordered(
     bundle.assemble().map_err(map_error)
 }
 
-pub(super) fn check_range_proof(
+pub(super) fn check_range_proof<'data>(
     subject: SubjectId,
     covered_offset: u64,
-    data: &[u8],
+    data: &'data [u8],
     proof: &[u8],
-) -> Result<(), Error> {
+) -> Result<vot_verified_range::VerifiedSlice<'data>, Error> {
     vot_verified_range::verify_range(object_id(subject), covered_offset, data, proof)
         .map_err(map_error)
 }

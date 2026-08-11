@@ -1,4 +1,9 @@
-use vot_object::{ObjectBuilder, PreparedObject, Suite};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use vot_object::{ObjectBuilder, PreparedObject, ProofNodeStorage, StoreError, Suite};
 use vot_proof_store::MemoryNodeStorage;
 
 use super::*;
@@ -143,6 +148,81 @@ fn prepare_stored(suite: Suite, data: &[u8]) -> PreparedObject {
     builder.finish().unwrap()
 }
 
+struct SwitchableStorage {
+    inner: MemoryNodeStorage,
+    unavailable: Arc<AtomicBool>,
+}
+
+impl ProofNodeStorage for SwitchableStorage {
+    fn len(&self) -> Result<u64, StoreError> {
+        self.inner.len()
+    }
+
+    fn append(&mut self, node: [u8; 32]) -> Result<(), StoreError> {
+        self.inner.append(node)
+    }
+
+    fn read(&self, ordinal: u64) -> Result<[u8; 32], StoreError> {
+        if self.unavailable.load(Ordering::Relaxed) {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.read(ordinal)
+    }
+}
+
+fn assemble_streamed(prepared: &PreparedObject) -> Result<Vec<u8>, Error> {
+    let (record_count, _) = geometry(prepared.object_id().length)?;
+    let mut encoder = CatalogEncoder::new(prepared)?;
+    let mut records = Vec::new();
+    let mut expected_proof_offset =
+        HEADER_LENGTH as u64 + record_count * u64::try_from(INDEX_ENTRY_LENGTH).unwrap();
+    for ordinal in 0..record_count {
+        let record = encoder.next_record()?.ok_or(Error::ProofGeneration)?;
+        assert_eq!(record.ordinal(), ordinal);
+        assert_eq!(
+            record.index_offset(),
+            HEADER_LENGTH as u64 + ordinal * u64::try_from(INDEX_ENTRY_LENGTH).unwrap()
+        );
+        assert_eq!(record.proof_offset(), expected_proof_offset);
+        assert!(u64::try_from(record.proof().len()).unwrap() <= MAX_PROOF_LENGTH);
+        expected_proof_offset += u64::try_from(record.proof().len()).unwrap();
+        records.push(record);
+    }
+    assert_eq!(encoder.next_record()?, None);
+    let finished = encoder.finish()?;
+    assert_eq!(finished.record_count(), record_count);
+    assert_eq!(finished.catalog_length(), expected_proof_offset);
+    let mut catalog = vec![0; usize::try_from(finished.catalog_length()).unwrap()];
+    catalog[..HEADER_LENGTH].copy_from_slice(finished.header());
+    for record in records {
+        let index = usize::try_from(record.index_offset()).unwrap();
+        catalog[index..index + INDEX_ENTRY_LENGTH].copy_from_slice(record.index_entry());
+        let proof = usize::try_from(record.proof_offset()).unwrap();
+        catalog[proof..proof + record.proof().len()].copy_from_slice(record.proof());
+    }
+    Ok(catalog)
+}
+
+#[test]
+fn catalog_record_takes_ownership_of_the_range_cover_proof() {
+    use crate::encode::record_from_cover;
+
+    let data = pattern(65_537);
+    let prepared = prepare(Suite::Blake3Bao64, &data);
+    let cover = prepared.prove(0, data.len() as u64).unwrap();
+    let proof_address = cover.proof().as_ptr();
+    let proof_blob_offset = (HEADER_LENGTH + INDEX_ENTRY_LENGTH) as u64;
+    let (record, next_proof_blob_length) =
+        record_from_cover(cover, 0, 0, data.len() as u64, proof_blob_offset, 0).unwrap();
+
+    assert_eq!(record.proof().as_ptr(), proof_address);
+    assert_eq!(record.proof_offset(), proof_blob_offset);
+    assert_eq!(
+        next_proof_blob_length,
+        u64::try_from(record.proof().len()).unwrap()
+    );
+}
+
 fn identity(fixture: &[u8]) -> ObjectId {
     let mut root = [0; 32];
     root.copy_from_slice(&fixture[24..56]);
@@ -212,6 +292,70 @@ fn every_committed_catalog_is_reproduced_and_verifies() {
             assert_eq!(proof_bytes, cold);
         }
     }
+}
+
+#[test]
+fn streaming_records_reproduce_empty_and_multi_record_catalogs_for_both_suites() {
+    for case in cases()
+        .into_iter()
+        .filter(|case| matches!(case.length, 0 | 8_388_625))
+    {
+        let data = pattern(case.length);
+        let prepared = prepare(case.suite, &data);
+        let catalog = assemble_streamed(&prepared).unwrap();
+        assert_eq!(
+            catalog, case.fixture,
+            "suite {:?}, length {}",
+            case.suite, case.length
+        );
+        let header = validate_complete(&catalog, prepared.object_id()).unwrap();
+        assert_eq!(header.record_count(), if case.length == 0 { 0 } else { 3 });
+    }
+}
+
+#[test]
+fn finish_rejects_incomplete_output_and_abandonment_leaves_preparation_usable() {
+    let data = pattern(4_194_305);
+    let prepared = prepare(Suite::Blake3Bao64, &data);
+
+    let encoder = CatalogEncoder::new(&prepared).unwrap();
+    assert_eq!(encoder.finish(), Err(Error::ProofGeneration));
+
+    {
+        let mut abandoned = CatalogEncoder::new(&prepared).unwrap();
+        let first = abandoned.next_record().unwrap().unwrap();
+        assert_eq!(first.ordinal(), 0);
+    }
+    let cover = prepared.prove(4_194_304, 1).unwrap();
+    assert_eq!(cover.covered_offset(), 4_194_304);
+    assert_eq!(cover.covered_length(), 1);
+}
+
+#[test]
+fn second_record_storage_failure_permanently_poisons_the_encoder() {
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let storage = SwitchableStorage {
+        inner: MemoryNodeStorage::new(),
+        unavailable: Arc::clone(&unavailable),
+    };
+    let data = pattern(4_194_305);
+    let mut builder = ObjectBuilder::with_proof_storage(
+        Suite::Blake3Bao64,
+        Some(data.len() as u64),
+        Box::new(storage),
+    )
+    .unwrap();
+    builder.update(&data).unwrap();
+    let prepared = builder.finish().unwrap();
+
+    let mut encoder = CatalogEncoder::new(&prepared).unwrap();
+    let first = encoder.next_record().unwrap().unwrap();
+    assert_eq!(first.ordinal(), 0);
+    unavailable.store(true, Ordering::Relaxed);
+    assert_eq!(encoder.next_record(), Err(Error::ProofGeneration));
+    unavailable.store(false, Ordering::Relaxed);
+    assert_eq!(encoder.next_record(), Err(Error::ProofGeneration));
+    assert_eq!(encoder.finish(), Err(Error::ProofGeneration));
 }
 
 #[test]
@@ -321,6 +465,7 @@ fn fixed_width_integer_readers_use_every_byte() {
 fn encoder_guards_have_exact_boundaries() {
     use crate::encode::{
         cover_is_exact, finished_catalog_length, next_proof_blob_length, proof_length_is_valid,
+        record_offsets,
     };
 
     assert!(cover_is_exact(4, 8, 4, 8));
@@ -353,6 +498,20 @@ fn encoder_guards_have_exact_boundaries() {
         next_proof_blob_length(u64::MAX, 1),
         Err(Error::ProofGeneration)
     );
+
+    let final_ordinal = (u64::MAX - HEADER_LENGTH as u64) / INDEX_ENTRY_LENGTH as u64;
+    assert_eq!(
+        record_offsets(final_ordinal, 128, 32),
+        Ok((
+            HEADER_LENGTH as u64 + final_ordinal * INDEX_ENTRY_LENGTH as u64,
+            160
+        ))
+    );
+    assert_eq!(
+        record_offsets(final_ordinal + 1, 128, 32),
+        Err(Error::ProofGeneration)
+    );
+    assert_eq!(record_offsets(0, u64::MAX, 1), Err(Error::ProofGeneration));
 
     assert_eq!(
         finished_catalog_length(MAX_CATALOG_LENGTH, 0, MAX_CATALOG_LENGTH),

@@ -8,6 +8,9 @@ enum vot_proof_catalog::Error
 function vot_proof_catalog::decode_header
 function vot_proof_catalog::encode
 function vot_proof_catalog::validate_complete
+struct vot_proof_catalog::CatalogEncoder
 struct vot_proof_catalog::CatalogHeader
+struct vot_proof_catalog::CatalogRecord
+struct vot_proof_catalog::FinishedCatalog
 struct vot_proof_catalog::SelectedEntry
 use vot_proof_catalog::ObjectId <- vot_object::ObjectId

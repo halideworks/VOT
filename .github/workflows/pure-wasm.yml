@@ -31,6 +31,8 @@ jobs:
             cargo_args: ""
           - package: vot-package
             cargo_args: ""
+          - package: vot-proof-catalog
+            cargo_args: ""
           - package: vot-verified-range
             cargo_args: ""
           - package: vot-resume-core

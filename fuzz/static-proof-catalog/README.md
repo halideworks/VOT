@@ -3,8 +3,10 @@
 `vot_proof_catalog_fuzz_driver::exercise` drives complete and selected-entry
 catalog decoding under a 256 MiB allocation ceiling. Inputs are capped at 256
 KiB. Header-declared object and catalog lengths never control a whole-object
-allocation. Parse, identity, availability, and proof failures are expected. A
-panic, abort, excessive allocation, or hang is a failure.
+allocation. One out of every 256 selector values also streams a synthesized
+object slightly larger than 4 MiB through the encoder and checks cumulative
+record offsets. Parse, identity, availability, and proof failures are expected.
+A panic, abort, excessive allocation, or hang is a failure.
 
 Two gates share that function, so they cannot drift apart.
 

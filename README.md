@@ -11,6 +11,19 @@ Status: early development. Specifications are in `spec/`.
 cargo test --workspace --locked
 ```
 
+## Library entry points
+
+- `vot-sdk` is the pure Rust facade for verified coverage, package ingest,
+  proof catalogs, and receipts. It has no native filesystem or network
+  dependency.
+- `vot-wasm` exposes the pure facade through generated WebAssembly bindings.
+- `vot-sdk-file` adds native file staging and publication on Linux, macOS, and
+  Windows. It never overwrites an existing destination and reports an
+  unsupported assurance requirement instead of silently downgrading it.
+
+Applications can use the pure facade directly and add the native adapter only
+where filesystem publication is required.
+
 ## Commands
 
 Build and run with `cargo run -p vot-cli -- <command>`.

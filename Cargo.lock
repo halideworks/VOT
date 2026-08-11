@@ -2318,6 +2318,7 @@ dependencies = [
  "vot-codec",
  "vot-manifest",
  "vot-pack",
+ "vot-package",
  "vot-proof-blake3",
  "vot-proof-sha256",
  "vot-receipt",
@@ -2417,6 +2418,14 @@ dependencies = [
 
 [[package]]
 name = "vot-pack"
+version = "0.0.1"
+dependencies = [
+ "vot-manifest",
+ "vot-verifier",
+]
+
+[[package]]
+name = "vot-package"
 version = "0.0.1"
 dependencies = [
  "vot-manifest",

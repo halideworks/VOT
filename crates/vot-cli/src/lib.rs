@@ -8,11 +8,14 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use vot_manifest::{
-    Component, EntryKind, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment,
-    PathProfile, Seal, StorageRef, canonical_path_key, decode_page, decode_seal, encode_page,
-    encode_seal,
+    Component, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment, PathProfile,
+    Seal, canonical_path_key, decode_page, decode_seal, encode_page, encode_seal,
 };
+#[cfg(test)]
+use vot_manifest::{EntryKind, StorageRef};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
+pub use vot_package::PackageSummary;
+pub(crate) use vot_package::{EntryRecord, PackageRootBuilder, Storage};
 use vot_receipt::{
     AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
     authenticate_hmac_sha256, decode_authenticated, encode_authenticated, sign_ed25519,
@@ -122,6 +125,16 @@ impl From<vot_pack::Error> for Error {
     }
 }
 
+impl From<vot_package::Error> for Error {
+    fn from(error: vot_package::Error) -> Self {
+        match error {
+            vot_package::Error::InvalidPath => Self::InvalidPath,
+            vot_package::Error::InvalidBundle => Self::InvalidBundle,
+            vot_package::Error::Verifier(error) => Self::Verifier(error),
+        }
+    }
+}
+
 impl From<vot_scheduler::Error> for Error {
     fn from(error: vot_scheduler::Error) -> Self {
         Self::Scheduler(error)
@@ -150,13 +163,6 @@ impl From<vot_codec::frames::Error> for Error {
     fn from(error: vot_codec::frames::Error) -> Self {
         Self::Codec(error)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PackageSummary {
-    pub root: [u8; 32],
-    pub logical_length: u64,
-    pub entries: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2313,31 +2319,5 @@ mod tests {
         commitment.index = 0;
         commitment.digest = [7; 32];
         assert!(validate_page_envelope(&page, &seal, &commitment, 0, [0; 32], [2; 32]).is_err());
-    }
-
-    #[test]
-    fn package_root_builder_contributes_every_record_field() {
-        let record = EntryRecord {
-            path: vec![Component::Text("a".to_owned())],
-            suite: DEFAULT_LOGICAL_SUITE,
-            logical_root: [5; 32],
-            logical_length: 3,
-            storage: Storage::Direct,
-        };
-        let path = encode_path(&record.path).unwrap();
-        assert_eq!(path, [0, 1, 0, 1, b'a']);
-        let mut transcript = Vec::from(PACKAGE_DOMAIN);
-        transcript.extend_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
-        transcript.extend_from_slice(&path);
-        transcript.extend_from_slice(&2_u16.to_be_bytes());
-        transcript.extend_from_slice(&record.logical_length.to_be_bytes());
-        transcript.extend_from_slice(&record.logical_root);
-        let expected = vot_verifier::root(Suite::Blake3Bao64, &transcript).unwrap();
-        let mut builder = PackageRootBuilder::new().unwrap();
-        builder.push(&record).unwrap();
-        let package = builder.finish().unwrap();
-        assert_eq!(package.root, expected);
-        assert_eq!(package.logical_length, 3);
-        assert_eq!(package.entries, 1);
     }
 }

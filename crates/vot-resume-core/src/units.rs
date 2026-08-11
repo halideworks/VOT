@@ -161,8 +161,25 @@ impl UnitRanges {
     /// # Errors
     /// Rejects a zero-length run or one whose end overflows.
     pub fn from_runs<I: IntoIterator<Item = (u64, u64)>>(runs: I) -> Result<Self, RunError> {
+        Self::from_runs_bounded(runs, usize::MAX)
+    }
+
+    /// Builds a set from at most `max_input_runs` `(start, length)` runs.
+    /// Normalises order and merges after the bounded input has been validated.
+    ///
+    /// # Errors
+    /// Rejects a zero-length run, one whose end overflows, or an input that
+    /// yields more than `max_input_runs` runs. The first excess run is neither
+    /// validated nor stored, and no later input is consumed.
+    pub fn from_runs_bounded<I: IntoIterator<Item = (u64, u64)>>(
+        runs: I,
+        max_input_runs: usize,
+    ) -> Result<Self, RunError> {
         let mut collected: Vec<(u64, u64)> = Vec::new();
         for (start, length) in runs {
+            if collected.len() == max_input_runs {
+                return Err(RunError::TooManyRuns);
+            }
             if length == 0 {
                 return Err(RunError::EmptyRun);
             }
@@ -252,6 +269,7 @@ fn push_run(runs: &mut Vec<(u64, u64)>, start: u64, length: u64) {
 pub enum RunError {
     EmptyRun,
     EndOverflow,
+    TooManyRuns,
 }
 
 impl fmt::Display for RunError {
@@ -259,6 +277,7 @@ impl fmt::Display for RunError {
         match self {
             Self::EmptyRun => formatter.write_str("a checkpoint run covers no units"),
             Self::EndOverflow => formatter.write_str("a checkpoint run ends past u64"),
+            Self::TooManyRuns => formatter.write_str("checkpoint run count exceeds its limit"),
         }
     }
 }
@@ -401,6 +420,73 @@ mod tests {
     }
 
     #[test]
+    fn bounded_from_runs_enforces_zero_one_and_n_exactly() {
+        assert_eq!(
+            UnitRanges::from_runs_bounded([], 0).unwrap(),
+            UnitRanges::new()
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(4, 1)], 0),
+            Err(RunError::TooManyRuns)
+        );
+
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(4, 1)], 1)
+                .unwrap()
+                .runs()
+                .collect::<Vec<_>>(),
+            vec![(4, 1)]
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(4, 1), (8, 1)], 1),
+            Err(RunError::TooManyRuns)
+        );
+
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(4, 2), (0, 2), (2, 3)], 3)
+                .unwrap()
+                .runs()
+                .collect::<Vec<_>>(),
+            vec![(0, 6)]
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(4, 2), (0, 2), (2, 3), (9, 1)], 3),
+            Err(RunError::TooManyRuns)
+        );
+    }
+
+    #[test]
+    fn bounded_from_runs_stops_after_the_first_excess_item() {
+        use std::cell::Cell;
+
+        let consumed = Cell::new(0);
+        let runs = [(0, 1), (2, 1), (4, 1), (6, 1)].into_iter().inspect(|_| {
+            consumed.set(consumed.get() + 1);
+        });
+        assert_eq!(
+            UnitRanges::from_runs_bounded(runs, 2),
+            Err(RunError::TooManyRuns)
+        );
+        assert_eq!(consumed.get(), 3);
+    }
+
+    #[test]
+    fn invalid_runs_at_or_before_the_limit_take_precedence() {
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(0, 0), (2, 1)], 1),
+            Err(RunError::EmptyRun)
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(0, 1), (u64::MAX, 1), (2, 1)], 2),
+            Err(RunError::EndOverflow)
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(0, 1), (2, 0)], 1),
+            Err(RunError::TooManyRuns)
+        );
+    }
+
+    #[test]
     fn from_runs_rejects_a_run_that_covers_nothing_or_overflows() {
         assert_eq!(UnitRanges::from_runs([(0, 0)]), Err(RunError::EmptyRun));
         assert_eq!(
@@ -412,6 +498,15 @@ mod tests {
             Err(RunError::EndOverflow)
         );
         assert!(UnitRanges::from_runs([(u64::MAX - 1, 1)]).is_ok());
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(u64::MAX, 2)], 1),
+            Err(RunError::EndOverflow)
+        );
+        assert_eq!(
+            UnitRanges::from_runs_bounded([(u64::MAX, 1)], 1),
+            Err(RunError::EndOverflow)
+        );
+        assert!(UnitRanges::from_runs_bounded([(u64::MAX - 1, 1)], 1).is_ok());
     }
 
     #[test]
@@ -550,6 +645,10 @@ mod tests {
         assert_eq!(
             RunError::EndOverflow.to_string(),
             "a checkpoint run ends past u64"
+        );
+        assert_eq!(
+            RunError::TooManyRuns.to_string(),
+            "checkpoint run count exceeds its limit"
         );
     }
 

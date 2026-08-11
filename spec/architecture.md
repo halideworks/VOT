@@ -175,6 +175,10 @@ the conformance profile. Otherwise Strict is unsupported.
 
 Object-store completion, cheap metadata observation, and full readback are
 separate operations. Only explicit verification may produce at-rest evidence.
+An external mover may instead supply a bounded canonical part-receipt list and
+typed completion evidence without sending payload bytes or credentials through
+VOT. Completion alone stops at `DURABLE`; Strict publication still requires
+matching full-readback evidence from a host-authenticated source.
 
 ### 5.3 Receipts
 

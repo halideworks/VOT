@@ -3,8 +3,10 @@
 #![forbid(unsafe_code)]
 
 mod assembly;
+mod ingest;
 
 pub use assembly::{Encoded, ManifestFinalizer, PackageAssembly, PackageBuilder, PageDraft};
+pub use ingest::{PackageIngest, ValidatedManifestPage};
 
 use vot_manifest::{
     Component, EntryKind, Error as ManifestError, ManifestEntry, ObjectId, PackagePath,
@@ -21,6 +23,8 @@ pub enum Error {
     InvalidPath,
     /// An entry, storage reference, ordering relation, or counter is invalid.
     InvalidBundle,
+    /// A seal or caller-supplied package identity does not match the transcript.
+    RootMismatch,
     /// The package transcript verifier rejected an update or finalization.
     Verifier(VerifyError),
 }

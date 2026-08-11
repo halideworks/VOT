@@ -14,8 +14,11 @@ name = "vot-manifest-fuzz-driver"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = "1.8.5"
 cap = "=0.1.2"
 vot-fuzz-mutator = { path = "../mutator" }
 vot-manifest = { path = "../../crates/vot-manifest" }
+vot-package = { path = "../../crates/vot-package" }
+vot-verifier = { path = "../../crates/vot-verifier" }
 
 [workspace]

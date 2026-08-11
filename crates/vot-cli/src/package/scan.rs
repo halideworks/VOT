@@ -2,8 +2,8 @@
 
 use crate::{
     EntryRecord, Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestEntry, ManifestPage,
-    PackageRootBuilder, PackageSummary, PageCommitment, Path, PathBuf, Seal, decode_page,
-    decode_seal, manifest_page_path, read_bounded_file,
+    PackageIngest, PackageSummary, PageCommitment, Path, PathBuf, Seal, decode_page, decode_seal,
+    manifest_page_path, read_bounded_file,
 };
 
 /// The seal's page digests by index, refusing a commitment list that does
@@ -88,14 +88,6 @@ impl ManifestReader {
             self.entries = page.entries.into_iter();
         }
     }
-
-    pub(crate) fn expected_package(&self) -> PackageSummary {
-        PackageSummary {
-            root: self.seal.package.root,
-            logical_length: self.seal.package.length,
-            entries: 0,
-        }
-    }
 }
 
 pub(crate) fn validate_page_envelope(
@@ -131,24 +123,15 @@ pub(crate) fn validate_page_envelope(
 }
 
 pub(crate) fn scan_manifest(bundle: &Path) -> Result<PackageSummary, Error> {
-    let mut reader = ManifestReader::open(bundle)?;
-    let expected = reader.expected_package();
-    let mut package = PackageRootBuilder::new()?;
-    while let Some(record) = reader.next_record()? {
-        package.push(&record)?;
+    let directory = bundle.join(MANIFEST_DIRECTORY);
+    let encoded = read_bounded_file(&directory.join(MANIFEST_SEAL), vot_manifest::MAX_PAGE_BYTES)?;
+    let mut ingest = PackageIngest::new(&encoded)?;
+    for index in 0..ingest.page_count() {
+        let encoded = read_bounded_file(
+            &manifest_page_path(&directory, index),
+            vot_manifest::MAX_PAGE_BYTES,
+        )?;
+        drop(ingest.push_page(&encoded)?);
     }
-    if !reader.finished {
-        return Err(Error::InvalidBundle);
-    }
-    let actual = package.finish()?;
-    if actual.entries == 0 {
-        return Err(Error::InvalidBundle);
-    }
-    if actual.root != expected.root {
-        return Err(Error::RootMismatch);
-    }
-    if actual.logical_length != expected.logical_length {
-        return Err(Error::RootMismatch);
-    }
-    Ok(actual)
+    ingest.finish().map_err(Into::into)
 }

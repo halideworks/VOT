@@ -582,9 +582,12 @@ dependencies = [
 name = "vot-manifest-fuzz-driver"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "cap",
  "vot-fuzz-mutator",
  "vot-manifest",
+ "vot-package",
+ "vot-verifier",
 ]
 
 [[package]]
@@ -595,6 +598,15 @@ dependencies = [
  "vot-proof-blake3",
  "vot-proof-sha256",
  "vot-proof-store",
+ "vot-verifier",
+]
+
+[[package]]
+name = "vot-package"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "vot-manifest",
  "vot-verifier",
 ]
 

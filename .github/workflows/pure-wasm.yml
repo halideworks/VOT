@@ -26,10 +26,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - vot-coverage
-          - vot-verified-range
-          - vot-resume-core
+        include:
+          - package: vot-coverage
+            cargo_args: ""
+          - package: vot-verified-range
+            cargo_args: ""
+          - package: vot-resume-core
+            cargo_args: ""
+          - package: vot-scheduler
+            cargo_args: --no-default-features --lib
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -43,4 +48,26 @@ jobs:
       - name: Check pure crate
         run: >-
           cargo +1.88.0 check --package "${{ matrix.package }}"
+          ${{ matrix.cargo_args }}
           --target wasm32-unknown-unknown --locked
+
+  scheduler-no-default:
+    name: scheduler without file sink
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
+
+      - name: Validate scheduler without file sink
+        run: |
+          cargo +1.88.0 clippy -p vot-scheduler --no-default-features --all-targets --locked -- -D warnings
+          cargo +1.88.0 test -p vot-scheduler --no-default-features --lib --locked
+          if cargo +1.88.0 tree -p vot-scheduler --no-default-features --edges normal --locked | grep -q vot-platform-fs; then
+            echo "vot-platform-fs enabled without the file-sink feature" >&2
+            exit 1
+          fi

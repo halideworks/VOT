@@ -2280,9 +2280,8 @@ version = "0.0.1"
 dependencies = [
  "perf-event2",
  "vot-codec",
+ "vot-object",
  "vot-platform-proc",
- "vot-proof-blake3",
- "vot-proof-sha256",
  "vot-scheduler",
  "vot-transport-api",
  "vot-transport-msquic",
@@ -2317,10 +2316,9 @@ dependencies = [
  "vot-capability",
  "vot-codec",
  "vot-manifest",
+ "vot-object",
  "vot-pack",
  "vot-package",
- "vot-proof-blake3",
- "vot-proof-sha256",
  "vot-receipt",
  "vot-resume",
  "vot-scheduler",
@@ -2404,6 +2402,16 @@ dependencies = [
  "cap",
  "unicode-normalization",
  "vot-cbor",
+]
+
+[[package]]
+name = "vot-object"
+version = "0.0.1"
+dependencies = [
+ "vot-manifest",
+ "vot-proof-blake3",
+ "vot-proof-sha256",
+ "vot-verifier",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use vot_object::{ObjectBuilder, PreparedObject};
 use vot_scheduler::{DiscardSink, ReliableReceiver};
 use vot_transport_api::{
     Event, MAX_FRAME_ENVELOPE_BYTES, Payload, StreamId, SubjectId, TransportAdapter, shared_payload,
@@ -458,36 +459,25 @@ fn sink_note(sink: Option<&vot_scheduler::FileSink>, notes: &mut String) -> Resu
     Ok(())
 }
 
-/// Chaining-value layer ranges are proved from, per suite.
-enum ProverLayer {
-    Blake3(vot_proof_blake3::GroupCvs),
-    Sha256(vot_proof_sha256::PieceHashes),
-}
-
 /// Streams the generated object once, feeding the subject hash and the prover
 /// layer together. Runs before the timed section, as `subject_of` does.
-fn prover_layer_and_subject(config: &Config) -> Result<(SubjectId, ProverLayer), Error> {
-    let mut verifier = StreamVerifier::new(config.suite);
-    let mut layer = match config.suite {
-        Suite::Blake3Bao64 => ProverLayer::Blake3(vot_proof_blake3::GroupCvs::new()),
-        Suite::Sha256Bep52 => ProverLayer::Sha256(vot_proof_sha256::PieceHashes::new()),
-    };
+fn prepared_object_and_subject(config: &Config) -> Result<(SubjectId, PreparedObject), Error> {
+    let mut builder =
+        ObjectBuilder::new(config.suite, Some(config.object_bytes)).map_err(|_| layer_error())?;
     let mut source = ObjectSource::new(config.seed);
     let mut group = Vec::with_capacity(vot_verifier::GROUP_SIZE);
     for take in record_lengths(config.object_bytes, vot_verifier::GROUP_SIZE)? {
         source.fill(&mut group, take);
-        verifier.update(&group)?;
-        match &mut layer {
-            ProverLayer::Blake3(cvs) => cvs.push(&group).map_err(|_| layer_error())?,
-            ProverLayer::Sha256(pieces) => pieces.push(&group).map_err(|_| layer_error())?,
-        }
+        builder.update(&group).map_err(|_| layer_error())?;
     }
+    let prepared = builder.finish().map_err(|_| layer_error())?;
+    let object = prepared.object_id();
     let subject = SubjectId {
-        suite: config.suite.identifier(),
-        root: verifier.finish()?,
-        length: config.object_bytes,
+        suite: object.suite,
+        root: object.root,
+        length: object.length,
     };
-    Ok((subject, layer))
+    Ok((subject, prepared))
 }
 
 /// A proving failure with a well-formed schedule, which only a driver defect
@@ -497,19 +487,11 @@ fn layer_error() -> Error {
 }
 
 /// Proves one aligned range from the layer.
-fn prove_range(layer: &ProverLayer, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
-    let (covered_offset, covered_length, proof) = match layer {
-        ProverLayer::Blake3(cvs) => {
-            let cover =
-                vot_proof_blake3::prove_with(cvs, offset, length).map_err(|_| layer_error())?;
-            (cover.covered_offset, cover.covered_length, cover.proof)
-        }
-        ProverLayer::Sha256(pieces) => {
-            let cover =
-                vot_proof_sha256::prove_with(pieces, offset, length).map_err(|_| layer_error())?;
-            (cover.covered_offset, cover.covered_length, cover.proof)
-        }
-    };
+fn prove_range(layer: &PreparedObject, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
+    let (covered_offset, covered_length, proof) = layer
+        .prove(offset, length)
+        .map_err(|_| layer_error())?
+        .into_parts();
     // The schedule is group aligned, so the cover must be exactly the request;
     // an expanded cover would desynchronise the receiver's completion count.
     if covered_offset != offset || covered_length != length {
@@ -532,7 +514,7 @@ fn bundle_identifier(seed: u64, worker: u32, chunk: u32) -> [u8; 16] {
 /// encoding as it goes, so no more than one bundle of bytes exists at a time.
 struct BundleProducer {
     subject: SubjectId,
-    layer: Arc<ProverLayer>,
+    layer: Arc<PreparedObject>,
     source: ObjectSource,
     record_bytes: usize,
     /// Absolute offset of the next byte this worker will frame.
@@ -547,7 +529,7 @@ struct BundleProducer {
 impl BundleProducer {
     fn new(
         config: &Config,
-        layer: Arc<ProverLayer>,
+        layer: Arc<PreparedObject>,
         subject: SubjectId,
         range: WorkerRange,
         worker: u32,
@@ -1483,7 +1465,7 @@ fn transfer_ranged_into<C: Carrier>(
     // than a worker's; each producer reads the same value itself.
     ranged_record_bytes(config)?;
     let ranges = worker_ranges(config.object_bytes, workers)?;
-    let (subject, layer) = prover_layer_and_subject(config)?;
+    let (subject, layer) = prepared_object_and_subject(config)?;
     let layer = Arc::new(layer);
     let generator_ns = generator_nanos(config)?;
     let mut receiver = receiver_for_ranged(config)?;
@@ -2258,7 +2240,7 @@ mod tests {
     #[test]
     fn a_prover_refuses_a_cover_wider_than_the_request() {
         let config = ranged_case(2 * 65_536, 2, Suite::Blake3Bao64);
-        let (_, layer) = super::prover_layer_and_subject(&config).unwrap();
+        let (_, layer) = super::prepared_object_and_subject(&config).unwrap();
         assert!(super::prove_range(&layer, 0, 100).is_err());
         assert!(super::prove_range(&layer, 0, 65_536).is_ok());
     }

@@ -15,7 +15,7 @@ use crate::{
     BundleProducer, BundleReassembly, Config, Credit, Error, Measurement, ObjectSource, Rails,
     RangedFrame, SUBMIT_BATCH_RECORDS, TRANSFER_LANE, Tally, WitnessLedger, cpu_spent,
     cpu_times_ns, enforced_credit, generator_nanos, idle_wait, memory_high_water_bytes,
-    prover_layer_and_subject, ranged_record_bytes, receiver_for, receiver_for_ranged,
+    prepared_object_and_subject, ranged_record_bytes, receiver_for, receiver_for_ranged,
     record_lengths, record_payload, round_budget, subject_of, worker_ranges,
 };
 use vot_scheduler::ReliableReceiver as SchedulerReceiver;
@@ -570,7 +570,7 @@ fn send_ranged(config: &Config, generator_ns: u64, base: SocketAddr) -> Result<M
     let workers = config.workers;
     ranged_record_bytes(config)?;
     let ranges = worker_ranges(config.object_bytes, workers)?;
-    let (subject, layer) = prover_layer_and_subject(config)?;
+    let (subject, layer) = prepared_object_and_subject(config)?;
     let layer = std::sync::Arc::new(layer);
     let mut endpoints = Vec::with_capacity(workers);
     for rail in 0..workers {

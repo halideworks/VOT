@@ -1,0 +1,16 @@
+[package]
+name = "vot-object"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+vot-manifest = { path = "../vot-manifest" }
+vot-proof-blake3 = { path = "../vot-proof-blake3" }
+vot-proof-sha256 = { path = "../vot-proof-sha256" }
+vot-verifier = { path = "../vot-verifier" }
+
+[lints]
+workspace = true

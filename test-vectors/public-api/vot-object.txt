@@ -1,0 +1,7 @@
+constant vot_object::MAX_OBJECT_LENGTH
+enum vot_object::Error
+struct vot_object::ObjectBuilder
+struct vot_object::PreparedObject
+struct vot_object::RangeCover
+use vot_object::ObjectId <- vot_manifest::ObjectId
+use vot_object::Suite <- vot_verifier::Suite

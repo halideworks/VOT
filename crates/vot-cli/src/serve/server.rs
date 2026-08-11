@@ -259,8 +259,11 @@ impl BundleServer {
             return Err(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH));
         }
         // The codec bounded the request; the cover expands it to group boundaries.
-        let (covered_offset, covered_length, proof) =
-            served.layer.prove(request.offset, request.length)?;
+        let (covered_offset, covered_length, proof) = served
+            .layer
+            .prove(request.offset, request.length)
+            .map_err(Error::from)?
+            .into_parts();
         let plaintext = served.read_covered(covered_offset, covered_length)?;
         // Bundle identity derives from the request bytes, for replay detection.
         let mut bundle_id = [0u8; 16];

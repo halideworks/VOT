@@ -1,0 +1,46 @@
+name: static-proof-catalog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/static-proof-catalog.yml"
+      - "adr/0038-static-proof-catalog.md"
+      - "spec/proofs.md"
+      - "spec/static-proof-catalog.md"
+      - "test-vectors/static-proof-catalog/**"
+      - "tools/validate_static_proof_catalog_vectors.py"
+      - "tools/verify_wave1_vectors.py"
+  pull_request:
+    paths:
+      - ".github/workflows/static-proof-catalog.yml"
+      - "adr/0038-static-proof-catalog.md"
+      - "spec/proofs.md"
+      - "spec/static-proof-catalog.md"
+      - "test-vectors/static-proof-catalog/**"
+      - "tools/validate_static_proof_catalog_vectors.py"
+      - "tools/verify_wave1_vectors.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: static-proof-catalog
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
+      - run: python3 tools/validate_static_proof_catalog_vectors.py

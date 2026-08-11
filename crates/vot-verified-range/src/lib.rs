@@ -50,6 +50,37 @@ impl ValidatedBundle<'_> {
     }
 }
 
+/// Borrowed bytes authenticated against one exact object identity and offset.
+///
+/// The fields are private, so successful [`verify_range`] verification is the
+/// only way to construct this witness.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifiedSlice<'data> {
+    object: ObjectId,
+    covered_offset: u64,
+    data: &'data [u8],
+}
+
+impl<'data> VerifiedSlice<'data> {
+    /// Object identity that authenticated the range.
+    #[must_use]
+    pub const fn object(&self) -> ObjectId {
+        self.object
+    }
+
+    /// Object-relative byte offset of the range.
+    #[must_use]
+    pub const fn covered_offset(&self) -> u64 {
+        self.covered_offset
+    }
+
+    /// Authenticated bytes, borrowed from the input passed to [`verify_range`].
+    #[must_use]
+    pub const fn data(&self) -> &'data [u8] {
+        self.data
+    }
+}
+
 /// An owned range whose bytes have been authenticated against its object root.
 ///
 /// Its fields are private and only [`verify_typed_bundle`] constructs it.
@@ -129,25 +160,29 @@ pub fn verify_typed_bundle(
     records: &[DataRecord],
 ) -> Result<VerifiedRange, Error> {
     let data = validate_typed_bundle(object, bundle, records)?.assemble()?;
-    verify_range(object, bundle.covered_offset, &data, &bundle.proof)?;
+    let verified = verify_range(object, bundle.covered_offset, &data, &bundle.proof)?;
+    let object = verified.object();
+    let covered_offset = verified.covered_offset();
+    debug_assert!(std::ptr::eq(verified.data(), data.as_slice()));
     Ok(VerifiedRange {
         object,
-        covered_offset: bundle.covered_offset,
+        covered_offset,
         data,
     })
 }
 
-/// Authenticates borrowed range bytes without copying or retaining them.
+/// Authenticates borrowed range bytes and returns a witness without copying or
+/// retaining them.
 ///
 /// # Errors
 /// Rejects an empty or oversized range, arithmetic overflow, a range outside
 /// the object, non-final partial units, unknown suites, and invalid proofs.
-pub fn verify_range(
+pub fn verify_range<'data>(
     object: ObjectId,
     covered_offset: u64,
-    data: &[u8],
+    data: &'data [u8],
     proof: &[u8],
-) -> Result<(), Error> {
+) -> Result<VerifiedSlice<'data>, Error> {
     let bytes = u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)?;
     check_range_geometry(object.length, covered_offset, bytes)?;
     match Suite::try_from(object.suite).map_err(|_| Error::UnknownSuite)? {
@@ -160,7 +195,11 @@ pub fn verify_range(
                 .map_err(|_| Error::ProofInvalid)?;
         }
     }
-    Ok(())
+    Ok(VerifiedSlice {
+        object,
+        covered_offset,
+        data,
+    })
 }
 
 fn assemble_ordered(
@@ -286,29 +325,43 @@ mod tests {
     }
 
     #[test]
-    fn verified_range_reports_a_nonzero_covered_offset() {
+    fn verified_slice_reports_the_exact_nonzero_range() {
         let fixture = make_fixture(Suite::Blake3Bao64);
-        let range = VerifiedRange {
-            object: fixture.object,
-            covered_offset: RANGE_UNIT_BYTES,
-            data: vec![0x5a; 3],
-        };
-        assert_eq!(range.covered_offset(), RANGE_UNIT_BYTES);
+        let proof =
+            vot_proof_blake3::prove(&fixture.bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let verified = verify_range(
+            fixture.object,
+            proof.covered_offset,
+            &proof.data,
+            &proof.proof,
+        )
+        .unwrap();
+        assert_eq!(verified.object(), fixture.object);
+        assert_eq!(verified.covered_offset(), RANGE_UNIT_BYTES);
+        assert!(std::ptr::eq(verified.data(), proof.data.as_slice()));
     }
 
     #[test]
     fn both_frozen_suites_verify_borrowed_ranges() {
+        fn authenticated_data<'data>(verified: &VerifiedSlice<'data>) -> &'data [u8] {
+            verified.data()
+        }
+
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
             let fixture = make_fixture(suite);
-            assert_eq!(
-                verify_range(
-                    fixture.object,
-                    fixture.bundle.covered_offset,
-                    &fixture.bytes,
-                    &fixture.bundle.proof,
-                ),
-                Ok(())
-            );
+            let verified = verify_range(
+                fixture.object,
+                fixture.bundle.covered_offset,
+                &fixture.bytes,
+                &fixture.bundle.proof,
+            )
+            .unwrap();
+            assert_eq!(verified.object(), fixture.object);
+            assert_eq!(verified.covered_offset(), fixture.bundle.covered_offset);
+            assert!(std::ptr::eq(
+                authenticated_data(&verified),
+                fixture.bytes.as_slice()
+            ));
         }
     }
 
@@ -448,15 +501,15 @@ mod tests {
         let mut fixture = make_fixture(Suite::Blake3Bao64);
         fixture.object.suite = 9;
         assert_eq!(
-            verify_range(fixture.object, 0, &fixture.bytes, &fixture.bundle.proof),
-            Err(Error::UnknownSuite)
+            verify_range(fixture.object, 0, &fixture.bytes, &fixture.bundle.proof).unwrap_err(),
+            Error::UnknownSuite
         );
 
         for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
             let fixture = make_fixture(suite);
             assert_eq!(
-                verify_range(fixture.object, 0, &fixture.bytes, &[0]),
-                Err(Error::ProofInvalid)
+                verify_range(fixture.object, 0, &fixture.bytes, &[0]).unwrap_err(),
+                Error::ProofInvalid
             );
         }
     }

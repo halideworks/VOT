@@ -2482,10 +2482,12 @@ dependencies = [
 name = "vot-proof-catalog"
 version = "0.0.1"
 dependencies = [
+ "vot-codec",
  "vot-object",
  "vot-proof-blake3",
  "vot-proof-sha256",
  "vot-proof-store",
+ "vot-verified-range",
 ]
 
 [[package]]

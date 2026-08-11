@@ -150,8 +150,13 @@ impl ReliableReceiver {
         if !replay && !self.range_active.contains_key(&subject) {
             return Err(Error::UnknownObject);
         }
-        check_range_proof(subject, covered_offset, data, proof)?;
-        self.insert_checked_range(subject, covered_offset, data, caller_reserved)
+        let verified = check_range_proof(subject, covered_offset, data, proof)?;
+        self.insert_checked_range(
+            subject_id(verified.object()),
+            verified.covered_offset(),
+            verified.data(),
+            caller_reserved,
+        )
     }
 
     /// Books a range whose proof [`check_range_proof`] has already held:

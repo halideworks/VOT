@@ -7,9 +7,11 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+vot-codec = { path = "../vot-codec" }
 vot-object = { path = "../vot-object" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
+vot-verified-range = { path = "../vot-verified-range" }
 
 [dev-dependencies]
 vot-proof-store = { path = "../vot-proof-store" }

@@ -4,22 +4,29 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 0"
 
 permissions:
   contents: read
 
 # One run per ref. A pull request's older run is cancelled when a new commit
 # arrives, because it measures code that no longer exists. A push to main is
-# not cancelled once it is running, since its mutation sweep is the record for
-# that commit, but a newer push supersedes any run still pending, which is
-# what keeps a run of merges from queueing a sweep each and starving the pull
-# requests behind them.
+# not cancelled once it is running, since its checks are the record for that
+# commit, but a newer push supersedes any run still pending, which is what
+# keeps a run of merges from queueing checks for each and starving the pull
+# requests behind them. Scheduled and manual sweeps have their own group, so a
+# long full sweep cannot hold routine main checks behind it.
 #
 # A cancelled run is therefore two things now: a superseded one, and the
 # killed runner that an unbounded loop or a leaked temp file produces. Check
 # which before reading a cancelled mutation job as a defect.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ${{ github.workflow }}-${{
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && 'full-sweep' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -45,13 +52,23 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          if [ "$EVENT_NAME" = pull_request ]; then
-            git diff --name-only -z "origin/$BASE_REF...HEAD" > changed.paths
-            python3 tools/ci_mutation_plan.py --paths-file changed.paths >> "$GITHUB_OUTPUT"
-          else
-            python3 tools/ci_mutation_plan.py --all >> "$GITHUB_OUTPUT"
-          fi
+          mode="$(python3 tools/ci_mutation_scope.py \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            --before-sha "$BEFORE_SHA" --name-only --output changed.paths)"
+          case "$mode" in
+            targeted)
+              python3 tools/ci_mutation_plan.py --paths-file changed.paths >> "$GITHUB_OUTPUT"
+              ;;
+            full)
+              python3 tools/ci_mutation_plan.py --all >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "invalid mutation scope: $mode" >&2
+              exit 1
+              ;;
+          esac
 
   validate:
     runs-on: ubuntu-24.04
@@ -435,10 +452,9 @@ jobs:
     # test-vectors/mutants/the_live_transport_is_mutation_tested.md does not
     # already account for.
     #
-    # A pull request mutates only the lines it changed, which took this job from
-    # 28 minutes to a couple. The full sweep runs on every push to main, where a
-    # 28-minute job blocks nobody. What a diff run cannot see is a change that
-    # uncovers code it did not touch, and that is what the sweep is for.
+    # Pull requests and pushes mutate only the lines they changed, which took
+    # this job from 28 minutes to a couple. The weekly and manual full sweeps
+    # catch changes that uncover code outside the changed diff.
     needs: mutation-plan
     if: needs.mutation-plan.outputs.msquic == 'true'
     runs-on: ubuntu-24.04
@@ -490,20 +506,27 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -o pipefail
           scope=()
           sweep=(--full)
-          if [ "$EVENT_NAME" = pull_request ]; then
-            # origin/<base> comes from the checkout above, which fetched every
-            # branch. Fetching it again would be a network call this job does
-            # not need and a way for it to fail.
-            git diff "origin/$BASE_REF...HEAD" > changed.diff
-            scope=(--in-diff changed.diff)
-            # A diff run tests a subset, so it cannot say a classified survivor
-            # is gone. Only the sweep can.
-            sweep=()
-          fi
+          mode="$(python3 tools/ci_mutation_scope.py \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            --before-sha "$BEFORE_SHA" --output changed.diff)"
+          case "$mode" in
+            targeted)
+              scope=(--in-diff changed.diff)
+              # A diff run tests a subset, so it cannot say a classified
+              # survivor is gone. Only the sweep can.
+              sweep=()
+              ;;
+            full) ;;
+            *)
+              echo "invalid mutation scope: $mode" >&2
+              exit 1
+              ;;
+          esac
           # cargo-mutants exits non-zero whenever anything survives at all, and
           # what survives here is a classified list. A check that is red for a
           # known list teaches people to ignore red, so the checker decides
@@ -527,9 +550,9 @@ jobs:
     needs: mutation-plan
     if: needs.mutation-plan.outputs.quiche == 'true'
     runs-on: ubuntu-24.04
-    # The full sweep measured 40 minutes on a quiet 20-core box at 2 jobs; a
-    # loaded 2-core runner needs the headroom.
-    timeout-minutes: 60
+    # The full sweep measured 40 minutes on a quiet box at 2 jobs and exceeded
+    # an hour on a loaded hosted runner. Weekly and manual sweeps get headroom.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -565,17 +588,27 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -o pipefail
           scope=()
           sweep=(--full)
-          if [ "$EVENT_NAME" = pull_request ]; then
-            git diff "origin/$BASE_REF...HEAD" > changed.diff
-            scope=(--in-diff changed.diff)
-            # A diff run tests a subset, so it cannot say a classified survivor
-            # is gone. Only the sweep can.
-            sweep=()
-          fi
+          mode="$(python3 tools/ci_mutation_scope.py \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            --before-sha "$BEFORE_SHA" --output changed.diff)"
+          case "$mode" in
+            targeted)
+              scope=(--in-diff changed.diff)
+              # A diff run tests a subset, so it cannot say a classified
+              # survivor is gone. Only the sweep can.
+              sweep=()
+              ;;
+            full) ;;
+            *)
+              echo "invalid mutation scope: $mode" >&2
+              exit 1
+              ;;
+          esac
           cargo +1.88.0 mutants --package vot-transport-quiche --features live \
             --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
             "${scope[@]}" 2>&1 | tee mutants.log || true
@@ -671,12 +704,20 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           scope=()
-          if [ "$EVENT_NAME" = pull_request ]; then
-            git diff "origin/$BASE_REF...HEAD" > changed.diff
-            scope=(--in-diff changed.diff)
-          fi
+          mode="$(python3 tools/ci_mutation_scope.py \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            --before-sha "$BEFORE_SHA" --output changed.diff)"
+          case "$mode" in
+            targeted) scope=(--in-diff changed.diff) ;;
+            full) ;;
+            *)
+              echo "invalid mutation scope: $mode" >&2
+              exit 1
+              ;;
+          esac
           # shellcheck disable=SC2086: the shard args are word lists.
           cargo +1.88.0 mutants --package vot-cli --features wire \
             --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
@@ -724,14 +765,21 @@ jobs:
           || cargo +1.88.0 install --locked --force cargo-mutants --version 26.0.0
 
       - name: Select the mutants this change can affect
-        # A pull request mutates only the lines it changed. The filter runs
-        # before anything is built, so a package the change does not touch costs
-        # this job's setup and nothing else. The full sweep runs on every push to
-        # main.
-        if: github.event_name == 'pull_request'
+        # Routine changes mutate only their diff. The filter runs before
+        # anything is built, so an unaffected package costs setup and nothing
+        # else. Weekly and manual runs omit the filter for a full sweep.
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
-        run: git diff "origin/$BASE_REF...HEAD" > changed.diff
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          mode="$(python3 tools/ci_mutation_scope.py \
+            --event-name "$EVENT_NAME" --base-ref "$BASE_REF" \
+            --before-sha "$BEFORE_SHA" --output changed.diff)"
+          if [ "$mode" != targeted ] && [ "$mode" != full ]; then
+            echo "invalid mutation scope: $mode" >&2
+            exit 1
+          fi
 
       - name: Test mutants
         continue-on-error: ${{ !matrix.required }}

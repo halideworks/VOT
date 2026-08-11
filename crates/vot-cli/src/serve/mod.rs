@@ -10,17 +10,17 @@ use vot_codec::frames::{
     self, DataRecord, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest, TypedFrame,
 };
 use vot_codec::{DecodeLimits, error_code, frame_type};
+use vot_object::{ObjectBuilder, PreparedObject};
 use vot_session::{ErrorKind, Session};
 use vot_transport_api::{
     Event, MAX_CONTROL_FRAME_PAYLOAD, Payload, StreamId, TransportAdapter, shared_payload,
 };
-use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
+use vot_verifier::{GROUP_SIZE, Suite};
 
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
 
 mod connection;
 mod object;
-mod prover;
 mod server;
 
 #[cfg(test)]
@@ -28,7 +28,6 @@ use connection::{OUTBOUND_BUDGET_BYTES, REMEMBERED_REQUESTS};
 
 pub use connection::ServeConnection;
 pub(crate) use object::*;
-pub(crate) use prover::*;
 pub use server::BundleServer;
 
 /// The reliable lane every data record rides.
@@ -1186,7 +1185,10 @@ mod tests {
                 .reports_untouched(&Witness::of(&File::open(&stored.path).unwrap()).unwrap()),
             "nothing has touched the file"
         );
-        stored.layer = ProverLayer::Blake3(vot_proof_blake3::GroupCvs::new());
+        stored.layer = ObjectBuilder::new(Suite::Blake3Bao64, Some(0))
+            .unwrap()
+            .finish()
+            .unwrap();
 
         let bytes = server
             .objects

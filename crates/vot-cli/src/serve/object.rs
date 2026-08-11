@@ -1,7 +1,7 @@
 //! A served object and its source-mutation witness.
 
 use super::{
-    Error, File, GROUP_SIZE, Path, PathBuf, ProverLayer, Read, Seek, SeekFrom, StreamVerifier,
+    Error, File, GROUP_SIZE, ObjectBuilder, Path, PathBuf, PreparedObject, Read, Seek, SeekFrom,
     Suite, SystemTime, frames, io,
 };
 
@@ -12,7 +12,7 @@ pub(crate) const RECORD_PLAINTEXT_BYTES: usize = 258_048;
 /// One stored object: its wire identity, proving layer, and file.
 pub(crate) struct ServedObject {
     pub(crate) object: frames::ObjectId,
-    pub(crate) layer: ProverLayer,
+    pub(crate) layer: PreparedObject,
     pub(crate) path: PathBuf,
     pub(crate) witness: Witness,
 }
@@ -56,23 +56,22 @@ impl ServedObject {
         // Take the witness before reading: a mid-read write would otherwise
         // stamp into the witness.
         let witness = Witness::of(&file)?;
-        let mut verifier = StreamVerifier::new(suite);
-        let mut layer = ProverLayer::empty(suite);
+        let mut builder = ObjectBuilder::new(suite, Some(length))?;
         let mut group = vec![0u8; GROUP_SIZE];
         let mut remaining = length;
         while remaining > 0 {
             let take = usize::try_from(remaining.min(GROUP_SIZE as u64))
                 .map_err(|_| Error::InvalidBundle)?;
             file.read_exact(&mut group[..take]).map_err(short_read)?;
-            verifier.update(&group[..take])?;
-            layer.push(&group[..take])?;
+            builder.update(&group[..take])?;
             remaining -= take as u64;
         }
         // Trailing bytes mean the file is not the object it is named as.
         if file.read(&mut [0u8; 1])? != 0 {
             return Err(Error::RootMismatch);
         }
-        if verifier.finish()? != root {
+        let layer = builder.finish()?;
+        if layer.object_id().root != root {
             return Err(Error::RootMismatch);
         }
         Ok(Self {

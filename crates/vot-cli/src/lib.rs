@@ -137,6 +137,15 @@ impl From<vot_package::Error> for Error {
     }
 }
 
+impl From<vot_object::Error> for Error {
+    fn from(error: vot_object::Error) -> Self {
+        match error {
+            vot_object::Error::Verifier(error) => Self::Verifier(error),
+            _ => Self::Proof,
+        }
+    }
+}
+
 impl From<vot_scheduler::Error> for Error {
     fn from(error: vot_scheduler::Error) -> Self {
         Self::Scheduler(error)

@@ -273,6 +273,7 @@ jobs:
       matrix:
         package:
           - vot-verified-range
+          - vot-resume-core
     steps:
       - uses: actions/checkout@v7.0.1
         with:

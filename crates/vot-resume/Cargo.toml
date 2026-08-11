@@ -10,6 +10,7 @@ publish = false
 blake3.workspace = true
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 vot-platform-fs = { path = "../vot-platform-fs" }
+vot-resume-core = { path = "../vot-resume-core" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-transport-tcp = { path = "../vot-transport-tcp" }
 

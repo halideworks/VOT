@@ -94,6 +94,9 @@ The `vot-object` crate streams an object into its canonical identity and
 suite-neutral retained proof material without retaining the object. The current
 in-memory material costs approximately 32 bytes per 64 KiB verification unit.
 
+The `vot-proof-catalog` crate encodes and validates the optional random-access
+catalog profile without making the catalog part of object or package identity.
+
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated
 manifest pages containing verification-group commitments; `SEAL` commits the

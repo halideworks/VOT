@@ -12,6 +12,7 @@ PACKAGES = (
     "vot-journal",
     "vot-proof-blake3",
     "vot-proof-sha256",
+    "vot-proof-catalog",
     "vot-codec",
     "vot-verifier",
     "vot-manifest",

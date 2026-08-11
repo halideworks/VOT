@@ -11,6 +11,8 @@ scheduled `fuzz-nightly` workflow runs them.
 ```sh
 cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz frame_codec fuzz/frame_codec/corpus
 cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz manifest    fuzz/manifest/corpus
+cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz static_proof_catalog \
+  fuzz/static-proof-catalog/corpus
 ```
 
 The corpus directory passed on the command line is the persistent corpus.

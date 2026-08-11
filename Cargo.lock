@@ -1527,7 +1527,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.4"
-source = "git+https://github.com/halideworks/quiche.git?rev=6138b4d754263edf7f0164f12e46e8277dd5d674#6138b4d754263edf7f0164f12e46e8277dd5d674"
+source = "git+https://github.com/halideworks/quiche.git?rev=31a2d9c4f11c3a1dd290ad42bf5b9018b4d6f30d#31a2d9c4f11c3a1dd290ad42bf5b9018b4d6f30d"
 
 [[package]]
 name = "oid-registry"
@@ -1662,7 +1662,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.24.9"
-source = "git+https://github.com/halideworks/quiche.git?rev=6138b4d754263edf7f0164f12e46e8277dd5d674#6138b4d754263edf7f0164f12e46e8277dd5d674"
+source = "git+https://github.com/halideworks/quiche.git?rev=31a2d9c4f11c3a1dd290ad42bf5b9018b4d6f30d#31a2d9c4f11c3a1dd290ad42bf5b9018b4d6f30d"
 dependencies = [
  "cmake",
  "either",

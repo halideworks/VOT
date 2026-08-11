@@ -37,6 +37,10 @@ the bundle.
 Proof bytes authenticate the covered data but are not themselves object bytes.
 No data contributes to verified state until its complete 64 KiB group verifies.
 
+Immutable range-readable storage MAY carry the same canonical proof bytes in
+the optional random-access format defined by `spec/static-proof-catalog.md`.
+Catalog presence does not change object identity or this proof geometry.
+
 ## 2. Suite 0x0001: `blake3-bao64`
 
 ### 2.1 Root and geometry

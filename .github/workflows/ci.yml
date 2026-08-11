@@ -99,15 +99,17 @@ jobs:
       # and the build directory are worth keeping between runs. The key follows
       # the lockfile; a dependency change misses and rebuilds.
       - name: Restore cargo registry and build directory
-        uses: actions/cache@v6.1.0
+        id: validate-cache
+        uses: actions/cache/restore@v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: validate-1.88.0-${{ hashFiles('Cargo.lock') }}
-          restore-keys: validate-1.88.0-
+          key: validate-v2-ubuntu-24.04-${{ runner.os }}-${{ runner.arch }}-rust-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            validate-v2-ubuntu-24.04-${{ runner.os }}-${{ runner.arch }}-rust-1.88.0-
 
       - name: Check dependency policy and advisories
         run: |
@@ -252,6 +254,17 @@ jobs:
         # coverage-guided targets still compile. fuzz-nightly runs them.
         run: cargo +1.88.0 build --manifest-path fuzz/cargo-fuzz/Cargo.toml --locked
 
+      - name: Save cargo registry and build directory
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.validate-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.validate-cache.outputs.cache-primary-key }}
+
 
   # The importable public surface of every crate against its committed
   # snapshot, so a module-split refactor cannot drop or move a public item
@@ -301,6 +314,8 @@ jobs:
     name: quiche live (loopback)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/quiche-live
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -314,6 +329,50 @@ jobs:
       # quiche builds BoringSSL, and the tests generate their own certificate.
       - name: Install native build tools
         run: sudo apt-get update && sudo apt-get install -y cmake openssl
+
+      - name: Fingerprint native toolchain
+        id: quiche-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          fingerprint="$({
+            printf '%s\n' ubuntu-24.04 "$RUNNER_OS" "$RUNNER_ARCH"
+            rustc +1.88.0 -vV
+            cc -dumpmachine
+            cc -dumpfullversion -dumpversion
+            c++ -dumpmachine
+            c++ -dumpfullversion -dumpversion
+            ld --version
+            ar --version
+            ldd --version
+            cmake --version
+            openssl version
+          } | sha256sum)"
+          printf 'key=%s\n' "${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore quiche native build
+        id: quiche-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: quiche-live-v1-${{ steps.quiche-toolchain.outputs.key }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            quiche-live-v1-${{ steps.quiche-toolchain.outputs.key }}-
+
+      - name: Prime quiche native build
+        if: ${{ steps.quiche-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cargo +1.88.0 test -p vot-transport-quiche --features live --locked --no-run
+          cargo +1.88.0 test -p vot-transport-quiche --features live --release --locked --no-run
+
+      - name: Save quiche native build
+        # Both profiles compiled successfully. Preserve that work even when a
+        # later live gate fails so its same-commit rerun does not rebuild it.
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.quiche-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.quiche-cache.outputs.cache-primary-key }}
 
       # Both profiles, because a debug assertion and a release optimisation catch
       # different things in a threaded driver, and the pump is one.

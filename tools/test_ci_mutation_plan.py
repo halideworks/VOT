@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+import os
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -7,9 +11,11 @@ from pathlib import Path
 if __package__:
     from .ci_mutation_packages import EXCLUDED_PACKAGES
     from .ci_mutation_plan import PACKAGES, WIRE_SHARDS, plan
+    from .ci_mutation_scope import _write_diff, mutation_revision
 else:
     from ci_mutation_packages import EXCLUDED_PACKAGES
     from ci_mutation_plan import PACKAGES, WIRE_SHARDS, plan
+    from ci_mutation_scope import _write_diff, mutation_revision
 
 
 class MutationPlanTests(unittest.TestCase):
@@ -105,10 +111,137 @@ class MutationPlanTests(unittest.TestCase):
             [{"package": "vot-object-store", "required": True, "features": "s3-live"}],
         )
 
-    def test_main_push_selects_the_full_sweep(self) -> None:
+    def test_explicit_full_sweep_selects_every_package_and_wire_shard(self) -> None:
         result = plan([], full=True)
         self.assertEqual(len(result["packages"]), len(PACKAGES))
         self.assertEqual(len(result["wire"]), len(WIRE_SHARDS))
+
+    def test_pull_request_uses_the_merge_base_diff(self) -> None:
+        self.assertEqual(
+            mutation_revision("pull_request", "main", "", lambda _: True),
+            "origin/main...HEAD",
+        )
+
+    def test_push_uses_the_exact_pushed_range(self) -> None:
+        before = "a" * 40
+        self.assertEqual(
+            mutation_revision("push", "", before, lambda _: True),
+            f"{before}..HEAD",
+        )
+
+    def test_push_without_reachable_ancestry_uses_a_full_sweep(self) -> None:
+        for before, exists in [
+            ("", True),
+            ("0" * 40, True),
+            ("not-a-sha", True),
+            ("a" * 40, False),
+        ]:
+            with self.subTest(before=before, exists=exists):
+                self.assertIsNone(
+                    mutation_revision("push", "", before, lambda _: exists)
+                )
+
+    def test_explicit_and_unknown_events_use_a_full_sweep(self) -> None:
+        for event_name in ["schedule", "workflow_dispatch", "merge_group"]:
+            with self.subTest(event_name=event_name):
+                self.assertIsNone(
+                    mutation_revision(event_name, "main", "a" * 40, lambda _: True)
+                )
+
+
+class MutationScopeMaterializationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_root = os.environ.get("VOT_TEST_TMPDIR")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="vot-ci-scope-", dir=temporary_root
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.repo = Path(self.temporary.name)
+        self.script = Path(__file__).with_name("ci_mutation_scope.py")
+
+        self.git("init", "--quiet")
+        (self.repo / "tracked.txt").write_text("before\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git(
+            "-c",
+            "user.name=VOT CI",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "before",
+        )
+        self.before = self.git("rev-parse", "HEAD").stdout.decode().strip()
+        (self.repo / "tracked.txt").write_text("after\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git(
+            "-c",
+            "user.name=VOT CI",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "after",
+        )
+
+    def git(self, *args: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+
+    def scope(self, *args: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [sys.executable, self.script, *args],
+            cwd=self.repo,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+
+    def test_cli_materializes_patch_names_and_clears_full_output(self) -> None:
+        output = self.repo / "changed.diff"
+        result = self.scope(
+            "--event-name",
+            "push",
+            "--before-sha",
+            self.before,
+            "--output",
+            str(output),
+        )
+        self.assertEqual(result.stdout, b"targeted\n")
+        patch = output.read_bytes()
+        self.assertIn(b"-before\n", patch)
+        self.assertIn(b"+after\n", patch)
+
+        result = self.scope(
+            "--event-name",
+            "push",
+            "--before-sha",
+            self.before,
+            "--name-only",
+            "--output",
+            str(output),
+        )
+        self.assertEqual(result.stdout, b"targeted\n")
+        self.assertEqual(output.read_bytes(), b"tracked.txt\0")
+
+        result = self.scope(
+            "--event-name", "schedule", "--output", str(output)
+        )
+        self.assertEqual(result.stdout, b"full\n")
+        self.assertFalse(output.exists())
+
+    def test_failed_diff_preserves_destination_and_removes_temporary(self) -> None:
+        output = self.repo / "changed.diff"
+        output.write_bytes(b"keep")
+        with self.assertRaises(subprocess.CalledProcessError):
+            _write_diff(output, "missing..HEAD", name_only=False)
+        self.assertEqual(output.read_bytes(), b"keep")
+        self.assertFalse((self.repo / ".changed.diff.tmp").exists())
 
 
 if __name__ == "__main__":

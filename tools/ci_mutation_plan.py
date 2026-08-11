@@ -39,6 +39,7 @@ WIRE_SHARDS = (
 PLAN_INFRASTRUCTURE = {
     ".github/workflows/ci.yml",
     "tools/ci_mutation_plan.py",
+    "tools/ci_mutation_scope.py",
     "tools/test_ci_mutation_plan.py",
 }
 LIVE_CONFIGURATION = ".cargo/mutants-live.toml"

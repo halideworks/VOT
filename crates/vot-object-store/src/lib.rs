@@ -172,7 +172,9 @@ pub trait MultipartObjectStore {
         upload_id: &str,
         parts: &[PartReceipt],
     ) -> Result<MultipartCompleted, Error>;
+    /// Observes cheap metadata without reading or verifying the object body.
     fn stat_object(&self, key: &str) -> Result<Option<ObjectMetadata>, Error>;
+    /// Streams the complete object body and verifies its length and checksum.
     fn verify_by_readback(&self, expected: &ObjectExpectation) -> Result<ReadbackVerified, Error>;
     /// Releases local state retained only for multipart completion recovery.
     ///

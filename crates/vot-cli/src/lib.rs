@@ -204,6 +204,16 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn object_verifier_failures_keep_their_error_class() {
+        assert!(matches!(
+            Error::from(vot_object::Error::Verifier(
+                vot_verifier::VerifyError::InvalidGroupLength
+            )),
+            Error::Verifier(vot_verifier::VerifyError::InvalidGroupLength)
+        ));
+    }
+
+    #[test]
     fn a_rendezvous_names_every_address_it_answers_at_with_ipv6_first() {
         use std::net::SocketAddr;
 

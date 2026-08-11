@@ -3,6 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+#[cfg(any(feature = "hmac", test))]
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 

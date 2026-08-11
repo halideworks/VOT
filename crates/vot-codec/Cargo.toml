@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 vot-cbor = { path = "../vot-cbor" }
 vot-manifest = { path = "../vot-manifest" }
-vot-receipt = { path = "../vot-receipt" }
+vot-receipt = { path = "../vot-receipt", default-features = false }
 
 [lints]
 workspace = true

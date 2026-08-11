@@ -254,14 +254,13 @@ def build_catalog(suite: int, data: bytes):
         root = blake3_hash(data)
         material = blake_prover(data) if data else None
         prove = material[0] if material else None
-        context = (suite, root, material[1] if material else [], 0, data)
+        context = (suite, material[1] if material else [], 0, data)
     elif suite == 2:
         root = sha_root(data)
         material = sha_prover(data) if data else None
         prove = material[0] if material else None
         context = (
             suite,
-            root,
             material[1] if material else [],
             material[2] if material else 0,
             data,
@@ -321,8 +320,8 @@ def verify_record(
     proof: bytes,
     context,
 ) -> None:
-    context_suite, context_root, leaves, context_count, data = context
-    if context_suite != suite or context_root != root:
+    context_suite, leaves, context_count, data = context
+    if context_suite != suite:
         fail(PROOF_INVALID)
     data_offset = checked_mul(ordinal, RANGE_LENGTH)
     data_length = min(RANGE_LENGTH, object_length - data_offset)
@@ -580,10 +579,23 @@ def validate_random_access(vectors: list[dict[str, object]], positive) -> None:
         if "identity_root_xor" in vector:
             expected_root = bytes([root[0] ^ vector["identity_root_xor"]]) + root[1:]
         reads: list[tuple[int, int]] = []
+        selected_index = HEADER_LENGTH + ordinal * ENTRY_LENGTH
+        short_read_at = None
+        if vector.get("short_read") == "index":
+            short_read_at = selected_index
+        elif vector.get("short_read") == "proof":
+            proof_offset = HEADER.unpack(fixture[:HEADER_LENGTH])[12]
+            relative, _, _ = ENTRY.unpack(
+                fixture[selected_index : selected_index + ENTRY_LENGTH]
+            )
+            short_read_at = proof_offset + relative
 
         def read_at(offset: int, length: int) -> bytes:
             reads.append((offset, length))
-            return fixture[offset : offset + length]
+            result = fixture[offset : offset + length]
+            if offset == short_read_at and result:
+                return result[:-1]
+            return result
 
         outcome = "ok"
         try:
@@ -601,7 +613,6 @@ def validate_random_access(vectors: list[dict[str, object]], positive) -> None:
         if outcome == IDENTITY:
             assert reads == [(0, HEADER_LENGTH)]
         if vector.get("require_sparse"):
-            selected_index = HEADER_LENGTH + ordinal * ENTRY_LENGTH
             neighbor_indexes = {
                 HEADER_LENGTH + neighbor * ENTRY_LENGTH
                 for neighbor in range(len(records))

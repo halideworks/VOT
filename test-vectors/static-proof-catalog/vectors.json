@@ -836,6 +836,20 @@
       "expected": "IDENTITY_MISMATCH"
     },
     {
+      "name": "selected_index_short_read",
+      "base": "blake3_65537",
+      "record": 0,
+      "short_read": "index",
+      "expected": "CATALOG_UNAVAILABLE"
+    },
+    {
+      "name": "selected_proof_short_read",
+      "base": "blake3_65537",
+      "record": 0,
+      "short_read": "proof",
+      "expected": "CATALOG_UNAVAILABLE"
+    },
+    {
       "name": "selected_proof_offset_overflow",
       "base": "blake3_65537",
       "record": 0,

@@ -176,6 +176,7 @@ evolution never changes the underlying VOT object identity.
 the header, index addressing, proof bytes, both suites, boundary geometry,
 hostile arithmetic, identity mismatch, truncation, canonicality failures, and
 proof corruption. Coverage includes single-group payload corruption, the exact
-8,192-byte proof limit, and sparse selected-entry reads that occur only after
-object identity authentication. The validator independently regenerates cold
-proof bytes and requires each catalog record to match them exactly.
+8,192-byte proof limit, sparse selected-entry reads that occur only after object
+identity authentication, and short selected-entry and proof reads. The validator
+independently regenerates cold proof bytes and requires each catalog record to
+match them exactly.

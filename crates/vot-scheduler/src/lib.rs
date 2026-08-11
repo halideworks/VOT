@@ -785,10 +785,14 @@ mod tests {
 
     #[test]
     fn a_panicking_sink_does_not_strand_staging() {
-        struct PanickingSink;
-        impl RangeSink for PanickingSink {
+        struct PanicOnceSink(std::sync::atomic::AtomicBool);
+        impl RangeSink for PanicOnceSink {
             fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), SinkError> {
-                panic!("a sink is caller code and may do this");
+                assert!(
+                    !self.0.swap(false, std::sync::atomic::Ordering::Relaxed),
+                    "a sink is caller code and may do this"
+                );
+                Ok(())
             }
         }
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
@@ -798,7 +802,10 @@ mod tests {
         let staging = 2 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
         let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
         receiver
-            .begin_ranges(object, Box::new(PanickingSink))
+            .begin_ranges(
+                object,
+                Box::new(PanicOnceSink(std::sync::atomic::AtomicBool::new(true))),
+            )
             .unwrap();
         let credit = receiver.advertised_credit();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -806,6 +813,12 @@ mod tests {
         }));
         assert!(outcome.is_err(), "the sink's panic reached the caller");
         assert_eq!(receiver.advertised_credit(), credit);
+        assert_eq!(receiver.range_active[&object].coverage.covered_bytes(), 0);
+        receiver
+            .receive_range(object, 0, &bytes, &proof.proof)
+            .unwrap();
+        receiver.finish_ranges(object).unwrap();
+        assert!(receiver.is_verified(object));
     }
 
     #[test]

@@ -156,6 +156,14 @@ mod tests {
         booking.commit();
     }
 
+    fn coverage_at_fragment_cap(first_offset: u64) -> Coverage {
+        let mut coverage = Coverage::new();
+        for index in 0..u64::try_from(MAX_FRAGMENTS).unwrap() {
+            commit(&mut coverage, first_offset + index * 2, 1);
+        }
+        coverage
+    }
+
     #[test]
     fn new_ranges_coalesce_and_replays_change_nothing() {
         let mut coverage = Coverage::new();
@@ -209,10 +217,7 @@ mod tests {
 
     #[test]
     fn fragment_cap_rejects_isolation_but_accepts_merges() {
-        let mut coverage = Coverage::new();
-        for index in 0..u64::try_from(MAX_FRAGMENTS).unwrap() {
-            commit(&mut coverage, index * 2, 1);
-        }
+        let mut coverage = coverage_at_fragment_cap(0);
         assert_eq!(coverage.fragment_count(), MAX_FRAGMENTS);
         assert!(matches!(
             coverage.check(u64::try_from(MAX_FRAGMENTS).unwrap() * 2 + 10, 1),
@@ -221,6 +226,33 @@ mod tests {
 
         commit(&mut coverage, 1, 1);
         assert_eq!(coverage.fragment_count(), MAX_FRAGMENTS - 1);
+        assert_eq!(
+            coverage.covered_bytes(),
+            u64::try_from(MAX_FRAGMENTS).unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn fragment_cap_accepts_an_earlier_only_merge() {
+        let mut coverage = coverage_at_fragment_cap(0);
+        let offset = u64::try_from(MAX_FRAGMENTS).unwrap() * 2 - 1;
+
+        commit(&mut coverage, offset, 1);
+
+        assert_eq!(coverage.fragment_count(), MAX_FRAGMENTS);
+        assert_eq!(
+            coverage.covered_bytes(),
+            u64::try_from(MAX_FRAGMENTS).unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn fragment_cap_accepts_a_later_only_merge() {
+        let mut coverage = coverage_at_fragment_cap(1);
+
+        commit(&mut coverage, 0, 1);
+
+        assert_eq!(coverage.fragment_count(), MAX_FRAGMENTS);
         assert_eq!(
             coverage.covered_bytes(),
             u64::try_from(MAX_FRAGMENTS).unwrap() + 1

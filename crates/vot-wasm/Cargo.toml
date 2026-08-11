@@ -1,0 +1,25 @@
+[package]
+name = "vot-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+vot-sdk = { path = "../vot-sdk" }
+wasm-bindgen = "=0.2.126"
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+vot-receipt = { path = "../vot-receipt" }
+wasm-bindgen-test = "=0.3.76"
+
+[lints]
+workspace = true

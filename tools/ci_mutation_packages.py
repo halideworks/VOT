@@ -23,6 +23,7 @@ PACKAGES = (
     "vot-pack",
     "vot-package",
     "vot-sdk",
+    "vot-wasm",
     "vot-object",
     "vot-object-store",
     "vot-commit-object",

@@ -35,6 +35,8 @@ jobs:
             cargo_args: ""
           - package: vot-sdk
             cargo_args: --no-default-features
+          - package: vot-wasm
+            cargo_args: --no-default-features
           - package: vot-verified-range
             cargo_args: ""
           - package: vot-resume-core
@@ -62,6 +64,65 @@ jobs:
         run: |
           python3 -m unittest tools.test_sdk_dependencies
           python3 tools/check_sdk_dependencies.py
+
+      - name: Check WASM dependency boundary
+        if: matrix.package == 'vot-wasm'
+        run: |
+          python3 -m unittest tools.test_wasm_dependencies
+          python3 tools/check_wasm_dependencies.py
+
+  wasm-bindings:
+    name: wasm bindings (Node.js)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6.2.0
+        with:
+          node-version: 22.14.0
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.88.0 --profile minimal
+          --target wasm32-unknown-unknown
+
+      - name: Restore pinned WASM test runner
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: tools-1.88.0-wasm-bindgen-cli-0.2.126
+
+      - name: Install pinned WASM test runner
+        run: >-
+          cargo +1.88.0 install --locked wasm-bindgen-cli --version 0.2.126
+          || cargo +1.88.0 install --locked --force wasm-bindgen-cli --version 0.2.126
+
+      - name: Run WASM differential tests
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: >-
+          cargo +1.88.0 test --package vot-wasm --test wasm
+          --target wasm32-unknown-unknown --locked
+
+      - name: Build generated Node.js bindings
+        run: >-
+          cargo +1.88.0 build --package vot-wasm
+          --target wasm32-unknown-unknown --locked
+
+      - name: Test generated JavaScript package
+        run: |
+          bindings="${{ runner.temp }}/vot-wasm-bindings"
+          wasm-bindgen --target nodejs --out-dir "$bindings" \
+            target/wasm32-unknown-unknown/debug/vot_wasm.wasm
+          node crates/vot-wasm/tests/js-smoke.cjs "$bindings/vot_wasm.js"
 
   scheduler-no-default:
     name: scheduler without file sink

@@ -9,11 +9,15 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["file-sink"]
+file-sink = ["dep:vot-platform-fs"]
+
 [dependencies]
 blake3.workspace = true
 vot-codec = { path = "../vot-codec" }
 vot-coverage = { path = "../vot-coverage" }
-vot-platform-fs = { path = "../vot-platform-fs" }
+vot-platform-fs = { path = "../vot-platform-fs", optional = true }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-session = { path = "../vot-session" }
 vot-verifier = { path = "../vot-verifier" }

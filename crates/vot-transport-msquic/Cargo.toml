@@ -21,7 +21,7 @@ vot-transport-queue = { path = "../vot-transport-queue" }
 ed25519-dalek.workspace = true
 vot-capability = { path = "../vot-capability" }
 vot-session = { path = "../vot-session" }
-vot-scheduler = { path = "../vot-scheduler" }
+vot-scheduler = { path = "../vot-scheduler", default-features = false }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-verifier = { path = "../vot-verifier" }
 

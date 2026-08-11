@@ -23,6 +23,36 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  mutation-plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+      wire: ${{ steps.plan.outputs.wire }}
+      quiche: ${{ steps.plan.outputs.quiche }}
+      msquic: ${{ steps.plan.outputs.msquic }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Test mutation planner
+        run: python3 -m unittest tools.test_ci_mutation_plan
+
+      - name: Select mutation jobs
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git diff --name-only -z "origin/$BASE_REF...HEAD" > changed.paths
+            python3 tools/ci_mutation_plan.py --paths-file changed.paths >> "$GITHUB_OUTPUT"
+          else
+            python3 tools/ci_mutation_plan.py --all >> "$GITHUB_OUTPUT"
+          fi
+
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -409,6 +439,8 @@ jobs:
     # 28 minutes to a couple. The full sweep runs on every push to main, where a
     # 28-minute job blocks nobody. What a diff run cannot see is a change that
     # uncovers code it did not touch, and that is what the sweep is for.
+    needs: mutation-plan
+    if: needs.mutation-plan.outputs.msquic == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -492,6 +524,8 @@ jobs:
     # remedy: the run happens here, survivors live in
     # test-vectors/mutants/the_quiche_pump_is_mutation_tested.md, and the
     # checker fails on anything that file does not account for.
+    needs: mutation-plan
+    if: needs.mutation-plan.outputs.quiche == 'true'
     runs-on: ubuntu-24.04
     # The full sweep measured 40 minutes on a quiet 20-core box at 2 jobs; a
     # loaded 2-core runner needs the headroom.
@@ -589,6 +623,8 @@ jobs:
   # pumps run: one worker measured a whole-crate diff at over two hours.
   wire-mutation:
     name: wire-mutation (${{ matrix.shard }})
+    needs: mutation-plan
+    if: needs.mutation-plan.outputs.wire != '[]'
     runs-on: ubuntu-24.04
     # Sharded by area because a diff that spans the crate approximates the
     # full sweep, and one serial sweep of it does not fit any sane budget on
@@ -596,27 +632,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Globs anchor at the tree root and a name* glob does not descend
-          # into a directory of that name, so each area names both its
-          # single-file and its module-directory form. The ** globs are
-          # single-quoted so the runner shell passes them to cargo-mutants
-          # as patterns: unquoted, bash expands them into file names the
-          # moment the directory exists.
-          # Sized so no shard holds two large modules: a module-split PR
-          # sweeps its whole area, and the split PRs still to come (drive,
-          # wire) should pay for their own area rather than a neighbor's.
-          - { shard: fetch-protocol, args: "-f crates/vot-cli/src/fetch/protocol.rs" }
-          - { shard: fetch, args: "-f crates/vot-cli/src/fetch.rs -f 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/fetch/protocol.rs" }
-          - { shard: serve, args: "-f crates/vot-cli/src/serve.rs -f 'crates/vot-cli/src/serve/**'" }
-          - { shard: drive, args: "-f crates/vot-cli/src/drive.rs -f crates/vot-cli/src/nowire.rs" }
-          - { shard: wire, args: "-f crates/vot-cli/src/wire.rs -f 'crates/vot-cli/src/wire/**'" }
-          # Command-line globs replace the config file's exclude_globs, so
-          # the core shard restates them: main.rs (the binary is untested
-          # under wire, its Ok(()) mutants are unkillable by design) and the
-          # rendezvous and relay modules the featureless matrix already
-          # measures.
-          - { shard: core, args: "-e crates/vot-cli/src/fetch.rs -e 'crates/vot-cli/src/fetch/**' -e crates/vot-cli/src/serve.rs -e 'crates/vot-cli/src/serve/**' -e crates/vot-cli/src/drive.rs -e crates/vot-cli/src/wire.rs -e 'crates/vot-cli/src/wire/**' -e crates/vot-cli/src/nowire.rs -e crates/vot-cli/src/main.rs -e crates/vot-cli/src/rendezvous.rs -e 'crates/vot-cli/src/rendezvous/**' -e crates/vot-cli/src/relay.rs -e 'crates/vot-cli/src/relay/**'" }
+        include: ${{ fromJSON(needs.mutation-plan.outputs.wire) }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
@@ -668,47 +684,15 @@ jobs:
 
   mutation:
     name: mutation (${{ matrix.package }})
+    needs: mutation-plan
+    if: needs.mutation-plan.outputs.packages != '[]'
     runs-on: ubuntu-24.04
     # Sized for a diff that spans a whole package, which a module-split PR is.
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { package: vot-cbor, required: true }
-          - { package: vot-capability, required: true }
-          - { package: vot-commit-model, required: true }
-          - { package: vot-commit-posix, required: true }
-          - { package: vot-commit-strict, required: true }
-          - { package: vot-journal, required: true }
-          - { package: vot-proof-blake3, required: true }
-          - { package: vot-proof-sha256, required: true }
-          - { package: vot-codec, required: true }
-          - { package: vot-verifier, required: true }
-          - { package: vot-manifest, required: true }
-          - { package: vot-pack, required: true }
-          # The live adapter is behind a feature, so a run without it mutates a
-          # file the tests never compile and calls every one of those mutants
-          # missed. Measuring it means building it.
-          - { package: vot-object-store, required: true, features: s3-live }
-          - { package: vot-commit-object, required: true }
-          - { package: vot-receipt, required: true }
-          - { package: vot-platform-fs, required: true }
-          - { package: vot-platform-net, required: true }
-          - { package: vot-platform-proc, required: true }
-          - { package: vot-transport-api, required: true }
-          - { package: vot-transport-framing, required: true }
-          - { package: vot-transport-queue, required: true }
-          - { package: vot-transport-quiche, required: true }
-          - { package: vot-transport-sim, required: true }
-          - { package: vot-transport-msquic, required: true }
-          - { package: vot-session, required: true }
-          - { package: vot-scheduler, required: true }
-          - { package: vot-cli, required: true }
-          - { package: vot-transport-tcp, required: true }
-          - { package: vot-resume, required: true }
-          - { package: vot-commit-platform, required: true }
-          - { package: vot-bench-driver, required: true }
+        include: ${{ fromJSON(needs.mutation-plan.outputs.packages) }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:

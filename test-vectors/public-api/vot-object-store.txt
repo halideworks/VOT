@@ -1,6 +1,10 @@
 enum vot_object_store::Error
 struct vot_object_store::CompletedObject
 struct vot_object_store::MockStore
+struct vot_object_store::MultipartCompleted
+struct vot_object_store::MultipartStoreAdapter
+struct vot_object_store::ObjectExpectation
+struct vot_object_store::ObjectMetadata
 struct vot_object_store::PartReceipt
-struct vot_object_store::S3Adapter
-trait vot_object_store::S3Compatible
+struct vot_object_store::ReadbackVerified
+trait vot_object_store::MultipartObjectStore

@@ -173,6 +173,9 @@ durability barrier. A buffered read and `POSIX_FADV_DONTNEED` do not satisfy
 Strict. A backend checksum is acceptable only when its declared semantics meet
 the conformance profile. Otherwise Strict is unsupported.
 
+Object-store completion, cheap metadata observation, and full readback are
+separate operations. Only explicit verification may produce at-rest evidence.
+
 ### 5.3 Receipts
 
 Every receipt contains:

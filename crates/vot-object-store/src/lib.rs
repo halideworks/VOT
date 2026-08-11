@@ -14,6 +14,102 @@ pub struct PartReceipt {
     pub length: u64,
 }
 
+/// The object a multipart upload is expected to create.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectExpectation {
+    key: String,
+    length: u64,
+    checksum_crc32c: u32,
+}
+
+impl ObjectExpectation {
+    /// Derives the expected object from consecutive multipart receipts.
+    pub fn from_parts(key: &str, parts: &[PartReceipt]) -> Result<Self, Error> {
+        let Some(first) = parts.first() else {
+            return Err(Error::CompletionMismatch);
+        };
+        if first.number != 1 {
+            return Err(Error::CompletionMismatch);
+        }
+        if parts
+            .windows(2)
+            .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
+        {
+            return Err(Error::CompletionMismatch);
+        }
+        let mut length = 0_u64;
+        let mut checksum_crc32c = vot_journal::CRC32C_EMPTY;
+        for part in parts {
+            length = length
+                .checked_add(part.length)
+                .ok_or(Error::CompletionMismatch)?;
+            checksum_crc32c =
+                vot_journal::crc32c_combine(checksum_crc32c, part.checksum_crc32c, part.length);
+        }
+        Ok(Self {
+            key: key.to_owned(),
+            length,
+            checksum_crc32c,
+        })
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    #[must_use]
+    pub const fn checksum_crc32c(&self) -> u32 {
+        self.checksum_crc32c
+    }
+}
+
+/// Evidence that the multipart completion operation returned successfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipartCompleted {
+    expectation: ObjectExpectation,
+}
+
+impl MultipartCompleted {
+    #[must_use]
+    pub const fn new(expectation: ObjectExpectation) -> Self {
+        Self { expectation }
+    }
+
+    #[must_use]
+    pub const fn expectation(&self) -> &ObjectExpectation {
+        &self.expectation
+    }
+
+    #[must_use]
+    pub fn into_expectation(self) -> ObjectExpectation {
+        self.expectation
+    }
+}
+
+/// Cheap object metadata observed without reading the object body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectMetadata {
+    length: u64,
+}
+
+impl ObjectMetadata {
+    #[must_use]
+    pub const fn new(length: u64) -> Self {
+        Self { length }
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// What a completed multipart upload turned out to be.
 ///
@@ -26,6 +122,29 @@ pub struct CompletedObject {
     pub checksum_crc32c: u32,
 }
 
+/// An object whose complete body matched its expected length and checksum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadbackVerified {
+    object: CompletedObject,
+}
+
+impl ReadbackVerified {
+    #[must_use]
+    pub const fn new(object: CompletedObject) -> Self {
+        Self { object }
+    }
+
+    #[must_use]
+    pub const fn object(&self) -> &CompletedObject {
+        &self.object
+    }
+
+    #[must_use]
+    pub fn into_object(self) -> CompletedObject {
+        self.object
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     UnknownUpload,
@@ -35,10 +154,11 @@ pub enum Error {
     AlreadyExists,
     AlreadyCompleted,
     CompletionAmbiguous,
+    ObjectNotFound,
     Backend,
 }
 
-pub trait S3Compatible {
+pub trait MultipartObjectStore {
     fn create_multipart(&mut self, key: &str, now: u64) -> Result<String, Error>;
     fn upload_part(
         &mut self,
@@ -51,8 +171,15 @@ pub trait S3Compatible {
         &mut self,
         upload_id: &str,
         parts: &[PartReceipt],
-    ) -> Result<CompletedObject, Error>;
-    fn head(&self, key: &str) -> Option<(u64, u32)>;
+    ) -> Result<MultipartCompleted, Error>;
+    /// Observes cheap metadata without reading or verifying the object body.
+    fn stat_object(&self, key: &str) -> Result<Option<ObjectMetadata>, Error>;
+    /// Streams the complete object body and verifies its length and checksum.
+    fn verify_by_readback(&self, expected: &ObjectExpectation) -> Result<ReadbackVerified, Error>;
+    /// Releases local state retained only for multipart completion recovery.
+    ///
+    /// This does not abort a remote multipart upload.
+    fn release_multipart(&mut self, upload_id: &str);
 }
 
 #[derive(Clone, Debug)]
@@ -63,11 +190,16 @@ struct Upload {
     completed: bool,
 }
 
+struct StoredObject {
+    object: CompletedObject,
+    bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct MockStore {
     next_upload: u64,
     uploads: BTreeMap<String, Upload>,
-    objects: BTreeMap<String, CompletedObject>,
+    objects: BTreeMap<String, StoredObject>,
     leases: BTreeMap<String, u64>,
     tombstones: BTreeSet<String>,
 }
@@ -106,11 +238,11 @@ impl MockStore {
 
     #[must_use]
     pub fn object(&self, key: &str) -> Option<&CompletedObject> {
-        self.objects.get(key)
+        self.objects.get(key).map(|stored| &stored.object)
     }
 }
 
-impl S3Compatible for MockStore {
+impl MultipartObjectStore for MockStore {
     fn create_multipart(&mut self, key: &str, now: u64) -> Result<String, Error> {
         let id = format!("upload-{}", self.next_upload);
         self.next_upload += 1;
@@ -160,7 +292,7 @@ impl S3Compatible for MockStore {
         &mut self,
         upload_id: &str,
         parts: &[PartReceipt],
-    ) -> Result<CompletedObject, Error> {
+    ) -> Result<MultipartCompleted, Error> {
         let upload = self
             .uploads
             .get_mut(upload_id)
@@ -171,14 +303,10 @@ impl S3Compatible for MockStore {
         if self.objects.contains_key(&upload.key) {
             return Err(Error::AlreadyExists);
         }
-        if parts.len() != upload.parts.len()
-            || parts.first().is_none_or(|part| part.number != 1)
-            || parts
-                .windows(2)
-                .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
-        {
+        if parts.len() != upload.parts.len() {
             return Err(Error::CompletionMismatch);
         }
+        let expectation = ObjectExpectation::from_parts(&upload.key, parts)?;
         let mut bytes = Vec::new();
         for receipt in parts {
             let (part, checksum) = upload
@@ -196,22 +324,47 @@ impl S3Compatible for MockStore {
             checksum_crc32c: vot_journal::crc32c(&bytes),
         };
         upload.completed = true;
-        self.objects.insert(object.key.clone(), object.clone());
-        Ok(object)
+        self.objects
+            .insert(object.key.clone(), StoredObject { object, bytes });
+        Ok(MultipartCompleted::new(expectation))
     }
 
-    fn head(&self, key: &str) -> Option<(u64, u32)> {
-        self.objects
+    fn stat_object(&self, key: &str) -> Result<Option<ObjectMetadata>, Error> {
+        Ok(self
+            .objects
             .get(key)
-            .map(|object| (object.length, object.checksum_crc32c))
+            .map(|stored| ObjectMetadata::new(stored.object.length)))
+    }
+
+    fn verify_by_readback(&self, expected: &ObjectExpectation) -> Result<ReadbackVerified, Error> {
+        let stored = self
+            .objects
+            .get(expected.key())
+            .ok_or(Error::ObjectNotFound)?;
+        let actual = CompletedObject {
+            key: expected.key().to_owned(),
+            length: stored.bytes.len() as u64,
+            checksum_crc32c: vot_journal::crc32c(&stored.bytes),
+        };
+        if actual.length != expected.length()
+            || actual.checksum_crc32c != expected.checksum_crc32c()
+        {
+            return Err(Error::ChecksumMismatch);
+        }
+        Ok(ReadbackVerified::new(actual))
+    }
+
+    fn release_multipart(&mut self, upload_id: &str) {
+        self.uploads.remove(upload_id);
+        self.leases.remove(upload_id);
     }
 }
 
-pub struct S3Adapter<B> {
+pub struct MultipartStoreAdapter<B> {
     backend: B,
 }
 
-impl<B> S3Adapter<B> {
+impl<B> MultipartStoreAdapter<B> {
     #[must_use]
     pub const fn new(backend: B) -> Self {
         Self { backend }
@@ -228,7 +381,7 @@ impl<B> S3Adapter<B> {
     }
 }
 
-impl<B: S3Compatible> S3Compatible for S3Adapter<B> {
+impl<B: MultipartObjectStore> MultipartObjectStore for MultipartStoreAdapter<B> {
     fn create_multipart(&mut self, key: &str, now: u64) -> Result<String, Error> {
         self.backend.create_multipart(key, now)
     }
@@ -247,12 +400,20 @@ impl<B: S3Compatible> S3Compatible for S3Adapter<B> {
         &mut self,
         id: &str,
         parts: &[PartReceipt],
-    ) -> Result<CompletedObject, Error> {
+    ) -> Result<MultipartCompleted, Error> {
         self.backend.complete_multipart(id, parts)
     }
 
-    fn head(&self, key: &str) -> Option<(u64, u32)> {
-        self.backend.head(key)
+    fn stat_object(&self, key: &str) -> Result<Option<ObjectMetadata>, Error> {
+        self.backend.stat_object(key)
+    }
+
+    fn verify_by_readback(&self, expected: &ObjectExpectation) -> Result<ReadbackVerified, Error> {
+        self.backend.verify_by_readback(expected)
+    }
+
+    fn release_multipart(&mut self, upload_id: &str) {
+        self.backend.release_multipart(upload_id);
     }
 }
 
@@ -262,7 +423,7 @@ mod tests {
 
     #[test]
     fn multipart_checksums_and_conditional_completion() {
-        let mut store = S3Adapter::new(MockStore::default());
+        let mut store = MultipartStoreAdapter::new(MockStore::default());
         let id = store.create_multipart("object", 0).unwrap();
         let one = store
             .upload_part(&id, 1, b"one", vot_journal::crc32c(b"one"))
@@ -270,15 +431,57 @@ mod tests {
         let two = store
             .upload_part(&id, 2, b"two", vot_journal::crc32c(b"two"))
             .unwrap();
-        let object = store.complete_multipart(&id, &[one, two]).unwrap();
+        let completed = store.complete_multipart(&id, &[one, two]).unwrap();
+        let object = store
+            .verify_by_readback(completed.expectation())
+            .unwrap()
+            .into_object();
         assert_eq!(
             (object.length, object.checksum_crc32c),
             (b"onetwo".len() as u64, vot_journal::crc32c(b"onetwo"))
         );
         assert_eq!(
-            store.head("object"),
-            Some((6, vot_journal::crc32c(b"onetwo")))
+            store.stat_object("object"),
+            Ok(Some(ObjectMetadata::new(6)))
         );
+        assert_eq!(store.stat_object("object").unwrap().unwrap().length(), 6);
+        store.release_multipart(&id);
+        assert_eq!(
+            store.complete_multipart(&id, &[]),
+            Err(Error::UnknownUpload)
+        );
+    }
+
+    #[test]
+    fn expectation_requires_a_canonical_part_sequence() {
+        let one = PartReceipt {
+            number: 1,
+            checksum_crc32c: vot_journal::crc32c(b"one"),
+            length: 3,
+        };
+        let two = PartReceipt {
+            number: 2,
+            checksum_crc32c: vot_journal::crc32c(b"two"),
+            length: 3,
+        };
+        assert!(ObjectExpectation::from_parts("object", &[]).is_err());
+        assert!(ObjectExpectation::from_parts("object", std::slice::from_ref(&two)).is_err());
+        assert!(
+            ObjectExpectation::from_parts(
+                "object",
+                &[
+                    one.clone(),
+                    PartReceipt {
+                        number: 3,
+                        ..two.clone()
+                    },
+                ],
+            )
+            .is_err()
+        );
+        let expected = ObjectExpectation::from_parts("object", &[one, two]).unwrap();
+        assert_eq!(expected.length(), 6);
+        assert_eq!(expected.checksum_crc32c(), vot_journal::crc32c(b"onetwo"));
     }
 
     #[test]
@@ -293,7 +496,7 @@ mod tests {
             store.complete_multipart(&id, &[]),
             Err(Error::CompletionMismatch)
         );
-        assert!(store.head("object").is_none());
+        assert_eq!(store.stat_object("object"), Ok(None));
     }
 
     #[test]
@@ -345,7 +548,11 @@ mod tests {
 
         // The receipt that does match publishes the object, and the store hands
         // back what it holds rather than nothing.
-        let object = store.complete_multipart(&id, &[one]).unwrap();
+        let completed = store.complete_multipart(&id, &[one]).unwrap();
+        let object = store
+            .verify_by_readback(completed.expectation())
+            .unwrap()
+            .into_object();
         assert_eq!(store.object("object"), Some(&object));
         assert_eq!(
             (object.length, object.checksum_crc32c),
@@ -368,6 +575,46 @@ mod tests {
             store.complete_multipart(&id, &[one]),
             Err(Error::CompletionMismatch)
         );
-        assert!(store.head("object").is_none());
+        assert_eq!(store.stat_object("object"), Ok(None));
+    }
+
+    #[test]
+    fn metadata_and_readback_are_distinct_observations() {
+        let mut store = MockStore::default();
+        let id = store.create_multipart("object", 0).unwrap();
+        let part = store
+            .upload_part(&id, 1, b"data", vot_journal::crc32c(b"data"))
+            .unwrap();
+        let completed = store.complete_multipart(&id, &[part]).unwrap();
+
+        assert_eq!(
+            store.stat_object("object"),
+            Ok(Some(ObjectMetadata::new(4)))
+        );
+        assert_eq!(store.stat_object("absent"), Ok(None));
+        assert_eq!(
+            store.verify_by_readback(&ObjectExpectation {
+                key: "object".to_owned(),
+                length: 5,
+                checksum_crc32c: completed.expectation().checksum_crc32c(),
+            }),
+            Err(Error::ChecksumMismatch)
+        );
+        assert_eq!(
+            store.verify_by_readback(&ObjectExpectation {
+                key: "object".to_owned(),
+                length: completed.expectation().length(),
+                checksum_crc32c: completed.expectation().checksum_crc32c() ^ 1,
+            }),
+            Err(Error::ChecksumMismatch)
+        );
+        assert_eq!(
+            store.verify_by_readback(&ObjectExpectation {
+                key: "absent".to_owned(),
+                length: 4,
+                checksum_crc32c: vot_journal::crc32c(b"data"),
+            }),
+            Err(Error::ObjectNotFound)
+        );
     }
 }

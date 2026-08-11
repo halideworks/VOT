@@ -10,7 +10,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::runtime::Runtime;
 
-use crate::{CompletedObject, Error, PartReceipt, S3Compatible};
+use crate::{
+    CompletedObject, Error, MultipartCompleted, MultipartObjectStore, ObjectExpectation,
+    ObjectMetadata, PartReceipt, ReadbackVerified,
+};
 
 /// What the adapter remembers about a part it has uploaded.
 ///
@@ -89,7 +92,16 @@ impl AwsS3Store {
                     .key(key)
                     .send(),
             )
-            .map_err(|_| Error::Backend)?;
+            .map_err(|error| {
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| object_not_found(service.code()))
+                {
+                    Error::ObjectNotFound
+                } else {
+                    Error::Backend
+                }
+            })?;
         // One entry into the runtime for the whole body, not one per chunk.
         self.runtime.block_on(async {
             let mut length = 0_u64;
@@ -106,7 +118,7 @@ impl AwsS3Store {
     }
 }
 
-impl S3Compatible for AwsS3Store {
+impl MultipartObjectStore for AwsS3Store {
     fn create_multipart(&mut self, key: &str, _now: u64) -> Result<String, Error> {
         let output = self
             .runtime
@@ -189,33 +201,25 @@ impl S3Compatible for AwsS3Store {
         &mut self,
         upload_id: &str,
         parts: &[PartReceipt],
-    ) -> Result<CompletedObject, Error> {
+    ) -> Result<MultipartCompleted, Error> {
+        let upload = self.uploads.get(upload_id).ok_or(Error::UnknownUpload)?;
+        let expectation = ObjectExpectation::from_parts(&upload.key, parts)?;
         let upload = self.uploads.remove(upload_id).ok_or(Error::UnknownUpload)?;
-        if parts.len() != upload.parts.len()
-            || parts.first().is_none_or(|part| part.number != 1)
-            || parts
-                .windows(2)
-                .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
-        {
+        if parts.len() != upload.parts.len() {
             self.uploads.insert(upload_id.to_owned(), upload);
             return Err(Error::CompletionMismatch);
         }
-        let expected_length = upload
-            .parts
-            .values()
-            .try_fold(0_u64, |total, part| total.checked_add(part.length));
-        let Some(expected_length) = expected_length else {
-            self.uploads.insert(upload_id.to_owned(), upload);
-            return Err(Error::CompletionMismatch);
-        };
-        let expected_checksum = crc32c_parts(&upload.parts);
         let mut completed_parts = Vec::with_capacity(parts.len());
         for receipt in parts {
             let Some(part) = upload.parts.get(&receipt.number) else {
                 self.uploads.insert(upload_id.to_owned(), upload);
                 return Err(Error::CompletionMismatch);
             };
-            if receipt.length != part.length || receipt.checksum_crc32c != part.checksum_crc32c {
+            if receipt.length != part.length {
+                self.uploads.insert(upload_id.to_owned(), upload);
+                return Err(Error::CompletionMismatch);
+            }
+            if receipt.checksum_crc32c != part.checksum_crc32c {
                 self.uploads.insert(upload_id.to_owned(), upload);
                 return Err(Error::CompletionMismatch);
             }
@@ -242,58 +246,79 @@ impl S3Compatible for AwsS3Store {
                 .multipart_upload(completed)
                 .send(),
         );
-        let completion_was_ambiguous = match completion {
-            Ok(_) => false,
+        match completion {
+            Ok(_) => {}
             Err(error) if error.as_service_error().is_some() => {
-                let could_be_completed = error
-                    .as_service_error()
-                    .is_some_and(|service| service_error_may_be_completed(service.code()));
+                let could_be_completed = completion_error_may_be_ambiguous(
+                    error.as_service_error().and_then(|service| service.code()),
+                    error
+                        .raw_response()
+                        .is_some_and(|response| response.status().is_server_error()),
+                );
                 if !could_be_completed {
                     self.uploads.insert(upload_id.to_owned(), upload);
                     return Err(Error::Backend);
                 }
-                true
+                self.uploads.insert(upload_id.to_owned(), upload);
+                return Err(Error::CompletionAmbiguous);
             }
-            Err(_) => true,
-        };
-        let Ok((actual_length, actual_checksum)) = self.measure_object(&upload.key) else {
-            self.uploads.insert(upload_id.to_owned(), upload);
-            return Err(Error::CompletionAmbiguous);
-        };
+            Err(_) => {
+                self.uploads.insert(upload_id.to_owned(), upload);
+                return Err(Error::CompletionAmbiguous);
+            }
+        }
+        Ok(MultipartCompleted::new(expectation))
+    }
+
+    fn stat_object(&self, key: &str) -> Result<Option<ObjectMetadata>, Error> {
+        match self.runtime.block_on(
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        ) {
+            Ok(output) => {
+                let length = output.content_length().ok_or(Error::Backend)?;
+                let length = u64::try_from(length).map_err(|_| Error::Backend)?;
+                Ok(Some(ObjectMetadata::new(length)))
+            }
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|service| object_not_found(service.code())) =>
+            {
+                Ok(None)
+            }
+            Err(_) => Err(Error::Backend),
+        }
+    }
+
+    fn verify_by_readback(&self, expected: &ObjectExpectation) -> Result<ReadbackVerified, Error> {
+        let (actual_length, actual_checksum) = self.measure_object(expected.key())?;
         if !read_back_matches(
-            expected_length,
-            expected_checksum,
+            expected.length(),
+            expected.checksum_crc32c(),
             actual_length,
             actual_checksum,
         ) {
-            self.uploads.insert(upload_id.to_owned(), upload);
-            return Err(if completion_was_ambiguous {
-                Error::CompletionAmbiguous
-            } else {
-                Error::ChecksumMismatch
-            });
+            return Err(Error::ChecksumMismatch);
         }
-        Ok(CompletedObject {
-            key: upload.key,
+        Ok(ReadbackVerified::new(CompletedObject {
+            key: expected.key().to_owned(),
             length: actual_length,
             checksum_crc32c: actual_checksum,
-        })
+        }))
     }
 
-    /// Costs a read of the whole object.
-    ///
-    /// The length alone would be a `HeadObject`, but this reports the
-    /// object's own CRC-32C, and what S3 stores for a multipart upload is a
-    /// checksum of the parts' checksums rather than of the bytes. A caller
-    /// that only wants to know the object is there should ask for something
-    /// cheaper than this.
-    fn head(&self, key: &str) -> Option<(u64, u32)> {
-        self.measure_object(key).ok()
+    fn release_multipart(&mut self, upload_id: &str) {
+        self.uploads.remove(upload_id);
     }
 }
 
 /// The checksum of the parts concatenated in number order, from their own
 /// checksums and lengths. The bytes are long gone by completion.
+#[cfg(test)]
 fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
     parts
         .values()
@@ -302,8 +327,22 @@ fn crc32c_parts(parts: &BTreeMap<u32, LivePart>) -> u32 {
         })
 }
 
-fn service_error_may_be_completed(code: Option<&str>) -> bool {
-    matches!(code, Some("NoSuchUpload"))
+fn completion_error_may_be_ambiguous(code: Option<&str>, server_error: bool) -> bool {
+    server_error
+        || matches!(
+            code,
+            Some(
+                "NoSuchUpload"
+                    | "SlowDown"
+                    | "InternalError"
+                    | "ServiceUnavailable"
+                    | "RequestTimeout"
+            )
+        )
+}
+
+fn object_not_found(code: Option<&str>) -> bool {
+    matches!(code, Some("NoSuchKey" | "NotFound"))
 }
 
 const fn read_back_matches(
@@ -351,6 +390,14 @@ mod tests {
 
         fn is_complete_multipart(&self) -> bool {
             self.method == "POST" && self.target.contains("uploadId=")
+        }
+
+        fn is_stat_object(&self) -> bool {
+            self.method == "HEAD"
+        }
+
+        fn is_readback(&self) -> bool {
+            self.method == "GET"
         }
     }
 
@@ -464,7 +511,12 @@ mod tests {
         for (name, value) in headers {
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+        }
         out.extend_from_slice(b"connection: close\r\n\r\n");
         out.extend_from_slice(body);
         out
@@ -525,10 +577,35 @@ mod tests {
                 )
             } else if request.is_complete_multipart() {
                 completed_upload()
-            } else if request.method == "GET" {
+            } else if request.is_stat_object() {
+                let length = object.len().to_string();
+                response("200 OK", &[("content-length", &length)], b"")
+            } else if request.is_readback() {
                 response("200 OK", &[("etag", "\"final\"")], object)
             } else {
                 response("204 No Content", &[], b"")
+            }
+        }
+    }
+
+    fn ambiguous_endpoint(object: &'static [u8]) -> impl Fn(&Request) -> Vec<u8> {
+        move |request: &Request| {
+            if request.is_create_multipart() {
+                created("upload-1")
+            } else if request.is_upload_part() {
+                let checksum = request
+                    .header("x-amz-checksum-crc32c")
+                    .unwrap_or_default()
+                    .to_owned();
+                response(
+                    "200 OK",
+                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
+                    b"",
+                )
+            } else if request.is_complete_multipart() {
+                service_error("404 Not Found", "NoSuchUpload")
+            } else {
+                response("200 OK", &[], object)
             }
         }
     }
@@ -537,6 +614,11 @@ mod tests {
     /// not hand back an object, so this is what stands in for comparing it.
     fn is_object(object: &CompletedObject, bytes: &[u8]) -> bool {
         object.length == bytes.len() as u64 && object.checksum_crc32c == vot_journal::crc32c(bytes)
+    }
+
+    fn is_expectation(expectation: &ObjectExpectation, bytes: &[u8]) -> bool {
+        expectation.length() == bytes.len() as u64
+            && expectation.checksum_crc32c() == vot_journal::crc32c(bytes)
     }
 
     fn upload_one_part(store: &mut AwsS3Store, bytes: &[u8]) -> (String, PartReceipt) {
@@ -548,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upload_runs_from_creation_to_an_object_read_back() {
+    fn completion_metadata_and_readback_are_distinct_requests() {
         let endpoint = FakeS3::new(happy_endpoint(b"payload"));
         let mut store = endpoint.store();
 
@@ -563,24 +645,41 @@ mod tests {
             }
         );
 
-        let object = store
+        let completed = store
             .complete_multipart(&upload_id, std::slice::from_ref(&receipt))
             .expect("a completed object");
+        assert_eq!(completed.expectation().key(), "key");
+        assert_eq!(completed.expectation().length(), 7);
         assert_eq!(
-            object,
-            CompletedObject {
-                key: "key".to_owned(),
-                length: b"payload".len() as u64,
-                checksum_crc32c: vot_journal::crc32c(b"payload"),
-            }
+            completed.expectation().checksum_crc32c(),
+            vot_journal::crc32c(b"payload")
+        );
+        assert_eq!(
+            endpoint
+                .requests()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "PUT", "POST"],
+            "completion does not observe the object"
         );
 
-        assert_eq!(
-            store.head("key"),
-            Some((7, vot_journal::crc32c(b"payload")))
-        );
+        assert_eq!(store.stat_object("key"), Ok(Some(ObjectMetadata::new(7))));
+        let verified = store
+            .verify_by_readback(completed.expectation())
+            .expect("the completed bytes read back exactly");
+        assert!(is_object(verified.object(), b"payload"));
 
         let sent = endpoint.requests();
+        assert_eq!(
+            sent.iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "PUT", "POST", "HEAD", "GET"]
+        );
+        assert!(sent[3].is_stat_object());
+        assert!(sent[3].body.is_empty(), "metadata does not read a body");
+        assert!(sent[4].is_readback());
         let part = sent
             .iter()
             .find(|request| request.is_upload_part())
@@ -801,84 +900,118 @@ mod tests {
             "an upload with a part missing from the middle"
         );
 
-        let object = store
+        let completed = store
             .complete_multipart(&upload_id, &[one, two])
             .expect("the completion that matches");
-        assert!(is_object(&object, b"onetwo"));
-        assert_eq!(object.checksum_crc32c, vot_journal::crc32c(b"onetwo"));
+        assert!(is_expectation(completed.expectation(), b"onetwo"));
     }
 
     #[test]
-    fn an_object_that_is_not_what_went_up_is_refused_after_completion() {
+    fn malformed_expectation_does_not_consume_the_upload() {
+        let endpoint = FakeS3::new(happy_endpoint(b"onetwo"));
+        let mut store = endpoint.store();
+        let upload_id = store.create_multipart("key", 0).expect("an upload");
+        let one = store
+            .upload_part(&upload_id, 1, b"one", vot_journal::crc32c(b"one"))
+            .expect("the first part");
+        let two = store
+            .upload_part(&upload_id, 2, b"two", vot_journal::crc32c(b"two"))
+            .expect("the second part");
+        let overflowing = [
+            PartReceipt {
+                length: u64::MAX,
+                ..one.clone()
+            },
+            PartReceipt {
+                length: 1,
+                ..two.clone()
+            },
+        ];
+        assert_eq!(
+            store.complete_multipart(&upload_id, &overflowing),
+            Err(Error::CompletionMismatch)
+        );
+        let completed = store
+            .complete_multipart(&upload_id, &[one, two])
+            .expect("the retained upload remains completable");
+        assert!(is_expectation(completed.expectation(), b"onetwo"));
+    }
+
+    #[test]
+    fn explicit_readback_rejects_an_object_that_is_not_what_went_up() {
         let endpoint = FakeS3::new(happy_endpoint(b"something else"));
         let mut store = endpoint.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let completed = store
+            .complete_multipart(&upload_id, &[receipt])
+            .expect("completion itself succeeded");
         assert_eq!(
-            store.complete_multipart(&upload_id, &[receipt.clone()]),
+            store.verify_by_readback(completed.expectation()),
             Err(Error::ChecksumMismatch)
         );
 
         let swapped = FakeS3::new(happy_endpoint(b"paylaod"));
         let mut store = swapped.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let completed = store
+            .complete_multipart(&upload_id, &[receipt])
+            .expect("completion itself succeeded");
         assert_eq!(
-            store.complete_multipart(&upload_id, &[receipt]),
+            store.verify_by_readback(completed.expectation()),
             Err(Error::ChecksumMismatch)
         );
     }
 
     #[test]
-    fn a_completion_that_may_have_landed_is_reconciled_by_reading_it_back() {
-        let endpoint = FakeS3::new(|request: &Request| {
-            if request.is_create_multipart() {
-                created("upload-1")
-            } else if request.is_upload_part() {
-                let checksum = request
-                    .header("x-amz-checksum-crc32c")
-                    .unwrap_or_default()
-                    .to_owned();
-                response(
-                    "200 OK",
-                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
-                    b"",
-                )
-            } else if request.is_complete_multipart() {
-                service_error("404 Not Found", "NoSuchUpload")
-            } else {
-                response("200 OK", &[], b"payload")
-            }
-        });
+    fn ambiguous_completion_requires_explicit_readback() {
+        let endpoint = FakeS3::new(ambiguous_endpoint(b"payload"));
         let mut store = endpoint.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
-        let object = store
-            .complete_multipart(&upload_id, &[receipt])
-            .expect("an upload that had already landed");
-        assert!(is_object(&object, b"payload"));
-
-        let wrong = FakeS3::new(|request: &Request| {
-            if request.is_create_multipart() {
-                created("upload-1")
-            } else if request.is_upload_part() {
-                let checksum = request
-                    .header("x-amz-checksum-crc32c")
-                    .unwrap_or_default()
-                    .to_owned();
-                response(
-                    "200 OK",
-                    &[("etag", "\"part-1\""), ("x-amz-checksum-crc32c", &checksum)],
-                    b"",
-                )
-            } else if request.is_complete_multipart() {
-                service_error("404 Not Found", "NoSuchUpload")
-            } else {
-                response("200 OK", &[], b"something else")
-            }
-        });
-        let mut store = wrong.store();
-        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let expected = ObjectExpectation::from_parts("key", std::slice::from_ref(&receipt))
+            .expect("a valid expectation");
         assert_eq!(
             store.complete_multipart(&upload_id, &[receipt]),
             Err(Error::CompletionAmbiguous)
+        );
+        assert_eq!(
+            endpoint
+                .requests()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "PUT", "POST"],
+            "ambiguity is not reconciled implicitly"
+        );
+        let verified = store
+            .verify_by_readback(&expected)
+            .expect("the caller explicitly reconciles the ambiguity");
+        assert!(is_object(verified.object(), b"payload"));
+        store.release_multipart(&upload_id);
+        assert_eq!(
+            store.complete_multipart(
+                &upload_id,
+                &[PartReceipt {
+                    number: 1,
+                    checksum_crc32c: vot_journal::crc32c(b"payload"),
+                    length: 7,
+                }]
+            ),
+            Err(Error::UnknownUpload),
+            "reconciled completion state is released"
+        );
+
+        let wrong = FakeS3::new(ambiguous_endpoint(b"something else"));
+        let mut store = wrong.store();
+        let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let expected = ObjectExpectation::from_parts("key", std::slice::from_ref(&receipt))
+            .expect("a valid expectation");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::CompletionAmbiguous)
+        );
+        assert_eq!(
+            store.verify_by_readback(&expected),
+            Err(Error::ChecksumMismatch)
         );
 
         let absent = FakeS3::new(|request: &Request| {
@@ -902,15 +1035,26 @@ mod tests {
         });
         let mut store = absent.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
+        let expected = ObjectExpectation::from_parts("key", std::slice::from_ref(&receipt))
+            .expect("a valid expectation");
+        let completed = store
+            .complete_multipart(&upload_id, &[receipt])
+            .expect("the endpoint confirmed completion");
+        assert_eq!(completed.expectation(), &expected);
         assert_eq!(
-            store.complete_multipart(&upload_id, &[receipt]),
-            Err(Error::CompletionAmbiguous)
+            store.stat_object("key"),
+            Ok(None),
+            "metadata distinguishes absence from backend failure"
         );
-        assert_eq!(store.head("key"), None, "an object that is not there");
+        assert_eq!(
+            store.verify_by_readback(&expected),
+            Err(Error::ObjectNotFound),
+            "readback preserves absence"
+        );
     }
 
     #[test]
-    fn a_completion_that_is_never_answered_is_reconciled_like_any_other() {
+    fn a_completion_that_is_never_answered_remains_ambiguous() {
         let endpoint = FakeS3::new(|request: &Request| {
             if request.is_create_multipart() {
                 created("upload-1")
@@ -932,10 +1076,16 @@ mod tests {
         });
         let mut store = endpoint.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
-        let object = store
-            .complete_multipart(&upload_id, &[receipt])
-            .expect("an object the endpoint never confirmed but did store");
-        assert!(is_object(&object, b"payload"));
+        let expected = ObjectExpectation::from_parts("key", std::slice::from_ref(&receipt))
+            .expect("a valid expectation");
+        assert_eq!(
+            store.complete_multipart(&upload_id, &[receipt]),
+            Err(Error::CompletionAmbiguous)
+        );
+        let verified = store
+            .verify_by_readback(&expected)
+            .expect("explicit reconciliation succeeds");
+        assert!(is_object(verified.object(), b"payload"));
     }
 
     #[test]
@@ -977,7 +1127,17 @@ mod tests {
             AwsS3Store::new("http://127.0.0.1:1", "bucket", "us-east-1", "key", "secret")
                 .expect("a store against a closed port");
         assert_eq!(store.create_multipart("key", 0), Err(Error::Backend));
-        assert_eq!(store.head("key"), None);
+        assert_eq!(store.stat_object("key"), Err(Error::Backend));
+        let expected = ObjectExpectation::from_parts(
+            "key",
+            &[PartReceipt {
+                number: 1,
+                checksum_crc32c: vot_journal::crc32c(b"payload"),
+                length: 7,
+            }],
+        )
+        .expect("a valid expectation");
+        assert_eq!(store.verify_by_readback(&expected), Err(Error::Backend));
         assert_eq!(store.delete_object("key"), Err(Error::Backend));
         assert_eq!(
             store.upload_part("upload-1", 1, b"payload", vot_journal::crc32c(b"payload")),
@@ -1003,9 +1163,20 @@ mod tests {
             }
         });
         let store = endpoint.store();
-        assert_eq!(
-            store.measure_object("key").unwrap(),
-            (BIG.len() as u64, vot_journal::crc32c(&BIG)),
+        let expected = ObjectExpectation::from_parts(
+            "key",
+            &[PartReceipt {
+                number: 1,
+                checksum_crc32c: vot_journal::crc32c(&BIG),
+                length: BIG.len() as u64,
+            }],
+        )
+        .expect("a valid expectation");
+        let verified = store
+            .verify_by_readback(&expected)
+            .expect("the full body verifies");
+        assert!(
+            is_object(verified.object(), &BIG),
             "the measurement is of the whole body, not of its last piece"
         );
     }
@@ -1056,9 +1227,28 @@ mod tests {
     }
 
     #[test]
-    fn only_consumed_upload_service_error_enters_reconciliation() {
-        assert!(service_error_may_be_completed(Some("NoSuchUpload")));
-        assert!(!service_error_may_be_completed(Some("PreconditionFailed")));
-        assert!(!service_error_may_be_completed(None));
+    fn transient_completion_errors_enter_reconciliation() {
+        for code in [
+            "NoSuchUpload",
+            "SlowDown",
+            "InternalError",
+            "ServiceUnavailable",
+            "RequestTimeout",
+        ] {
+            assert!(
+                completion_error_may_be_ambiguous(Some(code), false),
+                "{code}"
+            );
+        }
+        assert!(completion_error_may_be_ambiguous(Some("Unknown"), true));
+        assert!(!completion_error_may_be_ambiguous(
+            Some("PreconditionFailed"),
+            false
+        ));
+        assert!(!completion_error_may_be_ambiguous(None, false));
+        assert!(object_not_found(Some("NoSuchKey")));
+        assert!(object_not_found(Some("NotFound")));
+        assert!(!object_not_found(Some("AccessDenied")));
+        assert!(!object_not_found(None));
     }
 }

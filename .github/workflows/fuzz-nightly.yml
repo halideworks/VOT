@@ -25,6 +25,7 @@ jobs:
           cargo +1.88.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
           cargo +1.88.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
           cargo +1.88.0 build --manifest-path fuzz/static-proof-catalog/Cargo.toml --locked
+          cargo +1.88.0 build --manifest-path fuzz/retained-proof-store/Cargo.toml --locked
 
       - name: Run extended bounded fuzz smoke tests
         run: |
@@ -41,6 +42,10 @@ jobs:
             fuzz/static-proof-catalog/target/debug/vot-proof-catalog-fuzz-driver \
               --iterations 10000 --corpus fuzz/static-proof-catalog/corpus < "$seed"
           done
+          for seed in fuzz/retained-proof-store/corpus/*; do
+            fuzz/retained-proof-store/target/debug/vot-retained-proof-store-fuzz-driver \
+              --iterations 10000 --corpus fuzz/retained-proof-store/corpus < "$seed"
+          done
 
   coverage-guided-fuzz:
     runs-on: ubuntu-24.04
@@ -52,6 +57,7 @@ jobs:
           - { target: frame_codec, corpus: fuzz/frame_codec/corpus }
           - { target: manifest, corpus: fuzz/manifest/corpus }
           - { target: static_proof_catalog, corpus: fuzz/static-proof-catalog/corpus }
+          - { target: retained_proof_store, corpus: fuzz/retained-proof-store/corpus }
     steps:
       - uses: actions/checkout@v7.0.1
         with:

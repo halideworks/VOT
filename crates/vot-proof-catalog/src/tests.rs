@@ -1,4 +1,5 @@
 use vot_object::{ObjectBuilder, PreparedObject, Suite};
+use vot_proof_store::MemoryNodeStorage;
 
 use super::*;
 
@@ -129,6 +130,19 @@ fn prepare(suite: Suite, data: &[u8]) -> PreparedObject {
     builder.finish().unwrap()
 }
 
+fn prepare_stored(suite: Suite, data: &[u8]) -> PreparedObject {
+    let mut builder = ObjectBuilder::with_proof_storage(
+        suite,
+        Some(data.len() as u64),
+        Box::new(MemoryNodeStorage::new()),
+    )
+    .unwrap();
+    for chunk in data.chunks(131_071) {
+        builder.update(chunk).unwrap();
+    }
+    builder.finish().unwrap()
+}
+
 fn identity(fixture: &[u8]) -> ObjectId {
     let mut root = [0; 32];
     root.copy_from_slice(&fixture[24..56]);
@@ -167,6 +181,9 @@ fn every_committed_catalog_is_reproduced_and_verifies() {
             "suite {:?}, length {}",
             case.suite, case.length
         );
+        let stored = prepare_stored(case.suite, &data);
+        assert_eq!(stored.object_id(), prepared.object_id());
+        assert_eq!(encode(&stored).unwrap(), case.fixture);
         let header = validate_complete(&catalog, prepared.object_id()).unwrap();
         for ordinal in 0..header.record_count() {
             let entry = selected(&header, &catalog, ordinal);

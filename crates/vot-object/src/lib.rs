@@ -6,6 +6,7 @@ use std::mem;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 pub use vot_manifest::ObjectId;
+pub use vot_proof_store::{ProofNodeStorage, StoreError};
 pub use vot_verifier::Suite;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, VerifyError};
 
@@ -27,6 +28,8 @@ pub enum Error {
     InvalidRange,
     /// A retained proof backend rejected internally consistent builder state.
     Proof,
+    /// Host-provided retained proof storage failed.
+    Storage(StoreError),
     /// The canonical streaming verifier rejected an update or finalization.
     Verifier(VerifyError),
 }
@@ -71,8 +74,12 @@ impl RangeCover {
     }
 }
 
-trait RetainedProofStore: Send + Sync + UnwindSafe + RefUnwindSafe {
+trait RetainedProofBuilder: Send + Sync + UnwindSafe + RefUnwindSafe {
     fn push(&mut self, group: &[u8]) -> Result<(), Error>;
+    fn finish(self: Box<Self>) -> Result<Box<dyn RetainedProof>, Error>;
+}
+
+trait RetainedProof: Send + Sync + UnwindSafe + RefUnwindSafe {
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error>;
     fn holds(&self, first: usize, bytes: &[u8]) -> bool;
 
@@ -94,7 +101,7 @@ impl MemoryProofStore {
     }
 }
 
-impl RetainedProofStore for MemoryProofStore {
+impl RetainedProofBuilder for MemoryProofStore {
     fn push(&mut self, group: &[u8]) -> Result<(), Error> {
         match self {
             Self::Blake3(cvs) => cvs.push(group).map_err(|_| Error::Proof),
@@ -102,6 +109,12 @@ impl RetainedProofStore for MemoryProofStore {
         }
     }
 
+    fn finish(self: Box<Self>) -> Result<Box<dyn RetainedProof>, Error> {
+        Ok(self)
+    }
+}
+
+impl RetainedProof for MemoryProofStore {
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
         match self {
             Self::Blake3(cvs) => vot_proof_blake3::prove_with(cvs, offset, length)
@@ -142,6 +155,98 @@ impl RetainedProofStore for MemoryProofStore {
     }
 }
 
+enum StoredProofBuilder {
+    Blake3(vot_proof_blake3::StoredGroupCvs),
+    Sha256(vot_proof_sha256::StoredPieceHashes),
+}
+
+impl StoredProofBuilder {
+    fn new(suite: Suite, storage: Box<dyn ProofNodeStorage>) -> Result<Self, Error> {
+        match suite {
+            Suite::Blake3Bao64 => vot_proof_blake3::StoredGroupCvs::new(storage)
+                .map(Self::Blake3)
+                .map_err(map_blake3_error),
+            Suite::Sha256Bep52 => vot_proof_sha256::StoredPieceHashes::new(storage)
+                .map(Self::Sha256)
+                .map_err(map_sha256_error),
+        }
+    }
+}
+
+impl RetainedProofBuilder for StoredProofBuilder {
+    fn push(&mut self, group: &[u8]) -> Result<(), Error> {
+        match self {
+            Self::Blake3(cvs) => cvs.push(group).map_err(map_blake3_error),
+            Self::Sha256(pieces) => pieces.push(group).map_err(map_sha256_error),
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Result<Box<dyn RetainedProof>, Error> {
+        match *self {
+            Self::Blake3(cvs) => cvs
+                .finish()
+                .map(|sealed| Box::new(sealed) as Box<dyn RetainedProof>)
+                .map_err(map_blake3_error),
+            Self::Sha256(pieces) => pieces
+                .finish()
+                .map(|sealed| Box::new(sealed) as Box<dyn RetainedProof>)
+                .map_err(map_sha256_error),
+        }
+    }
+}
+
+impl RetainedProof for vot_proof_blake3::SealedGroupCvs {
+    fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
+        vot_proof_blake3::SealedGroupCvs::prove(self, offset, length)
+            .map(|cover| RangeCover {
+                covered_offset: cover.covered_offset,
+                covered_length: cover.covered_length,
+                proof: cover.proof,
+            })
+            .map_err(map_blake3_error)
+    }
+
+    fn holds(&self, first: usize, bytes: &[u8]) -> bool {
+        bytes.chunks(GROUP_SIZE).enumerate().all(|(offset, group)| {
+            match first.checked_add(offset) {
+                Some(index) => vot_proof_blake3::SealedGroupCvs::holds(self, index, group),
+                None => false,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn retained_units(&self) -> usize {
+        self.groups()
+    }
+}
+
+impl RetainedProof for vot_proof_sha256::SealedPieceHashes {
+    fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
+        vot_proof_sha256::SealedPieceHashes::prove(self, offset, length)
+            .map(|cover| RangeCover {
+                covered_offset: cover.covered_offset,
+                covered_length: cover.covered_length,
+                proof: cover.proof,
+            })
+            .map_err(map_sha256_error)
+    }
+
+    fn holds(&self, first: usize, bytes: &[u8]) -> bool {
+        bytes.chunks(GROUP_SIZE).enumerate().all(|(offset, group)| {
+            match first.checked_add(offset) {
+                Some(index) => vot_proof_sha256::SealedPieceHashes::holds(self, index, group),
+                None => false,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn retained_units(&self) -> usize {
+        usize::try_from(self.pieces()).unwrap()
+    }
+}
+
 fn map_blake3_error(error: vot_proof_blake3::Error) -> Error {
     match error {
         vot_proof_blake3::Error::EmptyRange | vot_proof_blake3::Error::OutOfBounds => {
@@ -151,6 +256,7 @@ fn map_blake3_error(error: vot_proof_blake3::Error) -> Error {
         vot_proof_blake3::Error::MalformedProof | vot_proof_blake3::Error::HashMismatch => {
             Error::Proof
         }
+        vot_proof_blake3::Error::Storage(error) => Error::Storage(error),
     }
 }
 
@@ -163,6 +269,7 @@ fn map_sha256_error(error: vot_proof_sha256::Error) -> Error {
         vot_proof_sha256::Error::MalformedProof | vot_proof_sha256::Error::HashMismatch => {
             Error::Proof
         }
+        vot_proof_sha256::Error::Storage(error) => Error::Storage(error),
     }
 }
 
@@ -172,7 +279,7 @@ pub struct ObjectBuilder {
     expected_length: Option<u64>,
     length: u64,
     verifier: StreamVerifier,
-    proof: Box<dyn RetainedProofStore>,
+    proof: Box<dyn RetainedProofBuilder>,
     pending: Vec<u8>,
     failure: Option<Error>,
     #[cfg(test)]
@@ -186,6 +293,38 @@ impl ObjectBuilder {
     ///
     /// Rejects an expected length outside the VOT object model.
     pub fn new(suite: Suite, expected_length: Option<u64>) -> Result<Self, Error> {
+        Self::with_builder(
+            suite,
+            expected_length,
+            Box::new(MemoryProofStore::new(suite)),
+        )
+    }
+
+    /// Starts an object builder backed by caller-provided proof-node storage.
+    ///
+    /// The store must be empty. Its availability is temporary preparation
+    /// state and does not establish durability or any assurance transition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid expected length or unavailable, corrupt, or nonempty storage.
+    pub fn with_proof_storage(
+        suite: Suite,
+        expected_length: Option<u64>,
+        storage: Box<dyn ProofNodeStorage>,
+    ) -> Result<Self, Error> {
+        if expected_length.is_some_and(|length| length > MAX_OBJECT_LENGTH) {
+            return Err(Error::ExpectedLengthOutOfRange);
+        }
+        let proof = Box::new(StoredProofBuilder::new(suite, storage)?);
+        Self::with_builder(suite, expected_length, proof)
+    }
+
+    fn with_builder(
+        suite: Suite,
+        expected_length: Option<u64>,
+        proof: Box<dyn RetainedProofBuilder>,
+    ) -> Result<Self, Error> {
         if expected_length.is_some_and(|length| length > MAX_OBJECT_LENGTH) {
             return Err(Error::ExpectedLengthOutOfRange);
         }
@@ -194,7 +333,7 @@ impl ObjectBuilder {
             expected_length,
             length: 0,
             verifier: StreamVerifier::new(suite),
-            proof: Box::new(MemoryProofStore::new(suite)),
+            proof,
             pending: Vec::with_capacity(GROUP_SIZE),
             failure: None,
             #[cfg(test)]
@@ -307,13 +446,14 @@ impl ObjectBuilder {
             self.feed_pending()?;
         }
         let root = self.verifier.finish()?;
+        let proof = self.proof.finish()?;
         Ok(PreparedObject {
             object: ObjectId {
                 suite: self.suite.identifier(),
                 root,
                 length: self.length,
             },
-            proof: self.proof,
+            proof,
         })
     }
 }
@@ -321,7 +461,7 @@ impl ObjectBuilder {
 /// An immutable object identity bound to the material needed for range proofs.
 pub struct PreparedObject {
     object: ObjectId,
-    proof: Box<dyn RetainedProofStore>,
+    proof: Box<dyn RetainedProof>,
 }
 
 impl PreparedObject {
@@ -370,8 +510,11 @@ impl PreparedObject {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use vot_proof_store::{MemoryNodeStorage, ProofNode};
 
     fn assert_auto_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
 
@@ -394,6 +537,198 @@ mod tests {
             assert!(builder.buffered_bytes() <= GROUP_SIZE);
         }
         builder.finish().unwrap()
+    }
+
+    fn prepared_stored(suite: Suite, bytes: &[u8], chunk: usize) -> PreparedObject {
+        let mut builder = ObjectBuilder::with_proof_storage(
+            suite,
+            Some(bytes.len() as u64),
+            Box::new(MemoryNodeStorage::new()),
+        )
+        .unwrap();
+        for part in bytes.chunks(chunk) {
+            builder.update(part).unwrap();
+            assert!(builder.buffered_bytes() <= GROUP_SIZE);
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn host_backed_preparation_matches_the_default_backend() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            for length in [0, 1, GROUP_SIZE, GROUP_SIZE + 1, 5 * GROUP_SIZE + 71] {
+                let bytes = fixture(length);
+                let memory = prepared(suite, &bytes, 7_919);
+                let stored = prepared_stored(suite, &bytes, 4_093);
+                assert_eq!(stored.object_id(), memory.object_id());
+                assert_eq!(stored.retained_units(), memory.retained_units());
+                if !bytes.is_empty() {
+                    for (offset, requested) in
+                        [(0, 1), (bytes.len() as u64 - 1, 1), (0, bytes.len() as u64)]
+                    {
+                        assert_eq!(
+                            stored.prove(offset, requested),
+                            memory.prove(offset, requested)
+                        );
+                    }
+                    assert!(stored.holds(0, &bytes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_backed_forwarding_preserves_nontrivial_results() {
+        let bytes = fixture(2 * GROUP_SIZE + 71);
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let stored = prepared_stored(suite, &bytes, 4_093);
+            let cover = stored.prove(1, 1).unwrap();
+            assert_eq!(cover.covered_offset(), 0);
+            assert_eq!(cover.covered_length(), GROUP_SIZE as u64);
+            assert!(!cover.proof().is_empty());
+            assert!(stored.holds(0, &bytes[..GROUP_SIZE]));
+            let mut changed = bytes[..GROUP_SIZE].to_vec();
+            changed[0] ^= 1;
+            assert!(!stored.holds(0, &changed));
+        }
+    }
+
+    #[test]
+    fn host_storage_preflights_and_failures_are_typed() {
+        struct PanicStorage;
+        impl ProofNodeStorage for PanicStorage {
+            fn len(&self) -> Result<u64, StoreError> {
+                panic!("length preflight must run before storage access")
+            }
+            fn append(&mut self, _node: ProofNode) -> Result<(), StoreError> {
+                unreachable!()
+            }
+            fn read(&self, _ordinal: u64) -> Result<ProofNode, StoreError> {
+                unreachable!()
+            }
+        }
+        assert!(matches!(
+            ObjectBuilder::with_proof_storage(
+                Suite::Blake3Bao64,
+                Some(MAX_OBJECT_LENGTH + 1),
+                Box::new(PanicStorage)
+            ),
+            Err(Error::ExpectedLengthOutOfRange)
+        ));
+
+        let mut nonempty = MemoryNodeStorage::new();
+        nonempty.append([7; 32]).unwrap();
+        assert!(matches!(
+            ObjectBuilder::with_proof_storage(Suite::Sha256Bep52, None, Box::new(nonempty)),
+            Err(Error::Storage(StoreError::Corrupt))
+        ));
+
+        let maximum = ObjectBuilder::with_proof_storage(
+            Suite::Blake3Bao64,
+            Some(MAX_OBJECT_LENGTH),
+            Box::new(MemoryNodeStorage::new()),
+        );
+        assert!(maximum.is_ok());
+        let builder = maximum.unwrap();
+        assert_eq!(builder.suite, Suite::Blake3Bao64);
+        assert_eq!(builder.expected_length, Some(MAX_OBJECT_LENGTH));
+        assert_eq!(builder.observed_length(), 0);
+        assert_eq!(builder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn host_backed_updates_advance_exactly_once() {
+        let mut builder = ObjectBuilder::with_proof_storage(
+            Suite::Sha256Bep52,
+            Some(3),
+            Box::new(MemoryNodeStorage::new()),
+        )
+        .unwrap();
+        builder.update(b"abc").unwrap();
+        assert_eq!(builder.observed_length(), 3);
+        assert_eq!(builder.buffered_bytes(), 3);
+        assert_eq!(builder.finish().unwrap().object_id().length, 3);
+    }
+
+    struct FailingStorage {
+        inner: MemoryNodeStorage,
+        fail_append: bool,
+        fail_read: Arc<AtomicBool>,
+    }
+
+    impl ProofNodeStorage for FailingStorage {
+        fn len(&self) -> Result<u64, StoreError> {
+            self.inner.len()
+        }
+
+        fn append(&mut self, node: ProofNode) -> Result<(), StoreError> {
+            if self.fail_append {
+                self.inner.append(node)?;
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.append(node)
+        }
+
+        fn read(&self, ordinal: u64) -> Result<ProofNode, StoreError> {
+            if self.fail_read.load(Ordering::Relaxed) {
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.read(ordinal)
+        }
+    }
+
+    #[test]
+    fn host_append_failure_poisons_the_object_builder() {
+        let storage = FailingStorage {
+            inner: MemoryNodeStorage::new(),
+            fail_append: true,
+            fail_read: Arc::new(AtomicBool::new(false)),
+        };
+        let mut builder =
+            ObjectBuilder::with_proof_storage(Suite::Blake3Bao64, None, Box::new(storage)).unwrap();
+        let error = builder.update(&vec![0; GROUP_SIZE]).unwrap_err();
+        assert_eq!(error, Error::Storage(StoreError::Unavailable));
+        assert_eq!(builder.update(&[]), Err(error));
+        assert!(matches!(builder.finish(), Err(failure) if failure == error));
+    }
+
+    #[test]
+    fn host_append_failure_on_the_final_short_group_fails_closed() {
+        let storage = FailingStorage {
+            inner: MemoryNodeStorage::new(),
+            fail_append: true,
+            fail_read: Arc::new(AtomicBool::new(false)),
+        };
+        let mut builder =
+            ObjectBuilder::with_proof_storage(Suite::Sha256Bep52, Some(7), Box::new(storage))
+                .unwrap();
+        builder.update(b"partial").unwrap();
+        assert!(matches!(
+            builder.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn host_read_failure_aborts_finish_without_a_prepared_object() {
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let storage = FailingStorage {
+            inner: MemoryNodeStorage::new(),
+            fail_append: false,
+            fail_read: Arc::clone(&fail_read),
+        };
+        let mut builder = ObjectBuilder::with_proof_storage(
+            Suite::Sha256Bep52,
+            Some((2 * GROUP_SIZE) as u64),
+            Box::new(storage),
+        )
+        .unwrap();
+        builder.update(&vec![0; 2 * GROUP_SIZE]).unwrap();
+        fail_read.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            builder.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
     }
 
     #[test]

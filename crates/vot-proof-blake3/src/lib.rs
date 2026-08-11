@@ -3,6 +3,7 @@
 //! VOT `blake3-bao64` roots, canonical outboards, and range proofs.
 
 use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root};
+use vot_proof_store::{ProofNodeStorage, StoreError};
 
 pub const GROUP_SIZE: u64 = 65_536;
 
@@ -20,6 +21,13 @@ pub enum Error {
     LengthOverflow,
     MalformedProof,
     HashMismatch,
+    Storage(StoreError),
+}
+
+impl From<StoreError> for Error {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -151,6 +159,264 @@ impl GroupCvs {
         hasher.set_input_offset(input_offset);
         hasher.update(group);
         hasher.finalize_non_root() == *cv
+    }
+}
+
+const MAX_STORED_LEVELS: usize = 49;
+
+#[derive(Clone, Copy)]
+struct StoredLevel {
+    base: u64,
+    count: u64,
+}
+
+impl StoredLevel {
+    const EMPTY: Self = Self { base: 0, count: 0 };
+}
+
+/// Chaining values retained in caller-supplied sequential storage.
+pub struct StoredGroupCvs {
+    storage: Box<dyn ProofNodeStorage>,
+    length: u64,
+    groups: usize,
+    ended: bool,
+    failure: Option<StoreError>,
+}
+
+impl StoredGroupCvs {
+    /// Starts an empty retained layer over an empty node store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable storage and storage that already contains nodes.
+    pub fn new(storage: Box<dyn ProofNodeStorage>) -> Result<Self, Error> {
+        if !storage.is_empty()? {
+            return Err(Error::Storage(StoreError::Corrupt));
+        }
+        Ok(Self {
+            storage,
+            length: 0,
+            groups: 0,
+            ended: false,
+            failure: None,
+        })
+    }
+
+    /// Takes the next group and appends its absolute-offset chaining value.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid group ordering and length. A storage error poisons the
+    /// layer because an append may have partially changed its backing store.
+    pub fn push(&mut self, group: &[u8]) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(Error::Storage(error));
+        }
+        if group.is_empty() || group.len() as u64 > GROUP_SIZE || self.ended {
+            return Err(Error::OutOfBounds);
+        }
+        let group_length = u64::try_from(group.len()).map_err(|_| Error::LengthOverflow)?;
+        let next_length = self
+            .length
+            .checked_add(group_length)
+            .ok_or(Error::LengthOverflow)?;
+        let next_groups = self
+            .groups
+            .checked_add(1)
+            .ok_or(Error::Storage(StoreError::Capacity))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(self.length);
+        hasher.update(group);
+        if let Err(error) = self.storage.append(hasher.finalize_non_root()) {
+            self.failure = Some(error);
+            return Err(Error::Storage(error));
+        }
+        self.length = next_length;
+        self.groups = next_groups;
+        self.ended = group_length < GROUP_SIZE;
+        Ok(())
+    }
+
+    /// Appends complete aligned parent levels and seals the retained layer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects prior storage failure, inconsistent storage length, unavailable
+    /// nodes, and checked ordinal overflow.
+    pub fn finish(mut self) -> Result<SealedGroupCvs, Error> {
+        if let Some(error) = self.failure {
+            return Err(Error::Storage(error));
+        }
+        let group_count =
+            u64::try_from(self.groups).map_err(|_| Error::Storage(StoreError::Capacity))?;
+        if self.storage.len()? != group_count {
+            return Err(Error::Storage(StoreError::Corrupt));
+        }
+
+        let mut levels = [StoredLevel::EMPTY; MAX_STORED_LEVELS];
+        let mut level_count = usize::from(group_count != 0);
+        if group_count != 0 {
+            levels[0] = StoredLevel {
+                base: 0,
+                count: group_count,
+            };
+        }
+        let mut previous = levels[0];
+        let mut expected_records = group_count;
+        while previous.count >= 2 {
+            if level_count >= MAX_STORED_LEVELS {
+                return Err(Error::Storage(StoreError::Capacity));
+            }
+            if self.storage.len()? != expected_records {
+                return Err(Error::Storage(StoreError::Corrupt));
+            }
+            let count = previous.count / 2;
+            let level = StoredLevel {
+                base: expected_records,
+                count,
+            };
+            for index in 0..count {
+                let child = index
+                    .checked_mul(2)
+                    .ok_or(Error::Storage(StoreError::Capacity))?;
+                let left_ordinal = previous
+                    .base
+                    .checked_add(child)
+                    .ok_or(Error::Storage(StoreError::Capacity))?;
+                let right_ordinal = left_ordinal
+                    .checked_add(1)
+                    .ok_or(Error::Storage(StoreError::Capacity))?;
+                let left = self.storage.read(left_ordinal)?;
+                let right = self.storage.read(right_ordinal)?;
+                self.storage
+                    .append(merge_subtrees_non_root(&left, &right, Mode::Hash))?;
+            }
+            expected_records = expected_records
+                .checked_add(count)
+                .ok_or(Error::Storage(StoreError::Capacity))?;
+            if self.storage.len()? != expected_records {
+                return Err(Error::Storage(StoreError::Corrupt));
+            }
+            levels[level_count] = level;
+            level_count += 1;
+            previous = level;
+        }
+
+        Ok(SealedGroupCvs {
+            storage: self.storage,
+            length: self.length,
+            groups: self.groups,
+            levels,
+            level_count,
+        })
+    }
+}
+
+/// A stored chaining-value layer ready for readback checks and range proofs.
+pub struct SealedGroupCvs {
+    storage: Box<dyn ProofNodeStorage>,
+    length: u64,
+    groups: usize,
+    levels: [StoredLevel; MAX_STORED_LEVELS],
+    level_count: usize,
+}
+
+impl SealedGroupCvs {
+    /// The object length these nodes cover.
+    #[must_use]
+    pub const fn object_len(&self) -> u64 {
+        self.length
+    }
+
+    /// The number of retained verification groups.
+    #[must_use]
+    pub const fn groups(&self) -> usize {
+        self.groups
+    }
+
+    /// Whether `group` matches the retained node at `index`.
+    #[must_use]
+    pub fn holds(&self, index: usize, group: &[u8]) -> bool {
+        if group.is_empty() || group.len() as u64 > GROUP_SIZE {
+            return false;
+        }
+        let Ok(index) = u64::try_from(index) else {
+            return false;
+        };
+        let Some(level) = self.levels.first() else {
+            return false;
+        };
+        if index >= level.count {
+            return false;
+        }
+        let Some(ordinal) = level.base.checked_add(index) else {
+            return false;
+        };
+        let Ok(expected) = self.storage.read(ordinal) else {
+            return false;
+        };
+        let Some(input_offset) = index.checked_mul(GROUP_SIZE) else {
+            return false;
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(input_offset);
+        hasher.update(group);
+        hasher.finalize_non_root() == expected
+    }
+
+    /// Creates the canonical proof for a requested range.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid range geometry and unavailable or corrupt stored nodes.
+    pub fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
+        let RangeGeometry {
+            covered_offset,
+            covered_end,
+            first,
+            end,
+        } = RangeGeometry::of(self.length, offset, length)?;
+        let mut proof = Vec::new();
+        encode_selected_stored(
+            self,
+            Node {
+                start: 0,
+                count: group_count(self.length),
+            },
+            first,
+            end,
+            &mut proof,
+        )?;
+        Ok(RangeCover {
+            covered_offset,
+            covered_length: covered_end - covered_offset,
+            proof,
+        })
+    }
+
+    fn node_cv(&self, node: Node) -> Result<[u8; 32], Error> {
+        if node.count.is_power_of_two() && node.start % node.count == 0 {
+            let level_index = node.count.trailing_zeros() as usize;
+            if level_index >= self.level_count {
+                return Err(Error::Storage(StoreError::Corrupt));
+            }
+            let level = self.levels[level_index];
+            let index = node.start / node.count;
+            if index >= level.count {
+                return Err(Error::Storage(StoreError::Corrupt));
+            }
+            let ordinal = level
+                .base
+                .checked_add(index)
+                .ok_or(Error::Storage(StoreError::Capacity))?;
+            return self.storage.read(ordinal).map_err(Error::Storage);
+        }
+        let (left, right) = node.split();
+        Ok(merge_subtrees_non_root(
+            &self.node_cv(left)?,
+            &self.node_cv(right)?,
+            Mode::Hash,
+        ))
     }
 }
 
@@ -380,6 +646,23 @@ fn encode_selected_from(node: Node, first: u64, end: u64, cvs: &[[u8; 32]], outp
     encode_selected_from(right, first, end, cvs, output);
 }
 
+fn encode_selected_stored(
+    cvs: &SealedGroupCvs,
+    node: Node,
+    first: u64,
+    end: u64,
+    output: &mut Vec<u8>,
+) -> Result<(), Error> {
+    if node.count == 1 || !node.intersects(first, end) {
+        return Ok(());
+    }
+    let (left, right) = node.split();
+    output.extend_from_slice(&cvs.node_cv(left)?);
+    output.extend_from_slice(&cvs.node_cv(right)?);
+    encode_selected_stored(cvs, left, first, end, output)?;
+    encode_selected_stored(cvs, right, first, end, output)
+}
+
 fn encode_selected(node: Node, first: u64, end: u64, data: &[u8], output: &mut Vec<u8>) {
     if node.count == 1 || !node.intersects(first, end) {
         return;
@@ -464,7 +747,45 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use vot_proof_store::{MemoryNodeStorage, ProofNode};
+
+    #[derive(Default)]
+    struct FaultStore {
+        nodes: Vec<ProofNode>,
+        append_failure_at: Option<u64>,
+        read_failure: Arc<AtomicBool>,
+        length_failure: bool,
+    }
+
+    impl ProofNodeStorage for FaultStore {
+        fn len(&self) -> Result<u64, StoreError> {
+            if self.length_failure {
+                return Err(StoreError::Unavailable);
+            }
+            u64::try_from(self.nodes.len()).map_err(|_| StoreError::Capacity)
+        }
+
+        fn append(&mut self, node: ProofNode) -> Result<(), StoreError> {
+            if self.append_failure_at == Some(self.len()?) {
+                return Err(StoreError::Unavailable);
+            }
+            self.nodes.push(node);
+            Ok(())
+        }
+
+        fn read(&self, ordinal: u64) -> Result<ProofNode, StoreError> {
+            if self.read_failure.load(Ordering::Relaxed) {
+                return Err(StoreError::Unavailable);
+            }
+            let index = usize::try_from(ordinal).map_err(|_| StoreError::Capacity)?;
+            self.nodes.get(index).copied().ok_or(StoreError::Corrupt)
+        }
+    }
 
     fn fixture(length: usize) -> Vec<u8> {
         (0..length)
@@ -512,6 +833,168 @@ mod tests {
             cvs.push(group).unwrap();
         }
         cvs
+    }
+
+    fn stored_cvs_of(data: &[u8]) -> SealedGroupCvs {
+        let mut cvs = StoredGroupCvs::new(Box::new(MemoryNodeStorage::new())).unwrap();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            cvs.push(group).unwrap();
+        }
+        cvs.finish().unwrap()
+    }
+
+    fn assert_stored_auto_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+
+    #[test]
+    fn stored_layers_require_empty_available_storage() {
+        let empty = StoredGroupCvs::new(Box::new(MemoryNodeStorage::new())).unwrap();
+        let sealed = empty.finish().unwrap();
+        assert_eq!(sealed.object_len(), 0);
+        assert_eq!(sealed.groups(), 0);
+
+        let mut occupied = MemoryNodeStorage::new();
+        occupied.append([1; 32]).unwrap();
+        assert!(matches!(
+            StoredGroupCvs::new(Box::new(occupied)),
+            Err(Error::Storage(StoreError::Corrupt))
+        ));
+        assert!(matches!(
+            StoredGroupCvs::new(Box::new(FaultStore {
+                length_failure: true,
+                ..FaultStore::default()
+            })),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn stored_builder_enforces_every_group_order_boundary() {
+        let mut stored = StoredGroupCvs::new(Box::new(MemoryNodeStorage::new())).unwrap();
+        assert_eq!(stored.push(&[]), Err(Error::OutOfBounds));
+        assert_eq!(
+            stored.push(&fixture(GROUP_SIZE as usize + 1)),
+            Err(Error::OutOfBounds)
+        );
+        stored.push(&fixture(GROUP_SIZE as usize)).unwrap();
+        stored.push(&fixture(GROUP_SIZE as usize)).unwrap();
+        stored.push(&fixture(7)).unwrap();
+        assert_eq!(stored.push(&[1]), Err(Error::OutOfBounds));
+        let sealed = stored.finish().unwrap();
+        assert_eq!(sealed.object_len(), 2 * GROUP_SIZE + 7);
+        assert_eq!(sealed.groups(), 3);
+    }
+
+    #[test]
+    fn stored_layers_match_memory_across_irregular_tree_widths() {
+        for groups in [1_usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
+            let length = groups * GROUP_SIZE as usize - 7;
+            let data = fixture(length);
+            let memory = cvs_of(&data);
+            let stored = stored_cvs_of(&data);
+            assert_eq!(stored.object_len(), memory.object_len());
+            assert_eq!(stored.groups(), memory.groups());
+
+            for (index, group) in data.chunks(GROUP_SIZE as usize).enumerate() {
+                assert_eq!(stored.holds(index, group), memory.holds(index, group));
+            }
+            for (offset, request) in [
+                (0, 1),
+                (GROUP_SIZE.saturating_sub(1), 1),
+                (length as u64 - 1, 1),
+                (0, length as u64),
+            ] {
+                assert_eq!(
+                    stored.prove(offset, request),
+                    prove_with(&memory, offset, request)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_holds_rejects_changed_and_unavailable_nodes() {
+        let data = fixture(3 * GROUP_SIZE as usize + 7);
+        let read_failure = Arc::new(AtomicBool::new(false));
+        let mut building = StoredGroupCvs::new(Box::new(FaultStore {
+            read_failure: Arc::clone(&read_failure),
+            ..FaultStore::default()
+        }))
+        .unwrap();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            building.push(group).unwrap();
+        }
+        let stored = building.finish().unwrap();
+        assert!(stored.holds(0, &data[..GROUP_SIZE as usize]));
+        assert!(!stored.holds(0, &[]));
+        assert!(!stored.holds(0, &fixture(GROUP_SIZE as usize + 1)));
+        let mut changed = data[..GROUP_SIZE as usize].to_vec();
+        changed[0] ^= 1;
+        assert!(!stored.holds(0, &changed));
+
+        read_failure.store(true, Ordering::Relaxed);
+        assert!(!stored.holds(0, &data[..GROUP_SIZE as usize]));
+        assert!(matches!(
+            stored.prove(0, 1),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn append_storage_failure_poison_is_permanent() {
+        let mut stored = StoredGroupCvs::new(Box::new(FaultStore {
+            append_failure_at: Some(0),
+            ..FaultStore::default()
+        }))
+        .unwrap();
+        assert_eq!(
+            stored.push(b"first"),
+            Err(Error::Storage(StoreError::Unavailable))
+        );
+        assert_eq!(
+            stored.push(b"second"),
+            Err(Error::Storage(StoreError::Unavailable))
+        );
+        assert!(matches!(
+            stored.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn finish_surfaces_parent_read_and_append_failures() {
+        let group = vec![7; GROUP_SIZE as usize];
+
+        let read_failure = Arc::new(AtomicBool::new(false));
+        let mut unreadable = StoredGroupCvs::new(Box::new(FaultStore {
+            read_failure: Arc::clone(&read_failure),
+            ..FaultStore::default()
+        }))
+        .unwrap();
+        unreadable.push(&group).unwrap();
+        unreadable.push(&group).unwrap();
+        read_failure.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            unreadable.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+
+        let mut unwritable = StoredGroupCvs::new(Box::new(FaultStore {
+            append_failure_at: Some(2),
+            ..FaultStore::default()
+        }))
+        .unwrap();
+        unwritable.push(&group).unwrap();
+        unwritable.push(&group).unwrap();
+        assert!(matches!(
+            unwritable.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn stored_layers_keep_required_auto_traits() {
+        assert_stored_auto_traits::<StoredGroupCvs>();
+        assert_stored_auto_traits::<SealedGroupCvs>();
     }
 
     #[test]

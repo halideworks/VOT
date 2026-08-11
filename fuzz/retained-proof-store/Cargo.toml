@@ -1,0 +1,23 @@
+[package]
+name = "vot-retained-proof-store-fuzz-driver"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "vot_retained_proof_store_fuzz_driver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vot-retained-proof-store-fuzz-driver"
+path = "src/main.rs"
+
+[dependencies]
+cap = "=0.1.2"
+vot-fuzz-mutator = { path = "../mutator" }
+vot-object = { path = "../../crates/vot-object" }
+vot-proof-catalog = { path = "../../crates/vot-proof-catalog" }
+vot-proof-store = { path = "../../crates/vot-proof-store" }
+
+[workspace]

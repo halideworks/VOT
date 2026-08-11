@@ -91,8 +91,16 @@ Contiguous ranges SHOULD use a multiproof or streaming encoding. A receiver
 MUST NOT have to fetch a complete proof index before verifying useful data.
 
 The `vot-object` crate streams an object into its canonical identity and
-suite-neutral retained proof material without retaining the object. The current
-in-memory material costs approximately 32 bytes per 64 KiB verification unit.
+suite-neutral retained proof material without retaining the object. Its default
+memory backend costs approximately 32 bytes per 64 KiB verification unit. A
+host may instead provide sequential node storage. The native temporary-file
+adapter uses one 36-byte record per stored node. The stored tree uses fewer than
+twice the verification-unit count plus 64 nodes and at most 64 fixed tree-level
+descriptors. It retains no node collection on the heap; preparation keeps a 64
+KiB input buffer and the requested proof output. Backing choice changes no
+identity, proof, catalog, or assurance state. At 1 GiB, the scale gate records
+32,767 nodes and 1,179,612 spill bytes for either suite with the pending buffer
+capped at 65,536 bytes.
 
 The `vot-proof-catalog` crate encodes and validates the optional random-access
 catalog profile without making the catalog part of object or package identity.

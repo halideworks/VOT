@@ -536,6 +536,7 @@ dependencies = [
  "vot-frame-fuzz-driver",
  "vot-manifest-fuzz-driver",
  "vot-proof-catalog-fuzz-driver",
+ "vot-retained-proof-store-fuzz-driver",
 ]
 
 [[package]]
@@ -593,6 +594,7 @@ dependencies = [
  "vot-manifest",
  "vot-proof-blake3",
  "vot-proof-sha256",
+ "vot-proof-store",
  "vot-verifier",
 ]
 
@@ -601,6 +603,7 @@ name = "vot-proof-blake3"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "vot-proof-store",
  "vot-verifier",
 ]
 
@@ -627,8 +630,13 @@ name = "vot-proof-sha256"
 version = "0.0.1"
 dependencies = [
  "sha2 0.11.0",
+ "vot-proof-store",
  "vot-verifier",
 ]
+
+[[package]]
+name = "vot-proof-store"
+version = "0.0.1"
 
 [[package]]
 name = "vot-receipt"
@@ -639,6 +647,17 @@ dependencies = [
  "sha2 0.11.0",
  "vot-cbor",
  "vot-commit-model",
+]
+
+[[package]]
+name = "vot-retained-proof-store-fuzz-driver"
+version = "0.0.0"
+dependencies = [
+ "cap",
+ "vot-fuzz-mutator",
+ "vot-object",
+ "vot-proof-catalog",
+ "vot-proof-store",
 ]
 
 [[package]]

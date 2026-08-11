@@ -293,9 +293,9 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Test native commit provider
-        # vot-scheduler rides along for FileSink, whose positional-write
-        # loop is per-platform and otherwise never compiled off Linux.
-        run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-platform-net -p vot-platform-proc -p vot-resume -p vot-scheduler --locked
+        # FileSink and the spill store use positional I/O loops that otherwise
+        # never compile off Linux.
+        run: cargo +1.88.0 test -p vot-commit-platform -p vot-platform-fs -p vot-platform-net -p vot-platform-proc -p vot-proof-store-file -p vot-resume -p vot-scheduler --locked
 
   quiche-live:
     name: quiche live (loopback)

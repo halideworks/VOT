@@ -13,6 +13,8 @@ cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz frame_codec fuzz/frame_codec/
 cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz manifest    fuzz/manifest/corpus
 cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz static_proof_catalog \
   fuzz/static-proof-catalog/corpus
+cargo +nightly fuzz run --fuzz-dir fuzz/cargo-fuzz retained_proof_store \
+  fuzz/retained-proof-store/corpus
 ```
 
 The corpus directory passed on the command line is the persistent corpus.

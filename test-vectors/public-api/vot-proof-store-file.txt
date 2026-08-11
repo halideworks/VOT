@@ -1,0 +1,1 @@
+struct vot_proof_store_file::TemporaryFileNodeStorage

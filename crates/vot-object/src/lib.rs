@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::mem;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 pub use vot_manifest::ObjectId;
 pub use vot_verifier::Suite;
@@ -70,19 +71,30 @@ impl RangeCover {
     }
 }
 
-enum ProofLayer {
+trait RetainedProofStore: Send + Sync + UnwindSafe + RefUnwindSafe {
+    fn push(&mut self, group: &[u8]) -> Result<(), Error>;
+    fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error>;
+    fn holds(&self, first: usize, bytes: &[u8]) -> bool;
+
+    #[cfg(test)]
+    fn retained_units(&self) -> usize;
+}
+
+enum MemoryProofStore {
     Blake3(vot_proof_blake3::GroupCvs),
     Sha256(vot_proof_sha256::PieceHashes),
 }
 
-impl ProofLayer {
+impl MemoryProofStore {
     fn new(suite: Suite) -> Self {
         match suite {
             Suite::Blake3Bao64 => Self::Blake3(vot_proof_blake3::GroupCvs::new()),
             Suite::Sha256Bep52 => Self::Sha256(vot_proof_sha256::PieceHashes::new()),
         }
     }
+}
 
+impl RetainedProofStore for MemoryProofStore {
     fn push(&mut self, group: &[u8]) -> Result<(), Error> {
         match self {
             Self::Blake3(cvs) => cvs.push(group).map_err(|_| Error::Proof),
@@ -160,7 +172,7 @@ pub struct ObjectBuilder {
     expected_length: Option<u64>,
     length: u64,
     verifier: StreamVerifier,
-    proof: ProofLayer,
+    proof: Box<dyn RetainedProofStore>,
     pending: Vec<u8>,
     failure: Option<Error>,
     #[cfg(test)]
@@ -182,7 +194,7 @@ impl ObjectBuilder {
             expected_length,
             length: 0,
             verifier: StreamVerifier::new(suite),
-            proof: ProofLayer::new(suite),
+            proof: Box::new(MemoryProofStore::new(suite)),
             pending: Vec::with_capacity(GROUP_SIZE),
             failure: None,
             #[cfg(test)]
@@ -309,7 +321,7 @@ impl ObjectBuilder {
 /// An immutable object identity bound to the material needed for range proofs.
 pub struct PreparedObject {
     object: ObjectId,
-    proof: ProofLayer,
+    proof: Box<dyn RetainedProofStore>,
 }
 
 impl PreparedObject {
@@ -360,6 +372,14 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    fn assert_auto_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+
+    #[test]
+    fn builders_and_prepared_objects_keep_their_auto_traits() {
+        assert_auto_traits::<ObjectBuilder>();
+        assert_auto_traits::<PreparedObject>();
+    }
 
     fn fixture(length: usize) -> Vec<u8> {
         (0..length)

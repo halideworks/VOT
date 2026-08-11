@@ -49,40 +49,56 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    /// A journal path that takes its file with it.
+    /// A journal path that takes its private directory with it.
     ///
     /// Cleaning up in a `Drop` is the only version a later test cannot
     /// forget. A sweep runs the suite once per mutant, so one file per test
     /// per mutant is thousands in the shared temp directory, which is what
     /// has killed mutation runners here before.
-    struct TempJournal(std::path::PathBuf);
+    struct TempJournal {
+        path: std::path::PathBuf,
+        directory: std::path::PathBuf,
+    }
 
     impl std::ops::Deref for TempJournal {
         type Target = Path;
 
         fn deref(&self) -> &Path {
-            &self.0
+            &self.path
         }
     }
 
     impl AsRef<Path> for TempJournal {
         fn as_ref(&self) -> &Path {
-            &self.0
+            &self.path
         }
     }
 
     impl Drop for TempJournal {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
 
     fn temp_path(name: &str) -> TempJournal {
-        TempJournal(std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "vot-journal-{}-{}-{name}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        )))
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(&directory).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&directory).unwrap();
+        TempJournal {
+            path: directory.join("journal"),
+            directory,
+        }
     }
 
     #[test]
@@ -579,7 +595,7 @@ mod tests {
         std::fs::write(&path, b"replacement").unwrap();
         assert!(journal.remove_owned().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(held).unwrap();
     }
 

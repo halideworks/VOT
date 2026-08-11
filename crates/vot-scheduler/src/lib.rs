@@ -57,9 +57,7 @@ mod proof;
 mod receiver;
 mod sink;
 
-#[cfg(test)]
-use coverage::MAX_RANGE_FRAGMENTS;
-use coverage::RangeState;
+use coverage::{Check, RangeState, coverage_error};
 pub use planner::*;
 use proof::{
     assemble_ordered, check_range_proof, subject_id, suite, validate_typed_bundle,
@@ -67,6 +65,8 @@ use proof::{
 };
 pub use receiver::*;
 pub use sink::*;
+#[cfg(test)]
+use vot_coverage::MAX_FRAGMENTS as MAX_RANGE_FRAGMENTS;
 
 #[cfg(test)]
 mod tests {
@@ -301,23 +301,19 @@ mod tests {
         };
         let mut receiver =
             ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
-        receiver.range_active.insert(
-            object,
-            RangeState {
-                extents: BTreeMap::new(),
-                bytes: RANGE_UNIT_BYTES,
-                sink: Box::new(DiscardSink),
-            },
-        );
+        let mut partial = RangeState::new(Box::new(DiscardSink));
+        let Check::New(booking) = partial.coverage.check(0, RANGE_UNIT_BYTES).unwrap() else {
+            panic!("a new range");
+        };
+        booking.commit();
+        receiver.range_active.insert(object, partial);
         assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
-        receiver.range_active.insert(
-            object,
-            RangeState {
-                extents: BTreeMap::new(),
-                bytes: 2 * RANGE_UNIT_BYTES,
-                sink: Box::new(DiscardSink),
-            },
-        );
+        let mut complete = RangeState::new(Box::new(DiscardSink));
+        let Check::New(booking) = complete.coverage.check(0, 2 * RANGE_UNIT_BYTES).unwrap() else {
+            panic!("a new range");
+        };
+        booking.commit();
+        receiver.range_active.insert(object, complete);
         receiver.finish_ranges(object).unwrap();
         assert!(receiver.is_verified(object));
     }
@@ -573,7 +569,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            overlap.range_active[&range_subject].bytes,
+            overlap.range_active[&range_subject]
+                .coverage
+                .covered_bytes(),
             2 * RANGE_UNIT_BYTES
         );
 
@@ -624,14 +622,15 @@ mod tests {
                 &second_proof.proof,
             )
             .unwrap();
-        assert_eq!(middle.range_active[&range_subject].bytes, RANGE_UNIT_BYTES);
+        assert_eq!(
+            middle.range_active[&range_subject].coverage.covered_bytes(),
+            RANGE_UNIT_BYTES
+        );
         assert_eq!(
             middle.range_active[&range_subject]
-                .extents
-                .iter()
-                .map(|(start, end)| (*start, *end))
-                .collect::<Vec<_>>(),
-            vec![(RANGE_UNIT_BYTES, 2 * RANGE_UNIT_BYTES)]
+                .coverage
+                .fragment_count(),
+            1
         );
         assert_eq!(
             middle.finish_ranges(range_subject),
@@ -722,7 +721,7 @@ mod tests {
                 &prove(2 * RANGE_UNIT_BYTES).proof,
             )
             .unwrap();
-        assert_eq!(receiver.range_active[&object].extents.len(), 2);
+        assert_eq!(receiver.range_active[&object].coverage.fragment_count(), 2);
         receiver
             .receive_range(
                 object,
@@ -731,13 +730,10 @@ mod tests {
                 &prove(RANGE_UNIT_BYTES).proof,
             )
             .unwrap();
+        assert_eq!(receiver.range_active[&object].coverage.fragment_count(), 1);
         assert_eq!(
-            receiver.range_active[&object]
-                .extents
-                .iter()
-                .map(|(start, end)| (*start, *end))
-                .collect::<Vec<_>>(),
-            vec![(0, 3 * RANGE_UNIT_BYTES)]
+            receiver.range_active[&object].coverage.covered_bytes(),
+            3 * RANGE_UNIT_BYTES
         );
         receiver
             .receive_range(
@@ -779,7 +775,7 @@ mod tests {
             Err(Error::Sink)
         );
         assert_eq!(receiver.advertised_credit(), credit);
-        assert_eq!(receiver.range_active[&object].bytes, 0);
+        assert_eq!(receiver.range_active[&object].coverage.covered_bytes(), 0);
         receiver
             .receive_range(object, 0, &bytes, &proof.proof)
             .unwrap();
@@ -789,10 +785,14 @@ mod tests {
 
     #[test]
     fn a_panicking_sink_does_not_strand_staging() {
-        struct PanickingSink;
-        impl RangeSink for PanickingSink {
+        struct PanicOnceSink(std::sync::atomic::AtomicBool);
+        impl RangeSink for PanicOnceSink {
             fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), SinkError> {
-                panic!("a sink is caller code and may do this");
+                assert!(
+                    !self.0.swap(false, std::sync::atomic::Ordering::Relaxed),
+                    "a sink is caller code and may do this"
+                );
+                Ok(())
             }
         }
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
@@ -802,7 +802,10 @@ mod tests {
         let staging = 2 * RANGE_UNIT_BYTES + VERIFIER_RESERVATION;
         let mut receiver = ReliableReceiver::new(staging, staging, staging).unwrap();
         receiver
-            .begin_ranges(object, Box::new(PanickingSink))
+            .begin_ranges(
+                object,
+                Box::new(PanicOnceSink(std::sync::atomic::AtomicBool::new(true))),
+            )
             .unwrap();
         let credit = receiver.advertised_credit();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -810,10 +813,16 @@ mod tests {
         }));
         assert!(outcome.is_err(), "the sink's panic reached the caller");
         assert_eq!(receiver.advertised_credit(), credit);
+        assert_eq!(receiver.range_active[&object].coverage.covered_bytes(), 0);
+        receiver
+            .receive_range(object, 0, &bytes, &proof.proof)
+            .unwrap();
+        receiver.finish_ranges(object).unwrap();
+        assert!(receiver.is_verified(object));
     }
 
     #[test]
-    fn fragments_are_bounded_but_a_merging_range_is_not_refused() {
+    fn fragment_exhaustion_keeps_its_scheduler_error() {
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
         let bytes = vec![0x99; unit * 3];
         let object = subject(&bytes);
@@ -826,7 +835,11 @@ mod tests {
             let active = receiver.range_active.get_mut(&object).unwrap();
             for index in 0..u64::try_from(MAX_RANGE_FRAGMENTS).unwrap() {
                 let start = (10 + 2 * index) * RANGE_UNIT_BYTES;
-                active.extents.insert(start, start + RANGE_UNIT_BYTES);
+                let Check::New(booking) = active.coverage.check(start, RANGE_UNIT_BYTES).unwrap()
+                else {
+                    panic!("a new fragment");
+                };
+                booking.commit();
             }
         }
         let first = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
@@ -834,41 +847,9 @@ mod tests {
             receiver.receive_range(object, 0, &bytes[..unit], &first.proof),
             Err(Error::RangeFragmentsExhausted)
         );
-        {
-            let active = receiver.range_active.get_mut(&object).unwrap();
-            active.extents.remove(&(10 * RANGE_UNIT_BYTES));
-            active
-                .extents
-                .insert(RANGE_UNIT_BYTES, 2 * RANGE_UNIT_BYTES);
-        }
-        receiver
-            .receive_range(object, 0, &bytes[..unit], &first.proof)
-            .unwrap();
         assert_eq!(
-            receiver.range_active[&object].extents.len(),
+            receiver.range_active[&object].coverage.fragment_count(),
             MAX_RANGE_FRAGMENTS
-        );
-        assert_eq!(
-            receiver.range_active[&object].extents[&0],
-            2 * RANGE_UNIT_BYTES
-        );
-        let third =
-            vot_proof_blake3::prove(&bytes, 2 * RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
-        receiver
-            .receive_range(
-                object,
-                2 * RANGE_UNIT_BYTES,
-                &bytes[unit * 2..],
-                &third.proof,
-            )
-            .unwrap();
-        assert_eq!(
-            receiver.range_active[&object].extents.len(),
-            MAX_RANGE_FRAGMENTS
-        );
-        assert_eq!(
-            receiver.range_active[&object].extents[&0],
-            3 * RANGE_UNIT_BYTES
         );
     }
 
@@ -1204,7 +1185,10 @@ mod tests {
         drop(range);
         receiver.admit_written_range(written).unwrap();
         assert_eq!(receiver.advertised_credit(), credit);
-        assert_eq!(receiver.range_active[&subject].bytes, bytes.len() as u64);
+        assert_eq!(
+            receiver.range_active[&subject].coverage.covered_bytes(),
+            bytes.len() as u64
+        );
         receiver.finish_ranges(subject).unwrap();
         assert!(receiver.is_verified(subject));
         assert_eq!(sink.assembled(), bytes);

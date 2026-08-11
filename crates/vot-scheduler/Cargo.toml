@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 blake3.workspace = true
 vot-codec = { path = "../vot-codec" }
+vot-coverage = { path = "../vot-coverage" }
 vot-platform-fs = { path = "../vot-platform-fs" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-session = { path = "../vot-session" }

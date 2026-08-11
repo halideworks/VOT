@@ -38,6 +38,7 @@ PACKAGES = (
     "vot-scheduler",
     "vot-cli",
     "vot-transport-tcp",
+    "vot-resume-core",
     "vot-resume",
     "vot-commit-platform",
     "vot-bench-driver",

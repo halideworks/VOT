@@ -1,0 +1,10 @@
+constant vot_resume_core::units::MAX_UNIT
+enum vot_resume_core::Error
+enum vot_resume_core::units::RunError
+function vot_resume_core::validate_checkpoint_window
+module vot_resume_core::units
+struct vot_resume_core::CheckpointPlan
+struct vot_resume_core::ResumeIdentity
+struct vot_resume_core::ResumeState
+struct vot_resume_core::UnitRanges
+struct vot_resume_core::units::UnitRanges

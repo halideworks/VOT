@@ -2525,9 +2525,14 @@ dependencies = [
  "blake3",
  "fs4",
  "vot-platform-fs",
+ "vot-resume-core",
  "vot-transport-api",
  "vot-transport-tcp",
 ]
+
+[[package]]
+name = "vot-resume-core"
+version = "0.0.1"
 
 [[package]]
 name = "vot-scheduler"

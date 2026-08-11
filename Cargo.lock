@@ -2428,6 +2428,7 @@ dependencies = [
 name = "vot-package"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "vot-manifest",
  "vot-verifier",
 ]

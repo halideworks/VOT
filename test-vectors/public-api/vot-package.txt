@@ -1,5 +1,10 @@
 enum vot_package::Error
 enum vot_package::Storage
+struct vot_package::Encoded
 struct vot_package::EntryRecord
+struct vot_package::ManifestFinalizer
+struct vot_package::PackageAssembly
+struct vot_package::PackageBuilder
 struct vot_package::PackageRootBuilder
 struct vot_package::PackageSummary
+struct vot_package::PageDraft

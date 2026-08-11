@@ -19,6 +19,14 @@ impl TestDirectory {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700).create(&path).unwrap();
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }

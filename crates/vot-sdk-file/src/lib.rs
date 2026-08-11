@@ -617,6 +617,14 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("vot-sdk-file-unit-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+        }
+        #[cfg(not(unix))]
         fs::create_dir(&path).unwrap();
         path
     }

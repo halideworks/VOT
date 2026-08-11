@@ -818,12 +818,15 @@ mod tests {
     }
 
     fn directory(name: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+
         let path = std::env::temp_dir().join(format!(
             "vot-posix-{}-{}-{name}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&path).unwrap();
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&path).unwrap();
         path
     }
 
@@ -1154,11 +1157,14 @@ mod tests {
 
     #[test]
     fn publication_across_directories_removes_the_alias() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
         let directory = directory("cross-directory");
         let staging_directory = directory.join("staging");
         let namespace = directory.join("namespace");
-        fs::create_dir(&staging_directory).unwrap();
-        fs::create_dir(&namespace).unwrap();
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(&staging_directory).unwrap();
+        builder.mode(0o700).create(&namespace).unwrap();
         let mut commit = PosixCommit::create(
             Profile::Balanced,
             [4; 16],

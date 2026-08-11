@@ -272,9 +272,26 @@ fn publish_with(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn directory(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("vot-platform-{}-{name}", std::process::id()))
+        let path = std::env::temp_dir().join(format!(
+            "vot-platform-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&path).unwrap();
+        path
     }
 
     #[derive(Default)]
@@ -424,7 +441,6 @@ mod tests {
     #[test]
     fn macos_balanced_claim_follows_native_commit_operations() {
         let root = directory("macos");
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"verified bytes").unwrap();
@@ -445,7 +461,6 @@ mod tests {
     #[test]
     fn handle_bound_publication_rejects_a_swapped_staging_name() {
         let root = directory("handle-bound-swap");
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let trusted_alias = root.join("trusted-alias");
         let destination = root.join("published");
@@ -474,7 +489,6 @@ mod tests {
     #[test]
     fn native_same_file_identity_is_exact() {
         let root = directory("same-file");
-        fs::create_dir(&root).unwrap();
         let source = root.join("source");
         let linked = root.join("linked");
         let other = root.join("other");
@@ -518,8 +532,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = directory("unsafe-parent");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"verified bytes").unwrap();
@@ -542,7 +554,6 @@ mod tests {
     #[test]
     fn publication_is_no_overwrite_and_profile_checked_first() {
         let root = directory("no-overwrite");
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"new").unwrap();
@@ -852,8 +863,6 @@ mod tests {
     #[test]
     fn native_provider_publishes_at_its_claimed_level() {
         let root = directory("native");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         let destination = root.join("published");
         fs::write(&staging, b"verified bytes").unwrap();

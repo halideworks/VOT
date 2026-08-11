@@ -111,6 +111,39 @@ mod tests {
     use super::*;
     use crate::RANGE_UNIT_BYTES;
 
+    struct TemporaryFile {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl TemporaryFile {
+        fn new(name: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "vot-file-sink-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700).create(&directory).unwrap();
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir(&directory).unwrap();
+
+            let path = directory.join("sink.bin");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TemporaryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
     #[test]
     fn a_file_sink_places_ranges_at_their_offsets() {
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
@@ -118,13 +151,10 @@ mod tests {
         for index in 0..3_u8 {
             bytes.extend(std::iter::repeat_n(index + 1, unit));
         }
-        let path = std::env::temp_dir().join(format!(
-            "vot-file-sink-{}-{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let sink = FileSink::create(&path, bytes.len() as u64).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        let fixture = TemporaryFile::new("ranges");
+        let path = &fixture.path;
+        let sink = FileSink::create(path, bytes.len() as u64).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
         sink.write_at(2 * RANGE_UNIT_BYTES, &bytes[unit * 2..])
             .unwrap();
         sink.write_at(0, &bytes[..unit]).unwrap();
@@ -132,21 +162,17 @@ mod tests {
             .unwrap();
         sink.write_at(0, &bytes[..unit]).unwrap();
         drop(sink);
-        let written = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let written = std::fs::read(path).unwrap();
         assert_eq!(written, bytes);
     }
 
     #[test]
     fn a_resumed_sink_keeps_what_the_last_fetch_placed() {
         let unit = usize::try_from(RANGE_UNIT_BYTES).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "vot-file-sink-resume-{}-{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let fixture = TemporaryFile::new("resume");
+        let path = &fixture.path;
         let length = 3 * RANGE_UNIT_BYTES;
-        let first = FileSink::create(&path, length).unwrap();
+        let first = FileSink::create(path, length).unwrap();
         first.write_at(RANGE_UNIT_BYTES, &vec![0x42; unit]).unwrap();
         drop(first);
 
@@ -154,11 +180,10 @@ mod tests {
             FileSink::resume(std::path::Path::new("/vot-missing/none"), length).is_err(),
             "resume opens what exists, never invents it"
         );
-        let resumed = FileSink::resume(&path, length).unwrap();
+        let resumed = FileSink::resume(path, length).unwrap();
         resumed.write_at(0, &vec![0x41; unit]).unwrap();
         drop(resumed);
-        let written = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let written = std::fs::read(path).unwrap();
         assert_eq!(written.len() as u64, length, "sized on reopen");
         assert!(
             written[unit..unit * 2].iter().all(|byte| *byte == 0x42),

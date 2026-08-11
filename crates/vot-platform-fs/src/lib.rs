@@ -593,12 +593,24 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn directory(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("vot-platform-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
     #[test]
     fn replacement_overwrites_existing_file_atomically() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-fs-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("fs");
         let source = directory.join("source");
         let destination = directory.join("destination");
         fs::write(&source, b"new").unwrap();
@@ -612,10 +624,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn regular_identity_rejects_symlinks_and_other_files() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-identity-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("identity");
         let source = directory.join("source");
         let linked = directory.join("linked");
         let other = directory.join("other");
@@ -636,10 +645,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn handle_identity_survives_a_swapped_name() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-handle-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("handle");
         let path = directory.join("held");
         let alias = directory.join("alias");
         fs::write(&path, b"trusted").unwrap();
@@ -658,10 +664,7 @@ mod tests {
 
     #[test]
     fn retained_handle_removes_only_its_own_name() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-remove-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("remove");
         let path = directory.join("held");
         let published = directory.join("published");
         let file = create_staging_file(&path).unwrap();
@@ -677,10 +680,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn retained_windows_staging_handle_denies_namespace_swaps() {
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-guard-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("guard");
         let path = directory.join("held");
         let renamed = directory.join("renamed");
         let file = create_staging_file(&path).unwrap();
@@ -697,10 +697,7 @@ mod tests {
     fn removal_refuses_a_parent_writable_by_other_users() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-parent-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("parent");
         let path = directory.join("held");
         let file = create_staging_file(&path).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
@@ -720,10 +717,7 @@ mod tests {
     fn removal_parent_must_be_a_directory() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let directory =
-            std::env::temp_dir().join(format!("vot-platform-parent-file-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
+        let directory = directory("parent-file");
         let parent = directory.join("not-a-directory");
         fs::write(&parent, b"not a directory").unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o600)).unwrap();

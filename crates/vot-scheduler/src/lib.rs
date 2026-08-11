@@ -10,10 +10,10 @@ use vot_transport_api::{ConnectionId, PathStats, StagingCapacity, SubjectId, Tra
 pub mod session;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
-/// Range granularity a proof covers, from spec/proofs.md.
-pub const RANGE_UNIT_BYTES: u64 = 65_536;
 /// Max bytes one proof-bearing range may cover. Also sizes receiver staging.
-pub const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
+pub const MAX_PROOF_RANGE_BYTES: u64 = vot_verified_range::MAX_PROOF_RANGE_BYTES;
+/// Range granularity a proof covers, from spec/proofs.md.
+pub const RANGE_UNIT_BYTES: u64 = vot_verified_range::RANGE_UNIT_BYTES;
 
 const VERIFIER_RESERVATION: u64 = GROUP_SIZE as u64;
 
@@ -61,7 +61,10 @@ mod sink;
 use coverage::MAX_RANGE_FRAGMENTS;
 use coverage::RangeState;
 pub use planner::*;
-use proof::{assemble_ordered, check_range_proof, suite, validate_typed_bundle};
+use proof::{
+    assemble_ordered, check_range_proof, subject_id, suite, validate_typed_bundle,
+    verify_typed_bundle,
+};
 pub use receiver::*;
 pub use sink::*;
 
@@ -1115,6 +1118,10 @@ mod tests {
         .expect("a verified range");
         assert_eq!(range.len(), bytes.len() as u64);
         assert!(!range.is_empty());
+        assert_eq!(
+            format!("{range:?}"),
+            format!("VerifiedRange {{ subject: {subject:?}, covered_offset: 0, data: {bytes:?} }}")
+        );
 
         let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;
         let mut receiver =

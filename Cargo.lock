@@ -2541,6 +2541,7 @@ dependencies = [
  "vot-session",
  "vot-transport-api",
  "vot-transport-sim",
+ "vot-verified-range",
  "vot-verifier",
 ]
 
@@ -2626,6 +2627,16 @@ dependencies = [
  "vot-codec",
  "vot-transport-api",
  "vot-transport-queue",
+]
+
+[[package]]
+name = "vot-verified-range"
+version = "0.0.1"
+dependencies = [
+ "vot-codec",
+ "vot-proof-blake3",
+ "vot-proof-sha256",
+ "vot-verifier",
 ]
 
 [[package]]

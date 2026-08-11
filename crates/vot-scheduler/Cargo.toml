@@ -11,13 +11,14 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
-vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-codec = { path = "../vot-codec" }
-vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-platform-fs = { path = "../vot-platform-fs" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-session = { path = "../vot-session" }
 vot-verifier = { path = "../vot-verifier" }
+vot-verified-range = { path = "../vot-verified-range" }
 
 [dev-dependencies]
+vot-proof-blake3 = { path = "../vot-proof-blake3" }
+vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-transport-sim = { path = "../vot-transport-sim" }

@@ -76,3 +76,7 @@ jobs:
 
       - name: Test native storage adapters
         run: cargo +1.88.0 test -p vot-proof-store-file -p vot-sdk-file --locked
+
+      - name: Test strict unsupported path
+        if: runner.os == 'macOS'
+        run: cargo +1.88.0 test -p vot-commit-strict --locked

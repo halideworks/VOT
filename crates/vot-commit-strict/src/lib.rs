@@ -79,7 +79,13 @@ impl LinuxDirectReader {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Self::open_unsupported(path, logical_length, alignment)
+            let _ = path;
+            Ok(Self {
+                backend: DirectBackend::Unsupported,
+                logical_length,
+                alignment,
+                buffer_size: checked_buffer_size(alignment)?,
+            })
         }
     }
 
@@ -121,20 +127,6 @@ impl LinuxDirectReader {
                 CapabilityFailure::Hard(error) => Err(error),
             },
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn open_unsupported(
-        _path: &Path,
-        logical_length: u64,
-        alignment: usize,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            backend: DirectBackend::Unsupported,
-            logical_length,
-            alignment,
-            buffer_size: checked_buffer_size(alignment)?,
-        })
     }
 
     /// Confirms that the direct descriptor and the staged descriptor name the same object.

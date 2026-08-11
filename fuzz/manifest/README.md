@@ -1,9 +1,13 @@
 # Manifest fuzz driver
 
-`vot_manifest_fuzz_driver::exercise` invokes the bounded canonical decoder with
-a 256 MiB allocation ceiling. A successful decode must re-encode to the exact
-input bytes. Parse errors are expected. A panic, abort, excessive allocation, or
-hang is a failure.
+`vot_manifest_fuzz_driver::exercise` invokes the bounded canonical decoder and
+a structured sealed-package ingest state machine with a 256 MiB allocation
+ceiling. A successful page decode must re-encode to the exact input bytes. The
+ten stateful cases cover valid, missing, extra, reordered, uncommitted,
+chain-invalid, and hostile raw pages; partial-entry poisoning; expected identity
+mismatch; and provisional pages whose final transcript does not match that
+identity. Raw input also exercises both sealed-package constructors. Parse errors
+are expected. A panic, abort, excessive allocation, or hang is a failure.
 
 Two gates share that function, so they cannot drift apart.
 

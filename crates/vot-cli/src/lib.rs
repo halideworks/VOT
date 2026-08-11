@@ -16,7 +16,8 @@ use vot_manifest::{EntryKind, ObjectId, StorageRef, encode_page, encode_seal};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 pub use vot_package::PackageSummary;
 pub(crate) use vot_package::{
-    EntryRecord, PackageAssembly, PackageBuilder, PackageRootBuilder, PageDraft, Storage,
+    EntryRecord, PackageAssembly, PackageBuilder, PackageIngest, PackageRootBuilder, PageDraft,
+    Storage,
 };
 use vot_receipt::{
     AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
@@ -132,6 +133,7 @@ impl From<vot_package::Error> for Error {
         match error {
             vot_package::Error::InvalidPath => Self::InvalidPath,
             vot_package::Error::InvalidBundle => Self::InvalidBundle,
+            vot_package::Error::RootMismatch => Self::RootMismatch,
             vot_package::Error::Verifier(error) => Self::Verifier(error),
         }
     }

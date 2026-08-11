@@ -1,3 +1,7 @@
+constant vot_commit_object::MAX_EXTERNAL_KEY_BYTES
+constant vot_commit_object::MAX_EXTERNAL_PARTS
 enum vot_commit_object::Error
+enum vot_commit_object::ExternalError
+struct vot_commit_object::ExternalObjectCommit
 struct vot_commit_object::ObjectCommit
 struct vot_commit_object::Receipt

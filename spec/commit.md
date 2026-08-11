@@ -171,6 +171,12 @@ Multipart completion, metadata observation, and full readback are distinct
 operations. Metadata observation MUST NOT read the object body, and neither
 metadata nor completion alone is at-rest verification evidence.
 
+A host-authenticated external mover MAY provide a bounded canonical part list
+and typed completion and readback evidence. VOT validates that evidence against
+one object expectation but does not receive payload bytes, credentials, or
+provider-specific authentication state. Without readback evidence, a Strict
+external commit stops at `DURABLE` and MUST NOT publish.
+
 Multipart mismatch, failed completion, or ambiguous timeout enters poisoning or
 recovery as declared by whether prior state can be proven. Active authenticated
 leases prevent orphan collection during recovery.

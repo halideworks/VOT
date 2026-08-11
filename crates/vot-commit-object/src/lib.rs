@@ -6,8 +6,14 @@ use std::collections::BTreeMap;
 
 use vot_commit_model::{Assurance, Event, Machine, Profile, State};
 use vot_object_store::{
-    CompletedObject, Error as StoreError, MultipartObjectStore, ObjectExpectation, PartReceipt,
+    CompletedObject, Error as StoreError, MultipartCompleted, MultipartObjectStore,
+    ObjectExpectation, PartReceipt, ReadbackVerified,
 };
+
+/// Maximum number of external multipart receipts accepted in one object.
+pub const MAX_EXTERNAL_PARTS: usize = 10_000;
+/// Maximum external object-key length, in bytes.
+pub const MAX_EXTERNAL_KEY_BYTES: usize = 1_024;
 
 #[derive(Debug)]
 pub enum Error {
@@ -15,6 +21,19 @@ pub enum Error {
     Model(vot_commit_model::Error),
     ChecksumMismatch,
     MissingObservation,
+}
+
+#[derive(Debug)]
+pub enum ExternalError {
+    Commit(Error),
+    TooManyParts,
+    KeyTooLong,
+}
+
+impl From<Error> for ExternalError {
+    fn from(error: Error) -> Self {
+        Self::Commit(error)
+    }
 }
 
 impl From<StoreError> for Error {
@@ -37,6 +56,80 @@ pub struct Receipt {
     pub checksum_crc32c: u32,
 }
 
+/// A Strict object commit driven only by evidence from an external mover.
+///
+/// The part payloads, store credentials, and provider operations remain owned
+/// by the host. This value retains only their bounded aggregate expectation.
+/// The caller must authenticate evidence provenance and reject stale or
+/// cross-instance replay before calling `accept_completion` or
+/// `accept_verification`. The machine enforces ordering and replay only within
+/// one `ExternalObjectCommit` value.
+pub struct ExternalObjectCommit {
+    machine: Machine,
+    expectation: ObjectExpectation,
+}
+
+impl ExternalObjectCommit {
+    /// Validates canonical external part receipts without retaining their list.
+    pub fn from_parts(key: &str, parts: &[PartReceipt]) -> Result<Self, ExternalError> {
+        if key.len() > MAX_EXTERNAL_KEY_BYTES {
+            return Err(ExternalError::KeyTooLong);
+        }
+        if parts.len() > MAX_EXTERNAL_PARTS {
+            return Err(ExternalError::TooManyParts);
+        }
+        let expectation = ObjectExpectation::from_parts(key, parts).map_err(Error::from)?;
+        Ok(Self {
+            machine: admitted_strict_machine()?,
+            expectation,
+        })
+    }
+
+    #[must_use]
+    pub const fn expectation(&self) -> &ObjectExpectation {
+        &self.expectation
+    }
+
+    /// Accepts matching completion evidence and stops at Durable.
+    pub fn accept_completion(
+        &mut self,
+        completed: &MultipartCompleted,
+    ) -> Result<Assurance, ExternalError> {
+        if self.machine.state() != State::Admitted {
+            return Err(Error::Model(vot_commit_model::Error::InvalidTransition).into());
+        }
+        let assurance = advance_to_durable(&mut self.machine)?;
+        if let Err(error) = validate_completion(completed, &self.expectation) {
+            poison_at_rest(&mut self.machine)?;
+            return Err(Error::Store(error).into());
+        }
+        Ok(assurance)
+    }
+
+    /// Accepts matching full-readback evidence and publishes the Strict receipt.
+    pub fn accept_verification(
+        &mut self,
+        verified: ReadbackVerified,
+    ) -> Result<(CompletedObject, Receipt), ExternalError> {
+        if self.machine.state() != State::Durable {
+            return Err(Error::Model(vot_commit_model::Error::InvalidTransition).into());
+        }
+        let object = match validate_readback(verified, &self.expectation) {
+            Ok(object) => object,
+            Err(error) => {
+                poison_at_rest(&mut self.machine)?;
+                return Err(Error::Store(error).into());
+            }
+        };
+        publish_verified(&mut self.machine, self.expectation.key(), object).map_err(Into::into)
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> State {
+        self.machine.state()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionState {
     Pending,
@@ -57,11 +150,9 @@ pub struct ObjectCommit<S> {
 impl<S: MultipartObjectStore> ObjectCommit<S> {
     pub fn create(mut store: S, key: &str, now: u64) -> Result<Self, Error> {
         let upload_id = store.create_multipart(key, now)?;
-        let mut machine = Machine::new(Profile::Strict);
-        machine.apply(Event::Admit)?;
         Ok(Self {
             store,
-            machine,
+            machine: admitted_strict_machine()?,
             upload_id,
             key: key.to_owned(),
             parts: BTreeMap::new(),
@@ -99,9 +190,7 @@ impl<S: MultipartObjectStore> ObjectCommit<S> {
             .ok_or(Error::Store(StoreError::CompletionMismatch))?;
         match self.machine.state() {
             State::Admitted => {
-                self.machine.apply(Event::TransitVerified)?;
-                self.machine.apply(Event::DataFlushSucceeded)?;
-                self.machine.apply(Event::JournalFlushSucceeded)?;
+                advance_to_durable(&mut self.machine)?;
             }
             State::RecoveryRequired => {
                 self.machine.apply(Event::Recover)?;
@@ -120,7 +209,7 @@ impl<S: MultipartObjectStore> ObjectCommit<S> {
 
         if self.completion != CompletionState::Confirmed {
             match self.store.complete_multipart(&self.upload_id, &parts) {
-                Ok(completed) if expectations_match(completed.expectation(), &expected) => {
+                Ok(completed) if validate_completion(&completed, &expected).is_ok() => {
                     self.completion = CompletionState::Confirmed;
                 }
                 Ok(_) => {
@@ -149,12 +238,7 @@ impl<S: MultipartObjectStore> ObjectCommit<S> {
         &self,
         expected: &ObjectExpectation,
     ) -> Result<CompletedObject, StoreError> {
-        let object = self.store.verify_by_readback(expected)?.into_object();
-        if object_matches(&object, expected) {
-            Ok(object)
-        } else {
-            Err(StoreError::ChecksumMismatch)
-        }
+        validate_readback(self.store.verify_by_readback(expected)?, expected)
     }
 
     fn require_recovery<T>(&mut self) -> Result<T, Error> {
@@ -163,26 +247,15 @@ impl<S: MultipartObjectStore> ObjectCommit<S> {
     }
 
     fn fail_at_rest<T>(&mut self, error: StoreError) -> Result<T, Error> {
-        self.machine.apply(Event::AtRestVerificationFailed)?;
+        poison_at_rest(&mut self.machine)?;
         self.store.release_multipart(&self.upload_id);
         Err(Error::Store(error))
     }
 
     fn publish(&mut self, object: CompletedObject) -> Result<(CompletedObject, Receipt), Error> {
-        self.machine.apply(Event::AtRestVerified)?;
-        self.machine.apply(Event::NamespaceLinked)?;
-        let observation = self
-            .machine
-            .apply(Event::NamespaceDurable)?
-            .ok_or(Error::MissingObservation)?;
-        let receipt = Receipt {
-            assurance: observation.level,
-            sequence: observation.sequence,
-            key: self.key.clone(),
-            checksum_crc32c: object.checksum_crc32c,
-        };
+        let published = publish_verified(&mut self.machine, &self.key, object)?;
         self.store.release_multipart(&self.upload_id);
-        Ok((object, receipt))
+        Ok(published)
     }
 
     #[must_use]
@@ -201,10 +274,70 @@ impl<S: MultipartObjectStore> ObjectCommit<S> {
     }
 }
 
-fn expectations_match(actual: &ObjectExpectation, expected: &ObjectExpectation) -> bool {
-    actual.key() == expected.key()
+fn admitted_strict_machine() -> Result<Machine, Error> {
+    let mut machine = Machine::new(Profile::Strict);
+    machine.apply(Event::Admit)?;
+    Ok(machine)
+}
+
+fn advance_to_durable(machine: &mut Machine) -> Result<Assurance, Error> {
+    machine.apply(Event::TransitVerified)?;
+    machine.apply(Event::DataFlushSucceeded)?;
+    let observation = machine
+        .apply(Event::JournalFlushSucceeded)?
+        .ok_or(Error::MissingObservation)?;
+    Ok(observation.level)
+}
+
+fn validate_completion(
+    completed: &MultipartCompleted,
+    expected: &ObjectExpectation,
+) -> Result<(), StoreError> {
+    let actual = completed.expectation();
+    if actual.key() == expected.key()
         && actual.length() == expected.length()
         && actual.checksum_crc32c() == expected.checksum_crc32c()
+    {
+        Ok(())
+    } else {
+        Err(StoreError::CompletionMismatch)
+    }
+}
+
+fn validate_readback(
+    verified: ReadbackVerified,
+    expected: &ObjectExpectation,
+) -> Result<CompletedObject, StoreError> {
+    let object = verified.into_object();
+    if object_matches(&object, expected) {
+        Ok(object)
+    } else {
+        Err(StoreError::ChecksumMismatch)
+    }
+}
+
+fn poison_at_rest(machine: &mut Machine) -> Result<(), Error> {
+    machine.apply(Event::AtRestVerificationFailed)?;
+    Ok(())
+}
+
+fn publish_verified(
+    machine: &mut Machine,
+    key: &str,
+    object: CompletedObject,
+) -> Result<(CompletedObject, Receipt), Error> {
+    machine.apply(Event::AtRestVerified)?;
+    machine.apply(Event::NamespaceLinked)?;
+    let observation = machine
+        .apply(Event::NamespaceDurable)?
+        .ok_or(Error::MissingObservation)?;
+    let receipt = Receipt {
+        assurance: observation.level,
+        sequence: observation.sequence,
+        key: key.to_owned(),
+        checksum_crc32c: object.checksum_crc32c,
+    };
+    Ok((object, receipt))
 }
 
 fn object_matches(actual: &CompletedObject, expected: &ObjectExpectation) -> bool {
@@ -363,6 +496,37 @@ mod tests {
         object
     }
 
+    fn external_parts() -> [PartReceipt; 2] {
+        [
+            PartReceipt {
+                number: 1,
+                checksum_crc32c: vot_journal::crc32c(b"one"),
+                length: 3,
+            },
+            PartReceipt {
+                number: 2,
+                checksum_crc32c: vot_journal::crc32c(b"two"),
+                length: 3,
+            },
+        ]
+    }
+
+    fn external_evidence(
+        key: &str,
+        parts: &[PartReceipt],
+    ) -> (MultipartCompleted, ReadbackVerified) {
+        let expectation = ObjectExpectation::from_parts(key, parts).unwrap();
+        let object = CompletedObject {
+            key: key.to_owned(),
+            length: expectation.length(),
+            checksum_crc32c: expectation.checksum_crc32c(),
+        };
+        (
+            MultipartCompleted::new(expectation),
+            ReadbackVerified::new(object),
+        )
+    }
+
     #[test]
     fn backend_checksum_precedes_strict_publication() {
         let mut commit = ObjectCommit::create(MockStore::default(), "object", 0).unwrap();
@@ -374,6 +538,168 @@ mod tests {
             commit.store().stat_object("object"),
             Ok(Some(vot_object_store::ObjectMetadata::new(object.length)))
         );
+    }
+
+    #[test]
+    fn external_evidence_matches_the_direct_strict_receipt() {
+        let mut direct = ObjectCommit::create(MockStore::default(), "object", 0).unwrap();
+        direct.upload_verified_part(1, b"one").unwrap();
+        direct.upload_verified_part(2, b"two").unwrap();
+        let direct_result = direct.complete().unwrap();
+
+        let parts = external_parts();
+        let (completed, verified) = external_evidence("object", &parts);
+        let mut external = ExternalObjectCommit::from_parts("object", &parts).unwrap();
+        assert!(matches!(
+            external.accept_completion(&completed),
+            Ok(Assurance::Durable)
+        ));
+        let external_result = external.accept_verification(verified).unwrap();
+        assert_eq!(external_result, direct_result);
+        assert_eq!(external.state(), State::Published);
+    }
+
+    #[test]
+    fn completion_without_readback_stops_at_durable() {
+        let parts = external_parts();
+        let (completed, _) = external_evidence("object", &parts);
+        let mut external = ExternalObjectCommit::from_parts("object", &parts).unwrap();
+        assert!(matches!(
+            external.accept_completion(&completed),
+            Ok(Assurance::Durable)
+        ));
+        assert_eq!(external.state(), State::Durable);
+        assert!(matches!(
+            external.accept_completion(&completed),
+            Err(ExternalError::Commit(Error::Model(
+                vot_commit_model::Error::InvalidTransition
+            )))
+        ));
+        assert_eq!(external.state(), State::Durable);
+    }
+
+    #[test]
+    fn external_machine_enforces_order_and_same_instance_replay() {
+        let parts = external_parts();
+        let (completed, verified) = external_evidence("object", &parts);
+        let mut external = ExternalObjectCommit::from_parts("object", &parts).unwrap();
+        assert!(matches!(
+            external.accept_verification(verified.clone()),
+            Err(ExternalError::Commit(Error::Model(
+                vot_commit_model::Error::InvalidTransition
+            )))
+        ));
+        assert_eq!(external.state(), State::Admitted);
+        external.accept_completion(&completed).unwrap();
+        external.accept_verification(verified.clone()).unwrap();
+        assert!(matches!(
+            external.accept_verification(verified),
+            Err(ExternalError::Commit(Error::Model(
+                vot_commit_model::Error::InvalidTransition
+            )))
+        ));
+        assert_eq!(external.state(), State::Published);
+    }
+
+    #[test]
+    fn external_part_evidence_is_canonical_and_bounded() {
+        let receipt = |number, length| PartReceipt {
+            number,
+            checksum_crc32c: vot_journal::CRC32C_EMPTY,
+            length,
+        };
+        for invalid in [
+            vec![],
+            vec![receipt(2, 0)],
+            vec![receipt(1, 0), receipt(3, 0)],
+            vec![receipt(1, 0), receipt(1, 0)],
+            vec![receipt(2, 0), receipt(1, 0)],
+            vec![receipt(1, u64::MAX), receipt(2, 1)],
+        ] {
+            assert!(matches!(
+                ExternalObjectCommit::from_parts("object", &invalid),
+                Err(ExternalError::Commit(Error::Store(
+                    StoreError::CompletionMismatch
+                )))
+            ));
+        }
+
+        let maximum: Vec<_> = (1..=MAX_EXTERNAL_PARTS)
+            .map(|number| receipt(u32::try_from(number).unwrap(), 0))
+            .collect();
+        assert!(ExternalObjectCommit::from_parts("object", &maximum).is_ok());
+
+        let too_many = vec![receipt(0, 0); MAX_EXTERNAL_PARTS + 1];
+        assert!(matches!(
+            ExternalObjectCommit::from_parts("object", &too_many),
+            Err(ExternalError::TooManyParts)
+        ));
+    }
+
+    #[test]
+    fn external_key_bound_precedes_validation_and_cloning() {
+        let receipt = PartReceipt {
+            number: 1,
+            checksum_crc32c: vot_journal::CRC32C_EMPTY,
+            length: 0,
+        };
+        let maximum = "k".repeat(MAX_EXTERNAL_KEY_BYTES);
+        assert!(ExternalObjectCommit::from_parts(&maximum, std::slice::from_ref(&receipt)).is_ok());
+
+        let too_long = "k".repeat(MAX_EXTERNAL_KEY_BYTES + 1);
+        assert!(matches!(
+            ExternalObjectCommit::from_parts(&too_long, &[]),
+            Err(ExternalError::KeyTooLong)
+        ));
+    }
+
+    #[test]
+    fn external_completion_is_validated_field_by_field() {
+        let parts = external_parts();
+        let (completed, _) = external_evidence("object", &parts);
+        for fault in [
+            EvidenceFault::Key,
+            EvidenceFault::Length,
+            EvidenceFault::Checksum,
+        ] {
+            let mut external = ExternalObjectCommit::from_parts("object", &parts).unwrap();
+            assert!(matches!(
+                external.accept_completion(&faulty_completion(&completed, fault)),
+                Err(ExternalError::Commit(Error::Store(
+                    StoreError::CompletionMismatch
+                )))
+            ));
+            assert_eq!(external.state(), State::Poisoned, "{fault:?}");
+            assert!(external.accept_completion(&completed).is_err(), "{fault:?}");
+            assert_eq!(external.state(), State::Poisoned, "{fault:?}");
+        }
+    }
+
+    #[test]
+    fn external_readback_is_validated_field_by_field() {
+        let parts = external_parts();
+        let (completed, verified) = external_evidence("object", &parts);
+        for fault in [
+            EvidenceFault::Key,
+            EvidenceFault::Length,
+            EvidenceFault::Checksum,
+        ] {
+            let mut external = ExternalObjectCommit::from_parts("object", &parts).unwrap();
+            external.accept_completion(&completed).unwrap();
+            let faulty = ReadbackVerified::new(faulty_object(verified.object().clone(), fault));
+            assert!(matches!(
+                external.accept_verification(faulty),
+                Err(ExternalError::Commit(Error::Store(
+                    StoreError::ChecksumMismatch
+                )))
+            ));
+            assert_eq!(external.state(), State::Poisoned, "{fault:?}");
+            assert!(
+                external.accept_verification(verified.clone()).is_err(),
+                "{fault:?}"
+            );
+            assert_eq!(external.state(), State::Poisoned, "{fault:?}");
+        }
     }
 
     #[test]

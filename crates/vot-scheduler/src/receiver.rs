@@ -3,7 +3,8 @@
 use super::{
     BTreeMap, BTreeSet, ConnectionId, Error, PathStats, RangeSink, RangeState, SinkError,
     StagingCapacity, StreamVerifier, SubjectId, TransportAck, VERIFIER_RESERVATION,
-    assemble_ordered, check_range_proof, suite, validate_typed_bundle,
+    assemble_ordered, check_range_proof, subject_id, suite, validate_typed_bundle,
+    verify_typed_bundle,
 };
 
 pub(super) struct ActiveObject {
@@ -245,13 +246,8 @@ impl ReliableReceiver {
         bundle: &vot_codec::frames::ProofBundle,
         records: &[vot_codec::frames::DataRecord],
     ) -> Result<VerifiedRange, Error> {
-        let ordered = validate_typed_bundle(subject, bundle, records)?;
-        let data = assemble_ordered(bundle, &ordered)?;
-        check_range_proof(subject, bundle.covered_offset, &data, &bundle.proof)?;
         Ok(VerifiedRange {
-            subject,
-            covered_offset: bundle.covered_offset,
-            data,
+            inner: verify_typed_bundle(subject, bundle, records)?,
         })
     }
 
@@ -265,7 +261,12 @@ impl ReliableReceiver {
         reason = "admission spends the witness; handing it back would invite re-admitting it"
     )]
     pub fn admit_verified_range(&mut self, range: VerifiedRange) -> Result<(), Error> {
-        self.insert_checked_range(range.subject, range.covered_offset, &range.data, false)
+        self.insert_checked_range(
+            subject_id(range.inner.object()),
+            range.inner.covered_offset(),
+            range.inner.data(),
+            false,
+        )
     }
 
     /// Accepts a decoded proof bundle whose records may arrive out of order.
@@ -283,13 +284,13 @@ impl ReliableReceiver {
         bundle: &vot_codec::frames::ProofBundle,
         records: &[vot_codec::frames::DataRecord],
     ) -> Result<(), Error> {
-        let ordered = validate_typed_bundle(subject, bundle, records)?;
-        let covered_bytes = bundle.covered_length;
+        let validated = validate_typed_bundle(subject, bundle, records)?;
+        let covered_bytes = validated.covered_length();
         // Released after reassembly and sink write; bytes live in the sink now.
         self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         let result = (|| {
-            let data = assemble_ordered(bundle, &ordered)?;
+            let data = assemble_ordered(validated)?;
             self.receive_verified_range(subject, bundle.covered_offset, &data, &bundle.proof, true)
         })();
         self.staging.release(covered_bytes);
@@ -434,24 +435,32 @@ impl ReliableReceiver {
 
 /// A range whose proof has held. Only [`ReliableReceiver::verify_typed_bundle`]
 /// builds one; holding it is holding the verification.
-#[derive(Debug)]
 pub struct VerifiedRange {
-    pub(super) subject: SubjectId,
-    pub(super) covered_offset: u64,
-    pub(super) data: Vec<u8>,
+    inner: vot_verified_range::VerifiedRange,
+}
+
+impl std::fmt::Debug for VerifiedRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedRange")
+            .field("subject", &subject_id(self.inner.object()))
+            .field("covered_offset", &self.inner.covered_offset())
+            .field("data", &self.inner.data())
+            .finish()
+    }
 }
 
 impl VerifiedRange {
     /// The verified bytes this range carries.
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.inner.data().len() as u64
     }
 
     /// Whether the range carries nothing, which verification never produces.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.inner.data().is_empty()
     }
 
     /// Places the verified bytes and returns the witness admission takes.
@@ -459,11 +468,11 @@ impl VerifiedRange {
     /// # Errors
     /// Surfaces the sink's refusal; this witness stays usable for a retry.
     pub fn write_to(&self, sink: &dyn RangeSink) -> Result<WrittenRange, SinkError> {
-        sink.write_at(self.covered_offset, &self.data)?;
+        sink.write_at(self.inner.covered_offset(), self.inner.data())?;
         Ok(WrittenRange {
-            subject: self.subject,
-            covered_offset: self.covered_offset,
-            bytes: self.data.len() as u64,
+            subject: subject_id(self.inner.object()),
+            covered_offset: self.inner.covered_offset(),
+            bytes: self.inner.data().len() as u64,
         })
     }
 }

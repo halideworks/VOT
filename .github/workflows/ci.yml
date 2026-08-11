@@ -264,7 +264,29 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.validate-cache.outputs.cache-primary-key }}
+  pure-wasm:
+    name: pure wasm (${{ matrix.package }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - vot-verified-range
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.88.0 --profile minimal
+          --target wasm32-unknown-unknown
+
+      - name: Check pure crate
+        run: >-
+          cargo +1.88.0 check --package "${{ matrix.package }}"
+          --target wasm32-unknown-unknown --locked
 
   # The importable public surface of every crate against its committed
   # snapshot, so a module-split refactor cannot drop or move a public item

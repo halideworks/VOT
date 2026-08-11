@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use vot_manifest::{
-    Component, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment, PathProfile,
-    Seal, canonical_path_key, decode_page, decode_seal, encode_page, encode_seal,
+    Component, ManifestEntry, ManifestPage, PackagePath, PageCommitment, PathProfile, Seal,
+    canonical_path_key, decode_page, decode_seal,
 };
 #[cfg(test)]
-use vot_manifest::{EntryKind, StorageRef};
+use vot_manifest::{EntryKind, ObjectId, StorageRef, encode_page, encode_seal};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 pub use vot_package::PackageSummary;
-pub(crate) use vot_package::{EntryRecord, PackageRootBuilder, Storage};
+pub(crate) use vot_package::{
+    EntryRecord, PackageAssembly, PackageBuilder, PackageRootBuilder, PageDraft, Storage,
+};
 use vot_receipt::{
     AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
     authenticate_hmac_sha256, decode_authenticated, encode_authenticated, sign_ed25519,
@@ -2270,13 +2272,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_page_bounds_and_envelope_checks_are_exact() {
-        assert!(!page_needs_flush(0, vot_manifest::MAX_PAGE_BYTES, 1).unwrap());
-        assert!(page_needs_flush(vot_manifest::MAX_ENTRIES_PER_PAGE, 0, 1).unwrap());
-        assert!(!page_needs_flush(1, vot_manifest::MAX_PAGE_BYTES - 1, 1).unwrap());
-        assert!(page_needs_flush(1, vot_manifest::MAX_PAGE_BYTES, 1).unwrap());
-        assert!(page_needs_flush(1, usize::MAX, 1).is_err());
-
+    fn manifest_envelope_checks_are_exact() {
         let mut page = ManifestPage {
             manifest_id: [1; 16],
             index: 0,

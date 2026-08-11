@@ -2,11 +2,10 @@
 
 use crate::{
     CANDIDATE_MAX, Component, DEFAULT_LOGICAL_SUITE, EntryRecord, Error, File, LogicalFile,
-    MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_DATA_RECORD_BYTES, ManifestEntry, ManifestPage,
-    ObjectId, OpenOptions, Pack, PackagePath, PackageRootBuilder, PackageSummary, PageCommitment,
-    Path, PathBuf, PathProfile, Read, Seal, Storage, StreamVerifier, StreamingPacker, Suite, Write,
-    canonical_path_key, decode_page, encode_page, encode_seal, file_matches_bytes, fs,
-    manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
+    MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_DATA_RECORD_BYTES, OpenOptions, Pack, PackageAssembly,
+    PackageBuilder, PackagePath, PackageSummary, PageDraft, Path, PathBuf, PathProfile, Read,
+    Storage, StreamVerifier, StreamingPacker, Suite, Write, canonical_path_key, file_matches_bytes,
+    fs, manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
     write_new_synced,
 };
 
@@ -19,8 +18,6 @@ pub(crate) struct SourceFile {
 
 pub(crate) struct ManifestSpool {
     pub(crate) directory: PathBuf,
-    pub(crate) entries: Vec<ManifestEntry>,
-    pub(crate) estimated_bytes: usize,
     pub(crate) page_count: u64,
 }
 
@@ -30,114 +27,45 @@ impl ManifestSpool {
         fs::create_dir(&directory)?;
         Ok(Self {
             directory,
-            entries: Vec::new(),
-            estimated_bytes: 0,
             page_count: 0,
         })
     }
 
-    pub(crate) fn push(&mut self, entry: ManifestEntry) -> Result<(), Error> {
-        let encoded_entry = encode_page(&ManifestPage {
-            manifest_id: [0; 16],
-            index: 0,
-            total: None,
-            previous_digest: [0; 32],
-            profile: PathProfile::Portable,
-            entries: vec![entry.clone()],
-        })
-        .map_err(|_| Error::InvalidBundle)?
-        .len();
-        if page_needs_flush(self.entries.len(), self.estimated_bytes, encoded_entry)? {
-            self.flush_placeholder()?;
-        }
-        self.entries.push(entry);
-        self.estimated_bytes = self
-            .estimated_bytes
-            .checked_add(encoded_entry)
-            .ok_or(Error::InvalidBundle)?;
-        Ok(())
-    }
-
-    pub(crate) fn finish(mut self, package: PackageSummary) -> Result<(), Error> {
-        self.flush_placeholder()?;
-        if self.page_count == 0 {
+    pub(crate) fn push(&mut self, draft: &PageDraft) -> Result<(), Error> {
+        if draft.index() != self.page_count {
             return Err(Error::InvalidBundle);
         }
-        let mut manifest_id = [0; 16];
-        manifest_id.copy_from_slice(&package.root[..16]);
-        let mut previous_digest = [0; 32];
-        let mut pages =
-            Vec::with_capacity(usize::try_from(self.page_count).map_err(|_| Error::InvalidBundle)?);
-        for index in 0..self.page_count {
-            let spool = manifest_spool_path(&self.directory, index);
-            let encoded = read_bounded_file(&spool, vot_manifest::MAX_PAGE_BYTES)?;
-            let mut page = decode_page(&encoded).map_err(|_| Error::InvalidBundle)?;
-            page.manifest_id = manifest_id;
-            page.index = index;
-            page.total = None;
-            page.previous_digest = previous_digest;
-            let encoded = encode_page(&page).map_err(|_| Error::InvalidBundle)?;
-            let digest = *blake3::hash(&encoded).as_bytes();
-            write_new_synced(&manifest_page_path(&self.directory, index), &encoded)?;
-            fs::remove_file(spool)?;
-            pages.push(PageCommitment { index, digest });
-            previous_digest = digest;
-        }
-        let seal = Seal {
-            manifest_id,
-            final_page_count: self.page_count,
-            final_page_digest: previous_digest,
-            package: ObjectId {
-                suite: 1,
-                root: package.root,
-                length: package.logical_length,
-            },
-            pages,
-        };
-        let encoded = encode_seal(&seal).map_err(|_| Error::InvalidBundle)?;
-        write_new_synced(&self.directory.join(MANIFEST_SEAL), &encoded)?;
-        sync_directory(&self.directory)?;
-        Ok(())
-    }
-
-    pub(crate) fn flush_placeholder(&mut self) -> Result<(), Error> {
-        if self.entries.is_empty() {
-            return Ok(());
-        }
-        let page = self.placeholder_page();
-        let encoded = encode_page(&page).map_err(|_| Error::InvalidBundle)?;
+        let encoded = draft.encode()?;
         write_new_synced(
             &manifest_spool_path(&self.directory, self.page_count),
             &encoded,
         )?;
-        self.entries.clear();
-        self.estimated_bytes = 0;
         self.page_count = self.page_count.checked_add(1).ok_or(Error::InvalidBundle)?;
         Ok(())
     }
 
-    pub(crate) fn placeholder_page(&self) -> ManifestPage {
-        ManifestPage {
-            manifest_id: [0; 16],
-            index: self.page_count,
-            total: None,
-            previous_digest: [0; 32],
-            profile: PathProfile::Portable,
-            entries: self.entries.clone(),
+    pub(crate) fn finish(mut self, assembly: PackageAssembly) -> Result<PackageSummary, Error> {
+        let PackageAssembly {
+            summary,
+            final_page,
+            mut finalizer,
+        } = assembly;
+        self.push(&final_page)?;
+        for index in 0..self.page_count {
+            let spool = manifest_spool_path(&self.directory, index);
+            let encoded = read_bounded_file(&spool, vot_manifest::MAX_PAGE_BYTES)?;
+            let completed = finalizer.push(PageDraft::decode(&encoded)?)?;
+            write_new_synced(
+                &manifest_page_path(&self.directory, index),
+                &completed.bytes,
+            )?;
+            fs::remove_file(spool)?;
         }
+        let seal = finalizer.finish()?;
+        write_new_synced(&self.directory.join(MANIFEST_SEAL), &seal.bytes)?;
+        sync_directory(&self.directory)?;
+        Ok(summary)
     }
-}
-
-pub(crate) fn page_needs_flush(
-    entries: usize,
-    estimated_bytes: usize,
-    next_entry_bytes: usize,
-) -> Result<bool, Error> {
-    let estimated = estimated_bytes
-        .checked_add(next_entry_bytes)
-        .ok_or(Error::InvalidBundle)?;
-    Ok(entries == vot_manifest::MAX_ENTRIES_PER_PAGE
-        || (entries != 0 && estimated > vot_manifest::MAX_PAGE_BYTES))
 }
 
 pub fn build_bundle(source: &Path, bundle: &Path) -> Result<PackageSummary, Error> {
@@ -160,7 +88,7 @@ pub fn build_bundle_with_suite(
     let objects = bundle.join("objects");
     fs::create_dir(&objects)?;
     let mut manifest = ManifestSpool::new(bundle)?;
-    let mut package = PackageRootBuilder::new()?;
+    let mut package = PackageBuilder::new()?;
     let mut packer = StreamingPacker::new_with_suite(PathProfile::Portable, suite);
     for source_file in sources {
         if source_file.length <= CANDIDATE_MAX as u64 {
@@ -188,8 +116,7 @@ pub fn build_bundle_with_suite(
         emit_pack(&objects, &mut manifest, &mut package, &pack)?;
     }
 
-    let summary = package.finish()?;
-    manifest.finish(summary)?;
+    let summary = manifest.finish(package.finish()?)?;
     sync_directory(&objects)?;
     sync_directory(bundle)?;
     Ok(summary)
@@ -248,7 +175,7 @@ pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
 pub(crate) fn emit_pack(
     objects: &Path,
     manifest: &mut ManifestSpool,
-    package: &mut PackageRootBuilder,
+    package: &mut PackageBuilder,
     pack: &Pack,
 ) -> Result<(), Error> {
     write_object(objects, &pack.root, &pack.bytes)?;
@@ -264,8 +191,9 @@ pub(crate) fn emit_pack(
                 offset: entry.offset,
             },
         };
-        package.push(&record)?;
-        manifest.push(record.manifest_entry()?)?;
+        if let Some(draft) = package.push(&record)? {
+            manifest.push(&draft)?;
+        }
     }
     Ok(())
 }
@@ -273,7 +201,7 @@ pub(crate) fn emit_pack(
 pub(crate) fn emit_direct(
     objects: &Path,
     manifest: &mut ManifestSpool,
-    package: &mut PackageRootBuilder,
+    package: &mut PackageBuilder,
     source: &SourceFile,
     suite: Suite,
 ) -> Result<(), Error> {
@@ -293,8 +221,9 @@ pub(crate) fn emit_direct(
         logical_length: source.length,
         storage: Storage::Direct,
     };
-    package.push(&record)?;
-    manifest.push(record.manifest_entry()?)?;
+    if let Some(draft) = package.push(&record)? {
+        manifest.push(&draft)?;
+    }
     Ok(())
 }
 

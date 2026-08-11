@@ -1,6 +1,10 @@
-//! Filesystem-independent VOT package identity construction.
+//! Filesystem-independent VOT package identity and manifest construction.
 
 #![forbid(unsafe_code)]
+
+mod assembly;
+
+pub use assembly::{Encoded, ManifestFinalizer, PackageAssembly, PackageBuilder, PageDraft};
 
 use vot_manifest::{
     Component, EntryKind, Error as ManifestError, ManifestEntry, ObjectId, PackagePath,

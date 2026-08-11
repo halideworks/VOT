@@ -40,7 +40,11 @@ impl Rng {
     #[must_use]
     pub const fn new(seed: u64) -> Self {
         // A zero state is absorbing for xorshift.
-        Self(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+        Self(if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        })
     }
 
     pub fn next_u64(&mut self) -> u64 {

@@ -3,6 +3,7 @@
 //! Exact BEP 52 SHA-256 tree geometry with 64 KiB VOT range proofs.
 
 use sha2::{Digest, Sha256};
+use vot_proof_store::{ProofNodeStorage, StoreError};
 
 pub const LEAF_SIZE: usize = 16_384;
 pub const PIECE_SIZE: u64 = 65_536;
@@ -21,6 +22,13 @@ pub enum Error {
     LengthOverflow,
     MalformedProof,
     HashMismatch,
+    Storage(StoreError),
+}
+
+impl From<StoreError> for Error {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 #[must_use]
@@ -113,6 +121,258 @@ impl PieceHashes {
         }
         piece_hash(piece) == *hash
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StoredLayer {
+    base: u64,
+    count: u64,
+}
+
+const MAX_STORED_PIECES: u64 = u64::MAX / PIECE_SIZE + 1;
+const MAX_STORED_LEVELS: usize = 49;
+
+const fn stored_piece_count_is_valid(pieces: u64) -> bool {
+    pieces <= MAX_STORED_PIECES
+}
+
+/// Streaming piece hashes retained in host-provided storage.
+pub struct StoredPieceHashes {
+    storage: Box<dyn ProofNodeStorage>,
+    length: u64,
+    pieces: u64,
+    ended: bool,
+    failure: Option<StoreError>,
+}
+
+impl StoredPieceHashes {
+    /// Starts with an empty host-provided store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unavailable storage and stores that are not empty.
+    pub fn new(storage: Box<dyn ProofNodeStorage>) -> Result<Self, Error> {
+        if !storage.is_empty().map_err(Error::Storage)? {
+            return Err(Error::Storage(StoreError::Corrupt));
+        }
+        Ok(Self {
+            storage,
+            length: 0,
+            pieces: 0,
+            ended: false,
+            failure: None,
+        })
+    }
+
+    /// Takes the next piece and appends its hash to the backing store.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same piece-order rules as [`PieceHashes::push`]. A storage
+    /// error poisons this builder because an append may have partially changed
+    /// the backing store.
+    pub fn push(&mut self, piece: &[u8]) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(Error::Storage(error));
+        }
+        if piece.is_empty() || piece.len() as u64 > PIECE_SIZE || self.ended {
+            return Err(Error::OutOfBounds);
+        }
+        let piece_length = u64::try_from(piece.len()).map_err(|_| Error::LengthOverflow)?;
+        let next_length = self
+            .length
+            .checked_add(piece_length)
+            .ok_or(Error::LengthOverflow)?;
+        let next_pieces = self.pieces.checked_add(1).ok_or(Error::LengthOverflow)?;
+        if let Err(error) = self.storage.append(piece_hash(piece)) {
+            self.failure = Some(error);
+            return Err(Error::Storage(error));
+        }
+        self.length = next_length;
+        self.pieces = next_pieces;
+        self.ended = piece_length < PIECE_SIZE;
+        Ok(())
+    }
+
+    /// Seals the piece layer and builds bounded-memory parent layers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects poisoned, missing, corrupt, or unavailable backing state.
+    pub fn finish(mut self) -> Result<SealedPieceHashes, Error> {
+        if let Some(error) = self.failure {
+            return Err(Error::Storage(error));
+        }
+        if self.storage.len().map_err(Error::Storage)? != self.pieces {
+            return Err(Error::Storage(StoreError::Corrupt));
+        }
+        if !stored_piece_count_is_valid(self.pieces) {
+            return Err(Error::Storage(StoreError::Capacity));
+        }
+
+        let mut layers = [StoredLayer::default(); MAX_STORED_LEVELS];
+        let mut level_count = usize::from(self.pieces != 0);
+        if self.pieces != 0 {
+            layers[0] = StoredLayer {
+                base: 0,
+                count: self.pieces,
+            };
+        }
+        while level_count != 0 && layers[level_count - 1].count > 1 {
+            let child = layers[level_count - 1];
+            let child_width = 1_u64
+                .checked_shl((level_count - 1) as u32)
+                .ok_or(Error::Storage(StoreError::Capacity))?;
+            let parent_base = child
+                .base
+                .checked_add(child.count)
+                .ok_or(Error::Storage(StoreError::Capacity))?;
+            if self.storage.len().map_err(Error::Storage)? != parent_base {
+                return Err(Error::Storage(StoreError::Corrupt));
+            }
+            let parent_count = child.count.div_ceil(2);
+            for parent_index in 0..parent_count {
+                let left_index = parent_index
+                    .checked_mul(2)
+                    .ok_or(Error::Storage(StoreError::Capacity))?;
+                let left = read_stored_node(self.storage.as_ref(), child, left_index)?;
+                let right = if left_index + 1 < child.count {
+                    read_stored_node(self.storage.as_ref(), child, left_index + 1)?
+                } else {
+                    zero_subtree(child_width)
+                };
+                self.storage
+                    .append(parent(&left, &right))
+                    .map_err(Error::Storage)?;
+            }
+            layers[level_count] = StoredLayer {
+                base: parent_base,
+                count: parent_count,
+            };
+            level_count += 1;
+        }
+
+        Ok(SealedPieceHashes {
+            storage: self.storage,
+            length: self.length,
+            pieces: self.pieces,
+            layers,
+            level_count,
+        })
+    }
+}
+
+/// Sealed host-backed piece hashes that can prove ranges without the object.
+pub struct SealedPieceHashes {
+    storage: Box<dyn ProofNodeStorage>,
+    length: u64,
+    pieces: u64,
+    layers: [StoredLayer; MAX_STORED_LEVELS],
+    level_count: usize,
+}
+
+impl SealedPieceHashes {
+    /// The object length represented by this store.
+    #[must_use]
+    pub const fn object_len(&self) -> u64 {
+        self.length
+    }
+
+    /// The number of retained 64 KiB pieces.
+    #[must_use]
+    pub const fn pieces(&self) -> u64 {
+        self.pieces
+    }
+
+    /// Whether `piece` matches the retained hash at `index`.
+    #[must_use]
+    pub fn holds(&self, index: usize, piece: &[u8]) -> bool {
+        if piece.is_empty() || piece.len() as u64 > PIECE_SIZE || self.level_count == 0 {
+            return false;
+        }
+        let Ok(index) = u64::try_from(index) else {
+            return false;
+        };
+        read_stored_node(self.storage.as_ref(), self.layers[0], index)
+            .is_ok_and(|expected| piece_hash(piece) == expected)
+    }
+
+    /// Creates the canonical proof for one range.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid range or missing, corrupt, or unavailable backing state.
+    pub fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
+        let RangeGeometry {
+            covered_offset,
+            covered_end,
+            first,
+            end,
+        } = RangeGeometry::of(self.length, offset, length)?;
+        Ok(RangeCover {
+            covered_offset,
+            covered_length: covered_end - covered_offset,
+            proof: encode_stored_proof(self, first, end)?,
+        })
+    }
+}
+
+fn read_stored_node(
+    storage: &dyn ProofNodeStorage,
+    layer: StoredLayer,
+    index: u64,
+) -> Result<[u8; 32], Error> {
+    if index >= layer.count {
+        return Err(Error::Storage(StoreError::Corrupt));
+    }
+    let ordinal = layer
+        .base
+        .checked_add(index)
+        .ok_or(Error::Storage(StoreError::Capacity))?;
+    storage.read(ordinal).map_err(Error::Storage)
+}
+
+fn encode_stored_proof(pieces: &SealedPieceHashes, first: u64, end: u64) -> Result<Vec<u8>, Error> {
+    if pieces.pieces <= 1 {
+        return Ok(Vec::new());
+    }
+    let tree_width = pieces
+        .pieces
+        .checked_next_power_of_two()
+        .ok_or(Error::LengthOverflow)?;
+    let (window_start, window_width) = proof_window(first, end, tree_width);
+    let window_end = window_start
+        .checked_add(window_width)
+        .ok_or(Error::LengthOverflow)?;
+    let mut output = Vec::new();
+    for index in window_start..window_end {
+        if (index < first || index >= end) && index < pieces.pieces {
+            output.extend_from_slice(&read_stored_node(
+                pieces.storage.as_ref(),
+                pieces.layers[0],
+                index,
+            )?);
+        }
+    }
+    let mut start = window_start;
+    let mut width = window_width;
+    let mut level = width.trailing_zeros() as usize;
+    while width != tree_width {
+        let node_index = start / width;
+        let sibling = node_index ^ 1;
+        let sibling_start = sibling.checked_mul(width).ok_or(Error::LengthOverflow)?;
+        if sibling_start < pieces.pieces {
+            let layer = pieces.layers[..pieces.level_count]
+                .get(level)
+                .copied()
+                .ok_or(Error::Storage(StoreError::Corrupt))?;
+            output.extend_from_slice(&read_stored_node(pieces.storage.as_ref(), layer, sibling)?);
+        }
+        start = start.min(sibling_start);
+        width = width.checked_mul(2).ok_or(Error::LengthOverflow)?;
+        level += 1;
+    }
+    Ok(output)
 }
 
 /// Request-to-cover geometry for one range proof: the aligned start, an end
@@ -405,7 +665,12 @@ fn decode_root(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use super::*;
+    use vot_proof_store::{MemoryNodeStorage, ProofNode};
 
     fn fixture(length: usize) -> Vec<u8> {
         (0..length)
@@ -421,6 +686,196 @@ mod tests {
             pieces.push(piece).unwrap();
         }
         pieces
+    }
+
+    fn stored_pieces_of(data: &[u8]) -> SealedPieceHashes {
+        let mut pieces = StoredPieceHashes::new(Box::new(MemoryNodeStorage::new())).unwrap();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            pieces.push(piece).unwrap();
+        }
+        pieces.finish().unwrap()
+    }
+
+    struct FaultStorage {
+        inner: MemoryNodeStorage,
+        append_failure: Option<u64>,
+        append_calls: Arc<AtomicU64>,
+        read_failure: Arc<AtomicBool>,
+    }
+
+    impl ProofNodeStorage for FaultStorage {
+        fn len(&self) -> Result<u64, StoreError> {
+            self.inner.len()
+        }
+
+        fn append(&mut self, node: ProofNode) -> Result<(), StoreError> {
+            let ordinal = self.inner.len()?;
+            self.append_calls.fetch_add(1, Ordering::Relaxed);
+            if self.append_failure == Some(ordinal) {
+                self.inner.append(node)?;
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.append(node)
+        }
+
+        fn read(&self, ordinal: u64) -> Result<ProofNode, StoreError> {
+            if self.read_failure.load(Ordering::Relaxed) {
+                return Err(StoreError::Unavailable);
+            }
+            self.inner.read(ordinal)
+        }
+    }
+
+    struct UnavailableLength;
+
+    impl ProofNodeStorage for UnavailableLength {
+        fn len(&self) -> Result<u64, StoreError> {
+            Err(StoreError::Unavailable)
+        }
+
+        fn append(&mut self, _node: ProofNode) -> Result<(), StoreError> {
+            unreachable!()
+        }
+
+        fn read(&self, _ordinal: u64) -> Result<ProofNode, StoreError> {
+            unreachable!()
+        }
+    }
+
+    fn assert_auto_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+
+    #[test]
+    fn stored_piece_hashes_keep_required_auto_traits() {
+        assert_auto_traits::<StoredPieceHashes>();
+        assert_auto_traits::<SealedPieceHashes>();
+    }
+
+    #[test]
+    fn stored_piece_hashes_require_empty_available_storage() {
+        let mut nonempty = MemoryNodeStorage::new();
+        nonempty.append([7; 32]).unwrap();
+        assert!(matches!(
+            StoredPieceHashes::new(Box::new(nonempty)),
+            Err(Error::Storage(StoreError::Corrupt))
+        ));
+
+        assert!(matches!(
+            StoredPieceHashes::new(Box::new(UnavailableLength)),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn stored_builder_enforces_every_piece_order_boundary() {
+        let mut stored = StoredPieceHashes::new(Box::new(MemoryNodeStorage::new())).unwrap();
+        assert_eq!(stored.push(&[]), Err(Error::OutOfBounds));
+        assert_eq!(
+            stored.push(&fixture(PIECE_SIZE as usize + 1)),
+            Err(Error::OutOfBounds)
+        );
+        stored.push(&fixture(PIECE_SIZE as usize)).unwrap();
+        stored.push(&fixture(PIECE_SIZE as usize)).unwrap();
+        stored.push(&fixture(7)).unwrap();
+        assert_eq!(stored.push(&[1]), Err(Error::OutOfBounds));
+        let sealed = stored.finish().unwrap();
+        assert_eq!(sealed.object_len(), 2 * PIECE_SIZE + 7);
+        assert_eq!(sealed.pieces(), 3);
+    }
+
+    #[test]
+    fn stored_piece_count_boundaries_are_exact() {
+        assert_eq!(MAX_STORED_PIECES, 281_474_976_710_656);
+        assert!(stored_piece_count_is_valid(0));
+        assert!(stored_piece_count_is_valid(MAX_STORED_PIECES));
+        assert!(!stored_piece_count_is_valid(MAX_STORED_PIECES + 1));
+    }
+
+    #[test]
+    fn stored_piece_hashes_match_memory_across_padding_boundaries() {
+        for piece_count in [1_usize, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17] {
+            let length = (piece_count - 1) * PIECE_SIZE as usize + 71;
+            let data = fixture(length);
+            let memory = pieces_of(&data);
+            let stored = stored_pieces_of(&data);
+            assert_eq!(stored.object_len(), memory.object_len());
+            assert_eq!(stored.pieces(), piece_count as u64);
+            for first in 0..piece_count {
+                for end in first + 1..=piece_count {
+                    let offset = first as u64 * PIECE_SIZE;
+                    let requested_end = (end as u64 * PIECE_SIZE).min(data.len() as u64);
+                    let length = requested_end - offset;
+                    let expected = prove_with(&memory, offset, length).unwrap();
+                    let actual = stored.prove(offset, length).unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "pieces={piece_count} range={first}..{end}"
+                    );
+                }
+            }
+            for (index, piece) in data.chunks(PIECE_SIZE as usize).enumerate() {
+                assert!(stored.holds(index, piece));
+            }
+            assert!(!stored.holds(piece_count, &data[..data.len().min(PIECE_SIZE as usize)]));
+            assert!(!stored.holds(0, &[]));
+            assert!(!stored.holds(0, &fixture(PIECE_SIZE as usize + 1)));
+        }
+    }
+
+    #[test]
+    fn stored_right_edge_uses_implicit_padding_without_a_read() {
+        let data = fixture(2 * PIECE_SIZE as usize + 7);
+        let memory = pieces_of(&data);
+        let stored = stored_pieces_of(&data);
+        let offset = 2 * PIECE_SIZE;
+        assert_eq!(stored.prove(offset, 7), prove_with(&memory, offset, 7));
+    }
+
+    #[test]
+    fn append_failure_poisons_stored_piece_hashes() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let storage = FaultStorage {
+            inner: MemoryNodeStorage::new(),
+            append_failure: Some(0),
+            append_calls: Arc::clone(&calls),
+            read_failure: Arc::new(AtomicBool::new(false)),
+        };
+        let mut pieces = StoredPieceHashes::new(Box::new(storage)).unwrap();
+        assert_eq!(
+            pieces.push(&fixture(PIECE_SIZE as usize)),
+            Err(Error::Storage(StoreError::Unavailable))
+        );
+        assert_eq!(
+            pieces.push(&[1]),
+            Err(Error::Storage(StoreError::Unavailable))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            pieces.finish(),
+            Err(Error::Storage(StoreError::Unavailable))
+        ));
+    }
+
+    #[test]
+    fn stored_read_failure_returns_no_proof_and_makes_holds_false() {
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let storage = FaultStorage {
+            inner: MemoryNodeStorage::new(),
+            append_failure: None,
+            append_calls: Arc::new(AtomicU64::new(0)),
+            read_failure: Arc::clone(&fail_read),
+        };
+        let data = fixture(3 * PIECE_SIZE as usize + 7);
+        let mut pieces = StoredPieceHashes::new(Box::new(storage)).unwrap();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            pieces.push(piece).unwrap();
+        }
+        let pieces = pieces.finish().unwrap();
+        fail_read.store(true, Ordering::Relaxed);
+        assert_eq!(
+            pieces.prove(0, 1),
+            Err(Error::Storage(StoreError::Unavailable))
+        );
+        assert!(!pieces.holds(0, &data[..PIECE_SIZE as usize]));
     }
 
     #[test]

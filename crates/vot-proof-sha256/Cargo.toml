@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 sha2.workspace = true
+vot-proof-store = { path = "../vot-proof-store" }
 vot-verifier = { path = "../vot-verifier" }
 
 [lints]

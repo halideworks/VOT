@@ -1,0 +1,4 @@
+enum vot_proof_store::StoreError
+struct vot_proof_store::MemoryNodeStorage
+trait vot_proof_store::ProofNodeStorage
+type_alias vot_proof_store::ProofNode

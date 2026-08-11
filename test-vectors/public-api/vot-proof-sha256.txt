@@ -9,3 +9,5 @@ function vot_proof_sha256::verify
 struct vot_proof_sha256::PieceHashes
 struct vot_proof_sha256::RangeCover
 struct vot_proof_sha256::RangeProof
+struct vot_proof_sha256::SealedPieceHashes
+struct vot_proof_sha256::StoredPieceHashes

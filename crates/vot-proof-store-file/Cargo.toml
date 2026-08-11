@@ -1,5 +1,5 @@
 [package]
-name = "vot-proof-blake3"
+name = "vot-proof-store-file"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-blake3 = { workspace = true, features = ["std"] }
+vot-journal = { path = "../vot-journal" }
 vot-proof-store = { path = "../vot-proof-store" }
-vot-verifier = { path = "../vot-verifier" }
+
+[dev-dependencies]
+vot-object = { path = "../vot-object" }
+vot-proof-catalog = { path = "../vot-proof-catalog" }
 
 [lints]
 workspace = true

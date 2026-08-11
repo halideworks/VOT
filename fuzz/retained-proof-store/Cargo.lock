@@ -215,15 +215,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vot-proof-catalog-fuzz-driver"
-version = "0.0.0"
-dependencies = [
- "cap",
- "vot-fuzz-mutator",
- "vot-proof-catalog",
-]
-
-[[package]]
 name = "vot-proof-sha256"
 version = "0.0.1"
 dependencies = [
@@ -235,6 +226,17 @@ dependencies = [
 [[package]]
 name = "vot-proof-store"
 version = "0.0.1"
+
+[[package]]
+name = "vot-retained-proof-store-fuzz-driver"
+version = "0.0.0"
+dependencies = [
+ "cap",
+ "vot-fuzz-mutator",
+ "vot-object",
+ "vot-proof-catalog",
+ "vot-proof-store",
+]
 
 [[package]]
 name = "vot-verifier"

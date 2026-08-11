@@ -10,6 +10,8 @@ PACKAGES = (
     "vot-commit-posix",
     "vot-commit-strict",
     "vot-journal",
+    "vot-proof-store",
+    "vot-proof-store-file",
     "vot-proof-blake3",
     "vot-proof-sha256",
     "vot-proof-catalog",

@@ -2411,6 +2411,7 @@ dependencies = [
  "vot-manifest",
  "vot-proof-blake3",
  "vot-proof-sha256",
+ "vot-proof-store",
  "vot-verifier",
 ]
 
@@ -2469,6 +2470,7 @@ name = "vot-proof-blake3"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "vot-proof-store",
  "vot-verifier",
 ]
 
@@ -2479,6 +2481,7 @@ dependencies = [
  "vot-object",
  "vot-proof-blake3",
  "vot-proof-sha256",
+ "vot-proof-store",
 ]
 
 [[package]]
@@ -2486,7 +2489,22 @@ name = "vot-proof-sha256"
 version = "0.0.1"
 dependencies = [
  "sha2 0.11.0",
+ "vot-proof-store",
  "vot-verifier",
+]
+
+[[package]]
+name = "vot-proof-store"
+version = "0.0.1"
+
+[[package]]
+name = "vot-proof-store-file"
+version = "0.0.1"
+dependencies = [
+ "vot-journal",
+ "vot-object",
+ "vot-proof-catalog",
+ "vot-proof-store",
 ]
 
 [[package]]

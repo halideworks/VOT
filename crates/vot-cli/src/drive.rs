@@ -85,15 +85,18 @@ pub fn drive_until<E: Engine>(
             (IDLE_BOUND, IDLE_BOUND_MS)
         };
         let progress = engine.progress();
-        if progress == settled_so_far {
-            // Saturating add so a stuck counter cannot overflow to the stall check.
-            stalled_ms = stalled_ms.saturating_add(spent);
-            if stalled_ms > STALLED_WAIT_MS {
-                return Err(Error::Stalled);
+        match progress.cmp(&settled_so_far) {
+            std::cmp::Ordering::Equal => {
+                // Saturating add so a stuck counter cannot overflow to the stall check.
+                stalled_ms = stalled_ms.saturating_add(spent);
+                if stalled_ms > STALLED_WAIT_MS {
+                    return Err(Error::Stalled);
+                }
             }
-        } else {
-            settled_so_far = progress;
-            stalled_ms = 0;
+            std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
+                settled_so_far = progress;
+                stalled_ms = 0;
+            }
         }
         engine.wait(wait);
     }

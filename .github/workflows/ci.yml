@@ -130,6 +130,7 @@ jobs:
           python3 tools/validate_security_matrix.py
           python3 tools/validate_wave0.py
           python3 tools/verify_wave1_vectors.py
+          python3 tools/validate_static_proof_catalog_vectors.py
           python3 tools/verify_manifest_pack_vectors.py
           python3 tools/verify_wave4_package.py
           python3 tools/validate_commit_fixtures.py

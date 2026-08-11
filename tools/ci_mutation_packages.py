@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Packages eligible for targeted mutation jobs."""
+
+EXCLUDED_PACKAGES = ("vot-log",)
+
+PACKAGES = (
+    "vot-cbor",
+    "vot-capability",
+    "vot-commit-model",
+    "vot-commit-posix",
+    "vot-commit-strict",
+    "vot-journal",
+    "vot-proof-blake3",
+    "vot-proof-sha256",
+    "vot-codec",
+    "vot-verifier",
+    "vot-manifest",
+    "vot-pack",
+    "vot-object-store",
+    "vot-commit-object",
+    "vot-receipt",
+    "vot-platform-fs",
+    "vot-platform-net",
+    "vot-platform-proc",
+    "vot-transport-api",
+    "vot-transport-framing",
+    "vot-transport-queue",
+    "vot-transport-quiche",
+    "vot-transport-sim",
+    "vot-transport-msquic",
+    "vot-session",
+    "vot-scheduler",
+    "vot-cli",
+    "vot-transport-tcp",
+    "vot-resume",
+    "vot-commit-platform",
+    "vot-bench-driver",
+)

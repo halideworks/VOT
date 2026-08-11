@@ -1631,8 +1631,9 @@ mod tests {
 
     #[test]
     fn a_serve_that_requires_a_capability_answers_only_a_holder() {
-        // ADR-0036 end to end over a real QUIC socket: the same serve refuses
-        // a fetch with no token and completes one with the right token.
+        // ADR-0037 end to end over a real QUIC socket: the same serve refuses
+        // a fetch with no token and completes one whose possession proof binds
+        // to the exporter both ends derive for this connection.
         use ed25519_dalek::SigningKey;
 
         let source = crate::tests::temporary("capability-source");

@@ -21,6 +21,7 @@ path = "src/bin/vot-capability-vectors.rs"
 ed25519-dalek.workspace = true
 vot-cbor = { path = "../vot-cbor" }
 vot-codec = { path = "../vot-codec" }
+vot-transport-api = { path = "../vot-transport-api" }
 
 [lints]
 workspace = true

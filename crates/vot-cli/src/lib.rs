@@ -87,6 +87,10 @@ pub enum Error {
     Stalled,
     /// A carrier that would not bind or connect.
     CarrierUnavailable,
+    /// A capability session whose carrier cannot bind possession to its channel.
+    ///
+    /// Carries no exporter material, so reporting it cannot disclose the binding.
+    ChannelBindingUnavailable,
     /// The peer ended the session under a registered code.
     PeerClosed(u16),
     /// No serve registered for this rendezvous key.

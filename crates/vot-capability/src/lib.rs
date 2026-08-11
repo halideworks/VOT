@@ -1,4 +1,5 @@
-//! `ed25519-cbor-v1` capability format (`spec/registries.md` section 11).
+//! `ed25519-cbor-tls-exporter-v1` capability format
+//! (`spec/registries.md` section 11).
 //!
 //! Reads, writes, and checks signatures over capabilities. Signature covers the
 //! canonical bytes exactly as signed (not a re-encoding). Times are epoch seconds.
@@ -14,7 +15,7 @@ pub use vot_codec::Operation;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// The format identifier `spec/registries.md` section 11 gives this format.
-pub const FORMAT_ID: u16 = 0x0001;
+pub const FORMAT_ID: u16 = 0x0002;
 
 /// What the signature covers, before the key identifier and the capability.
 ///
@@ -183,7 +184,7 @@ mod tests {
 
         let mut other_format = signing_input(b"issuer-1", &signed.capability).unwrap();
         let position = DOMAIN.len();
-        other_format[position..position + 2].copy_from_slice(&2u16.to_be_bytes());
+        other_format[position..position + 2].copy_from_slice(&1u16.to_be_bytes());
         assert!(
             issuer_key()
                 .verifying_key()

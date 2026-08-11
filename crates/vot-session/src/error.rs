@@ -148,6 +148,8 @@ pub enum PresentationError {
     IdentifierReused,
     /// A capability format the server did not advertise.
     FormatNotOffered { format: u64 },
+    /// A retired capability format that this draft must not send.
+    FormatRetired { format: u64 },
     /// A binding proof that does not match the binding the challenge named:
     /// empty under proof of possession, or present under none.
     BindingProof {

@@ -30,26 +30,14 @@
     {
       "name": "auth_context_proof_of_possession",
       "frame": "auth_context",
-      "note": "Formats ascend and never repeat, so one server policy has one encoding.",
+      "note": "Formats ascend and never repeat. Format 1 is retired; format 2 proves possession over the local TLS exporter transcript without putting the exporter on the wire.",
       "nonce_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
       "binding": 1,
       "formats": [
-        1,
         2,
         9
       ],
-      "hex": "072da40000015820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a102010383010209"
-    },
-    {
-      "name": "auth_context_unbound_bearer",
-      "frame": "auth_context",
-      "note": "A capability with no channel binding, which spec/security.md section 5 allows only where policy declares the shorter lifetime and the replay exposure it costs.",
-      "nonce_hex": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
-      "binding": 0,
-      "formats": [
-        1
-      ],
-      "hex": "0723a400000158183e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e0200038101"
+      "hex": "072ca40000015820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1020103820209"
     },
     {
       "name": "auth_context_longest_nonce",
@@ -65,7 +53,7 @@
     {
       "name": "session_open_minimal",
       "frame": "session_open",
-      "note": "An empty requested scope asks for the capability's whole scope.",
+      "note": "Legacy format 1 remains parseable so a new peer can reject it as unsupported rather than malformed. Current policy MUST NOT advertise or select it. An empty requested scope asks for the capability's whole scope.",
       "session_id_hex": "11111111111111111111111111111111",
       "capability_format": 1,
       "capability_hex": "",
@@ -76,7 +64,7 @@
     {
       "name": "session_open_bound_capability",
       "frame": "session_open",
-      "note": "A capability bound by proof of possession, with a scope narrower than the capability's own.",
+      "note": "A format-2 capability bound by proof of possession over the TLS exporter transcript, with a scope narrower than the capability's own.",
       "session_id_hex": "22222222222222222222222222222222",
       "capability_format": 2,
       "capability_hex": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b",

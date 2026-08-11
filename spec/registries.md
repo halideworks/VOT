@@ -244,7 +244,8 @@ field of the statement it signs.
 
 | Value | Name | Status |
 |---:|---|---|
-| `0x0001` | `ed25519-cbor-v1` | draft |
+| `0x0001` | `ed25519-cbor-v1` | retired |
+| `0x0002` | `ed25519-cbor-tls-exporter-v1` | draft |
 
 `0x0000` is reserved and MUST NOT be advertised or sent.
 
@@ -253,11 +254,58 @@ capability bytes in `SESSION_OPEN`. The format identifier travels outside those
 bytes so a server can reject a format it does not implement without parsing
 anything an unauthenticated peer chose the shape of.
 
-`ed25519-cbor-v1` is defined by `spec/capability.cddl`, with the issuer anchor it
-verifies against defined by ADR-0023. Its capability is Ed25519 over canonical
-CBOR, signed as the bytes it travels as rather than as a re-encoding of its
-claims. A server advertising no format requires no authentication, which
+`ed25519-cbor-v1` is the legacy nonce-only proof format. It does not bind the
+holder's proof to the channel that carries it. A `vot-draft-05` implementation
+MUST NOT advertise or send it. Its capability uses the canonical schema in
+`spec/capability.cddl`. Its issuer signature input is the ASCII bytes
+`VOT capability v0`, one zero byte, `0x0001` in network byte order, the key
+identifier length in one byte, the key identifier, and the canonical capability
+bytes. Its holder proof input is the ASCII bytes `VOT capability pop v0`, one
+zero byte, `0x0001` in network byte order, the 16-byte token identifier, the
+16-byte session identifier, and the `AUTH_CONTEXT` nonce, in that order. A
+decoder accepts the retired identifier's wire representation so it can report an
+unsupported format rather than a malformed frame; no current policy selects it.
+
+`ed25519-cbor-tls-exporter-v1` is defined by `spec/capability.cddl`, with the
+issuer anchor it verifies against defined by ADR-0023. Its capability is Ed25519
+over canonical CBOR, signed as the bytes it travels as rather than as a
+re-encoding of its claims. The capability signature input is the ASCII bytes
+`VOT capability v0`, one zero byte, the two-byte format value in network byte
+order, the key identifier length in one byte, the key identifier, and the
+canonical capability bytes, in that order.
+
+The holder proof for `ed25519-cbor-tls-exporter-v1` is an Ed25519 signature under
+the holder key in the capability. It covers these fields in order:
+
+| Field | Encoding |
+|---|---|
+| domain separator | ASCII `VOT capability pop v1` followed by one zero byte |
+| capability format | `0x0002` as two bytes in network byte order |
+| token identifier | 16 bytes from the capability |
+| session identifier | 16 bytes from `SESSION_OPEN` |
+| nonce length | two bytes in network byte order |
+| nonce | the 16 to 64 bytes from `AUTH_CONTEXT` |
+| channel binding | 32 bytes exported by the presenting TLS session |
+
+The channel binding is TLS 1.3 exporter keying material with the exact label
+`EXPORTER-VOT-Channel-Binding`, no exporter context, and an output length of 32
+bytes. Each endpoint computes it locally after the TLS handshake. It is an input
+to the proof and never travels in a VOT frame.
+
+A server advertising `ed25519-cbor-tls-exporter-v1` advertises proof of
+possession in `AUTH_CONTEXT`. It fails closed if its carrier cannot supply the
+exporter. A client MUST NOT answer that challenge with `ed25519-cbor-v1`, and a
+server MUST NOT fall back to that retired format after advertising the bound
+format. A server advertising no format requires no authentication, which
 `spec/wire.md` section 1.1 describes.
+
+`test-vectors/capability/capability.json` is normative for the canonical
+capability and envelope bytes. `tools/validate_capability_vectors.py` rebuilds
+the format-2 issuer-signing transcript independently, derives the test issuer
+key, recomputes each accepted envelope signature, and proves that the same
+signature fails under the retired format value. The possession transcript and
+its positive and negative signatures are normative in
+`test-vectors/capability/possession-transcript.json`.
 
 A format defines its own delegation rules, and one that defines none refuses a
 capability claiming any. Chained delegation is therefore a new identifier rather

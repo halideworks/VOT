@@ -1,4 +1,4 @@
-; VOT ed25519-cbor-v1 capability, registered as `0x0001` in
+; VOT ed25519-cbor-tls-exporter-v1 capability, registered as `0x0002` in
 ; spec/registries.md section 11 and defined by ADR-0022 stage two.
 ; RFC 8949 core deterministic encoding is mandatory in addition to CDDL.
 ;

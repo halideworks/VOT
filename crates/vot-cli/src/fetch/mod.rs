@@ -630,9 +630,14 @@ mod tests {
         let holder = Arc::new(
             crate::authz::Holder::new(token, holder_key).expect("a holder for that token"),
         );
+        let channel_binding = vot_transport_api::ChannelBinding::from_bytes(
+            [0x27; vot_transport_api::CHANNEL_BINDING_LEN],
+        );
 
         // Holding the token: the serve grants and the bundle crosses.
-        let (client, serving) = crate::harness::duplex_pair();
+        let (mut client, mut serving) = crate::harness::duplex_pair();
+        client.set_channel_binding(channel_binding);
+        serving.set_channel_binding(channel_binding);
         let serving_bundle = bundle.to_path_buf();
         let granting_requirement = requirement.clone();
         let granting = std::thread::spawn(move || {
@@ -669,7 +674,9 @@ mod tests {
 
         // Holding none: the fetch stops on the challenge rather than after a
         // transfer, and writes no bundle.
-        let (client, serving) = crate::harness::duplex_pair();
+        let (mut client, mut serving) = crate::harness::duplex_pair();
+        client.set_channel_binding(channel_binding);
+        serving.set_channel_binding(channel_binding);
         let serving_bundle = bundle.to_path_buf();
         let refusing = std::thread::spawn(move || {
             let server = BundleServer::open(&serving_bundle)?;

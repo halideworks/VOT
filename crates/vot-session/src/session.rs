@@ -1,11 +1,16 @@
 //! `TransportAdapter` orchestration behind the negotiation gate.
 
 use super::{
-    Accepted, AuthContext, Authentication, BTreeSet, EndpointRole, Error, ErrorKind, Event,
-    ExtensionPolicy, Lane, Negotiation, Payload, PendingEvents, SessionAccept, SessionOpen,
-    SessionReject, Settings, Side, State, StreamId, TransportAdapter, TransportError, VecDeque,
-    check_frame, error_code, lane_allowed, no_capability, transport_error,
+    Accepted, AuthContext, Authentication, BTreeSet, Binding, EndpointRole, Error, ErrorKind,
+    Event, ExtensionPolicy, Lane, Negotiation, Payload, PendingEvents, PresentationError,
+    SessionAccept, SessionOpen, SessionReject, Settings, Side, State, StreamId, TransportAdapter,
+    TransportError, VecDeque, check_frame, error_code, lane_allowed, no_capability,
+    transport_error,
 };
+use vot_transport_api::ChannelBinding;
+
+const RETIRED_NONCE_ONLY_CAPABILITY_FORMAT: u64 = 0x0001;
+const CHANNEL_BOUND_CAPABILITY_FORMAT: u64 = 0x0002;
 
 /// A negotiation running over a transport, gating the data plane behind it.
 /// Owns the adapter so an application cannot reach past the gate.
@@ -26,6 +31,10 @@ pub struct Session<A> {
     pub(super) lanes: BTreeSet<StreamId>,
     /// Whether the peer's control-frame limit reached the backend.
     pub(super) control_limit_applied: bool,
+    /// Carrier-derived authentication material, latched once for this session.
+    channel_binding: Option<ChannelBinding>,
+    /// Whether this authentication policy requires carrier-derived material.
+    binding_required: bool,
 }
 
 impl<A: TransportAdapter> Session<A> {
@@ -82,6 +91,8 @@ impl<A: TransportAdapter> Session<A> {
             pending: PendingEvents::default(),
             lanes: BTreeSet::new(),
             control_limit_applied: false,
+            channel_binding: None,
+            binding_required: false,
         }
     }
 
@@ -159,10 +170,38 @@ impl<A: TransportAdapter> Session<A> {
     /// Reports a second call, an unencodable local frame, or a backend that
     /// refused the submission.
     pub fn begin(&mut self) -> Result<(), Error> {
+        self.begin_inner()
+    }
+
+    fn begin_inner(&mut self) -> Result<(), Error> {
         self.check_authentication_role()?;
+        self.check_local_authentication_policy()?;
+        self.binding_required = matches!(
+            &self.authentication,
+            Authentication::Capability { challenge }
+                if challenge.binding == Binding::ProofOfPossession
+        );
         self.check_receive_limit()?;
         let frames = self.negotiation.begin()?;
         self.submit(frames)
+    }
+
+    fn check_local_authentication_policy(&self) -> Result<(), Error> {
+        let Authentication::Capability { challenge } = &self.authentication else {
+            return Ok(());
+        };
+        let advertises_retired = challenge
+            .formats
+            .contains(&RETIRED_NONCE_ONLY_CAPABILITY_FORMAT);
+        let leaves_active_unbound = challenge.formats.contains(&CHANNEL_BOUND_CAPABILITY_FORMAT)
+            && challenge.binding != Binding::ProofOfPossession;
+        if advertises_retired || leaves_active_unbound {
+            return Err(Error::new(
+                ErrorKind::AuthContextInvalid,
+                error_code::MALFORMED_FRAME,
+            ));
+        }
+        Ok(())
     }
 
     /// Refuses a stance that means nothing for this endpoint's role.
@@ -236,6 +275,8 @@ impl<A: TransportAdapter> Session<A> {
     /// then.
     fn fail(&mut self, error: Error) -> Error {
         if error.kind().is_peer_fault() {
+            self.channel_binding = None;
+            self.binding_required = false;
             let _ = self.adapter.close(error.close_code());
             self.negotiation.abandon();
         }
@@ -265,6 +306,10 @@ impl<A: TransportAdapter> Session<A> {
         }
         while let Some(event) = self.adapter.poll() {
             match event {
+                Event::Connected(connection) => {
+                    self.latch_required_channel_binding()?;
+                    return Ok(Some(Event::Connected(connection)));
+                }
                 Event::Control(bytes) => {
                     self.check_inbound(&bytes, Lane::Control)?;
                     if let Some(event) = self.accept_control(&bytes)? {
@@ -272,6 +317,8 @@ impl<A: TransportAdapter> Session<A> {
                     }
                 }
                 Event::Disconnected(connection) => {
+                    self.channel_binding = None;
+                    self.binding_required = false;
                     self.negotiation.carrier_closed()?;
                     return Ok(Some(Event::Disconnected(connection)));
                 }
@@ -373,20 +420,64 @@ impl<A: TransportAdapter> Session<A> {
             }
             // The caller's policy decides. Nothing is sent and nothing moves
             // until it answers through grant, refuse, or present.
-            Accepted::AuthorizationRequired | Accepted::PresentationRequired => Ok(None),
+            Accepted::AuthorizationRequired => {
+                self.latch_required_channel_binding()?;
+                Ok(None)
+            }
+            Accepted::PresentationRequired => {
+                if self
+                    .negotiation
+                    .pending_presentation()
+                    .is_some_and(|challenge| challenge.binding == Binding::ProofOfPossession)
+                {
+                    self.binding_required = true;
+                    self.latch_required_channel_binding()?;
+                }
+                Ok(None)
+            }
         }
+    }
+
+    fn latch_required_channel_binding(&mut self) -> Result<(), Error> {
+        if self.binding_required && self.channel_binding.is_none() {
+            match self.adapter.channel_binding() {
+                Ok(binding) => self.channel_binding = Some(binding),
+                Err(transport) => {
+                    let error = transport_error(transport);
+                    self.channel_binding = None;
+                    let _ = self.adapter.close(error.close_code());
+                    self.negotiation.abandon();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The carrier material bound to this authentication exchange, when required.
+    #[must_use]
+    pub const fn channel_binding(&self) -> Option<ChannelBinding> {
+        self.channel_binding
     }
 
     /// The request awaiting the caller's policy, and the challenge it answered.
     #[must_use]
     pub const fn pending_authorization(&self) -> Option<(&AuthContext, &SessionOpen)> {
-        self.negotiation.pending_authorization()
+        if matches!(self.negotiation.state(), State::Closed) {
+            None
+        } else {
+            self.negotiation.pending_authorization()
+        }
     }
 
     /// The challenge awaiting a capability from the caller.
     #[must_use]
     pub const fn pending_presentation(&self) -> Option<&AuthContext> {
-        self.negotiation.pending_presentation()
+        if matches!(self.negotiation.state(), State::Closed) {
+            None
+        } else {
+            self.negotiation.pending_presentation()
+        }
     }
 
     /// Attempts section 1.1 still allows this session.
@@ -412,6 +503,14 @@ impl<A: TransportAdapter> Session<A> {
     /// # Errors
     /// Reports a request section 1.1 does not allow, and a backend refusal.
     pub fn present(&mut self, request: SessionOpen) -> Result<(), Error> {
+        if request.capability_format == RETIRED_NONCE_ONLY_CAPABILITY_FORMAT {
+            return Err(Error::new(
+                ErrorKind::PresentationInvalid(PresentationError::FormatRetired {
+                    format: request.capability_format,
+                }),
+                error_code::AUTHENTICATION_FAILED,
+            ));
+        }
         let reply = self.negotiation.present(request)?;
         self.submit(reply)
     }

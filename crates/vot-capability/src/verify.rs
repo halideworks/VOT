@@ -5,12 +5,13 @@
 //! wire to avoid leaking an oracle.
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use vot_transport_api::ChannelBinding;
 
 use crate::{Capability, Error, FORMAT_ID, Range, SignedCapability, bounds};
 
 /// What a proof of possession covers. Distinct from the capability signature
 /// domain.
-const PROOF_DOMAIN: &[u8] = b"VOT capability pop v0\0";
+const PROOF_DOMAIN: &[u8] = b"VOT capability pop v1\0";
 
 /// One trusted key bound to one issuer and its audiences.
 #[derive(Clone, Debug)]
@@ -84,6 +85,8 @@ pub struct Presentation<'a> {
     /// The identifier of the attempt, fresh per attempt by section 1.1, so a
     /// proof cannot be replayed into a later attempt on the same session.
     pub session_id: [u8; 16],
+    /// Carrier-derived material for the connection carrying this attempt.
+    pub channel_binding: ChannelBinding,
     /// The signature over those, under the key the capability names.
     pub proof: &'a [u8],
 }
@@ -281,17 +284,38 @@ fn finish(
 ///
 /// The nonce is the challenge, so the proof is fresh for this session. The token
 /// identifier is bound in so a proof made for one capability cannot be presented
-/// with another, and the attempt identifier so a proof cannot be replayed into a
-/// later attempt on the same session, which shares the nonce.
-#[must_use]
-pub fn proof_input(token_id: &[u8; 16], session_id: &[u8; 16], nonce: &[u8]) -> Vec<u8> {
-    let mut input = Vec::with_capacity(PROOF_DOMAIN.len() + 2 + 32 + nonce.len());
+/// with another, the attempt identifier prevents replay within a session, and
+/// the channel binding prevents replay onto another carrier session.
+///
+/// # Errors
+/// Rejects a nonce outside the bounds `spec/session.cddl` gives the challenge.
+pub fn proof_input(
+    token_id: &[u8; 16],
+    session_id: &[u8; 16],
+    nonce: &[u8],
+    channel_binding: ChannelBinding,
+) -> Result<Vec<u8>, Error> {
+    if !(16..=64).contains(&nonce.len()) {
+        return Err(Error::InvalidLength);
+    }
+    let nonce_len = u16::try_from(nonce.len()).map_err(|_| Error::InvalidLength)?;
+    let mut input = Vec::with_capacity(
+        PROOF_DOMAIN.len()
+            + std::mem::size_of::<u16>()
+            + token_id.len()
+            + session_id.len()
+            + std::mem::size_of::<u16>()
+            + nonce.len()
+            + channel_binding.as_bytes().len(),
+    );
     input.extend_from_slice(PROOF_DOMAIN);
     input.extend_from_slice(&FORMAT_ID.to_be_bytes());
     input.extend_from_slice(token_id);
     input.extend_from_slice(session_id);
+    input.extend_from_slice(&nonce_len.to_be_bytes());
     input.extend_from_slice(nonce);
-    input
+    input.extend_from_slice(channel_binding.as_bytes());
+    Ok(input)
 }
 
 fn verify_proof_of_possession(
@@ -307,7 +331,13 @@ fn verify_proof_of_possession(
         .map_err(|_| Denial::ProofOfPossession)?;
     let key =
         VerifyingKey::from_bytes(&capability.holder_key).map_err(|_| Denial::ProofOfPossession)?;
-    let input = proof_input(&capability.token_id, &presented.session_id, presented.nonce);
+    let input = proof_input(
+        &capability.token_id,
+        &presented.session_id,
+        presented.nonce,
+        presented.channel_binding,
+    )
+    .map_err(|_| Denial::ProofOfPossession)?;
     key.verify_strict(&input, &Signature::from_bytes(&signature))
         .map_err(|_| Denial::ProofOfPossession)
 }
@@ -320,12 +350,10 @@ pub fn prove_possession(
     capability: &Capability,
     session_id: &[u8; 16],
     nonce: &[u8],
+    channel_binding: ChannelBinding,
     key: &ed25519_dalek::SigningKey,
 ) -> Result<Vec<u8>, Error> {
-    if !(16..=64).contains(&nonce.len()) {
-        return Err(Error::InvalidLength);
-    }
-    let input = proof_input(&capability.token_id, session_id, nonce);
+    let input = proof_input(&capability.token_id, session_id, nonce, channel_binding)?;
     Ok(ed25519_dalek::Signer::sign(key, &input).to_bytes().to_vec())
 }
 
@@ -356,6 +384,7 @@ mod tests {
     const NONCE: &[u8] = &[0x5a; 32];
     const SESSION: [u8; 16] = [0xc0; 16];
     const TOKEN: [u8; 16] = [0xc1; 16];
+    const CHANNEL: ChannelBinding = ChannelBinding::from_bytes([0x27; 32]);
 
     fn issuer_key() -> SigningKey {
         SigningKey::from_bytes(&[3; 32])
@@ -418,12 +447,27 @@ mod tests {
         Presentation {
             nonce: NONCE,
             session_id: SESSION,
+            channel_binding: CHANNEL,
             proof,
         }
     }
 
     fn proof_for(capability: &Capability) -> Vec<u8> {
-        prove_possession(capability, &SESSION, NONCE, &holder_key()).unwrap()
+        prove_possession(capability, &SESSION, NONCE, CHANNEL, &holder_key()).unwrap()
+    }
+
+    #[test]
+    fn possession_transcript_has_one_canonical_layout() {
+        let input = proof_input(&TOKEN, &SESSION, NONCE, CHANNEL).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"VOT capability pop v1\0");
+        expected.extend_from_slice(&FORMAT_ID.to_be_bytes());
+        expected.extend_from_slice(&TOKEN);
+        expected.extend_from_slice(&SESSION);
+        expected.extend_from_slice(&32_u16.to_be_bytes());
+        expected.extend_from_slice(NONCE);
+        expected.extend_from_slice(CHANNEL.as_bytes());
+        assert_eq!(input, expected);
     }
 
     /// The whole decision, on a capability everything about which is right.
@@ -657,7 +701,7 @@ mod tests {
         let honest = proof_for(&value);
 
         let thief = SigningKey::from_bytes(&[11; 32]);
-        let stolen = prove_possession(&value, &SESSION, NONCE, &thief).unwrap();
+        let stolen = prove_possession(&value, &SESSION, NONCE, CHANNEL, &thief).unwrap();
         assert_eq!(
             authorize(
                 &signed,
@@ -668,7 +712,8 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        let elsewhere = prove_possession(&value, &SESSION, &[0x11; 32], &holder_key()).unwrap();
+        let elsewhere =
+            prove_possession(&value, &SESSION, &[0x11; 32], CHANNEL, &holder_key()).unwrap();
         assert_eq!(
             authorize(
                 &signed,
@@ -679,7 +724,7 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
 
-        let earlier = prove_possession(&value, &[0xc9; 16], NONCE, &holder_key()).unwrap();
+        let earlier = prove_possession(&value, &[0xc9; 16], NONCE, CHANNEL, &holder_key()).unwrap();
         assert_eq!(
             authorize(
                 &signed,
@@ -707,12 +752,41 @@ mod tests {
             authorize(&signed, presented(&[]), &anchors(), policy(&limits(), &[])),
             Err(Denial::ProofOfPossession)
         );
+
+        let mut omitted_input = proof_input(&TOKEN, &SESSION, NONCE, CHANNEL).unwrap();
+        omitted_input.truncate(omitted_input.len() - CHANNEL.as_bytes().len());
+        let omitted = ed25519_dalek::Signer::sign(&holder_key(), &omitted_input)
+            .to_bytes()
+            .to_vec();
+        assert_eq!(
+            authorize(
+                &signed,
+                presented(&omitted),
+                &anchors(),
+                policy(&limits(), &[])
+            ),
+            Err(Denial::ProofOfPossession)
+        );
+
+        let other_channel = ChannelBinding::from_bytes([0x28; 32]);
+        let proof =
+            prove_possession(&value, &SESSION, NONCE, other_channel, &holder_key()).unwrap();
+        assert_eq!(
+            authorize(
+                &signed,
+                presented(&proof),
+                &anchors(),
+                policy(&limits(), &[])
+            ),
+            Err(Denial::ProofOfPossession)
+        );
         assert_eq!(
             authorize(
                 &signed,
                 Presentation {
                     nonce: &[0x5a; 15],
                     session_id: SESSION,
+                    channel_binding: CHANNEL,
                     proof: &honest,
                 },
                 &anchors(),
@@ -721,7 +795,7 @@ mod tests {
             Err(Denial::ProofOfPossession)
         );
         assert_eq!(
-            prove_possession(&value, &SESSION, &[0x5a; 65], &holder_key()),
+            prove_possession(&value, &SESSION, &[0x5a; 65], CHANNEL, &holder_key()),
             Err(Error::InvalidLength)
         );
     }

@@ -1,4 +1,4 @@
-//! Line-oriented oracle for the `ed25519-cbor-v1` conformance vectors.
+//! Line-oriented oracle for the capability encoding and possession vectors.
 //!
 //! `tools/validate_capability_vectors.py` reimplements `spec/capability.cddl`
 //! from the specification text and compares its answer to this one, so agreement
@@ -7,28 +7,77 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
 
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use vot_capability::{Capability, Error, Scope, SignedCapability};
 
 fn main() -> io::Result<()> {
     for line in io::stdin().lock().lines() {
         let line = line?;
-        let Some((kind, hex)) = line.split_once(' ') else {
-            println!("err|INVALID_REQUEST");
-            continue;
-        };
-        let Some(input) = decode_hex(hex) else {
-            println!("err|INVALID_HEX");
-            continue;
-        };
-        let answer = match kind {
-            "signed" => signed_line(&input),
-            "capability" => capability_line(&input),
-            "scope" => scope_line(&input),
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let answer = match fields.as_slice() {
+            ["possession", public_key, transcript, signature] => {
+                verification_line(public_key, transcript, signature, "possession")
+            }
+            ["ed25519-sign", seed, transcript] => signing_line(seed, transcript),
+            ["ed25519-verify", public_key, transcript, signature] => {
+                verification_line(public_key, transcript, signature, "signature")
+            }
+            [kind @ ("signed" | "capability" | "scope"), hex] => {
+                let Some(input) = decode_hex(hex) else {
+                    println!("err|INVALID_HEX");
+                    continue;
+                };
+                match *kind {
+                    "signed" => signed_line(&input),
+                    "capability" => capability_line(&input),
+                    "scope" => scope_line(&input),
+                    _ => unreachable!(),
+                }
+            }
             _ => "err|INVALID_REQUEST".to_owned(),
         };
         println!("{answer}");
     }
     Ok(())
+}
+
+fn signing_line(seed: &str, transcript: &str) -> String {
+    let Some(seed) = decode_hex(seed).and_then(|value| value.try_into().ok()) else {
+        return "err|INVALID_REQUEST".to_owned();
+    };
+    let Some(transcript) = decode_hex(transcript) else {
+        return "err|INVALID_HEX".to_owned();
+    };
+    let key = SigningKey::from_bytes(&seed);
+    let signature = key.sign(&transcript).to_bytes();
+    format!(
+        "ok|signature|{}|{}",
+        encode_hex(&key.verifying_key().to_bytes()),
+        encode_hex(&signature)
+    )
+}
+
+fn verification_line(public_key: &str, transcript: &str, signature: &str, kind: &str) -> String {
+    let Some(public_key) = decode_hex(public_key).and_then(|value| value.try_into().ok()) else {
+        return "err|INVALID_REQUEST".to_owned();
+    };
+    let Some(transcript) = decode_hex(transcript) else {
+        return "err|INVALID_HEX".to_owned();
+    };
+    let Some(signature) = decode_hex(signature).and_then(|value| value.try_into().ok()) else {
+        return "err|INVALID_REQUEST".to_owned();
+    };
+    let Ok(public_key) = VerifyingKey::from_bytes(&public_key) else {
+        return "err|INVALID_REQUEST".to_owned();
+    };
+    if public_key
+        .verify_strict(&transcript, &Signature::from_bytes(&signature))
+        .is_ok()
+    {
+        format!("ok|{kind}")
+    } else {
+        "err|SIGNATURE".to_owned()
+    }
 }
 
 /// The envelope, without checking its signature: that needs a key the vectors do

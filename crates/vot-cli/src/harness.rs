@@ -149,6 +149,7 @@ impl DuplexQueue {
 pub(crate) struct Duplex {
     inbox: std::sync::Arc<DuplexQueue>,
     outbox: std::sync::Arc<DuplexQueue>,
+    channel_binding: Option<vot_transport_api::ChannelBinding>,
     sequence: u64,
     closed: bool,
 }
@@ -166,12 +167,14 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
         Duplex {
             inbox: std::sync::Arc::clone(&left),
             outbox: std::sync::Arc::clone(&right),
+            channel_binding: None,
             sequence: 0,
             closed: false,
         },
         Duplex {
             inbox: right,
             outbox: left,
+            channel_binding: None,
             sequence: 0,
             closed: false,
         },
@@ -179,6 +182,13 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
 }
 
 impl Duplex {
+    pub(crate) const fn set_channel_binding(
+        &mut self,
+        channel_binding: vot_transport_api::ChannelBinding,
+    ) {
+        self.channel_binding = Some(channel_binding);
+    }
+
     fn hang_up(&mut self) {
         if !self.closed {
             self.closed = true;
@@ -195,6 +205,13 @@ impl Drop for Duplex {
 }
 
 impl TransportAdapter for Duplex {
+    fn channel_binding(
+        &self,
+    ) -> Result<vot_transport_api::ChannelBinding, vot_transport_api::Error> {
+        self.channel_binding
+            .ok_or(vot_transport_api::Error::Unsupported)
+    }
+
     fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
         self.outbox.push(Event::Control(shared_payload(frame)));
         Ok(())

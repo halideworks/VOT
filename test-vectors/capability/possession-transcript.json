@@ -1,0 +1,53 @@
+{
+  "format": "vot-capability-possession-transcript-v1",
+  "capability_format": 2,
+  "domain_separator_hex": "564f54206361706162696c69747920706f7020763100",
+  "exporter": {
+    "label": "EXPORTER-VOT-Channel-Binding",
+    "context": null,
+    "output_bytes": 32
+  },
+  "note": "The holder signs the exact transcript below. The exporter is computed locally and never appears in a VOT frame. Rejected cases retain the positive signature while changing one transcript input.",
+  "test_signing_seed_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+  "holder_public_key_hex": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+  "case": {
+    "token_id_hex": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+    "session_id_hex": "22222222222222222222222222222222",
+    "nonce_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "channel_binding_hex": "2727272727272727272727272727272727272727272727272727272727272727",
+    "transcript_hex": "564f54206361706162696c69747920706f70207631000002c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1222222222222222222222222222222220020a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12727272727272727272727272727272727272727272727272727272727272727",
+    "signature_hex": "c770c0b914ac2d30c07500dd03bcc15519e608aa24a2f90308881d3d84fbc1d8add0ecfa0d24f47b13d6939866a16793280f41ab073324382677a469427ed00b"
+  },
+  "rejected": [
+    {
+      "name": "retired capability format",
+      "field": "capability_format",
+      "value": 1
+    },
+    {
+      "name": "different token identifier",
+      "field": "token_id_hex",
+      "value": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+    },
+    {
+      "name": "different session identifier",
+      "field": "session_id_hex",
+      "value": "23232323232323232323232323232323"
+    },
+    {
+      "name": "different nonce",
+      "field": "nonce_hex",
+      "value": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+    },
+    {
+      "name": "different channel binding",
+      "field": "channel_binding_hex",
+      "value": "2828282828282828282828282828282828282828282828282828282828282828"
+    },
+    {
+      "name": "different domain separator",
+      "field": "domain_separator_hex",
+      "value": "564f54206361706162696c69747920706f7020763200"
+    }
+  ]
+}

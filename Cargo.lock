@@ -2298,6 +2298,7 @@ dependencies = [
  "ed25519-dalek",
  "vot-cbor",
  "vot-codec",
+ "vot-transport-api",
 ]
 
 [[package]]

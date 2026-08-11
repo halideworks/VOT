@@ -188,6 +188,11 @@ jobs:
           CLIPPY_CONF_DIR=crates/vot-transport-sim \
             cargo +1.88.0 clippy -p vot-transport-sim --all-targets --locked -- -D warnings
 
+      - name: Build documentation
+        run: >-
+          RUSTDOCFLAGS="-D warnings" cargo +1.88.0 doc --workspace
+          --no-deps --locked
+
       - name: Test
         run: |
           cargo +1.88.0 test --workspace --locked

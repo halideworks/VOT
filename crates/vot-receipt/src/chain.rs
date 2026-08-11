@@ -34,7 +34,7 @@ pub struct VerifiedReceipt {
 /// A chain is scoped to one of these. The label cannot do that job: two keys
 /// may share one, and a chain mixing schemes would let an entry the reader
 /// could have minted sit inside a record presented as third-party evidence.
-/// That is the rule [`verify_witness`] already applies to a witness.
+/// That is the rule [`crate::verify_witness`] already applies to a witness.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerifiedBy {
     /// The public key the signature verified under, so two keys sharing a

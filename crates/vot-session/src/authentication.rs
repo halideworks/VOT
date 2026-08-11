@@ -6,7 +6,7 @@ use super::{AuthContext, Binding};
 ///
 /// `spec/wire.md` section 1.1 makes the exchange unconditional, so a caller
 /// names its stance rather than opting in. Two of the three are for one role
-/// only, and [`Session::begin`] refuses a stance the role cannot act on.
+/// only, and [`crate::Session::begin`] refuses a stance the role cannot act on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Authentication {
     /// No authentication required. The exchange concludes at `AUTH_CONTEXT`.
@@ -16,11 +16,11 @@ pub enum Authentication {
     NotRequired { nonce: [u8; 32] },
     /// A server that asks for a capability. The exchange concludes at
     /// `SESSION_ACCEPT`. The caller decides what a capability is worth through
-    /// [`Session::pending_authorization`], [`Session::grant`], and
-    /// [`Session::refuse`].
+    /// [`crate::Session::pending_authorization`], [`crate::Session::grant`], and
+    /// [`crate::Session::refuse`].
     Capability { challenge: AuthContext },
     /// A client that answers a capability challenge. The caller builds the
-    /// request and passes it to [`Session::present`].
+    /// request and passes it to [`crate::Session::present`].
     Presenting,
 }
 

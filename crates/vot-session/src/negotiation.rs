@@ -67,7 +67,7 @@ pub enum Accepted {
 }
 
 /// The exchange as a state machine, with no carrier and no buffers.
-/// [`Session`] connects it to a transport.
+/// [`crate::Session`] connects it to a transport.
 #[derive(Clone, Debug)]
 pub struct Negotiation {
     pub(super) role: EndpointRole,

@@ -3370,8 +3370,7 @@ pub mod live {
         }
 
         #[test]
-        #[allow(clippy::too_many_lines)]
-        fn a_capability_is_presented_and_authorized_over_the_real_carrier() {
+        fn capability_authentication_rejects_a_carrier_without_channel_binding() {
             let registration = Arc::new(super::registration().unwrap());
             let configuration = server_configuration(&registration);
             let alpn = [BufferRef::from(vot_transport_api::ALPN)];
@@ -3412,6 +3411,16 @@ pub mod live {
                 std::thread::yield_now();
             }
             assert!(connected, "the client never connected");
+            assert_eq!(
+                client.adapter().channel_binding(),
+                Err(vot_transport_api::Error::Unsupported),
+                "MsQuic silently claimed a channel binding"
+            );
+            assert_eq!(
+                client.channel_binding(),
+                None,
+                "the session invented binding material for an unsupported carrier"
+            );
             client.begin().unwrap();
 
             let accepted = loop {
@@ -3438,202 +3447,27 @@ pub mod live {
             );
             server.begin().unwrap();
 
-            while Instant::now() < deadline && client.pending_presentation().is_none() {
-                let _ = server.poll().unwrap();
-                let _ = client.poll().unwrap();
-                std::thread::yield_now();
-            }
-            let challenge = client
-                .pending_presentation()
-                .expect("the server never asked for a capability")
-                .clone();
-            assert_eq!(challenge.nonce, vec![0x5a; 32], "the server's own nonce");
-            assert_eq!(
-                challenge.formats,
-                vec![u64::from(vot_capability::FORMAT_ID)]
-            );
-            assert!(!client.is_ready() && !server.is_ready());
-            assert!(
-                client
-                    .send_reliable(
-                        StreamId(1),
-                        &framed(vot_codec::frame_type::DATA_RECORD, b"x")
-                    )
-                    .is_err(),
-                "the data plane is shut until the exchange concludes"
-            );
-
-            let issuer_key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
-            let holder_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
-            let session_id = [0xc1; 16];
-            let capability = vot_capability::Capability {
-                issuer: "issuer.example".to_owned(),
-                audience: "receiver.example".to_owned(),
-                holder_key: holder_key.verifying_key().to_bytes(),
-                operations: vec![vot_codec::operation::PUBLISH],
-                scope: vot_capability::Scope {
-                    suite: 1,
-                    root: [7; 32],
-                    length: Some(1 << 20),
-                    ranges: vec![vot_capability::Range {
-                        offset: 0,
-                        length: 65_536,
-                    }],
-                },
-                limits: vec![vot_capability::Limit {
-                    id: u16::try_from(vot_codec::resource_limit::CONCURRENT_LANES).unwrap(),
-                    value: 4,
-                }],
-                not_before: 1_700_000_000,
-                expiry: 1_700_003_600,
-                token_id: [0xc7; 16],
-                delegation: vot_capability::NO_FURTHER_DELEGATION,
-            };
-            let signed = vot_capability::sign(&capability, b"issuer-1", &issuer_key).unwrap();
-            let proof = vot_capability::verify::prove_possession(
-                &capability,
-                &session_id,
-                &challenge.nonce,
-                &holder_key,
-            )
-            .unwrap();
-
-            client
-                .present(vot_codec::frames::SessionOpen {
-                    session_id,
-                    capability_format: u64::from(vot_capability::FORMAT_ID),
-                    capability: vot_capability::encode(&signed).unwrap(),
-                    requested_scope: vot_capability::encode_scope(&capability.scope).unwrap(),
-                    binding_proof: proof,
-                })
-                .unwrap();
-
-            while Instant::now() < deadline && server.pending_authorization().is_none() {
-                let _ = server.poll().unwrap();
-                let _ = client.poll().unwrap();
-                std::thread::yield_now();
-            }
-            let (asked, open) = server
-                .pending_authorization()
-                .expect("the request never arrived");
-            assert_eq!(open.session_id, session_id);
-            assert_eq!(open.capability_format, u64::from(vot_capability::FORMAT_ID));
-            assert!(!server.is_ready(), "a request is not a grant");
-
-            let anchors =
-                vot_capability::verify::Anchors::new().with(vot_capability::verify::IssuerEntry {
-                    key_id: b"issuer-1".to_vec(),
-                    issuer: "issuer.example".to_owned(),
-                    audiences: vec!["receiver.example".to_owned()],
-                    key: issuer_key.verifying_key(),
-                });
-            let enforceable = vot_capability::verify::enforceable_limits();
-            let presented = vot_capability::verify::Presentation {
-                nonce: &asked.nonce,
-                session_id: open.session_id,
-                proof: &open.binding_proof,
-            };
-            let authorized = vot_capability::verify::authorize(
-                &vot_capability::decode(&open.capability).unwrap(),
-                presented,
-                &anchors,
-                vot_capability::verify::Policy {
-                    audience: "receiver.example",
-                    now: 1_700_001_000,
-                    skew: 30,
-                    denied: &[],
-                    known_limits: &enforceable,
-                },
-            )
-            .expect("the verifier refused a capability it anchored");
-
-            let mut tampered = vot_capability::decode(&open.capability).unwrap();
-            tampered.signature[0] ^= 1;
-            let refused = vot_capability::verify::authorize(
-                &tampered,
-                presented,
-                &anchors,
-                vot_capability::verify::Policy {
-                    audience: "receiver.example",
-                    now: 1_700_001_000,
-                    skew: 30,
-                    denied: &[],
-                    known_limits: &enforceable,
-                },
-            )
-            .expect_err("a tampered signature is refused");
-            assert_eq!(refused, vot_capability::verify::Denial::Signature);
-            assert_eq!(
-                refused.wire_reason(),
-                vot_codec::error_code::AUTHENTICATION_FAILED,
-                "and what the peer would be told is the registered code"
-            );
-            assert_eq!(
-                authorized
-                    .limit(u16::try_from(vot_codec::resource_limit::CONCURRENT_LANES).unwrap()),
-                Some(4),
-                "and the ceiling reached the deployment that has to hold it"
-            );
-            assert_eq!(
-                authorized.allows(vot_capability::verify::Request {
-                    operation: vot_codec::Operation::Publish,
-                    suite: 1,
-                    root: [7; 32],
-                    range: Some(vot_capability::Range {
-                        offset: 0,
-                        length: 65_536,
-                    }),
-                }),
-                Ok(())
-            );
-
-            let granted = vot_capability::Scope {
-                ranges: vec![vot_capability::Range {
-                    offset: 0,
-                    length: 32_768,
-                }],
-                ..authorized.capability().scope.clone()
-            };
-            assert!(
-                !granted.allows(vot_capability::Range {
-                    offset: 0,
-                    length: 65_536,
-                }),
-                "the grant is narrower than the capability, or narrowing means nothing"
-            );
-            server
-                .grant(vot_capability::encode_scope(&granted).unwrap())
-                .unwrap();
-            assert!(server.is_ready());
-
-            while Instant::now() < deadline && !client.is_ready() {
-                let _ = server.poll().unwrap();
-                let _ = client.poll().unwrap();
-                std::thread::yield_now();
-            }
-            assert!(client.is_ready(), "the client never read the acceptance");
-            let accepted = client
-                .granted()
-                .expect("the acceptance carries what was granted");
-            assert_eq!(
-                vot_capability::decode_scope(&accepted.granted_scope),
-                Ok(granted),
-                "the client reads the narrowed scope the verifier decided"
-            );
-
-            let payload = framed(vot_codec::frame_type::DATA_RECORD, b"after authentication");
-            client.send_reliable(StreamId(1), &payload).unwrap();
-            client.flush().unwrap();
-            let mut records = Vec::new();
-            while Instant::now() < deadline && records.is_empty() {
-                while let Some(event) = server.poll().unwrap() {
-                    if let Event::Reliable { bytes, .. } = event {
-                        records.push(bytes.to_vec());
-                    }
+            let rejected = loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "the unsupported carrier was never rejected"
+                );
+                match server.poll() {
+                    Err(error) => break error,
+                    Ok(_) => std::thread::yield_now(),
                 }
-                std::thread::yield_now();
-            }
-            assert_eq!(records, vec![payload]);
+            };
+            assert_eq!(
+                rejected.kind(),
+                &vot_session::ErrorKind::Transport(vot_transport_api::Error::Unsupported),
+                "capability authentication failed for something other than missing binding"
+            );
+            assert_eq!(
+                server.adapter().channel_binding(),
+                Err(vot_transport_api::Error::Unsupported)
+            );
+            assert_eq!(server.channel_binding(), None);
+            assert!(!client.is_ready() && !server.is_ready());
 
             drop(client);
             drop(server);

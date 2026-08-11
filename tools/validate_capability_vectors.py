@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Independent validator for the ed25519-cbor-v1 capability vectors.
+"""Independent validator for the ed25519-cbor-tls-exporter-v1 vectors.
 
-Reimplements spec/capability.cddl and the rules spec/security.md section 5 puts
-on a capability, from the specification text rather than from the Rust crate, so
-agreement between the two is evidence and not a tautology. Every case is then put
+Reimplements spec/capability.cddl, the rules spec/security.md section 5 puts on a
+capability, and the possession transcript in spec/registries.md section 11 from
+the specification text rather than from the Rust crate. Every case is then put
 through the Rust oracle and the two answers are compared.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import struct
 import subprocess
 import sys
 import unicodedata
@@ -26,6 +27,11 @@ RANGES = 64
 SIGNED = 49_152
 SCOPE = 4_096
 SUITES = (1, 2)
+CAPABILITY_DOMAIN = b"VOT capability v0\0"
+PROOF_DOMAIN = b"VOT capability pop v1\0"
+PROOF_FORMAT = 2
+CHANNEL_BINDING_BYTES = 32
+EXPORTER_LABEL = "EXPORTER-VOT-Channel-Binding"
 
 
 class Refused(Exception):
@@ -322,9 +328,127 @@ def oracle_lines(root: Path, requests: list[str]) -> list[str]:
     return result.stdout.splitlines()
 
 
+def capability_signing_input(
+    capability_format: int, key_id: bytes, capability: bytes
+) -> bytes:
+    assert 0 <= capability_format <= 0xFFFF
+    assert KEY_ID[0] <= len(key_id) <= KEY_ID[1]
+    return b"".join(
+        (
+            CAPABILITY_DOMAIN,
+            struct.pack(">H", capability_format),
+            bytes([len(key_id)]),
+            key_id,
+            capability,
+        )
+    )
+
+
+def validate_capability_signatures(root: Path, document: dict[str, Any]) -> int:
+    metadata = document["capability_signature"]
+    assert bytes.fromhex(metadata["domain_separator_hex"]) == CAPABILITY_DOMAIN
+    seed = metadata["test_signing_seed_hex"]
+    public_key = metadata["issuer_public_key_hex"]
+    assert len(bytes.fromhex(seed)) == 32
+    assert len(bytes.fromhex(public_key)) == 32
+
+    requests = []
+    expected = []
+    first = None
+    for case in document["cases"]:
+        if case["kind"] != "signed" or case["result"] != "ok":
+            continue
+        signed = read_signed(bytes.fromhex(case["bytes"]))
+        transcript = capability_signing_input(
+            document["capability_format"], signed["key_id"], signed["capability"]
+        )
+        signature = signed["signature"].hex()
+        requests.append(f"ed25519-sign {seed} {transcript.hex()}")
+        expected.append(f"ok|signature|{public_key}|{signature}")
+        if first is None:
+            first = (signed, signature)
+
+    assert first is not None, "no accepted signed capability case"
+    signed, signature = first
+    retired = capability_signing_input(1, signed["key_id"], signed["capability"])
+    requests.append(f"ed25519-verify {public_key} {retired.hex()} {signature}")
+    expected.append("err|SIGNATURE")
+    actual = oracle_lines(root, requests)
+    assert actual == expected, f"capability signature oracle={actual} expected={expected}"
+    return len(requests)
+
+
+def possession_transcript(values: dict[str, Any]) -> bytes:
+    domain = bytes.fromhex(values["domain_separator_hex"])
+    token_id = bytes.fromhex(values["token_id_hex"])
+    session_id = bytes.fromhex(values["session_id_hex"])
+    nonce = bytes.fromhex(values["nonce_hex"])
+    channel_binding = bytes.fromhex(values["channel_binding_hex"])
+    capability_format = values["capability_format"]
+    assert 0 <= capability_format <= 0xFFFF
+    assert len(token_id) == 16
+    assert len(session_id) == 16
+    assert 16 <= len(nonce) <= 64
+    assert len(channel_binding) == CHANNEL_BINDING_BYTES
+    return b"".join(
+        (
+            domain,
+            struct.pack(">H", capability_format),
+            token_id,
+            session_id,
+            struct.pack(">H", len(nonce)),
+            nonce,
+            channel_binding,
+        )
+    )
+
+
+def validate_possession(root: Path) -> int:
+    path = root / "test-vectors" / "capability" / "possession-transcript.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["format"] == "vot-capability-possession-transcript-v1"
+    assert document["capability_format"] == PROOF_FORMAT
+    assert bytes.fromhex(document["domain_separator_hex"]) == PROOF_DOMAIN
+    assert document["exporter"] == {
+        "label": EXPORTER_LABEL,
+        "context": None,
+        "output_bytes": CHANNEL_BINDING_BYTES,
+    }
+    public_key = document["holder_public_key_hex"]
+    assert len(bytes.fromhex(public_key)) == 32
+    assert len(bytes.fromhex(document["test_signing_seed_hex"])) == 32
+
+    case = {
+        **document["case"],
+        "capability_format": document["capability_format"],
+        "domain_separator_hex": document["domain_separator_hex"],
+    }
+    transcript = possession_transcript(case)
+    assert transcript.hex() == case["transcript_hex"]
+    signature = case["signature_hex"]
+    assert len(bytes.fromhex(signature)) == 64
+
+    requests = [f"possession {public_key} {transcript.hex()} {signature}"]
+    expected = ["ok|possession"]
+    names = []
+    for rejected in document["rejected"]:
+        names.append(rejected["name"])
+        altered = dict(case)
+        altered[rejected["field"]] = rejected["value"]
+        requests.append(
+            f"possession {public_key} {possession_transcript(altered).hex()} {signature}"
+        )
+        expected.append("err|SIGNATURE")
+    assert len(names) == len(set(names)), "duplicate possession refusal case"
+    assert len(names) >= 6, "too few possession refusal cases to be evidence"
+    actual = oracle_lines(root, requests)
+    assert actual == expected, f"possession oracle={actual} expected={expected}"
+    return len(requests)
+
+
 def validate(document: dict[str, Any]) -> tuple[list[str], list[str]]:
     assert document["format"] == "vot-capability-vectors-v1"
-    assert document["capability_format"] == 1
+    assert document["capability_format"] == PROOF_FORMAT
     cases = document["cases"]
     assert cases, "no cases"
     names = [case["name"] for case in cases]
@@ -370,6 +494,8 @@ def main() -> int:
                 raise AssertionError(
                     f"{request[:40]}: python={expected[:96]} rust={actual[:96]}"
                 )
+        signature_cases = validate_capability_signatures(root, document)
+        possession_cases = validate_possession(root)
     except (
         AssertionError,
         OSError,
@@ -379,7 +505,12 @@ def main() -> int:
     ) as error:
         print(f"capability vector validation failed: {error}", file=sys.stderr)
         return 1
-    print(f"capability vector validation: PASS ({len(document['cases'])} cases cross-checked)")
+    print(
+        "capability vector validation: PASS "
+        f"({len(document['cases'])} encoding cases, "
+        f"{signature_cases} capability signature cases, and "
+        f"{possession_cases} possession cases cross-checked)"
+    )
     return 0
 
 

@@ -1,4 +1,4 @@
-//! Writes the canonical conformance vectors for `ed25519-cbor-v1`.
+//! Writes the canonical conformance vectors for `ed25519-cbor-tls-exporter-v1`.
 //!
 //! Run with `cargo run -p vot-capability --bin vot-capability-vectors`. The
 //! refusal cases in the vector file are hand-written bytes rather than output

@@ -52,7 +52,8 @@ The capability itself is opaque at this layer. Its format is a value from the
 capability format registry in `spec/registries.md` section 11 and its bytes are
 handed to the deployment's authentication policy, which is what
 `spec/security.md` section 5 describes. This section defines only the exchange
-that carries it.
+that carries it. Format `0x0001` is retired and MUST NOT be advertised or sent;
+the channel-bound capability format is `0x0002`.
 
 The four payloads are canonical CBOR maps under `spec/session.cddl`, encoded and
 decoded by the deterministic rules the other typed payloads use. A payload that
@@ -60,11 +61,13 @@ is not in that form is `MALFORMED_FRAME`.
 
 `AUTH_CONTEXT` carries a nonce, the channel binding this deployment uses, and
 the capability formats it accepts. The nonce is fresh per session and gives the
-client something to sign when the binding is proof of possession. The format
-list lets a client holding none of the accepted formats fail immediately rather
-than after a rejected `SESSION_OPEN`. Formats are ascending and duplicates are
-rejected, so one server policy has one encoding. An empty list means no
-authentication is required.
+client something to sign when the binding is proof of possession. For format
+`0x0002`, both endpoints also obtain the local TLS exporter value that
+`spec/registries.md` section 11 defines. The exporter value does not travel in
+`AUTH_CONTEXT`. The format list lets a client holding none of the accepted
+formats fail immediately rather than after a rejected `SESSION_OPEN`. Formats
+are ascending and duplicates are rejected, so one server policy has one
+encoding. An empty list means no authentication is required.
 
 `SESSION_OPEN` carries a session identifier, the chosen format, the capability,
 the requested scope, and the binding proof. The session identifier is an
@@ -73,7 +76,13 @@ The format MUST be one the server advertised. An empty requested scope asks for
 the capability's whole scope; a non-empty one asks for a subset, and a server
 MUST NOT grant more than the capability allows regardless of what is requested.
 The binding proof is empty when the binding is none, and otherwise proves
-possession of the key the capability names, over the `AUTH_CONTEXT` nonce.
+possession of the key the capability names. Format `0x0002` signs the domain,
+format, token identifier, session identifier, length-prefixed `AUTH_CONTEXT`
+nonce, and the presenting session's 32-byte TLS exporter value in the exact
+order `spec/registries.md` section 11 defines. A proof produced on one TLS
+session therefore fails on another. Missing exporter material, a proof made
+under format `0x0001`, or any mismatch fails authentication without retrying an
+unbound format.
 
 `SESSION_ACCEPT` repeats the session identifier and carries the scope the server
 actually authorized, which may be narrower than what was requested. The
@@ -240,7 +249,10 @@ arrive in one read.
 
 The TLS/TCP fallback uses the identical VOT frame bytes on a reliable byte
 stream. Switching carriers preserves object, package, verified-range, durable,
-and receipt state; it does not reuse unsafe path or congestion state.
+and receipt state; it does not reuse unsafe path or congestion state. An
+authenticated grant is bound to its carrier session and is not preserved. The
+new carrier repeats session authentication with its own channel binding before
+it sends or accepts a frame marked `auth: yes`.
 
 An implementation SHOULD start QUIC first and start authenticated TLS/TCP after
 a short configurable delay rather than waiting for a long UDP timeout. It may

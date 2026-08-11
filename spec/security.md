@@ -83,9 +83,20 @@ capabilities permit.
 ## 5. Authentication and authorization
 
 All live carriers MUST provide TLS 1.3 or a security profile with equivalent
-peer authentication, confidentiality, integrity, and downgrade protection.
-Production policy MUST authenticate the server. Client authentication may use a
-certificate, an application identity authenticated above TLS, or both.
+confidentiality, integrity, and downgrade protection. A deployment that relies
+on server identity for authority or intended-peer confidentiality MUST
+authenticate that identity. An anonymous content-addressed deployment MAY use
+an ephemeral self-signed server certificate only when a trusted object or
+package root independently authenticates every accepted byte and no
+authorization decision depends on server identity. Client authentication may
+use a certificate, an application identity authenticated above TLS, or both.
+
+TLS exporter binding proves that a holder's authorization proof was made on the
+same TLS session that presents it. An interposer that terminates TLS creates two
+different exporters and cannot forward the proof between them. The exporter
+does not authenticate the server's identity to the client. Anonymous mode still
+provides content authenticity from the trusted root, not server identity or
+confidentiality from the intended server.
 
 A capability is signed or authenticated data containing at least:
 
@@ -104,6 +115,14 @@ claims fail closed. Bearer capabilities SHOULD be bound to a TLS exporter, peer
 key, or proof-of-possession key. When deployment constraints require an unbound
 bearer token, its shorter lifetime and replay exposure MUST be declared in
 policy and audit data.
+
+The registered `ed25519-cbor-tls-exporter-v1` format requires proof of possession
+bound to the presenting TLS session's exporter as `spec/registries.md` section
+11 defines. A deployment that advertises that format MUST fail closed when its
+carrier cannot provide the exporter and MUST NOT retry or accept the retired
+nonce-only format. A carrier switch invalidates the authenticated grant and
+reruns the exchange with the new carrier's exporter before protected work
+resumes.
 
 A verifier accepts a capability only against a configured issuer entry naming a
 key identifier, a verification key, and the audiences that key may issue for. All
@@ -127,8 +146,8 @@ faster than expiry MUST shorten the lifetime.
 
 A verifier MUST evaluate the delegation constraints claim rather than carry it
 unread. A capability format that does not define delegation MUST refuse a
-capability claiming any, which is what `ed25519-cbor-v1` does; chained delegation
-is a separate capability format identifier.
+capability claiming any, which is what `ed25519-cbor-tls-exporter-v1` does;
+chained delegation is a separate capability format identifier.
 
 Authorization is checked again when a request expands scope, switches source or
 carrier, publishes an object, creates an alias, or renews a lease. Cache presence

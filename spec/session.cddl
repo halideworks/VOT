@@ -14,7 +14,7 @@ session-open = {
   2: capability-format,
   3: bstr .size (0..49152),     ; capability, opaque at this layer
   4: bstr .size (0..4096),      ; requested_scope, empty asks for all of it
-  5: bstr .size (0..4096),      ; binding_proof, empty when binding is 0
+  5: bstr .size (0..4096),      ; binding_proof, empty for 0; format-defined otherwise
 }
 
 session-accept = {
@@ -33,7 +33,7 @@ session-reject = {
 ; 0 none, 1 proof of possession
 binding = 0 / 1
 
-; 0 is reserved and never sent; see spec/registries.md section 11.
+; 0 is reserved. 1 is parseable but retired; see spec/registries.md section 11.
 capability-format = 1..65535
 
 ; AUTHENTICATION_FAILED, AUTHORIZATION_FAILED, REPLAY_REJECTED

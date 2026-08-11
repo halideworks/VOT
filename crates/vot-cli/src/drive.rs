@@ -276,7 +276,16 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
             let Some((challenge, open)) = self.session.pending_authorization() else {
                 return Ok(());
             };
-            requirement.decide(challenge, open, crate::authz::now_seconds()?)
+            let channel_binding = self
+                .session
+                .channel_binding()
+                .ok_or(Error::ChannelBindingUnavailable)?;
+            requirement.decide(
+                challenge,
+                open,
+                channel_binding,
+                crate::authz::now_seconds()?,
+            )
         };
         match decision {
             Some(scope) => self.session.grant(scope)?,

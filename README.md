@@ -129,10 +129,12 @@ token, because the difference between an expired one and a forged one is an
 oracle.
 
 What the token decides is that whoever opened the session holds the key it
-names. It does not decide that the peer at the far end of the QUIC connection
-is that holder: the proof is over a nonce, so an interposer can forward it.
-Binding to the channel needs a keying-material exporter quiche does not
-expose. An interposer still cannot give you different bytes.
+names on the TLS session carrying the request. The proof covers the session
+challenge and the TLS exporter value, so an interposer that terminates TLS has a
+different binding and cannot forward the proof. Capability authentication fails
+closed on a carrier without that exporter. The exporter does not authenticate
+the serve's identity to the fetch; anonymous mode authenticates received content
+against the trusted root instead. See ADR-0037.
 
 ### Environment variables
 

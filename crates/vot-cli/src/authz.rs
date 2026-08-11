@@ -8,6 +8,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use vot_capability::verify::{Anchors, IssuerEntry, Policy, Presentation, Request};
 use vot_capability::{Capability, Operation, Scope};
 use vot_codec::frames::{AuthContext, Binding, SessionOpen};
+use vot_transport_api::ChannelBinding;
 
 use crate::Error;
 
@@ -84,7 +85,13 @@ impl Requirement {
     /// Refuses without saying which rule broke: every path out is the same
     /// two values, and the reason is [`REFUSAL_DETAIL`]'s to explain.
     #[must_use]
-    pub fn decide(&self, challenge: &AuthContext, open: &SessionOpen, now: u64) -> Option<Vec<u8>> {
+    pub fn decide(
+        &self,
+        challenge: &AuthContext,
+        open: &SessionOpen,
+        channel_binding: ChannelBinding,
+        now: u64,
+    ) -> Option<Vec<u8>> {
         if open.capability_format != u64::from(vot_capability::FORMAT_ID) {
             return None;
         }
@@ -94,6 +101,7 @@ impl Requirement {
             Presentation {
                 nonce: &challenge.nonce,
                 session_id: open.session_id,
+                channel_binding,
                 proof: &open.binding_proof,
             },
             &self.anchors,
@@ -166,13 +174,18 @@ impl Holder {
     /// Reports [`Error::Randomness`] for a system that will not give 16
     /// bytes, and [`Error::InvalidArguments`] for a challenge whose nonce is
     /// outside what the format signs over.
-    pub fn answer(&self, challenge: &AuthContext) -> Result<SessionOpen, Error> {
+    pub fn answer(
+        &self,
+        challenge: &AuthContext,
+        channel_binding: ChannelBinding,
+    ) -> Result<SessionOpen, Error> {
         let mut session_id = [0_u8; 16];
         getrandom::fill(&mut session_id).map_err(|_| Error::Randomness)?;
         let proof = vot_capability::verify::prove_possession(
             &self.capability,
             &session_id,
             &challenge.nonce,
+            channel_binding,
             &self.key,
         )
         .map_err(|_| Error::InvalidArguments)?;
@@ -345,6 +358,10 @@ mod tests {
     const ROOT: [u8; 32] = [7; 32];
     const NOW: u64 = 1_700_000_000;
 
+    fn channel(seed: u8) -> ChannelBinding {
+        ChannelBinding::from_bytes([seed; vot_transport_api::CHANNEL_BINDING_LEN])
+    }
+
     fn requirement(issuer_key: &SigningKey) -> Requirement {
         Requirement::new(
             ISSUER,
@@ -375,14 +392,36 @@ mod tests {
         let requirement = requirement(&issuer_key);
         let holder = holder(&issuer_key, &keypair(2), ROOT);
         let challenge = requirement.challenge([9; 32]);
-        let open = holder.answer(&challenge).expect("a request");
+        let binding = channel(5);
+        let open = holder.answer(&challenge, binding).expect("a request");
         let granted = requirement
-            .decide(&challenge, &open, NOW)
+            .decide(&challenge, &open, binding, NOW)
             .expect("the token names this package");
         assert_eq!(
             granted,
             vot_capability::encode_scope(&package_scope(ROOT)).expect("the scope"),
             "the grant is the scope the token carries"
+        );
+    }
+
+    #[test]
+    fn a_proof_from_one_channel_cannot_be_replayed_on_another() {
+        let issuer_key = keypair(1);
+        let requirement = requirement(&issuer_key);
+        let holder = holder(&issuer_key, &keypair(2), ROOT);
+        let challenge = requirement.challenge([9; 32]);
+        let first = channel(5);
+        let second = channel(6);
+        let open = holder.answer(&challenge, first).expect("a request");
+
+        assert!(
+            requirement.decide(&challenge, &open, first, NOW).is_some(),
+            "the channel that made the proof was refused"
+        );
+        assert_eq!(
+            requirement.decide(&challenge, &open, second, NOW),
+            None,
+            "a proof moved between carriers"
         );
     }
 
@@ -395,33 +434,38 @@ mod tests {
         let requirement = requirement(&issuer_key);
         let challenge = requirement.challenge([9; 32]);
         let holder_key = keypair(2);
+        let binding = channel(5);
 
         let another_issuer = holder(&keypair(3), &holder_key, ROOT);
         let another_package = holder(&issuer_key, &holder_key, [8; 32]);
         let good = holder(&issuer_key, &holder_key, ROOT);
 
-        let mut expired = good.answer(&challenge).expect("a request");
-        let mut wrong_nonce = good.answer(&challenge).expect("a request");
+        let mut expired = good.answer(&challenge, binding).expect("a request");
+        let mut wrong_nonce = good.answer(&challenge, binding).expect("a request");
         wrong_nonce.binding_proof = holder(&issuer_key, &holder_key, ROOT)
-            .answer(&requirement.challenge([1; 32]))
+            .answer(&requirement.challenge([1; 32]), binding)
             .expect("a request made for another challenge")
             .binding_proof;
-        let mut no_proof = good.answer(&challenge).expect("a request");
+        let mut no_proof = good.answer(&challenge, binding).expect("a request");
         no_proof.binding_proof.clear();
-        let mut wrong_format = good.answer(&challenge).expect("a request");
+        let mut wrong_format = good.answer(&challenge, binding).expect("a request");
         wrong_format.capability_format += 1;
-        let mut not_a_token = good.answer(&challenge).expect("a request");
+        let mut not_a_token = good.answer(&challenge, binding).expect("a request");
         not_a_token.capability = vec![0xff; 8];
 
         for (name, request, now) in [
             (
                 "another issuer",
-                another_issuer.answer(&challenge).expect("a request"),
+                another_issuer
+                    .answer(&challenge, binding)
+                    .expect("a request"),
                 NOW,
             ),
             (
                 "another package",
-                another_package.answer(&challenge).expect("a request"),
+                another_package
+                    .answer(&challenge, binding)
+                    .expect("a request"),
                 NOW,
             ),
             ("a proof for another challenge", wrong_nonce, NOW),
@@ -440,7 +484,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                requirement.decide(&challenge, &request, now),
+                requirement.decide(&challenge, &request, binding, now),
                 None,
                 "{name} was granted"
             );
@@ -451,7 +495,8 @@ mod tests {
             requirement
                 .decide(
                     &challenge,
-                    &good.answer(&challenge).expect("a request"),
+                    &good.answer(&challenge, binding).expect("a request"),
+                    binding,
                     NOW
                 )
                 .is_some()

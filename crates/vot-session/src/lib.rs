@@ -33,6 +33,7 @@ pub use session::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
 
     /// A transport that hands each endpoint whatever the other submitted.
@@ -50,9 +51,21 @@ mod tests {
         refuse_control: Option<TransportError>,
         closed: Vec<u16>,
         receive_limits: Option<vot_transport_api::ReceiveLimits>,
+        channel_binding: Option<vot_transport_api::ChannelBinding>,
+        channel_binding_error: Option<TransportError>,
+        channel_binding_queries: Cell<usize>,
     }
 
     impl TransportAdapter for Loopback {
+        fn channel_binding(&self) -> Result<vot_transport_api::ChannelBinding, TransportError> {
+            self.channel_binding_queries
+                .set(self.channel_binding_queries.get() + 1);
+            if let Some(error) = self.channel_binding_error {
+                return Err(error);
+            }
+            self.channel_binding.ok_or(TransportError::Unsupported)
+        }
+
         fn send_control(&mut self, frame: &[u8]) -> Result<(), TransportError> {
             if let Some(error) = self.refuse_control {
                 return Err(error);
@@ -382,8 +395,338 @@ mod tests {
         AuthContext {
             nonce: nonce.to_vec(),
             binding: Binding::None,
-            formats: vec![1, 2],
+            formats: vec![3, 4],
         }
+    }
+
+    fn proof_demanding(nonce: [u8; 32]) -> AuthContext {
+        AuthContext {
+            nonce: nonce.to_vec(),
+            binding: Binding::ProofOfPossession,
+            formats: vec![2],
+        }
+    }
+
+    #[test]
+    fn a_server_cannot_advertise_retired_or_unbound_active_authentication() {
+        for challenge in [
+            AuthContext {
+                nonce: vec![3; 32],
+                binding: Binding::None,
+                formats: vec![1],
+            },
+            AuthContext {
+                nonce: vec![3; 32],
+                binding: Binding::None,
+                formats: vec![2],
+            },
+        ] {
+            let mut server = Session::server(
+                Loopback::default(),
+                Settings::default(),
+                BTreeSet::new(),
+                Authentication::Capability { challenge },
+            );
+            let error = server.begin().unwrap_err();
+            assert_eq!(error.kind(), &ErrorKind::AuthContextInvalid);
+            assert_eq!(server.adapter().channel_binding_queries.get(), 0);
+            assert!(server.adapter().sent.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_bound_server_latches_only_after_the_carrier_connects() {
+        let binding = vot_transport_api::ChannelBinding::from_bytes([0x27; 32]);
+        let adapter = Loopback {
+            channel_binding: Some(binding),
+            ..Loopback::default()
+        };
+        let mut server = Session::server(
+            adapter,
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: proof_demanding([3; 32]),
+            },
+        );
+
+        server.begin().unwrap();
+        assert_eq!(server.adapter().channel_binding_queries.get(), 0);
+        assert_eq!(server.channel_binding(), None);
+
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+        assert_eq!(
+            server.poll().unwrap(),
+            Some(Event::Connected(vot_transport_api::ConnectionId(7)))
+        );
+        assert_eq!(server.channel_binding(), Some(binding));
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+        assert!(server.poll().unwrap().is_some());
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+    }
+
+    #[test]
+    fn beginning_twice_after_binding_does_not_erase_it() {
+        let binding = vot_transport_api::ChannelBinding::from_bytes([0x27; 32]);
+        let adapter = Loopback {
+            channel_binding: Some(binding),
+            ..Loopback::default()
+        };
+        let mut server = Session::server(
+            adapter,
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: proof_demanding([3; 32]),
+            },
+        );
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+        assert!(server.poll().unwrap().is_some());
+        assert_eq!(server.channel_binding(), Some(binding));
+
+        assert!(server.begin().is_err());
+        assert_eq!(server.channel_binding(), Some(binding));
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+    }
+
+    #[test]
+    fn a_backend_begin_failure_keeps_the_handshake_for_retry() {
+        let mut client = Session::client(
+            Loopback {
+                refuse_control: Some(TransportError::Backend),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [3; 32] },
+        );
+
+        let error = client.begin().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Transport(TransportError::Backend));
+        assert_eq!(client.unsent_negotiation_frames(), 2);
+        assert!(client.adapter().sent.is_empty());
+
+        client.adapter.refuse_control = None;
+        client.flush().unwrap();
+        assert_eq!(client.unsent_negotiation_frames(), 0);
+        assert_eq!(client.adapter().sent.len(), 2);
+        assert_eq!(client.state(), State::HelloSent);
+    }
+
+    #[test]
+    fn a_bound_server_fails_closed_when_connected_without_binding() {
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: proof_demanding([3; 32]),
+            },
+        );
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+
+        let error = server.poll().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::Transport(TransportError::Unsupported)
+        );
+        assert_eq!(server.channel_binding(), None);
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+        assert_eq!(server.state(), State::Closed);
+        assert_eq!(server.pending_authorization(), None);
+        assert!(server.grant(Vec::new()).is_err());
+        assert_eq!(server.poll().unwrap(), None);
+        assert_eq!(server.adapter().closed, vec![error.close_code()]);
+    }
+
+    #[test]
+    fn backend_binding_failure_cannot_be_resumed_by_a_server() {
+        let adapter = Loopback {
+            channel_binding_error: Some(TransportError::Backend),
+            ..Loopback::default()
+        };
+        let mut server = Session::server(
+            adapter,
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: proof_demanding([3; 32]),
+            },
+        );
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Transport(TransportError::Backend));
+        assert_eq!(server.state(), State::Closed);
+        assert_eq!(server.pending_authorization(), None);
+        assert!(server.grant(Vec::new()).is_err());
+        assert_eq!(server.poll().unwrap(), None);
+    }
+
+    #[test]
+    fn presenting_client_binding_failures_are_terminal() {
+        for transport_error in [TransportError::Unsupported, TransportError::Backend] {
+            let client_adapter = Loopback {
+                channel_binding_error: Some(transport_error),
+                ..Loopback::default()
+            };
+            let server_adapter = Loopback {
+                channel_binding: Some(vot_transport_api::ChannelBinding::from_bytes([0x27; 32])),
+                ..Loopback::default()
+            };
+            let mut client = Session::client(
+                client_adapter,
+                Settings::default(),
+                BTreeSet::new(),
+                Authentication::Presenting,
+            );
+            let mut server = Session::server(
+                server_adapter,
+                Settings::default(),
+                BTreeSet::new(),
+                Authentication::Capability {
+                    challenge: proof_demanding([3; 32]),
+                },
+            );
+            client.begin().unwrap();
+            server.begin().unwrap();
+            pump(&mut client, &mut server);
+            for frame in std::mem::take(&mut server.adapter.sent) {
+                client.adapter.events.push_back(control(&frame));
+            }
+
+            let error = client.poll().unwrap_err();
+            assert_eq!(error.kind(), &ErrorKind::Transport(transport_error));
+            assert_eq!(client.state(), State::Closed);
+            assert_eq!(client.pending_presentation(), None);
+            let mut open = request([7; 16], 4);
+            open.binding_proof = vec![4; 64];
+            assert!(client.present(open).is_err());
+            assert_eq!(client.poll().unwrap(), None);
+            assert_eq!(client.adapter().closed, vec![error.close_code()]);
+        }
+    }
+
+    #[test]
+    fn an_open_session_does_not_query_binding_when_connected() {
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [3; 32] },
+        );
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+
+        assert!(server.poll().unwrap().is_some());
+        assert_eq!(server.adapter().channel_binding_queries.get(), 0);
+        assert_eq!(server.channel_binding(), None);
+    }
+
+    #[test]
+    fn a_recoverable_send_failure_preserves_the_latched_binding() {
+        let binding = vot_transport_api::ChannelBinding::from_bytes([0x27; 32]);
+        let mut client = Session::client(
+            Loopback {
+                channel_binding: Some(binding),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Presenting,
+        );
+        let mut server = Session::server(
+            Loopback {
+                channel_binding: Some(binding),
+                ..Loopback::default()
+            },
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Capability {
+                challenge: proof_demanding([3; 32]),
+            },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        server
+            .adapter
+            .events
+            .push_back(Event::Connected(vot_transport_api::ConnectionId(7)));
+        assert!(server.poll().unwrap().is_some());
+        assert_eq!(server.channel_binding(), Some(binding));
+
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.adapter.refuse_control = Some(TransportError::Backend);
+        let error = server.poll().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Transport(TransportError::Backend));
+        assert_eq!(server.channel_binding(), Some(binding));
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+
+        server.adapter.refuse_control = None;
+        assert_eq!(server.poll().unwrap(), None);
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(client.poll().unwrap(), None);
+        assert_eq!(client.channel_binding(), Some(binding));
+
+        let mut open = request([7; 16], 2);
+        open.binding_proof = vec![4; 64];
+        client.present(open).unwrap();
+        pump(&mut client, &mut server);
+        assert!(server.pending_authorization().is_some());
+        assert_eq!(server.channel_binding(), Some(binding));
+        assert_eq!(server.adapter().channel_binding_queries.get(), 1);
+    }
+
+    #[test]
+    fn a_presenting_client_refuses_a_retired_format_even_when_offered() {
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::Presenting,
+        );
+        client.negotiation.state = State::Negotiated;
+        client
+            .adapter
+            .events
+            .push_back(control(&auth_context_of(Binding::None, vec![1])));
+        assert_eq!(client.poll().unwrap(), None);
+        assert!(client.pending_presentation().is_some());
+
+        let error = client.present(request([7; 16], 1)).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::PresentationInvalid(PresentationError::FormatRetired { format: 1 })
+        );
+        assert!(client.adapter().sent.is_empty());
+        assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
     }
 
     /// A request a client presents, and a server reads.
@@ -465,7 +808,7 @@ mod tests {
         let mut server = demanding_server();
         assert_eq!(server.pending_authorization(), None);
         assert_eq!(
-            server.accept_control(&session_open([7; 16], 2)).unwrap(),
+            server.accept_control(&session_open([7; 16], 4)).unwrap(),
             Accepted::AuthorizationRequired
         );
         let (challenge, open) = server
@@ -473,7 +816,7 @@ mod tests {
             .expect("a request is pending");
         assert_eq!(challenge.nonce, vec![3; 32], "the challenge it answered");
         assert_eq!(open.session_id, [7; 16]);
-        assert_eq!(open.capability_format, 2);
+        assert_eq!(open.capability_format, 4);
         assert_eq!(server.state(), State::Negotiated, "not yet authenticated");
 
         let reply = server.grant(b"read:objects".to_vec()).unwrap();
@@ -501,7 +844,7 @@ mod tests {
         for attempt in 0..MAX_AUTHENTICATION_ATTEMPTS {
             let id = [u8::try_from(attempt).unwrap(); 16];
             assert_eq!(
-                server.accept_control(&session_open(id, 1)).unwrap(),
+                server.accept_control(&session_open(id, 3)).unwrap(),
                 Accepted::AuthorizationRequired,
                 "attempt {attempt}"
             );
@@ -522,7 +865,7 @@ mod tests {
         }
 
         let error = server
-            .accept_control(&session_open([9; 16], 1))
+            .accept_control(&session_open([9; 16], 3))
             .unwrap_err();
         assert_eq!(
             error.kind(),
@@ -577,7 +920,7 @@ mod tests {
         server
             .adapter
             .events
-            .push_back(control(&session_open([7; 16], 1)));
+            .push_back(control(&session_open([7; 16], 3)));
         assert_eq!(server.poll().unwrap(), None);
         assert!(!server.is_ready(), "a request is not a grant");
         assert!(
@@ -585,7 +928,7 @@ mod tests {
             "nothing goes out until the caller answers"
         );
         let (challenge, open) = server.pending_authorization().expect("pending");
-        assert_eq!(challenge.formats, vec![1, 2]);
+        assert_eq!(challenge.formats, vec![3, 4]);
         assert_eq!(open.session_id, [7; 16]);
 
         server
@@ -598,7 +941,7 @@ mod tests {
         server
             .adapter
             .events
-            .push_back(control(&session_open([8; 16], 1)));
+            .push_back(control(&session_open([8; 16], 3)));
         assert_eq!(server.poll().unwrap(), None);
         server.grant(b"scope".to_vec()).unwrap();
         assert!(server.is_ready(), "the exchange concluded");
@@ -623,11 +966,11 @@ mod tests {
             vec![3; 32],
             "the nonce a proof of possession would be over"
         );
-        assert_eq!(challenge.formats, vec![1, 2]);
+        assert_eq!(challenge.formats, vec![3, 4]);
         assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
         assert!(client.granted().is_none() && client.last_refusal().is_none());
 
-        client.present(request([7; 16], 2)).unwrap();
+        client.present(request([7; 16], 4)).unwrap();
         assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS - 1);
         assert_eq!(
             client.pending_presentation(),
@@ -639,7 +982,7 @@ mod tests {
         pump(&mut client, &mut server);
         let (_, open) = server.pending_authorization().expect("the request arrived");
         assert_eq!(open.session_id, [7; 16]);
-        assert_eq!(open.capability_format, 2);
+        assert_eq!(open.capability_format, 4);
         server.grant(b"read:objects".to_vec()).unwrap();
         assert!(server.is_ready());
 
@@ -666,7 +1009,7 @@ mod tests {
                 client.pending_presentation().is_some(),
                 "attempt {attempt} may be made"
             );
-            client.present(request(id, 1)).unwrap();
+            client.present(request(id, 3)).unwrap();
             pump(&mut client, &mut server);
             server
                 .refuse(error_code::AUTHORIZATION_FAILED, "not enough".to_owned())
@@ -686,7 +1029,7 @@ mod tests {
         }
 
         assert_eq!(client.attempts_remaining(), 0);
-        let error = client.present(request([9; 16], 1)).unwrap_err();
+        let error = client.present(request([9; 16], 3)).unwrap_err();
         assert_eq!(
             error.kind(),
             &ErrorKind::PresentationInvalid(PresentationError::AttemptsSpent {
@@ -711,7 +1054,7 @@ mod tests {
         );
         plain.begin().unwrap();
         assert_eq!(
-            plain.present(request([7; 16], 1)).unwrap_err().kind(),
+            plain.present(request([7; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
                 state: State::HelloSent
             }),
@@ -735,7 +1078,7 @@ mod tests {
         );
         assert!(client.adapter().sent.is_empty());
 
-        let mut signed = request([7; 16], 1);
+        let mut signed = request([7; 16], 3);
         signed.binding_proof = vec![4; 8];
         assert_eq!(
             client.present(signed).unwrap_err().kind(),
@@ -745,9 +1088,9 @@ mod tests {
             })
         );
 
-        client.present(request([7; 16], 1)).unwrap();
+        client.present(request([7; 16], 3)).unwrap();
         assert_eq!(
-            client.present(request([8; 16], 1)).unwrap_err().kind(),
+            client.present(request([8; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
                 state: State::Negotiated
             }),
@@ -764,7 +1107,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            client.present(request([7; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::IdentifierReused)
         );
     }
@@ -777,12 +1120,12 @@ mod tests {
             AuthContext {
                 nonce: vec![3; 32],
                 binding: Binding::ProofOfPossession,
-                formats: vec![1],
+                formats: vec![3],
             },
         );
         server.state = State::Negotiated;
         let error = server
-            .accept_control(&session_open([7; 16], 1))
+            .accept_control(&session_open([7; 16], 3))
             .unwrap_err();
         assert_eq!(
             error.kind(),
@@ -800,7 +1143,7 @@ mod tests {
         );
 
         let mut none = demanding_server();
-        let mut open = request([7; 16], 1);
+        let mut open = request([7; 16], 3);
         open.binding_proof = vec![4; 8];
         let mut frame = Vec::new();
         vot_codec::frames::encode(
@@ -819,16 +1162,16 @@ mod tests {
         let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
         client
-            .accept_control(&auth_context_of(Binding::ProofOfPossession, vec![1]))
+            .accept_control(&auth_context_of(Binding::ProofOfPossession, vec![3]))
             .unwrap();
         assert_eq!(
-            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            client.present(request([7; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::BindingProof {
                 binding: Binding::ProofOfPossession,
                 proof_bytes: 0
             })
         );
-        let mut proved = request([7; 16], 1);
+        let mut proved = request([7; 16], 3);
         proved.binding_proof = vec![4; 64];
         client.present(proved).unwrap();
     }
@@ -836,7 +1179,7 @@ mod tests {
     #[test]
     fn an_answer_naming_another_attempt_is_refused() {
         let (mut client, _) = demanding_pair(Settings::default(), Settings::default());
-        client.present(request([7; 16], 1)).unwrap();
+        client.present(request([7; 16], 3)).unwrap();
         let mut mismatched = client.negotiation.clone();
         let error = mismatched
             .accept_control(&answer_frame(
@@ -890,7 +1233,7 @@ mod tests {
         );
 
         let mut holding = demanding_server();
-        holding.accept_control(&session_open([7; 16], 1)).unwrap();
+        holding.accept_control(&session_open([7; 16], 3)).unwrap();
         for reply in [
             vot_codec::frames::TypedFrame::SessionAccept(SessionAccept {
                 session_id: [7; 16],
@@ -958,7 +1301,7 @@ mod tests {
         );
         assert_eq!(client.pending_presentation(), None);
         assert_eq!(
-            client.present(request([7; 16], 1)).unwrap_err().kind(),
+            client.present(request([7; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
                 state: State::Authenticated
             }),
@@ -984,7 +1327,7 @@ mod tests {
             client
                 .pending_presentation()
                 .map(|challenge| challenge.formats.clone()),
-            Some(vec![1, 2]),
+            Some(vec![3, 4]),
             "the challenge it was asked with"
         );
     }
@@ -996,7 +1339,7 @@ mod tests {
             ..Settings::default()
         };
         let (mut client, mut server) = demanding_pair(Settings::default(), narrow);
-        let mut large = request([7; 16], 1);
+        let mut large = request([7; 16], 3);
         large.capability = vec![9; 4096];
         let error = client.present(large).unwrap_err();
         assert_eq!(
@@ -1015,7 +1358,7 @@ mod tests {
         assert_eq!(client.attempts_remaining(), MAX_AUTHENTICATION_ATTEMPTS);
         assert!(client.adapter().sent.is_empty());
 
-        client.present(request([7; 16], 1)).unwrap();
+        client.present(request([7; 16], 3)).unwrap();
         pump(&mut client, &mut server);
         let mut narrow_client = server.negotiation.clone();
         narrow_client.peer_settings = Some(Settings {
@@ -1063,7 +1406,7 @@ mod tests {
         let mut accepting = demanding_server();
         assert_eq!(accepting.pending_presentation(), None);
         assert_eq!(
-            accepting.present(request([7; 16], 1)).unwrap_err().kind(),
+            accepting.present(request([7; 16], 3)).unwrap_err().kind(),
             &ErrorKind::PresentationInvalid(PresentationError::NothingToAnswer {
                 state: State::Negotiated
             })
@@ -1132,7 +1475,7 @@ mod tests {
         server
             .adapter
             .events
-            .push_back(control(&session_open([7; 16], 1)));
+            .push_back(control(&session_open([7; 16], 3)));
         assert_eq!(server.poll().unwrap(), None);
         server.grant(b"scope".to_vec()).unwrap();
 
@@ -1185,12 +1528,12 @@ mod tests {
     #[test]
     fn a_request_this_endpoint_never_invited_is_refused() {
         let mut reused = demanding_server();
-        reused.accept_control(&session_open([7; 16], 1)).unwrap();
+        reused.accept_control(&session_open([7; 16], 3)).unwrap();
         reused
             .refuse(error_code::AUTHENTICATION_FAILED, String::new())
             .unwrap();
         let error = reused
-            .accept_control(&session_open([7; 16], 1))
+            .accept_control(&session_open([7; 16], 3))
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::SessionIdentifierReused);
         assert_eq!(error.close_code(), error_code::REPLAY_REJECTED);
@@ -1230,24 +1573,24 @@ mod tests {
         open_to_nobody.state = State::Negotiated;
         assert!(
             open_to_nobody
-                .accept_control(&session_open([7; 16], 1))
+                .accept_control(&session_open([7; 16], 3))
                 .is_err()
         );
 
         let mut busy = demanding_server();
-        busy.accept_control(&session_open([7; 16], 1)).unwrap();
-        assert!(busy.accept_control(&session_open([8; 16], 1)).is_err());
+        busy.accept_control(&session_open([7; 16], 3)).unwrap();
+        assert!(busy.accept_control(&session_open([8; 16], 3)).is_err());
 
         let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
-        assert!(client.accept_control(&session_open([7; 16], 1)).is_err());
+        assert!(client.accept_control(&session_open([7; 16], 3)).is_err());
 
         let mut early = demanding_server();
         early.state = State::HelloSent;
-        assert!(early.accept_control(&session_open([7; 16], 1)).is_err());
+        assert!(early.accept_control(&session_open([7; 16], 3)).is_err());
         let mut done = demanding_server();
         done.state = State::Authenticated;
-        assert!(done.accept_control(&session_open([7; 16], 1)).is_err());
+        assert!(done.accept_control(&session_open([7; 16], 3)).is_err());
     }
 
     #[test]
@@ -1261,7 +1604,7 @@ mod tests {
         );
         assert_eq!(server.state(), State::Negotiated);
 
-        server.accept_control(&session_open([7; 16], 1)).unwrap();
+        server.accept_control(&session_open([7; 16], 3)).unwrap();
         let error = server
             .refuse(error_code::MALFORMED_FRAME, String::new())
             .unwrap_err();
@@ -1289,7 +1632,7 @@ mod tests {
         let mut client = Negotiation::client(Settings::default(), BTreeSet::new());
         client.state = State::Negotiated;
         let error = client
-            .accept_control(&auth_context(&[7; 16], vec![1, 2]))
+            .accept_control(&auth_context(&[7; 16], vec![3, 4]))
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::CapabilityRequired { formats: 2 });
         assert_eq!(error.close_code(), error_code::AUTHENTICATION_FAILED);
@@ -1397,7 +1740,7 @@ mod tests {
         .unwrap();
         for frame in [
             auth_context(&[7; 16], Vec::new()),
-            session_open([7; 16], 1),
+            session_open([7; 16], 3),
             accept,
             reject,
             frame_of(frame_type::HELLO, 0),

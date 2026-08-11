@@ -3102,6 +3102,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn independent_connections_expose_different_channel_bindings() {
+        let (first_client, first_server) = pair();
+        assert!(first_client.connected_within(Duration::from_secs(5)));
+        assert!(first_server.connected_within(Duration::from_secs(5)));
+        let first_binding = first_client.channel_binding().expect("first binding");
+        drop(first_client);
+        drop(first_server);
+
+        let (second_client, second_server) = pair();
+        assert!(second_client.connected_within(Duration::from_secs(5)));
+        assert!(second_server.connected_within(Duration::from_secs(5)));
+        let second_binding = second_client.channel_binding().expect("second binding");
+
+        assert_ne!(first_binding, second_binding);
+    }
+
     fn connected(events: &[Event]) -> bool {
         events
             .iter()

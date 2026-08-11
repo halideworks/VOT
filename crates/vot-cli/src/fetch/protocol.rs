@@ -517,7 +517,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let Some(challenge) = self.receiver.session().pending_presentation() else {
                 return Ok(());
             };
-            holder.answer(challenge)?
+            let channel_binding = self
+                .receiver
+                .session()
+                .channel_binding()
+                .ok_or(Error::ChannelBindingUnavailable)?;
+            holder.answer(challenge, channel_binding)?
         };
         self.receiver.session_mut().present(request)?;
         Ok(())

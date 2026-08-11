@@ -2558,6 +2558,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vot-sdk"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "vot-codec",
+ "vot-coverage",
+ "vot-manifest",
+ "vot-object",
+ "vot-package",
+ "vot-proof-catalog",
+ "vot-receipt",
+ "vot-resume-core",
+ "vot-verified-range",
+]
+
+[[package]]
 name = "vot-session"
 version = "0.0.1"
 dependencies = [

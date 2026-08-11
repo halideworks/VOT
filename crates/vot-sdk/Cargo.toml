@@ -1,0 +1,28 @@
+[package]
+name = "vot-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+ed25519-dalek.workspace = true
+vot-codec = { path = "../vot-codec" }
+vot-coverage = { path = "../vot-coverage" }
+vot-manifest = { path = "../vot-manifest" }
+vot-object = { path = "../vot-object" }
+vot-package = { path = "../vot-package" }
+vot-proof-catalog = { path = "../vot-proof-catalog" }
+vot-receipt = { path = "../vot-receipt", default-features = false }
+vot-resume-core = { path = "../vot-resume-core" }
+vot-verified-range = { path = "../vot-verified-range" }
+
+[dev-dependencies]
+blake3.workspace = true
+
+[lints]
+workspace = true

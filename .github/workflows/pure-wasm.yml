@@ -33,6 +33,8 @@ jobs:
             cargo_args: ""
           - package: vot-proof-catalog
             cargo_args: ""
+          - package: vot-sdk
+            cargo_args: --no-default-features
           - package: vot-verified-range
             cargo_args: ""
           - package: vot-resume-core
@@ -54,6 +56,12 @@ jobs:
           cargo +1.88.0 check --package "${{ matrix.package }}"
           ${{ matrix.cargo_args }}
           --target wasm32-unknown-unknown --locked
+
+      - name: Check SDK dependency boundary
+        if: matrix.package == 'vot-sdk'
+        run: |
+          python3 -m unittest tools.test_sdk_dependencies
+          python3 tools/check_sdk_dependencies.py
 
   scheduler-no-default:
     name: scheduler without file sink

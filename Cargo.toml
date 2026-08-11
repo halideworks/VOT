@@ -22,11 +22,8 @@ unsafe_code = "forbid"
 all = "warn"
 pedantic = "warn"
 
-# quiche 0.24.9 plus one recovery change: the loss delay is floored at the
-# ack latency the connection has observed, behind a config flag the pump
-# turns on. Without it the detector declares tens of thousands of delivered
-# packets lost per gigabyte on sub-millisecond paths and holds the wire a
-# gigabit under its ceiling; the full case is ADR-0028. The same change is
-# submitted upstream, and this pin dissolves the day it lands.
+# quiche 0.24.9 plus two changes: the ADR-0028 ack-latency loss floor, and a
+# narrow TLS exporter used to implement ADR-0037 channel binding. Both live in
+# the maintained fork; this pin dissolves when upstream releases equivalents.
 [patch.crates-io]
-quiche = { git = "https://github.com/halideworks/quiche.git", rev = "0d2f3542c1edddb1c957ddb6919dd6c61e5acaf5" }
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "6138b4d754263edf7f0164f12e46e8277dd5d674" }

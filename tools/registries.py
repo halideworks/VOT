@@ -161,15 +161,15 @@ def _const_block(rows: list[dict], ty: str) -> str:
 def render_identifiers(document: dict) -> str:
     """Rust identifier modules whose YAML rows are the complete set.
 
-    Frame types stay in `frame_registry!` until payload, auth, and
-    extension columns live in the YAML. Error codes stay handwritten
-    because the codec names a subset of the registry.
+    Frame types stay in `generated_frames.rs` because `frame_registry!`
+    also carries payload, auth, and extension.
     """
     settings = document["settings"]
     retired = document["retired_settings"]
     operations = document["operations"]
     limits = document["limits"]
     extensions = document["extensions"]
+    errors = document["errors"]
     retired_values = ", ".join(row["value"] for row in retired)
     setting_list = ",\n    ".join(f"setting_id::{row['name']}" for row in settings)
     operation_list = ",\n    ".join(f"operation::{row['name']}" for row in operations)
@@ -198,6 +198,10 @@ def render_identifiers(document: dict) -> str:
         "/// Extension identifiers.\n"
         "pub mod extension_id {\n"
         f"{_const_block(extensions, 'u64')}\n"
+        "}\n"
+        "\n"
+        "pub mod error_code {\n"
+        f"{_const_block(errors, 'u16')}\n"
         "}\n"
         "\n"
         f"/// Every registered setting, in identifier order.\n"
@@ -652,22 +656,14 @@ def check_registries(
     if error_values != sorted(error_values):
         failures.append("error table not ascending")
 
-    error_rust = {
-        match["name"]: parse_hex(match["value"])
-        for match in RUST_U16.finditer(rust_module(rust, "error_code"))
-    }
-    if not error_rust:
-        failures.append("no error_code constants parsed")
-    error_source = name_values(errors)
-    rust_only = error_rust.keys() - error_source.keys()
-    if rust_only:
-        failures.append(f"error codes in Rust but not the registry: {rust_only}")
-    mismatched = {
-        name: (value, error_source[name])
-        for name, value in error_rust.items()
-        if name in error_source and error_source[name] != value
-    }
-    if mismatched:
-        failures.append(f"error-code value mismatch (rust, registry): {mismatched}")
+    try:
+        error_rust = {
+            match["name"]: parse_hex(match["value"])
+            for match in RUST_U16.finditer(rust_module(rust, "error_code"))
+        }
+    except ValueError as error:
+        failures.append(f"error_code: {error}")
+        error_rust = {}
+    _maps_equal(name_values(errors), error_rust, "registry", "Rust error", failures)
 
     return failures

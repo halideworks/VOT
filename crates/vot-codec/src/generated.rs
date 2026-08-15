@@ -37,6 +37,35 @@ pub mod extension_id {
     pub const MULTIPATH_QUIC: u64 = 0x06;
 }
 
+pub mod error_code {
+    pub const UNKNOWN_CRITICAL_FRAME: u16 = 0x0101;
+    pub const MALFORMED_FRAME: u16 = 0x0102;
+    pub const FRAME_TOO_LARGE: u16 = 0x0103;
+    pub const UNSUPPORTED_VERSION: u16 = 0x0104;
+    pub const INVALID_SETTING: u16 = 0x0105;
+    pub const DUPLICATE_SETTING: u16 = 0x0106;
+    pub const AUTHENTICATION_FAILED: u16 = 0x0201;
+    pub const AUTHORIZATION_FAILED: u16 = 0x0202;
+    pub const REPLAY_REJECTED: u16 = 0x0203;
+    pub const MANIFEST_INVALID: u16 = 0x0301;
+    pub const OBJECT_IDENTITY_MISMATCH: u16 = 0x0302;
+    pub const PROOF_INVALID: u16 = 0x0303;
+    pub const SOURCE_MUTATED: u16 = 0x0304;
+    pub const STORAGE_WRITE_FAILED: u16 = 0x0401;
+    pub const DURABILITY_FAILED: u16 = 0x0402;
+    pub const AT_REST_VERIFICATION_FAILED: u16 = 0x0403;
+    pub const PUBLICATION_FAILED: u16 = 0x0404;
+    pub const STALE_INCARNATION: u16 = 0x0405;
+    pub const ASSURANCE_UNSUPPORTED: u16 = 0x0406;
+    pub const ADMISSION_DENIED: u16 = 0x0501;
+    pub const RESOURCE_LIMIT: u16 = 0x0502;
+    pub const FLOW_CONTROL_VIOLATION: u16 = 0x0503;
+    pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
+    pub const PATH_STATE_REJECTED: u16 = 0x0602;
+    pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
+    pub const RISK_BUDGET_EXHAUSTED: u16 = 0x0702;
+}
+
 /// Every registered setting, in identifier order.
 pub const REGISTERED_SETTINGS: [u64; 5] = [
     setting_id::MAX_CONTROL_FRAME_PAYLOAD,

@@ -5,6 +5,7 @@
 mod permit;
 pub use permit::{Ledger, Permit};
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -142,29 +143,49 @@ pub enum Error {
     AccountingPoisoned,
 }
 
-/// A batch that stopped part way through.
+/// Why a reliable batch stopped, and who owns the records.
 ///
-/// `admitted` is how many records the adapter took, which is not the same as
-/// how many went out: every adapter here submits into a queue that a later
-/// `flush` drains, and a carrier torn down before that flush drops what it
-/// still holds. So this says which records the adapter now owns, and a
-/// caller deciding what to resend has to know whether the carrier survived.
-/// Resending from zero duplicates; resending from `admitted` after a
-/// teardown loses.
+/// `Rejected` leaves every record with the caller. `Partial` means the
+/// adapter now owns the first `admitted` records. `Ambiguous` means the
+/// adapter cannot say: resending from zero may duplicate, and skipping
+/// them may lose. Ownership here is of the queued submission, not of a
+/// carrier write. A later `flush` still has to drain what was taken.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BatchFailure {
-    /// How many records of the batch the adapter took ownership of.
-    ///
-    /// Zero for every adapter this workspace ships, because they share one
-    /// preflight that checks the whole batch's count and bytes before any of
-    /// it is submitted, and nothing between that check and the loop can
-    /// fail. The field exists for an adapter whose backend can refuse part
-    /// way, and reporting it is how such an adapter says so rather than
-    /// silently leaving the caller to guess. This crate's tests build one to
-    /// hold the default implementation to that.
-    pub admitted: usize,
-    /// What stopped the rest.
-    pub error: Error,
+pub enum BatchFailure {
+    Rejected(Error),
+    Partial {
+        admitted: NonZeroUsize,
+        error: Error,
+    },
+    Ambiguous(Error),
+}
+
+impl BatchFailure {
+    /// A known stop after `taken` records. Zero taken is [`Self::Rejected`].
+    #[must_use]
+    pub fn stopped(taken: usize, error: Error) -> Self {
+        match NonZeroUsize::new(taken) {
+            None => Self::Rejected(error),
+            Some(admitted) => Self::Partial { admitted, error },
+        }
+    }
+
+    #[must_use]
+    pub const fn error(self) -> Error {
+        match self {
+            Self::Rejected(error) | Self::Ambiguous(error) | Self::Partial { error, .. } => error,
+        }
+    }
+
+    /// Records the adapter now owns. `None` when the outcome is ambiguous.
+    #[must_use]
+    pub const fn taken(self) -> Option<usize> {
+        match self {
+            Self::Rejected(_) => Some(0),
+            Self::Partial { admitted, .. } => Some(admitted.get()),
+            Self::Ambiguous(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -274,28 +295,26 @@ pub trait TransportAdapter {
 
     /// Submits a batch before the caller requests a backend flush.
     ///
-    /// Not atomic. Preflight rejects the whole batch before anything is
-    /// submitted, but a backend that fails part way has already taken the
-    /// records before it, and no default implementation over a per-record
-    /// send can unsend them. [`BatchFailure::admitted`] says how many, and
-    /// its documentation says what that does and does not mean. An adapter
-    /// whose backend submits atomically overrides this and reports
-    /// `admitted: 0` on every failure, which is what every adapter here
-    /// does by construction.
+    /// Not atomic. Preflight rejects the whole batch as
+    /// [`BatchFailure::Rejected`]. A per-record send that fails after
+    /// taking earlier records is [`BatchFailure::Partial`]. An adapter
+    /// that cannot name what it took reports [`BatchFailure::Ambiguous`].
+    /// Adapters whose queue preflight is the only failure path stay on
+    /// `Rejected` for those refusals.
     ///
     /// # Errors
-    /// Reports the first backend or protocol limit failure, with the count
-    /// of records the adapter took. Preflight failures report zero.
+    /// Reports the first backend or protocol limit failure and who owns
+    /// the records that were already taken.
     fn send_reliable_batch(
         &mut self,
         stream: StreamId,
         records: &[Payload],
     ) -> Result<(), BatchFailure> {
         self.preflight_reliable_batch(stream, records)
-            .map_err(|error| BatchFailure { admitted: 0, error })?;
-        for (admitted, record) in records.iter().enumerate() {
+            .map_err(BatchFailure::Rejected)?;
+        for (taken, record) in records.iter().enumerate() {
             self.send_reliable_shared(stream, record.clone())
-                .map_err(|error| BatchFailure { admitted, error })?;
+                .map_err(|error| BatchFailure::stopped(taken, error))?;
         }
         Ok(())
     }
@@ -688,15 +707,48 @@ mod tests {
         ];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(BatchFailure {
-                admitted: 2,
-                error: Error::Backend
-            })
+            Err(BatchFailure::stopped(2, Error::Backend))
         );
         assert_eq!(
             adapter.reliable.len(),
             2,
             "the count reported is the count the backend has"
+        );
+
+        let mut first = ContractAdapter {
+            reliable_failures_after: Some(0),
+            ..ContractAdapter::default()
+        };
+        assert_eq!(
+            first.send_reliable_batch(StreamId(1), &records),
+            Err(BatchFailure::Rejected(Error::Backend))
+        );
+        assert!(first.reliable.is_empty());
+    }
+
+    #[test]
+    fn rejected_partial_and_ambiguous_are_distinct() {
+        assert_eq!(
+            BatchFailure::stopped(0, Error::Backend),
+            BatchFailure::Rejected(Error::Backend)
+        );
+        assert_eq!(
+            BatchFailure::stopped(3, Error::Backend),
+            BatchFailure::Partial {
+                admitted: NonZeroUsize::new(3).expect("nonzero"),
+                error: Error::Backend
+            }
+        );
+        assert_ne!(
+            BatchFailure::Rejected(Error::Backend),
+            BatchFailure::Ambiguous(Error::Backend)
+        );
+        assert_eq!(BatchFailure::Rejected(Error::Backend).taken(), Some(0));
+        assert_eq!(BatchFailure::stopped(3, Error::Backend).taken(), Some(3));
+        assert_eq!(BatchFailure::Ambiguous(Error::Backend).taken(), None);
+        assert_eq!(
+            BatchFailure::Ambiguous(Error::Backend).error(),
+            Error::Backend
         );
     }
 
@@ -910,10 +962,7 @@ mod tests {
         ];
         assert_eq!(
             preflight.send_reliable_batch(StreamId(8), &invalid_records),
-            Err(BatchFailure {
-                admitted: 0,
-                error: Error::RecordTooLarge
-            })
+            Err(BatchFailure::Rejected(Error::RecordTooLarge))
         );
         assert!(preflight.reliable.is_empty());
 

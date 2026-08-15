@@ -14,6 +14,7 @@ if __package__:
         REGISTRY_PATH,
         check_registries,
         load_registries,
+        render_frames,
     )
 else:
     from registries import (
@@ -22,6 +23,7 @@ else:
         REGISTRY_PATH,
         check_registries,
         load_registries,
+        render_frames,
     )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,6 +137,33 @@ class RegistrySourceSync(unittest.TestCase):
             any("receipt_schemes" in item for item in failures),
             failures,
         )
+
+    def test_an_experimental_frame_may_gate_on_any_experimental_extension(self) -> None:
+        document, markdown, rust, wire, generated, generated_frames = sources()
+        mutated = copy.deepcopy(document)
+
+        def gate_failures():
+            # The declarations come from the generated frame table, so the
+            # mutated registry is rendered before it is checked.
+            return [
+                item
+                for item in check(mutated, markdown, rust, wire, generated, render_frames(mutated))
+                if "extension" in item
+            ]
+
+        gen_state = next(row for row in mutated["frames"] if row["name"] == "GEN_STATE")
+        gen_state["extension"] = "VCRC"
+        self.assertEqual(gate_failures(), [])
+        gen_state["extension"] = "ZSTD_RECORDS"
+        self.assertTrue(
+            any("GEN_STATE" in item and "ZSTD_RECORDS" in item for item in gate_failures())
+        )
+        gen_state["extension"] = "none"
+        self.assertTrue(any("GEN_STATE" in item for item in gate_failures()))
+        gen_state["extension"] = "DATAGRAM_FEC"
+        hello = next(row for row in mutated["frames"] if row["name"] == "HELLO")
+        hello["extension"] = "DATAGRAM_FEC"
+        self.assertTrue(any("HELLO" in item for item in gate_failures()))
 
     def test_handling_parity_is_rejected(self) -> None:
         document, markdown, rust, wire, generated, generated_frames = sources()

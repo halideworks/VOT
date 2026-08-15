@@ -607,6 +607,12 @@ def check_registries(
         )
     unit_bytes = {None: 1, "KiB": 1024, "MiB": 1024 * 1024}
     frame_status = {row["name"]: row["status"] for row in frames}
+    # An experimental frame is gated by an experimental extension, and by no
+    # other kind: wire.md section 5 names DATAGRAM_FEC and VCRC today, and a
+    # new one earns its place by being registered experimental.
+    experimental_extensions = {
+        row["name"] for row in document["extensions"] if row["status"] == "experimental"
+    }
     for name, (maximum, auth) in behavior_rows.items():
         declaration = declarations.get(name)
         if declaration is None:
@@ -633,13 +639,18 @@ def check_registries(
                 f"{name}: wire.md maximum is {spec_bytes} bytes, "
                 f"the declaration says {declared_bytes}"
             )
-        expected_extension = (
-            "DATAGRAM_FEC" if frame_status.get(name) == "experimental" else "none"
-        )
-        if declaration["extension"] != expected_extension:
+        extension = declaration["extension"]
+        if frame_status.get(name) == "experimental":
+            if extension not in experimental_extensions:
+                failures.append(
+                    f"{name}: an experimental frame needs an experimental extension, "
+                    f"one of {sorted(experimental_extensions)}, the declaration says "
+                    f"{extension}"
+                )
+        elif extension != "none":
             failures.append(
-                f"{name}: registry status {frame_status.get(name)!r} expects extension "
-                f"{expected_extension}, the declaration says {declaration['extension']}"
+                f"{name}: registry status {frame_status.get(name)!r} expects no extension, "
+                f"the declaration says {extension}"
             )
 
     error_values = [parse_hex(row["value"]) for row in errors]

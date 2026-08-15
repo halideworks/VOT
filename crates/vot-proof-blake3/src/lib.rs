@@ -38,22 +38,34 @@ struct Node {
 
 impl Node {
     fn split(self) -> (Self, Self) {
-        let left_count = 1_u64 << (63 - (self.count - 1).leading_zeros());
+        let left_count = left_count(self.count);
         (
             Self {
                 start: self.start,
                 count: left_count,
             },
             Self {
-                start: self.start + left_count,
-                count: self.count - left_count,
+                start: self.start.saturating_add(left_count),
+                count: self.count.saturating_sub(left_count),
             },
         )
     }
 
     fn intersects(self, first: u64, end: u64) -> bool {
-        self.start < end && first < self.start + self.count
+        self.start < end && first < self.start.saturating_add(self.count)
     }
+}
+
+/// Largest power of two strictly below `count`. Zero when `count` cannot split.
+fn left_count(count: u64) -> u64 {
+    let Some(predecessor) = count.checked_sub(1) else {
+        return 0;
+    };
+    if predecessor == 0 {
+        return 0;
+    }
+    let shift = 63u32.saturating_sub(predecessor.leading_zeros());
+    1_u64.checked_shl(shift).unwrap_or(0)
 }
 
 #[must_use]
@@ -395,7 +407,7 @@ impl SealedGroupCvs {
     }
 
     fn node_cv(&self, node: Node) -> Result<[u8; 32], Error> {
-        if node.count.is_power_of_two() && node.start % node.count == 0 {
+        if node.count != 0 && node.count.is_power_of_two() && node.start % node.count == 0 {
             let level_index = node.count.trailing_zeros() as usize;
             if level_index >= self.level_count {
                 return Err(Error::Storage(StoreError::Corrupt));
@@ -1192,6 +1204,35 @@ mod tests {
         assert_eq!(
             verify(&expected, data.len() as u64, 0, &data, &[0]),
             Err(Error::MalformedProof)
+        );
+    }
+
+    #[test]
+    fn a_node_splits_on_the_largest_power_of_two_below_its_count() {
+        for (count, expected) in [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 4),
+            (6, 4),
+            (7, 4),
+            (8, 4),
+            (9, 8),
+        ] {
+            assert_eq!(left_count(count), expected, "count {count}");
+        }
+        let (left, right) = Node { start: 1, count: 5 }.split();
+        assert_eq!(left.count, 4);
+        assert_eq!(right.start, 5);
+        assert_eq!(right.count, 1);
+        assert!(
+            !Node {
+                start: u64::MAX,
+                count: 1
+            }
+            .intersects(0, 1)
         );
     }
 }

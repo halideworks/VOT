@@ -571,10 +571,7 @@ mod tests {
         let records = [shared_payload(b"second"), shared_payload(b"third")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(BatchFailure {
-                admitted: 0,
-                error: Error::OutboundQueueFull
-            })
+            Err(BatchFailure::Rejected(Error::OutboundQueueFull))
         );
         assert_eq!(
             adapter.next_command(),
@@ -607,10 +604,7 @@ mod tests {
         let records = [shared_payload(b"two"), shared_payload(b"three")];
         assert_eq!(
             adapter.send_reliable_batch(StreamId(1), &records),
-            Err(BatchFailure {
-                admitted: 0,
-                error: Error::OutboundQueueFull
-            })
+            Err(BatchFailure::Rejected(Error::OutboundQueueFull))
         );
         assert_eq!(
             adapter.next_command(),

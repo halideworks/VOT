@@ -105,8 +105,8 @@ impl Ledger {
         inner.limit.saturating_sub(inner.used)
     }
 
-    #[cfg(test)]
-    fn force_used(&self, used: u64) {
+    #[doc(hidden)]
+    pub fn force_used(&self, used: u64) {
         lock(&self.inner).used = used;
     }
 }

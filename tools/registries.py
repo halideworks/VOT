@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "spec" / "registries.yaml"
+GENERATED_PATH = ROOT / "crates" / "vot-codec" / "src" / "generated.rs"
 
 FRAME_ROW = re.compile(
     r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_-]+)` "
@@ -143,6 +144,70 @@ def parse_hex(value: str) -> int:
 
 def name_values(rows: list[dict]) -> dict[str, int]:
     return {row["name"]: parse_hex(row["value"]) for row in rows}
+
+
+def _const_block(rows: list[dict], ty: str) -> str:
+    lines = [f"    pub const {row['name']}: {ty} = {row['value']};" for row in rows]
+    return "\n".join(lines)
+
+
+def render_identifiers(document: dict) -> str:
+    """Rust identifier modules whose YAML rows are the complete set.
+
+    Frame types stay in `frame_registry!` until payload, auth, and
+    extension columns live in the YAML. Error codes stay handwritten
+    because the codec names a subset of the registry.
+    """
+    settings = document["settings"]
+    retired = document["retired_settings"]
+    operations = document["operations"]
+    limits = document["limits"]
+    extensions = document["extensions"]
+    retired_values = ", ".join(row["value"] for row in retired)
+    setting_list = ",\n    ".join(f"setting_id::{row['name']}" for row in settings)
+    operation_list = ",\n    ".join(f"operation::{row['name']}" for row in operations)
+    limit_list = ",\n    ".join(f"resource_limit::{row['name']}" for row in limits)
+    return (
+        "// Generated from spec/registries.yaml by tools/generate_registries.py.\n"
+        "// Do not edit.\n"
+        "\n"
+        "pub mod setting_id {\n"
+        f"{_const_block(settings, 'u64')}\n"
+        "\n"
+        "    /// Identifiers the registry retired, kept so nothing reassigns them.\n"
+        f"    pub const RETIRED: [u64; {len(retired)}] = [{retired_values}];\n"
+        "}\n"
+        "\n"
+        "/// What a capability authorizes.\n"
+        "pub mod operation {\n"
+        f"{_const_block(operations, 'u64')}\n"
+        "}\n"
+        "\n"
+        "/// What a capability may cap.\n"
+        "pub mod resource_limit {\n"
+        f"{_const_block(limits, 'u64')}\n"
+        "}\n"
+        "\n"
+        "/// Extension identifiers.\n"
+        "pub mod extension_id {\n"
+        f"{_const_block(extensions, 'u64')}\n"
+        "}\n"
+        "\n"
+        f"/// Every registered setting, in identifier order.\n"
+        f"pub const REGISTERED_SETTINGS: [u64; {len(settings)}] = [\n"
+        f"    {setting_list},\n"
+        "];\n"
+        "\n"
+        f"/// Every registered operation, in identifier order.\n"
+        f"pub const REGISTERED_OPERATIONS: [u64; {len(operations)}] = [\n"
+        f"    {operation_list},\n"
+        "];\n"
+        "\n"
+        f"/// Every registered resource limit, in identifier order.\n"
+        f"pub const REGISTERED_LIMITS: [u64; {len(limits)}] = [\n"
+        f"    {limit_list},\n"
+        "];\n"
+    )
 
 
 def section(document: str, heading: str, next_heading: str) -> str:
@@ -319,9 +384,23 @@ def _listed_names(rust: str, const: str, prefix: str) -> list[str]:
     return names
 
 
-def check_registries(document: dict, markdown: str, rust: str, wire: str) -> list[str]:
+def check_registries(
+    document: dict,
+    markdown: str,
+    rust: str,
+    wire: str,
+    generated: str | None = None,
+) -> list[str]:
     """Failures that mean the YAML, the Markdown view, or vot-codec drifted."""
     failures: list[str] = []
+    if generated is not None:
+        expected = render_identifiers(document)
+        if generated != expected:
+            failures.append(
+                "crates/vot-codec/src/generated.rs is stale; "
+                "run tools/generate_registries.py"
+            )
+        rust = generated + "\n" + rust
 
     frames = document["frames"]
     settings = document["settings"]

@@ -5,6 +5,7 @@ Every check the repository can run, in review order.
 ## Specification and vectors
 
 ```sh
+python3 tools/generate_registries.py      # rewrite vot-codec generated identifiers
 python3 tools/validate_registries.py
 python3 -m unittest tools.test_registries
 python3 tools/validate_wire_vectors.py
@@ -41,9 +42,11 @@ rejects them.
 `validate_registries.py` loads `spec/registries.yaml` and holds
 `spec/registries.md` and the `vot-codec` constants to it, including the
 error-code table: block/class structure, ascending order, and a value-exact
-subset check for the Rust constants. `tools/test_registries.py` drops a frame,
-swaps an operation value, removes a Markdown row, and flips handling parity
-and proves the checker rejects them.
+subset check for the Rust constants. Setting, operation, limit, and
+extension identifiers are generated into `crates/vot-codec/src/generated.rs`;
+a stale file fails. `tools/test_registries.py` drops a frame, swaps an
+operation value, edits the generated file, removes a Markdown row, and flips
+handling parity and proves the checker rejects them.
 
 ## Public API
 

@@ -21,8 +21,11 @@ def validate(root: Path) -> None:
     document = load_registries(root / "spec" / "registries.yaml")
     markdown = (root / "spec" / "registries.md").read_text(encoding="utf-8")
     rust = (root / "crates" / "vot-codec" / "src" / "lib.rs").read_text(encoding="utf-8")
+    generated = (root / "crates" / "vot-codec" / "src" / "generated.rs").read_text(
+        encoding="utf-8"
+    )
     wire = (root / "spec" / "wire.md").read_text(encoding="utf-8")
-    failures = check_registries(document, markdown, rust, wire)
+    failures = check_registries(document, markdown, rust, wire, generated)
     if failures:
         raise AssertionError("; ".join(failures))
 

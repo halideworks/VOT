@@ -127,6 +127,7 @@ jobs:
         run: |
           python3 tools/validate_benchmark_contract.py
           python3 tools/validate_registries.py
+          python3 -m unittest tools.test_registries
           python3 tools/validate_wire_vectors.py
           python3 tools/validate_receipt_vectors.py
           python3 tools/validate_security_matrix.py

@@ -16,6 +16,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "spec" / "registries.yaml"
 GENERATED_PATH = ROOT / "crates" / "vot-codec" / "src" / "generated.rs"
+GENERATED_FRAMES_PATH = ROOT / "crates" / "vot-codec" / "src" / "generated_frames.rs"
+
+FRAME_BEHAVIOR_KEYS = ("limit", "auth", "extension")
 
 FRAME_ROW = re.compile(
     r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_-]+)` "
@@ -135,6 +138,10 @@ def load_registries(path: Path = REGISTRY_PATH) -> dict:
         raise ValueError(f"registry table missing {missing}")
     if "grease_frames" not in document:
         raise ValueError("registry table missing grease_frames")
+    for row in document["frames"]:
+        missing = [key for key in FRAME_BEHAVIOR_KEYS if key not in row]
+        if missing:
+            raise ValueError(f"frame {row.get('name')!r} missing {missing}")
     return document
 
 
@@ -208,6 +215,25 @@ def render_identifiers(document: dict) -> str:
         f"    {limit_list},\n"
         "];\n"
     )
+
+
+def render_frames(document: dict) -> str:
+    """The `frame_registry!` invocation, included from lib.rs after the macro."""
+    lines = [
+        "// Generated from spec/registries.yaml by tools/generate_registries.py.",
+        "// Do not edit.",
+        "",
+        "frame_registry! {",
+    ]
+    for row in document["frames"]:
+        lines.append(
+            f"    {row['name']} = {row['value']}, "
+            f"limit: {row['limit']}, auth: {row['auth']}, "
+            f"extension: {row['extension']};"
+        )
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def section(document: str, heading: str, next_heading: str) -> str:
@@ -390,6 +416,7 @@ def check_registries(
     rust: str,
     wire: str,
     generated: str | None = None,
+    generated_frames: str | None = None,
 ) -> list[str]:
     """Failures that mean the YAML, the Markdown view, or vot-codec drifted."""
     failures: list[str] = []
@@ -401,6 +428,14 @@ def check_registries(
                 "run tools/generate_registries.py"
             )
         rust = generated + "\n" + rust
+    if generated_frames is not None:
+        expected_frames = render_frames(document)
+        if generated_frames != expected_frames:
+            failures.append(
+                "crates/vot-codec/src/generated_frames.rs is stale; "
+                "run tools/generate_registries.py"
+            )
+        rust = generated_frames + "\n" + rust
 
     frames = document["frames"]
     settings = document["settings"]
@@ -448,7 +483,18 @@ def check_registries(
         failures.append(f"markdown view: {error}")
         view = {}
     for key, rows in view.items():
-        if rows != document[key]:
+        if not rows:
+            failures.append(f"markdown {key} table is empty")
+            continue
+        columns = list(rows[0])
+        try:
+            projected = [
+                {column: row[column] for column in columns} for row in document[key]
+            ]
+        except KeyError as error:
+            failures.append(f"markdown {key} table: source missing {error}")
+            continue
+        if projected != rows:
             failures.append(f"markdown {key} table does not match the registry source")
 
     try:

@@ -24,8 +24,13 @@ def validate(root: Path) -> None:
     generated = (root / "crates" / "vot-codec" / "src" / "generated.rs").read_text(
         encoding="utf-8"
     )
+    generated_frames = (
+        root / "crates" / "vot-codec" / "src" / "generated_frames.rs"
+    ).read_text(encoding="utf-8")
     wire = (root / "spec" / "wire.md").read_text(encoding="utf-8")
-    failures = check_registries(document, markdown, rust, wire, generated)
+    failures = check_registries(
+        document, markdown, rust, wire, generated, generated_frames
+    )
     if failures:
         raise AssertionError("; ".join(failures))
 

@@ -2,6 +2,9 @@
 
 Status: frozen for `vot-draft-05`
 
+Identifier tables are assigned in `spec/registries.yaml`. This document is
+the human view of those tables.
+
 All integer registry values are unsigned QUIC variable-length integers unless a
 table says otherwise. Values not listed here are unassigned. Implementations
 MUST use symbolic names in source and MUST NOT allocate values outside this

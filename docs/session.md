@@ -30,8 +30,8 @@ this point.
 A `PING` between the two states is fine; a `DATA_RECORD` is not.
 
 `requires_authentication` in `vot-codec` defines the auth-gated subset.
-`tools/validate_registries.py` cross-checks it against the registry's `Auth`
-column.
+`tools/validate_registries.py` cross-checks it against the frame table in
+`spec/registries.yaml` and the `Auth` column in `spec/wire.md`.
 
 ## Authentication exchange
 

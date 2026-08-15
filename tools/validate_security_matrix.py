@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -41,10 +40,8 @@ def validate(root: Path) -> None:
         assert case["controls"], f"{case['id']}: no controls"
         assert case["tests"], f"{case['id']}: no tests"
 
-    registry = (root / "spec" / "registries.md").read_text(encoding="utf-8")
-    registered_events = set(
-        re.findall(r"^\| `((?:vot|vcrc)\.[a-z0-9_.]+)` \|", registry, re.MULTILINE)
-    )
+    registries = json.loads((root / "spec" / "registries.yaml").read_text(encoding="utf-8"))
+    registered_events = {row["name"] for row in registries["telemetry"]}
     used_events = {
         event for case in cases for event in case["telemetry"]
     }

@@ -6,6 +6,7 @@ Every check the repository can run, in review order.
 
 ```sh
 python3 tools/validate_registries.py
+python3 -m unittest tools.test_registries
 python3 tools/validate_wire_vectors.py
 python3 tools/validate_negotiation_vectors.py
 python3 tools/validate_session_vectors.py
@@ -37,9 +38,12 @@ Event-name comments alone are not enough. `tools/test_commit_model_sync.py`
 feeds a swapped `Step` and a dropped `FlushFailure` and proves the checker
 rejects them.
 
-`validate_registries.py` compares `spec/registries.md` tables against `vot-codec`
-constants, including the error-code table: block/class structure, ascending
-order, and a value-exact subset check for the Rust constants.
+`validate_registries.py` loads `spec/registries.yaml` and holds
+`spec/registries.md` and the `vot-codec` constants to it, including the
+error-code table: block/class structure, ascending order, and a value-exact
+subset check for the Rust constants. `tools/test_registries.py` drops a frame,
+swaps an operation value, removes a Markdown row, and flips handling parity
+and proves the checker rejects them.
 
 ## Public API
 

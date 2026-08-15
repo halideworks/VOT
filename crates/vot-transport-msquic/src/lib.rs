@@ -293,7 +293,7 @@ pub mod live {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use msquic::{
@@ -876,9 +876,8 @@ pub mod live {
             if self.bytes == 0 {
                 return;
             }
-            if let Ok(mut budget) = self.budget.lock() {
-                budget.release_assembly(self.bytes);
-            }
+            let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+            budget.release_assembly(self.bytes);
             self.bytes = 0;
         }
     }
@@ -887,7 +886,7 @@ pub mod live {
         type Hold = AssemblyHold;
 
         fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
-            let mut budget = self.0.lock().ok()?;
+            let mut budget = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if !budget.reserve_assembly(bytes) {
                 return None;
             }
@@ -1305,7 +1304,10 @@ pub mod live {
 
         /// Returns partial-frame storage to the budget.
         fn release_assembly(&mut self, bytes: usize) {
-            self.assembling = self.assembling.saturating_sub(bytes);
+            self.assembling = self
+                .assembling
+                .checked_sub(bytes)
+                .unwrap_or(MAX_CALLBACK_BYTES);
         }
 
         /// Queues a connection lifecycle event past both bounds.

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -177,9 +177,11 @@ impl Drop for AssemblyHold {
         if self.bytes == 0 {
             return;
         }
-        if let Ok(mut inbound) = self.inbound.lock() {
-            inbound.assembling = inbound.assembling.saturating_sub(self.bytes);
-        }
+        let mut inbound = self.inbound.lock().unwrap_or_else(PoisonError::into_inner);
+        inbound.assembling = inbound
+            .assembling
+            .checked_sub(self.bytes)
+            .unwrap_or(MAX_ASSEMBLY_BYTES);
         self.bytes = 0;
     }
 }
@@ -188,7 +190,7 @@ impl AssemblyBudget for SharedBudget {
     type Hold = AssemblyHold;
 
     fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
-        let mut inbound = self.0.lock().ok()?;
+        let mut inbound = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let next = inbound.charged().checked_add(bytes)?;
         if next > MAX_ASSEMBLY_BYTES {
             return None;

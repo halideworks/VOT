@@ -144,28 +144,69 @@ impl Denial {
 
 /// What a request asks a capability to authorize.
 ///
-/// A raw identifier cannot be one, which is the whole point:
+/// The variant is the operation. A raw identifier cannot be one, and a
+/// ranges request cannot omit the range:
 ///
-/// ```compile_fail,E0308
-/// use vot_capability::verify::Request;
+/// ```compile_fail,E0560
+/// use vot_capability::verify::AuthorizedRequest;
 ///
-/// let request = Request {
-///     operation: 0x0004,
+/// let _ = AuthorizedRequest::Publish {
 ///     suite: 1,
 ///     root: [0; 32],
-///     range: None,
+///     operation: 0x0004,
+/// };
+/// ```
+///
+/// ```compile_fail,E0063
+/// use vot_capability::verify::AuthorizedRequest;
+///
+/// let _ = AuthorizedRequest::ReadRanges {
+///     suite: 1,
+///     root: [0; 32],
 /// };
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct Request {
-    /// What is being asked for. Closed, so an identifier this revision
-    /// cannot name has no way to reach the grant below.
-    pub operation: vot_codec::Operation,
-    /// The suite and root the request is about.
-    pub suite: u16,
-    pub root: [u8; 32],
-    /// The bytes it asks for, when it asks for bytes.
-    pub range: Option<Range>,
+pub enum AuthorizedRequest {
+    Publish {
+        suite: u16,
+        root: [u8; 32],
+    },
+    ReadManifest {
+        suite: u16,
+        root: [u8; 32],
+    },
+    ReadRanges {
+        suite: u16,
+        root: [u8; 32],
+        range: Range,
+    },
+}
+
+impl AuthorizedRequest {
+    #[must_use]
+    pub const fn operation(self) -> vot_codec::Operation {
+        match self {
+            Self::Publish { .. } => vot_codec::Operation::Publish,
+            Self::ReadManifest { .. } => vot_codec::Operation::ReadManifest,
+            Self::ReadRanges { .. } => vot_codec::Operation::ReadRanges,
+        }
+    }
+
+    const fn suite(self) -> u16 {
+        match self {
+            Self::Publish { suite, .. }
+            | Self::ReadManifest { suite, .. }
+            | Self::ReadRanges { suite, .. } => suite,
+        }
+    }
+
+    const fn root(self) -> [u8; 32] {
+        match self {
+            Self::Publish { root, .. }
+            | Self::ReadManifest { root, .. }
+            | Self::ReadRanges { root, .. } => root,
+        }
+    }
 }
 
 /// A verified capability with the audience and clock it was accepted under.
@@ -186,16 +227,18 @@ impl Authorized {
     /// # Errors
     /// Reports an operation the capability does not allow, another object, and a
     /// range outside its scope.
-    pub fn allows(&self, request: Request) -> Result<(), Denial> {
-        if !self.capability.allows(request.operation) {
-            return Err(Denial::OperationNotAllowed(request.operation.identifier()));
+    pub fn allows(&self, request: AuthorizedRequest) -> Result<(), Denial> {
+        if !self.capability.allows(request.operation()) {
+            return Err(Denial::OperationNotAllowed(
+                request.operation().identifier(),
+            ));
         }
-        if request.suite != self.capability.scope.suite
-            || request.root != self.capability.scope.root
+        if request.suite() != self.capability.scope.suite
+            || request.root() != self.capability.scope.root
         {
             return Err(Denial::SubjectIsAnother);
         }
-        if let Some(range) = request.range
+        if let AuthorizedRequest::ReadRanges { range, .. } = request
             && !self.capability.scope.allows(range)
         {
             return Err(Denial::RangeNotAllowed);
@@ -486,14 +529,9 @@ mod tests {
         assert_eq!(authorized.capability(), &value);
         assert_eq!(authorized.limit(1), Some(4));
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::Publish,
+            authorized.allows(AuthorizedRequest::Publish {
                 suite: 1,
                 root: [7; 32],
-                range: Some(Range {
-                    offset: 0,
-                    length: 65_536
-                }),
             }),
             Ok(())
         );
@@ -828,11 +866,9 @@ mod tests {
         );
 
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::Publish,
+            authorized.allows(AuthorizedRequest::Publish {
                 suite: 1,
                 root: [7; 32],
-                range: None,
             }),
             Ok(())
         );
@@ -852,11 +888,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::ReadManifest,
+            authorized.allows(AuthorizedRequest::ReadManifest {
                 suite: 1,
                 root: [7; 32],
-                range: None,
             }),
             Err(Denial::OperationNotAllowed(
                 vot_codec::operation::READ_MANIFEST
@@ -864,47 +898,53 @@ mod tests {
         );
 
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::Publish,
+            authorized.allows(AuthorizedRequest::Publish {
                 suite: 1,
                 root: [8; 32],
-                range: None,
             }),
             Err(Denial::SubjectIsAnother)
         );
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::Publish,
+            authorized.allows(AuthorizedRequest::Publish {
                 suite: 2,
                 root: [7; 32],
-                range: None,
             }),
             Err(Denial::SubjectIsAnother)
         );
 
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::ReadRanges,
+            authorized.allows(AuthorizedRequest::ReadRanges {
                 suite: 1,
                 root: [7; 32],
-                range: Some(Range {
+                range: Range {
                     offset: 0,
                     length: 65_537
-                }),
+                },
             }),
             Err(Denial::RangeNotAllowed)
         );
         assert_eq!(
-            authorized.allows(Request {
-                operation: vot_codec::Operation::ReadRanges,
+            authorized.allows(AuthorizedRequest::ReadRanges {
                 suite: 1,
                 root: [7; 32],
-                range: Some(Range {
+                range: Range {
                     offset: 65_535,
                     length: 1
-                }),
+                },
             }),
             Ok(())
+        );
+        assert_eq!(
+            AuthorizedRequest::ReadRanges {
+                suite: 1,
+                root: [7; 32],
+                range: Range {
+                    offset: 65_535,
+                    length: 1
+                },
+            }
+            .operation(),
+            vot_codec::Operation::ReadRanges
         );
     }
 

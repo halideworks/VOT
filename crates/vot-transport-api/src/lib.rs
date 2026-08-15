@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+mod permit;
+pub use permit::{Ledger, Permit};
+
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 

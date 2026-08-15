@@ -26,7 +26,9 @@ GF(2^8), with the polynomial 0x11D and generator 2, exactly as written in
 - Source symbols are sent unchanged as ESIs `0..k-1`; repair symbol `i` is the
   Cauchy row `inverse((k + i) XOR j)` applied to the sources.
 - Any `k` received symbols of a generation reconstruct all `k` sources. Fewer
-  than `k` is `INSUFFICIENT_SYMBOLS` and reconstructs nothing.
+  than `k` is `INSUFFICIENT_SYMBOLS` and reconstructs nothing. A symbol with
+  an ESI outside the geometry or a length other than `L` fails the whole call
+  as `INVALID_SYMBOL`; nothing is silently dropped.
 - Geometry is `(k, r, L)` with `k` in `1..=64`, `r` in `0..=16`, `L` in
   `1..=65535`. Anything else is `INVALID_GEOMETRY`, checked before allocation.
 - Decoding is deterministic: received sources first, then repair ESIs in

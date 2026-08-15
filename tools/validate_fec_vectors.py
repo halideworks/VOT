@@ -68,6 +68,10 @@ def cauchy_row(source_count: int, repair_index: int) -> list[int]:
     return [gf_inv(x ^ y) for y in range(source_count)]
 
 
+class InvalidSymbol(ValueError):
+    """A received symbol the geometry cannot place; the whole call fails."""
+
+
 def check_geometry(source_count: int, repair_count: int, symbol_length: int) -> None:
     if not 1 <= source_count <= MAX_SOURCE:
         raise ValueError("source_count out of range")
@@ -111,9 +115,9 @@ def decode(
     k = source_count
     for esi, symbol in received.items():
         if not 0 <= esi < k + repair_count:
-            raise ValueError("esi out of range")
+            raise InvalidSymbol("esi out of range")
         if len(symbol) != symbol_length:
-            raise ValueError("symbol length mismatch")
+            raise InvalidSymbol("symbol length mismatch")
     if len(received) < k:
         return None
     # Use source symbols first, then the lowest repair ESIs, exactly k rows.
@@ -161,6 +165,13 @@ INSUFFICIENT = [
     ("k1_r1_len1_two_lost", 1, 1, 1, [0, 1]),
     ("k2_r2_len4_three_lost", 2, 2, 4, [0, 1, 3]),
     ("k64_r16_len4_seventeen_lost", 64, 16, 4, list(range(17))),
+]
+
+INVALID_SYMBOL = [
+    # name, k, r, symbol_length, extra (esi, length) presented beside k valid symbols
+    ("k2_r2_len4_esi_past_geometry", 2, 2, 4, (4, 4)),
+    ("k2_r2_len4_short_symbol", 2, 2, 4, (3, 3)),
+    ("k2_r2_len4_long_symbol", 2, 2, 4, (3, 5)),
 ]
 
 INVALID_GEOMETRY = [
@@ -240,6 +251,28 @@ def build_vectors() -> dict:
                 "outcome": "INSUFFICIENT_SYMBOLS",
             }
         )
+    invalid_symbol = []
+    for name, k, r, length, (bad_esi, bad_length) in INVALID_SYMBOL:
+        source = [pattern_symbol(esi, length) for esi in range(k)]
+        received = {esi: sym for esi, sym in enumerate(source)}
+        received[bad_esi] = pattern_symbol(bad_esi, bad_length)
+        try:
+            decode(k, r, length, received)
+        except InvalidSymbol:
+            invalid_symbol.append(
+                {
+                    "name": name,
+                    "source_count": k,
+                    "repair_count": r,
+                    "symbol_length": length,
+                    "received_esis": sorted(received),
+                    "invalid_esi": bad_esi,
+                    "invalid_length": bad_length,
+                    "outcome": "INVALID_SYMBOL",
+                }
+            )
+        else:
+            raise AssertionError(name)
     invalid = []
     for name, k, r, length in INVALID_GEOMETRY:
         try:
@@ -268,6 +301,7 @@ def build_vectors() -> dict:
         "matrices": matrix_vectors(),
         "encode": encode_cases,
         "insufficient": insufficient,
+        "invalid_symbol": invalid_symbol,
         "invalid_geometry": invalid,
     }
 
@@ -289,7 +323,11 @@ def main() -> int:
     if VECTOR_FILE.read_text() != text:
         print("vectors.json does not match the reference implementation", file=sys.stderr)
         return 1
-    print(f"ok: {len(vectors['encode'])} encode, {len(vectors['insufficient'])} insufficient, {len(vectors['invalid_geometry'])} invalid geometry")
+    print(
+        f"ok: {len(vectors['encode'])} encode, {len(vectors['insufficient'])} insufficient, "
+        f"{len(vectors['invalid_symbol'])} invalid symbol, "
+        f"{len(vectors['invalid_geometry'])} invalid geometry"
+    )
     return 0
 
 

@@ -66,9 +66,11 @@ repair[i][p] = XOR over j in 0..k of  G[i][j] * source[j][p]
 
 ## 5. Decoding
 
-Given at least `k` distinct received ESIs of one generation, the decoder:
+Given the received symbols of one generation, the decoder:
 
-1. Rejects any ESI at or above `k + r` and any symbol whose length is not `L`.
+1. Returns `INVALID_SYMBOL` if any received ESI is at or above `k + r`, any
+   received symbol's length is not `L`, or one ESI is presented twice. The
+   whole call fails; no symbol is dropped and decoding does not continue.
 2. If fewer than `k` distinct ESIs are present, returns
    `INSUFFICIENT_SYMBOLS`. Nothing is reconstructed.
 3. Selects exactly `k` rows: every received source ESI, then the received
@@ -96,8 +98,9 @@ geometry.
 The file carries field spot checks (exp and log tables, products, inverses),
 generator rows and matrix digests, encode cases with the repair bytes and the
 digest of the reconstruction after erasing the listed ESIs, insufficient cases
-that MUST return `INSUFFICIENT_SYMBOLS`, and geometries that MUST return
-`INVALID_GEOMETRY`. Source symbol `esi` byte `i` in a vector is
+that MUST return `INSUFFICIENT_SYMBOLS`, invalid symbol cases that MUST return
+`INVALID_SYMBOL` even though `k` valid symbols are present, and geometries
+that MUST return `INVALID_GEOMETRY`. Source symbol `esi` byte `i` in a vector is
 `(i*17 + esi*7 + 3) % 251`.
 
 ## 8. References

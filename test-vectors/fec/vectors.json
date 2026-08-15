@@ -464,6 +464,50 @@
       "outcome": "INSUFFICIENT_SYMBOLS"
     }
   ],
+  "invalid_symbol": [
+    {
+      "name": "k2_r2_len4_esi_past_geometry",
+      "source_count": 2,
+      "repair_count": 2,
+      "symbol_length": 4,
+      "received_esis": [
+        0,
+        1,
+        4
+      ],
+      "invalid_esi": 4,
+      "invalid_length": 4,
+      "outcome": "INVALID_SYMBOL"
+    },
+    {
+      "name": "k2_r2_len4_short_symbol",
+      "source_count": 2,
+      "repair_count": 2,
+      "symbol_length": 4,
+      "received_esis": [
+        0,
+        1,
+        3
+      ],
+      "invalid_esi": 3,
+      "invalid_length": 3,
+      "outcome": "INVALID_SYMBOL"
+    },
+    {
+      "name": "k2_r2_len4_long_symbol",
+      "source_count": 2,
+      "repair_count": 2,
+      "symbol_length": 4,
+      "received_esis": [
+        0,
+        1,
+        3
+      ],
+      "invalid_esi": 3,
+      "invalid_length": 5,
+      "outcome": "INVALID_SYMBOL"
+    }
+  ],
   "invalid_geometry": [
     {
       "name": "zero_source",

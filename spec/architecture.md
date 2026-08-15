@@ -296,7 +296,7 @@ end-to-end deadline certificate.
 | Default idle timeout | 90 s, negotiated; see ADR-0035 for what installs it |
 | Online VCRC objective | CVaR95 |
 | Initial VCRC scenarios | 256, adaptively expanded |
-| Datagram FEC field | GF(2^8) |
+| Datagram FEC field | GF(2^8), code in `spec/fec.md` |
 | Initial FEC geometry | 64 source symbols; repair cap 16 |
 
 ## 10. Final-review disposition record

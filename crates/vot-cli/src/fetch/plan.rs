@@ -234,9 +234,5 @@ impl FetchPlan {
 }
 
 pub(crate) fn subject_of(planned: &PlannedObject) -> SubjectId {
-    SubjectId {
-        suite: planned.object.suite,
-        root: planned.object.root,
-        length: planned.object.length,
-    }
+    SubjectId::try_from(planned.object).expect("a planned object names a registered suite")
 }

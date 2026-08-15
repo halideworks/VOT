@@ -9,11 +9,7 @@ use vot_transport_api::SubjectId;
 use vot_transport_tcp::{Carrier, CarrierRace, RaceAction};
 
 fn subject() -> SubjectId {
-    SubjectId {
-        suite: 1,
-        root: [0x51; 32],
-        length: 100 * 65_536,
-    }
+    SubjectId::new(1, [0x51; 32], 100 * 65_536).unwrap()
 }
 
 /// A store path that takes its own files with it.

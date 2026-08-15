@@ -261,11 +261,8 @@ pub(crate) fn receive_direct(
     if source.metadata()?.len() != length {
         return Err(Error::InvalidBundle);
     }
-    let subject = SubjectId {
-        suite: suite_id(suite),
-        root,
-        length,
-    };
+    let subject =
+        SubjectId::new(suite_id(suite), root, length).map_err(|_| Error::InvalidBundle)?;
     let mut destination = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -314,11 +311,8 @@ pub(crate) fn receive_object(
     if source.metadata()?.len() != length {
         return Err(Error::InvalidBundle);
     }
-    let subject = SubjectId {
-        suite: suite_id(suite),
-        root,
-        length,
-    };
+    let subject =
+        SubjectId::new(suite_id(suite), root, length).map_err(|_| Error::InvalidBundle)?;
     let already_verified = receiver.is_verified(subject);
     if !already_verified {
         receiver.begin(subject)?;

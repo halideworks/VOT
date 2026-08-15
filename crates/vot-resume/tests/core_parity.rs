@@ -5,11 +5,7 @@ use vot_resume_core::{ResumeIdentity, ResumeState, UnitRanges};
 use vot_transport_api::SubjectId;
 
 fn subject() -> SubjectId {
-    SubjectId {
-        suite: 1,
-        root: [0x72; 32],
-        length: 6 * 65_536,
-    }
+    SubjectId::new(1, [0x72; 32], 6 * 65_536).unwrap()
 }
 
 struct TempStore(PathBuf);
@@ -34,7 +30,7 @@ fn native_tracker_matches_the_persistence_neutral_state() {
     let subject = subject();
     let mut store = ResumeStore::open(path.0.clone()).unwrap();
     let mut native = ResumeTracker::discover(&mut store, subject, 6, 2).unwrap();
-    let identity = ResumeIdentity::new(subject.suite, subject.root, subject.length);
+    let identity = ResumeIdentity::new(subject.suite(), subject.root(), subject.length());
     let mut core = ResumeState::new(identity, 6, 2, UnitRanges::new()).unwrap();
 
     for unit in 0..5 {

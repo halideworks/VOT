@@ -3788,22 +3788,19 @@ pub mod live {
         fn a_proof_bearing_range_becomes_verified_state_over_the_carrier() {
             let unit = usize::try_from(vot_scheduler::RANGE_UNIT_BYTES).unwrap();
             let bytes = vec![0x5a_u8; unit * 2];
-            let subject = vot_transport_api::SubjectId {
-                suite: 1,
-                root: vot_verifier::root(vot_verifier::Suite::Blake3Bao64, &bytes).unwrap(),
-                length: bytes.len() as u64,
-            };
+            let subject = vot_transport_api::SubjectId::new(
+                1,
+                vot_verifier::root(vot_verifier::Suite::Blake3Bao64, &bytes).unwrap(),
+                bytes.len() as u64,
+            )
+            .unwrap();
             let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
             let bundle = vot_codec::frames::ProofBundle {
                 request_id: [1; 16],
                 bundle_id: [2; 16],
-                object: vot_codec::frames::ObjectId {
-                    suite: subject.suite,
-                    root: subject.root,
-                    length: subject.length,
-                },
+                object: vot_codec::frames::ObjectId::try_from(subject).unwrap(),
                 requested_offset: 0,
-                requested_length: subject.length,
+                requested_length: subject.length(),
                 covered_offset: proof.covered_offset,
                 covered_length: proof.data.len() as u64,
                 data_record_count: 2,

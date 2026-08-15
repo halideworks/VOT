@@ -74,7 +74,7 @@ impl ReliableReceiver {
         if self.active.contains_key(&subject) || self.range_active.contains_key(&subject) {
             return Err(Error::AlreadyReceiving);
         }
-        let verifier = StreamVerifier::new(suite(subject.suite)?);
+        let verifier = StreamVerifier::new(suite(subject.suite())?);
         let reservation = self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         self.active.insert(
@@ -103,8 +103,8 @@ impl ReliableReceiver {
         if self.active.contains_key(&subject) || self.range_active.contains_key(&subject) {
             return Err(Error::AlreadyReceiving);
         }
-        let _ = suite(subject.suite)?;
-        if subject.length == 0 {
+        let _ = suite(subject.suite())?;
+        if subject.length() == 0 {
             return Err(Error::LengthMismatch);
         }
         let reservation = self.staging.reserve(VERIFIER_RESERVATION)?;
@@ -286,7 +286,7 @@ impl ReliableReceiver {
         let complete = self
             .range_active
             .get(&subject)
-            .map(|active| active.coverage.is_complete(subject.length))
+            .map(|active| active.coverage.is_complete(subject.length()))
             .ok_or(Error::UnknownObject)?;
         if !complete {
             return Err(Error::LengthMismatch);
@@ -331,7 +331,7 @@ impl ReliableReceiver {
             .received
             .checked_add(bytes)
             .ok_or(Error::LengthExceeded)?;
-        if received > subject.length {
+        if received > subject.length() {
             return Err(Error::LengthExceeded);
         }
         active.verifier.update(record)?;
@@ -347,10 +347,10 @@ impl ReliableReceiver {
         }
         let active = self.active.remove(&subject).ok_or(Error::UnknownObject)?;
         drop(active.reservation);
-        if active.received != subject.length {
+        if active.received != subject.length() {
             return Err(Error::LengthMismatch);
         }
-        if active.verifier.finish()? != subject.root {
+        if active.verifier.finish()? != subject.root() {
             return Err(Error::RootMismatch);
         }
         self.verified.insert(subject);

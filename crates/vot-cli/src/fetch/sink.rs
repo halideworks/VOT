@@ -56,13 +56,13 @@ impl DurableHook {
         let Some(covered) = covered else {
             return;
         };
-        let units = durable_units(&covered, self.subject.length);
+        let units = durable_units(&covered, self.subject.length());
         if units.is_empty() {
             return;
         }
         if let Ok(mut store) = self.store.lock() {
             let _ =
-                store.checkpoint_units(self.subject, total_units_of(self.subject.length), &units);
+                store.checkpoint_units(self.subject, total_units_of(self.subject.length()), &units);
         }
     }
 }

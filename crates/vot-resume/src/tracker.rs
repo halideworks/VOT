@@ -19,7 +19,7 @@ impl ResumeTracker {
         validate_total_units(total_units)?;
         validate_checkpoint_window(total_units, checkpoint_window)?;
         let checkpointed = store.reserve_object(subject, total_units)?;
-        let identity = ResumeIdentity::new(subject.suite, subject.root, subject.length);
+        let identity = ResumeIdentity::new(subject.suite(), subject.root(), subject.length());
         let state = ResumeState::new(identity, total_units, checkpoint_window, checkpointed)
             .map_err(map_core_error)?;
         Ok(Self { subject, state })

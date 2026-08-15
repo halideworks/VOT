@@ -6,6 +6,11 @@ use core::cmp::min;
 use std::collections::BTreeSet;
 
 pub mod frames;
+mod generated;
+pub use generated::{
+    REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS, extension_id, operation,
+    resource_limit, setting_id,
+};
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
 pub const MIN_CONTROL_FRAME_PAYLOAD: usize = 1024;
@@ -16,38 +21,9 @@ pub const MAX_SETTINGS_PER_FRAME: usize = 128;
 pub const MAX_EXTENSIONS_PER_HELLO: usize = 256;
 pub const DRAFT_REVISION: u64 = 5;
 
-pub mod setting_id {
-    pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 0x01;
-    pub const MAX_DATA_RECORD_PAYLOAD: u64 = 0x03;
-    pub const MAX_MANIFEST_PAGE_PAYLOAD: u64 = 0x05;
-    pub const RELIABLE_LANE_LIMIT: u64 = 0x07;
-    pub const IDLE_TIMEOUT_MS: u64 = 0x09;
-
-    /// Identifiers ADR-0035 retired, kept here so nothing reassigns them.
-    /// `0x0b` was `ACTIVE_KEEPALIVE_MS`, `0x20` `COMPRESSION_MIN_GAIN_BPS`,
-    /// and `0x22` `TELEMETRY_LEVEL`. Each returns with the thing it
-    /// configures, and `0x0b` was critical, so a peer still sending it meets
-    /// the unknown-critical rule and the session closes.
-    pub const RETIRED: [u64; 3] = [0x0b, 0x20, 0x22];
-}
-
 /// The registered default for `IDLE_TIMEOUT_MS`, named so the carrier that
 /// installs its own idle timeout can take this one rather than repeat it.
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 90_000;
-
-/// What a capability authorizes.
-pub mod operation {
-    pub const PUBLISH: u64 = 0x0001;
-    pub const READ_MANIFEST: u64 = 0x0002;
-    pub const READ_RANGES: u64 = 0x0003;
-}
-
-/// What a capability may cap.
-pub mod resource_limit {
-    pub const CONCURRENT_LANES: u64 = 0x0001;
-    pub const WIRE_BYTES: u64 = 0x0002;
-    pub const STORAGE_BYTES: u64 = 0x0003;
-}
 
 pub mod error_code {
     pub const UNKNOWN_CRITICAL_FRAME: u16 = 0x0101;
@@ -67,17 +43,6 @@ pub mod error_code {
     pub const PROOF_INVALID: u16 = 0x0303;
     pub const SOURCE_MUTATED: u16 = 0x0304;
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
-}
-
-/// Extension identifiers.
-pub mod extension_id {
-    pub const CORE_RELIABLE: u64 = 0x00;
-    pub const DATAGRAM_FEC: u64 = 0x01;
-    pub const ZSTD_RECORDS: u64 = 0x02;
-    pub const VCRC: u64 = 0x03;
-    pub const PUBLIC_MULTI_RAIL: u64 = 0x04;
-    pub const CUSTOM_CONGESTION_CONTROL: u64 = 0x05;
-    pub const MULTIPATH_QUIC: u64 = 0x06;
 }
 
 /// One row per registered frame: identifier, payload ceiling, whether an
@@ -419,26 +384,6 @@ pub fn decode_settings(payload: &[u8]) -> Result<Settings, SettingsError> {
     Ok(settings)
 }
 
-/// Every registered setting, in identifier order.
-pub const REGISTERED_SETTINGS: [u64; 5] = [
-    setting_id::MAX_CONTROL_FRAME_PAYLOAD,
-    setting_id::MAX_DATA_RECORD_PAYLOAD,
-    setting_id::MAX_MANIFEST_PAGE_PAYLOAD,
-    setting_id::RELIABLE_LANE_LIMIT,
-    setting_id::IDLE_TIMEOUT_MS,
-];
-
-/// Every registered operation, in identifier order.
-///
-/// Written out rather than derived from [`Operation`], and held to it by
-/// test: an identifier here that names no variant, or a variant naming no
-/// identifier here, fails `no_unregistered_identifier_becomes_an_operation`.
-pub const REGISTERED_OPERATIONS: [u64; 3] = [
-    operation::PUBLISH,
-    operation::READ_MANIFEST,
-    operation::READ_RANGES,
-];
-
 /// Whether this revision knows what an operation authorizes. Unknown
 /// identifiers grant nothing but do not invalidate the capability.
 #[must_use]
@@ -490,13 +435,6 @@ impl TryFrom<u64> for Operation {
         }
     }
 }
-
-/// Every registered resource limit, in identifier order.
-pub const REGISTERED_LIMITS: [u64; 3] = [
-    resource_limit::CONCURRENT_LANES,
-    resource_limit::WIRE_BYTES,
-    resource_limit::STORAGE_BYTES,
-];
 
 /// Whether this revision knows what a resource limit bounds. Unknown
 /// identifiers fail closed (opposite of operations): ignoring a restriction

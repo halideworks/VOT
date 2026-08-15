@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 pub mod frames;
 mod generated;
 pub use generated::{
-    REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS, extension_id, operation,
-    resource_limit, setting_id,
+    REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS, error_code, extension_id,
+    operation, resource_limit, setting_id,
 };
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
@@ -24,26 +24,6 @@ pub const DRAFT_REVISION: u64 = 5;
 /// The registered default for `IDLE_TIMEOUT_MS`, named so the carrier that
 /// installs its own idle timeout can take this one rather than repeat it.
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 90_000;
-
-pub mod error_code {
-    pub const UNKNOWN_CRITICAL_FRAME: u16 = 0x0101;
-    pub const MALFORMED_FRAME: u16 = 0x0102;
-    pub const FRAME_TOO_LARGE: u16 = 0x0103;
-    pub const INVALID_SETTING: u16 = 0x0105;
-    pub const DUPLICATE_SETTING: u16 = 0x0106;
-    pub const UNSUPPORTED_VERSION: u16 = 0x0104;
-    pub const STORAGE_WRITE_FAILED: u16 = 0x0401;
-    pub const RESOURCE_LIMIT: u16 = 0x0502;
-    pub const CARRIER_UNAVAILABLE: u16 = 0x0601;
-    pub const AUTHENTICATION_FAILED: u16 = 0x0201;
-    pub const AUTHORIZATION_FAILED: u16 = 0x0202;
-    pub const REPLAY_REJECTED: u16 = 0x0203;
-    pub const MANIFEST_INVALID: u16 = 0x0301;
-    pub const OBJECT_IDENTITY_MISMATCH: u16 = 0x0302;
-    pub const PROOF_INVALID: u16 = 0x0303;
-    pub const SOURCE_MUTATED: u16 = 0x0304;
-    pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
-}
 
 /// One row per registered frame: identifier, payload ceiling, whether an
 /// authenticated session is required to send it, and the extension it needs.

@@ -57,6 +57,29 @@ class RegistrySourceSync(unittest.TestCase):
             failures,
         )
 
+    def test_dropped_error_is_rejected(self) -> None:
+        document, markdown, rust, wire, generated, generated_frames = sources()
+        mutated = copy.deepcopy(document)
+        mutated["errors"] = [
+            row for row in mutated["errors"] if row["name"] != "RISK_BUDGET_EXHAUSTED"
+        ]
+        failures = check(mutated, markdown, rust, wire, generated, generated_frames)
+        self.assertTrue(
+            any("error" in item or "stale" in item for item in failures),
+            failures,
+        )
+
+    def test_swapped_error_value_is_rejected(self) -> None:
+        document, markdown, rust, wire, generated, generated_frames = sources()
+        mutated = generated.replace(
+            "pub const MALFORMED_FRAME: u16 = 0x0102;",
+            "pub const MALFORMED_FRAME: u16 = 0x0103;",
+            1,
+        )
+        self.assertNotEqual(generated, mutated)
+        failures = check(document, markdown, rust, wire, mutated, generated_frames)
+        self.assertTrue(any("error" in item or "stale" in item for item in failures), failures)
+
     def test_swapped_operation_value_is_rejected(self) -> None:
         document, markdown, rust, wire, generated, generated_frames = sources()
         mutated = generated.replace(

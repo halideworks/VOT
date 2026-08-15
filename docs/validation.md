@@ -41,12 +41,13 @@ rejects them.
 
 `validate_registries.py` loads `spec/registries.yaml` and holds
 `spec/registries.md` and the `vot-codec` constants to it, including the
-error-code table: block/class structure, ascending order, and a value-exact
-subset check for the Rust constants. Setting, operation, limit, and
-extension identifiers are generated into `crates/vot-codec/src/generated.rs`.
-Frame payload, auth, and extension rows are generated into
-`generated_frames.rs`. A stale file fails. `tools/test_registries.py` drops a
-frame, swaps an operation value, edits a generated file, removes a Markdown
+error-code table: block/class structure, ascending order, and an exact
+match against the generated Rust constants. Setting, operation, limit,
+extension, and error-code identifiers are generated into
+`crates/vot-codec/src/generated.rs`. Frame payload, auth, and extension
+rows are generated into `generated_frames.rs`. A stale file fails.
+`tools/test_registries.py` drops a frame, drops an error, swaps an
+operation or error value, edits a generated file, removes a Markdown
 row, and flips handling parity and proves the checker rejects them.
 
 ## Public API

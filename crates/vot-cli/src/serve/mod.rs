@@ -184,11 +184,7 @@ mod tests {
         bundle: &ProofBundle,
         records: &[DataRecord],
     ) -> Vec<u8> {
-        let subject = SubjectId {
-            suite: object.suite,
-            root: object.root,
-            length: object.length,
-        };
+        let subject = SubjectId::try_from(object).unwrap();
         ReliableReceiver::verify_typed_bundle(subject, bundle, records).unwrap();
         let mut ordered: Vec<&DataRecord> = records.iter().collect();
         ordered.sort_by_key(|record| record.record_index);

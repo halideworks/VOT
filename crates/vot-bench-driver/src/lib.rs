@@ -472,11 +472,8 @@ fn prepared_object_and_subject(config: &Config) -> Result<(SubjectId, PreparedOb
     }
     let prepared = builder.finish().map_err(|_| layer_error())?;
     let object = prepared.object_id();
-    let subject = SubjectId {
-        suite: object.suite,
-        root: object.root,
-        length: object.length,
-    };
+    let subject =
+        SubjectId::new(object.suite, object.root, object.length).map_err(|_| layer_error())?;
     Ok((subject, prepared))
 }
 
@@ -595,11 +592,8 @@ impl BundleProducer {
         let bundle = vot_codec::frames::ProofBundle {
             request_id: identifier,
             bundle_id: identifier,
-            object: vot_codec::frames::ObjectId {
-                suite: self.subject.suite,
-                root: self.subject.root,
-                length: self.subject.length,
-            },
+            object: vot_codec::frames::ObjectId::try_from(self.subject)
+                .map_err(|_| layer_error())?,
             requested_offset: covered_offset,
             requested_length: covered_length,
             covered_offset,
@@ -810,11 +804,12 @@ fn subject_of(config: &Config) -> Result<SubjectId, Error> {
         source.fill(&mut record, take);
         verifier.update(&record)?;
     }
-    Ok(SubjectId {
-        suite: config.suite.identifier(),
-        root: verifier.finish()?,
-        length: config.object_bytes,
-    })
+    SubjectId::new(
+        config.suite.identifier(),
+        verifier.finish()?,
+        config.object_bytes,
+    )
+    .map_err(|_| Error::Value("VOT_BENCH_OBJECT_BYTES"))
 }
 
 /// User and system CPU time this process has spent, in nanoseconds.

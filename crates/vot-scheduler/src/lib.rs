@@ -99,11 +99,12 @@ mod tests {
         assert!(!receiver.recover_accounting(), "and only once");
     }
     fn subject(bytes: &[u8]) -> SubjectId {
-        SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, bytes).unwrap(),
-            length: bytes.len() as u64,
-        }
+        SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap()
     }
 
     /// Retains what it is written, for test assertions.
@@ -296,11 +297,7 @@ mod tests {
 
     #[test]
     fn finish_ranges_requires_every_byte_of_the_object() {
-        let object = SubjectId {
-            suite: 1,
-            root: [0; 32],
-            length: 2 * RANGE_UNIT_BYTES,
-        };
+        let object = SubjectId::new(1, [0; 32], 2 * RANGE_UNIT_BYTES).unwrap();
         let mut receiver =
             ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
         let mut partial = RangeState::new(
@@ -435,17 +432,17 @@ mod tests {
     #[test]
     fn mismatched_root_and_overrun_are_rejected() {
         let bytes = b"expected";
-        let mut wrong = subject(bytes);
-        wrong.root[0] ^= 1;
+        let expected = subject(bytes);
+        let mut root = expected.root();
+        root[0] ^= 1;
+        let wrong = SubjectId::new(expected.suite(), root, expected.length()).unwrap();
         let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
         receiver.begin(wrong).unwrap();
         receiver.receive(wrong, bytes).unwrap();
         assert_eq!(receiver.finish(wrong), Err(Error::RootMismatch));
 
-        let short = SubjectId {
-            length: 2,
-            ..subject(b"ab")
-        };
+        let base = subject(b"ab");
+        let short = SubjectId::new(base.suite(), base.root(), 2).unwrap();
         receiver.begin(short).unwrap();
         assert_eq!(receiver.receive(short, b"abc"), Err(Error::LengthExceeded));
     }
@@ -509,11 +506,7 @@ mod tests {
             Err(Error::RecordTooLarge)
         );
 
-        let large_range_subject = SubjectId {
-            suite: 1,
-            root: [0; 32],
-            length: MAX_PROOF_RANGE_BYTES,
-        };
+        let large_range_subject = SubjectId::new(1, [0; 32], MAX_PROOF_RANGE_BYTES).unwrap();
         let exact_max = vec![0; usize::try_from(MAX_PROOF_RANGE_BYTES).unwrap()];
         let mut exact_receiver = make_receiver();
         exact_receiver
@@ -844,11 +837,12 @@ mod tests {
     fn proof_bearing_ranges_accept_out_of_order_for_both_suites() {
         let bytes = vec![0x5a; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
 
-        let blake_subject = SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let blake_subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let second_blake =
             vot_proof_blake3::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let first_blake = vot_proof_blake3::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
@@ -880,11 +874,12 @@ mod tests {
         blake_receiver.finish_ranges(blake_subject).unwrap();
         assert!(blake_receiver.is_verified(blake_subject));
 
-        let sha_subject = SubjectId {
-            suite: 2,
-            root: vot_verifier::root(Suite::Sha256Bep52, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let sha_subject = SubjectId::new(
+            2,
+            vot_verifier::root(Suite::Sha256Bep52, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let second_sha =
             vot_proof_sha256::prove(&bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
         let first_sha = vot_proof_sha256::prove(&bytes, 0, RANGE_UNIT_BYTES).unwrap();
@@ -921,22 +916,19 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn typed_wire_bundle_reassembles_records_before_root_verification() {
         let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
-        let subject = SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
         let bundle = vot_codec::frames::ProofBundle {
             request_id: [3; 16],
             bundle_id: [4; 16],
-            object: vot_codec::frames::ObjectId {
-                suite: subject.suite,
-                root: subject.root,
-                length: subject.length,
-            },
+            object: vot_codec::frames::ObjectId::try_from(subject).unwrap(),
             requested_offset: 0,
-            requested_length: subject.length,
+            requested_length: subject.length(),
             covered_offset: proof.covered_offset,
             covered_length: proof.data.len() as u64,
             data_record_count: 2,
@@ -1046,22 +1038,19 @@ mod tests {
     #[test]
     fn a_witness_verifies_off_thread_and_admits_on_it() {
         let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
-        let subject = SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
         let bundle = vot_codec::frames::ProofBundle {
             request_id: [3; 16],
             bundle_id: [4; 16],
-            object: vot_codec::frames::ObjectId {
-                suite: subject.suite,
-                root: subject.root,
-                length: subject.length,
-            },
+            object: vot_codec::frames::ObjectId::try_from(subject).unwrap(),
             requested_offset: 0,
-            requested_length: subject.length,
+            requested_length: subject.length(),
             covered_offset: proof.covered_offset,
             covered_length: proof.data.len() as u64,
             data_record_count: 1,
@@ -1128,22 +1117,19 @@ mod tests {
     #[test]
     fn a_written_range_admits_without_the_bytes() {
         let bytes = vec![0x3c; usize::try_from(RANGE_UNIT_BYTES * 2).unwrap()];
-        let subject = SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
         let bundle = vot_codec::frames::ProofBundle {
             request_id: [3; 16],
             bundle_id: [4; 16],
-            object: vot_codec::frames::ObjectId {
-                suite: subject.suite,
-                root: subject.root,
-                length: subject.length,
-            },
+            object: vot_codec::frames::ObjectId::try_from(subject).unwrap(),
             requested_offset: 0,
-            requested_length: subject.length,
+            requested_length: subject.length(),
             covered_offset: proof.covered_offset,
             covered_length: proof.data.len() as u64,
             data_record_count: 1,
@@ -1222,11 +1208,12 @@ mod tests {
     #[test]
     fn sha256_suite_transfer_is_verified() {
         let bytes = b"sha256 tree content";
-        let subject = SubjectId {
-            suite: 2,
-            root: vot_verifier::root(Suite::Sha256Bep52, bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let subject = SubjectId::new(
+            2,
+            vot_verifier::root(Suite::Sha256Bep52, bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
         receiver.begin(subject).unwrap();
         receiver.receive(subject, bytes).unwrap();

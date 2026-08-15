@@ -587,11 +587,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     }
 
     fn hold_bundle(&mut self, bundle: ProofBundle, identity: [u8; 32]) -> Result<(), Error> {
-        let subject = SubjectId {
-            suite: bundle.object.suite,
-            root: bundle.object.root,
-            length: bundle.object.length,
-        };
+        let subject = SubjectId::try_from(bundle.object).map_err(|_| Error::UnknownObject)?;
         // Checked before anything is stored, so an unauthorised peer cannot
         // spend this endpoint's memory by naming an object it may not have.
         if !self.admitted.contains(&subject) {
@@ -684,11 +680,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let (Some(bundle), Some(identity)) = (pending.bundle, pending.identity) else {
             return Ok(());
         };
-        let subject = SubjectId {
-            suite: bundle.object.suite,
-            root: bundle.object.root,
-            length: bundle.object.length,
-        };
+        let subject = SubjectId::try_from(bundle.object).map_err(|_| Error::UnknownObject)?;
         let delivered = Delivered::of(identity, &pending.records);
         // A cover for a subject already verified never goes to the caller:
         // the caller places what it proves through the sink of the object it
@@ -879,22 +871,19 @@ mod tests {
     fn object_of(fill: u8, id: [u8; 16]) -> (SubjectId, ProofBundle, Vec<DataRecord>) {
         let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
         let bytes = vec![fill; unit * 2];
-        let subject = SubjectId {
-            suite: 1,
-            root: vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
-            length: bytes.len() as u64,
-        };
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
         let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
         let bundle = ProofBundle {
             request_id: [1; 16],
             bundle_id: id,
-            object: ObjectId {
-                suite: subject.suite,
-                root: subject.root,
-                length: subject.length,
-            },
+            object: ObjectId::try_from(subject).unwrap(),
             requested_offset: 0,
-            requested_length: subject.length,
+            requested_length: subject.length(),
             covered_offset: proof.covered_offset,
             covered_length: proof.data.len() as u64,
             data_record_count: 2,
@@ -1744,11 +1733,12 @@ mod tests {
         conflicting.object.root = [9; 32];
         driver
             .admit(
-                SubjectId {
-                    suite: conflicting.object.suite,
-                    root: conflicting.object.root,
-                    length: conflicting.object.length,
-                },
+                SubjectId::new(
+                    conflicting.object.suite,
+                    conflicting.object.root,
+                    conflicting.object.length,
+                )
+                .unwrap(),
                 Box::new(DiscardSink),
             )
             .unwrap();

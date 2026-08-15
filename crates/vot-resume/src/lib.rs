@@ -48,11 +48,7 @@ mod tests {
     use super::*;
 
     fn subject(byte: u8) -> SubjectId {
-        SubjectId {
-            suite: 1,
-            root: [byte; 32],
-            length: 100,
-        }
+        SubjectId::new(1, [byte; 32], 100).unwrap()
     }
 
     /// Builds a checkpoint set from individual units, as the tests think of them.
@@ -108,7 +104,7 @@ mod tests {
         TempStore(std::env::temp_dir().join(format!(
             "vot-resume-{name}-{}-{}",
             std::process::id(),
-            subject(name.as_bytes()[0]).root[0]
+            subject(name.as_bytes()[0]).root()[0]
         )))
     }
 
@@ -926,11 +922,7 @@ mod tests {
     #[test]
     fn a_large_contiguous_object_costs_one_run_in_memory() {
         let path = temp_path("run-length-memory");
-        let subject = SubjectId {
-            suite: 1,
-            root: [0x5c; 32],
-            length: MAX_UNITS_PER_OBJECT * 65_536,
-        };
+        let subject = SubjectId::new(1, [0x5c; 32], MAX_UNITS_PER_OBJECT * 65_536).unwrap();
         let mut store = ResumeStore::open(&path).unwrap();
         store
             .reserve_many([(subject, MAX_UNITS_PER_OBJECT)])
@@ -965,17 +957,9 @@ mod tests {
         let subject_for = |index: u32| {
             let mut root = [0; 32];
             root[..4].copy_from_slice(&index.to_be_bytes());
-            SubjectId {
-                suite: 1,
-                root,
-                length: 1,
-            }
+            SubjectId::new(1, root, 1).unwrap()
         };
-        let large_subject = SubjectId {
-            suite: 1,
-            root: [0xaa; 32],
-            length: 100 * 65_536,
-        };
+        let large_subject = SubjectId::new(1, [0xaa; 32], 100 * 65_536).unwrap();
         let mut store = ResumeStore::open(&path).unwrap();
         store
             .reserve_many(
@@ -1011,17 +995,9 @@ mod tests {
         let subject_for = |index: u32| {
             let mut root = [0; 32];
             root[..4].copy_from_slice(&index.to_be_bytes());
-            SubjectId {
-                suite: 1,
-                root,
-                length: 1,
-            }
+            SubjectId::new(1, root, 1).unwrap()
         };
-        let large_subject = SubjectId {
-            suite: 1,
-            root: [0xaa; 32],
-            length: 100 * 65_536,
-        };
+        let large_subject = SubjectId::new(1, [0xaa; 32], 100 * 65_536).unwrap();
 
         let mut objects = BTreeMap::new();
         for index in 0..1_000_000_u32 {

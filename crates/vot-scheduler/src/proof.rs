@@ -40,20 +40,12 @@ pub(super) fn suite(id: u16) -> Result<Suite, Error> {
     Suite::try_from(id).map_err(|_| Error::UnknownObject)
 }
 
-pub(super) const fn subject_id(object: ObjectId) -> SubjectId {
-    SubjectId {
-        suite: object.suite,
-        root: object.root,
-        length: object.length,
-    }
+pub(super) fn subject_id(object: ObjectId) -> SubjectId {
+    SubjectId::try_from(object).expect("a verified object names a registered suite")
 }
 
-const fn object_id(subject: SubjectId) -> ObjectId {
-    ObjectId {
-        suite: subject.suite,
-        root: subject.root,
-        length: subject.length,
-    }
+fn object_id(subject: SubjectId) -> ObjectId {
+    ObjectId::try_from(subject).expect("a verified subject names a registered suite")
 }
 
 const fn map_error(error: vot_verified_range::Error) -> Error {

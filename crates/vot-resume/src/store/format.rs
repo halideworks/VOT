@@ -134,9 +134,9 @@ pub(crate) fn encode_checkpoint(
 }
 
 pub(crate) fn encode_subject(subject: &SubjectId, output: &mut Vec<u8>) {
-    output.extend_from_slice(&subject.suite.to_be_bytes());
-    output.extend_from_slice(&subject.root);
-    output.extend_from_slice(&subject.length.to_be_bytes());
+    output.extend_from_slice(&subject.suite().to_be_bytes());
+    output.extend_from_slice(&subject.root());
+    output.extend_from_slice(&subject.length().to_be_bytes());
 }
 
 pub(crate) fn encode_ranges(units: &UnitRanges, output: &mut Vec<u8>) {
@@ -262,11 +262,13 @@ pub(crate) fn apply_record(
 }
 
 pub(crate) fn decode_subject(decoder: &mut Decoder<'_>) -> Result<SubjectId, Error> {
-    Ok(SubjectId {
-        suite: decoder.u16()?,
-        root: decoder.array()?,
-        length: decoder.u64()?,
-    })
+    let suite = decoder.u16()?;
+    let root = decoder.array()?;
+    let length = decoder.u64()?;
+    if suite == 0 && length == 0 {
+        return Ok(SubjectId::marker(root));
+    }
+    SubjectId::new(suite, root, length).map_err(|_| Error::Corrupt)
 }
 
 #[cfg(test)]

@@ -28,11 +28,96 @@ pub struct ConnectionId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StreamId(pub u64);
 
+/// An object identity this revision can name.
+///
+/// Assembled from a registered suite, a 32-byte root, and a representable
+/// length. Suite zero is not an object; only [`SubjectId::marker`] produces
+/// it, as a store key that cannot collide with one.
+///
+/// ```compile_fail,E0451
+/// use vot_transport_api::SubjectId;
+/// let _ = SubjectId {
+///     suite: 0,
+///     root: [0; 32],
+///     length: 0,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SubjectId {
-    pub suite: u16,
-    pub root: [u8; 32],
-    pub length: u64,
+    suite: u16,
+    root: [u8; 32],
+    length: u64,
+}
+
+impl SubjectId {
+    /// # Errors
+    /// Rejects a suite this revision does not name, or a length past the
+    /// object bound.
+    pub fn new(suite: u16, root: [u8; 32], length: u64) -> Result<Self, Error> {
+        Self::try_from(vot_codec::frames::ObjectId {
+            suite,
+            root,
+            length,
+        })
+    }
+
+    /// A store key that is not an object. Suite zero never validates.
+    #[must_use]
+    pub const fn marker(root: [u8; 32]) -> Self {
+        Self {
+            suite: 0,
+            root,
+            length: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_marker(self) -> bool {
+        self.suite == 0
+    }
+
+    #[must_use]
+    pub const fn suite(self) -> u16 {
+        self.suite
+    }
+
+    #[must_use]
+    pub const fn root(self) -> [u8; 32] {
+        self.root
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+impl TryFrom<vot_codec::frames::ObjectId> for SubjectId {
+    type Error = Error;
+
+    fn try_from(object: vot_codec::frames::ObjectId) -> Result<Self, Self::Error> {
+        object.validate().map_err(|_| Error::InvalidConfiguration)?;
+        Ok(Self {
+            suite: object.suite,
+            root: object.root,
+            length: object.length,
+        })
+    }
+}
+
+impl TryFrom<SubjectId> for vot_codec::frames::ObjectId {
+    type Error = Error;
+
+    fn try_from(subject: SubjectId) -> Result<Self, Self::Error> {
+        if subject.is_marker() {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(Self {
+            suite: subject.suite,
+            root: subject.root,
+            length: subject.length,
+        })
+    }
 }
 
 /// Carrier-derived material that binds authentication to one connection.
@@ -905,6 +990,59 @@ mod tests {
         );
         assert_eq!(
             StagingCapacity::new(10, 1, 11).err(),
+            Some(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn a_subject_is_a_registered_suite_and_a_representable_length() {
+        let root = [7; 32];
+        let subject = SubjectId::new(1, root, 64).unwrap();
+        assert_eq!(subject.suite(), 1);
+        assert_eq!(subject.root(), root);
+        assert_eq!(subject.length(), 64);
+        assert!(!subject.is_marker());
+        assert_eq!(SubjectId::new(2, root, 1).unwrap().suite(), 2);
+        assert_eq!(
+            SubjectId::new(0, root, 1).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            SubjectId::new(3, root, 1).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            SubjectId::new(1, root, i64::MAX as u64 + 1).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        assert!(SubjectId::new(1, root, i64::MAX as u64).is_ok());
+
+        let object = vot_codec::frames::ObjectId {
+            suite: 1,
+            root,
+            length: 8,
+        };
+        let converted = SubjectId::try_from(object).unwrap();
+        assert_eq!(
+            vot_codec::frames::ObjectId::try_from(converted).unwrap(),
+            object
+        );
+
+        let marker = SubjectId::marker(root);
+        assert!(marker.is_marker());
+        assert_eq!(marker.suite(), 0);
+        assert_eq!(marker.length(), 0);
+        assert_eq!(
+            vot_codec::frames::ObjectId::try_from(marker).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        assert_eq!(
+            SubjectId::try_from(vot_codec::frames::ObjectId {
+                suite: 0,
+                root,
+                length: 0,
+            })
+            .err(),
             Some(Error::InvalidConfiguration)
         );
     }

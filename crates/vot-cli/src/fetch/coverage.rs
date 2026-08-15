@@ -8,11 +8,7 @@ pub(crate) const RESUME_STORE: &str = "resume.vot";
 /// Store entry binding a store to the package it continues. Suite zero
 /// never collides with a stored object; its root is checked before resume.
 pub(crate) const fn package_sentinel(root: [u8; 32]) -> SubjectId {
-    SubjectId {
-        suite: 0,
-        root,
-        length: 0,
-    }
+    SubjectId::marker(root)
 }
 
 /// Checkpoint units of an object, in the receiver's own range currency.

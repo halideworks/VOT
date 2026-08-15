@@ -277,8 +277,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if resuming {
             let stored = store
                 .subjects()
-                .find(|subject| subject.suite == 0)
-                .map(|sentinel| sentinel.root);
+                .find(|subject| subject.is_marker())
+                .map(vot_transport_api::SubjectId::root);
             match (pin, stored) {
                 (Some(pinned), Some(root)) if pinned != root => {
                     return Err(Error::RootMismatch);
@@ -1135,11 +1135,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.current += 1;
                 continue;
             }
-            let subject = SubjectId {
-                suite: object.suite,
-                root: object.root,
-                length: object.length,
-            };
+            let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
             let resumed = if path.exists() {
                 planned.resumed.clone()
             } else {

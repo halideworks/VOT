@@ -11,193 +11,289 @@
       "value": "0x01",
       "name": "HELLO",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "4 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x03",
       "name": "SETTINGS",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "16 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x05",
       "name": "SETTINGS_ACK",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "0",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x07",
       "name": "AUTH_CONTEXT",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x09",
       "name": "SESSION_OPEN",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x0b",
       "name": "SESSION_ACCEPT",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x0d",
       "name": "SESSION_REJECT",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x21",
       "name": "PACKAGE_DESCRIPTOR",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "1024 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x23",
       "name": "MANIFEST_REQUEST",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x25",
       "name": "MANIFEST_PAGE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "1024 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x27",
       "name": "PROGRESSIVE_PAGE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "1024 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x29",
       "name": "SEAL",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "256 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x2b",
       "name": "HAVE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "4 * 1024 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x2d",
       "name": "RANGE_REQUEST",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "1024 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x2f",
       "name": "PROOF_BUNDLE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "HARD_MAX_FRAME_PAYLOAD",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x31",
       "name": "DATA_RECORD",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "256 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x33",
       "name": "RANGE_CANCEL",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x40",
       "name": "CAPACITY",
       "handling": "optional",
-      "status": "draft"
+      "status": "draft",
+      "limit": "4 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x43",
       "name": "TRANSIT_VERIFIED",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x45",
       "name": "CHUNK_DURABLE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x47",
       "name": "CHUNK_AT_REST_VERIFIED",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x49",
       "name": "PUBLISH_RECEIPT",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x60",
       "name": "DATAGRAM_CREDIT",
       "handling": "optional",
-      "status": "experimental"
+      "status": "experimental",
+      "limit": "4 * 1024",
+      "auth": "required",
+      "extension": "DATAGRAM_FEC"
     },
     {
       "value": "0x62",
       "name": "CODING_EPOCH_OPEN",
       "handling": "optional",
-      "status": "experimental"
+      "status": "experimental",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "DATAGRAM_FEC"
     },
     {
       "value": "0x64",
       "name": "GEN_STATE",
       "handling": "optional",
-      "status": "experimental"
+      "status": "experimental",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "DATAGRAM_FEC"
     },
     {
       "value": "0x66",
       "name": "GEN_DONE",
       "handling": "optional",
-      "status": "experimental"
+      "status": "experimental",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "DATAGRAM_FEC"
     },
     {
       "value": "0x68",
       "name": "CODING_EPOCH_CLOSE",
       "handling": "optional",
-      "status": "experimental"
+      "status": "experimental",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "DATAGRAM_FEC"
     },
     {
       "value": "0x80",
       "name": "PING",
       "handling": "optional",
-      "status": "draft"
+      "status": "draft",
+      "limit": "0",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x83",
       "name": "GOAWAY",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "4 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x85",
       "name": "ERROR",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "exempt",
+      "extension": "none"
     },
     {
       "value": "0x86",
       "name": "SOURCE_SCORE_HINT",
       "handling": "optional",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     },
     {
       "value": "0x89",
       "name": "JOB_PRIORITY_UPDATE",
       "handling": "critical",
-      "status": "draft"
+      "status": "draft",
+      "limit": "64 * 1024",
+      "auth": "required",
+      "extension": "none"
     }
   ],
   "settings": [

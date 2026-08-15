@@ -4,15 +4,33 @@
 from __future__ import annotations
 
 if __package__:
-    from .registries import GENERATED_PATH, REGISTRY_PATH, ROOT, load_registries, render_identifiers
+    from .registries import (
+        GENERATED_FRAMES_PATH,
+        GENERATED_PATH,
+        REGISTRY_PATH,
+        ROOT,
+        load_registries,
+        render_frames,
+        render_identifiers,
+    )
 else:
-    from registries import GENERATED_PATH, REGISTRY_PATH, ROOT, load_registries, render_identifiers
+    from registries import (
+        GENERATED_FRAMES_PATH,
+        GENERATED_PATH,
+        REGISTRY_PATH,
+        ROOT,
+        load_registries,
+        render_frames,
+        render_identifiers,
+    )
 
 
 def main() -> int:
     document = load_registries(REGISTRY_PATH)
     GENERATED_PATH.write_text(render_identifiers(document), encoding="utf-8")
+    GENERATED_FRAMES_PATH.write_text(render_frames(document), encoding="utf-8")
     print(f"wrote {GENERATED_PATH.relative_to(ROOT)}")
+    print(f"wrote {GENERATED_FRAMES_PATH.relative_to(ROOT)}")
     return 0
 
 

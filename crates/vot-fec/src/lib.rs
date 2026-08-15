@@ -101,8 +101,9 @@ impl Geometry {
         debug_assert_eq!(row.len(), self.source_count);
         let x = self.source_count + repair_index;
         for (j, entry) in row.iter_mut().enumerate() {
-            // Both below 80, so the XOR is one non-zero byte.
-            *entry = gf::inv(u8::try_from(x ^ j).expect("k + r is at most 80"));
+            // Both operands are below 128, so the XOR fits a byte, and
+            // x >= k > j keeps it non-zero.
+            *entry = gf::inv(u8::try_from(x ^ j).expect("operands below 128"));
         }
     }
 

@@ -202,6 +202,9 @@ fn the_field_matches_the_vectors() {
     let field = vectors.get("field");
     assert_eq!(field.get("polynomial").u64(), 0x11D);
     assert_eq!(field.get("generator").u64(), 2);
+    assert!(field.get("exp_first_16").array().len() == 16);
+    assert!(field.get("products").array().len() >= 6);
+    assert!(field.get("inverses").array().len() >= 6);
     let mut power = 1_u8;
     for (i, expected) in field.get("exp_first_16").usizes().into_iter().enumerate() {
         assert_eq!(usize::from(power), expected, "exp[{i}]");
@@ -229,7 +232,9 @@ fn the_field_matches_the_vectors() {
 #[test]
 fn the_generator_rows_match_the_vectors() {
     let vectors = vectors();
-    for matrix in vectors.get("matrices").array() {
+    let matrices = vectors.get("matrices").array();
+    assert!(matrices.len() >= 4);
+    for matrix in matrices {
         let k = matrix.get("source_count").usize();
         let r = matrix.get("repair_count").usize();
         let geometry = Geometry::new(k, r, 1).unwrap();

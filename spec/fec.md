@@ -58,6 +58,9 @@ the stacked matrix `[I_k; G]` has the property that any `k` of its `k + r` rows
 form an invertible matrix, and any `k` received symbols reconstruct all `k`
 source symbols.
 
+An encoder given other than `k` source symbols, or a source symbol whose
+length is not `L`, returns `INVALID_SYMBOL` and produces nothing.
+
 Repair byte `p` of repair symbol `i` is
 
 ```text

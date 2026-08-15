@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Check the Rust commit relation against an independent one, exhaustively.
 
-`validate_commit_model_sync.py` checks that the Rust `Event` variants and the
-TLA action names line up. That is a vocabulary check: it passes whether or not
-the two agree about what any event does. This one reimplements the relation
-from spec/commit.md and compares it against every row the Rust model can
+`validate_commit_model_sync.py` checks that the TLA actions implement
+`models/commit/relation.json`. This one loads that same table through
+`commit_relation` and compares it against every row the Rust model can
 produce, which is every reachable machine crossed with every event.
 
 The Rust rows come from `vot-commit-transitions`. Set `VOT_CARGO` to pick the

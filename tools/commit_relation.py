@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The commit transition relation, read from spec/commit.md.
+"""The commit transition relation, loaded from models/commit/relation.json.
 
 One independent implementation, used by both the fixture executor and the
 exhaustive cross-check. Two copies is what the two of them had, and they had
@@ -9,30 +9,41 @@ fixture aborts.
 
 Independent of the Rust model on purpose. That is the whole point of
 comparing them; sharing this between the two Python callers costs nothing of
-that, because neither of them is the Rust side.
+that, because neither of them is the Rust side. The JSON table is this
+Python relation, not a generated view of the Rust match.
 """
 
-TERMINAL = {"Published", "Poisoned", "Aborted"}
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RELATION_PATH = ROOT / "models" / "commit" / "relation.json"
+
+
+def load_relation(path: Path = RELATION_PATH) -> dict:
+    """The committed relation table."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    required = ("terminal", "required", "poisoning", "recovering", "abortable", "advances")
+    missing = [key for key in required if key not in document]
+    if missing:
+        raise ValueError(f"relation table missing {missing}")
+    return document
+
+
+_RELATION = load_relation()
+
+TERMINAL = set(_RELATION["terminal"])
 # The assurance a profile must have performed before it can publish, and the
 # only state it may link a namespace from.
-REQUIRED = {"Fast": "TransitVerified", "Balanced": "Durable", "Strict": "AtRestVerified"}
-POISONING = {"DataFlushFailed", "JournalFlushFailed", "AtRestVerificationFailed"}
-RECOVERING = {"NamespaceLinkAmbiguous", "NamespaceFlushFailed", "Crash"}
-ABORTABLE = {
-    "New",
-    "Admitted",
-    "TransitVerified",
-    "DataFlushed",
-    "Durable",
-    "AtRestVerified",
-}
+REQUIRED = dict(_RELATION["required"])
+POISONING = set(_RELATION["poisoning"])
+RECOVERING = set(_RELATION["recovering"])
+ABORTABLE = set(_RELATION["abortable"])
 ADVANCES = {
-    ("New", "Admit"): ("Admitted", "Admitted"),
-    ("Admitted", "TransitVerified"): ("TransitVerified", "TransitVerified"),
-    ("TransitVerified", "DataFlushSucceeded"): ("DataFlushed", None),
-    ("DataFlushed", "JournalFlushSucceeded"): ("Durable", "Durable"),
-    ("Durable", "AtRestVerified"): ("AtRestVerified", "AtRestVerified"),
-    ("NamespaceLinked", "NamespaceDurable"): ("Published", "Published"),
+    (row["state"], row["event"]): (row["next"], row["observation"])
+    for row in _RELATION["advances"]
 }
 
 

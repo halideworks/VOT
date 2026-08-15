@@ -134,6 +134,7 @@ jobs:
           python3 tools/verify_wave1_vectors.py
           python3 tools/verify_manifest_pack_vectors.py
           python3 tools/verify_wave4_package.py
+          python3 -m unittest tools.test_commit_model_sync
           python3 tools/validate_commit_fixtures.py
           python3 tools/validate_commit_model_sync.py
           VOT_CARGO="cargo +1.88.0" python3 tools/validate_commit_transitions.py

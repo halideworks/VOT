@@ -5,8 +5,8 @@ CONSTANTS InjectUnsafeReceipt, InjectStalePublish, InjectUnsafePublish,
           InjectPoisonAfterPublish, InjectRetrySuccess, InjectRecoverySink,
           InjectUnsupportedAdvance
 
-\* Keep these mappings synchronized with the Rust Event enum. CI verifies that
-\* every Rust event names a model action and every named action exists.
+\* Keep these mappings synchronized with models/commit/relation.json. CI
+\* verifies that the actions implement that table, not only that the names exist.
 \* RUST_EVENT Admit -> Admit
 \* RUST_EVENT TransitVerified -> VerifyTransit
 \* RUST_EVENT DataFlushSucceeded -> FlushData

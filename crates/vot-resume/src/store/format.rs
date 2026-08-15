@@ -373,3 +373,35 @@ pub(crate) fn validate_payload_length(length: u64) -> Result<(), Error> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod decode_subject_tests {
+    use super::*;
+
+    fn encoded(suite: u16, root: [u8; 32], length: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&suite.to_be_bytes());
+        bytes.extend_from_slice(&root);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_marker_decodes_and_its_neighbors_do_not() {
+        let root = [7; 32];
+        let marker = decode_subject(&mut Decoder::new(&encoded(0, root, 0))).unwrap();
+        assert!(marker.is_marker());
+        assert_eq!(marker.root(), root);
+        assert!(matches!(
+            decode_subject(&mut Decoder::new(&encoded(0, root, 1))),
+            Err(Error::Corrupt)
+        ));
+        let empty = decode_subject(&mut Decoder::new(&encoded(1, root, 0))).unwrap();
+        assert!(!empty.is_marker());
+        assert_eq!(empty.suite(), 1);
+        assert!(matches!(
+            decode_subject(&mut Decoder::new(&encoded(3, root, 1))),
+            Err(Error::Corrupt)
+        ));
+    }
+}

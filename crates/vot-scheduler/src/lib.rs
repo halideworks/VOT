@@ -1241,4 +1241,39 @@ mod tests {
         assert_eq!(receiver.finish(first), Err(Error::LengthMismatch));
         receiver.begin(second).unwrap();
     }
+
+    #[test]
+    fn a_marker_subject_is_not_an_object() {
+        let bundle = vot_codec::frames::ProofBundle {
+            request_id: [0; 16],
+            bundle_id: [0; 16],
+            object: vot_codec::frames::ObjectId {
+                suite: 1,
+                root: [0; 32],
+                length: 1,
+            },
+            requested_offset: 0,
+            requested_length: 1,
+            covered_offset: 0,
+            covered_length: 1,
+            data_record_count: 0,
+            total_plaintext_length: 1,
+            proof: Vec::new(),
+        };
+        let marker = SubjectId::marker([1; 32]);
+        assert!(matches!(
+            ReliableReceiver::verify_typed_bundle(marker, &bundle, &[]),
+            Err(Error::UnknownObject)
+        ));
+        let mut receiver = ReliableReceiver::new(
+            VERIFIER_RESERVATION,
+            VERIFIER_RESERVATION,
+            VERIFIER_RESERVATION,
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.receive_typed_bundle(marker, &bundle, &[]),
+            Err(Error::UnknownObject)
+        ));
+    }
 }

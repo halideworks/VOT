@@ -8,7 +8,7 @@ pub(super) fn validate_typed_bundle<'records>(
     bundle: &'records ProofBundle,
     records: &'records [DataRecord],
 ) -> Result<vot_verified_range::ValidatedBundle<'records>, Error> {
-    vot_verified_range::validate_typed_bundle(object_id(subject), bundle, records)
+    vot_verified_range::validate_typed_bundle(object_id(subject)?, bundle, records)
         .map_err(map_error)
 }
 
@@ -24,7 +24,7 @@ pub(super) fn check_range_proof<'data>(
     data: &'data [u8],
     proof: &[u8],
 ) -> Result<vot_verified_range::VerifiedSlice<'data>, Error> {
-    vot_verified_range::verify_range(object_id(subject), covered_offset, data, proof)
+    vot_verified_range::verify_range(object_id(subject)?, covered_offset, data, proof)
         .map_err(map_error)
 }
 
@@ -33,7 +33,7 @@ pub(super) fn verify_typed_bundle(
     bundle: &ProofBundle,
     records: &[DataRecord],
 ) -> Result<vot_verified_range::VerifiedRange, Error> {
-    vot_verified_range::verify_typed_bundle(object_id(subject), bundle, records).map_err(map_error)
+    vot_verified_range::verify_typed_bundle(object_id(subject)?, bundle, records).map_err(map_error)
 }
 
 pub(super) fn suite(id: u16) -> Result<Suite, Error> {
@@ -44,8 +44,8 @@ pub(super) fn subject_id(object: ObjectId) -> SubjectId {
     SubjectId::try_from(object).expect("a verified object names a registered suite")
 }
 
-fn object_id(subject: SubjectId) -> ObjectId {
-    ObjectId::try_from(subject).expect("a verified subject names a registered suite")
+fn object_id(subject: SubjectId) -> Result<ObjectId, Error> {
+    ObjectId::try_from(subject).map_err(|_| Error::UnknownObject)
 }
 
 const fn map_error(error: vot_verified_range::Error) -> Error {

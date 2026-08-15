@@ -5,7 +5,7 @@
 //! between them, which is the part the spec leaves to a deployment.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use vot_capability::verify::{Anchors, IssuerEntry, Policy, Presentation, Request};
+use vot_capability::verify::{Anchors, AuthorizedRequest, IssuerEntry, Policy, Presentation};
 use vot_capability::{Capability, Operation, Scope};
 use vot_codec::frames::{AuthContext, Binding, SessionOpen};
 use vot_transport_api::ChannelBinding;
@@ -119,15 +119,16 @@ impl Requirement {
         .ok()?;
         // Both, because a fetch reads the manifest and then its ranges, and a
         // token that allows one without the other authorizes half a transfer.
-        for operation in [Operation::ReadManifest, Operation::ReadRanges] {
-            authorized
-                .allows(Request {
-                    operation,
-                    suite: PACKAGE_SUITE,
-                    root: self.root,
-                    range: None,
-                })
-                .ok()?;
+        // The range grant is checked when the fetch names bytes; here we only
+        // need the token to name ReadRanges on this subject.
+        authorized
+            .allows(AuthorizedRequest::ReadManifest {
+                suite: PACKAGE_SUITE,
+                root: self.root,
+            })
+            .ok()?;
+        if !authorized.capability().allows(Operation::ReadRanges) {
+            return None;
         }
         // The whole scope the token carries. A client asking for a subset is
         // allowed by section 1.1 and this one never does, so granting the

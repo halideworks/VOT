@@ -9,6 +9,7 @@ constant vot_capability::bounds::SCOPE
 constant vot_capability::bounds::SIGNED
 constant vot_capability::verify::PROOF_BYTES
 enum vot_capability::Error
+enum vot_capability::verify::AuthorizedRequest
 enum vot_capability::verify::Denial
 function vot_capability::decode
 function vot_capability::decode_scope
@@ -33,5 +34,4 @@ struct vot_capability::verify::Authorized
 struct vot_capability::verify::IssuerEntry
 struct vot_capability::verify::Policy
 struct vot_capability::verify::Presentation
-struct vot_capability::verify::Request
 use vot_capability::Operation <- vot_codec::Operation

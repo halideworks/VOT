@@ -42,6 +42,34 @@ pub mod major {
 /// The one encoding of `null` this profile has.
 const NULL: u8 = 0xf6;
 
+/// The number of bytes `head` writes for `value`.
+#[must_use]
+pub const fn head_len(value: u64) -> usize {
+    match value {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+/// The number of bytes `int` writes for `value`.
+#[must_use]
+pub const fn int_len(value: i64) -> usize {
+    if value < 0 {
+        head_len(value.unsigned_abs() - 1)
+    } else {
+        head_len(value.unsigned_abs())
+    }
+}
+
+/// The number of bytes `bytes` or `text` writes for a payload of `len`.
+#[must_use]
+pub const fn payload_len(len: usize) -> usize {
+    head_len(len as u64).saturating_add(len)
+}
+
 /// Appends the shortest head for `major` and `value`.
 ///
 /// The tag uses `major * 32` (not `<< 5`) so mutation runs can verify it.
@@ -380,13 +408,17 @@ mod tests {
         u64::MAX,
     ];
 
-    fn expected_width(value: u64) -> usize {
-        match value {
-            0..=23 => 1,
-            24..=0xff => 2,
-            0x100..=0xffff => 3,
-            0x1_0000..=0xffff_ffff => 5,
-            _ => 9,
+    #[test]
+    fn payload_len_counts_the_head_and_the_bytes() {
+        for len in [0_usize, 1, 23, 24, 255, 256] {
+            let payload = vec![b'x'; len];
+            let mut bytes_out = Vec::new();
+            bytes(&mut bytes_out, &payload);
+            assert_eq!(bytes_out.len(), payload_len(len), "bytes {len}");
+            let text = "x".repeat(len);
+            let mut text_out = Vec::new();
+            super::text(&mut text_out, &text);
+            assert_eq!(text_out.len(), payload_len(len), "text {len}");
         }
     }
 
@@ -403,7 +435,7 @@ mod tests {
             ] {
                 let mut out = Vec::new();
                 head(&mut out, major, value);
-                assert_eq!(out.len(), expected_width(value), "{major} {value:#x}");
+                assert_eq!(out.len(), head_len(value), "{major} {value:#x}");
                 let mut reader = Reader::new(&out);
                 assert_eq!(reader.head(), Ok((major, value)), "{major} {value:#x}");
                 assert_eq!(reader.finish(), Ok(()));
@@ -483,6 +515,7 @@ mod tests {
         ] {
             let mut out = Vec::new();
             int(&mut out, value);
+            assert_eq!(out.len(), int_len(value), "{value}");
             let mut reader = Reader::new(&out);
             assert_eq!(reader.int(), Ok(value), "{value}");
             assert_eq!(reader.finish(), Ok(()));

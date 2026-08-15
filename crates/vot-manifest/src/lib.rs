@@ -113,6 +113,10 @@ mod tests {
         assert_eq!(encoded, encode_page(&page(0, [0; 32], "a.txt")).unwrap());
         assert!(encoded.len() < MAX_PAGE_BYTES);
         assert_eq!(decode_page(&encoded).unwrap(), page(0, [0; 32], "a.txt"));
+        assert_eq!(
+            page_encoded_len(&page(0, [0; 32], "a.txt")).unwrap(),
+            encoded.len()
+        );
     }
 
     #[test]
@@ -174,6 +178,7 @@ mod tests {
         };
         let encoded = encode_page(&rich).unwrap();
         assert_eq!(decode_page(&encoded).unwrap(), rich);
+        assert_eq!(page_encoded_len(&rich).unwrap(), encoded.len());
     }
 
     #[test]
@@ -200,6 +205,7 @@ mod tests {
         };
         let encoded = encode_seal(&seal).unwrap();
         assert_eq!(decode_seal(&encoded).unwrap(), seal);
+        assert_eq!(seal_encoded_len(&seal).unwrap(), encoded.len());
         for length in 0..encoded.len() {
             assert!(decode_seal(&encoded[..length]).is_err());
         }

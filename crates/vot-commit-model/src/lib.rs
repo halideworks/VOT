@@ -5,8 +5,9 @@
 /// One list per enum: the variants, their `ALL` walk, their test positions,
 /// and their display names all come from the same rows, so none can drift.
 /// Only mechanical facts are generated; the transition relation in
-/// [`Machine::apply`] stays an explicit match. `tools/validate_commit_model_sync.py`
-/// parses the `Event` rows and holds them to the TLA actions.
+/// [`Machine::apply`] stays an explicit match. `models/commit/relation.json`
+/// is the independent Python/TLA table; the exhaustive walk holds this match
+/// to that table.
 macro_rules! enum_metadata {
     (walked $(#[$attr:meta])* $vis:vis enum $name:ident { $($variant:ident),* $(,)? }) => {
         enum_metadata!(named $(#[$attr])* $vis enum $name { $($variant),* });

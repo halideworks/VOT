@@ -1,0 +1,98 @@
+{
+  "terminal": ["Published", "Poisoned", "Aborted"],
+  "required": {
+    "Fast": "TransitVerified",
+    "Balanced": "Durable",
+    "Strict": "AtRestVerified"
+  },
+  "poisoning": [
+    "DataFlushFailed",
+    "JournalFlushFailed",
+    "AtRestVerificationFailed"
+  ],
+  "recovering": ["NamespaceLinkAmbiguous", "NamespaceFlushFailed", "Crash"],
+  "abortable": [
+    "New",
+    "Admitted",
+    "TransitVerified",
+    "DataFlushed",
+    "Durable",
+    "AtRestVerified"
+  ],
+  "advances": [
+    {
+      "state": "New",
+      "event": "Admit",
+      "next": "Admitted",
+      "observation": "Admitted"
+    },
+    {
+      "state": "Admitted",
+      "event": "TransitVerified",
+      "next": "TransitVerified",
+      "observation": "TransitVerified"
+    },
+    {
+      "state": "TransitVerified",
+      "event": "DataFlushSucceeded",
+      "next": "DataFlushed",
+      "observation": null
+    },
+    {
+      "state": "DataFlushed",
+      "event": "JournalFlushSucceeded",
+      "next": "Durable",
+      "observation": "Durable"
+    },
+    {
+      "state": "Durable",
+      "event": "AtRestVerified",
+      "next": "AtRestVerified",
+      "observation": "AtRestVerified"
+    },
+    {
+      "state": "NamespaceLinked",
+      "event": "NamespaceDurable",
+      "next": "Published",
+      "observation": "Published"
+    }
+  ],
+  "tla_states": {
+    "New": "NEW",
+    "Admitted": "ADMITTED",
+    "TransitVerified": "TRANSIT_VERIFIED",
+    "DataFlushed": "DATA_FLUSHED",
+    "Durable": "DURABLE",
+    "AtRestVerified": "AT_REST_VERIFIED",
+    "NamespaceLinked": "NAMESPACE_LINKED",
+    "Published": "PUBLISHED",
+    "RecoveryRequired": "RECOVERY_REQUIRED",
+    "Poisoned": "POISONED",
+    "Aborted": "ABORTED"
+  },
+  "tla_assurances": {
+    "Admitted": "ADMITTED",
+    "TransitVerified": "TRANSIT_VERIFIED",
+    "Durable": "DURABLE",
+    "AtRestVerified": "AT_REST_VERIFIED",
+    "Published": "PUBLISHED"
+  },
+  "tla_events": {
+    "Admit": "Admit",
+    "TransitVerified": "VerifyTransit",
+    "DataFlushSucceeded": "FlushData",
+    "DataFlushFailed": "FlushFailure",
+    "JournalFlushSucceeded": "FlushJournal",
+    "JournalFlushFailed": "FlushFailure",
+    "AtRestVerified": "VerifyAtRest",
+    "AtRestVerificationFailed": "FlushFailure",
+    "NamespaceLinked": "LinkNamespace",
+    "NamespaceLinkAmbiguous": "EnterRecovery",
+    "NamespaceDurable": "Publish",
+    "NamespaceFlushFailed": "EnterRecovery",
+    "Crash": "EnterRecovery",
+    "Recover": "Recover",
+    "Abort": "Abort"
+  },
+  "tla_flush_failure_from": ["TransitVerified", "DataFlushed", "Durable"]
+}

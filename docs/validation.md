@@ -13,6 +13,7 @@ python3 tools/validate_capability_vectors.py
 python3 tools/validate_receipt_vectors.py
 python3 tools/validate_security_matrix.py
 python3 tools/validate_benchmark_contract.py
+python3 -m unittest tools.test_commit_model_sync
 python3 tools/validate_commit_fixtures.py
 python3 tools/validate_commit_model_sync.py
 python3 tools/validate_wave0.py
@@ -28,6 +29,13 @@ the Rust crates through oracle binaries (`vot-codec-oracle`,
 
 `validate_capability_vectors.py` checks 13 cases including 5 refusals. A file of
 only accepted cases would prove nothing about what the crate rejects.
+
+`validate_commit_model_sync.py` checks that `models/tla/Commit.tla` implements
+the committed relation in `models/commit/relation.json`: the same advances,
+profile predecessors, abort and recovery guards, and `FlushFailure` from-states.
+Event-name comments alone are not enough. `tools/test_commit_model_sync.py`
+feeds a swapped `Step` and a dropped `FlushFailure` and proves the checker
+rejects them.
 
 `validate_registries.py` compares `spec/registries.md` tables against `vot-codec`
 constants, including the error-code table: block/class structure, ascending

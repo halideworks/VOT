@@ -45,7 +45,7 @@ pub enum NativeEvent {
 
 /// Bounded TLS/TCP command and event adapter. VOT frame bytes are not rewritten.
 /// One byte stream: lanes are logical identifiers, not separate streams.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct TcpAdapter {
     queue: Queue,
     /// Lanes the peer has sent on. Only grows, for the reason above.

@@ -4,8 +4,8 @@
 use std::collections::VecDeque;
 
 use vot_transport_api::{
-    Error, Event, Payload, ReceiveLimits, StreamId, effective_send_limit, validate_control_frame,
-    validate_control_payload_limit, validate_data_record,
+    Error, Event, Ledger, Payload, Permit, ReceiveLimits, StreamId, effective_send_limit,
+    validate_control_frame, validate_control_payload_limit, validate_data_record,
 };
 
 /// What a driver has been handed to put on the carrier.
@@ -88,34 +88,42 @@ impl QueueCost for Event {
 enum Refusal {
     Overflow,
     Full,
+    Poisoned,
 }
 
 /// A deque that owns its own byte accounting, so items and their charged
-/// bytes cannot drift apart. Only `try_push` charges and only `pop` releases.
-#[derive(Clone, Debug)]
+/// bytes cannot drift apart. Only `try_push` charges and only `pop` or drop
+/// releases, by dropping the permit. Credit holds `None`.
+#[derive(Debug)]
 struct BoundedQueue<T> {
-    items: VecDeque<T>,
-    bytes: usize,
+    items: VecDeque<(T, Option<Permit>)>,
+    bytes: Ledger,
     count_limit: usize,
     byte_limit: usize,
 }
 
 impl<T: QueueCost> BoundedQueue<T> {
-    const fn new(count_limit: usize, byte_limit: usize) -> Self {
-        Self {
+    fn new(count_limit: usize, byte_limit: usize) -> Result<Self, Error> {
+        let limit = u64::try_from(byte_limit).map_err(|_| Error::InvalidConfiguration)?;
+        Ok(Self {
             items: VecDeque::new(),
-            bytes: 0,
+            bytes: Ledger::new(limit)?,
             count_limit,
             byte_limit,
-        }
+        })
     }
 
     /// Whether `added` more items weighing `added_bytes` would fit, changing
     /// nothing. Overflow is reported apart from fullness because callers
     /// surface it as arithmetic, not backpressure.
     fn preflight(&self, added: usize, added_bytes: usize) -> Result<(), Refusal> {
+        if self.bytes.is_poisoned() {
+            return Err(Refusal::Poisoned);
+        }
+        let added_bytes = u64::try_from(added_bytes).map_err(|_| Refusal::Overflow)?;
         let next_bytes = self
             .bytes
+            .used()
             .checked_add(added_bytes)
             .ok_or(Refusal::Overflow)?;
         let next_count = self
@@ -123,7 +131,8 @@ impl<T: QueueCost> BoundedQueue<T> {
             .len()
             .checked_add(added)
             .ok_or(Refusal::Overflow)?;
-        if next_count > self.count_limit || next_bytes > self.byte_limit {
+        let limit = u64::try_from(self.byte_limit).map_err(|_| Refusal::Overflow)?;
+        if next_count > self.count_limit || next_bytes > limit {
             return Err(Refusal::Full);
         }
         Ok(())
@@ -132,45 +141,64 @@ impl<T: QueueCost> BoundedQueue<T> {
     /// Takes the item or hands it back with the reason, changing nothing on
     /// refusal.
     fn try_push(&mut self, item: T) -> Result<(), (T, Refusal)> {
-        let Some(next_bytes) = self.bytes.checked_add(item.queue_cost()) else {
+        if self.bytes.is_poisoned() {
+            return Err((item, Refusal::Poisoned));
+        }
+        let Ok(amount) = u64::try_from(item.queue_cost()) else {
             return Err((item, Refusal::Overflow));
         };
-        if self.items.len() >= self.count_limit || next_bytes > self.byte_limit {
+        let Some(next_bytes) = self.bytes.used().checked_add(amount) else {
+            return Err((item, Refusal::Overflow));
+        };
+        let Ok(limit) = u64::try_from(self.byte_limit) else {
+            return Err((item, Refusal::Overflow));
+        };
+        if self.items.len() >= self.count_limit || next_bytes > limit {
             return Err((item, Refusal::Full));
         }
-        self.items.push_back(item);
-        self.bytes = next_bytes;
-        self.assert_accounted();
+        let permit = if amount == 0 {
+            None
+        } else {
+            match self.bytes.acquire(amount) {
+                Ok(permit) => Some(permit),
+                Err(Error::StagingExhausted) => return Err((item, Refusal::Full)),
+                Err(Error::AccountingPoisoned) => return Err((item, Refusal::Poisoned)),
+                Err(_) => return Err((item, Refusal::Overflow)),
+            }
+        };
+        self.items.push_back((item, permit));
         Ok(())
     }
 
-    /// Hands back the front item, releasing exactly its cost.
+    /// Hands back the front item. The permit drops with the unused slot.
     fn pop(&mut self) -> Option<T> {
-        let item = self.items.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(item.queue_cost());
-        self.assert_accounted();
-        Some(item)
+        self.items.pop_front().map(|(item, _permit)| item)
     }
 
     fn front(&self) -> Option<&T> {
-        self.items.front()
+        self.items.front().map(|(item, _)| item)
     }
 
     fn len(&self) -> usize {
         self.items.len()
     }
 
-    /// The charged bytes recomputed from the items, in tests and debug builds.
-    fn assert_accounted(&self) {
-        debug_assert_eq!(
-            self.bytes,
-            self.items.iter().map(QueueCost::queue_cost).sum::<usize>()
-        );
+    #[cfg(test)]
+    fn poison(&self) {
+        self.bytes.poison();
+    }
+
+    #[cfg(test)]
+    fn charged(&self) -> u64 {
+        self.bytes.used()
     }
 }
 
 /// Submissions out, events in, both bounded by count and bytes.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`: a clone would either share permits and double-release or
+/// invent a second charge for the same items.
+#[derive(Debug)]
 pub struct Queue {
     commands: BoundedQueue<Command>,
     /// The peer's bound on what this endpoint sends.
@@ -185,13 +213,8 @@ pub struct Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        Self {
-            commands: BoundedQueue::new(DEFAULT_COUNT_LIMIT, DEFAULT_BYTE_LIMIT),
-            control_send_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
-            control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
-            receive_limits: None,
-            events: BoundedQueue::new(DEFAULT_COUNT_LIMIT, DEFAULT_BYTE_LIMIT),
-        }
+        Self::with_limits(DEFAULT_COUNT_LIMIT, DEFAULT_BYTE_LIMIT)
+            .expect("default queue limits are nonzero")
     }
 }
 
@@ -207,9 +230,11 @@ impl Queue {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            commands: BoundedQueue::new(count, bytes),
-            events: BoundedQueue::new(count, bytes),
-            ..Self::default()
+            commands: BoundedQueue::new(count, bytes)?,
+            events: BoundedQueue::new(count, bytes)?,
+            control_send_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            control_receive_limit: vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+            receive_limits: None,
         })
     }
 
@@ -313,6 +338,7 @@ impl Queue {
             .map_err(|refusal| match refusal {
                 Refusal::Overflow => Error::ArithmeticOverflow,
                 Refusal::Full => Error::OutboundQueueFull,
+                Refusal::Poisoned => Error::AccountingPoisoned,
             })
     }
 
@@ -373,6 +399,7 @@ impl Queue {
             let error = match refusal {
                 Refusal::Overflow => Error::ArithmeticOverflow,
                 Refusal::Full => Error::InboundQueueFull,
+                Refusal::Poisoned => Error::AccountingPoisoned,
             };
             (event, error)
         })
@@ -395,6 +422,7 @@ impl Queue {
             .map_err(|(_, refusal)| match refusal {
                 Refusal::Overflow => Error::ArithmeticOverflow,
                 Refusal::Full => Error::OutboundQueueFull,
+                Refusal::Poisoned => Error::AccountingPoisoned,
             })
     }
 }
@@ -975,15 +1003,41 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn a_drifted_byte_total_fails_the_recomputation() {
-        let mut queue = BoundedQueue::<Command>::new(4, 64);
-        queue
-            .try_push(Command::Control(shared_payload(b"frame")))
-            .ok();
-        // The only way bytes and items can disagree is a bug; simulate one.
-        queue.bytes += 1;
-        queue.assert_accounted();
+    fn charged_bytes_are_the_sum_of_payloads() {
+        let mut queue = Queue::with_limits(4, 64).expect("a bounded queue");
+        queue.send_control(frame(5)).expect("a control frame");
+        queue.set_receive_credit(1).expect("credit");
+        assert_eq!(queue.commands.charged(), 5);
+        assert!(queue.next_command().is_some());
+        assert_eq!(queue.commands.charged(), 0);
+        assert!(queue.next_command().is_some());
+        assert_eq!(queue.commands.charged(), 0);
+    }
+
+    #[test]
+    fn a_poisoned_queue_refuses_submissions_and_events() {
+        let mut queue = Queue::with_limits(4, 64).expect("a bounded queue");
+        queue.send_control(frame(4)).expect("a control frame");
+        queue.commands.poison();
+        assert_eq!(queue.send_control(frame(1)), Err(Error::AccountingPoisoned));
+        assert_eq!(
+            queue.set_receive_credit(1),
+            Err(Error::AccountingPoisoned),
+            "zero-cost credit is refused too"
+        );
+        assert_eq!(
+            queue.preflight_reliable_batch(&[shared_payload(b"x")]),
+            Err(Error::AccountingPoisoned)
+        );
+        assert!(queue.next_command().is_some());
+        assert_eq!(queue.commands.charged(), 64, "poison reports the limit");
+
+        let mut inbound = Queue::with_limits(4, 64).expect("a bounded queue");
+        inbound.events.poison();
+        assert_eq!(
+            inbound.admit_event(Event::Connected(ConnectionId(1))),
+            Err(Error::AccountingPoisoned)
+        );
     }
 
     #[test]

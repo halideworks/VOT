@@ -133,7 +133,7 @@ pub enum NativeEvent {
 
 /// Holds the bounded queue every adapter has and translates what the pump
 /// reports.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct QuicheAdapter {
     queue: Queue,
     path: Option<(ConnectionId, PathStats)>,

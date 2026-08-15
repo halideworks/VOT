@@ -67,16 +67,30 @@ mod tests {
     use super::*;
 
     fn file(path: &str) -> ManifestEntry {
+        nested_file(&[path])
+    }
+
+    fn nested_file(parts: &[&str]) -> ManifestEntry {
         let object = ObjectId {
             suite: 1,
             root: [7; 32],
             length: 3,
         };
         ManifestEntry {
-            path: PackagePath::portable([path]).unwrap(),
+            path: PackagePath::portable(parts.iter().copied()).unwrap(),
             kind: EntryKind::File,
             length: Some(3),
             storage: Some(StorageRef::Direct(object)),
+            metadata: None,
+        }
+    }
+
+    fn directory(parts: &[&str]) -> ManifestEntry {
+        ManifestEntry {
+            path: PackagePath::portable(parts.iter().copied()).unwrap(),
+            kind: EntryKind::Directory,
+            length: None,
+            storage: None,
             metadata: None,
         }
     }
@@ -901,6 +915,79 @@ mod tests {
             validate_entries(&repeated, PathProfile::Portable),
             Err(Error::PathCollision)
         );
+    }
+
+    #[test]
+    fn a_file_cannot_be_the_ancestor_of_another_entry() {
+        assert!(
+            is_path_prefix(b"a", b"a\0b"),
+            "a component boundary is an ancestor"
+        );
+        assert!(
+            !is_path_prefix(b"foo", b"foobar"),
+            "a shared spelling is not an ancestor"
+        );
+        assert!(!is_path_prefix(b"a", b"a"), "a path is not above itself");
+        assert!(!is_path_prefix(b"b", b"a\0b"));
+
+        assert_eq!(
+            validate_entries(
+                &[file("a"), nested_file(&["a", "b"])],
+                PathProfile::Portable
+            ),
+            Err(Error::PathCollision)
+        );
+        assert_eq!(
+            validate_entries(
+                &[directory(&["a"]), nested_file(&["a", "b"])],
+                PathProfile::Portable
+            )
+            .map(|keys| keys.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            validate_entries(&[file("foo"), file("foobar")], PathProfile::Portable)
+                .map(|keys| keys.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            validate_entries(
+                &[
+                    directory(&["a"]),
+                    nested_file(&["a", "b"]),
+                    nested_file(&["a", "c"])
+                ],
+                PathProfile::Portable
+            )
+            .map(|keys| keys.len()),
+            Ok(3)
+        );
+
+        let first = ManifestPage {
+            entries: vec![file("a")],
+            ..page(0, [0; 32], "unused")
+        };
+        let digest = *blake3::hash(&encode_page(&first).unwrap()).as_bytes();
+        let child = ManifestPage {
+            entries: vec![nested_file(&["a", "b"])],
+            ..page(1, digest, "unused")
+        };
+        let mut files = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        files.accept(&first).unwrap();
+        assert_eq!(files.accept(&child), Err(Error::PathCollision));
+
+        let dir_page = ManifestPage {
+            entries: vec![directory(&["a"])],
+            ..page(0, [0; 32], "unused")
+        };
+        let dir_digest = *blake3::hash(&encode_page(&dir_page).unwrap()).as_bytes();
+        let under_dir = ManifestPage {
+            entries: vec![nested_file(&["a", "b"])],
+            ..page(1, dir_digest, "unused")
+        };
+        let mut dirs = ProgressiveIngest::new([9; 16], PathProfile::Portable);
+        dirs.accept(&dir_page).unwrap();
+        assert!(dirs.accept(&under_dir).is_ok());
     }
 
     #[test]

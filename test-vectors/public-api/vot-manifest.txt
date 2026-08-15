@@ -13,6 +13,7 @@ function vot_manifest::decode_page
 function vot_manifest::decode_seal
 function vot_manifest::encode_page
 function vot_manifest::encode_seal
+function vot_manifest::is_path_prefix
 function vot_manifest::validate_entries
 struct vot_manifest::FileMetadata
 struct vot_manifest::IndexEntry

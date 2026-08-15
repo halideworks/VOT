@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ REQUIRED_FILES = (
     "spec/commit.md",
     "spec/wire.md",
     "spec/registries.md",
+    "spec/registries.yaml",
     "spec/security.md",
     "spec/telemetry.md",
     "spec/manifest.cddl",
@@ -122,17 +124,15 @@ def validate(root: Path) -> None:
     for path in adrs:
         assert "Status: Accepted" in path.read_text(encoding="utf-8"), path.name
 
-    registry = documents["spec/registries.md"]
-    frame_section = registry[registry.index("## 2. Frame types") : registry.index("## 3. Settings")]
-    allocated_frames = set(
-        re.findall(r"^\| `0x[0-9a-f]+` \| `([A-Z0-9_]+)` \|", frame_section, re.MULTILINE)
-    )
+    registries = json.loads(documents["spec/registries.yaml"])
+    allocated_frames = {row["name"] for row in registries["frames"]}
     assert allocated_frames == REQUIRED_FRAMES, (
         f"frame registry mismatch: missing={sorted(REQUIRED_FRAMES - allocated_frames)}, "
         f"extra={sorted(allocated_frames - REQUIRED_FRAMES)}"
     )
-    assert "`0x0001` | `ED25519` | 64 bytes" in registry
-    assert "`0x0002` | `HMAC_SHA256` | 32 bytes" in registry
+    schemes = {row["name"]: row for row in registries["receipt_schemes"]}
+    assert schemes["ED25519"]["authenticator_length"] == "64 bytes"
+    assert schemes["HMAC_SHA256"]["authenticator_length"] == "32 bytes"
 
     proofs = documents["spec/proofs.md"]
     for phrase in (

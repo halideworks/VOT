@@ -82,10 +82,10 @@ pub mod extension_id {
 
 /// One row per registered frame: identifier, payload ceiling, whether an
 /// authenticated session is required to send it, and the extension it needs.
-/// `tools/validate_registries.py` parses these rows and holds every column to
-/// `spec/registries.md` section 2 and the `spec/wire.md` frame table, so a
-/// row that drifts from either specification fails validation. The macro
-/// generates only mechanical lookups; nothing semantic hides in it.
+/// `tools/validate_registries.py` holds these rows to `spec/registries.yaml`
+/// and the `spec/wire.md` frame table, so a row that drifts from either
+/// specification fails validation. The macro generates only mechanical
+/// lookups; nothing semantic hides in it.
 macro_rules! frame_registry {
     ($($name:ident = $value:literal, limit: $limit:expr, auth: $auth:ident, extension: $extension:ident;)*) => {
         pub mod frame_type {

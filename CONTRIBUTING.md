@@ -13,7 +13,7 @@ Every contribution must:
   protocol cloning;
 - include success and failure-path tests;
 - update conformance vectors for wire- or identity-visible changes;
-- use only identifiers allocated by `spec/registries.md`;
+- use only identifiers allocated by `spec/registries.yaml`;
 - state memory, CPU, storage, and wire amplification impacts; and
 - update security, telemetry, provenance, and ADR records when relevant.
 

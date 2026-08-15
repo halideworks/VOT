@@ -318,7 +318,8 @@ stable implementation record. All are accepted; none are waived.
 ## 11. Change control
 
 Normative architecture changes require an ADR. Numeric identifiers are assigned
-only in `spec/registries.md`. Wire-visible changes also require updated golden
+in `spec/registries.yaml`. `spec/registries.md` is the human view of those
+tables. Wire-visible changes also require updated golden
 vectors. New hash, compression, congestion-control, or FEC algorithms require
 an ADR and provenance review. Experimental behavior remains negotiated,
 off-by-default, and identified in receipts and telemetry until its gate passes.

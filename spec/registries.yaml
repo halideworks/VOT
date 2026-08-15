@@ -1,0 +1,642 @@
+{
+  "schema": "vot-registries-v1",
+  "revision": "vot-draft-05",
+  "grease_frames": {
+    "first": "0x1f00",
+    "last": "0x1ffe",
+    "step": 2
+  },
+  "frames": [
+    {
+      "value": "0x01",
+      "name": "HELLO",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x03",
+      "name": "SETTINGS",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x05",
+      "name": "SETTINGS_ACK",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x07",
+      "name": "AUTH_CONTEXT",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x09",
+      "name": "SESSION_OPEN",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x0b",
+      "name": "SESSION_ACCEPT",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x0d",
+      "name": "SESSION_REJECT",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x21",
+      "name": "PACKAGE_DESCRIPTOR",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x23",
+      "name": "MANIFEST_REQUEST",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x25",
+      "name": "MANIFEST_PAGE",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x27",
+      "name": "PROGRESSIVE_PAGE",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x29",
+      "name": "SEAL",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x2b",
+      "name": "HAVE",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x2d",
+      "name": "RANGE_REQUEST",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x2f",
+      "name": "PROOF_BUNDLE",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x31",
+      "name": "DATA_RECORD",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x33",
+      "name": "RANGE_CANCEL",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x40",
+      "name": "CAPACITY",
+      "handling": "optional",
+      "status": "draft"
+    },
+    {
+      "value": "0x43",
+      "name": "TRANSIT_VERIFIED",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x45",
+      "name": "CHUNK_DURABLE",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x47",
+      "name": "CHUNK_AT_REST_VERIFIED",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x49",
+      "name": "PUBLISH_RECEIPT",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x60",
+      "name": "DATAGRAM_CREDIT",
+      "handling": "optional",
+      "status": "experimental"
+    },
+    {
+      "value": "0x62",
+      "name": "CODING_EPOCH_OPEN",
+      "handling": "optional",
+      "status": "experimental"
+    },
+    {
+      "value": "0x64",
+      "name": "GEN_STATE",
+      "handling": "optional",
+      "status": "experimental"
+    },
+    {
+      "value": "0x66",
+      "name": "GEN_DONE",
+      "handling": "optional",
+      "status": "experimental"
+    },
+    {
+      "value": "0x68",
+      "name": "CODING_EPOCH_CLOSE",
+      "handling": "optional",
+      "status": "experimental"
+    },
+    {
+      "value": "0x80",
+      "name": "PING",
+      "handling": "optional",
+      "status": "draft"
+    },
+    {
+      "value": "0x83",
+      "name": "GOAWAY",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x85",
+      "name": "ERROR",
+      "handling": "critical",
+      "status": "draft"
+    },
+    {
+      "value": "0x86",
+      "name": "SOURCE_SCORE_HINT",
+      "handling": "optional",
+      "status": "draft"
+    },
+    {
+      "value": "0x89",
+      "name": "JOB_PRIORITY_UPDATE",
+      "handling": "critical",
+      "status": "draft"
+    }
+  ],
+  "settings": [
+    {
+      "value": "0x01",
+      "name": "MAX_CONTROL_FRAME_PAYLOAD",
+      "default": "1 MiB",
+      "range": "1 KiB--16 MiB",
+      "handling": "critical"
+    },
+    {
+      "value": "0x03",
+      "name": "MAX_DATA_RECORD_PAYLOAD",
+      "default": "256 KiB",
+      "range": "64 KiB--256 KiB",
+      "handling": "critical"
+    },
+    {
+      "value": "0x05",
+      "name": "MAX_MANIFEST_PAGE_PAYLOAD",
+      "default": "1 MiB",
+      "range": "64 KiB--1 MiB",
+      "handling": "critical"
+    },
+    {
+      "value": "0x07",
+      "name": "RELIABLE_LANE_LIMIT",
+      "default": "16",
+      "range": "1--256",
+      "handling": "critical"
+    },
+    {
+      "value": "0x09",
+      "name": "IDLE_TIMEOUT_MS",
+      "default": "90000",
+      "range": "1000--600000",
+      "handling": "critical"
+    }
+  ],
+  "retired_settings": [
+    {
+      "value": "0x0b",
+      "name": "ACTIVE_KEEPALIVE_MS"
+    },
+    {
+      "value": "0x20",
+      "name": "COMPRESSION_MIN_GAIN_BPS"
+    },
+    {
+      "value": "0x22",
+      "name": "TELEMETRY_LEVEL"
+    }
+  ],
+  "extensions": [
+    {
+      "value": "0x00",
+      "name": "CORE_RELIABLE",
+      "status": "draft",
+      "default": "enabled"
+    },
+    {
+      "value": "0x01",
+      "name": "DATAGRAM_FEC",
+      "status": "experimental",
+      "default": "disabled"
+    },
+    {
+      "value": "0x02",
+      "name": "ZSTD_RECORDS",
+      "status": "draft optional",
+      "default": "disabled"
+    },
+    {
+      "value": "0x03",
+      "name": "VCRC",
+      "status": "experimental",
+      "default": "disabled"
+    },
+    {
+      "value": "0x04",
+      "name": "PUBLIC_MULTI_RAIL",
+      "status": "experimental",
+      "default": "disabled"
+    },
+    {
+      "value": "0x05",
+      "name": "CUSTOM_CONGESTION_CONTROL",
+      "status": "experimental",
+      "default": "disabled"
+    },
+    {
+      "value": "0x06",
+      "name": "MULTIPATH_QUIC",
+      "status": "experimental",
+      "default": "disabled"
+    }
+  ],
+  "suites": [
+    {
+      "value": "0x0001",
+      "name": "blake3-bao64",
+      "root_length": "32 bytes",
+      "status": "required v1"
+    },
+    {
+      "value": "0x0002",
+      "name": "sha256-bep52-64k",
+      "root_length": "32 bytes",
+      "status": "required v1"
+    }
+  ],
+  "compression": [
+    {
+      "value": "0x0000",
+      "name": "none",
+      "status": "required"
+    },
+    {
+      "value": "0x0001",
+      "name": "zstd-record",
+      "status": "optional"
+    }
+  ],
+  "commit_profiles": [
+    {
+      "value": "0x01",
+      "name": "FAST",
+      "predecessor": "TRANSIT_VERIFIED"
+    },
+    {
+      "value": "0x02",
+      "name": "BALANCED",
+      "predecessor": "DURABLE"
+    },
+    {
+      "value": "0x03",
+      "name": "STRICT",
+      "predecessor": "AT_REST_VERIFIED"
+    }
+  ],
+  "providers": [
+    {
+      "value": "0x0001",
+      "name": "POSIX_LOCAL",
+      "status": "draft"
+    },
+    {
+      "value": "0x0002",
+      "name": "OBJECT_STORE",
+      "status": "draft"
+    },
+    {
+      "value": "0x0003",
+      "name": "WINDOWS_LOCAL",
+      "status": "reserved for implementation profile"
+    },
+    {
+      "value": "0x0004",
+      "name": "MACOS_LOCAL",
+      "status": "reserved for implementation profile"
+    }
+  ],
+  "assurance": [
+    {
+      "value": "0x01",
+      "name": "ADMITTED"
+    },
+    {
+      "value": "0x02",
+      "name": "TRANSIT_VERIFIED"
+    },
+    {
+      "value": "0x03",
+      "name": "DURABLE"
+    },
+    {
+      "value": "0x04",
+      "name": "AT_REST_VERIFIED"
+    },
+    {
+      "value": "0x05",
+      "name": "PUBLISHED"
+    }
+  ],
+  "errors": [
+    {
+      "value": "0x0101",
+      "name": "UNKNOWN_CRITICAL_FRAME",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0102",
+      "name": "MALFORMED_FRAME",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0103",
+      "name": "FRAME_TOO_LARGE",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0104",
+      "name": "UNSUPPORTED_VERSION",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0105",
+      "name": "INVALID_SETTING",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0106",
+      "name": "DUPLICATE_SETTING",
+      "class": "protocol/version"
+    },
+    {
+      "value": "0x0201",
+      "name": "AUTHENTICATION_FAILED",
+      "class": "authentication/authorization"
+    },
+    {
+      "value": "0x0202",
+      "name": "AUTHORIZATION_FAILED",
+      "class": "authentication/authorization"
+    },
+    {
+      "value": "0x0203",
+      "name": "REPLAY_REJECTED",
+      "class": "authentication/authorization"
+    },
+    {
+      "value": "0x0301",
+      "name": "MANIFEST_INVALID",
+      "class": "manifest/object/proof integrity"
+    },
+    {
+      "value": "0x0302",
+      "name": "OBJECT_IDENTITY_MISMATCH",
+      "class": "manifest/object/proof integrity"
+    },
+    {
+      "value": "0x0303",
+      "name": "PROOF_INVALID",
+      "class": "manifest/object/proof integrity"
+    },
+    {
+      "value": "0x0304",
+      "name": "SOURCE_MUTATED",
+      "class": "manifest/object/proof integrity"
+    },
+    {
+      "value": "0x0401",
+      "name": "STORAGE_WRITE_FAILED",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0402",
+      "name": "DURABILITY_FAILED",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0403",
+      "name": "AT_REST_VERIFICATION_FAILED",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0404",
+      "name": "PUBLICATION_FAILED",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0405",
+      "name": "STALE_INCARNATION",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0406",
+      "name": "ASSURANCE_UNSUPPORTED",
+      "class": "storage/commit"
+    },
+    {
+      "value": "0x0501",
+      "name": "ADMISSION_DENIED",
+      "class": "resource/admission"
+    },
+    {
+      "value": "0x0502",
+      "name": "RESOURCE_LIMIT",
+      "class": "resource/admission"
+    },
+    {
+      "value": "0x0503",
+      "name": "FLOW_CONTROL_VIOLATION",
+      "class": "resource/admission"
+    },
+    {
+      "value": "0x0601",
+      "name": "CARRIER_UNAVAILABLE",
+      "class": "fallback/path"
+    },
+    {
+      "value": "0x0602",
+      "name": "PATH_STATE_REJECTED",
+      "class": "fallback/path"
+    },
+    {
+      "value": "0x0701",
+      "name": "EXPERIMENT_NOT_NEGOTIATED",
+      "class": "experimental/research"
+    },
+    {
+      "value": "0x0702",
+      "name": "RISK_BUDGET_EXHAUSTED",
+      "class": "experimental/research"
+    }
+  ],
+  "telemetry": [
+    {
+      "name": "vot.session.opened",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.session.closed",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.frame.unknown_optional",
+      "stability": "draft",
+      "redaction": "minimal"
+    },
+    {
+      "name": "vot.frame.unknown_critical",
+      "stability": "draft",
+      "redaction": "minimal"
+    },
+    {
+      "name": "vot.receiver.admitted",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.range.transit_verified",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.chunk.durable",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.chunk.at_rest_verified",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.object.published",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.commit.poisoned",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vot.carrier.switched",
+      "stability": "draft",
+      "redaction": "pseudonymous"
+    },
+    {
+      "name": "vcrc.budget_exhausted",
+      "stability": "experimental",
+      "redaction": "pseudonymous"
+    }
+  ],
+  "receipt_schemes": [
+    {
+      "value": "0x0001",
+      "name": "ED25519",
+      "authenticator_length": "64 bytes",
+      "status": "required v1"
+    },
+    {
+      "value": "0x0002",
+      "name": "HMAC_SHA256",
+      "authenticator_length": "32 bytes",
+      "status": "optional"
+    }
+  ],
+  "capability_formats": [
+    {
+      "value": "0x0001",
+      "name": "ed25519-cbor-v1",
+      "status": "retired"
+    },
+    {
+      "value": "0x0002",
+      "name": "ed25519-cbor-tls-exporter-v1",
+      "status": "draft"
+    }
+  ],
+  "operations": [
+    {
+      "value": "0x0001",
+      "name": "PUBLISH",
+      "status": "draft"
+    },
+    {
+      "value": "0x0002",
+      "name": "READ_MANIFEST",
+      "status": "draft"
+    },
+    {
+      "value": "0x0003",
+      "name": "READ_RANGES",
+      "status": "draft"
+    }
+  ],
+  "limits": [
+    {
+      "value": "0x0001",
+      "name": "CONCURRENT_LANES",
+      "unit": "reliable lanes open at once",
+      "status": "draft"
+    },
+    {
+      "value": "0x0002",
+      "name": "WIRE_BYTES",
+      "unit": "bytes on the wire under this capability",
+      "status": "draft"
+    },
+    {
+      "value": "0x0003",
+      "name": "STORAGE_BYTES",
+      "unit": "bytes stored at the receiver",
+      "status": "draft"
+    }
+  ]
+}

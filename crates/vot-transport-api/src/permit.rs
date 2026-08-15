@@ -104,6 +104,11 @@ impl Ledger {
         }
         inner.limit.saturating_sub(inner.used)
     }
+
+    #[cfg(test)]
+    fn force_used(&self, used: u64) {
+        lock(&self.inner).used = used;
+    }
 }
 
 impl Permit {
@@ -240,5 +245,28 @@ mod tests {
     #[test]
     fn zero_limit_is_rejected() {
         assert_eq!(Ledger::new(0).err(), Some(Error::InvalidConfiguration));
+    }
+
+    #[test]
+    fn acquire_may_fill_the_limit() {
+        let ledger = Ledger::new(10).unwrap();
+        let permit = ledger.acquire(10).unwrap();
+        assert_eq!(ledger.used(), 10);
+        assert_eq!(ledger.remaining(), 0);
+        assert_eq!(ledger.acquire(1).err(), Some(Error::StagingExhausted));
+        drop(permit);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn over_release_poisons() {
+        let ledger = Ledger::new(10).unwrap();
+        let permit = ledger.acquire(4).unwrap();
+        ledger.force_used(0);
+        drop(permit);
+        assert!(ledger.is_poisoned());
+        assert_eq!(ledger.used(), 10);
+        assert_eq!(ledger.remaining(), 0);
+        assert_eq!(ledger.acquire(1).err(), Some(Error::AccountingPoisoned));
     }
 }

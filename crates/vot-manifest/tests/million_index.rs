@@ -1,7 +1,7 @@
 use std::alloc::System;
 
 use cap::Cap;
-use vot_manifest::{Component, ManifestIndex, PathProfile};
+use vot_manifest::{ManifestIndex, PackagePath, PathProfile};
 
 const LIMIT: usize = 512 * 1024 * 1024;
 
@@ -14,7 +14,7 @@ fn million_file_index_peak_allocation_is_bounded() {
     for value in 0_u64..1_000_000 {
         let mut first = vec![b'a'; 240];
         first[..16].copy_from_slice(format!("{value:016x}").as_bytes());
-        let path = vec![Component::Bytes(first), Component::Bytes(vec![b'b'; 240])];
+        let path = PackagePath::raw([first, vec![b'b'; 240]]).unwrap();
         index
             .push(
                 &path,
@@ -27,7 +27,7 @@ fn million_file_index_peak_allocation_is_bounded() {
     index.finish();
     assert!(ALLOCATOR.allocated() < LIMIT);
     assert_eq!(
-        index.candidates(&vec![Component::Bytes(vec![b'x'])], PathProfile::RawPosix),
+        index.candidates(&PackagePath::raw([b"x"]).unwrap(), PathProfile::RawPosix),
         vec![]
     );
 }

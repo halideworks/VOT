@@ -73,7 +73,7 @@ mod tests {
             length: 3,
         };
         ManifestEntry {
-            path: vec![Component::Text(path.to_owned())],
+            path: PackagePath::portable([path]).unwrap(),
             kind: EntryKind::File,
             length: Some(3),
             storage: Some(StorageRef::Direct(object)),
@@ -137,7 +137,7 @@ mod tests {
             previous_digest: [5; 32],
             profile: PathProfile::RawPosix,
             entries: vec![ManifestEntry {
-                path: vec![Component::Bytes(b"raw-name".to_vec())],
+                path: PackagePath::raw([b"raw-name"]).unwrap(),
                 kind: EntryKind::File,
                 length: Some(3),
                 storage: Some(StorageRef::Pack {
@@ -297,13 +297,7 @@ mod tests {
             "join\u{200d}er",
             "rtl\u{202e}name",
         ] {
-            assert_eq!(
-                canonical_path_key(
-                    &vec![Component::Text(name.to_owned())],
-                    PathProfile::Portable
-                ),
-                Err(Error::InvalidPath)
-            );
+            assert_eq!(PackagePath::portable([name]), Err(Error::InvalidPath));
         }
     }
 
@@ -559,7 +553,7 @@ mod tests {
     fn every_rule_on_an_entry_is_refused_on_its_own() {
         assert_eq!(validate_entry(&file("a.txt")), Ok(()));
         let directory = ManifestEntry {
-            path: vec![Component::Text("d".to_owned())],
+            path: PackagePath::portable(["d"]).unwrap(),
             kind: EntryKind::Directory,
             length: None,
             storage: None,
@@ -793,22 +787,22 @@ mod tests {
             Component::Bytes(b"etc".to_vec()),
         ];
         assert!(matches!(
-            canonical_path_key(&escape, PathProfile::RawPosix),
+            PackagePath::new(escape, PathProfile::RawPosix),
             Err(Error::InvalidPath)
         ));
     }
 
     #[test]
     fn an_encoder_refuses_a_path_the_decoder_would_not_read() {
-        let widest: PackagePath = (0..MAX_PATH_COMPONENTS)
-            .map(|_| Component::Text("a".to_owned()))
-            .collect();
+        let widest = PackagePath::portable((0..MAX_PATH_COMPONENTS).map(|_| "a")).unwrap();
         assert!(canonical_path_key(&widest, PathProfile::Portable).is_ok());
 
-        let mut wider = widest;
+        let mut wider: Vec<Component> = (0..MAX_PATH_COMPONENTS)
+            .map(|_| Component::Text("a".to_owned()))
+            .collect();
         wider.push(Component::Text("a".to_owned()));
         assert!(matches!(
-            canonical_path_key(&wider, PathProfile::Portable),
+            PackagePath::new(wider, PathProfile::Portable),
             Err(Error::InvalidPath)
         ));
     }
@@ -819,32 +813,26 @@ mod tests {
         // began with one would sort a path under the empty component.
         assert_eq!(
             canonical_path_key(
-                &vec![
-                    Component::Text("a".to_owned()),
-                    Component::Text("b".to_owned())
-                ],
+                &PackagePath::portable(["a", "b"]).unwrap(),
                 PathProfile::Portable
             ),
             Ok(b"a\0b".to_vec())
         );
         assert_eq!(
-            canonical_path_key(
-                &vec![Component::Bytes(b"a".to_vec())],
-                PathProfile::RawPosix
-            ),
+            canonical_path_key(&PackagePath::raw([b"a"]).unwrap(), PathProfile::RawPosix),
             Ok(b"a".to_vec())
         );
 
         // A path of no components names nothing.
         assert_eq!(
-            canonical_path_key(&Vec::new(), PathProfile::Portable),
+            PackagePath::new(Vec::new(), PathProfile::Portable),
             Err(Error::InvalidPath)
         );
 
         // Each profile takes one kind of component and refuses the other, and the
         // raw profile asks whether the bytes are a component at all rather than
         // taking them.
-        for (name, path, profile) in [
+        for (name, components, profile) in [
             (
                 "bytes under the portable profile",
                 vec![Component::Bytes(b"a".to_vec())],
@@ -872,7 +860,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                canonical_path_key(&path, profile),
+                PackagePath::new(components, profile),
                 Err(Error::InvalidPath),
                 "{name}"
             );
@@ -882,11 +870,11 @@ mod tests {
         // filesystem would drop, so two spellings of one name share a key.
         assert_eq!(
             canonical_path_key(
-                &vec![Component::Text("A.TXT".to_owned())],
+                &PackagePath::portable(["A.TXT"]).unwrap(),
                 PathProfile::Portable
             ),
             canonical_path_key(
-                &vec![Component::Text("a.txt".to_owned())],
+                &PackagePath::portable(["a.txt"]).unwrap(),
                 PathProfile::Portable
             )
         );
@@ -936,7 +924,7 @@ mod tests {
                 ManifestPage {
                     profile: PathProfile::RawPosix,
                     entries: vec![ManifestEntry {
-                        path: vec![Component::Bytes(b"b.txt".to_vec())],
+                        path: PackagePath::raw([b"b.txt"]).unwrap(),
                         ..file("b.txt")
                     }],
                     ..page(1, digest, "b.txt")
@@ -1072,10 +1060,7 @@ mod tests {
         // rather than on where one of them happens to land.
         let paths: Vec<PackagePath> = (0..16)
             .map(|index| {
-                vec![
-                    Component::Text(format!("dir{index}")),
-                    Component::Text(format!("file{index}.txt")),
-                ]
+                PackagePath::portable([format!("dir{index}"), format!("file{index}.txt")]).unwrap()
             })
             .collect();
 
@@ -1099,18 +1084,18 @@ mod tests {
             );
         }
 
-        // A path nothing pushed, and a path no profile can key.
+        // A path nothing pushed, and a path this profile did not accept.
         assert!(
             index
                 .candidates(
-                    &vec![Component::Text("absent".to_owned())],
+                    &PackagePath::portable(["absent"]).unwrap(),
                     PathProfile::Portable
                 )
                 .is_empty()
         );
         assert!(
             index
-                .candidates(&Vec::new(), PathProfile::Portable)
+                .candidates(&PackagePath::raw([b"a"]).unwrap(), PathProfile::Portable)
                 .is_empty()
         );
 
@@ -1133,7 +1118,7 @@ mod tests {
         // profile's rather than swallowed.
         assert_eq!(
             twice.push(
-                &vec![Component::Bytes(b"a".to_vec())],
+                &PackagePath::raw([b"a"]).unwrap(),
                 PathProfile::Portable,
                 0,
                 0
@@ -1147,9 +1132,8 @@ mod tests {
         // A path of exactly as many components as one may have. The bound is the
         // count itself, so the page at it has to be readable.
         let deep = ManifestEntry {
-            path: (0..MAX_PATH_COMPONENTS)
-                .map(|index| Component::Text(format!("c{index}")))
-                .collect(),
+            path: PackagePath::portable((0..MAX_PATH_COMPONENTS).map(|index| format!("c{index}")))
+                .unwrap(),
             ..file("unused.txt")
         };
         let deep_page = ManifestPage {
@@ -1162,7 +1146,7 @@ mod tests {
         // A directory entry, which is the other kind a page may hold.
         let directory_page = ManifestPage {
             entries: vec![ManifestEntry {
-                path: vec![Component::Text("d".to_owned())],
+                path: PackagePath::portable(["d"]).unwrap(),
                 kind: EntryKind::Directory,
                 length: None,
                 storage: None,

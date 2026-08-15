@@ -2202,7 +2202,7 @@ mod tests {
             length: 3,
         };
         let direct = ManifestEntry {
-            path: vec![Component::Text("file".to_owned())],
+            path: PackagePath::portable(["file"]).unwrap(),
             kind: EntryKind::File,
             length: Some(3),
             storage: Some(StorageRef::Direct(logical.clone())),

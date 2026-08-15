@@ -1,7 +1,7 @@
 //! Package construction from a source tree.
 
 use crate::{
-    CANDIDATE_MAX, Component, DEFAULT_LOGICAL_SUITE, EntryRecord, Error, File, LogicalFile,
+    CANDIDATE_MAX, DEFAULT_LOGICAL_SUITE, EntryRecord, Error, File, LogicalFile,
     MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_DATA_RECORD_BYTES, OpenOptions, Pack, PackageAssembly,
     PackageBuilder, PackagePath, PackageSummary, PageDraft, Path, PathBuf, PathProfile, Read,
     Storage, StreamVerifier, StreamingPacker, Suite, Write, canonical_path_key, file_matches_bytes,
@@ -126,7 +126,7 @@ pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
     pub(crate) fn visit(
         root: &Path,
         directory: &Path,
-        components: &mut PackagePath,
+        components: &mut Vec<String>,
         output: &mut Vec<SourceFile>,
     ) -> Result<(), Error> {
         let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -136,7 +136,7 @@ pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
                 .file_name()
                 .into_string()
                 .map_err(|_| Error::InvalidPath)?;
-            components.push(Component::Text(name));
+            components.push(name);
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() {
@@ -145,7 +145,8 @@ pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
             if metadata.is_dir() {
                 visit(root, &path, components, output)?;
             } else if metadata.is_file() {
-                let package_path = components.clone();
+                let package_path = PackagePath::portable(components.iter().cloned())
+                    .map_err(|_| Error::InvalidPath)?;
                 let key = canonical_path_key(&package_path, PathProfile::Portable)
                     .map_err(|_| Error::InvalidPath)?;
                 output.push(SourceFile {

@@ -20,7 +20,7 @@ struct vot_manifest::ManifestEntry
 struct vot_manifest::ManifestIndex
 struct vot_manifest::ManifestPage
 struct vot_manifest::ObjectId
+struct vot_manifest::PackagePath
 struct vot_manifest::PageCommitment
 struct vot_manifest::ProgressiveIngest
 struct vot_manifest::Seal
-type_alias vot_manifest::PackagePath

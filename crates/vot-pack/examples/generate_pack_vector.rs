@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::format_collect)]
 
-use vot_manifest::{Component, PathProfile};
+use vot_manifest::{Component, PackagePath, PathProfile};
 use vot_pack::{LogicalFile, build};
 
 fn hex(bytes: &[u8]) -> String {
@@ -9,7 +9,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn file(path: &str, bytes: &[u8]) -> LogicalFile {
     LogicalFile {
-        path: vec![Component::Text(path.to_owned())],
+        path: PackagePath::portable([path]).unwrap(),
         bytes: bytes.to_vec(),
     }
 }

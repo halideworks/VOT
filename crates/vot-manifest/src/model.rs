@@ -79,6 +79,9 @@ pub fn validate_entries(
     let mut unique = BTreeSet::new();
     for entry in entries {
         validate_entry(entry)?;
+        if entry.path.profile() != profile {
+            return Err(Error::InvalidPath);
+        }
         let key = canonical_path_key(&entry.path, profile)?;
         if !unique.insert(key.clone()) {
             return Err(Error::PathCollision);

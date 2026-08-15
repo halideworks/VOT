@@ -335,10 +335,7 @@ mod tests {
     use super::*;
 
     fn text_path(parts: &[&str]) -> PackagePath {
-        parts
-            .iter()
-            .map(|part| Component::Text((*part).to_owned()))
-            .collect()
+        PackagePath::portable(parts.iter().copied()).unwrap()
     }
 
     fn direct(path: &[&str], suite: Suite, root: [u8; 32], length: u64) -> EntryRecord {
@@ -495,11 +492,12 @@ mod tests {
         );
 
         let mut invalid = PackageRootBuilder::new().unwrap();
-        let mut empty = direct(&["a"], Suite::Sha256Bep52, [1; 32], 1);
-        empty.path.clear();
-        assert_eq!(invalid.push(&empty), Err(Error::InvalidPath));
+        assert_eq!(
+            PackagePath::new(Vec::new(), PathProfile::Portable),
+            Err(vot_manifest::Error::InvalidPath)
+        );
         let raw = EntryRecord {
-            path: vec![Component::Bytes(b"raw".to_vec())],
+            path: PackagePath::raw([b"raw"]).unwrap(),
             ..direct(&["a"], Suite::Sha256Bep52, [1; 32], 1)
         };
         assert_eq!(invalid.push(&raw), Err(Error::InvalidPath));
@@ -773,8 +771,10 @@ mod tests {
             Some(Error::InvalidBundle)
         );
 
-        let mut malformed_path = boundary.clone();
-        malformed_path.path.clear();
+        let malformed_path = EntryRecord {
+            path: PackagePath::raw([b"a"]).unwrap(),
+            ..boundary.clone()
+        };
         assert_eq!(
             malformed_path.manifest_entry().err(),
             Some(Error::InvalidPath)

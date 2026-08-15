@@ -147,7 +147,7 @@ impl Denial {
 /// The variant is the operation. A raw identifier cannot be one, and a
 /// ranges request cannot omit the range:
 ///
-/// ```compile_fail,E0560
+/// ```compile_fail,E0559
 /// use vot_capability::verify::AuthorizedRequest;
 ///
 /// let _ = AuthorizedRequest::Publish {

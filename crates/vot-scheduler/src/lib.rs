@@ -86,9 +86,7 @@ mod tests {
 
         let held = subject(b"in flight");
         receiver.begin(held).unwrap();
-        let extra = receiver.staging.reserve(1).unwrap();
-        receiver.staging.force_used(0);
-        drop(extra);
+        receiver.staging.poison();
         assert!(receiver.staging.is_poisoned());
         assert!(
             !receiver.recover_accounting(),

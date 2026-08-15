@@ -6,9 +6,9 @@ active object or range state and does not call a bare `release`.
 
 Passing evidence: `flow_credit_is_derived_from_remaining_staging` holds
 permits across credit checks and drops them to restore credit.
-`a_poisoned_ledger_recovers_only_with_nothing_in_flight` poisons by
-dropping a permit after `force_used(0)` and refuses rebuild while
-`begin` still holds a permit.
+`a_poisoned_ledger_recovers_only_with_nothing_in_flight` calls the
+test-only `poison` hook and refuses rebuild while `begin` still holds
+a permit.
 
 Mutants: restore a public `release(bytes)` that subtracts without a
 permit, which `releasing_more_than_was_held_poisons_the_ledger` no

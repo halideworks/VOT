@@ -516,9 +516,9 @@ impl StagingCapacity {
         self.remaining().min(target)
     }
 
-    #[doc(hidden)]
-    pub fn force_used(&self, used: u64) {
-        self.ledger.force_used(used);
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn poison(&self) {
+        self.ledger.poison();
     }
 }
 
@@ -648,8 +648,8 @@ mod tests {
         assert_eq!(staging.advertised_credit(), 800);
 
         let second = staging.reserve(400).unwrap();
-        staging.force_used(0);
         drop(second);
+        staging.poison();
         assert!(staging.is_poisoned());
         assert_eq!(
             (
@@ -664,8 +664,8 @@ mod tests {
 
         let holding = StagingCapacity::new(1024, 800, 900).unwrap();
         let held = holding.reserve(400).unwrap();
-        holding.force_used(0);
         drop(held);
+        holding.poison();
         assert!(holding.is_poisoned());
         assert_eq!(holding.used(), 1024, "the over-release read as free space");
 

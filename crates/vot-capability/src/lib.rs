@@ -98,6 +98,10 @@ impl From<vot_cbor::Error> for Error {
 mod tests {
     use super::*;
 
+    fn range(offset: u64, length: u64) -> Range {
+        Range::new(offset, length).unwrap()
+    }
+
     fn issuer_key() -> SigningKey {
         SigningKey::from_bytes(&[3; 32])
     }
@@ -116,16 +120,7 @@ mod tests {
                 suite: 1,
                 root: [7; 32],
                 length: Some(1 << 20),
-                ranges: vec![
-                    Range {
-                        offset: 0,
-                        length: 65_536,
-                    },
-                    Range {
-                        offset: 131_072,
-                        length: 65_536,
-                    },
-                ],
+                ranges: vec![range(0, 65_536), range(131_072, 65_536)],
             },
             limits: vec![
                 Limit { id: 1, value: 4 },
@@ -326,33 +321,10 @@ mod tests {
                 Error::InvalidSuite(3),
             ),
             (
-                "an empty range",
-                Capability {
-                    scope: Scope {
-                        ranges: vec![Range {
-                            offset: 0,
-                            length: 0,
-                        }],
-                        ..capability().scope
-                    },
-                    ..capability()
-                },
-                Error::InvalidRange,
-            ),
-            (
                 "ranges out of order",
                 Capability {
                     scope: Scope {
-                        ranges: vec![
-                            Range {
-                                offset: 128,
-                                length: 8,
-                            },
-                            Range {
-                                offset: 0,
-                                length: 8,
-                            },
-                        ],
+                        ranges: vec![range(128, 8), range(0, 8)],
                         ..capability().scope
                     },
                     ..capability()
@@ -363,16 +335,7 @@ mod tests {
                 "overlapping ranges",
                 Capability {
                     scope: Scope {
-                        ranges: vec![
-                            Range {
-                                offset: 0,
-                                length: 16,
-                            },
-                            Range {
-                                offset: 8,
-                                length: 16,
-                            },
-                        ],
+                        ranges: vec![range(0, 16), range(8, 16)],
                         ..capability().scope
                     },
                     ..capability()
@@ -384,25 +347,7 @@ mod tests {
                 Capability {
                     scope: Scope {
                         length: Some(64),
-                        ranges: vec![Range {
-                            offset: 0,
-                            length: 65,
-                        }],
-                        ..capability().scope
-                    },
-                    ..capability()
-                },
-                Error::InvalidRange,
-            ),
-            (
-                "a range that overflows",
-                Capability {
-                    scope: Scope {
-                        length: None,
-                        ranges: vec![Range {
-                            offset: u64::MAX,
-                            length: 2,
-                        }],
+                        ranges: vec![range(0, 65)],
                         ..capability().scope
                     },
                     ..capability()
@@ -454,10 +399,7 @@ mod tests {
             .collect();
         value.scope.length = None;
         value.scope.ranges = (0..bounds::RANGES as u64)
-            .map(|index| Range {
-                offset: index * 2,
-                length: 1,
-            })
+            .map(|index| range(index * 2, 1))
             .collect();
         let bytes = value.canonical_bytes().unwrap();
         assert_eq!(Capability::from_canonical_bytes(&bytes), Ok(value.clone()));
@@ -476,10 +418,7 @@ mod tests {
         let mut ranged = capability();
         ranged.scope.length = None;
         ranged.scope.ranges = (0..=bounds::RANGES as u64)
-            .map(|index| Range {
-                offset: index * 2,
-                length: 1,
-            })
+            .map(|index| range(index * 2, 1))
             .collect();
         assert_eq!(ranged.validate(), Err(Error::TooLarge));
     }
@@ -547,62 +486,38 @@ mod tests {
     #[test]
     fn a_scope_decides_what_it_allows() {
         let scope = capability().scope;
-        assert!(scope.allows(Range {
-            offset: 0,
-            length: 65_536
-        }));
-        assert!(scope.allows(Range {
-            offset: 65_535,
-            length: 1
-        }));
-        assert!(scope.allows(Range {
-            offset: 131_072,
-            length: 1
-        }));
-        assert!(!scope.allows(Range {
-            offset: 0,
-            length: 65_537
-        }));
-        assert!(!scope.allows(Range {
-            offset: 65_536,
-            length: 1
-        }));
-        assert!(!scope.allows(Range {
-            offset: 0,
-            length: 196_608
-        }));
-        assert!(!scope.allows(Range {
-            offset: 0,
-            length: 0
-        }));
-        assert!(!scope.allows(Range {
-            offset: u64::MAX,
-            length: 1
-        }));
+        assert!(scope.allows(range(0, 65_536)));
+        assert!(scope.allows(range(65_535, 1)));
+        assert!(scope.allows(range(131_072, 1)));
+        assert!(!scope.allows(range(0, 65_537)));
+        assert!(!scope.allows(range(65_536, 1)));
+        assert!(!scope.allows(range(0, 196_608)));
 
         let whole = Scope {
             ranges: Vec::new(),
             length: Some(1024),
             ..scope.clone()
         };
-        assert!(whole.allows(Range {
-            offset: 0,
-            length: 1024
-        }));
-        assert!(!whole.allows(Range {
-            offset: 0,
-            length: 1025
-        }));
+        assert!(whole.allows(range(0, 1024)));
+        assert!(!whole.allows(range(0, 1025)));
 
         let unbounded = Scope {
             ranges: Vec::new(),
             length: None,
             ..scope
         };
-        assert!(unbounded.allows(Range {
-            offset: 0,
-            length: u64::MAX
-        }));
+        assert!(unbounded.allows(range(0, u64::MAX)));
+    }
+
+    #[test]
+    fn a_range_is_a_nonzero_length_that_fits() {
+        let range = Range::new(7, 3).unwrap();
+        assert_eq!(range.offset(), 7);
+        assert_eq!(range.length(), 3);
+        assert_eq!(range.end(), 10);
+        assert_eq!(Range::new(0, 0).err(), Some(Error::InvalidRange));
+        assert_eq!(Range::new(u64::MAX, 1).err(), Some(Error::InvalidRange));
+        assert_eq!(Range::new(u64::MAX - 1, 1).unwrap().end(), u64::MAX);
     }
 
     #[test]
@@ -624,49 +539,25 @@ mod tests {
     #[test]
     fn every_bound_is_tested_at_its_own_edge() {
         let adjacent = Scope {
-            ranges: vec![
-                Range {
-                    offset: 0,
-                    length: 8,
-                },
-                Range {
-                    offset: 8,
-                    length: 8,
-                },
-            ],
+            ranges: vec![range(0, 8), range(8, 8)],
             ..capability().scope
         };
         assert_eq!(adjacent.validate(), Err(Error::InvalidRange));
         let separated = Scope {
-            ranges: vec![
-                Range {
-                    offset: 0,
-                    length: 8,
-                },
-                Range {
-                    offset: 9,
-                    length: 8,
-                },
-            ],
+            ranges: vec![range(0, 8), range(9, 8)],
             ..capability().scope
         };
         assert_eq!(separated.validate(), Ok(()));
 
         let exact = Scope {
             length: Some(64),
-            ranges: vec![Range {
-                offset: 32,
-                length: 32,
-            }],
+            ranges: vec![range(32, 32)],
             ..capability().scope
         };
         assert_eq!(exact.validate(), Ok(()));
         let past = Scope {
             length: Some(64),
-            ranges: vec![Range {
-                offset: 32,
-                length: 33,
-            }],
+            ranges: vec![range(32, 33)],
             ..capability().scope
         };
         assert_eq!(past.validate(), Err(Error::InvalidRange));
@@ -738,10 +629,7 @@ mod tests {
             .collect();
         value.scope.length = None;
         value.scope.ranges = (0..bounds::RANGES as u64)
-            .map(|index| Range {
-                offset: index * (1 << 49),
-                length: 1 << 48,
-            })
+            .map(|index| range(index * (1 << 49), 1 << 48))
             .collect();
 
         let scope = encode_scope(&value.scope).unwrap();

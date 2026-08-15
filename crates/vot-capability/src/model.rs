@@ -3,17 +3,46 @@
 use super::{Error, NO_FURTHER_DELEGATION, bounds};
 
 /// A half-open byte range of an object, as `(offset, length)`.
+///
+/// Length is nonzero and the end fits in `u64`.
+///
+/// ```compile_fail,E0451
+/// use vot_capability::Range;
+/// let _ = Range {
+///     offset: 0,
+///     length: 0,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Range {
-    pub offset: u64,
-    pub length: u64,
+    offset: u64,
+    length: u64,
 }
 
 impl Range {
-    /// The first byte past this range, or `None` when it does not fit `u64`.
+    /// # Errors
+    /// Rejects a zero length and an end that does not fit `u64`.
+    pub const fn new(offset: u64, length: u64) -> Result<Self, Error> {
+        if length == 0 || offset.checked_add(length).is_none() {
+            return Err(Error::InvalidRange);
+        }
+        Ok(Self { offset, length })
+    }
+
     #[must_use]
-    pub const fn end(self) -> Option<u64> {
-        self.offset.checked_add(self.length)
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+
+    /// The first byte past this range. [`Self::new`] already checked the add.
+    #[must_use]
+    pub const fn end(self) -> u64 {
+        self.offset + self.length
     }
 }
 
@@ -77,19 +106,10 @@ pub struct SignedCapability {
     pub signature: [u8; 64],
 }
 
-impl Range {
-    fn validate(self) -> Result<(), Error> {
-        if self.length == 0 || self.end().is_none() {
-            return Err(Error::InvalidRange);
-        }
-        Ok(())
-    }
-}
-
 impl Scope {
     /// # Errors
-    /// Rejects an unknown suite, and ranges that are empty, unordered,
-    /// overlapping, or past a known length.
+    /// Rejects an unknown suite, and ranges that are unordered, overlapping,
+    /// or past a known length.
     pub fn validate(&self) -> Result<(), Error> {
         if !(1..=2).contains(&self.suite) {
             return Err(Error::InvalidSuite(u64::from(self.suite)));
@@ -99,13 +119,12 @@ impl Scope {
         }
         let mut previous_end = None;
         for range in &self.ranges {
-            range.validate()?;
             // Strictly separated, not just disjoint: adjacent ranges are one
             // range written twice.
-            if previous_end.is_some_and(|end| range.offset <= end) {
+            if previous_end.is_some_and(|end| range.offset() <= end) {
                 return Err(Error::InvalidRange);
             }
-            let end = range.end().ok_or(Error::InvalidRange)?;
+            let end = range.end();
             if let Some(length) = self.length
                 && end > length
             {
@@ -121,18 +140,13 @@ impl Scope {
     /// An empty range list is the whole object, bounded by a known length.
     #[must_use]
     pub fn allows(&self, range: Range) -> bool {
-        let Some(end) = range.end() else {
-            return false;
-        };
-        if range.length == 0 {
-            return false;
-        }
+        let end = range.end();
         if self.ranges.is_empty() {
             return self.length.is_none_or(|length| end <= length);
         }
         self.ranges
             .iter()
-            .any(|allowed| range.offset >= allowed.offset && Some(end) <= allowed.end())
+            .any(|allowed| range.offset() >= allowed.offset() && end <= allowed.end())
     }
 
     pub(super) fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -151,8 +165,8 @@ impl Scope {
         vot_cbor::array(out, self.ranges.len() as u64);
         for range in &self.ranges {
             vot_cbor::array(out, 2);
-            vot_cbor::uint(out, range.offset);
-            vot_cbor::uint(out, range.length);
+            vot_cbor::uint(out, range.offset());
+            vot_cbor::uint(out, range.length());
         }
         Ok(())
     }
@@ -176,10 +190,7 @@ impl Scope {
         let mut ranges = Vec::with_capacity(usize::try_from(count).map_err(|_| Error::TooLarge)?);
         for _ in 0..count {
             reader.array(2)?;
-            ranges.push(Range {
-                offset: reader.uint()?,
-                length: reader.uint()?,
-            });
+            ranges.push(Range::new(reader.uint()?, reader.uint()?)?);
         }
         let scope = Self {
             suite,

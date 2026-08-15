@@ -8,6 +8,7 @@ constant vot_transport_api::MAX_DATA_RECORD_BYTES
 constant vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES
 constant vot_transport_api::MAX_FRAME_ENVELOPE_BYTES
 constant vot_transport_api::MIN_CONTROL_FRAME_PAYLOAD
+enum vot_transport_api::BatchFailure
 enum vot_transport_api::DatagramSendState
 enum vot_transport_api::Error
 enum vot_transport_api::Event
@@ -16,7 +17,6 @@ function vot_transport_api::shared_payload
 function vot_transport_api::validate_control_frame
 function vot_transport_api::validate_control_payload_limit
 function vot_transport_api::validate_data_record
-enum vot_transport_api::BatchFailure
 struct vot_transport_api::ChannelBinding
 struct vot_transport_api::ConnectionId
 struct vot_transport_api::EventSignal

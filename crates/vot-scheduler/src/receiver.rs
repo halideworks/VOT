@@ -28,9 +28,10 @@ pub struct ReliableReceiver {
 impl ReliableReceiver {
     /// Whether the staging ledger has stopped granting, and the way back.
     ///
-    /// An over-release poisons the ledger, which is a bug in this crate's
-    /// accounting rather than anything a peer did, and a poisoned ledger
-    /// refuses every later reservation. Rebuilding forgets what is
+    /// A release past what is held poisons the ledger. Every reservation is
+    /// a permit that releases itself once, so nothing here can reach that
+    /// state; the hook remains for the day something does, since a poisoned
+    /// ledger refuses every later reservation. Rebuilding forgets what is
     /// outstanding, so it is only safe with nothing outstanding: this
     /// refuses while any object is in flight, which is the only moment the
     /// receiver can tell that no permit is live.
@@ -316,7 +317,13 @@ impl ReliableReceiver {
             other => Error::Staging(other),
         })?;
         let bytes = u64::try_from(record.len()).map_err(|_| Error::LengthExceeded)?;
-        let _hold = self.staging.reserve(bytes)?;
+        // An empty record stages nothing, and the ledger refuses a zero permit
+        // as a configuration error, which this is not.
+        let _hold = if bytes == 0 {
+            None
+        } else {
+            Some(self.staging.reserve(bytes)?)
+        };
         self.peak_staging = self.peak_staging.max(self.staging.used());
         self.receive_reserved(subject, record, bytes)
     }

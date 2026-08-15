@@ -434,6 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_record_stages_nothing_and_still_names_its_object() {
+        let bytes = b"object";
+        let known = subject(bytes);
+        let mut receiver = ReliableReceiver::new(2 * VERIFIER_RESERVATION, 1024, 1024).unwrap();
+        receiver.begin(known).unwrap();
+        let before = receiver.peak_staging();
+        receiver.receive(known, &[]).unwrap();
+        assert_eq!(receiver.peak_staging(), before, "nothing was staged");
+        receiver.receive(known, bytes).unwrap();
+        receiver.finish(known).unwrap();
+        assert!(receiver.is_verified(known));
+
+        let unknown = subject(b"never begun");
+        assert_eq!(receiver.receive(unknown, &[]), Err(Error::UnknownObject));
+    }
+
+    #[test]
     fn mismatched_root_and_overrun_are_rejected() {
         let bytes = b"expected";
         let expected = subject(bytes);

@@ -9,9 +9,12 @@ enum vot_cbor::Error
 function vot_cbor::array
 function vot_cbor::bytes
 function vot_cbor::head
+function vot_cbor::head_len
 function vot_cbor::int
+function vot_cbor::int_len
 function vot_cbor::map
 function vot_cbor::null
+function vot_cbor::payload_len
 function vot_cbor::text
 function vot_cbor::uint
 module vot_cbor::major

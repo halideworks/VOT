@@ -5,10 +5,66 @@ use super::{
     Seal, StorageRef, validate_entries, validate_entry_count, validate_page_length, validate_seal,
 };
 
-pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
+pub fn page_encoded_len(page: &ManifestPage) -> Result<usize, Error> {
     validate_entry_count(page.entries.len())?;
     validate_entries(&page.entries, page.profile)?;
-    let mut out = Vec::new();
+    let mut total = add(0, vot_cbor::head_len(7))?;
+    total = add(total, vot_cbor::head_len(0))?;
+    total = add(total, vot_cbor::head_len(0))?;
+    total = add(total, vot_cbor::head_len(1))?;
+    total = add(total, vot_cbor::payload_len(page.manifest_id.len()))?;
+    total = add(total, vot_cbor::head_len(2))?;
+    total = add(total, vot_cbor::head_len(page.index))?;
+    total = add(total, vot_cbor::head_len(3))?;
+    total = add(total, page.total.map_or(1, vot_cbor::head_len))?;
+    total = add(total, vot_cbor::head_len(4))?;
+    total = add(total, vot_cbor::payload_len(page.previous_digest.len()))?;
+    total = add(total, vot_cbor::head_len(5))?;
+    total = add(
+        total,
+        vot_cbor::head_len(u64::from(page.profile == PathProfile::RawPosix)),
+    )?;
+    total = add(total, vot_cbor::head_len(6))?;
+    total = add(total, vot_cbor::head_len(page.entries.len() as u64))?;
+    for entry in &page.entries {
+        total = add(total, entry_encoded_len(entry)?)?;
+    }
+    validate_page_length(total)?;
+    Ok(total)
+}
+
+pub fn seal_encoded_len(seal: &Seal) -> Result<usize, Error> {
+    validate_seal(seal)?;
+    let mut total = add(0, vot_cbor::head_len(6))?;
+    total = add(total, vot_cbor::head_len(0))?;
+    total = add(total, vot_cbor::head_len(0))?;
+    total = add(total, vot_cbor::head_len(1))?;
+    total = add(total, vot_cbor::payload_len(seal.manifest_id.len()))?;
+    total = add(total, vot_cbor::head_len(2))?;
+    total = add(total, vot_cbor::head_len(seal.final_page_count))?;
+    total = add(total, vot_cbor::head_len(3))?;
+    total = add(total, vot_cbor::payload_len(seal.final_page_digest.len()))?;
+    total = add(total, vot_cbor::head_len(4))?;
+    total = add(total, vot_cbor::head_len(4))?;
+    total = add(total, vot_cbor::head_len(1))?;
+    total = add(total, vot_cbor::head_len(u64::from(seal.package.suite)))?;
+    total = add(total, vot_cbor::payload_len(seal.package.root.len()))?;
+    total = add(total, vot_cbor::head_len(seal.package.length))?;
+    total = add(total, vot_cbor::head_len(5))?;
+    total = add(total, vot_cbor::head_len(seal.pages.len() as u64))?;
+    for commitment in &seal.pages {
+        total = add(total, vot_cbor::head_len(3))?;
+        total = add(total, vot_cbor::head_len(commitment.index))?;
+        total = add(total, vot_cbor::payload_len(commitment.digest.len()))?;
+        total = add(total, vot_cbor::head_len(0))?;
+    }
+    validate_page_length(total)?;
+    Ok(total)
+}
+
+pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
+    let expected = page_encoded_len(page)?;
+    let mut out = Vec::with_capacity(expected);
     vot_cbor::map(&mut out, 7);
     vot_cbor::uint(&mut out, 0);
     vot_cbor::uint(&mut out, 0);
@@ -31,13 +87,15 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
     for entry in &page.entries {
         encode_entry(&mut out, entry);
     }
-    validate_page_length(out.len())?;
+    if out.len() != expected {
+        return Err(Error::PageTooLarge);
+    }
     Ok(out)
 }
 
 pub fn encode_seal(seal: &Seal) -> Result<Vec<u8>, Error> {
-    validate_seal(seal)?;
-    let mut out = Vec::new();
+    let expected = seal_encoded_len(seal)?;
+    let mut out = Vec::with_capacity(expected);
     vot_cbor::map(&mut out, 6);
     vot_cbor::uint(&mut out, 0);
     vot_cbor::uint(&mut out, 0);
@@ -61,8 +119,106 @@ pub fn encode_seal(seal: &Seal) -> Result<Vec<u8>, Error> {
         vot_cbor::bytes(&mut out, &commitment.digest);
         vot_cbor::array(&mut out, 0);
     }
-    validate_page_length(out.len())?;
+    if out.len() != expected {
+        return Err(Error::PageTooLarge);
+    }
     Ok(out)
+}
+
+fn add(total: usize, part: usize) -> Result<usize, Error> {
+    total.checked_add(part).ok_or(Error::PageTooLarge)
+}
+
+fn entry_encoded_len(entry: &ManifestEntry) -> Result<usize, Error> {
+    let fields = 2
+        + usize::from(entry.length.is_some())
+        + usize::from(entry.storage.is_some())
+        + usize::from(entry.metadata.is_some());
+    let mut total = add(0, vot_cbor::head_len(fields as u64))?;
+    total = add(total, vot_cbor::head_len(0))?;
+    total = add(total, vot_cbor::head_len(entry.path.len() as u64))?;
+    for component in &entry.path {
+        total = add(
+            total,
+            match component {
+                Component::Text(text) => vot_cbor::payload_len(text.len()),
+                Component::Bytes(bytes) => vot_cbor::payload_len(bytes.len()),
+            },
+        )?;
+    }
+    total = add(total, vot_cbor::head_len(1))?;
+    total = add(
+        total,
+        vot_cbor::head_len(u64::from(entry.kind == EntryKind::Directory)),
+    )?;
+    if let Some(length) = entry.length {
+        total = add(total, vot_cbor::head_len(2))?;
+        total = add(total, vot_cbor::head_len(length))?;
+    }
+    if let Some(storage) = &entry.storage {
+        total = add(total, vot_cbor::head_len(3))?;
+        total = add(total, storage_encoded_len(storage)?)?;
+    }
+    if let Some(metadata) = &entry.metadata {
+        total = add(total, vot_cbor::head_len(4))?;
+        total = add(total, metadata_encoded_len(metadata)?)?;
+    }
+    Ok(total)
+}
+
+fn object_encoded_len(object: &ObjectId) -> Result<usize, Error> {
+    let mut total = add(0, vot_cbor::head_len(3))?;
+    total = add(total, vot_cbor::head_len(u64::from(object.suite)))?;
+    total = add(total, vot_cbor::payload_len(object.root.len()))?;
+    add(total, vot_cbor::head_len(object.length))
+}
+
+fn storage_encoded_len(storage: &StorageRef) -> Result<usize, Error> {
+    match storage {
+        StorageRef::Direct(object) => {
+            let mut total = add(0, vot_cbor::head_len(2))?;
+            total = add(total, vot_cbor::head_len(0))?;
+            add(total, object_encoded_len(object)?)
+        }
+        StorageRef::Pack {
+            pack,
+            offset,
+            length,
+            logical,
+        } => {
+            let mut total = add(0, vot_cbor::head_len(5))?;
+            total = add(total, vot_cbor::head_len(1))?;
+            total = add(total, object_encoded_len(pack)?)?;
+            total = add(total, vot_cbor::head_len(*offset))?;
+            total = add(total, vot_cbor::head_len(*length))?;
+            add(total, object_encoded_len(logical)?)
+        }
+    }
+}
+
+fn metadata_encoded_len(metadata: &FileMetadata) -> Result<usize, Error> {
+    let fields = usize::from(metadata.mode.is_some())
+        + usize::from(metadata.mtime_seconds.is_some())
+        + usize::from(metadata.mtime_nanoseconds.is_some())
+        + usize::from(metadata.media_type.is_some());
+    let mut total = add(0, vot_cbor::head_len(fields as u64))?;
+    if let Some(mode) = metadata.mode {
+        total = add(total, vot_cbor::head_len(0))?;
+        total = add(total, vot_cbor::head_len(u64::from(mode)))?;
+    }
+    if let Some(seconds) = metadata.mtime_seconds {
+        total = add(total, vot_cbor::head_len(1))?;
+        total = add(total, vot_cbor::int_len(seconds))?;
+    }
+    if let Some(nanoseconds) = metadata.mtime_nanoseconds {
+        total = add(total, vot_cbor::head_len(2))?;
+        total = add(total, vot_cbor::head_len(u64::from(nanoseconds)))?;
+    }
+    if let Some(media_type) = &metadata.media_type {
+        total = add(total, vot_cbor::head_len(3))?;
+        total = add(total, vot_cbor::payload_len(media_type.len()))?;
+    }
+    Ok(total)
 }
 
 pub(super) fn encode_entry(out: &mut Vec<u8>, entry: &ManifestEntry) {

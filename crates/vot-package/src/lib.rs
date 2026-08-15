@@ -250,7 +250,7 @@ impl PackageRootBuilder {
             return Err(Error::Verifier(error));
         }
         Ok(PackageSummary {
-            root: self.verifier.finish()?,
+            root: self.verifier.digest()?,
             logical_length: self.logical_length,
             entries: self.entries,
         })

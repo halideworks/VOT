@@ -49,6 +49,63 @@ pub enum VerifyError {
     InvalidGroupLength,
     GroupAfterFinal,
     LengthOverflow,
+    SuiteMismatch,
+    LengthMismatch,
+    RootMismatch,
+}
+
+/// Claimed suite, root, and length. [`StreamVerifier::finish`] is what checks
+/// a stream against this claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpectedObject {
+    suite: Suite,
+    root: Root,
+    length: u64,
+}
+
+impl ExpectedObject {
+    #[must_use]
+    pub const fn new(suite: Suite, root: Root, length: u64) -> Self {
+        Self {
+            suite,
+            root,
+            length,
+        }
+    }
+}
+
+/// Suite, root, and length that matched a finished stream.
+///
+/// ```compile_fail,E0451
+/// use vot_verifier::{Suite, VerifiedObject};
+/// let _ = VerifiedObject {
+///     suite: Suite::Blake3Bao64,
+///     root: [0; 32],
+///     length: 0,
+/// };
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedObject {
+    suite: Suite,
+    root: Root,
+    length: u64,
+}
+
+impl VerifiedObject {
+    #[must_use]
+    pub const fn suite(&self) -> Suite {
+        self.suite
+    }
+
+    #[must_use]
+    pub const fn root(&self) -> Root {
+        self.root
+    }
+
+    #[must_use]
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
 }
 
 pub trait GroupVerifier: Sized {
@@ -166,22 +223,27 @@ impl GroupVerifier for Verifier {
 }
 
 pub struct StreamVerifier {
+    suite: Suite,
     verifier: Verifier,
     pending: Vec<u8>,
+    length: u64,
 }
 
 impl StreamVerifier {
     #[must_use]
     pub fn new(suite: Suite) -> Self {
         Self {
+            suite,
             verifier: Verifier::new(suite),
             pending: Vec::with_capacity(GROUP_SIZE),
+            length: 0,
         }
     }
 
     /// # Errors
     /// Propagates group-order or length overflow errors from the verifier.
     pub fn update(&mut self, mut bytes: &[u8]) -> Result<(), VerifyError> {
+        let incoming = bytes.len();
         if !self.pending.is_empty() {
             let consumed = (GROUP_SIZE - self.pending.len()).min(bytes.len());
             self.pending.extend_from_slice(&bytes[..consumed]);
@@ -198,6 +260,11 @@ impl StreamVerifier {
             bytes = groups.remainder();
         }
         self.pending.extend_from_slice(bytes);
+        let added = u64::try_from(incoming).map_err(|_| VerifyError::LengthOverflow)?;
+        self.length = self
+            .length
+            .checked_add(added)
+            .ok_or(VerifyError::LengthOverflow)?;
         Ok(())
     }
 
@@ -216,13 +283,37 @@ impl StreamVerifier {
         result
     }
 
+    /// Computed root of the bytes accepted so far. Hash construction uses this
+    /// when there is no expected identity to check.
+    ///
     /// # Errors
     /// Propagates final-group or tree accumulator errors.
-    pub fn finish(mut self) -> Result<Root, VerifyError> {
+    pub fn digest(mut self) -> Result<Root, VerifyError> {
         if !self.pending.is_empty() {
             self.verifier.feed_next(&self.pending)?;
         }
         self.verifier.finish()
+    }
+
+    /// # Errors
+    /// Rejects a suite, length, or root that does not match the accepted
+    /// bytes, and propagates final-group or tree accumulator errors.
+    pub fn finish(self, expected: ExpectedObject) -> Result<VerifiedObject, VerifyError> {
+        if self.suite != expected.suite {
+            return Err(VerifyError::SuiteMismatch);
+        }
+        if self.length != expected.length {
+            return Err(VerifyError::LengthMismatch);
+        }
+        let root = self.digest()?;
+        if root != expected.root {
+            return Err(VerifyError::RootMismatch);
+        }
+        Ok(VerifiedObject {
+            suite: expected.suite,
+            root,
+            length: expected.length,
+        })
     }
 
     #[must_use]
@@ -236,7 +327,7 @@ impl StreamVerifier {
 pub fn root(suite: Suite, bytes: &[u8]) -> Result<Root, VerifyError> {
     let mut verifier = StreamVerifier::new(suite);
     verifier.update(bytes)?;
-    verifier.finish()
+    verifier.digest()
 }
 
 #[derive(Default)]
@@ -362,7 +453,7 @@ mod tests {
                     verifier.update(bytes).unwrap();
                     assert!(verifier.buffered_bytes() <= GROUP_SIZE);
                 }
-                assert_eq!(verifier.finish().unwrap(), expected);
+                assert_eq!(verifier.digest().unwrap(), expected);
             }
         }
     }
@@ -374,14 +465,14 @@ mod tests {
             let mut verifier = StreamVerifier::new(suite);
             verifier.update(&data).unwrap();
             assert_eq!(verifier.buffered_bytes(), 0);
-            assert_eq!(verifier.finish().unwrap(), root(suite, &data).unwrap());
+            assert_eq!(verifier.digest().unwrap(), root(suite, &data).unwrap());
 
             let mut split = StreamVerifier::new(suite);
             split.update(&data[..7]).unwrap();
             assert_eq!(split.buffered_bytes(), 7);
             split.update(&data[7..]).unwrap();
             assert_eq!(split.buffered_bytes(), 0);
-            assert_eq!(split.finish().unwrap(), root(suite, &data).unwrap());
+            assert_eq!(split.digest().unwrap(), root(suite, &data).unwrap());
         }
     }
 
@@ -489,7 +580,63 @@ mod tests {
             for chunk in data.chunks(4096) {
                 streamed.update(chunk).unwrap();
             }
-            assert_eq!(hex(streamed.finish().unwrap()), expected);
+            assert_eq!(hex(streamed.digest().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn finish_returns_a_witness_only_for_the_expected_identity() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let data = fixture(GROUP_SIZE + 17);
+            let digest = root(suite, &data).unwrap();
+            let expected = ExpectedObject::new(suite, digest, data.len() as u64);
+
+            let mut verifier = StreamVerifier::new(suite);
+            verifier.update(&data).unwrap();
+            let witness = verifier.finish(expected).unwrap();
+            assert_eq!(witness.suite(), suite);
+            assert_eq!(witness.root(), digest);
+            assert_eq!(witness.length(), data.len() as u64);
+
+            let other = match suite {
+                Suite::Blake3Bao64 => Suite::Sha256Bep52,
+                Suite::Sha256Bep52 => Suite::Blake3Bao64,
+            };
+            let mut verifier = StreamVerifier::new(suite);
+            verifier.update(&data).unwrap();
+            assert_eq!(
+                verifier.finish(ExpectedObject::new(other, digest, data.len() as u64)),
+                Err(VerifyError::SuiteMismatch)
+            );
+
+            let mut verifier = StreamVerifier::new(suite);
+            verifier.update(&data).unwrap();
+            assert_eq!(
+                verifier.finish(ExpectedObject::new(suite, digest, data.len() as u64 - 1)),
+                Err(VerifyError::LengthMismatch)
+            );
+
+            let mut wrong = digest;
+            wrong[0] ^= 1;
+            let mut verifier = StreamVerifier::new(suite);
+            verifier.update(&data).unwrap();
+            assert_eq!(
+                verifier.finish(ExpectedObject::new(suite, wrong, data.len() as u64)),
+                Err(VerifyError::RootMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_stream_finishes_against_the_empty_object() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let digest = root(suite, &[]).unwrap();
+            let witness = StreamVerifier::new(suite)
+                .finish(ExpectedObject::new(suite, digest, 0))
+                .unwrap();
+            assert_eq!(witness.suite(), suite);
+            assert_eq!(witness.root(), digest);
+            assert_eq!(witness.length(), 0);
         }
     }
 }

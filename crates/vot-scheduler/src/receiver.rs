@@ -6,6 +6,7 @@ use super::{
     assemble_ordered, check_range_proof, coverage_error, subject_id, suite, validate_typed_bundle,
     verify_typed_bundle,
 };
+use vot_verifier::ExpectedObject;
 
 pub(super) struct ActiveObject {
     verifier: StreamVerifier,
@@ -350,9 +351,9 @@ impl ReliableReceiver {
         if active.received != subject.length() {
             return Err(Error::LengthMismatch);
         }
-        if active.verifier.finish()? != subject.root() {
-            return Err(Error::RootMismatch);
-        }
+        let expected =
+            ExpectedObject::new(suite(subject.suite())?, subject.root(), subject.length());
+        active.verifier.finish(expected)?;
         self.verified.insert(subject);
         Ok(())
     }

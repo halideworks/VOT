@@ -9,6 +9,7 @@ use crate::{
     prepared_receipt_paths, publication_receipt, receipt_summary_bytes, recover_prepared_receipts,
     scan_manifest, staging_path, stream_root, suite_id, sync_directories, sync_directory,
 };
+use vot_verifier::ExpectedObject;
 
 pub(crate) fn validate_published_destination(
     bundle: &Path,
@@ -286,9 +287,7 @@ pub(crate) fn receive_direct(
         destination.write_all(&buffer[..read])?;
     }
     if let Some(verifier) = verifier {
-        if verifier.finish()? != root {
-            return Err(Error::RootMismatch);
-        }
+        verifier.finish(ExpectedObject::new(suite, root, length))?;
     } else {
         receiver.finish(subject)?;
     }
@@ -333,9 +332,7 @@ pub(crate) fn receive_object(
         bytes.extend_from_slice(&buffer[..read]);
     }
     if let Some(verifier) = verifier {
-        if verifier.finish()? != root {
-            return Err(Error::RootMismatch);
-        }
+        verifier.finish(ExpectedObject::new(suite, root, length))?;
     } else {
         receiver.finish(subject)?;
     }

@@ -49,7 +49,11 @@ impl From<vot_transport_api::Error> for Error {
 
 impl From<vot_verifier::VerifyError> for Error {
     fn from(error: vot_verifier::VerifyError) -> Self {
-        Self::Verification(error)
+        match error {
+            vot_verifier::VerifyError::RootMismatch => Self::RootMismatch,
+            vot_verifier::VerifyError::LengthMismatch => Self::LengthMismatch,
+            other => Self::Verification(other),
+        }
     }
 }
 

@@ -72,12 +72,6 @@ impl Deref for PackagePath {
     }
 }
 
-impl AsRef<[Component]> for PackagePath {
-    fn as_ref(&self) -> &[Component] {
-        &self.components
-    }
-}
-
 impl<'a> IntoIterator for &'a PackagePath {
     type Item = &'a Component;
     type IntoIter = std::slice::Iter<'a, Component>;

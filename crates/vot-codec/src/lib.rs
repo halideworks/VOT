@@ -9,7 +9,7 @@ pub mod frames;
 mod generated;
 pub use generated::{
     REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS, error_code, extension_id,
-    operation, resource_limit, setting_id,
+    operation, resource_limit, setting_bounds, setting_default, setting_id,
 };
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;
@@ -23,7 +23,13 @@ pub const DRAFT_REVISION: u64 = 5;
 
 /// The registered default for `IDLE_TIMEOUT_MS`, named so the carrier that
 /// installs its own idle timeout can take this one rather than repeat it.
-pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 90_000;
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = setting_default::IDLE_TIMEOUT_MS;
+
+// The control frame bounds are the registry's; the constants the codec
+// enforces with are the same numbers or nothing agrees.
+const _: () =
+    assert!(setting_bounds::MAX_CONTROL_FRAME_PAYLOAD.0 == MIN_CONTROL_FRAME_PAYLOAD as u64);
+const _: () = assert!(setting_bounds::MAX_CONTROL_FRAME_PAYLOAD.1 == HARD_MAX_FRAME_PAYLOAD as u64);
 
 /// One row per registered frame: identifier, payload ceiling, whether an
 /// authenticated session is required to send it, and the extension it needs.
@@ -143,11 +149,11 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            max_control_frame_payload: 1024 * 1024,
-            max_data_record_payload: 256 * 1024,
-            max_manifest_page_payload: 1024 * 1024,
-            reliable_lane_limit: 16,
-            idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
+            max_control_frame_payload: setting_default::MAX_CONTROL_FRAME_PAYLOAD,
+            max_data_record_payload: setting_default::MAX_DATA_RECORD_PAYLOAD,
+            max_manifest_page_payload: setting_default::MAX_MANIFEST_PAGE_PAYLOAD,
+            reliable_lane_limit: setting_default::RELIABLE_LANE_LIMIT,
+            idle_timeout_ms: setting_default::IDLE_TIMEOUT_MS,
         }
     }
 }
@@ -395,14 +401,11 @@ pub const fn setting_range(identifier: u64) -> Option<(u64, u64)> {
     use setting_id as id;
 
     match identifier {
-        id::MAX_CONTROL_FRAME_PAYLOAD => Some((
-            MIN_CONTROL_FRAME_PAYLOAD as u64,
-            HARD_MAX_FRAME_PAYLOAD as u64,
-        )),
-        id::MAX_DATA_RECORD_PAYLOAD => Some((64 * 1024, 256 * 1024)),
-        id::MAX_MANIFEST_PAGE_PAYLOAD => Some((64 * 1024, 1024 * 1024)),
-        id::RELIABLE_LANE_LIMIT => Some((1, 256)),
-        id::IDLE_TIMEOUT_MS => Some((1000, 600_000)),
+        id::MAX_CONTROL_FRAME_PAYLOAD => Some(setting_bounds::MAX_CONTROL_FRAME_PAYLOAD),
+        id::MAX_DATA_RECORD_PAYLOAD => Some(setting_bounds::MAX_DATA_RECORD_PAYLOAD),
+        id::MAX_MANIFEST_PAGE_PAYLOAD => Some(setting_bounds::MAX_MANIFEST_PAGE_PAYLOAD),
+        id::RELIABLE_LANE_LIMIT => Some(setting_bounds::RELIABLE_LANE_LIMIT),
+        id::IDLE_TIMEOUT_MS => Some(setting_bounds::IDLE_TIMEOUT_MS),
         _ => None,
     }
 }

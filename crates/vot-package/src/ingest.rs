@@ -175,7 +175,7 @@ impl PackageIngest {
 #[cfg(test)]
 mod tests {
     use vot_manifest::{
-        Component, EntryKind, ManifestPage, ObjectId, PageCommitment, PathProfile, Seal,
+        EntryKind, ManifestPage, ObjectId, PackagePath, PageCommitment, PathProfile, Seal,
         StorageRef, encode_page, encode_seal,
     };
     use vot_verifier::Suite;
@@ -196,7 +196,7 @@ mod tests {
 
     fn record(name: &str, root: u8, length: u64) -> EntryRecord {
         EntryRecord {
-            path: vec![Component::Text(name.to_owned())],
+            path: PackagePath::portable([name]).unwrap(),
             suite: Suite::Sha256Bep52,
             logical_root: [root; 32],
             logical_length: length,
@@ -562,7 +562,7 @@ mod tests {
         let portable = fixture(&[&["a"]]);
         let mut raw_file = fixture(&[&["a"]]);
         raw_file.pages[0].profile = PathProfile::RawPosix;
-        raw_file.pages[0].entries[0].path = vec![Component::Bytes(b"a".to_vec())];
+        raw_file.pages[0].entries[0].path = PackagePath::raw([b"a"]).unwrap();
         recommit(&mut raw_file);
         let mut ingest = open_ingest(&raw_file);
         assert_eq!(

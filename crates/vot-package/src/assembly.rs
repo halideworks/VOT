@@ -391,11 +391,11 @@ fn should_check_actual_page(flush: bool, index: u64, estimated_bytes: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vot_manifest::{Component, StorageRef};
+    use vot_manifest::{PackagePath, StorageRef};
 
     fn record(name: &str, root: u8) -> EntryRecord {
         EntryRecord {
-            path: vec![Component::Text(name.to_owned())],
+            path: PackagePath::portable([name]).unwrap(),
             suite: Suite::Sha256Bep52,
             logical_root: [root; 32],
             logical_length: 3,
@@ -517,7 +517,7 @@ mod tests {
         rejects(page);
         let mut page = base.clone();
         page.profile = PathProfile::RawPosix;
-        page.entries[0].path = vec![Component::Bytes(b"a".to_vec())];
+        page.entries[0].path = PackagePath::raw([b"a"]).unwrap();
         rejects(page);
         let mut page = base.clone();
         page.entries.clear();
@@ -609,7 +609,7 @@ mod tests {
         let error = builder.push(&record("a", 1)).unwrap_err();
         assert!(matches!(error, Error::Verifier(_)));
         let mut malformed = record("b", 2);
-        malformed.path.clear();
+        malformed.path = PackagePath::raw([b"b"]).unwrap();
         assert_eq!(builder.push(&malformed), Err(error));
         assert!(matches!(builder.finish(), Err(failure) if failure == error));
     }

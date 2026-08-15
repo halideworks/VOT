@@ -245,11 +245,9 @@ pub fn extract<'a>(pack: &'a Pack, entry: &PackedEntry) -> Result<&'a [u8], Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vot_manifest::Component;
-
     fn file(path: &str, bytes: &[u8]) -> LogicalFile {
         LogicalFile {
-            path: vec![Component::Text(path.to_owned())],
+            path: PackagePath::portable([path]).unwrap(),
             bytes: bytes.to_vec(),
         }
     }

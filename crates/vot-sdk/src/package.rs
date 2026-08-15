@@ -51,7 +51,8 @@ impl PackageEntry {
             },
         };
         let inner = vot_package::EntryRecord {
-            path: path.into_iter().map(Component::Text).collect(),
+            path: vot_manifest::PackagePath::portable(path)
+                .map_err(|_| Error::new(ErrorCode::InvalidInput))?,
             suite,
             logical_root: logical.root,
             logical_length: logical.length,
@@ -335,7 +336,7 @@ mod tests {
 
     fn record(name: &str, root: u8) -> vot_package::EntryRecord {
         vot_package::EntryRecord {
-            path: vec![Component::Text(name.to_owned())],
+            path: vot_manifest::PackagePath::portable([name]).unwrap(),
             suite: Suite::Sha256Bep52,
             logical_root: [root; 32],
             logical_length: u64::from(root),

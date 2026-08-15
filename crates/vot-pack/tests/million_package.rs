@@ -1,4 +1,4 @@
-use vot_manifest::{Component, PathProfile};
+use vot_manifest::{PackagePath, PathProfile};
 use vot_pack::{LogicalFile, MAX_ENTRIES_PER_PACK, StreamingPacker};
 
 #[test]
@@ -11,7 +11,7 @@ fn one_million_small_files_stream_through_bounded_packs() {
     for index in 0..1_000_000_u32 {
         if let Some(pack) = packer
             .push(LogicalFile {
-                path: vec![Component::Text(format!("{index:07}"))],
+                path: PackagePath::portable([format!("{index:07}")]).unwrap(),
                 bytes: Vec::new(),
             })
             .unwrap()

@@ -4,8 +4,8 @@
 #![forbid(unsafe_code)]
 
 use vot_manifest::{
-    Component, EntryKind, MAX_PAGE_BYTES, ManifestEntry, ManifestPage, ObjectId, PageCommitment,
-    PathProfile, Seal, StorageRef, decode_page, encode_page, encode_seal,
+    Component, EntryKind, MAX_PAGE_BYTES, ManifestEntry, ManifestPage, ObjectId, PackagePath,
+    PageCommitment, PathProfile, Seal, StorageRef, decode_page, encode_page, encode_seal,
 };
 use vot_package::{
     EntryRecord, Error as PackageError, PackageIngest, PackageRootBuilder, PackageSummary, Storage,
@@ -49,7 +49,7 @@ fn record(input: &[u8], ordinal: usize) -> EntryRecord {
         *byte = control(input, ordinal.saturating_add(index).saturating_add(11));
     }
     EntryRecord {
-        path: vec![Component::Text(format!("file-{ordinal:06}"))],
+        path: PackagePath::portable([format!("file-{ordinal:06}")]).unwrap(),
         suite: if marker & 1 == 0 {
             Suite::Blake3Bao64
         } else {
@@ -215,7 +215,7 @@ fn exercise_package_ingest(input: &[u8]) {
         }
         6 => {
             fixture.pages[0].entries.push(ManifestEntry {
-                path: vec![Component::Text("zz-invalid-directory".to_owned())],
+                path: PackagePath::portable(["zz-invalid-directory"]).unwrap(),
                 kind: EntryKind::Directory,
                 length: None,
                 storage: None,

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vot_commit_model::{Event, Machine, Profile};
 use vot_journal::{Error as JournalError, Journal, replay};
 use vot_manifest::{
-    Component, EntryKind, Error as ManifestError, ManifestEntry, ManifestPage, ObjectId,
+    EntryKind, Error as ManifestError, ManifestEntry, ManifestPage, ObjectId, PackagePath,
     PathProfile, ProgressiveIngest, StorageRef,
 };
 use vot_transport_sim::{Failure, NegativeControl, Outcome, Scenario, Simulator};
@@ -45,7 +45,7 @@ impl Drop for TemporaryJournal {
 
 fn file(name: &str) -> ManifestEntry {
     ManifestEntry {
-        path: vec![Component::Text(name.to_owned())],
+        path: PackagePath::portable([name]).unwrap(),
         kind: EntryKind::File,
         length: Some(1),
         storage: Some(StorageRef::Direct(ObjectId {

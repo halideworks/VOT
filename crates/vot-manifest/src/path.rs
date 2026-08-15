@@ -1,5 +1,7 @@
 //! Path profiles, canonical keys, and component validation.
 
+use std::ops::Deref;
+
 use super::{Error, MAX_PATH_COMPONENTS, UnicodeNormalization};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,32 +16,114 @@ pub enum Component {
     Bytes(Vec<u8>),
 }
 
-pub type PackagePath = Vec<Component>;
+/// A package path that has already been accepted under one profile.
+///
+/// Construction is the only way to obtain one. The walk stack that builds a
+/// path is an ordinary `Vec`; it becomes a `PackagePath` when it is done.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackagePath {
+    profile: PathProfile,
+    components: Vec<Component>,
+}
+
+impl PackagePath {
+    /// Accepts a path that is valid under `profile`.
+    pub fn new(components: Vec<Component>, profile: PathProfile) -> Result<Self, Error> {
+        validate_components(&components, profile)?;
+        Ok(Self {
+            profile,
+            components,
+        })
+    }
+
+    /// Accepts a portable path of Unicode components.
+    pub fn portable(parts: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, Error> {
+        Self::new(
+            parts
+                .into_iter()
+                .map(|part| Component::Text(part.into()))
+                .collect(),
+            PathProfile::Portable,
+        )
+    }
+
+    /// Accepts a raw POSIX path of byte components.
+    pub fn raw(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<Self, Error> {
+        Self::new(
+            parts
+                .into_iter()
+                .map(|part| Component::Bytes(part.as_ref().to_vec()))
+                .collect(),
+            PathProfile::RawPosix,
+        )
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> PathProfile {
+        self.profile
+    }
+}
+
+impl Deref for PackagePath {
+    type Target = [Component];
+
+    fn deref(&self) -> &[Component] {
+        &self.components
+    }
+}
+
+impl<'a> IntoIterator for &'a PackagePath {
+    type Item = &'a Component;
+    type IntoIter = std::slice::Iter<'a, Component>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.components.iter()
+    }
+}
 
 pub fn canonical_path_key(path: &PackagePath, profile: PathProfile) -> Result<Vec<u8>, Error> {
+    if path.profile != profile {
+        return Err(Error::InvalidPath);
+    }
+    Ok(path_key(path))
+}
+
+fn validate_components(path: &[Component], profile: PathProfile) -> Result<(), Error> {
     // The decoder refuses a path past this bound, so an encoder that emitted
     // one would produce a page nothing could read back.
     if path.is_empty() || path.len() > MAX_PATH_COMPONENTS {
         return Err(Error::InvalidPath);
     }
-    let mut key = Vec::new();
     for component in path {
-        if !key.is_empty() {
-            key.push(0);
-        }
         match (profile, component) {
             (PathProfile::Portable, Component::Text(text)) => {
                 validate_portable_component(text)?;
-                let folded = portable_fold(text);
-                key.extend_from_slice(folded.trim_end_matches(['.', ' ']).as_bytes());
             }
-            (PathProfile::RawPosix, Component::Bytes(bytes)) if valid_raw_component(bytes) => {
-                key.extend_from_slice(bytes);
-            }
+            (PathProfile::RawPosix, Component::Bytes(bytes)) if valid_raw_component(bytes) => {}
             _ => return Err(Error::InvalidPath),
         }
     }
-    Ok(key)
+    Ok(())
+}
+
+fn path_key(path: &PackagePath) -> Vec<u8> {
+    let mut key = Vec::new();
+    for component in &path.components {
+        if !key.is_empty() {
+            key.push(0);
+        }
+        match (path.profile, component) {
+            (PathProfile::Portable, Component::Text(text)) => {
+                let folded = portable_fold(text);
+                key.extend_from_slice(folded.trim_end_matches(['.', ' ']).as_bytes());
+            }
+            (PathProfile::RawPosix, Component::Bytes(bytes)) => {
+                key.extend_from_slice(bytes);
+            }
+            _ => unreachable!("PackagePath::new rejected mixed components"),
+        }
+    }
+    key
 }
 
 pub(super) fn validate_portable_component(component: &str) -> Result<(), Error> {

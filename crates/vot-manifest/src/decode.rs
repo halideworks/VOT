@@ -2,8 +2,8 @@
 
 use super::{
     Component, DecodeError, EntryKind, FileMetadata, MAX_ENTRIES_PER_PAGE, MAX_PAGE_COMMITMENTS,
-    MAX_PATH_COMPONENTS, ManifestEntry, ManifestPage, ObjectId, PageCommitment, PathProfile, Seal,
-    StorageRef, encode_page, encode_seal, validate_page_length, validate_seal,
+    MAX_PATH_COMPONENTS, ManifestEntry, ManifestPage, ObjectId, PackagePath, PageCommitment,
+    PathProfile, Seal, StorageRef, encode_page, encode_seal, validate_page_length, validate_seal,
 };
 
 pub fn decode_seal(input: &[u8]) -> Result<Seal, DecodeError> {
@@ -135,13 +135,14 @@ pub(super) fn decode_entry(
     if component_count == 0 {
         return Err(DecodeError::InvalidStructure);
     }
-    let mut path = Vec::with_capacity(component_count);
+    let mut components = Vec::with_capacity(component_count);
     for _ in 0..component_count {
-        path.push(match profile {
+        components.push(match profile {
             PathProfile::Portable => Component::Text(decoder.text(255)?.to_owned()),
             PathProfile::RawPosix => Component::Bytes(decoder.bytes(255)?.to_vec()),
         });
     }
+    let path = PackagePath::new(components, profile).map_err(DecodeError::Semantic)?;
     decoder.exact_key(1)?;
     let kind = match decoder.uint()? {
         0 => EntryKind::File,

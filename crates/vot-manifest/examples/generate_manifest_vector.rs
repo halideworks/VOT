@@ -1,7 +1,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::format_collect)]
 
 use vot_manifest::{
-    Component, EntryKind, ManifestEntry, ManifestPage, ObjectId, PathProfile, StorageRef,
+    EntryKind, ManifestEntry, ManifestPage, ObjectId, PackagePath, PathProfile, StorageRef,
     encode_page,
 };
 
@@ -23,14 +23,14 @@ fn main() {
         profile: PathProfile::Portable,
         entries: vec![
             ManifestEntry {
-                path: vec![Component::Text("a.txt".to_owned())],
+                path: PackagePath::portable(["a.txt"]).unwrap(),
                 kind: EntryKind::File,
                 length: Some(3),
                 storage: Some(StorageRef::Direct(object)),
                 metadata: None,
             },
             ManifestEntry {
-                path: vec![Component::Text("shots".to_owned())],
+                path: PackagePath::portable(["shots"]).unwrap(),
                 kind: EntryKind::Directory,
                 length: None,
                 storage: None,

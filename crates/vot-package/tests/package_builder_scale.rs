@@ -18,7 +18,7 @@ use std::time::Duration;
 use std::os::unix::fs::DirBuilderExt;
 
 use cap::Cap;
-use vot_manifest::Component;
+use vot_manifest::PackagePath;
 use vot_package::{EntryRecord, PackageAssembly, PackageBuilder, PageDraft, Storage};
 use vot_verifier::Suite;
 
@@ -213,7 +213,7 @@ impl Drop for DraftSpool {
 
 fn record(index: u64) -> EntryRecord {
     EntryRecord {
-        path: vec![Component::Text(format!("{index:020}"))],
+        path: PackagePath::portable([format!("{index:020}")]).unwrap(),
         suite: Suite::Sha256Bep52,
         logical_root: index.to_be_bytes().repeat(4).try_into().unwrap(),
         logical_length: LOGICAL_ENTRY_BYTES,

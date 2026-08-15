@@ -137,7 +137,7 @@ fn scope_fields(scope: &Scope) -> String {
     let ranges = scope
         .ranges
         .iter()
-        .map(|range| format!("{}:{}", range.offset, range.length))
+        .map(|range| format!("{}:{}", range.offset(), range.length()))
         .collect::<Vec<_>>()
         .join("+");
     format!(

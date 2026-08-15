@@ -24,14 +24,8 @@ fn main() {
             root: [7; 32],
             length: Some(1 << 20),
             ranges: vec![
-                Range {
-                    offset: 0,
-                    length: 65_536,
-                },
-                Range {
-                    offset: 131_072,
-                    length: 65_536,
-                },
+                Range::new(0, 65_536).unwrap(),
+                Range::new(131_072, 65_536).unwrap(),
             ],
         },
         limits: vec![

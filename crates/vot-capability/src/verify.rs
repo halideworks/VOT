@@ -450,10 +450,7 @@ mod tests {
                 suite: 1,
                 root: [7; 32],
                 length: Some(1 << 20),
-                ranges: vec![Range {
-                    offset: 0,
-                    length: 65_536,
-                }],
+                ranges: vec![Range::new(0, 65_536).unwrap()],
             },
             limits: vec![Limit { id: 1, value: 4 }],
             not_before: 1_700_000_000,
@@ -916,10 +913,7 @@ mod tests {
             authorized.allows(AuthorizedRequest::ReadRanges {
                 suite: 1,
                 root: [7; 32],
-                range: Range {
-                    offset: 0,
-                    length: 65_537
-                },
+                range: Range::new(0, 65_537).unwrap(),
             }),
             Err(Denial::RangeNotAllowed)
         );
@@ -927,10 +921,7 @@ mod tests {
             authorized.allows(AuthorizedRequest::ReadRanges {
                 suite: 1,
                 root: [7; 32],
-                range: Range {
-                    offset: 65_535,
-                    length: 1
-                },
+                range: Range::new(65_535, 1).unwrap(),
             }),
             Ok(())
         );
@@ -938,10 +929,7 @@ mod tests {
             AuthorizedRequest::ReadRanges {
                 suite: 1,
                 root: [7; 32],
-                range: Range {
-                    offset: 65_535,
-                    length: 1
-                },
+                range: Range::new(65_535, 1).unwrap(),
             }
             .operation(),
             vot_codec::Operation::ReadRanges

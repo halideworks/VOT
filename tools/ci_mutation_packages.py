@@ -15,6 +15,7 @@ PACKAGES = (
     "vot-proof-blake3",
     "vot-proof-sha256",
     "vot-proof-catalog",
+    "vot-fec",
     "vot-verified-range",
     "vot-coverage",
     "vot-codec",

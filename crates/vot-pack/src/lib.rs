@@ -230,7 +230,31 @@ fn finish_pack(bytes: Vec<u8>, entries: Vec<PackedEntry>, suite: Suite) -> Pack 
     }
 }
 
+/// Whether every entry is aligned, in offset order, and inside `pack.bytes`.
+pub fn validate_layout(pack: &Pack) -> Result<(), Error> {
+    let mut cursor = 0_u64;
+    let pack_len = u64::try_from(pack.bytes.len()).map_err(|_| Error::Bounds)?;
+    for entry in &pack.entries {
+        if entry.offset % ENTRY_ALIGNMENT as u64 != 0 {
+            return Err(Error::Bounds);
+        }
+        if entry.offset < cursor {
+            return Err(Error::Bounds);
+        }
+        let end = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or(Error::Bounds)?;
+        if end > pack_len {
+            return Err(Error::Bounds);
+        }
+        cursor = end;
+    }
+    Ok(())
+}
+
 pub fn extract<'a>(pack: &'a Pack, entry: &PackedEntry) -> Result<&'a [u8], Error> {
+    validate_layout(pack)?;
     let start = usize::try_from(entry.offset).map_err(|_| Error::Bounds)?;
     let length = usize::try_from(entry.length).map_err(|_| Error::Bounds)?;
     let end = start.checked_add(length).ok_or(Error::Bounds)?;
@@ -365,5 +389,33 @@ mod tests {
             ),
             Err(Error::FileTooLarge)
         );
+    }
+
+    #[test]
+    fn a_pack_layout_refuses_overlap_misalignment_and_overflow() {
+        let pack = build(vec![file("a", b"data")], PathProfile::Portable)
+            .unwrap()
+            .remove(0);
+        assert_eq!(validate_layout(&pack), Ok(()));
+
+        let mut overlap = pack.clone();
+        overlap.entries.push(overlap.entries[0].clone());
+        assert_eq!(validate_layout(&overlap), Err(Error::Bounds));
+
+        let mut unaligned = pack.clone();
+        unaligned.entries[0].offset = 1;
+        unaligned.entries[0].length = 1;
+        assert_eq!(validate_layout(&unaligned), Err(Error::Bounds));
+
+        let mut past_end = pack.clone();
+        past_end.entries[0].length = pack.bytes.len() as u64 + 1;
+        assert_eq!(validate_layout(&past_end), Err(Error::Bounds));
+
+        let mut wrapping = pack.clone();
+        wrapping.entries[0].offset = u64::MAX;
+        wrapping.entries[0].length = 1;
+        assert_eq!(validate_layout(&wrapping), Err(Error::Bounds));
+
+        assert_eq!(extract(&overlap, &overlap.entries[0]), Err(Error::Bounds));
     }
 }

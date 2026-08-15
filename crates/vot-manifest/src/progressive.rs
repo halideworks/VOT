@@ -1,6 +1,9 @@
 //! Progressive manifest ingest state.
 
-use super::{Error, ManifestPage, PathProfile, Seal, encode_page, valid_object, validate_entries};
+use super::{
+    EntryKind, Error, ManifestPage, PathProfile, Seal, encode_page, is_path_prefix, valid_object,
+    validate_entries,
+};
 
 #[derive(Clone, Debug)]
 pub struct ProgressiveIngest {
@@ -8,6 +11,7 @@ pub struct ProgressiveIngest {
     profile: PathProfile,
     digests: Vec<[u8; 32]>,
     last_path: Option<Vec<u8>>,
+    last_file: bool,
     poisoned: bool,
 }
 
@@ -19,6 +23,7 @@ impl ProgressiveIngest {
             profile,
             digests: Vec::new(),
             last_path: None,
+            last_file: false,
             poisoned: false,
         }
     }
@@ -53,9 +58,15 @@ impl ProgressiveIngest {
             if first <= previous {
                 return Err(Error::EntriesUnsorted);
             }
+            if self.last_file && is_path_prefix(previous, first) {
+                return Err(Error::PathCollision);
+            }
         }
         let encoded = encode_page(page)?;
         let digest = *blake3::hash(&encoded).as_bytes();
+        if let Some(last) = page.entries.last() {
+            self.last_file = last.kind == EntryKind::File;
+        }
         self.last_path = keys.last().cloned().or_else(|| self.last_path.take());
         self.digests.push(digest);
         Ok(digest)

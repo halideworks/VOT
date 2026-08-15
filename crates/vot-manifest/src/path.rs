@@ -88,6 +88,15 @@ pub fn canonical_path_key(path: &PackagePath, profile: PathProfile) -> Result<Ve
     Ok(path_key(path))
 }
 
+/// Whether `ancestor` is a proper path ancestor of `descendant`.
+///
+/// Canonical keys join components with a 0 byte. A shared spelling prefix
+/// is not an ancestor: `foo` is not above `foobar`.
+#[must_use]
+pub fn is_path_prefix(ancestor: &[u8], descendant: &[u8]) -> bool {
+    descendant.starts_with(ancestor) && descendant.get(ancestor.len()) == Some(&0)
+}
+
 fn validate_components(path: &[Component], profile: PathProfile) -> Result<(), Error> {
     // The decoder refuses a path past this bound, so an encoder that emitted
     // one would produce a page nothing could read back.

@@ -2,7 +2,7 @@
 
 use super::{
     BTreeSet, Error, MAX_ENTRIES_PER_PAGE, MAX_PAGE_BYTES, MAX_PAGE_COMMITMENTS, PackagePath,
-    PathProfile, canonical_path_key,
+    PathProfile, canonical_path_key, is_path_prefix,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,8 +75,9 @@ pub fn validate_entries(
     entries: &[ManifestEntry],
     profile: PathProfile,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let mut keys = Vec::with_capacity(entries.len());
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     let mut unique = BTreeSet::new();
+    let mut previous_file = false;
     for entry in entries {
         validate_entry(entry)?;
         if entry.path.profile() != profile {
@@ -89,7 +90,15 @@ pub fn validate_entries(
         if keys.last().is_some_and(|previous| previous >= &key) {
             return Err(Error::EntriesUnsorted);
         }
+        if previous_file
+            && keys
+                .last()
+                .is_some_and(|previous| is_path_prefix(previous, &key))
+        {
+            return Err(Error::PathCollision);
+        }
         keys.push(key);
+        previous_file = entry.kind == EntryKind::File;
     }
     Ok(keys)
 }

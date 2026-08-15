@@ -10,7 +10,7 @@ pub use ingest::{PackageIngest, ValidatedManifestPage};
 
 use vot_manifest::{
     Component, EntryKind, Error as ManifestError, ManifestEntry, ObjectId, PackagePath,
-    PathProfile, StorageRef, canonical_path_key, validate_entries,
+    PathProfile, StorageRef, canonical_path_key, is_path_prefix, validate_entries,
 };
 use vot_verifier::{StreamVerifier, Suite, VerifyError};
 
@@ -212,7 +212,7 @@ impl PackageRootBuilder {
         if self
             .last_key
             .as_ref()
-            .is_some_and(|last| key.as_slice() <= last.as_slice())
+            .is_some_and(|last| key.as_slice() <= last.as_slice() || is_path_prefix(last, &key))
         {
             return Err(Error::InvalidBundle);
         }
@@ -501,6 +501,24 @@ mod tests {
             ..direct(&["a"], Suite::Sha256Bep52, [1; 32], 1)
         };
         assert_eq!(invalid.push(&raw), Err(Error::InvalidPath));
+
+        let mut under_a_file = PackageRootBuilder::new().unwrap();
+        under_a_file
+            .push(&direct(&["a"], Suite::Sha256Bep52, [1; 32], 1))
+            .unwrap();
+        assert_eq!(
+            under_a_file.push(&direct(&["a", "b"], Suite::Sha256Bep52, [2; 32], 1)),
+            Err(Error::InvalidBundle)
+        );
+        let mut spelling = PackageRootBuilder::new().unwrap();
+        spelling
+            .push(&direct(&["foo"], Suite::Sha256Bep52, [1; 32], 1))
+            .unwrap();
+        assert!(
+            spelling
+                .push(&direct(&["foobar"], Suite::Sha256Bep52, [2; 32], 1))
+                .is_ok()
+        );
     }
 
     #[test]

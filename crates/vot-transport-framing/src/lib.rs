@@ -114,6 +114,11 @@ pub trait AssemblyBudget {
 
     /// Charges more partial-frame storage. `None` when the budget is spent.
     fn reserve(&self, bytes: usize) -> Option<Self::Hold>;
+
+    /// Charges `bytes` more onto an existing hold, so a frame that arrives in
+    /// many pieces costs one hold rather than one per piece. `false` when the
+    /// budget is spent; the hold is then unchanged.
+    fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool;
 }
 
 /// A budget of its own, for a backend whose reassembly shares memory with
@@ -148,6 +153,10 @@ impl AssemblyBudget for StandaloneBudget {
         let amount = u64::try_from(bytes).ok()?;
         self.ledger.as_ref()?.acquire(amount).ok()
     }
+
+    fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool {
+        u64::try_from(bytes).is_ok_and(|amount| hold.grow(amount).is_ok())
+    }
 }
 
 impl<T: AssemblyBudget> AssemblyBudget for Arc<T> {
@@ -155,6 +164,10 @@ impl<T: AssemblyBudget> AssemblyBudget for Arc<T> {
 
     fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
         T::reserve(self, bytes)
+    }
+
+    fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool {
+        T::grow(self, hold, bytes)
     }
 }
 
@@ -167,8 +180,10 @@ pub struct Framing<B: AssemblyBudget> {
     control_limit: Arc<AtomicUsize>,
     /// Payload bytes of a skipped frame still to arrive. Dropped as they land.
     discarding: usize,
-    /// Permits for what `pending` currently costs against the shared budget.
-    holds: Vec<B::Hold>,
+    /// The one permit for what `pending` currently costs against the shared
+    /// budget. One per stream, however many pieces the frame arrives in, so
+    /// the permits themselves cannot outgrow what they account for.
+    hold: Option<B::Hold>,
     budget: B,
     kind: StreamKind,
 }
@@ -179,7 +194,7 @@ impl<B: AssemblyBudget> Framing<B> {
             pending: Vec::new(),
             control_limit,
             discarding: 0,
-            holds: Vec::new(),
+            hold: None,
             budget,
             kind,
         }
@@ -192,11 +207,20 @@ impl<B: AssemblyBudget> Framing<B> {
     /// rather than a malformed frame.
     fn hold(&mut self, bytes: &[u8]) -> Result<(), FrameFault> {
         if !bytes.is_empty() {
-            let hold = self
-                .budget
-                .reserve(bytes.len())
-                .ok_or_else(FrameFault::exhausted)?;
-            self.holds.push(hold);
+            match &mut self.hold {
+                Some(hold) => {
+                    if !self.budget.grow(hold, bytes.len()) {
+                        return Err(FrameFault::exhausted());
+                    }
+                }
+                None => {
+                    self.hold = Some(
+                        self.budget
+                            .reserve(bytes.len())
+                            .ok_or_else(FrameFault::exhausted)?,
+                    );
+                }
+            }
         }
         self.pending.extend_from_slice(bytes);
         Ok(())
@@ -206,7 +230,7 @@ impl<B: AssemblyBudget> Framing<B> {
     /// the only places the reservation moves; everything that empties the
     /// buffer settles through here so the two cannot drift.
     fn settle_charge(&mut self) {
-        self.holds.clear();
+        self.hold = None;
     }
 
     /// Hands over the completed frame with its charge already returned, so a
@@ -614,6 +638,83 @@ mod tests {
             Err(FrameFault::too_large()),
             "and one byte more"
         );
+    }
+
+    /// A budget that counts how it was asked, over a standalone one.
+    struct Counting {
+        inner: StandaloneBudget,
+        reserves: AtomicUsize,
+        grows: AtomicUsize,
+    }
+
+    impl AssemblyBudget for Counting {
+        type Hold = vot_transport_api::Permit;
+
+        fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+            self.reserves.fetch_add(1, Ordering::Relaxed);
+            self.inner.reserve(bytes)
+        }
+
+        fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool {
+            self.grows.fetch_add(1, Ordering::Relaxed);
+            self.inner.grow(hold, bytes)
+        }
+    }
+
+    #[test]
+    fn a_frame_arriving_in_pieces_costs_one_hold() {
+        // The permits are what bound memory, so a byte-at-a-time peer must
+        // not turn one accounted frame into thousands of them.
+        let counting = Arc::new(Counting {
+            inner: StandaloneBudget::new(MAX_PARTIAL_CONTROL_FRAME),
+            reserves: AtomicUsize::new(0),
+            grows: AtomicUsize::new(0),
+        });
+        let mut framing = Framing::new(StreamKind::Control, Arc::clone(&counting), control_limit());
+        let stream = [frame(300), frame(200)].concat();
+        let mut delivered = 0;
+        for piece in stream.chunks(1) {
+            framing
+                .accept(piece, |_| {
+                    delivered += 1;
+                    Ok(())
+                })
+                .expect("a well-formed stream");
+        }
+        assert_eq!(delivered, 2);
+        assert_eq!(
+            counting.reserves.load(Ordering::Relaxed),
+            2,
+            "one reservation per frame, taken on its first byte"
+        );
+        assert_eq!(
+            counting.grows.load(Ordering::Relaxed),
+            stream.len() - 2,
+            "every later piece grows that reservation"
+        );
+        assert_eq!(counting.inner.held(), 0);
+    }
+
+    #[test]
+    fn a_grow_past_the_budget_is_refused_with_the_charge_still_held() {
+        // The exhaustion now lands on a grow rather than a fresh reservation;
+        // the invariant is the same as for a first-piece refusal.
+        let narrow = Arc::new(StandaloneBudget::new(100));
+        let mut framing = Framing::new(StreamKind::Control, Arc::clone(&narrow), control_limit());
+        let whole = frame(400);
+        let mut fault = None;
+        for piece in whole.chunks(30) {
+            if let Err(error) = framing.accept(piece, |_| Ok(())) {
+                fault = Some(error);
+                break;
+            }
+            assert_eq!(narrow.held(), framing.buffered());
+        }
+        assert_eq!(fault, Some(FrameFault::exhausted()));
+        assert_eq!(narrow.held(), framing.buffered());
+        assert!(narrow.held() > 30, "the refused piece was not the first");
+        framing.release();
+        assert_eq!(narrow.held(), 0, "release returns the whole grown charge");
     }
 
     #[test]

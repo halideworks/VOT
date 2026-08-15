@@ -201,6 +201,22 @@ impl AssemblyBudget for SharedBudget {
             bytes,
         })
     }
+
+    fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool {
+        let Some(total) = hold.bytes.checked_add(bytes) else {
+            return false;
+        };
+        let mut inbound = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(next) = inbound.charged().checked_add(bytes) else {
+            return false;
+        };
+        if next > MAX_ASSEMBLY_BYTES {
+            return false;
+        }
+        inbound.assembling += bytes;
+        hold.bytes = total;
+        true
+    }
 }
 
 /// What an endpoint needs before it can carry anything.
@@ -3735,6 +3751,34 @@ mod tests {
         let leftover = budget.reserve(1).expect("a released budget stayed spent");
         assert_eq!(inbound.lock().expect("the queue").assembling, 1);
         drop(leftover);
+    }
+
+    #[test]
+    fn a_grown_assembly_hold_is_one_charge() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let mut hold = budget.reserve(1).expect("a byte");
+        assert!(
+            budget.grow(&mut hold, MAX_ASSEMBLY_BYTES - 1),
+            "an exact fit"
+        );
+        assert_eq!(hold.bytes, MAX_ASSEMBLY_BYTES);
+        assert_eq!(
+            inbound.lock().expect("the queue").assembling,
+            MAX_ASSEMBLY_BYTES
+        );
+        assert!(!budget.grow(&mut hold, 1), "a byte past the budget");
+        assert!(!budget.grow(&mut hold, usize::MAX), "an overflowing grow");
+        assert_eq!(
+            hold.bytes, MAX_ASSEMBLY_BYTES,
+            "a refused grow leaves the hold"
+        );
+        drop(hold);
+        assert_eq!(
+            inbound.lock().expect("the queue").assembling,
+            0,
+            "one drop returns the grown charge"
+        );
     }
 
     #[test]

@@ -109,6 +109,13 @@ impl Ledger {
     fn force_used(&self, used: u64) {
         lock(&self.inner).used = used;
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn poison(&self) {
+        let mut inner = lock(&self.inner);
+        inner.poisoned = true;
+        inner.used = inner.limit;
+    }
 }
 
 impl Permit {

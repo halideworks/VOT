@@ -5,7 +5,9 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
-use vot_transport_api::{ConnectionId, PathStats, StagingCapacity, SubjectId, TransportAck};
+use vot_transport_api::{
+    ConnectionId, PathStats, Permit, StagingCapacity, SubjectId, TransportAck,
+};
 
 pub mod session;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
@@ -84,7 +86,7 @@ mod tests {
 
         let held = subject(b"in flight");
         receiver.begin(held).unwrap();
-        receiver.staging.release(u64::MAX);
+        receiver.staging.poison();
         assert!(receiver.staging.is_poisoned());
         assert!(
             !receiver.recover_accounting(),
@@ -301,14 +303,20 @@ mod tests {
         };
         let mut receiver =
             ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
-        let mut partial = RangeState::new(Box::new(DiscardSink));
+        let mut partial = RangeState::new(
+            Box::new(DiscardSink),
+            receiver.staging.reserve(VERIFIER_RESERVATION).unwrap(),
+        );
         let Check::New(booking) = partial.coverage.check(0, RANGE_UNIT_BYTES).unwrap() else {
             panic!("a new range");
         };
         booking.commit();
         receiver.range_active.insert(object, partial);
         assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
-        let mut complete = RangeState::new(Box::new(DiscardSink));
+        let mut complete = RangeState::new(
+            Box::new(DiscardSink),
+            receiver.staging.reserve(VERIFIER_RESERVATION).unwrap(),
+        );
         let Check::New(booking) = complete.coverage.check(0, 2 * RANGE_UNIT_BYTES).unwrap() else {
             panic!("a new range");
         };

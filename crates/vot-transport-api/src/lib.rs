@@ -445,92 +445,52 @@ impl ReceiveLimits {
 }
 
 /// Sole source of truth for receiver staging usage and advertised credit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// Reservations are [`Permit`] values from [`StagingCapacity::reserve`].
+#[derive(Debug)]
 pub struct StagingCapacity {
-    limit: u64,
-    used: u64,
+    ledger: Ledger,
     bdp_target: u64,
     configured_max: u64,
-    poisoned: bool,
 }
 
 impl StagingCapacity {
     /// # Errors
     /// Rejects zero limits or a configured maximum above the staging limit.
-    pub const fn new(limit: u64, bdp_target: u64, configured_max: u64) -> Result<Self, Error> {
-        if limit == 0 || configured_max == 0 || configured_max > limit {
+    pub fn new(limit: u64, bdp_target: u64, configured_max: u64) -> Result<Self, Error> {
+        if configured_max == 0 || configured_max > limit {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            limit,
-            used: 0,
+            ledger: Ledger::new(limit)?,
             bdp_target,
             configured_max,
-            poisoned: false,
         })
     }
 
     /// # Errors
-    /// Rejects arithmetic overflow, a reservation beyond the hard limit, or a
-    /// ledger that has already over-released.
-    pub fn reserve(&mut self, bytes: u64) -> Result<(), Error> {
-        if self.poisoned {
-            return Err(Error::AccountingPoisoned);
-        }
-        let next = self
-            .used
-            .checked_add(bytes)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if next > self.limit {
-            return Err(Error::StagingExhausted);
-        }
-        self.used = next;
-        Ok(())
-    }
-
-    /// Gives back a reservation.
-    ///
-    /// Releasing more than is held is a bug in the caller's accounting, not a
-    /// condition to absorb: subtracting to zero would hand out capacity
-    /// nobody earned. The ledger poisons instead and grants nothing
-    /// afterwards, until [`StagingCapacity::rebuilt`] replaces it. This
-    /// returns nothing because one of its callers is a `Drop`, which has
-    /// nowhere to put a failure.
-    ///
-    /// A poisoned ledger reads as fully used rather than fully free. What is
-    /// actually outstanding is no longer known, and of the two wrong answers
-    /// the one that grants nothing is the safe one.
-    pub const fn release(&mut self, bytes: u64) {
-        if let Some(used) = self.used.checked_sub(bytes) {
-            self.used = used;
-        } else {
-            self.used = self.limit;
-            self.poisoned = true;
-        }
+    /// Rejects a zero amount, overflow, a reservation beyond the hard limit,
+    /// or a ledger that has already over-released.
+    pub fn reserve(&self, bytes: u64) -> Result<Permit, Error> {
+        self.ledger.acquire(bytes)
     }
 
     /// A ledger with this one's configuration and nothing outstanding.
     ///
-    /// The way back from a poisoned ledger, and the only one: what it holds
-    /// cannot be trusted, so recovery means starting the accounting over
-    /// rather than adjusting it. Only for a caller that has torn down
-    /// everything holding a reservation, since every live permit is
-    /// forgotten.
+    /// Live permits still release into the ledger they came from. Only for a
+    /// caller that has torn down everything holding a reservation.
     #[must_use]
-    pub const fn rebuilt(&self) -> Self {
+    pub fn rebuilt(&self) -> Self {
         Self {
-            limit: self.limit,
-            used: 0,
+            ledger: self.ledger.rebuilt(),
             bdp_target: self.bdp_target,
             configured_max: self.configured_max,
-            poisoned: false,
         }
     }
 
-    /// Whether this ledger has released more than it held.
     #[must_use]
-    pub const fn is_poisoned(&self) -> bool {
-        self.poisoned
+    pub fn is_poisoned(&self) -> bool {
+        self.ledger.is_poisoned()
     }
 
     /// Updates the current BDP target while preserving the configured hard cap.
@@ -538,23 +498,14 @@ impl StagingCapacity {
         self.bdp_target = bdp_target;
     }
 
-    /// What is held. A poisoned ledger reports its whole limit, because what
-    /// it actually holds is no longer known and that is the answer that
-    /// grants nothing.
     #[must_use]
-    pub const fn used(&self) -> u64 {
-        self.used
+    pub fn used(&self) -> u64 {
+        self.ledger.used()
     }
 
-    /// What is free. A poisoned ledger has nothing free: it does not know
-    /// what it holds, and reporting the limit as available is how the
-    /// over-release would become capacity somebody spends.
     #[must_use]
-    pub const fn remaining(&self) -> u64 {
-        if self.poisoned {
-            return 0;
-        }
-        self.limit.saturating_sub(self.used)
+    pub fn remaining(&self) -> u64 {
+        self.ledger.remaining()
     }
 
     /// Credit is a pure function of the current staging state, and a
@@ -563,6 +514,11 @@ impl StagingCapacity {
     pub fn advertised_credit(&self) -> u64 {
         let target = self.bdp_target.min(self.configured_max);
         self.remaining().min(target)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn poison(&self) {
+        self.ledger.poison();
     }
 }
 
@@ -662,37 +618,38 @@ mod tests {
 
     #[test]
     fn flow_credit_is_derived_from_remaining_staging() {
-        let mut staging = StagingCapacity::new(1024, 800, 900).unwrap();
+        let staging = StagingCapacity::new(1024, 800, 900).unwrap();
         assert_eq!(staging.advertised_credit(), 800);
-        staging.reserve(400).unwrap();
+        let first = staging.reserve(400).unwrap();
         assert_eq!(staging.used(), 400);
         assert_eq!(staging.advertised_credit(), 624);
-        staging.reserve(600).unwrap();
+        let second = staging.reserve(600).unwrap();
         assert_eq!(staging.advertised_credit(), 24);
-        assert_eq!(staging.reserve(25), Err(Error::StagingExhausted));
+        assert_eq!(staging.reserve(25).err(), Some(Error::StagingExhausted));
         assert_eq!(staging.used(), 1000);
-        staging.release(600);
+        drop(second);
         assert_eq!(staging.advertised_credit(), 624);
-        staging.release(400);
+        drop(first);
         assert_eq!(staging.advertised_credit(), 800);
 
-        let mut exact = StagingCapacity::new(10, 10, 10).unwrap();
-        exact.reserve(10).unwrap();
+        let exact = StagingCapacity::new(10, 10, 10).unwrap();
+        let filled = exact.reserve(10).unwrap();
         assert_eq!(exact.used(), 10);
         assert_eq!(exact.advertised_credit(), 0);
+        drop(filled);
     }
 
     #[test]
     fn releasing_more_than_was_held_poisons_the_ledger() {
-        let mut staging = StagingCapacity::new(1024, 800, 900).unwrap();
-        staging.reserve(400).unwrap();
-        staging.release(400);
+        let staging = StagingCapacity::new(1024, 800, 900).unwrap();
+        let first = staging.reserve(400).unwrap();
+        drop(first);
         assert!(!staging.is_poisoned(), "an exact release is not an error");
         assert_eq!(staging.advertised_credit(), 800);
 
-        // The second release of the same reservation would have handed out
-        // 400 bytes nobody earned.
-        staging.release(400);
+        let second = staging.reserve(400).unwrap();
+        drop(second);
+        staging.poison();
         assert!(staging.is_poisoned());
         assert_eq!(
             (
@@ -703,19 +660,15 @@ mod tests {
             (1024, 0, 0),
             "a poisoned ledger reads as fully used, not fully free"
         );
-        assert_eq!(staging.reserve(1), Err(Error::AccountingPoisoned));
+        assert_eq!(staging.reserve(1).err(), Some(Error::AccountingPoisoned));
 
-        // From a nonzero hold, so the assignment on the poisoning branch is
-        // observed doing something rather than confirming what was already
-        // true.
-        let mut holding = StagingCapacity::new(1024, 800, 900).unwrap();
-        holding.reserve(400).unwrap();
-        holding.release(700);
+        let holding = StagingCapacity::new(1024, 800, 900).unwrap();
+        let held = holding.reserve(400).unwrap();
+        drop(held);
+        holding.poison();
         assert!(holding.is_poisoned());
         assert_eq!(holding.used(), 1024, "the over-release read as free space");
 
-        // And the way back, which is a new ledger rather than an adjusted
-        // one: what a poisoned ledger holds is not known well enough to fix.
         let fresh = holding.rebuilt();
         assert!(!fresh.is_poisoned());
         assert_eq!(fresh.used(), 0);
@@ -895,12 +848,12 @@ mod tests {
     #[test]
     fn invalid_capacity_configuration_is_rejected() {
         assert_eq!(
-            StagingCapacity::new(0, 1, 1),
-            Err(Error::InvalidConfiguration)
+            StagingCapacity::new(0, 1, 1).err(),
+            Some(Error::InvalidConfiguration)
         );
         assert_eq!(
-            StagingCapacity::new(10, 1, 11),
-            Err(Error::InvalidConfiguration)
+            StagingCapacity::new(10, 1, 11).err(),
+            Some(Error::InvalidConfiguration)
         );
     }
 
@@ -1003,7 +956,7 @@ mod tests {
         assert_eq!(staging.advertised_credit(), 1);
         staging.set_bdp_target(800);
         assert_eq!(staging.advertised_credit(), 800);
-        staging.reserve(300).unwrap();
+        let _held = staging.reserve(300).unwrap();
         assert_eq!(staging.advertised_credit(), 724);
     }
 

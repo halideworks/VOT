@@ -7,13 +7,16 @@ pub(super) use vot_coverage::Check;
 pub(super) struct RangeState {
     pub(super) coverage: vot_coverage::Coverage,
     pub(super) sink: Box<dyn RangeSink>,
+    #[expect(dead_code, reason = "owns the verifier reservation until drop")]
+    pub(super) reservation: vot_transport_api::Permit,
 }
 
 impl RangeState {
-    pub(super) fn new(sink: Box<dyn RangeSink>) -> Self {
+    pub(super) fn new(sink: Box<dyn RangeSink>, reservation: vot_transport_api::Permit) -> Self {
         Self {
             coverage: vot_coverage::Coverage::new(),
             sink,
+            reservation,
         }
     }
 }

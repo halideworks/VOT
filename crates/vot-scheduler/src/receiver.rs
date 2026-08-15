@@ -1,8 +1,8 @@
 //! Root-verified receive state, keyed by subject identity.
 
 use super::{
-    BTreeMap, BTreeSet, Check, ConnectionId, Error, PathStats, RangeSink, RangeState, SinkError,
-    StagingCapacity, StreamVerifier, SubjectId, TransportAck, VERIFIER_RESERVATION,
+    BTreeMap, BTreeSet, Check, ConnectionId, Error, PathStats, Permit, RangeSink, RangeState,
+    SinkError, StagingCapacity, StreamVerifier, SubjectId, TransportAck, VERIFIER_RESERVATION,
     assemble_ordered, check_range_proof, coverage_error, subject_id, suite, validate_typed_bundle,
     verify_typed_bundle,
 };
@@ -10,18 +10,7 @@ use super::{
 pub(super) struct ActiveObject {
     verifier: StreamVerifier,
     received: u64,
-}
-
-/// Releases a transient staging hold on every exit, including panic.
-pub(super) struct StagingHold<'capacity> {
-    staging: &'capacity mut StagingCapacity,
-    bytes: u64,
-}
-
-impl Drop for StagingHold<'_> {
-    fn drop(&mut self) {
-        self.staging.release(self.bytes);
-    }
+    reservation: Permit,
 }
 
 /// Receiver state is keyed by subject identity and outlives connections.
@@ -86,13 +75,14 @@ impl ReliableReceiver {
             return Err(Error::AlreadyReceiving);
         }
         let verifier = StreamVerifier::new(suite(subject.suite)?);
-        self.staging.reserve(VERIFIER_RESERVATION)?;
+        let reservation = self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
         self.active.insert(
             subject,
             ActiveObject {
                 verifier,
                 received: 0,
+                reservation,
             },
         );
         Ok(())
@@ -117,9 +107,10 @@ impl ReliableReceiver {
         if subject.length == 0 {
             return Err(Error::LengthMismatch);
         }
-        self.staging.reserve(VERIFIER_RESERVATION)?;
+        let reservation = self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        self.range_active.insert(subject, RangeState::new(sink));
+        self.range_active
+            .insert(subject, RangeState::new(sink, reservation));
         Ok(())
     }
 
@@ -187,17 +178,12 @@ impl ReliableReceiver {
         else {
             return Ok(());
         };
-        let reserved = if caller_reserved {
-            0
+        let hold = if caller_reserved {
+            None
         } else {
-            self.staging.reserve(bytes)?;
-            bytes
+            Some(self.staging.reserve(bytes)?)
         };
-        let hold = StagingHold {
-            staging: &mut self.staging,
-            bytes: reserved,
-        };
-        self.peak_staging = self.peak_staging.max(hold.staging.used());
+        self.peak_staging = self.peak_staging.max(self.staging.used());
         active.sink.write_at(covered_offset, data)?;
         drop(hold);
         booking.commit();
@@ -284,15 +270,10 @@ impl ReliableReceiver {
     ) -> Result<(), Error> {
         let validated = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = validated.covered_length();
-        // Released after reassembly and sink write; bytes live in the sink now.
-        self.staging.reserve(covered_bytes)?;
+        let _hold = self.staging.reserve(covered_bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        let result = (|| {
-            let data = assemble_ordered(validated)?;
-            self.receive_verified_range(subject, bundle.covered_offset, &data, &bundle.proof, true)
-        })();
-        self.staging.release(covered_bytes);
-        result
+        let data = assemble_ordered(validated)?;
+        self.receive_verified_range(subject, bundle.covered_offset, &data, &bundle.proof, true)
     }
     /// Completes a range transfer only after every 64 KiB unit is root verified.
     ///
@@ -310,10 +291,11 @@ impl ReliableReceiver {
         if !complete {
             return Err(Error::LengthMismatch);
         }
-        self.range_active
-            .remove(&subject)
-            .ok_or(Error::UnknownObject)?;
-        self.staging.release(VERIFIER_RESERVATION);
+        drop(
+            self.range_active
+                .remove(&subject)
+                .ok_or(Error::UnknownObject)?,
+        );
         self.verified.insert(subject);
         Ok(())
     }
@@ -322,11 +304,7 @@ impl ReliableReceiver {
     /// Used when a rail's object completes elsewhere. Returns whether anything
     /// was held; a verified subject stays verified.
     pub fn abandon_ranges(&mut self, subject: SubjectId) -> bool {
-        if self.range_active.remove(&subject).is_none() {
-            return false;
-        }
-        self.staging.release(VERIFIER_RESERVATION);
-        true
+        self.range_active.remove(&subject).is_some()
     }
 
     /// # Errors
@@ -337,11 +315,9 @@ impl ReliableReceiver {
             other => Error::Staging(other),
         })?;
         let bytes = u64::try_from(record.len()).map_err(|_| Error::LengthExceeded)?;
-        self.staging.reserve(bytes)?;
+        let _hold = self.staging.reserve(bytes)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        let result = self.receive_reserved(subject, record, bytes);
-        self.staging.release(bytes);
-        result
+        self.receive_reserved(subject, record, bytes)
     }
 
     fn receive_reserved(
@@ -370,7 +346,7 @@ impl ReliableReceiver {
             return Ok(());
         }
         let active = self.active.remove(&subject).ok_or(Error::UnknownObject)?;
-        self.staging.release(VERIFIER_RESERVATION);
+        drop(active.reservation);
         if active.received != subject.length {
             return Err(Error::LengthMismatch);
         }

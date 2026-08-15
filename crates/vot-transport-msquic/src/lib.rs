@@ -857,18 +857,44 @@ pub mod live {
     #[derive(Clone)]
     struct SharedBudget(Arc<Mutex<CallbackQueue>>);
 
-    impl vot_transport_framing::AssemblyBudget for SharedBudget {
-        fn reserve(&self, bytes: usize) -> bool {
-            let Ok(mut budget) = self.0.lock() else {
-                return false;
-            };
-            budget.reserve_assembly(bytes)
-        }
+    struct AssemblyHold {
+        budget: Arc<Mutex<CallbackQueue>>,
+        bytes: usize,
+    }
 
-        fn release(&self, bytes: usize) {
-            if let Ok(mut budget) = self.0.lock() {
-                budget.release_assembly(bytes);
+    impl std::fmt::Debug for AssemblyHold {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("AssemblyHold")
+                .field("bytes", &self.bytes)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for AssemblyHold {
+        fn drop(&mut self) {
+            if self.bytes == 0 {
+                return;
             }
+            if let Ok(mut budget) = self.budget.lock() {
+                budget.release_assembly(self.bytes);
+            }
+            self.bytes = 0;
+        }
+    }
+
+    impl vot_transport_framing::AssemblyBudget for SharedBudget {
+        type Hold = AssemblyHold;
+
+        fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+            let mut budget = self.0.lock().ok()?;
+            if !budget.reserve_assembly(bytes) {
+                return None;
+            }
+            Some(AssemblyHold {
+                budget: Arc::clone(&self.0),
+                bytes,
+            })
         }
     }
 

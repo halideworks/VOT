@@ -166,25 +166,38 @@ fn native_payload_len(event: &NativeEvent) -> usize {
 #[derive(Clone)]
 struct SharedBudget(Arc<Mutex<Inbound>>);
 
+#[derive(Debug)]
+struct AssemblyHold {
+    inbound: Arc<Mutex<Inbound>>,
+    bytes: usize,
+}
+
+impl Drop for AssemblyHold {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if let Ok(mut inbound) = self.inbound.lock() {
+            inbound.assembling = inbound.assembling.saturating_sub(self.bytes);
+        }
+        self.bytes = 0;
+    }
+}
+
 impl AssemblyBudget for SharedBudget {
-    fn reserve(&self, bytes: usize) -> bool {
-        let Ok(mut inbound) = self.0.lock() else {
-            return false;
-        };
-        let Some(next) = inbound.charged().checked_add(bytes) else {
-            return false;
-        };
+    type Hold = AssemblyHold;
+
+    fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+        let mut inbound = self.0.lock().ok()?;
+        let next = inbound.charged().checked_add(bytes)?;
         if next > MAX_ASSEMBLY_BYTES {
-            return false;
+            return None;
         }
         inbound.assembling += bytes;
-        true
-    }
-
-    fn release(&self, bytes: usize) {
-        if let Ok(mut inbound) = self.0.lock() {
-            inbound.assembling = inbound.assembling.saturating_sub(bytes);
-        }
+        Some(AssemblyHold {
+            inbound: Arc::clone(&self.0),
+            bytes,
+        })
     }
 }
 
@@ -3709,14 +3722,17 @@ mod tests {
     fn the_assembly_budget_reserves_to_the_bound_and_releases() {
         let inbound = Arc::new(Mutex::new(Inbound::default()));
         let budget = SharedBudget(Arc::clone(&inbound));
+        let full = budget
+            .reserve(MAX_ASSEMBLY_BYTES)
+            .expect("an exact fit was refused");
         assert!(
-            budget.reserve(MAX_ASSEMBLY_BYTES),
-            "an exact fit was refused"
+            budget.reserve(1).is_none(),
+            "a byte past the budget was reserved"
         );
-        assert!(!budget.reserve(1), "a byte past the budget was reserved");
-        budget.release(MAX_ASSEMBLY_BYTES);
-        assert!(budget.reserve(1), "a released budget stayed spent");
+        drop(full);
+        let leftover = budget.reserve(1).expect("a released budget stayed spent");
         assert_eq!(inbound.lock().expect("the queue").assembling, 1);
+        drop(leftover);
     }
 
     #[test]

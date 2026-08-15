@@ -11,6 +11,7 @@ vot-transport-api = { path = "../vot-transport-api" }
 
 [dev-dependencies]
 vot-codec = { path = "../vot-codec" }
+vot-transport-api = { path = "../vot-transport-api", features = ["test-util"] }
 
 [lints]
 workspace = true

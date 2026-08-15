@@ -293,7 +293,7 @@ pub mod live {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     use msquic::{
@@ -857,18 +857,43 @@ pub mod live {
     #[derive(Clone)]
     struct SharedBudget(Arc<Mutex<CallbackQueue>>);
 
-    impl vot_transport_framing::AssemblyBudget for SharedBudget {
-        fn reserve(&self, bytes: usize) -> bool {
-            let Ok(mut budget) = self.0.lock() else {
-                return false;
-            };
-            budget.reserve_assembly(bytes)
-        }
+    struct AssemblyHold {
+        budget: Arc<Mutex<CallbackQueue>>,
+        bytes: usize,
+    }
 
-        fn release(&self, bytes: usize) {
-            if let Ok(mut budget) = self.0.lock() {
-                budget.release_assembly(bytes);
+    impl std::fmt::Debug for AssemblyHold {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("AssemblyHold")
+                .field("bytes", &self.bytes)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for AssemblyHold {
+        fn drop(&mut self) {
+            if self.bytes == 0 {
+                return;
             }
+            let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+            budget.release_assembly(self.bytes);
+            self.bytes = 0;
+        }
+    }
+
+    impl vot_transport_framing::AssemblyBudget for SharedBudget {
+        type Hold = AssemblyHold;
+
+        fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+            let mut budget = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if !budget.reserve_assembly(bytes) {
+                return None;
+            }
+            Some(AssemblyHold {
+                budget: Arc::clone(&self.0),
+                bytes,
+            })
         }
     }
 
@@ -1279,7 +1304,10 @@ pub mod live {
 
         /// Returns partial-frame storage to the budget.
         fn release_assembly(&mut self, bytes: usize) {
-            self.assembling = self.assembling.saturating_sub(bytes);
+            self.assembling = self
+                .assembling
+                .checked_sub(bytes)
+                .unwrap_or(MAX_CALLBACK_BYTES);
         }
 
         /// Queues a connection lifecycle event past both bounds.

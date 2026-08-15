@@ -106,82 +106,55 @@ impl FrameFault {
 }
 
 /// Shared budget for partial-frame storage across all streams. The backend
-/// decides what it shares with.
+/// decides what it shares with. A reservation is a [`Self::Hold`] that
+/// returns the bytes when dropped.
 pub trait AssemblyBudget {
-    /// Charges more partial-frame storage. False when the budget is spent.
-    fn reserve(&self, bytes: usize) -> bool;
+    /// Outstanding reservation. Dropping it returns the charged bytes.
+    type Hold: std::fmt::Debug;
 
-    /// Returns partial-frame storage to the budget.
-    fn release(&self, bytes: usize);
+    /// Charges more partial-frame storage. `None` when the budget is spent.
+    fn reserve(&self, bytes: usize) -> Option<Self::Hold>;
 }
 
 /// A budget of its own, for a backend whose reassembly shares memory with
 /// nothing else.
 #[derive(Debug)]
 pub struct StandaloneBudget {
-    held: AtomicUsize,
-    limit: usize,
+    ledger: Option<vot_transport_api::Ledger>,
 }
 
 impl StandaloneBudget {
     #[must_use]
-    pub const fn new(limit: usize) -> Self {
-        Self {
-            held: AtomicUsize::new(0),
-            limit,
-        }
+    pub fn new(limit: usize) -> Self {
+        let ledger = u64::try_from(limit)
+            .ok()
+            .and_then(|limit| vot_transport_api::Ledger::new(limit).ok());
+        Self { ledger }
     }
 
     /// Bytes currently charged across every stream.
     #[must_use]
     pub fn held(&self) -> usize {
-        self.held.load(Ordering::Relaxed)
+        self.ledger.as_ref().map_or(0, |ledger| {
+            usize::try_from(ledger.used()).unwrap_or(usize::MAX)
+        })
     }
 }
 
 impl AssemblyBudget for StandaloneBudget {
-    fn reserve(&self, bytes: usize) -> bool {
-        // CAS, not fetch-add: avoids overspend and phantom charges on refusal.
-        let mut held = self.held.load(Ordering::Relaxed);
-        loop {
-            let Some(next) = held.checked_add(bytes) else {
-                return false;
-            };
-            if next > self.limit {
-                return false;
-            }
-            match self
-                .held
-                .compare_exchange_weak(held, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(current) => held = current,
-            }
-        }
-    }
+    type Hold = vot_transport_api::Permit;
 
-    fn release(&self, bytes: usize) {
-        let mut held = self.held.load(Ordering::Relaxed);
-        loop {
-            let next = held.saturating_sub(bytes);
-            match self
-                .held
-                .compare_exchange_weak(held, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return,
-                Err(current) => held = current,
-            }
-        }
+    fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+        let amount = u64::try_from(bytes).ok()?;
+        self.ledger.as_ref()?.acquire(amount).ok()
     }
 }
 
 impl<T: AssemblyBudget> AssemblyBudget for Arc<T> {
-    fn reserve(&self, bytes: usize) -> bool {
-        T::reserve(self, bytes)
-    }
+    type Hold = T::Hold;
 
-    fn release(&self, bytes: usize) {
-        T::release(self, bytes);
+    fn reserve(&self, bytes: usize) -> Option<Self::Hold> {
+        T::reserve(self, bytes)
     }
 }
 
@@ -194,8 +167,8 @@ pub struct Framing<B: AssemblyBudget> {
     control_limit: Arc<AtomicUsize>,
     /// Payload bytes of a skipped frame still to arrive. Dropped as they land.
     discarding: usize,
-    /// What `pending` currently costs against the shared budget.
-    reserved: usize,
+    /// Permits for what `pending` currently costs against the shared budget.
+    holds: Vec<B::Hold>,
     budget: B,
     kind: StreamKind,
 }
@@ -206,7 +179,7 @@ impl<B: AssemblyBudget> Framing<B> {
             pending: Vec::new(),
             control_limit,
             discarding: 0,
-            reserved: 0,
+            holds: Vec::new(),
             budget,
             kind,
         }
@@ -219,13 +192,13 @@ impl<B: AssemblyBudget> Framing<B> {
     /// rather than a malformed frame.
     fn hold(&mut self, bytes: &[u8]) -> Result<(), FrameFault> {
         if !bytes.is_empty() {
-            if !self.budget.reserve(bytes.len()) {
-                return Err(FrameFault::exhausted());
-            }
-            self.reserved += bytes.len();
+            let hold = self
+                .budget
+                .reserve(bytes.len())
+                .ok_or_else(FrameFault::exhausted)?;
+            self.holds.push(hold);
         }
         self.pending.extend_from_slice(bytes);
-        debug_assert_eq!(self.reserved, self.pending.len());
         Ok(())
     }
 
@@ -233,11 +206,7 @@ impl<B: AssemblyBudget> Framing<B> {
     /// the only places the reservation moves; everything that empties the
     /// buffer settles through here so the two cannot drift.
     fn settle_charge(&mut self) {
-        if self.reserved != 0 {
-            self.budget.release(self.reserved);
-            self.reserved = 0;
-        }
-        debug_assert_eq!(self.reserved, self.pending.len());
+        self.holds.clear();
     }
 
     /// Hands over the completed frame with its charge already returned, so a
@@ -372,13 +341,6 @@ impl<B: AssemblyBudget> Framing<B> {
     #[must_use]
     pub const fn is_assembling(&self) -> bool {
         !self.pending.is_empty() || self.discarding != 0
-    }
-}
-
-impl<B: AssemblyBudget> Drop for Framing<B> {
-    fn drop(&mut self) {
-        // Return the reservation on reset so partial frames are uncharged.
-        self.release();
     }
 }
 
@@ -560,16 +522,20 @@ mod tests {
     #[test]
     fn a_budget_admits_what_it_has_room_for_and_no_more() {
         let budget = StandaloneBudget::new(10);
-        assert!(budget.reserve(10), "exactly the budget");
-        assert!(!budget.reserve(1), "and nothing past it");
+        let full = budget.reserve(10).expect("exactly the budget");
+        assert!(budget.reserve(1).is_none(), "and nothing past it");
         assert_eq!(budget.held(), 10);
-        budget.release(4);
-        assert_eq!(budget.held(), 6);
-        assert!(budget.reserve(4));
-        assert!(!budget.reserve(1));
-        budget.release(1_000);
+        drop(full);
+        let first = budget.reserve(6).expect("room after release");
+        let second = budget.reserve(4).expect("the rest of the budget");
+        assert!(budget.reserve(1).is_none());
+        drop(second);
+        drop(first);
         assert_eq!(budget.held(), 0);
-        assert!(!budget.reserve(usize::MAX), "an overflow is not room");
+        assert!(
+            budget.reserve(usize::MAX).is_none(),
+            "an overflow is not room"
+        );
     }
 
     #[test]

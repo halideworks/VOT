@@ -806,7 +806,7 @@ fn subject_of(config: &Config) -> Result<SubjectId, Error> {
     }
     SubjectId::new(
         config.suite.identifier(),
-        verifier.finish()?,
+        verifier.digest()?,
         config.object_bytes,
     )
     .map_err(|_| Error::Value("VOT_BENCH_OBJECT_BYTES"))

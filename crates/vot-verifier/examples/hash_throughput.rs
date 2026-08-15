@@ -36,12 +36,12 @@ fn main() {
     measure("vot blake3 verifier", bytes, |data| {
         let mut verifier = StreamVerifier::new(Suite::Blake3Bao64);
         verifier.update(data).unwrap();
-        black_box(verifier.finish().unwrap());
+        black_box(verifier.digest().unwrap());
     });
     measure("vot sha256 verifier", bytes, |data| {
         let mut verifier = StreamVerifier::new(Suite::Sha256Bep52);
         verifier.update(data).unwrap();
-        black_box(verifier.finish().unwrap());
+        black_box(verifier.digest().unwrap());
     });
     println!(
         "logical cpus: {}",

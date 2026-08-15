@@ -156,7 +156,10 @@ impl From<vot_scheduler::Error> for Error {
 
 impl From<vot_verifier::VerifyError> for Error {
     fn from(error: vot_verifier::VerifyError) -> Self {
-        Self::Verifier(error)
+        match error {
+            vot_verifier::VerifyError::RootMismatch => Self::RootMismatch,
+            other => Self::Verifier(other),
+        }
     }
 }
 

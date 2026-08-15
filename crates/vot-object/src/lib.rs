@@ -445,7 +445,7 @@ impl ObjectBuilder {
         if !self.pending.is_empty() {
             self.feed_pending()?;
         }
-        let root = self.verifier.finish()?;
+        let root = self.verifier.digest()?;
         let proof = self.proof.finish()?;
         Ok(PreparedObject {
             object: ObjectId {

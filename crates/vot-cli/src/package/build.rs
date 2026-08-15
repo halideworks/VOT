@@ -8,6 +8,7 @@ use crate::{
     fs, manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
     write_new_synced,
 };
+use vot_verifier::ExpectedObject;
 
 pub(crate) struct SourceFile {
     pub(crate) path: PackagePath,
@@ -241,7 +242,6 @@ pub(crate) fn copy_and_verify(
         .write(true)
         .open(destination)?;
     let mut verifier = StreamVerifier::new(suite);
-    let mut length = 0_u64;
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
         let read = input.read(&mut buffer)?;
@@ -250,13 +250,16 @@ pub(crate) fn copy_and_verify(
         }
         output.write_all(&buffer[..read])?;
         verifier.update(&buffer[..read])?;
-        length = length
-            .checked_add(read as u64)
-            .ok_or(Error::InvalidBundle)?;
     }
     output.sync_all()?;
-    if length != expected_length || verifier.finish()? != expected_root {
-        return Err(Error::SourceMutation);
+    match verifier.finish(ExpectedObject::new(suite, expected_root, expected_length)) {
+        Ok(_) => {}
+        Err(
+            vot_verifier::VerifyError::RootMismatch
+            | vot_verifier::VerifyError::LengthMismatch
+            | vot_verifier::VerifyError::SuiteMismatch,
+        ) => return Err(Error::SourceMutation),
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -283,7 +286,7 @@ pub(crate) fn stream_root(
     if length != expected_length {
         return Err(Error::SourceMutation);
     }
-    Ok(verifier.finish()?)
+    Ok(verifier.digest()?)
 }
 
 pub(crate) fn write_object(objects: &Path, root: &[u8; 32], bytes: &[u8]) -> Result<(), Error> {

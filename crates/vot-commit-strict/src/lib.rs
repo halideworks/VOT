@@ -174,7 +174,7 @@ impl ReadBack for LinuxDirectReader {
             }
         }
         Ok(DirectHash::Supported(
-            verifier.finish().map_err(Error::Verify)?,
+            verifier.digest().map_err(Error::Verify)?,
         ))
     }
 }

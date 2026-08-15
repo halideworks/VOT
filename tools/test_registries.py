@@ -63,6 +63,20 @@ class RegistrySourceSync(unittest.TestCase):
             failures,
         )
 
+    def test_markdown_receipt_length_is_rejected(self) -> None:
+        document, markdown, rust, wire = sources()
+        mutated = markdown.replace(
+            "| `0x0001` | `ED25519` | 64 bytes | required v1 |",
+            "| `0x0001` | `ED25519` | 32 bytes | required v1 |",
+            1,
+        )
+        self.assertNotEqual(markdown, mutated)
+        failures = check_registries(document, mutated, rust, wire)
+        self.assertTrue(
+            any("receipt_schemes" in item for item in failures),
+            failures,
+        )
+
     def test_handling_parity_is_rejected(self) -> None:
         document, markdown, rust, wire = sources()
         mutated = copy.deepcopy(document)

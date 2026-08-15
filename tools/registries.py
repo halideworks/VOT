@@ -44,6 +44,42 @@ TELEMETRY_ROW = re.compile(
     r"(?P<redaction>[^|]+?) \|",
     re.MULTILINE,
 )
+EXTENSION_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| "
+    r"(?P<status>[^|]+?) \| (?P<default>[^|]+?) \|",
+    re.MULTILINE,
+)
+SUITE_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[a-z0-9-]+)` \| "
+    r"(?P<root_length>[^|]+?) \| (?P<status>[^|]+?) \|",
+    re.MULTILINE,
+)
+COMPRESSION_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[a-z0-9-]+)` \| (?P<status>[^|]+?) \|",
+    re.MULTILINE,
+)
+PROFILE_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z_]+)` \| "
+    r"`(?P<predecessor>[A-Z_]+)` \|",
+    re.MULTILINE,
+)
+PROVIDER_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z_]+)` \| (?P<status>[^|]+?) \|",
+    re.MULTILINE,
+)
+ASSURANCE_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z_]+)` \|",
+    re.MULTILINE,
+)
+RECEIPT_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[A-Z0-9_]+)` \| "
+    r"(?P<authenticator_length>[^|]+?) \| (?P<status>[^|]+?) \|",
+    re.MULTILINE,
+)
+FORMAT_ROW = re.compile(
+    r"^\| `(?P<value>0x[0-9a-f]+)` \| `(?P<name>[a-z0-9-]+)` \| (?P<status>[^|]+?) \|",
+    re.MULTILINE,
+)
 FRAME_DECLARATION_ROW = re.compile(
     r"^\s*(?P<name>[A-Z0-9_]+) = (?P<value>0x[0-9a-f]+), "
     r"limit: (?P<limit>[0-9 *]+|HARD_MAX_FRAME_PAYLOAD), "
@@ -171,6 +207,50 @@ def markdown_tables(markdown: str) -> dict[str, list[dict]]:
             ),
             "| `",
         ),
+        "extensions": _view_rows(
+            EXTENSION_ROW,
+            section(markdown, "## 4. Extension identifiers", "## 5. Verification suites"),
+            "| `0x",
+        ),
+        "suites": _view_rows(
+            SUITE_ROW,
+            section(markdown, "## 5. Verification suites", "## 6. Compression suites"),
+            "| `0x",
+        ),
+        "compression": _view_rows(
+            COMPRESSION_ROW,
+            section(markdown, "## 6. Compression suites", "## 7. Commit profiles"),
+            "| `0x",
+        ),
+        "commit_profiles": _view_rows(
+            PROFILE_ROW,
+            section(markdown, "### 7.1 Commit profiles", "### 7.2 Provider identifiers"),
+            "| `0x",
+        ),
+        "providers": _view_rows(
+            PROVIDER_ROW,
+            section(markdown, "### 7.2 Provider identifiers", "### 7.3 Assurance levels"),
+            "| `0x",
+        ),
+        "assurance": _view_rows(
+            ASSURANCE_ROW,
+            section(markdown, "### 7.3 Assurance levels", "## 8. Error codes"),
+            "| `0x",
+        ),
+        "receipt_schemes": _view_rows(
+            RECEIPT_ROW,
+            section(
+                markdown,
+                "## 10. Receipt authentication schemes",
+                "## 11. Capability formats",
+            ),
+            "| `0x",
+        ),
+        "capability_formats": _view_rows(
+            FORMAT_ROW,
+            numbered_section(markdown, "## 11. Capability formats"),
+            "| `0x",
+        ),
         "operations": _view_rows(
             OPERATION_ROW,
             numbered_section(markdown, "## 12. Capability operations"),
@@ -288,10 +368,8 @@ def check_registries(document: dict, markdown: str, rust: str, wire: str) -> lis
     except (ValueError, KeyError) as error:
         failures.append(f"markdown view: {error}")
         view = {}
-    for key in ("frames", "settings", "operations", "limits", "errors", "telemetry"):
-        if key not in view:
-            continue
-        if view[key] != document[key]:
+    for key, rows in view.items():
+        if rows != document[key]:
             failures.append(f"markdown {key} table does not match the registry source")
 
     try:

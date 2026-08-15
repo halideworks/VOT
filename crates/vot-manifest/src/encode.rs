@@ -20,10 +20,7 @@ pub fn page_encoded_len(page: &ManifestPage) -> Result<usize, Error> {
     total = add(total, vot_cbor::head_len(4))?;
     total = add(total, vot_cbor::payload_len(page.previous_digest.len()))?;
     total = add(total, vot_cbor::head_len(5))?;
-    total = add(
-        total,
-        vot_cbor::head_len(u64::from(page.profile == PathProfile::RawPosix)),
-    )?;
+    total = add(total, vot_cbor::head_len(profile_code(page.profile)))?;
     total = add(total, vot_cbor::head_len(6))?;
     total = add(total, vot_cbor::head_len(page.entries.len() as u64))?;
     for entry in &page.entries {
@@ -81,7 +78,7 @@ pub fn encode_page(page: &ManifestPage) -> Result<Vec<u8>, Error> {
     vot_cbor::uint(&mut out, 4);
     vot_cbor::bytes(&mut out, &page.previous_digest);
     vot_cbor::uint(&mut out, 5);
-    vot_cbor::uint(&mut out, u64::from(page.profile == PathProfile::RawPosix));
+    vot_cbor::uint(&mut out, profile_code(page.profile));
     vot_cbor::uint(&mut out, 6);
     vot_cbor::array(&mut out, page.entries.len() as u64);
     for entry in &page.entries {
@@ -129,12 +126,49 @@ fn add(total: usize, part: usize) -> Result<usize, Error> {
     total.checked_add(part).ok_or(Error::PageTooLarge)
 }
 
+pub(super) fn counted_fields(base: u64, flags: impl IntoIterator<Item = bool>) -> u64 {
+    flags.into_iter().fold(base, |n, flag| n + u64::from(flag))
+}
+
+pub(super) const fn profile_code(profile: PathProfile) -> u64 {
+    match profile {
+        PathProfile::Portable => 0,
+        PathProfile::RawPosix => 1,
+    }
+}
+
+pub(super) const fn kind_code(kind: EntryKind) -> u64 {
+    match kind {
+        EntryKind::File => 0,
+        EntryKind::Directory => 1,
+    }
+}
+
+fn entry_fields(entry: &ManifestEntry) -> u64 {
+    counted_fields(
+        2,
+        [
+            entry.length.is_some(),
+            entry.storage.is_some(),
+            entry.metadata.is_some(),
+        ],
+    )
+}
+
+fn metadata_fields(metadata: &FileMetadata) -> u64 {
+    counted_fields(
+        0,
+        [
+            metadata.mode.is_some(),
+            metadata.mtime_seconds.is_some(),
+            metadata.mtime_nanoseconds.is_some(),
+            metadata.media_type.is_some(),
+        ],
+    )
+}
+
 fn entry_encoded_len(entry: &ManifestEntry) -> Result<usize, Error> {
-    let fields = 2
-        + usize::from(entry.length.is_some())
-        + usize::from(entry.storage.is_some())
-        + usize::from(entry.metadata.is_some());
-    let mut total = add(0, vot_cbor::head_len(fields as u64))?;
+    let mut total = add(0, vot_cbor::head_len(entry_fields(entry)))?;
     total = add(total, vot_cbor::head_len(0))?;
     total = add(total, vot_cbor::head_len(entry.path.len() as u64))?;
     for component in &entry.path {
@@ -147,10 +181,7 @@ fn entry_encoded_len(entry: &ManifestEntry) -> Result<usize, Error> {
         )?;
     }
     total = add(total, vot_cbor::head_len(1))?;
-    total = add(
-        total,
-        vot_cbor::head_len(u64::from(entry.kind == EntryKind::Directory)),
-    )?;
+    total = add(total, vot_cbor::head_len(kind_code(entry.kind)))?;
     if let Some(length) = entry.length {
         total = add(total, vot_cbor::head_len(2))?;
         total = add(total, vot_cbor::head_len(length))?;
@@ -197,11 +228,7 @@ fn storage_encoded_len(storage: &StorageRef) -> Result<usize, Error> {
 }
 
 fn metadata_encoded_len(metadata: &FileMetadata) -> Result<usize, Error> {
-    let fields = usize::from(metadata.mode.is_some())
-        + usize::from(metadata.mtime_seconds.is_some())
-        + usize::from(metadata.mtime_nanoseconds.is_some())
-        + usize::from(metadata.media_type.is_some());
-    let mut total = add(0, vot_cbor::head_len(fields as u64))?;
+    let mut total = add(0, vot_cbor::head_len(metadata_fields(metadata)))?;
     if let Some(mode) = metadata.mode {
         total = add(total, vot_cbor::head_len(0))?;
         total = add(total, vot_cbor::head_len(u64::from(mode)))?;
@@ -222,11 +249,7 @@ fn metadata_encoded_len(metadata: &FileMetadata) -> Result<usize, Error> {
 }
 
 pub(super) fn encode_entry(out: &mut Vec<u8>, entry: &ManifestEntry) {
-    let fields = 2
-        + usize::from(entry.length.is_some())
-        + usize::from(entry.storage.is_some())
-        + usize::from(entry.metadata.is_some());
-    vot_cbor::map(out, fields as u64);
+    vot_cbor::map(out, entry_fields(entry));
     vot_cbor::uint(out, 0);
     vot_cbor::array(out, entry.path.len() as u64);
     for component in &entry.path {
@@ -236,7 +259,7 @@ pub(super) fn encode_entry(out: &mut Vec<u8>, entry: &ManifestEntry) {
         }
     }
     vot_cbor::uint(out, 1);
-    vot_cbor::uint(out, u64::from(entry.kind == EntryKind::Directory));
+    vot_cbor::uint(out, kind_code(entry.kind));
     if let Some(length) = entry.length {
         vot_cbor::uint(out, 2);
         vot_cbor::uint(out, length);
@@ -282,11 +305,7 @@ pub(super) fn encode_storage(out: &mut Vec<u8>, storage: &StorageRef) {
 }
 
 pub(super) fn encode_metadata(out: &mut Vec<u8>, metadata: &FileMetadata) {
-    let fields = usize::from(metadata.mode.is_some())
-        + usize::from(metadata.mtime_seconds.is_some())
-        + usize::from(metadata.mtime_nanoseconds.is_some())
-        + usize::from(metadata.media_type.is_some());
-    vot_cbor::map(out, fields as u64);
+    vot_cbor::map(out, metadata_fields(metadata));
     if let Some(mode) = metadata.mode {
         vot_cbor::uint(out, 0);
         vot_cbor::uint(out, u64::from(mode));
@@ -302,5 +321,26 @@ pub(super) fn encode_metadata(out: &mut Vec<u8>, metadata: &FileMetadata) {
     if let Some(media_type) = &metadata.media_type {
         vot_cbor::uint(out, 3);
         vot_cbor::text(out, media_type);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{counted_fields, kind_code, profile_code};
+    use crate::{EntryKind, PathProfile};
+
+    #[test]
+    fn counted_fields_adds_each_present_flag() {
+        assert_eq!(counted_fields(2, [false, false, false]), 2);
+        assert_eq!(counted_fields(2, [true, false, false]), 3);
+        assert_eq!(counted_fields(2, [false, true, false]), 3);
+        assert_eq!(counted_fields(2, [true, true, false]), 4);
+        assert_eq!(counted_fields(2, [true, true, true]), 5);
+        assert_eq!(counted_fields(0, [true, true, true, true]), 4);
+        assert_eq!(counted_fields(0, [false, false, false, false]), 0);
+        assert_eq!(profile_code(PathProfile::Portable), 0);
+        assert_eq!(profile_code(PathProfile::RawPosix), 1);
+        assert_eq!(kind_code(EntryKind::File), 0);
+        assert_eq!(kind_code(EntryKind::Directory), 1);
     }
 }

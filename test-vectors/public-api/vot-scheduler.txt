@@ -11,6 +11,7 @@ constant vot_scheduler::session::REMEMBERED_BUNDLES
 enum vot_scheduler::Error
 module vot_scheduler::session
 struct vot_scheduler::DiscardSink
+struct vot_scheduler::FecCounts
 struct vot_scheduler::FileSink
 struct vot_scheduler::Job
 struct vot_scheduler::Planner

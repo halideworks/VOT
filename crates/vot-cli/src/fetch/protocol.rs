@@ -218,6 +218,14 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
     Ok(wire)
 }
 
+/// Bytes the bundle holds under this plan: what the objects already left
+/// behind placed, plus what the one still in flight has placed so far.
+///
+/// One function rather than the same sum in each accessor that means it.
+fn placed_in(plan: &FetchPlan) -> u64 {
+    plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
+}
+
 impl<A: TransportAdapter> BundleFetcher<A> {
     /// Sets how many provers this fetch runs, or none to prove on the
     /// session's own thread.
@@ -423,10 +431,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.extensions.clone()
     }
 
-    /// Generations this fetch's session decoded from the datagram path.
+    /// What this fetch's session decoded, abandoned, and refused on the
+    /// datagram path.
     #[must_use]
-    pub fn fec_generations_decoded(&self) -> u64 {
-        self.receiver.fec_generations_decoded()
+    pub fn fec_counts(&self) -> vot_scheduler::FecCounts {
+        self.receiver.fec_counts()
     }
 
     /// The bundle directory this fetch writes.
@@ -451,8 +460,23 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Bytes verified and placed into the bundle, only ever going up.
     #[must_use]
     pub fn placed_bytes(&self) -> u64 {
+        self.locked_plan().map_or(0, |plan| placed_in(&plan))
+    }
+
+    /// Of [`Self::placed_bytes`], the part this fetch put there itself.
+    ///
+    /// A fetch into a bundle a previous one left behind resumes it and asks
+    /// only for what is missing, so the bytes it placed are the ones that
+    /// crossed the wire and the rest were already on disk. Anything divided
+    /// by this fetch's own clock has to be this rather than the package's
+    /// length, which a resume would make a throughput out of bytes nobody
+    /// moved.
+    ///
+    /// One lock for both halves, so the two cannot be read a rail apart.
+    #[must_use]
+    pub fn moved_bytes(&self) -> u64 {
         self.locked_plan().map_or(0, |plan| {
-            plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
+            placed_in(&plan).saturating_sub(plan.carried_before)
         })
     }
 
@@ -1016,6 +1040,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -1154,6 +1179,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
+                plan.carried_before = plan.carried_before.saturating_add(object.length);
                 plan.current += 1;
                 continue;
             }
@@ -1175,6 +1201,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 BTreeMap::new()
             };
             let seeded: u64 = resumed.values().sum();
+            plan.carried_before = plan.carried_before.saturating_add(seeded);
             let durable = plan.store.as_ref().map(|store| DurableHook {
                 plan: Arc::downgrade(&shared),
                 store: Arc::clone(store),

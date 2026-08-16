@@ -456,6 +456,7 @@ mod tests {
             current: 0,
             active: Some(sink0),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -506,6 +507,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -531,6 +533,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -559,6 +562,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -585,6 +589,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -657,10 +662,12 @@ mod tests {
         // sources. The four full ones decode never, so the reliable path is
         // what carried them. The sim's loss is periodic rather than sampled,
         // so this count is the same on every run.
+        let counts = fetcher.fec_counts();
+        assert_eq!(counts.decoded, 1, "only the short tail had the symbols");
+        assert_eq!(counts.offered, 5, "every generation was offered coded");
         assert_eq!(
-            fetcher.fec_generations_decoded(),
-            1,
-            "only the short tail had the symbols to decode"
+            counts.abandoned, 0,
+            "no generation reached its decode attempt, so none was given up on"
         );
         drop(fetcher);
         serving_thread
@@ -699,17 +706,29 @@ mod tests {
             BundleFetcher::begin_with(client, &output, Some(built.root), None, fec.clone())
                 .expect("a fetch offering the extension");
         assert_eq!(fetcher.extensions(), fec);
-        assert_eq!(fetcher.fec_generations_decoded(), 0, "nothing yet");
+        assert_eq!(
+            fetcher.fec_counts(),
+            vot_scheduler::FecCounts::default(),
+            "nothing yet"
+        );
         assert_eq!(
             crate::drive::drive(&mut fetcher).expect("a driven fetch"),
             FetchStatus::Complete
         );
         assert_eq!(fetcher.package().expect("a package"), built);
+        let counts = fetcher.fec_counts();
         assert!(
-            fetcher.fec_generations_decoded() >= 20,
-            "the object's 23 generations came as symbols: {}",
-            fetcher.fec_generations_decoded()
+            counts.decoded >= 20,
+            "the object's 23 generations came as symbols: {counts:?}"
         );
+        // Every generation an epoch opened is accounted for, and this loss
+        // rate spends no decode budget it does not have.
+        assert!(
+            counts.offered >= counts.decoded,
+            "offered bounds decoded: {counts:?}"
+        );
+        assert_eq!(counts.abandoned, 0, "decode budget was never short");
+        assert_eq!(counts.refused, 0, "credit admitted every epoch");
         drop(fetcher);
         serving_thread
             .join()
@@ -737,7 +756,7 @@ mod tests {
             crate::drive::drive(&mut plain).expect("a driven fetch"),
             FetchStatus::Complete
         );
-        assert_eq!(plain.fec_generations_decoded(), 0);
+        assert_eq!(plain.fec_counts(), vot_scheduler::FecCounts::default());
         drop(plain);
         serving_thread
             .join()
@@ -904,8 +923,8 @@ mod tests {
             Ok(client)
         };
         let fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
-        let package = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
-        assert_eq!(package, built);
+        let outcome = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
+        assert_eq!(outcome.package, built);
         assert_eq!(
             connects.load(Ordering::Relaxed),
             2,
@@ -1026,6 +1045,20 @@ mod tests {
         assert_eq!(
             resumed.rail.taken_bytes, second_length,
             "the resumed fetch asked for the unplaced object and nothing more"
+        );
+        // What it placed is what it asked for, while what the bundle holds is
+        // both objects. A throughput divided by this fetch's clock has to be
+        // the first of those: the object the earlier fetch left behind never
+        // crossed the wire on this one.
+        assert_eq!(
+            resumed.moved_bytes(),
+            second_length,
+            "the resumed fetch moved only the object that was missing"
+        );
+        assert_eq!(
+            resumed.placed_bytes(),
+            built.logical_length,
+            "the bundle holds both objects either way"
         );
         assert!(
             !output.join(RESUME_STORE).exists(),
@@ -1344,6 +1377,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::seeded(covered),
             syncing: false,
@@ -1426,6 +1460,7 @@ mod tests {
                 CountingSink::create(&output.join("s.obj"), object.length, None).unwrap(),
             )),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -1834,6 +1869,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -2352,6 +2388,7 @@ mod tests {
             current: 0,
             active: Some(Arc::clone(&sink)),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,

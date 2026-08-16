@@ -142,6 +142,7 @@ authenticates received content. See ADR-0037.
 | `VOT_DATAGRAM_FEC` | unset | Set to `1` at both ends to offer the experimental datagram FEC extension; group-aligned answers then travel as coded symbols and the reliable path carries the rest |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
+| `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, the milliseconds it took, and what the datagram FEC path offered, decoded, abandoned, and refused |
 | `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
 | `VOT_SERVE_ISSUER` | unset | Issuer public key a serve accepts capabilities from, as a `KEY_SOURCE`. With the two below, the serve requires one |
 | `VOT_SERVE_ISSUER_NAME` | unset | The issuer name that key signs under |

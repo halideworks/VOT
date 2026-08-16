@@ -654,10 +654,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.fec_armed
     }
 
-    /// Generations this session decoded from the datagram path.
+    /// What this session's datagram path decoded, abandoned, and refused.
     #[must_use]
-    pub const fn fec_generations_decoded(&self) -> u64 {
-        self.fec.decoded()
+    pub const fn fec_counts(&self) -> crate::FecCounts {
+        self.fec.counts()
     }
 
     /// `CODING_EPOCH_OPEN` or `CODING_EPOCH_CLOSE` from the sender.
@@ -2174,7 +2174,15 @@ mod tests {
             driver.is_verified(subject),
             "both generations decoded and verified"
         );
-        assert_eq!(driver.fec_generations_decoded(), 2);
+        assert_eq!(
+            driver.fec_counts(),
+            crate::FecCounts {
+                offered: plan.generation_count(),
+                decoded: 2,
+                abandoned: 0,
+                refused: 0,
+            }
+        );
         assert_eq!(driver.pending_bundles(), 0);
         let types = sent_types(&mut driver);
         assert_eq!(

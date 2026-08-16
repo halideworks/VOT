@@ -71,6 +71,7 @@ mod receiver;
 mod sink;
 
 use coverage::{Check, RangeState, coverage_error};
+pub use fec::FecCounts;
 pub use planner::*;
 use proof::{
     assemble_ordered, check_range_proof, subject_id, suite, validate_typed_bundle,

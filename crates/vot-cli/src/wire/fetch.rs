@@ -2,9 +2,9 @@
 
 use super::{
     BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
-    FETCH_RAILS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr,
-    Transport, apply_datagram_bytes, carrier_failure, congestion_from, extensions_from,
-    holder_from, limits, local_for, punch, rails_from, rendezvous_from, take_slot,
+    FETCH_RAILS, FETCH_STATS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY,
+    SocketAddr, Transport, apply_datagram_bytes, carrier_failure, congestion_from, extensions_from,
+    holder_from, limits, local_for, punch, rails_from, rendezvous_from, stats_wanted, take_slot,
 };
 
 /// Fetches a bundle from `address` into `bundle`.
@@ -78,9 +78,11 @@ where
 {
     let extensions = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
     fetch_over_offering(primary, connect, bundle, pin, rails, extensions)
+        .map(|fetched| fetched.package)
 }
 
-/// [`fetch_over`] offering `extensions` on every rail.
+/// [`fetch_over`] offering `extensions` on every rail, reporting what the
+/// fetch measured as well as what it proved.
 pub(crate) fn fetch_over_offering<F>(
     primary: Transport,
     connect: F,
@@ -88,10 +90,13 @@ pub(crate) fn fetch_over_offering<F>(
     pin: Option<[u8; 32]>,
     rails: usize,
     extensions: std::collections::BTreeSet<u64>,
-) -> Result<PackageSummary, Error>
+) -> Result<crate::drive::Fetched, Error>
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
+    // Read before the fetch runs, so a value this cannot read is refused now
+    // rather than after the transfer it was meant to report on.
+    let wanted = stats_wanted(std::env::var(FETCH_STATS).ok().as_deref())?;
     let mut fetcher = BundleFetcher::begin_with(
         primary,
         bundle,
@@ -113,7 +118,45 @@ where
             None => eprintln!("{} MiB", placed >> 20),
         }),
     )?;
-    crate::drive::fetch_striped(fetcher, rails, connect)
+    let began = std::time::Instant::now();
+    let outcome = crate::drive::fetch_striped(fetcher, rails, connect)?;
+    let elapsed = began.elapsed();
+    if wanted {
+        eprintln!("{}", stats_line(outcome.moved, elapsed, outcome.fec));
+    }
+    Ok(outcome)
+}
+
+/// What one fetch measured, as one line an operator or a bench harness reads:
+/// the bytes it placed itself and the wall time that divide into a
+/// throughput, and the datagram-FEC counts that say how much of the object
+/// the coded path carried and how much fell back to the reliable one.
+///
+/// The bytes are this fetch's own, not the package's length: a fetch that
+/// resumed a bundle asks only for what is missing, and dividing the whole
+/// package by the time it took to move the remainder is a throughput of
+/// bytes nobody sent.
+///
+/// The line rather than the printing, so a test can read what the harness
+/// would, the way [`super::relay::closing_line`] is written.
+///
+/// Elapsed time is truncated to whole milliseconds rather than rounded: a
+/// transfer measured in microseconds is not a measurement, and reporting it
+/// as one millisecond would hide that.
+pub(crate) fn stats_line(
+    bytes: u64,
+    elapsed: std::time::Duration,
+    fec: vot_scheduler::FecCounts,
+) -> String {
+    format!(
+        "fetch stats bytes={bytes} ms={} fec_offered={} fec_decoded={} \
+         fec_abandoned={} fec_refused={}",
+        elapsed.as_millis(),
+        fec.offered,
+        fec.decoded,
+        fec.abandoned,
+        fec.refused
+    )
 }
 
 /// Fetches a bundle by resolving `root` through a rendezvous service.

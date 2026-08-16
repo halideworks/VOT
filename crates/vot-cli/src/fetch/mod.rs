@@ -402,14 +402,18 @@ mod tests {
             "a narrower pool is the rail's to choose"
         );
         // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
+        // The depth counts the bundles a coded answer cuts each cover into,
+        // not the covers alone: at the cover count a coded fetch spent the
+        // budget on pieces and ended with `PendingBundlesExhausted`.
+        assert_eq!(
+            secondary.receiver.pending_bundle_limit(),
+            PENDING_BUNDLE_DEPTH
+        );
         assert_eq!(
             secondary.receiver.pending_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+            PENDING_BUNDLE_BYTES
         );
-        assert_eq!(
-            secondary.receiver.orphan_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-        );
+        assert_eq!(secondary.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
         discard(&[&bundle, &output]);
     }
 
@@ -1676,14 +1680,8 @@ mod tests {
             DEFAULT_PROVING_THREADS + 1
         );
         // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
-        assert_eq!(
-            fetcher.receiver.pending_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
-        );
-        assert_eq!(
-            fetcher.receiver.orphan_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-        );
+        assert_eq!(fetcher.receiver.pending_byte_limit(), PENDING_BUNDLE_BYTES);
+        assert_eq!(fetcher.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
         // A narrower pool: the bound follows the width.
         fetcher.set_proving_threads(2).unwrap();
         assert_eq!(fetcher.proving.width, 2);

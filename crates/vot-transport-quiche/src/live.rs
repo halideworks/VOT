@@ -63,6 +63,14 @@ pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 /// Most events the driver holds for a caller that has not drained them.
 const MAX_INBOUND_EVENTS: usize = 1_024;
 
+/// Datagrams quiche queues in each direction before it refuses or drops one.
+const DATAGRAM_QUEUE_LEN: usize = 1_024;
+
+/// Received datagram bytes the driver holds for a caller that has not drained
+/// them, on top of the shared budget. A quarter of that budget, so the stream
+/// reader's headroom precondition always survives a datagram flood.
+const MAX_DATAGRAM_INBOUND_BYTES: usize = MAX_ASSEMBLY_BYTES / 4;
+
 /// What the driver holds across every outbox before it stops taking submissions.
 ///
 /// Matches the caller's own queue byte bound. A peer that stops reading fills
@@ -109,6 +117,8 @@ struct Inbound {
     events: VecDeque<NativeEvent>,
     bytes: usize,
     assembling: usize,
+    /// Received datagram bytes among `bytes`, capped on their own.
+    datagram_bytes: usize,
     /// Raised on every push, waited on by `wait_for_event`. Shared so a
     /// waiter holds no lock the pump needs while it sleeps.
     arrived: Arc<vot_transport_api::EventSignal>,
@@ -119,7 +129,8 @@ impl Inbound {
         self.bytes + self.assembling
     }
 
-    /// Queues one event, or gives it back when either bound is met.
+    /// Queues one event, or gives it back when either bound is met. A
+    /// datagram is also bounded by its own byte cap.
     fn push(&mut self, event: NativeEvent) -> Result<(), NativeEvent> {
         let payload = native_payload_len(&event);
         let Some(next) = self.charged().checked_add(payload) else {
@@ -127,6 +138,12 @@ impl Inbound {
         };
         if self.events.len() >= MAX_INBOUND_EVENTS || next > MAX_ASSEMBLY_BYTES {
             return Err(event);
+        }
+        if matches!(event, NativeEvent::Datagram(_)) {
+            if self.datagram_bytes + payload > MAX_DATAGRAM_INBOUND_BYTES {
+                return Err(event);
+            }
+            self.datagram_bytes += payload;
         }
         self.events.push_back(event);
         self.bytes += payload;
@@ -146,14 +163,20 @@ impl Inbound {
 
     fn pop(&mut self) -> Option<NativeEvent> {
         let event = self.events.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(native_payload_len(&event));
+        let payload = native_payload_len(&event);
+        self.bytes = self.bytes.saturating_sub(payload);
+        if matches!(event, NativeEvent::Datagram(_)) {
+            self.datagram_bytes = self.datagram_bytes.saturating_sub(payload);
+        }
         Some(event)
     }
 }
 
 fn native_payload_len(event: &NativeEvent) -> usize {
     match event {
-        NativeEvent::Control(bytes) | NativeEvent::Reliable { bytes, .. } => bytes.len(),
+        NativeEvent::Control(bytes)
+        | NativeEvent::Reliable { bytes, .. }
+        | NativeEvent::Datagram(bytes) => bytes.len(),
         NativeEvent::Connected(_)
         | NativeEvent::Disconnected(_)
         | NativeEvent::Acknowledged { .. }
@@ -354,6 +377,10 @@ impl Config {
         // blackholes every data packet; with it, the connection probes and
         // settles under the ceiling.
         config.discover_pmtu(true);
+        // The QUIC DATAGRAM extension carries the experimental unreliable
+        // path. Both queues are bounded in datagrams; the inbound event budget
+        // bounds what a peer can make this end hold.
+        config.enable_dgram(true, DATAGRAM_QUEUE_LEN, DATAGRAM_QUEUE_LEN);
         // The loss delay never undercuts the ack latency the connection has
         // observed. Without it, stock quiche declares delivered packets lost
         // on paths whose RTT sits at or under the pump's ack-processing cadence.
@@ -1098,7 +1125,7 @@ fn run(
             role,
             &mut buffer,
         );
-        drain_datagrams(&mut conn, &mut buffer);
+        drain_datagrams(&mut conn, inbound, &mut buffer);
         if let Some(sample) = path_sample(&conn) {
             if let Ok(mut slot) = path.lock() {
                 *slot = Some(sample);
@@ -2364,13 +2391,22 @@ fn read_streams(
     }
 }
 
-/// Takes received datagrams off the connection.
+/// Takes received datagrams off the connection and hands them to the caller.
 ///
-/// They are dropped rather than delivered: `vot-transport-api` has no inbound
-/// datagram event, so there is nothing to hand a caller. Leaving them queued
-/// would instead stall the connection's datagram credit.
-fn drain_datagrams(conn: &mut quiche::Connection, buffer: &mut [u8]) {
-    while conn.dgram_recv(buffer).is_ok() {}
+/// One the inbound budget cannot hold is dropped: it is an unreliable
+/// datagram, and leaving it queued would stall the connection's datagram
+/// credit for the ones behind it.
+fn drain_datagrams(
+    conn: &mut quiche::Connection,
+    inbound: &Arc<Mutex<Inbound>>,
+    buffer: &mut [u8],
+) {
+    while let Ok(len) = conn.dgram_recv(buffer) {
+        let event = NativeEvent::Datagram(vot_transport_api::shared_payload(&buffer[..len]));
+        if let Ok(mut queue) = inbound.lock() {
+            let _ = queue.push(event);
+        }
+    }
 }
 
 /// Reads the active path's measurements, when there is one.
@@ -3393,9 +3429,10 @@ mod tests {
         client
             .send_datagram(9, b"experimental")
             .expect("a datagram");
-        let (from_client, _) = pump_until(&mut client, &mut server, 10, |a, _| {
+        let (from_client, at_server) = pump_until(&mut client, &mut server, 10, |a, b| {
             a.iter()
                 .any(|event| matches!(event, Event::DatagramState { .. }))
+                && b.iter().any(|event| matches!(event, Event::Datagram(_)))
         });
         let state = from_client
             .iter()
@@ -3405,14 +3442,21 @@ mod tests {
             })
             .expect("a datagram state");
         assert_eq!(state.0, 9, "the context the caller gave");
-        assert!(
-            matches!(
-                state.1,
-                vot_transport_api::DatagramSendState::Sent
-                    | vot_transport_api::DatagramSendState::Canceled
-            ),
-            "never acknowledged: {:?}",
-            state.1
+        assert_eq!(
+            state.1,
+            vot_transport_api::DatagramSendState::Sent,
+            "the extension is enabled, so the carrier takes it"
+        );
+        // And the peer receives it as bytes, once, with nothing added.
+        let received: Vec<&Event> = at_server
+            .iter()
+            .filter(|event| matches!(event, Event::Datagram(_)))
+            .collect();
+        assert_eq!(
+            received,
+            vec![&Event::Datagram(vot_transport_api::shared_payload(
+                b"experimental"
+            ))]
         );
     }
 
@@ -3734,6 +3778,31 @@ mod tests {
         assert_eq!(inbound.bytes, 10);
         let _ = inbound.pop();
         assert_eq!(inbound.bytes, 0, "a popped event kept its charge");
+
+        // Datagrams have a cap of their own: a flood stops at a quarter of
+        // the budget while a stream event still fits, and popping one gives
+        // its bytes back to both counts.
+        let mut inbound = Inbound::default();
+        let datagram = || NativeEvent::Datagram(vec![1_u8; MAX_DATAGRAM_INBOUND_BYTES / 4].into());
+        for _ in 0..4 {
+            assert!(inbound.push(datagram()).is_ok());
+        }
+        assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES);
+        assert!(inbound.push(datagram()).is_err(), "a fifth is past the cap");
+        assert!(
+            inbound
+                .push(NativeEvent::Reliable {
+                    lane: 1,
+                    sequence: 1,
+                    bytes: vec![2_u8; 1024].into(),
+                })
+                .is_ok(),
+            "the reliable path is untouched by the flood"
+        );
+        assert_eq!(inbound.bytes, MAX_DATAGRAM_INBOUND_BYTES + 1024);
+        let _ = inbound.pop();
+        assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES * 3 / 4);
+        assert!(inbound.push(datagram()).is_ok(), "room again");
     }
 
     #[test]

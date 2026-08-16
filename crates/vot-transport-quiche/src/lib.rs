@@ -129,6 +129,8 @@ pub enum NativeEvent {
     DatagramDropped {
         context: u64,
     },
+    /// A datagram the peer sent.
+    Datagram(Payload),
 }
 
 /// Holds the bounded queue every adapter has and translates what the pump
@@ -281,6 +283,7 @@ fn translate(event: NativeEvent) -> Event {
             context,
             state: DatagramSendState::Canceled,
         },
+        NativeEvent::Datagram(bytes) => Event::Datagram(bytes),
     }
 }
 

@@ -630,6 +630,70 @@ mod tests {
     }
 
     #[test]
+    fn an_epoch_is_retired_only_after_the_peer_has_gone_quiet() {
+        // Two epochs open with every symbol handed over. A peer that keeps
+        // speaking, about anything, keeps both: the close is for a receiver
+        // that stopped answering, and eight passes of an active connection
+        // are microseconds, not the pause the budget is meant to be. Once it
+        // does go silent the budget is spent and both are repaired reliably.
+        let (bundle, _) = built_bundle("quiet", &[("big.bin", patterned(1_500_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [21; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.fec.epochs.len(), 2, "a piece of 17 and one of 6");
+
+        // Twice the budget of passes, each one hearing from the peer.
+        for _ in 0..(server::QUIET_PASSES_BEFORE_CLOSE * 2) {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::DatagramCredit(ample_credit())));
+            server.service(&mut session, &mut connection).unwrap();
+            assert_eq!(
+                connection.fec.epochs.len(),
+                2,
+                "a peer that is still speaking keeps every epoch"
+            );
+        }
+
+        // Silence. One pass short of the budget still keeps them.
+        for _ in 0..(server::QUIET_PASSES_BEFORE_CLOSE - 1) {
+            server.service(&mut session, &mut connection).unwrap();
+        }
+        assert_eq!(
+            connection.fec.epochs.len(),
+            2,
+            "the budget is not spent until its last pass"
+        );
+        session.driver().records.clear();
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(
+            connection.fec.epochs.is_empty(),
+            "the budget spent retires both epochs"
+        );
+        // Both epochs' generations came back as reliable records, which is
+        // what the fetch needs when no GEN_DONE ever arrives for them.
+        assert_eq!(
+            session.driver().records.len(),
+            23,
+            "every generation of both epochs was repaired reliably"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     pub(crate) fn a_long_range_is_coded_in_pieces_of_at_most_seventeen_generations() {
         // 1500000 bytes is 23 generations: a piece of 17 and a piece of 6,
         // each its own bundle, proof, and epoch, the request partitioned

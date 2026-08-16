@@ -104,6 +104,10 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
+        // Whether this pass heard anything at all from the peer. A pass that
+        // did is not one the receiver stayed silent through, whatever it was
+        // about, so it cannot count against an epoch's quiet budget.
+        let mut heard = false;
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -112,12 +116,16 @@ impl BundleServer {
                 return fail(fault, session, connection);
             }
             if connection.outbound.bytes() >= connection.budget {
+                // Broken on the budget rather than on an empty queue, so
+                // frames the peer has already sent may be sitting unread.
+                heard = true;
                 break;
             }
             connection.fec_negotiated =
                 session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
             match session.poll() {
                 Ok(Some(Event::Control(bytes))) => {
+                    heard = true;
                     // Announce before the first answer.
                     self.ensure_announced(connection, session.is_ready());
                     if let Err(fault) = self.dispatch(&bytes, connection) {
@@ -125,7 +133,9 @@ impl BundleServer {
                     }
                 }
                 Ok(Some(Event::Disconnected(_))) => return Ok(ServeStatus::Disconnected),
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {
+                    heard = true;
+                }
                 Ok(None) => {
                     self.ensure_announced(connection, session.is_ready());
                     break;
@@ -145,7 +155,7 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
-        if let Err(fault) = self.retire_quiet_epochs(connection) {
+        if let Err(fault) = self.retire_quiet_epochs(connection, heard) {
             return fail(fault, session, connection);
         }
         connection.drain(session)?;
@@ -170,9 +180,28 @@ impl BundleServer {
     /// abandoned.
     ///
     /// Counted in passes rather than timed, so the bound is the loop's own
-    /// and a test can spend it. Only idle passes count: one that read an
-    /// event or left bytes queued has not given the receiver its chance.
-    fn retire_quiet_epochs(&self, connection: &mut ServeConnection) -> Result<(), Fault> {
+    /// and a test can spend it.
+    ///
+    /// A pass counts only when this end heard nothing from the peer at all
+    /// and has nothing of its own left queued. Anything the peer sent is
+    /// proof it is still there, whatever epoch it was about, so it resets
+    /// every open epoch rather than only the one a `GEN_DONE` names: an
+    /// epoch held alongside seven others must not be retired on the strength
+    /// of the peer answering for one of them. Without that, eight passes
+    /// elapse in microseconds on an active connection, because the carrier's
+    /// wait returns the moment anything is queued, and the serve resends the
+    /// tail of every transfer that had in fact decoded.
+    fn retire_quiet_epochs(
+        &self,
+        connection: &mut ServeConnection,
+        heard: bool,
+    ) -> Result<(), Fault> {
+        if heard {
+            for opened in connection.fec.epochs.values_mut() {
+                opened.quiet_passes = 0;
+            }
+            return Ok(());
+        }
         if !pass_is_quiet(
             !connection.fec.epochs.is_empty(),
             connection.outbound.is_empty(),
@@ -187,6 +216,12 @@ impl BundleServer {
             }
         }
         for epoch in spent {
+            // The budget bounds this the way it bounds the request loop: a
+            // retirement queues a whole epoch of records, and eight at once
+            // would put megabytes past it in a single pass.
+            if connection.outbound.bytes() >= connection.budget {
+                break;
+            }
             let opened = connection
                 .fec
                 .epochs
@@ -327,9 +362,6 @@ impl BundleServer {
                     .epochs
                     .get_mut(&done.epoch)
                     .expect("cloned above");
-                // The receiver is answering, so the quiet the close counts
-                // has not happened.
-                epoch.quiet_passes = 0;
                 epoch.live.remove(&done.generation);
                 if epoch.live.is_empty() {
                     connection.fec.sender.close(done.epoch);

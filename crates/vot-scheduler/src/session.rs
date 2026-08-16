@@ -2371,7 +2371,11 @@ mod tests {
             sent_types(&mut driver),
             vec![
                 vot_codec::frame_type::DATAGRAM_CREDIT,
+                // Each generation reports itself at its first symbol, then
+                // ends with its done, and one pass carries all of it.
+                vot_codec::frame_type::GEN_STATE,
                 vot_codec::frame_type::GEN_DONE,
+                vot_codec::frame_type::GEN_STATE,
                 vot_codec::frame_type::GEN_DONE
             ],
             "one pass sends everything owed"

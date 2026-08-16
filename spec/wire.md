@@ -204,7 +204,7 @@ send them would leave no way to reach one.
 | `CHUNK_AT_REST_VERIFIED` | 64 KiB | monotonic receipt sequence; exact duplicate ignored | yes | no |
 | `PUBLISH_RECEIPT` | 64 KiB | monotonic receipt sequence; exact duplicate ignored | yes | no |
 | `DATAGRAM_CREDIT` | 4 KiB | newer credit epoch replaces; stale epoch ignored | yes | no |
-| `CODING_EPOCH_OPEN` | 64 KiB | exact epoch geometry is idempotent; geometry conflict rejected | yes | no |
+| `CODING_EPOCH_OPEN` | 64 KiB | exact epoch definition is idempotent; a differing repeat is rejected | yes | no |
 | `GEN_STATE` | 64 KiB | newer generation sequence supersedes | yes | no |
 | `GEN_DONE` | 64 KiB | terminal and idempotent for generation | yes | no |
 | `CODING_EPOCH_CLOSE` | 64 KiB | terminal and idempotent for epoch | yes | no |
@@ -214,7 +214,8 @@ send them would leave no way to reach one.
 | `SOURCE_SCORE_HINT` | 64 KiB | advisory; latest sample supersedes | yes | no |
 | `JOB_PRIORITY_UPDATE` | 64 KiB | monotonic update sequence; stale update ignored | yes | no |
 
-Experimental FEC frames are invalid unless `DATAGRAM_FEC` is negotiated. VCRC
+Experimental FEC frames are invalid unless `DATAGRAM_FEC` is negotiated; their
+payloads and the symbol datagram are `spec/fec.md` sections 9 through 12. VCRC
 actions additionally require `VCRC`. A known but unnegotiated experimental frame
 causes `EXPERIMENT_NOT_NEGOTIATED`; its optional criticality only defines how an
 implementation that does not know the frame skips it.

@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/fec.yml"
       - "adr/0039-datagram-fec-erasure-code.md"
+      - "adr/0040-datagram-fec-on-the-wire.md"
       - "spec/fec.md"
       - "test-vectors/fec/**"
       - "tools/validate_fec_vectors.py"
@@ -13,6 +14,7 @@ on:
     paths:
       - ".github/workflows/fec.yml"
       - "adr/0039-datagram-fec-erasure-code.md"
+      - "adr/0040-datagram-fec-on-the-wire.md"
       - "spec/fec.md"
       - "test-vectors/fec/**"
       - "tools/validate_fec_vectors.py"

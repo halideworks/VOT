@@ -261,8 +261,8 @@ the provider's configured staging root.
 ## 12. Datagram, FEC, and VCRC containment
 
 Datagram mode begins with zero credit. A newer `credit_epoch` replaces older
-credit and sets absolute maxima for unretired bytes, active generations, and
-decode work. Zero credit stops new generations. Receiver overload cannot
+credit and sets absolute maxima for unretired bytes, active generations, open
+coding epochs, and decode work. Zero credit stops new generations. Receiver overload cannot
 increase parity without bound, and reliable repair remains available.
 
 FEC, VCRC, public multi-rail, custom congestion control, and Multipath QUIC are

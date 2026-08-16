@@ -608,6 +608,11 @@
       "value": "0x0702",
       "name": "RISK_BUDGET_EXHAUSTED",
       "class": "experimental/research"
+    },
+    {
+      "value": "0x0703",
+      "name": "CODING_EPOCH_CONFLICT",
+      "class": "experimental/research"
     }
   ],
   "telemetry": [

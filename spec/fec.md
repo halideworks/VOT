@@ -1,9 +1,9 @@
 # VOT Datagram FEC Erasure Code v0
 
 Status: normative for the experimental `DATAGRAM_FEC` extension. Disabled by
-default. This document defines the erasure code only: the field, the generator
-matrix, systematic encoding, and erasure decoding. Frame payloads, credit, and
-generation lifecycle are specified separately when the wire integration lands.
+default. Sections 1 through 8 define the erasure code (ADR-0039). Sections 9
+through 12 define how symbols travel, the five `DATAGRAM_FEC` frames, credit,
+and the drop and error rules (ADR-0040).
 
 ## 1. Field
 
@@ -119,3 +119,174 @@ that MUST return `INVALID_GEOMETRY`. Source symbol `esi` byte `i` in a vector is
   (GF(2^8) with 0x11D).
 - RFC 6865, "Simple Reed-Solomon Forward Error Correction (FEC) Scheme for
   FECFRAME", 2013.
+
+## 9. Coding epochs and generations
+
+A coding epoch is opened by the sender with `CODING_EPOCH_OPEN` on the
+reliable control stream. It binds one epoch identifier to one object, one
+contiguous byte range of that object, and one geometry `(k, r, L)`. Epoch
+identifiers are chosen by the sender and are unique for the session; an
+identifier is never reused after `CODING_EPOCH_CLOSE`.
+
+Generations under an epoch are implicit and sequential. Generation `g`
+covers object bytes
+
+```text
+[offset + g * k * L,  min(offset + (g + 1) * k * L, offset + length))
+```
+
+Source symbol `j` of generation `g` is the `L` bytes starting at
+`offset + (g * k + j) * L`. Only the last generation may be short. Its
+source symbol that straddles `offset + length` is transmitted zero-padded to
+`L`. A source symbol that lies entirely at or past `offset + length` is
+all zero by definition: it is never transmitted, both ends count it as
+received from the start, it never appears in `missing_sources`, and repair
+symbols are computed over it as zeros. The receiver discards padding by the
+declared `length`; padding is never handed to verification. `length` MUST
+satisfy `ceil(length / (k * L)) <= 2^32` so every generation has an
+identifier. Nothing else announces a generation.
+
+The profile this project ships is `k = 64`, `L = 1024`, `offset` a multiple
+of 65536: one generation is exactly one 64 KiB integrity group, so the bytes
+a decoded generation yields are verified by the same range proof a reliable
+`DATA_RECORD` for that group would carry. Proofs travel on the reliable path
+as before; the datagram path carries bytes only.
+
+## 10. Symbol datagrams
+
+A symbol is one QUIC datagram (or the equivalent unreliable unit of another
+carrier) with a fixed nine-byte header, every integer big-endian:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | `epoch` (u32) |
+| 4 | 4 | `generation` (u32) |
+| 8 | 1 | `esi` (u8), `0..k+r` |
+| 9 | `L` | symbol bytes |
+
+The datagram length MUST be exactly `9 + L` for the epoch's `L`. Epoch and
+generation identifiers carried in frames MUST fit these widths.
+
+## 11. Frames
+
+Every payload is a CBOR map with unsigned integer keys, in the deterministic
+encoding every other VOT payload uses. `object` is the object identity map
+`DATA_RECORD` uses. All five frames are invalid unless `DATAGRAM_FEC` was
+negotiated (`EXPERIMENT_NOT_NEGOTIATED`).
+
+`CODING_EPOCH_OPEN` (sender to receiver):
+
+| Key | Field | Constraint |
+|---:|---|---|
+| 0 | `epoch` | u32 range |
+| 1 | `object` | object identity |
+| 2 | `offset` | `offset + length <= object length` |
+| 3 | `length` | `> 0` |
+| 4 | `source_count` | `k`, `1..=64` |
+| 5 | `repair_count` | `r`, `0..=16` |
+| 6 | `symbol_length` | `L`, `1..=65535`; the sender chooses `9 + L` at or below the datagram size the path allows |
+
+A field outside its constraint is `MALFORMED_FRAME`, as for any payload. An
+exact repeat is idempotent. A repeat of the same `epoch` with any other
+field is `CODING_EPOCH_CONFLICT`. An open that would take the receiver past
+`max_open_epochs` is ignored: the epoch stays unknown to the receiver, its
+symbols drop, and the receiver answers with `GEN_DONE` outcome `2` so the
+sender closes it and moves the bytes to the reliable path. Epochs already
+open when credit shrinks stay open.
+
+`GEN_STATE` (receiver to sender, advisory):
+
+| Key | Field | Constraint |
+|---:|---|---|
+| 0 | `epoch` | an epoch the sender (the end this frame arrives at) has open and not closed; a frame naming any other epoch is ignored |
+| 1 | `generation` | u32 range, inside the epoch |
+| 2 | `sequence` | scoped to `(epoch, generation)`; a lower or equal sequence than one already accepted is ignored |
+| 3 | `received` | distinct symbols so far, `0..=k+r`, counting all-zero sources past the end |
+| 4 | `missing_sources` | array of source ESIs not yet received, ascending, at most `k` |
+
+`GEN_DONE` (receiver to sender, terminal for the generation):
+
+| Key | Field | Constraint |
+|---:|---|---|
+| 0 | `epoch` | an epoch the sender (the end this frame arrives at) has open and not closed; a frame naming any other epoch is ignored |
+| 1 | `generation` | u32 range, inside the epoch; `0` when the outcome is `2` |
+| 2 | `outcome` | `0` decoded, `1` abandoned, `2` refused |
+
+An exact repeat is idempotent; a repeat with a different outcome is
+`MALFORMED_FRAME`. A generation with a `GEN_DONE` accepts no further
+`GEN_STATE`; a later one is ignored. Outcome `2` names the whole epoch: the
+receiver does not hold it (its open was ignored, section 11 above), every
+generation counts as abandoned, and the sender closes the epoch and moves the
+bytes to the reliable path. A receiver MUST send it once for each open it
+ignores.
+
+`CODING_EPOCH_CLOSE` (sender to receiver, terminal for the epoch):
+
+| Key | Field | Constraint |
+|---:|---|---|
+| 0 | `epoch` | an epoch the receiver has open; a close naming any other epoch is ignored |
+
+Every generation under the epoch that has no `GEN_DONE` retires as
+abandoned and the receiver forgets the epoch. Because an identifier is never
+reused, a later duplicate close, a `GEN_STATE` or `GEN_DONE` that crossed the
+close in flight, and any later symbol all name an unknown epoch and are
+ignored or dropped. Nothing about a closed epoch is retained.
+
+`DATAGRAM_CREDIT` (receiver to sender):
+
+| Key | Field | Constraint |
+|---:|---|---|
+| 0 | `credit_epoch` | monotonic per session; a lower or equal value is ignored |
+| 1 | `max_unretired_bytes` | bytes of all active generations (`k * L` each) the sender may have outstanding |
+| 2 | `max_active_generations` | generations the sender may have opened by a symbol and not retired |
+| 3 | `max_decode_work` | symbol bytes the receiver will hand to elimination under this credit epoch |
+| 4 | `max_open_epochs` | epochs the sender may have opened and not closed |
+
+Before the first accepted `DATAGRAM_CREDIT` every cap is zero, so no epoch may
+be opened and no symbol may be sent. A newer credit epoch replaces the older
+one whole, never adds to it, and it may shrink: the sender then opens and
+sends nothing new until it is back inside every cap, and what it already sent
+under the older credit is dropped by the receiver, never punished.
+`max_unretired_bytes`, `max_active_generations`, and `max_open_epochs` are
+levels both ends can count from the frames and symbols they have exchanged.
+`max_decode_work` is a budget only the receiver counts: once elimination has
+consumed it, the receiver abandons every further generation that would need
+elimination (`GEN_DONE` outcome `1`) until a newer credit epoch, and a
+generation whose `k` sources all arrive costs nothing against it.
+
+## 12. Retirement, drops, and errors
+
+A generation becomes active when its first symbol is accepted and retires on
+its `GEN_DONE` or on `CODING_EPOCH_CLOSE`. Retirement releases the
+generation's `k * L` bytes of unretired credit. Decode work is charged in
+symbol bytes handed to elimination; a generation whose `k` sources all
+arrive is charged nothing. Nothing in this section depends on a clock: a
+receiver that wants missing bytes asks for them on the reliable path as it
+would without FEC, and abandonment is a decision it reports.
+
+| Event | Handling |
+|---|---|
+| Symbol for an epoch the receiver does not have open | dropped |
+| Symbol whose datagram length is not `9 + L` | dropped |
+| Symbol whose `esi >= k + r`, whose generation lies past the epoch, or whose source ESI lies entirely past `offset + length` | dropped |
+| Duplicate `(epoch, generation, esi)` | dropped |
+| Symbol that would make active generations or unretired bytes exceed credit | dropped |
+| Symbol before any `DATAGRAM_CREDIT` was accepted | dropped |
+| `CODING_EPOCH_OPEN` past `max_open_epochs` | ignored, the epoch stays unknown |
+| `GEN_STATE` or `GEN_DONE` arriving at a sender for an epoch it does not have open, or a `GEN_STATE` for a generation already done | ignored |
+| `CODING_EPOCH_CLOSE` naming an epoch the receiver does not have open | ignored |
+| `CODING_EPOCH_OPEN` repeating a known epoch with any field changed | `CODING_EPOCH_CONFLICT`, session closes |
+| Any FEC payload outside its field constraints, or a generation past the epoch's count | `MALFORMED_FRAME`, session closes |
+| Any FEC frame without `DATAGRAM_FEC` negotiated | `EXPERIMENT_NOT_NEGOTIATED`, session closes |
+
+Datagrams overtake the control stream, the two reliable directions are
+independent, and credit may shrink in flight, so in normal operation a
+symbol, an open, or a feedback frame can arrive for state its receiver no
+longer holds or credit it no longer extends. Every such case is a drop or an
+ignore and the reliable path repairs whatever it cost. Session errors are
+reserved for what only a broken peer can produce: a payload outside its
+constraints, and one epoch identifier opened twice with different content. A
+receiver cannot detect a sender that reuses an identifier after close, since
+it retains nothing of a closed epoch; stale symbols that land in the reused
+epoch's table are caught only by range verification, which is why the
+identifier rule is on the sender.

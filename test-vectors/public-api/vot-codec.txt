@@ -16,6 +16,7 @@ constant vot_codec::error_code::AT_REST_VERIFICATION_FAILED
 constant vot_codec::error_code::AUTHENTICATION_FAILED
 constant vot_codec::error_code::AUTHORIZATION_FAILED
 constant vot_codec::error_code::CARRIER_UNAVAILABLE
+constant vot_codec::error_code::CODING_EPOCH_CONFLICT
 constant vot_codec::error_code::DUPLICATE_SETTING
 constant vot_codec::error_code::DURABILITY_FAILED
 constant vot_codec::error_code::EXPERIMENT_NOT_NEGOTIATED

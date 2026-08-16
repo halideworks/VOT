@@ -226,7 +226,8 @@ beyond bytes it can stage. Capacity telemetry is advisory.
 
 Datagram mode begins with zero credit. A monotonic `credit_epoch` supersedes
 older credit and places absolute caps on unretired bytes, active generations,
-and decode work. Wall-clock expiry is not a correctness mechanism.
+open coding epochs, and decode work (`spec/fec.md` section 11). Wall-clock
+expiry is not a correctness mechanism.
 
 The default connection idle timeout is 90 seconds. There is no keepalive:
 ADR-0035 retired the setting that configured one, because nothing implemented

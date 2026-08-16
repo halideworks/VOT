@@ -26,6 +26,11 @@ pub struct ServeConnection {
     pub(crate) progress: u64,
     /// Answers the carrier has taken, which the outbound budget may hide.
     pub(crate) handed_over: u64,
+    /// The datagram FEC sending state: what the peer's credit lets this end
+    /// open and send. Used only while `fec_negotiated`.
+    pub(crate) fec: FecSender,
+    /// Whether the session negotiated `DATAGRAM_FEC`, refreshed each pass.
+    pub(crate) fec_negotiated: bool,
 }
 
 impl Default for ServeConnection {
@@ -39,8 +44,28 @@ impl Default for ServeConnection {
             closed: None,
             progress: 0,
             handed_over: 0,
+            fec: FecSender::default(),
+            fec_negotiated: false,
         }
     }
+}
+
+/// One epoch this serve opened for one bundle: what to re-send reliably when
+/// the receiver reports a generation abandoned or the epoch refused.
+#[derive(Clone, Debug)]
+pub(crate) struct OpenedEpoch {
+    pub(crate) root: [u8; 32],
+    pub(crate) bundle_id: [u8; 16],
+    pub(crate) plan: vot_fec::EpochPlan,
+    /// Generations still owed an outcome; the epoch closes when empty.
+    pub(crate) live: std::collections::BTreeSet<u32>,
+}
+
+/// The sender side of datagram FEC for one connection.
+#[derive(Debug, Default)]
+pub(crate) struct FecSender {
+    pub(crate) sender: vot_fec::Sender,
+    pub(crate) epochs: std::collections::BTreeMap<u32, OpenedEpoch>,
 }
 
 pub(crate) struct Remembered {
@@ -52,6 +77,9 @@ pub(crate) struct Remembered {
 pub(crate) enum Outbound {
     Control(Payload),
     Record(Payload),
+    /// One FEC symbol datagram, in the same queue so the outbound budget and
+    /// the backlog see it.
+    Datagram(Payload),
 }
 
 impl Outbound {
@@ -60,11 +88,12 @@ impl Outbound {
         match self {
             Self::Control(frame) => frame.len(),
             Self::Record(record) => record.len(),
+            Self::Datagram(symbol) => symbol.len(),
         }
     }
 
     /// Hands the answer to its lane: control frames as control, records
-    /// shared on the record lane.
+    /// shared on the record lane, symbols to the datagram path.
     pub(crate) fn send<A: TransportAdapter>(
         &self,
         session: &mut Session<A>,
@@ -72,6 +101,7 @@ impl Outbound {
         match self {
             Self::Control(frame) => session.send_control(frame),
             Self::Record(record) => session.send_reliable_shared(RECORD_LANE, record.clone()),
+            Self::Datagram(symbol) => session.send_datagram(0, symbol),
         }
     }
 }
@@ -219,6 +249,10 @@ impl ServeConnection {
 
     pub(crate) fn queue_record(&mut self, record: Payload) {
         self.queue(Outbound::Record(record));
+    }
+
+    pub(crate) fn queue_datagram(&mut self, symbol: Payload) {
+        self.queue(Outbound::Datagram(symbol));
     }
 
     /// Hands queued answers to the session until the carrier refuses one.

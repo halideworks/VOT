@@ -25,6 +25,7 @@ vot-pack = { path = "../vot-pack" }
 vot-package = { path = "../vot-package" }
 vot-receipt = { path = "../vot-receipt" }
 vot-resume = { path = "../vot-resume" }
+vot-fec = { path = "../vot-fec" }
 vot-scheduler = { path = "../vot-scheduler", default-features = false, features = ["file-sink"] }
 vot-session = { path = "../vot-session" }
 vot-transport-api = { path = "../vot-transport-api" }

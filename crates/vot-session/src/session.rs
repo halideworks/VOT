@@ -409,6 +409,20 @@ impl<A: TransportAdapter> Session<A> {
         Ok(())
     }
 
+    /// Submits an unreliable datagram, the experimental symbol path.
+    ///
+    /// # Errors
+    /// Refuses before `Ready` and propagates a backend refusal. Whether the
+    /// peer negotiated the extension the datagram serves is the caller's to
+    /// check with [`Self::extension_negotiated`]; the carrier drops what the
+    /// peer's session will not take.
+    pub fn send_datagram(&mut self, context: u64, payload: &[u8]) -> Result<(), Error> {
+        self.require_sendable()?;
+        self.adapter
+            .send_datagram(context, payload)
+            .map_err(transport_error)
+    }
+
     /// Pushes queued submissions into the backend.
     ///
     /// Allowed before `Ready`, because the negotiation frames themselves have

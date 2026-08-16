@@ -2449,6 +2449,13 @@ name = "vot-coverage"
 version = "0.0.1"
 
 [[package]]
+name = "vot-fec"
+version = "0.0.1"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "vot-journal"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,8 @@
+constant vot_fec::MAX_REPAIR_SYMBOLS
+constant vot_fec::MAX_SOURCE_SYMBOLS
+constant vot_fec::MAX_SYMBOLS
+constant vot_fec::MAX_SYMBOL_LENGTH
+enum vot_fec::Error
+function vot_fec::decode
+function vot_fec::encode
+struct vot_fec::Geometry

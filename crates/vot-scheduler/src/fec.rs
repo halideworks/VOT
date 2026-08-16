@@ -24,6 +24,18 @@ use vot_fec::{Credit, Decoded, EpochPlan, Open, Receiver, Report, Symbol};
 /// and the reliable path repairs it. Their FEC credit was released when they
 /// decoded, so this is the whole bound on them.
 pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 16;
+
+/// Most `GEN_STATE` frames held for sending at once.
+///
+/// A state is advisory (`spec/fec.md` section 11), so one this end has no
+/// room for is dropped rather than queued. Without that bound the datagram
+/// path can mint them faster than the control stream drains: one arrives per
+/// generation opened, a peer that stops reading leaves everything queued,
+/// and closing an epoch frees the credit that limits how many generations
+/// may be live, so opening and closing epochs mints another queue's worth
+/// each time. Credit and done frames are never dropped, because the
+/// sender's own state machine waits on them.
+pub(crate) const MAX_OWED_STATES: usize = 256;
 pub(crate) const MAX_ORPHAN_BYTES: usize = 16 * 65_536;
 
 /// The bundle a decoded generation belongs to: the object root and the exact
@@ -124,6 +136,9 @@ pub(crate) struct Intake {
     orphan_bytes: usize,
     owed: VecDeque<Owed>,
     credit_epoch: u64,
+    /// States among `owed`, so the advisory ones can be bounded without
+    /// walking the queue.
+    owed_states: usize,
     /// What the datagram path did over the session's life.
     counts: FecCounts,
 }
@@ -232,8 +247,7 @@ impl Intake {
                 // generation and no state is accepted after it. What this one
                 // was still missing when it was given up on is the only loss
                 // sample the sender gets for it.
-                self.owed
-                    .push_back(Owed::State(state_of(header.epoch, generation, &state)));
+                self.owe_state(state_of(header.epoch, generation, &state));
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
                     generation,
@@ -247,11 +261,7 @@ impl Intake {
                 // a control frame behind every datagram.
                 if first {
                     if let Some(state) = self.receiver.report(header.epoch, header.generation) {
-                        self.owed.push_back(Owed::State(state_of(
-                            header.epoch,
-                            header.generation,
-                            &state,
-                        )));
+                        self.owe_state(state_of(header.epoch, header.generation, &state));
                     }
                 }
                 None
@@ -320,13 +330,29 @@ impl Intake {
     }
 
     /// The front owed frame reached the carrier.
+    /// Queues an advisory state, or drops it when this end is already
+    /// holding [`MAX_OWED_STATES`] of them.
+    fn owe_state(&mut self, state: GenState) {
+        if self.owed_states >= MAX_OWED_STATES {
+            return;
+        }
+        self.owed_states += 1;
+        self.owed.push_back(Owed::State(state));
+    }
+
     pub(crate) fn settle_owed(&mut self) {
-        self.owed.pop_front();
+        if let Some(Owed::State(_)) = self.owed.pop_front() {
+            self.owed_states -= 1;
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn take_owed(&mut self) -> Option<Owed> {
-        self.owed.pop_front()
+        let taken = self.owed.pop_front();
+        if let Some(Owed::State(_)) = taken {
+            self.owed_states -= 1;
+        }
+        taken
     }
 }
 
@@ -361,7 +387,6 @@ pub(crate) fn record_of(bundle_id: [u8; 16], joined: Joined) -> DataRecord {
     }
 }
 
-/// Encodes one owed frame.
 /// One `GEN_STATE` frame from what the receiver reported.
 fn state_of(epoch: u32, generation: u32, report: &Report) -> GenState {
     GenState {
@@ -373,6 +398,7 @@ fn state_of(epoch: u32, generation: u32, report: &Report) -> GenState {
     }
 }
 
+/// Encodes one owed frame.
 pub(crate) fn frame_of(owed: &Owed) -> Vec<u8> {
     let typed = match owed {
         Owed::Credit(credit) => TypedFrame::DatagramCredit(vot_codec::frames::DatagramCredit {
@@ -573,6 +599,62 @@ mod tests {
         let (esi, symbol) = &symbols[1];
         assert!(intake.symbol(&datagram(3, 0, *esi, symbol)).is_none());
         assert_eq!(intake.take_owed(), None, "only the symbol that opened it");
+    }
+
+    #[test]
+    fn advisory_states_are_bounded_and_never_crowd_out_what_is_owed() {
+        // A peer that stops reading leaves everything queued, and one state
+        // is minted per generation opened, so the advisory ones are capped.
+        // Nothing else is: a done is terminal for its generation and the
+        // sender waits on it.
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 30);
+        assert!(matches!(intake.take_owed(), Some(Owed::Credit(_))));
+        // k = 2, L = 1: a two-byte generation, so one cover spans many.
+        let generations = u32::try_from(MAX_OWED_STATES).unwrap() + 8;
+        let length = u64::from(generations) * 2;
+        intake.open(&open_of(1, 0, length, 2, 1, 1)).unwrap();
+        for generation in 0..generations {
+            // A single source symbol opens the generation and leaves it
+            // short of its two, so each one queues a state and nothing else.
+            assert!(
+                intake.symbol(&datagram(1, generation, 0, &[7])).is_none(),
+                "generation {generation} is not complete"
+            );
+        }
+        assert_eq!(
+            intake.owed.len(),
+            MAX_OWED_STATES,
+            "the advisory queue stops growing"
+        );
+        assert!(
+            intake
+                .owed
+                .iter()
+                .all(|owed| matches!(owed, Owed::State(_))),
+            "everything queued here is a state"
+        );
+        // Settling states makes room for new ones again.
+        for _ in 0..8 {
+            intake.settle_owed();
+        }
+        intake.open(&open_of(2, 0, 2, 2, 1, 1)).unwrap();
+        assert!(intake.symbol(&datagram(2, 0, 0, &[9])).is_none());
+        assert!(
+            intake
+                .owed
+                .iter()
+                .any(|owed| matches!(owed, Owed::State(state) if state.epoch == 2)),
+            "room freed is room reused"
+        );
+        // Credit still goes out with the queue at its cap, because the
+        // sender's flow control waits on it. Last, because a narrower credit
+        // is what stops new generations going live.
+        intake.extend_credit(1 << 20);
+        assert!(
+            matches!(intake.owed.back(), Some(Owed::Credit(_))),
+            "a credit is owed whatever the state queue holds"
+        );
     }
 
     #[test]

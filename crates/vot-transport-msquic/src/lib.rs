@@ -895,6 +895,18 @@ pub mod live {
                 bytes,
             })
         }
+
+        fn grow(&self, hold: &mut Self::Hold, bytes: usize) -> bool {
+            let Some(total) = hold.bytes.checked_add(bytes) else {
+                return false;
+            };
+            let mut budget = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if !budget.reserve_assembly(bytes) {
+                return false;
+            }
+            hold.bytes = total;
+            true
+        }
     }
 
     /// Builds the per-stream receive callback.
@@ -2470,6 +2482,32 @@ pub mod live {
             assert!(collect(&mut right, &second[..4]).unwrap().is_empty());
             assert_eq!(collect(&mut right, &second[4..]).unwrap(), vec![second]);
             assert_eq!(collect(&mut left, &first[4..]).unwrap(), vec![first]);
+        }
+
+        #[test]
+        fn a_grown_assembly_hold_is_one_charge() {
+            use vot_transport_framing::AssemblyBudget;
+            let queue = Arc::new(Mutex::new(super::CallbackQueue::default()));
+            let budget = super::SharedBudget(Arc::clone(&queue));
+            let mut hold = budget.reserve(1).expect("a byte");
+            assert!(
+                budget.grow(&mut hold, MAX_CALLBACK_BYTES - 1),
+                "an exact fit"
+            );
+            assert_eq!(hold.bytes, MAX_CALLBACK_BYTES);
+            assert_eq!(queue.lock().unwrap().charged(), MAX_CALLBACK_BYTES);
+            assert!(!budget.grow(&mut hold, 1), "a byte past the budget");
+            assert!(!budget.grow(&mut hold, usize::MAX), "an overflowing grow");
+            assert_eq!(
+                hold.bytes, MAX_CALLBACK_BYTES,
+                "a refused grow leaves the hold"
+            );
+            drop(hold);
+            assert_eq!(
+                queue.lock().unwrap().charged(),
+                0,
+                "one drop returns the grown charge"
+            );
         }
 
         #[test]

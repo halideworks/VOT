@@ -44,21 +44,7 @@ impl Ledger {
     /// Rejects a zero amount, overflow, a request past the limit, or a
     /// poisoned ledger. A rejection leaves the counters unchanged.
     pub fn acquire(&self, amount: u64) -> Result<Permit, Error> {
-        if amount == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
-        let mut inner = lock(&self.inner);
-        if inner.poisoned {
-            return Err(Error::AccountingPoisoned);
-        }
-        let next = inner
-            .used
-            .checked_add(amount)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if next > inner.limit {
-            return Err(Error::StagingExhausted);
-        }
-        inner.used = next;
+        charge(&self.inner, amount)?;
         Ok(Permit {
             ledger: Arc::clone(&self.inner),
             amount,
@@ -124,6 +110,22 @@ impl Permit {
         self.amount
     }
 
+    /// Charges `more` onto this permit, so one permit can cover a reservation
+    /// that arrives in pieces.
+    ///
+    /// # Errors
+    /// Rejects a zero amount, overflow, a request past the limit, or a
+    /// poisoned ledger. A rejection leaves the permit and counters unchanged.
+    pub fn grow(&mut self, more: u64) -> Result<(), Error> {
+        let total = self
+            .amount
+            .checked_add(more)
+            .ok_or(Error::ArithmeticOverflow)?;
+        charge(&self.ledger, more)?;
+        self.amount = total;
+        Ok(())
+    }
+
     /// Moves `take` into a new permit. The ledger used amount is unchanged.
     ///
     /// # Errors
@@ -158,6 +160,26 @@ impl Drop for Permit {
         }
         self.amount = 0;
     }
+}
+
+/// Adds `amount` to the ledger's used count, or leaves it unchanged.
+fn charge(inner: &Mutex<Inner>, amount: u64) -> Result<(), Error> {
+    if amount == 0 {
+        return Err(Error::InvalidConfiguration);
+    }
+    let mut inner = lock(inner);
+    if inner.poisoned {
+        return Err(Error::AccountingPoisoned);
+    }
+    let next = inner
+        .used
+        .checked_add(amount)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if next > inner.limit {
+        return Err(Error::StagingExhausted);
+    }
+    inner.used = next;
+    Ok(())
 }
 
 fn lock(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
@@ -199,6 +221,30 @@ mod tests {
         );
         assert_eq!(ledger.used(), 2);
         drop(held);
+    }
+
+    #[test]
+    fn grow_charges_onto_the_same_permit() {
+        let ledger = Ledger::new(10).unwrap();
+        let mut permit = ledger.acquire(3).unwrap();
+        permit.grow(4).unwrap();
+        assert_eq!(permit.amount(), 7);
+        assert_eq!(ledger.used(), 7);
+        drop(permit);
+        assert_eq!(ledger.used(), 0, "one drop returns the whole grown amount");
+    }
+
+    #[test]
+    fn grow_rejects_without_touching_permit_or_ledger() {
+        let ledger = Ledger::new(10).unwrap();
+        let mut permit = ledger.acquire(6).unwrap();
+        assert_eq!(permit.grow(0).err(), Some(Error::InvalidConfiguration));
+        assert_eq!(permit.grow(5).err(), Some(Error::StagingExhausted));
+        assert_eq!(permit.grow(u64::MAX).err(), Some(Error::ArithmeticOverflow));
+        assert_eq!(permit.amount(), 6);
+        assert_eq!(ledger.used(), 6);
+        permit.grow(4).unwrap();
+        assert_eq!(ledger.used(), 10, "an exact fit still grows");
     }
 
     #[test]

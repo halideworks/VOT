@@ -80,9 +80,17 @@ pub(crate) struct Joined {
 /// decode threshold before the epoch closed. `refused` counts epochs rather
 /// than generations, because an epoch this end would not open never said how
 /// many generations it held.
+///
+/// `offered` is what the epoch spans, not what the sender chose to code. A
+/// sender past this end's generation credit sends the remainder as reliable
+/// records from the outset, and this end cannot tell those apart from the
+/// ones whose symbols were lost: both are simply generations of an open
+/// epoch that never decoded. So `offered - decoded` is the share the
+/// reliable path carried, for either reason, and not a loss rate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FecCounts {
-    /// Generations in every coding epoch this end opened.
+    /// Generations spanned by every coding epoch this end opened, whether or
+    /// not the sender coded them.
     pub offered: u64,
     /// Generations decoded from symbols.
     pub decoded: u64,

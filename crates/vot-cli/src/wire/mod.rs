@@ -1541,7 +1541,10 @@ mod tests {
         // `a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it`,
         // over a carrier with no queue to overrun.
         let counts = outcome.fec;
-        assert_eq!(counts.offered, 23, "every generation was offered coded");
+        assert_eq!(
+            counts.offered, 23,
+            "the epochs opened span every generation of the object"
+        );
         assert_eq!(counts.refused, 0, "credit admitted every epoch");
         assert!(
             counts.decoded + counts.abandoned <= counts.offered,

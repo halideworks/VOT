@@ -2380,6 +2380,7 @@ dependencies = [
  "rustix",
  "vot-capability",
  "vot-codec",
+ "vot-fec",
  "vot-manifest",
  "vot-object",
  "vot-pack",

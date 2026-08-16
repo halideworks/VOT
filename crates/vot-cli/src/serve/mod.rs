@@ -26,6 +26,7 @@ mod server;
 #[cfg(test)]
 use connection::{OUTBOUND_BUDGET_BYTES, REMEMBERED_REQUESTS};
 
+pub(crate) use connection::OpenedEpoch;
 pub use connection::ServeConnection;
 pub(crate) use object::*;
 pub use server::BundleServer;
@@ -319,6 +320,464 @@ mod tests {
             assert_eq!(assembled, expected, "the whole object arrived verified");
         }
         assert!(session.driver().closed.is_none());
+    }
+
+    /// A ready session with `DATAGRAM_FEC` negotiated at both ends and the
+    /// peer's credit already extended.
+    pub(crate) fn ready_session_fec(credit: frames::DatagramCredit) -> Session<Loopback> {
+        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            fec.clone(),
+            not_required(),
+        );
+        server.begin().unwrap();
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            fec,
+            not_required(),
+        );
+        client.begin().unwrap();
+        for frame in std::mem::take(&mut client.driver().control) {
+            server
+                .driver()
+                .events
+                .push_back(Event::Control(shared_payload(&frame)));
+        }
+        assert_eq!(server.poll().unwrap(), None);
+        assert!(server.is_ready());
+        server.driver().control.clear();
+        server
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::DatagramCredit(credit)));
+        server
+    }
+
+    fn ample_credit() -> frames::DatagramCredit {
+        frames::DatagramCredit {
+            credit_epoch: 1,
+            max_unretired_bytes: 1 << 24,
+            max_active_generations: 64,
+            max_decode_work: 1 << 30,
+            max_open_epochs: 4,
+        }
+    }
+
+    /// Decodes every queued symbol datagram through a receiver and returns
+    /// each generation's bytes by generation.
+    fn decoded_generations(
+        session: &mut Session<Loopback>,
+        open: &frames::CodingEpochOpen,
+        credit: vot_fec::Credit,
+    ) -> BTreeMap<u32, Vec<u8>> {
+        let mut receiver = vot_fec::Receiver::new();
+        receiver.credit(credit);
+        let plan =
+            vot_fec::EpochPlan::new(open.epoch, open.offset, open.length, open.geometry).unwrap();
+        assert_eq!(receiver.open(plan), Ok(vot_fec::Open::Opened));
+        let mut out = BTreeMap::new();
+        for datagram in std::mem::take(&mut session.driver().datagrams) {
+            let (header, symbol) = frames::decode_symbol(&datagram, open.geometry).unwrap();
+            if let vot_fec::Symbol::Decoded(decoded) =
+                receiver.symbol(header.epoch, header.generation, header.esi, symbol)
+            {
+                out.insert(decoded.generation, decoded.bytes);
+            }
+        }
+        out
+    }
+
+    fn fec_frames(session: &mut Session<Loopback>) -> Vec<TypedFrame> {
+        std::mem::take(&mut session.driver().control)
+            .iter()
+            .map(|frame| decode_control(frame))
+            .collect()
+    }
+
+    #[test]
+    pub(crate) fn a_negotiated_credited_session_is_answered_over_the_datagram_path() {
+        let (bundle, _) = built_bundle("coded", &[("big.bin", patterned(300_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        // The whole object: 300000 bytes is five 64 KiB groups, the last short.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [7; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let [
+            TypedFrame::ProofBundle(bundle_frame),
+            TypedFrame::CodingEpochOpen(open),
+        ] = &frames[..]
+        else {
+            panic!("bundle then open, got {frames:?}");
+        };
+        assert_eq!(
+            bundle_frame.data_record_count, 5,
+            "one record per generation"
+        );
+        assert_eq!(open.offset, bundle_frame.covered_offset);
+        assert_eq!(open.length, bundle_frame.covered_length);
+        assert_eq!(open.object, object);
+        assert_eq!(
+            open.geometry,
+            vot_fec::Geometry::new(64, server::FEC_REPAIR_SYMBOLS, 1024).unwrap()
+        );
+        assert!(
+            session.driver().records.is_empty(),
+            "nothing rode the record lane"
+        );
+        assert_eq!(
+            session.driver().datagrams.len(),
+            4 * (64 + server::FEC_REPAIR_SYMBOLS)
+                + (server::FEC_REPAIR_SYMBOLS + 300_000_usize.div_ceil(1024) - 4 * 64),
+            "every sent source and every repair symbol, the short tail's zero sources omitted"
+        );
+        // Decoded through a receiver, the generations are the bundle's records
+        // and verify against its proof.
+        let generations = decoded_generations(
+            &mut session,
+            open,
+            vot_fec::Credit {
+                credit_epoch: 1,
+                max_unretired_bytes: 1 << 24,
+                max_active_generations: 64,
+                max_decode_work: 1 << 30,
+                max_open_epochs: 4,
+            },
+        );
+        assert_eq!(generations.len(), 5);
+        let records: Vec<DataRecord> = generations
+            .iter()
+            .map(|(generation, bytes)| DataRecord {
+                bundle_id: bundle_frame.bundle_id,
+                record_index: u64::from(*generation),
+                plaintext_offset: u64::from(*generation) * server::FEC_GENERATION_BYTES,
+                plaintext_length: bytes.len() as u64,
+                compression: 0,
+                encoded: bytes.clone(),
+            })
+            .collect();
+        let assembled = verified_bytes(object, bundle_frame, &records);
+        assert_eq!(assembled, patterned(300_000));
+        // Feedback: decoded generations settle; the last one closes the epoch.
+        for generation in 0..5 {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                    epoch: open.epoch,
+                    generation,
+                    outcome: frames::GenOutcome::Decoded,
+                })));
+        }
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            fec_frames(&mut session),
+            vec![TypedFrame::CodingEpochClose(frames::CodingEpochClose {
+                epoch: open.epoch
+            })]
+        );
+        assert!(connection.fec.epochs.is_empty());
+        assert!(session.driver().records.is_empty());
+    }
+
+    #[test]
+    pub(crate) fn an_abandoned_or_refused_generation_is_resent_reliably() {
+        let (bundle, _) = built_bundle("resend", &[("big.bin", patterned(200_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [8; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let [
+            TypedFrame::ProofBundle(bundle_frame),
+            TypedFrame::CodingEpochOpen(open),
+        ] = &frames[..]
+        else {
+            panic!("bundle then open");
+        };
+        assert_eq!(bundle_frame.data_record_count, 4);
+        session.driver().datagrams.clear();
+        // Generation 2 abandoned: its record rides the record lane, index 2,
+        // absolute offset, and the epoch stays open for the rest.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch: open.epoch,
+                generation: 2,
+                outcome: frames::GenOutcome::Abandoned,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(fec_frames(&mut session).is_empty(), "no close yet");
+        let records = std::mem::take(&mut session.driver().records);
+        assert_eq!(records.len(), 1);
+        let TypedFrame::DataRecord(record) = decode_control(&records[0].1) else {
+            panic!("a record");
+        };
+        assert_eq!(record.bundle_id, bundle_frame.bundle_id);
+        assert_eq!(record.record_index, 2);
+        assert_eq!(record.plaintext_offset, 2 * server::FEC_GENERATION_BYTES);
+        assert_eq!(record.plaintext_length, server::FEC_GENERATION_BYTES);
+        assert_eq!(
+            record.encoded,
+            patterned(200_000)[131_072..196_608].to_vec()
+        );
+        // A repeat with another outcome is the peer's fault.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch: open.epoch,
+                generation: 2,
+                outcome: frames::GenOutcome::Decoded,
+            })));
+        assert_eq!(
+            server.service(&mut session, &mut connection).unwrap(),
+            ServeStatus::Closed(error_code::MALFORMED_FRAME)
+        );
+
+        // Refused: a second session whose open the receiver would not hold.
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [9; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let TypedFrame::CodingEpochOpen(open) = &frames[1] else {
+            panic!("an open");
+        };
+        session.driver().datagrams.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch: open.epoch,
+                generation: 0,
+                outcome: frames::GenOutcome::Refused,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            fec_frames(&mut session),
+            vec![TypedFrame::CodingEpochClose(frames::CodingEpochClose {
+                epoch: open.epoch
+            })]
+        );
+        let records = std::mem::take(&mut session.driver().records);
+        assert_eq!(records.len(), 4, "every generation rides reliably");
+        assert!(connection.fec.epochs.is_empty());
+        // The identifier is spent: the next answer opens a higher epoch.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [10; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let TypedFrame::CodingEpochOpen(next) = &frames[1] else {
+            panic!("an open");
+        };
+        assert!(next.epoch > open.epoch);
+    }
+
+    #[test]
+    pub(crate) fn without_credit_or_generation_room_the_answer_rides_reliably() {
+        let (bundle, _) = built_bundle("plain", &[("big.bin", patterned(200_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        // Negotiated, but the peer never extended credit: the reliable answer.
+        let mut session = ready_session_fec(frames::DatagramCredit {
+            credit_epoch: 1,
+            max_unretired_bytes: 0,
+            max_active_generations: 0,
+            max_decode_work: 0,
+            max_open_epochs: 0,
+        });
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [11; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let answers = served_answers(&mut session);
+        assert_eq!(answers.len(), 1);
+        assert!(session.driver().datagrams.is_empty());
+        assert!(connection.fec.epochs.is_empty());
+        // One generation of credit: the first rides coded, the other three
+        // reliably under the same bundle.
+        let mut session = ready_session_fec(frames::DatagramCredit {
+            credit_epoch: 1,
+            max_unretired_bytes: 1 << 24,
+            max_active_generations: 1,
+            max_decode_work: 1 << 30,
+            max_open_epochs: 4,
+        });
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [12; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let [
+            TypedFrame::ProofBundle(bundle_frame),
+            TypedFrame::CodingEpochOpen(_),
+        ] = &frames[..]
+        else {
+            panic!("bundle then open");
+        };
+        assert_eq!(bundle_frame.data_record_count, 4);
+        assert_eq!(
+            session.driver().datagrams.len(),
+            64 + server::FEC_REPAIR_SYMBOLS
+        );
+        let indexes: Vec<u64> = session
+            .driver()
+            .records
+            .iter()
+            .map(|(_, bytes)| match decode_control(bytes) {
+                TypedFrame::DataRecord(record) => record.record_index,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(indexes, vec![1, 2, 3]);
+        assert_eq!(connection.fec.epochs.len(), 1);
+        // GEN_STATE is taken as feedback: one for a generation past the epoch
+        // is the peer's fault, one inside it is quiet.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                epoch: 0,
+                generation: 0,
+                sequence: 1,
+                received: 3,
+                missing_sources: vec![0, 1],
+            })));
+        assert_eq!(
+            server.service(&mut session, &mut connection).unwrap(),
+            ServeStatus::Active
+        );
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                epoch: 0,
+                generation: 9,
+                sequence: 2,
+                received: 0,
+                missing_sources: vec![],
+            })));
+        assert_eq!(
+            server.service(&mut session, &mut connection).unwrap(),
+            ServeStatus::Closed(error_code::MALFORMED_FRAME)
+        );
+    }
+
+    #[test]
+    pub(crate) fn a_range_starting_on_a_later_group_is_coded_from_that_group() {
+        let (bundle, _) = built_bundle("later", &[("big.bin", patterned(200_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        // The second and third groups only.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [13; 16],
+                object,
+                offset: 65_536,
+                length: 131_072,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let [
+            TypedFrame::ProofBundle(bundle_frame),
+            TypedFrame::CodingEpochOpen(open),
+        ] = &frames[..]
+        else {
+            panic!("bundle then open, got {frames:?}");
+        };
+        assert_eq!(bundle_frame.covered_offset, 65_536);
+        assert_eq!(bundle_frame.data_record_count, 2);
+        assert_eq!(open.offset, 65_536);
+        let generations = decoded_generations(
+            &mut session,
+            open,
+            vot_fec::Credit {
+                credit_epoch: 1,
+                max_unretired_bytes: 1 << 24,
+                max_active_generations: 64,
+                max_decode_work: 1 << 30,
+                max_open_epochs: 4,
+            },
+        );
+        assert_eq!(generations.len(), 2);
+        assert_eq!(
+            generations[&0],
+            patterned(200_000)[65_536..131_072].to_vec()
+        );
+        assert_eq!(
+            generations[&1],
+            patterned(200_000)[131_072..196_608].to_vec()
+        );
     }
 
     #[test]

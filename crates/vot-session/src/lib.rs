@@ -2770,6 +2770,28 @@ mod tests {
     }
 
     #[test]
+    fn a_datagram_is_refused_before_readiness_and_reaches_the_carrier_after() {
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        assert!(matches!(
+            client.send_datagram(1, b"symbol").unwrap_err().kind(),
+            ErrorKind::NotReady { .. }
+        ));
+        let (mut client, _) = negotiated();
+        // The loopback has no datagram path, which is what the default
+        // adapter reports; the point is that the session let it through.
+        assert!(matches!(
+            client.send_datagram(1, b"symbol").unwrap_err().kind(),
+            ErrorKind::Transport(TransportError::Unsupported)
+        ));
+    }
+
+    #[test]
     fn a_record_larger_than_the_peer_accepts_is_refused() {
         let peer = Settings {
             max_data_record_payload: 64 * 1024,

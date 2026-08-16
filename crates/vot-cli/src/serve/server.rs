@@ -2,10 +2,10 @@
 
 use super::{
     BTreeMap, DataRecord, DecodeLimits, Error, Event, Fault, MANIFEST_DIRECTORY, MANIFEST_SEAL,
-    MAX_CONTROL_FRAME_PAYLOAD, ManifestReader, ManifestRequest, PackageDescriptor, PackageSummary,
-    Path, PathBuf, Payload, ProofBundle, RECORD_PLAINTEXT_BYTES, RangeRequest, ServeConnection,
-    ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter, TypedFrame, encoded,
-    error_code, fail, frame_type, frames,
+    MAX_CONTROL_FRAME_PAYLOAD, ManifestReader, ManifestRequest, OpenedEpoch, PackageDescriptor,
+    PackageSummary, Path, PathBuf, Payload, ProofBundle, RECORD_PLAINTEXT_BYTES, RangeRequest,
+    ServeConnection, ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter,
+    TypedFrame, encoded, error_code, fail, frame_type, frames,
 };
 
 /// One bundle, opened and proved once, answering any number of sessions.
@@ -114,6 +114,8 @@ impl BundleServer {
             if connection.outbound.bytes() >= connection.budget {
                 break;
             }
+            connection.fec_negotiated =
+                session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
             match session.poll() {
                 Ok(Some(Event::Control(bytes))) => {
                     // Announce before the first answer.
@@ -193,9 +195,120 @@ impl BundleServer {
                 connection.admit_request(frame_type::RANGE_REQUEST, request.request_id, bytes)?;
                 self.answer_range(&request, bytes, connection)
             }
+            // The receiver's side of datagram FEC (spec/fec.md section 11).
+            TypedFrame::DatagramCredit(credit) => {
+                connection.fec.sender.credit(vot_fec::Credit {
+                    credit_epoch: credit.credit_epoch,
+                    max_unretired_bytes: credit.max_unretired_bytes,
+                    max_active_generations: credit.max_active_generations,
+                    max_decode_work: credit.max_decode_work,
+                    max_open_epochs: credit.max_open_epochs,
+                });
+                Ok(())
+            }
+            TypedFrame::GenState(state) => {
+                connection
+                    .fec
+                    .sender
+                    .state(
+                        state.epoch,
+                        state.generation,
+                        vot_fec::State {
+                            sequence: state.sequence,
+                            received: state.received,
+                            missing_sources: &state.missing_sources,
+                        },
+                    )
+                    .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
+                Ok(())
+            }
+            TypedFrame::GenDone(done) => self.generation_done(&done, connection),
             // A well-formed frame this engine does not answer yet.
             _ => Ok(()),
         }
+    }
+
+    /// `GEN_DONE` from the receiver: a decoded generation is settled, an
+    /// abandoned one is re-sent as a reliable record of the same bundle, a
+    /// refused epoch is closed and every generation of it re-sent, and an
+    /// epoch with nothing live left is closed.
+    fn generation_done(
+        &self,
+        done: &frames::GenDone,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        let Some(opened) = connection.fec.epochs.get(&done.epoch).cloned() else {
+            // An epoch this end does not have open: ignored (section 12).
+            return Ok(());
+        };
+        match done.outcome {
+            frames::GenOutcome::Refused => {
+                connection.fec.sender.refused(done.epoch);
+                connection.fec.epochs.remove(&done.epoch);
+                for generation in &opened.live {
+                    self.resend_generation(&opened, *generation, connection)?;
+                }
+                connection.queue_control(encoded(&TypedFrame::CodingEpochClose(
+                    frames::CodingEpochClose { epoch: done.epoch },
+                ))?);
+                Ok(())
+            }
+            outcome => {
+                let verdict = match outcome {
+                    frames::GenOutcome::Decoded => vot_fec::Done::Decoded,
+                    _ => vot_fec::Done::Abandoned,
+                };
+                connection
+                    .fec
+                    .sender
+                    .done(done.epoch, done.generation, verdict)
+                    .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
+                if verdict == vot_fec::Done::Abandoned {
+                    self.resend_generation(&opened, done.generation, connection)?;
+                }
+                let epoch = connection
+                    .fec
+                    .epochs
+                    .get_mut(&done.epoch)
+                    .expect("cloned above");
+                epoch.live.remove(&done.generation);
+                if epoch.live.is_empty() {
+                    connection.fec.sender.close(done.epoch);
+                    connection.fec.epochs.remove(&done.epoch);
+                    connection.queue_control(encoded(&TypedFrame::CodingEpochClose(
+                        frames::CodingEpochClose { epoch: done.epoch },
+                    ))?);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// One generation of an epoch as the reliable record it would have been.
+    fn resend_generation(
+        &self,
+        opened: &OpenedEpoch,
+        generation: u32,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        let served = self
+            .objects
+            .get(&opened.root)
+            .ok_or(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH))?;
+        if !opened.plan.holds(generation) {
+            return Ok(());
+        }
+        let (offset, length) = opened.plan.generation_span(generation);
+        let plaintext = served.read_covered(offset, length)?;
+        connection.queue_record(encoded(&TypedFrame::DataRecord(DataRecord {
+            bundle_id: opened.bundle_id,
+            record_index: u64::from(generation),
+            plaintext_offset: offset,
+            plaintext_length: length,
+            compression: 0,
+            encoded: plaintext,
+        }))?);
+        Ok(())
     }
 
     pub(crate) fn answer_manifest(
@@ -268,6 +381,19 @@ impl BundleServer {
         // Bundle identity derives from the request bytes, for replay detection.
         let mut bundle_id = [0u8; 16];
         bundle_id.copy_from_slice(&blake3::hash(request_bytes).as_bytes()[..16]);
+        if let Some(plan) = Self::fec_plan(connection, covered_offset, covered_length) {
+            return Self::answer_range_coded(
+                request,
+                served.object,
+                bundle_id,
+                covered_offset,
+                covered_length,
+                proof,
+                &plaintext,
+                plan,
+                connection,
+            );
+        }
         let chunks = plaintext.chunks(RECORD_PLAINTEXT_BYTES);
         let bundle = TypedFrame::ProofBundle(ProofBundle {
             request_id: request.request_id,
@@ -297,4 +423,140 @@ impl BundleServer {
         }
         Ok(())
     }
+
+    /// The epoch this answer would travel under, when the session negotiated
+    /// `DATAGRAM_FEC`, the peer's credit admits one more epoch, and the range
+    /// starts on a generation boundary so each generation is one integrity
+    /// group. `None` sends the answer reliably as ever.
+    fn fec_plan(
+        connection: &mut ServeConnection,
+        covered_offset: u64,
+        covered_length: u64,
+    ) -> Option<vot_fec::EpochPlan> {
+        if !connection.fec_negotiated
+            || !connection.fec.sender.may_open()
+            || covered_offset % FEC_GENERATION_BYTES != 0
+        {
+            return None;
+        }
+        let epoch = connection.fec.sender.next_epoch()?;
+        vot_fec::EpochPlan::new(epoch, covered_offset, covered_length, fec_geometry()).ok()
+    }
+
+    /// The coded answer: the same bundle with one record per generation,
+    /// then the epoch open, then each generation's symbols, or its record
+    /// when the peer's generation credit is spent.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_range_coded(
+        request: &RangeRequest,
+        object: frames::ObjectId,
+        bundle_id: [u8; 16],
+        covered_offset: u64,
+        covered_length: u64,
+        proof: Vec<u8>,
+        plaintext: &[u8],
+        plan: vot_fec::EpochPlan,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        let generations = plan.generation_count();
+        connection.queue_control(encoded(&TypedFrame::ProofBundle(ProofBundle {
+            request_id: request.request_id,
+            bundle_id,
+            object,
+            requested_offset: request.offset,
+            requested_length: request.length,
+            covered_offset,
+            covered_length,
+            data_record_count: generations,
+            total_plaintext_length: covered_length,
+            proof,
+        }))?);
+        connection
+            .fec
+            .sender
+            .open(plan)
+            .map_err(|_| Error::InvalidBundle)?;
+        connection.queue_control(encoded(&TypedFrame::CodingEpochOpen(
+            frames::CodingEpochOpen {
+                epoch: plan.epoch(),
+                object,
+                offset: covered_offset,
+                length: covered_length,
+                geometry: plan.geometry(),
+            },
+        ))?);
+        let mut live = std::collections::BTreeSet::new();
+        for generation in 0..u32::try_from(generations).map_err(|_| Error::InvalidBundle)? {
+            let (offset, length) = plan.generation_span(generation);
+            let start =
+                usize::try_from(offset - covered_offset).map_err(|_| Error::InvalidBundle)?;
+            let end = start + usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
+            let bytes = &plaintext[start..end];
+            if connection
+                .fec
+                .sender
+                .begin(plan.epoch(), generation)
+                .is_ok()
+            {
+                for (esi, symbol) in vot_fec::encode_generation(&plan, generation, bytes)
+                    .map_err(|_| Error::InvalidBundle)?
+                {
+                    let mut datagram = Vec::new();
+                    frames::encode_symbol(
+                        frames::SymbolHeader {
+                            epoch: plan.epoch(),
+                            generation,
+                            esi,
+                        },
+                        plan.geometry(),
+                        &symbol,
+                        &mut datagram,
+                    )
+                    .map_err(|_| Error::InvalidBundle)?;
+                    connection.queue_datagram(Payload::from(datagram));
+                }
+                live.insert(generation);
+            } else {
+                // Past the peer's generation credit: this one rides reliably
+                // under the same bundle.
+                connection.queue_record(encoded(&TypedFrame::DataRecord(DataRecord {
+                    bundle_id,
+                    record_index: u64::from(generation),
+                    plaintext_offset: offset,
+                    plaintext_length: length,
+                    compression: 0,
+                    encoded: bytes.to_vec(),
+                }))?);
+            }
+        }
+        if live.is_empty() {
+            connection.fec.sender.close(plan.epoch());
+            connection.queue_control(encoded(&TypedFrame::CodingEpochClose(
+                frames::CodingEpochClose {
+                    epoch: plan.epoch(),
+                },
+            ))?);
+        } else {
+            connection.fec.epochs.insert(
+                plan.epoch(),
+                OpenedEpoch {
+                    root: object.root,
+                    bundle_id,
+                    plan,
+                    live,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The shipped FEC profile (spec/fec.md section 9): one generation is one
+/// 64 KiB integrity group, 64 sources of 1024 bytes, with the repair count
+/// this serve adds.
+pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
+pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
+
+fn fec_geometry() -> vot_fec::Geometry {
+    vot_fec::Geometry::new(64, FEC_REPAIR_SYMBOLS, 1024).expect("the shipped profile")
 }

@@ -21,6 +21,7 @@ use crate::{PackageSummary, build_bundle};
 pub(crate) struct Loopback {
     pub(crate) control: Vec<Vec<u8>>,
     pub(crate) records: Vec<(StreamId, Vec<u8>)>,
+    pub(crate) datagrams: Vec<Vec<u8>>,
     pub(crate) events: VecDeque<Event>,
     pub(crate) refuse_sends: usize,
     pub(crate) fail_sends_with: Option<vot_transport_api::Error>,
@@ -96,6 +97,16 @@ impl TransportAdapter for Loopback {
     ) -> Result<(), vot_transport_api::Error> {
         self.refuse_send()?;
         self.records.push((stream, record.to_vec()));
+        Ok(())
+    }
+
+    fn send_datagram(
+        &mut self,
+        _context: u64,
+        payload: &[u8],
+    ) -> Result<(), vot_transport_api::Error> {
+        self.refuse_send()?;
+        self.datagrams.push(payload.to_vec());
         Ok(())
     }
 

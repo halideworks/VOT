@@ -1,10 +1,10 @@
 //! The serve command over a live socket.
 
 use super::{
-    BundleServer, CONGESTION, Config, Credentials, Ephemeral, Error, Listener, PackageSummary,
-    Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME, ServeSession, SocketAddr,
-    apply_datagram_bytes, carrier_failure, congestion_from, limits, rendezvous_from,
-    requirement_from, start_registration,
+    BundleServer, CONGESTION, Config, Credentials, DATAGRAM_FEC, Ephemeral, Error, Listener,
+    PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME,
+    ServeSession, SocketAddr, apply_datagram_bytes, carrier_failure, congestion_from,
+    extensions_from, limits, rendezvous_from, requirement_from, start_registration,
 };
 
 /// The serve's stance for one session: what it asks of the peer, with a fresh
@@ -46,6 +46,26 @@ pub fn serve_bundle(
     address: SocketAddr,
     credentials: &Credentials,
     sessions: Option<u32>,
+    listening: impl FnMut(SocketAddr, [u8; 32]),
+) -> Result<PackageSummary, Error> {
+    let extensions = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
+    serve_bundle_offering(
+        bundle,
+        address,
+        credentials,
+        sessions,
+        &extensions,
+        listening,
+    )
+}
+
+/// [`serve_bundle`] offering `extensions` to every session.
+pub(crate) fn serve_bundle_offering(
+    bundle: &Path,
+    address: SocketAddr,
+    credentials: &Credentials,
+    sessions: Option<u32>,
+    extensions: &std::collections::BTreeSet<u64>,
     mut listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let server = BundleServer::open(bundle)?;
@@ -98,7 +118,11 @@ pub fn serve_bundle(
     let outcome = crate::drive::serve_sessions(sessions, || {
         // Accept blocks until a connection arrives.
         let carrier = listener.accept().map_err(carrier_failure)?;
-        ServeSession::begin(&server, carrier, serve_stance(requirement.as_ref())?)
+        ServeSession::begin(
+            &server,
+            carrier,
+            serve_stance(requirement.as_ref())?.offering(extensions.clone()),
+        )
     });
     // Drop before surfacing the error so the socket is released.
     drop(registration);

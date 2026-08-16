@@ -290,8 +290,14 @@ mod tests {
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         primary.rail.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
-        let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
+        let mut secondary = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
 
         let (mut seq1, mut seq2) = (0, 0);
         // Admit the rail before the primary settles, so the handout is deterministic.
@@ -348,8 +354,14 @@ mod tests {
         let output = temporary("abandoned-fetched");
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
-        let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
+        let mut secondary = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
 
         abandon_plan(&plan);
         assert_eq!(primary.service().unwrap(), FetchStatus::Disconnected);
@@ -367,8 +379,14 @@ mod tests {
         let output = temporary("railpace-fetched");
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         let plan = planned(&server, &mut session, &mut connection, &mut primary);
-        let mut secondary =
-            BundleFetcher::join(Loopback::default(), &output, Arc::clone(&plan), None).unwrap();
+        let mut secondary = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
         assert!(secondary.secondary, "a joined fetcher is a rail");
         assert_eq!(
             secondary.pin,
@@ -599,6 +617,82 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it() {
+        // Both ends offer DATAGRAM_FEC over an in-process pair that loses
+        // every ninth datagram: exactly eight of a full generation's 72, the
+        // repair count, so every generation decodes with nothing to spare
+        // and the fetch completes with the object having travelled as
+        // symbols.
+        let (bundle, built) = built_bundle("in-process-fec", &[("big.bin", patterned(1_500_000))]);
+        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let (client, mut serving) = crate::harness::duplex_pair();
+        serving.drop_datagram_every = 9;
+        let serving_bundle = bundle.to_path_buf();
+        let serving_offer = fec.clone();
+        let serving_thread = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]).offering(serving_offer.clone()),
+                )
+            })
+        });
+        let output = temporary("in-process-fec-fetched");
+        let mut fetcher =
+            BundleFetcher::begin_with(client, &output, Some(built.root), None, fec.clone())
+                .expect("a fetch offering the extension");
+        assert_eq!(fetcher.extensions(), fec);
+        assert_eq!(fetcher.fec_generations_decoded(), 0, "nothing yet");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        assert!(
+            fetcher.fec_generations_decoded() >= 20,
+            "the object's 23 generations came as symbols: {}",
+            fetcher.fec_generations_decoded()
+        );
+        drop(fetcher);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+        // A fetch offering nothing decodes nothing.
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let serving_thread = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]).offering(fec.clone()),
+                )
+            })
+        });
+        let output = temporary("in-process-plain-fetched");
+        let mut plain = BundleFetcher::begin(client, &output, Some(built.root)).unwrap();
+        assert!(plain.extensions().is_empty());
+        assert_eq!(
+            crate::drive::drive(&mut plain).expect("a driven fetch"),
+            FetchStatus::Complete
+        );
+        assert_eq!(plain.fec_generations_decoded(), 0);
+        drop(plain);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+    }
+
+    #[test]
     pub(crate) fn a_capability_decides_a_transfer_in_process() {
         // The same thing the QUIC test asserts, over the in-process duplex.
         // `wire.rs` is not compiled without the carrier feature, so the QUIC
@@ -653,9 +747,14 @@ mod tests {
             })
         });
         let output = temporary("in-process-granted");
-        let mut fetcher =
-            BundleFetcher::begin_with(client, &output, Some(built.root), Some(Arc::clone(&holder)))
-                .expect("a fetch holding the token");
+        let mut fetcher = BundleFetcher::begin_with(
+            client,
+            &output,
+            Some(built.root),
+            Some(Arc::clone(&holder)),
+            BTreeSet::new(),
+        )
+        .expect("a fetch holding the token");
         assert_eq!(
             crate::drive::drive(&mut fetcher).expect("a driven fetch"),
             FetchStatus::Complete,

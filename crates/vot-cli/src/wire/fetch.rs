@@ -1,10 +1,10 @@
 //! The fetch command over a live socket.
 
 use super::{
-    BundleFetcher, CONGESTION, Config, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY, FETCH_RAILS,
-    PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr, Transport,
-    apply_datagram_bytes, carrier_failure, congestion_from, holder_from, limits, local_for, punch,
-    rails_from, rendezvous_from, take_slot,
+    BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
+    FETCH_RAILS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr,
+    Transport, apply_datagram_bytes, carrier_failure, congestion_from, extensions_from,
+    holder_from, limits, local_for, punch, rails_from, rendezvous_from, take_slot,
 };
 
 /// Fetches a bundle from `address` into `bundle`.
@@ -76,6 +76,22 @@ pub(crate) fn fetch_over<F>(
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
+    let extensions = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
+    fetch_over_offering(primary, connect, bundle, pin, rails, extensions)
+}
+
+/// [`fetch_over`] offering `extensions` on every rail.
+pub(crate) fn fetch_over_offering<F>(
+    primary: Transport,
+    connect: F,
+    bundle: &Path,
+    pin: Option<[u8; 32]>,
+    rails: usize,
+    extensions: std::collections::BTreeSet<u64>,
+) -> Result<PackageSummary, Error>
+where
+    F: Fn() -> Result<Transport, Error> + Sync,
+{
     let mut fetcher = BundleFetcher::begin_with(
         primary,
         bundle,
@@ -84,6 +100,7 @@ where
             std::env::var(FETCH_CAPABILITY).ok().as_deref(),
             std::env::var(FETCH_HOLDER_KEY).ok().as_deref(),
         )?,
+        extensions,
     )?;
     if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
         fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;

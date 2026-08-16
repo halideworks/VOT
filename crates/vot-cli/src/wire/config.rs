@@ -62,6 +62,29 @@ fn positive(value: &str) -> Result<u64, Error> {
 /// The environment variable that picks the congestion controller.
 pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
 
+/// The environment variable that offers the experimental datagram FEC
+/// extension. Off unless set: `spec/architecture.md` has every experimental
+/// feature disabled by default.
+pub(crate) const DATAGRAM_FEC: &str = "VOT_DATAGRAM_FEC";
+
+/// The extensions [`DATAGRAM_FEC`] names: `1`, `on`, or `true` offer
+/// `DATAGRAM_FEC`; unset, `0`, `off`, or `false` offer nothing.
+///
+/// # Errors
+/// Rejects any other value.
+pub(crate) fn extensions_from(pin: Option<&str>) -> Result<std::collections::BTreeSet<u64>, Error> {
+    match pin
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("0" | "off" | "false") => Ok(std::collections::BTreeSet::new()),
+        Some("1" | "on" | "true") => Ok(std::collections::BTreeSet::from([
+            vot_codec::extension_id::DATAGRAM_FEC,
+        ])),
+        Some(_) => Err(Error::InvalidArguments),
+    }
+}
+
 /// The environment variable that sets how many rails a fetch runs.
 pub(crate) const FETCH_RAILS: &str = "VOT_FETCH_RAILS";
 

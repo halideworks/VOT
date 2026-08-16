@@ -466,12 +466,17 @@ name = "vot-codec"
 version = "0.0.1"
 dependencies = [
  "vot-cbor",
+ "vot-fec",
  "vot-manifest",
  "vot-receipt",
 ]
 
 [[package]]
 name = "vot-commit-model"
+version = "0.0.1"
+
+[[package]]
+name = "vot-fec"
 version = "0.0.1"
 
 [[package]]

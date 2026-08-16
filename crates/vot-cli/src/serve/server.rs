@@ -104,10 +104,8 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
-        // Whether this pass heard anything at all from the peer. A pass that
-        // did is not one the receiver stayed silent through, whatever it was
-        // about, so it cannot count against an epoch's quiet budget.
-        let mut heard = false;
+        // Whether this pass stopped before reading everything the peer sent.
+        let mut unread = false;
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -117,15 +115,15 @@ impl BundleServer {
             }
             if connection.outbound.bytes() >= connection.budget {
                 // Broken on the budget rather than on an empty queue, so
-                // frames the peer has already sent may be sitting unread.
-                heard = true;
+                // frames the peer has already sent may be sitting unread and
+                // an epoch's outcome may be among them.
+                unread = true;
                 break;
             }
             connection.fec_negotiated =
                 session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
             match session.poll() {
                 Ok(Some(Event::Control(bytes))) => {
-                    heard = true;
                     // Announce before the first answer.
                     self.ensure_announced(connection, session.is_ready());
                     if let Err(fault) = self.dispatch(&bytes, connection) {
@@ -133,9 +131,7 @@ impl BundleServer {
                     }
                 }
                 Ok(Some(Event::Disconnected(_))) => return Ok(ServeStatus::Disconnected),
-                Ok(Some(_)) => {
-                    heard = true;
-                }
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     self.ensure_announced(connection, session.is_ready());
                     break;
@@ -155,8 +151,10 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
-        if let Err(fault) = self.retire_quiet_epochs(connection, heard) {
-            return fail(fault, session, connection);
+        if !unread {
+            if let Err(fault) = self.retire_quiet_epochs(connection, std::time::Instant::now()) {
+                return fail(fault, session, connection);
+            }
         }
         connection.drain(session)?;
         if let Some(code) = connection.closed {
@@ -173,36 +171,36 @@ impl BundleServer {
     /// reports nothing: the receiver owes a `GEN_DONE` only for a generation
     /// it decoded or gave up on. Waiting for that outcome forever is what
     /// leaves the fetch with a record that never comes, so an epoch whose
-    /// symbols are all on the carrier and which has drawn no outcome for
-    /// `QUIET_PASSES_BEFORE_CLOSE` idle passes is repaired reliably and
-    /// closed, which is what `spec/fec.md` section 11 already says a close
-    /// means: every generation under it with no `GEN_DONE` retires as
-    /// abandoned.
+    /// symbols are all on the carrier and which has drawn nothing from the
+    /// receiver for [`EPOCH_QUIET_GRACE`] is repaired reliably and closed,
+    /// which is what `spec/fec.md` section 11 already says a close means:
+    /// every generation under it with no `GEN_DONE` retires as abandoned.
     ///
-    /// Counted in passes rather than timed, so the bound is the loop's own
-    /// and a test can spend it.
+    /// The instant to measure against is the caller's, so a test spends the
+    /// grace without waiting for it. A pass that stopped on the outbound
+    /// budget does not spend it at all: frames the peer already sent may be
+    /// unread, and an epoch's outcome may be among them.
     ///
-    /// A pass counts only when this end heard nothing from the peer at all
-    /// and has nothing of its own left queued. Anything the peer sent is
-    /// proof it is still there, whatever epoch it was about, so it resets
-    /// every open epoch rather than only the one a `GEN_DONE` names: an
-    /// epoch held alongside seven others must not be retired on the strength
-    /// of the peer answering for one of them. Without that, eight passes
-    /// elapse in microseconds on an active connection, because the carrier's
-    /// wait returns the moment anything is queued, and the serve resends the
-    /// tail of every transfer that had in fact decoded.
-    fn retire_quiet_epochs(
+    /// The budget is per epoch and is reset by anything the receiver says
+    /// about that epoch: a `GEN_STATE`, which it sends as each generation's
+    /// first symbol lands, or a `GEN_DONE`. So it measures one epoch's own
+    /// progress rather than the connection's silence.
+    ///
+    /// Measuring silence instead does not work in either direction. Counting
+    /// every pass retires epochs whose outcomes are still in flight, because
+    /// the carrier's wait returns the moment anything is queued and a budget
+    /// of passes is microseconds on a busy connection. Requiring the whole
+    /// connection to fall silent never fires at all during a transfer, so an
+    /// epoch holding one generation that cannot decode keeps its slot to the
+    /// end and every later piece is answered reliably: measured over a 1 GB
+    /// fetch, all eight slots were held for the whole run and under a tenth
+    /// of the object travelled coded.
+    pub(crate) fn retire_quiet_epochs(
         &self,
         connection: &mut ServeConnection,
-        heard: bool,
+        now: std::time::Instant,
     ) -> Result<(), Fault> {
-        if heard {
-            for opened in connection.fec.epochs.values_mut() {
-                opened.quiet_passes = 0;
-            }
-            return Ok(());
-        }
-        if !pass_is_quiet(
+        if !epochs_are_waiting(
             !connection.fec.epochs.is_empty(),
             connection.outbound.is_empty(),
         ) {
@@ -210,8 +208,8 @@ impl BundleServer {
         }
         let mut spent = Vec::new();
         for (epoch, opened) in &mut connection.fec.epochs {
-            opened.quiet_passes += 1;
-            if opened.quiet_passes >= QUIET_PASSES_BEFORE_CLOSE {
+            let since = *opened.quiet_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= EPOCH_QUIET_GRACE {
                 spent.push(*epoch);
             }
         }
@@ -296,6 +294,11 @@ impl BundleServer {
                 Ok(())
             }
             TypedFrame::GenState(state) => {
+                // The receiver is working on this epoch, which is what the
+                // close budget measures the absence of.
+                if let Some(opened) = connection.fec.epochs.get_mut(&state.epoch) {
+                    opened.quiet_since = None;
+                }
                 connection
                     .fec
                     .sender
@@ -362,6 +365,7 @@ impl BundleServer {
                     .epochs
                     .get_mut(&done.epoch)
                     .expect("cloned above");
+                epoch.quiet_since = None;
                 epoch.live.remove(&done.generation);
                 if epoch.live.is_empty() {
                     connection.fec.sender.close(done.epoch);
@@ -681,7 +685,7 @@ impl BundleServer {
                     bundle_id,
                     plan,
                     live,
-                    quiet_passes: 0,
+                    quiet_since: None,
                 },
             );
         }
@@ -695,27 +699,35 @@ impl BundleServer {
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
 pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
 
-/// Whether a pass counts against an epoch's quiet budget: there is an epoch
-/// owed an outcome, and every symbol of it is already on the carrier rather
-/// than waiting in this end's own queue.
+/// Whether a pass may spend an epoch's grace: there is an epoch owed an
+/// outcome, and every symbol of it is already on the carrier rather than
+/// waiting in this end's own queue. It says nothing about whether the peer
+/// was heard, which is measured per epoch and not per pass.
 ///
 /// Pure, because both halves have to hold and neither is reachable from a
 /// test that drives a whole transfer: a queue that is never empty at the
 /// wrong moment is not something a caller can arrange.
-pub(crate) const fn pass_is_quiet(epochs_open: bool, outbound_empty: bool) -> bool {
+pub(crate) const fn epochs_are_waiting(epochs_open: bool, outbound_empty: bool) -> bool {
     epochs_open && outbound_empty
 }
 
-/// Idle passes an epoch may draw no outcome for before this end repairs it
-/// reliably and closes it.
+/// How long an epoch may draw nothing from the receiver before this end
+/// repairs its remaining generations reliably and closes it.
 ///
-/// An idle pass costs the driving loop's idle wait, so this is a few hundred
-/// milliseconds of a connection with nothing to read and nothing queued:
-/// long enough that a receiver's outcomes cross any path this serves before
-/// it expires, short enough that a wedged generation costs a pause rather
-/// than the fetch's whole stall budget. Every outcome the receiver reports
-/// resets it, so an epoch being answered never reaches it.
-pub(crate) const QUIET_PASSES_BEFORE_CLOSE: u32 = 8;
+/// Measured per epoch and reset by any `GEN_STATE` or `GEN_DONE` naming it,
+/// so it is that epoch's own silence rather than the connection's. A
+/// receiver working through an epoch reports each generation as its first
+/// symbol lands, so one being received resets this over and over; one that
+/// has said nothing for this long holds generations its symbols will never
+/// complete, and the reliable path is what carries those.
+///
+/// Timed rather than counted in passes, because a pass is microseconds on a
+/// busy connection and whole milliseconds on an idle one: a budget of 256
+/// passes retired epochs whose outcomes were still in flight and took a
+/// 256 MB coded fetch from 0.8 to 13 seconds in reliable resends. What the
+/// grace has to clear is a round trip and the receiver's decode, so it is
+/// set well above both for the paths this serves.
+pub(crate) const EPOCH_QUIET_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 /// The most a coded piece covers: one generation per record, and a bundle
 /// declares at most `MAX_DATA_RECORDS_PER_BUNDLE` of them.
 pub(crate) const FEC_PIECE_BYTES: u64 =

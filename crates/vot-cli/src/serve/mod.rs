@@ -114,13 +114,19 @@ mod tests {
     use vot_transport_api::SubjectId;
 
     #[test]
-    fn only_an_idle_pass_with_an_epoch_open_counts_as_quiet() {
+    fn a_grace_is_only_spent_with_an_epoch_open_and_nothing_queued() {
         // Both halves, all four ways round: an epoch still owed an outcome,
         // and nothing of this end's own left to hand the carrier.
-        assert!(server::pass_is_quiet(true, true));
-        assert!(!server::pass_is_quiet(true, false), "symbols still queued");
-        assert!(!server::pass_is_quiet(false, true), "no epoch to close");
-        assert!(!server::pass_is_quiet(false, false));
+        assert!(server::epochs_are_waiting(true, true));
+        assert!(
+            !server::epochs_are_waiting(true, false),
+            "symbols still queued"
+        );
+        assert!(
+            !server::epochs_are_waiting(false, true),
+            "no epoch to close"
+        );
+        assert!(!server::epochs_are_waiting(false, false));
     }
 
     /// A ready server session with handshake replies cleared.
@@ -630,12 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn an_epoch_is_retired_only_after_the_peer_has_gone_quiet() {
-        // Two epochs open with every symbol handed over. A peer that keeps
-        // speaking, about anything, keeps both: the close is for a receiver
-        // that stopped answering, and eight passes of an active connection
-        // are microseconds, not the pause the budget is meant to be. Once it
-        // does go silent the budget is spent and both are repaired reliably.
+    fn an_epoch_is_retired_only_after_it_has_gone_quiet_itself() {
+        // The budget is that epoch's own silence, not the connection's. A
+        // transfer is never silent, so measuring the connection never fires
+        // and an epoch holding one generation that cannot decode keeps its
+        // slot to the end of the run.
         let (bundle, _) = built_bundle("quiet", &[("big.bin", patterned(1_500_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
@@ -654,87 +659,107 @@ mod tests {
         server.service(&mut session, &mut connection).unwrap();
         assert_eq!(connection.fec.epochs.len(), 2, "a piece of 17 and one of 6");
 
-        // Twice the budget of passes, each one hearing from the peer.
-        for _ in 0..(server::QUIET_PASSES_BEFORE_CLOSE * 2) {
-            session
-                .driver()
-                .events
-                .push_back(control_event(&TypedFrame::DatagramCredit(ample_credit())));
-            server.service(&mut session, &mut connection).unwrap();
-            assert_eq!(
-                connection.fec.epochs.len(),
-                2,
-                "a peer that is still speaking keeps every epoch"
-            );
-        }
-
-        // Silence. One pass short of the budget still keeps them.
-        for _ in 0..(server::QUIET_PASSES_BEFORE_CLOSE - 1) {
-            server.service(&mut session, &mut connection).unwrap();
-        }
+        // The first quiet pass starts the clock rather than spending it.
+        let began = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
+        assert_eq!(connection.fec.epochs.len(), 2);
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, began + server::EPOCH_QUIET_GRACE / 2)
+                .is_ok()
+        );
         assert_eq!(
             connection.fec.epochs.len(),
             2,
-            "the budget is not spent until its last pass"
+            "inside the grace both are kept"
         );
-        session.driver().records.clear();
-        server.service(&mut session, &mut connection).unwrap();
-        assert!(
-            connection.fec.epochs.is_empty(),
-            "the budget spent retires both epochs"
-        );
-        // Both epochs' generations came back as reliable records, which is
-        // what the fetch needs when no GEN_DONE ever arrives for them.
-        assert_eq!(
-            session.driver().records.len(),
-            23,
-            "every generation of both epochs was repaired reliably"
-        );
-        crate::harness::discard(&[&bundle]);
-    }
 
-    #[test]
-    fn a_reporting_receiver_keeps_its_epochs() {
-        // What the receiver now sends while it works. A serve that took
-        // silence for a receiver that had gone would retire these epochs
-        // under it; the report is the proof it is still there, and it is the
-        // frame a working receiver actually produces rather than a stand-in.
-        let (bundle, _) = built_bundle("reporting", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
-        let object = server.objects.values().next().unwrap().object;
-        let mut session = ready_session_fec(ample_credit());
-        let mut connection = ServeConnection::new();
-        server.service(&mut session, &mut connection).unwrap();
+        // A report about one epoch clears that epoch's clock and no other's,
+        // which is what stops a receiver working through an epoch from ever
+        // reaching the grace.
         session
             .driver()
             .events
-            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
-                request_id: [33; 16],
-                object,
-                offset: 0,
-                length: object.length,
+            .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                epoch: 0,
+                generation: 0,
+                sequence: 1,
+                received: 1,
+                missing_sources: vec![1, 2, 3],
             })));
         server.service(&mut session, &mut connection).unwrap();
-        assert_eq!(connection.fec.epochs.len(), 2);
+        // The report restarts that epoch's clock, so its deadline is later
+        // than the one nothing was said about. A receiver reporting each
+        // generation as its first symbol lands therefore never reaches the
+        // grace while it is still working.
+        let reported = connection.fec.epochs[&0]
+            .quiet_since
+            .expect("armed by the pass that read the report");
+        let silent = connection.fec.epochs[&1]
+            .quiet_since
+            .expect("armed by the first quiet pass");
+        assert!(
+            reported > silent,
+            "the reported epoch's clock restarted and the silent one's did not"
+        );
 
-        for sequence in 1..=u64::from(server::QUIET_PASSES_BEFORE_CLOSE * 2) {
-            session
-                .driver()
-                .events
-                .push_back(control_event(&TypedFrame::GenState(frames::GenState {
-                    epoch: 0,
-                    generation: 0,
-                    sequence,
-                    received: 1,
-                    missing_sources: vec![1, 2, 3],
-                })));
-            server.service(&mut session, &mut connection).unwrap();
-            assert_eq!(
-                connection.fec.epochs.len(),
-                2,
-                "a receiver reporting on one epoch is still there for both"
-            );
-        }
+        // A done restarts the clock the same way. This is the reset that
+        // carries an epoch through its decode tail, when the states have
+        // stopped and only outcomes are still arriving.
+        let before_done = connection.fec.epochs[&0].quiet_since.expect("armed above");
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch: 0,
+                generation: 0,
+                outcome: frames::GenOutcome::Decoded,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(
+            connection.fec.epochs[&0]
+                .quiet_since
+                .expect("armed by the pass that read the done")
+                > before_done,
+            "an outcome restarts its epoch's clock"
+        );
+
+        // Silence past the grace retires them and their generations come
+        // back as reliable records: 16 left of the first piece and 6 of the
+        // tail, the decoded one having settled.
+        session.driver().records.clear();
+        // Both clocks are armed already, so measure from the later of them:
+        // an epoch is kept right up to its grace and goes once past it, and
+        // neither half depends on how long the passes above really took.
+        let armed = connection
+            .fec
+            .epochs
+            .values()
+            .filter_map(|opened| opened.quiet_since)
+            .max()
+            .expect("both are armed");
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE / 2)
+                .is_ok()
+        );
+        assert_eq!(
+            connection.fec.epochs.len(),
+            2,
+            "inside the grace both are kept"
+        );
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE)
+                .is_ok()
+        );
+        assert!(connection.fec.epochs.is_empty(), "both are past the grace");
+        connection.drain(&mut session).unwrap();
+        assert_eq!(
+            session.driver().records.len(),
+            22,
+            "every live generation of both came back reliably"
+        );
         crate::harness::discard(&[&bundle]);
     }
 

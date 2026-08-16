@@ -59,10 +59,10 @@ pub(crate) struct OpenedEpoch {
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,
-    /// Passes this connection has made with every symbol already handed to
-    /// the carrier, nothing left to read, and this epoch still owed an
-    /// outcome. Reset by any outcome the receiver reports for it.
-    pub(crate) quiet_passes: u32,
+    /// When this epoch was first seen with its symbols all on the carrier
+    /// and nothing heard about it since. Cleared by anything the receiver
+    /// says about it, so it measures one epoch's own silence.
+    pub(crate) quiet_since: Option<std::time::Instant>,
 }
 
 /// The sender side of datagram FEC for one connection.

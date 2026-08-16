@@ -82,6 +82,7 @@ pub mod error_code {
     pub const PATH_STATE_REJECTED: u16 = 0x0602;
     pub const EXPERIMENT_NOT_NEGOTIATED: u16 = 0x0701;
     pub const RISK_BUDGET_EXHAUSTED: u16 = 0x0702;
+    pub const CODING_EPOCH_CONFLICT: u16 = 0x0703;
 }
 
 /// Every registered setting, in identifier order.

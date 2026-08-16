@@ -214,7 +214,8 @@ send them would leave no way to reach one.
 | `SOURCE_SCORE_HINT` | 64 KiB | advisory; latest sample supersedes | yes | no |
 | `JOB_PRIORITY_UPDATE` | 64 KiB | monotonic update sequence; stale update ignored | yes | no |
 
-Experimental FEC frames are invalid unless `DATAGRAM_FEC` is negotiated. VCRC
+Experimental FEC frames are invalid unless `DATAGRAM_FEC` is negotiated; their
+payloads and the symbol datagram are `spec/fec.md` sections 9 through 12. VCRC
 actions additionally require `VCRC`. A known but unnegotiated experimental frame
 causes `EXPERIMENT_NOT_NEGOTIATED`; its optional criticality only defines how an
 implementation that does not know the frame skips it.

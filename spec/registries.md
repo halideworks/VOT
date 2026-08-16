@@ -185,6 +185,7 @@ Error classes occupy `0x0100` blocks.
 | `0x0602` | `PATH_STATE_REJECTED` | fallback/path |
 | `0x0701` | `EXPERIMENT_NOT_NEGOTIATED` | experimental/research |
 | `0x0702` | `RISK_BUDGET_EXHAUSTED` | experimental/research |
+| `0x0703` | `CODING_EPOCH_CONFLICT` | experimental/research |
 
 An `ERROR` frame carries a registered code and bounded diagnostic data. Default
 telemetry and peer-visible diagnostics MUST NOT contain raw paths, credentials,

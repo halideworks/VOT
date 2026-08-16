@@ -22,6 +22,10 @@ pub const MAX_ORPHAN_BUNDLE_BYTES: usize =
     vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE * vot_transport_api::MAX_DATA_RECORD_BYTES;
 
 /// Admitted bundles held while the rest of their records arrive.
+///
+/// A caller that answers covers in several bundles at once, which a coded
+/// transfer does, has to raise this: see `epoch_capacity`, which keeps the
+/// credit this end advertises inside whatever the caller set.
 pub const DEFAULT_PENDING_BUNDLES: usize = 4;
 
 /// Bytes held for admitted bundles that are not complete.
@@ -32,6 +36,13 @@ pub const DEFAULT_ORPHAN_BUNDLES: usize = 2;
 
 /// Bytes held for records that arrived before their proof.
 pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUNDLE_BYTES;
+
+/// Coding epochs a receiver will invite a sender to hold open at once.
+///
+/// Public because each one pins a pending bundle for its whole life, so a
+/// caller setting its own pending limits has to leave room for these on top
+/// of whatever depth its reliable pipeline runs at.
+pub const MAX_CODING_EPOCHS: usize = 8;
 
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
 pub const REMEMBERED_BUNDLES: usize = 64;
@@ -160,6 +171,17 @@ impl PendingBundles {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Coding epochs this end can promise room for.
+    ///
+    /// An open epoch pins one pending bundle from its `CODING_EPOCH_OPEN`
+    /// until the last of its generations lands, so a credit inviting more
+    /// epochs than this admits bundles is one the sender spends and this end
+    /// then refuses, ending the fetch. One slot stays free for a range
+    /// answered reliably alongside the coded ones.
+    fn epoch_capacity(&self) -> u64 {
+        u64::try_from(self.bundle_limit.saturating_sub(1)).unwrap_or(u64::MAX)
     }
 
     /// Bytes held across both budgets.
@@ -504,6 +526,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.pending.byte_limit
     }
 
+    /// The bound on how many admitted bundles are held part-built at once.
+    #[must_use]
+    pub const fn pending_bundle_limit(&self) -> usize {
+        self.pending.bundle_limit
+    }
+
     /// The byte bound on records that arrived before their proof.
     #[must_use]
     pub const fn orphan_byte_limit(&self) -> usize {
@@ -583,7 +611,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                         // The decode budget is a credit-epoch budget: once
                         // it is half spent a new epoch goes out here, not
                         // only when a bundle completes.
-                        self.fec.extend_credit(self.receiver.advertised_credit());
+                        self.fec.extend_credit(
+                            self.receiver.advertised_credit(),
+                            self.pending.epoch_capacity(),
+                        );
                     }
                     self.send_owed()?;
                 }
@@ -642,7 +673,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
         if self.session.is_ready() && negotiated {
             self.fec_armed = true;
-            self.fec.extend_credit(self.receiver.advertised_credit());
+            self.fec.extend_credit(
+                self.receiver.advertised_credit(),
+                self.pending.epoch_capacity(),
+            );
             self.send_owed()?;
         }
         Ok(())
@@ -877,7 +911,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         let credit = self.receiver.advertised_credit();
         self.credit_applied = self.session.driver().set_receive_credit(credit).is_ok();
         if self.fec_armed {
-            self.fec.extend_credit(credit);
+            self.fec
+                .extend_credit(credit, self.pending.epoch_capacity());
             self.send_owed()?;
         }
         Ok(())
@@ -1377,6 +1412,44 @@ mod tests {
         // simulate one.
         pending.orphan_bytes += 1;
         pending.assert_accounted();
+    }
+
+    #[test]
+    fn the_pending_limits_are_what_the_caller_set() {
+        // Both halves are readable, because a caller sizing its own depth
+        // for coded pieces has to be able to check what it got, and the
+        // epoch credit is derived from the count.
+        let mut driver = ready();
+        assert_eq!(driver.pending_bundle_limit(), DEFAULT_PENDING_BUNDLES);
+        assert_eq!(driver.pending_byte_limit(), DEFAULT_PENDING_BUNDLE_BYTES);
+        driver
+            .set_pending_limits(20, 20 * MAX_PENDING_BUNDLE_BYTES)
+            .unwrap();
+        assert_eq!(driver.pending_bundle_limit(), 20);
+        assert_eq!(driver.pending_byte_limit(), 20 * MAX_PENDING_BUNDLE_BYTES);
+        // A depth of one bundle is legal; none is not, and neither is a byte
+        // bound too small to hold the one bundle it admits.
+        assert!(
+            driver
+                .set_pending_limits(1, MAX_PENDING_BUNDLE_BYTES)
+                .is_ok()
+        );
+        assert_eq!(driver.pending_bundle_limit(), 1);
+        assert!(
+            driver
+                .set_pending_limits(0, MAX_PENDING_BUNDLE_BYTES)
+                .is_err()
+        );
+        assert!(
+            driver
+                .set_pending_limits(4, MAX_PENDING_BUNDLE_BYTES - 1)
+                .is_err()
+        );
+        assert_eq!(
+            driver.pending_bundle_limit(),
+            1,
+            "a refusal changes nothing"
+        );
     }
 
     #[test]
@@ -2423,6 +2496,16 @@ mod tests {
     fn a_conflicting_reopen_closes_and_a_refused_open_is_answered() {
         let (subject, bundle, _) = object();
         let mut driver = ready_fec();
+        // Room for every epoch the coding side would extend, plus the slot
+        // `epoch_capacity` keeps for a reliably answered range. Without it
+        // the credit clamps to the pending depth and the refusal under test
+        // happens earlier, for the other reason.
+        driver
+            .set_pending_limits(
+                MAX_CODING_EPOCHS + 1,
+                (MAX_CODING_EPOCHS + 1) * MAX_PENDING_BUNDLE_BYTES,
+            )
+            .unwrap();
         driver.admit(subject, Box::new(DiscardSink)).unwrap();
         let (open, _) = epoch_of(&bundle, 1);
         // Eight epochs is the cap this end extends; the ninth is refused

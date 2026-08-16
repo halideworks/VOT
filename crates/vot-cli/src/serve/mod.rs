@@ -21,7 +21,7 @@ use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSum
 
 mod connection;
 mod object;
-mod server;
+pub(crate) mod server;
 
 #[cfg(test)]
 use connection::{OUTBOUND_BUDGET_BYTES, REMEMBERED_REQUESTS};

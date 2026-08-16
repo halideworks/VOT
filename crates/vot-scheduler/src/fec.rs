@@ -152,13 +152,18 @@ impl Intake {
     /// bytes, since elimination is bounded by the bytes a peer can put on
     /// the wire and costs about what receiving them did. Nothing is sent
     /// while the caps stand and the decode budget is under half spent.
-    pub(crate) fn extend_credit(&mut self, staging_bytes: u64) {
+    pub(crate) fn extend_credit(&mut self, staging_bytes: u64, epoch_capacity: u64) {
         let credit = Credit {
             credit_epoch: self.credit_epoch + 1,
             max_unretired_bytes: staging_bytes,
             max_active_generations: (staging_bytes / GENERATION_BYTES).max(1),
             max_decode_work: staging_bytes.saturating_mul(DECODE_WORK_PER_STAGING_BYTE),
-            max_open_epochs: MAX_OPEN_EPOCHS,
+            // Never more epochs than this end has bundles to put them in. An
+            // open epoch pins a pending bundle until its last generation
+            // lands, so inviting more than that is inviting the sender to
+            // open one this end then refuses, which ends the fetch rather
+            // than slowing it.
+            max_open_epochs: MAX_OPEN_EPOCHS.min(epoch_capacity),
         };
         let held = self.receiver.credit_held();
         let unchanged = held.is_some_and(|held| {
@@ -358,8 +363,10 @@ impl Intake {
 
 /// The shipped profile's generation: one 64 KiB integrity group.
 pub(crate) const GENERATION_BYTES: u64 = 65_536;
-/// Epochs a sender may hold open at once under this receiver's credit.
-pub(crate) const MAX_OPEN_EPOCHS: u64 = 8;
+/// Epochs a sender may hold open at once under this receiver's credit, as
+/// far as the coding side is concerned. What is advertised is this or the
+/// receiver's pending-bundle capacity, whichever is smaller.
+pub(crate) const MAX_OPEN_EPOCHS: u64 = crate::session::MAX_CODING_EPOCHS as u64;
 /// Decode work per staging byte under one credit epoch. Elimination of one
 /// generation costs about the bytes it holds; sixteen refills of staging
 /// before a new epoch is due keeps the budget from binding on a lossy path.
@@ -454,7 +461,7 @@ mod tests {
     #[test]
     fn credit_is_sized_from_staging_and_reissued_only_when_something_moved() {
         let mut intake = Intake::default();
-        intake.extend_credit(200_000);
+        intake.extend_credit(200_000, MAX_OPEN_EPOCHS);
         let Some(Owed::Credit(first)) = intake.take_owed() else {
             panic!("credit is owed on the first extension");
         };
@@ -463,16 +470,16 @@ mod tests {
         assert_eq!(first.max_active_generations, 3, "200000 / 65536");
         assert_eq!(first.max_decode_work, 3_200_000);
         assert_eq!(first.max_open_epochs, MAX_OPEN_EPOCHS);
-        intake.extend_credit(200_000);
+        intake.extend_credit(200_000, MAX_OPEN_EPOCHS);
         assert_eq!(intake.take_owed(), None, "nothing moved");
-        intake.extend_credit(199_000);
+        intake.extend_credit(199_000, MAX_OPEN_EPOCHS);
         let Some(Owed::Credit(second)) = intake.take_owed() else {
             panic!("a changed byte cap is a new epoch even at the same generation cap");
         };
         assert_eq!(second.credit_epoch, 2);
         assert_eq!(second.max_active_generations, 3);
         assert_eq!(second.max_unretired_bytes, 199_000);
-        intake.extend_credit(65_536);
+        intake.extend_credit(65_536, MAX_OPEN_EPOCHS);
         let Some(Owed::Credit(third)) = intake.take_owed() else {
             panic!("a changed generation cap is a new epoch");
         };
@@ -482,7 +489,7 @@ mod tests {
         // whole active cap and the decode budget is 16. Nine eliminations
         // spend past half of it and a fresh epoch is owed at the next call.
         let mut small = Intake::default();
-        small.extend_credit(1);
+        small.extend_credit(1, MAX_OPEN_EPOCHS);
         assert!(matches!(small.take_owed(), Some(Owed::Credit(_))));
         small.open(&open_of(1, 0, 16, 1, 1, 1)).unwrap();
         for generation in 0..9_u32 {
@@ -493,16 +500,16 @@ mod tests {
             assert!(joined.is_some(), "generation {generation}");
             assert!(matches!(small.take_owed(), Some(Owed::Done(_))));
             if generation == 0 {
-                small.extend_credit(1);
+                small.extend_credit(1, MAX_OPEN_EPOCHS);
                 assert_eq!(small.take_owed(), None, "one of sixteen spent is fresh");
             }
         }
-        small.extend_credit(1);
+        small.extend_credit(1, MAX_OPEN_EPOCHS);
         let Some(Owed::Credit(refreshed)) = small.take_owed() else {
             panic!("half the decode budget is spent, so a new epoch is due");
         };
         assert_eq!(refreshed.credit_epoch, 2);
-        small.extend_credit(1);
+        small.extend_credit(1, MAX_OPEN_EPOCHS);
         assert_eq!(
             small.take_owed(),
             None,
@@ -530,7 +537,7 @@ mod tests {
         // of thirty-two one-byte generations. The refusal and the credit are
         // both owed to the sender; draining them leaves the loop below seeing
         // only what each generation produced.
-        intake.extend_credit(1);
+        intake.extend_credit(1, MAX_OPEN_EPOCHS);
         assert!(matches!(intake.take_owed(), Some(Owed::Done(_))));
         assert!(matches!(intake.take_owed(), Some(Owed::Credit(_))));
         assert_eq!(intake.take_owed(), None);
@@ -573,9 +580,29 @@ mod tests {
     }
 
     #[test]
+    fn the_credit_never_invites_more_epochs_than_there_is_room_for() {
+        // An open epoch pins a pending bundle, so promising more epochs than
+        // the receiver admits bundles is promising a refusal. A coded fetch
+        // died of exactly that: eight epochs invited against four bundles.
+        for capacity in 0..=u64::from(u8::try_from(MAX_OPEN_EPOCHS).unwrap()) + 4 {
+            let mut intake = Intake::default();
+            intake.extend_credit(1 << 20, capacity);
+            let Some(Owed::Credit(credit)) = intake.take_owed() else {
+                panic!("a first extension owes its credit");
+            };
+            assert!(
+                credit.max_open_epochs <= capacity,
+                "capacity {capacity} invited {}",
+                credit.max_open_epochs
+            );
+            assert_eq!(credit.max_open_epochs, MAX_OPEN_EPOCHS.min(capacity));
+        }
+    }
+
+    #[test]
     fn a_generation_reports_itself_once_at_the_symbol_that_opened_it() {
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
         // k = 4, L = 2, cover of 24 bytes: three generations of 8, all full.
         intake.open(&open_of(3, 0, 24, 4, 2, 2)).unwrap();
@@ -608,7 +635,7 @@ mod tests {
         // Nothing else is: a done is terminal for its generation and the
         // sender waits on it.
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 30);
+        intake.extend_credit(1 << 30, MAX_OPEN_EPOCHS);
         assert!(matches!(intake.take_owed(), Some(Owed::Credit(_))));
         // k = 2, L = 1: a two-byte generation, so one cover spans many.
         let generations = u32::try_from(MAX_OWED_STATES).unwrap() + 8;
@@ -650,7 +677,7 @@ mod tests {
         // Credit still goes out with the queue at its cap, because the
         // sender's flow control waits on it. Last, because a narrower credit
         // is what stops new generations going live.
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         assert!(
             matches!(intake.owed.back(), Some(Owed::Credit(_))),
             "a credit is owed whatever the state queue holds"
@@ -664,7 +691,7 @@ mod tests {
         // 20 bytes at k = 4, L = 2 is two generations of 8 and a tail of 4,
         // which is two sources rather than four.
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
         intake.open(&open_of(4, 0, 20, 4, 2, 2)).unwrap();
         let plan = EpochPlan::new(4, 0, 20, Geometry::new(4, 2, 2).unwrap()).unwrap();
@@ -725,7 +752,7 @@ mod tests {
     #[test]
     fn a_decoded_generation_is_placed_relative_to_its_cover() {
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
         // Cover starts at 3 * 64 KiB; k = 4, L = 2: 8 bytes per generation.
         intake.open(&open_of(5, 3 * 65_536, 16, 4, 2, 2)).unwrap();
@@ -790,7 +817,7 @@ mod tests {
     #[test]
     fn a_closed_epoch_takes_no_symbols_and_a_short_datagram_is_nothing() {
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
         intake.open(&open_of(2, 0, 4, 1, 1, 4)).unwrap();
         intake.close(CodingEpochClose { epoch: 2 });
@@ -811,7 +838,7 @@ mod tests {
     #[test]
     fn orphans_are_bounded_by_count_and_bytes_and_leave_with_their_epoch() {
         let mut intake = Intake::default();
-        intake.extend_credit(1 << 20);
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
         // Orphans are bounded: the oldest goes first.
         for i in 0..=u32::try_from(MAX_ORPHAN_GENERATIONS).unwrap() {

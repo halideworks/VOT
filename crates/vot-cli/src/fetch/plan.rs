@@ -22,6 +22,37 @@ pub(crate) fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)
 /// any size be asked for in full before the first cover lands.
 pub(crate) const OUTSTANDING_COVERS: usize = 4;
 
+/// Bundles one cover can be answered in.
+///
+/// A coded answer is cut into fixed `FEC_PIECE_BYTES` windows of the object
+/// and each piece is its own bundle, so a cover spans the pieces its length
+/// covers plus one more, because a cover is not aligned to those windows.
+const PIECES_PER_COVER: usize = 5;
+
+/// Bundles a fetch holds part-built at once.
+///
+/// Every cover in flight can be answered in `PIECES_PER_COVER` bundles and
+/// each of those is pinned from its `PROOF_BUNDLE` until its last record
+/// lands, so the depth is the product of the two rather than either alone.
+/// Sized at the cover depth alone, a coded fetch of 16 MB failed four times
+/// in five with `PendingBundlesExhausted`, and one of 256 MB every time;
+/// the reliable path never noticed because it completes a bundle's records
+/// before the next bundle is announced.
+///
+/// The byte budget beside it is unchanged and is what bounds the memory: a
+/// bundle of the shipped FEC profile is about a quarter of the worst case
+/// this counts, so the deeper count fits inside the same bytes.
+pub(crate) const PENDING_BUNDLE_DEPTH: usize = OUTSTANDING_COVERS * PIECES_PER_COVER;
+
+// Tied to the geometry it stands for, so a change to either the cover bound
+// or the piece size breaks the build here rather than showing up as a fetch
+// that ends partway through a coded transfer.
+const _: () = assert!(
+    PIECES_PER_COVER as u64
+        == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
+);
+const _: () = assert!(PENDING_BUNDLE_DEPTH == 20);
+
 /// Bytes this fetch may have asked for and not yet placed.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;
 

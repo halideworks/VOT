@@ -5,12 +5,12 @@ use super::{
     DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY,
     MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE,
     ManifestReader, ManifestRequest, Mutex, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
-    PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject,
-    Proving, ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
-    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter, TypedFrame,
-    UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
-    remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
-    total_units_of,
+    PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf,
+    PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
+    ReliableReceiver, ResumeStore, Session, SessionReceiver, Settings, SharedPlan, Storage,
+    SubjectId, TransportAdapter, TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames,
+    fs, is_backpressure, package_sentinel, remove_store_files, reservations_of, resume_failure,
+    resumed_extents, subject_of, total_units_of,
 };
 
 /// Credit advertised to the server: the covers this end asked for.
@@ -316,8 +316,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // the receiver defaults are too shallow and fail a conforming
         // transfer with `PendingBundlesExhausted`.
         receiver.set_pending_limits(
-            OUTSTANDING_COVERS,
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
+            PENDING_BUNDLE_DEPTH,
+            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
         )?;
         receiver.set_orphan_limits(
             OUTSTANDING_COVERS,
@@ -374,8 +374,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let mut receiver = SessionReceiver::new(session, receiver);
         // Same pipeline budgets as the primary: each rail carries the full depth.
         receiver.set_pending_limits(
-            OUTSTANDING_COVERS,
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
+            PENDING_BUNDLE_DEPTH,
+            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
         )?;
         receiver.set_orphan_limits(
             OUTSTANDING_COVERS,

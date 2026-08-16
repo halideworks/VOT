@@ -5,6 +5,7 @@ constant vot_scheduler::session::DEFAULT_ORPHAN_BUNDLES
 constant vot_scheduler::session::DEFAULT_ORPHAN_BYTES
 constant vot_scheduler::session::DEFAULT_PENDING_BUNDLES
 constant vot_scheduler::session::DEFAULT_PENDING_BUNDLE_BYTES
+constant vot_scheduler::session::MAX_CODING_EPOCHS
 constant vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
 constant vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
 constant vot_scheduler::session::REMEMBERED_BUNDLES

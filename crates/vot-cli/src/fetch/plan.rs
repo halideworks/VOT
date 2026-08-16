@@ -151,6 +151,12 @@ pub(crate) struct FetchPlan {
     /// Bytes placed for objects already left behind, so what this fetch
     /// has settled only ever goes up.
     pub(crate) placed_before: u64,
+    /// Of what `placed_bytes` counts, the part a previous fetch placed: an
+    /// object this one found already whole, and the extents a resumed sink
+    /// was seeded with. Subtracting it is what separates the bytes that
+    /// crossed the wire on this run from the ones that were on disk before
+    /// it, which anything divided by this run's clock has to be.
+    pub(crate) carried_before: u64,
     /// Where the current object's next range request starts.
     pub(crate) next_offset: u64,
     /// Settled extents of the current object; completion is full coverage,

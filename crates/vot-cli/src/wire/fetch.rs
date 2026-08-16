@@ -122,18 +122,20 @@ where
     let outcome = crate::drive::fetch_striped(fetcher, rails, connect)?;
     let elapsed = began.elapsed();
     if wanted {
-        eprintln!(
-            "{}",
-            stats_line(outcome.package.logical_length, elapsed, outcome.fec)
-        );
+        eprintln!("{}", stats_line(outcome.moved, elapsed, outcome.fec));
     }
     Ok(outcome)
 }
 
 /// What one fetch measured, as one line an operator or a bench harness reads:
-/// the bytes and the wall time that divide into a throughput, and the
-/// datagram-FEC counts that say how much of the object the coded path
-/// carried and how much fell back to the reliable one.
+/// the bytes it placed itself and the wall time that divide into a
+/// throughput, and the datagram-FEC counts that say how much of the object
+/// the coded path carried and how much fell back to the reliable one.
+///
+/// The bytes are this fetch's own, not the package's length: a fetch that
+/// resumed a bundle asks only for what is missing, and dividing the whole
+/// package by the time it took to move the remainder is a throughput of
+/// bytes nobody sent.
 ///
 /// The line rather than the printing, so a test can read what the harness
 /// would, the way [`super::relay::closing_line`] is written.

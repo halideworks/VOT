@@ -456,6 +456,7 @@ mod tests {
             current: 0,
             active: Some(sink0),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -506,6 +507,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -531,6 +533,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -559,6 +562,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -585,6 +589,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -657,10 +662,12 @@ mod tests {
         // sources. The four full ones decode never, so the reliable path is
         // what carried them. The sim's loss is periodic rather than sampled,
         // so this count is the same on every run.
+        let counts = fetcher.fec_counts();
+        assert_eq!(counts.decoded, 1, "only the short tail had the symbols");
+        assert_eq!(counts.offered, 5, "every generation was offered coded");
         assert_eq!(
-            fetcher.fec_generations_decoded(),
-            1,
-            "only the short tail had the symbols to decode"
+            counts.abandoned, 0,
+            "no generation reached its decode attempt, so none was given up on"
         );
         drop(fetcher);
         serving_thread
@@ -1039,6 +1046,20 @@ mod tests {
             resumed.rail.taken_bytes, second_length,
             "the resumed fetch asked for the unplaced object and nothing more"
         );
+        // What it placed is what it asked for, while what the bundle holds is
+        // both objects. A throughput divided by this fetch's clock has to be
+        // the first of those: the object the earlier fetch left behind never
+        // crossed the wire on this one.
+        assert_eq!(
+            resumed.moved_bytes(),
+            second_length,
+            "the resumed fetch moved only the object that was missing"
+        );
+        assert_eq!(
+            resumed.placed_bytes(),
+            built.logical_length,
+            "the bundle holds both objects either way"
+        );
         assert!(
             !output.join(RESUME_STORE).exists(),
             "completion removed the store"
@@ -1356,6 +1377,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::seeded(covered),
             syncing: false,
@@ -1438,6 +1460,7 @@ mod tests {
                 CountingSink::create(&output.join("s.obj"), object.length, None).unwrap(),
             )),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -1846,6 +1869,7 @@ mod tests {
             current: 0,
             active: None,
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -2364,6 +2388,7 @@ mod tests {
             current: 0,
             active: Some(Arc::clone(&sink)),
             placed_before: 0,
+            carried_before: 0,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,

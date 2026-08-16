@@ -4,7 +4,18 @@ gitignore = true
 # insertion do more work, and 20s is tight on a loaded runner. The timeout only
 # costs anything for a mutant that genuinely hangs, and one had never done so
 # before this, so the headroom is close to free.
-minimum_test_timeout = 60.0
+#
+# Raised again from 60s, because a floor under the fetch's own stall budget
+# cannot classify the mutants that spend it. `drive` gives a fetch 30 seconds
+# without progress before it calls a stall, so a mutant that stops one making
+# progress at all, which replacing the body of `advance` or `finish_manifest`
+# with `Ok(())` does, makes every test that drives a fetch wait that budget out
+# before failing. Hand-applying the `advance` mutant here fails 17 tests and
+# takes the suite 30.3 seconds; on a loaded two-core runner the same run lands
+# past a 60 second floor and is reported as a timeout, which is a failure
+# rather than the kill it actually is. The floor now clears the stall budget
+# with the suite's own time on top.
+minimum_test_timeout = 120.0
 timeout_multiplier = 4.0
 # The msquic live module only compiles under the `live` feature, which this
 # configuration does not enable, so every mutant in it would be unviable here.

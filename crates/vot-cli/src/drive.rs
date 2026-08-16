@@ -127,11 +127,18 @@ fn fetched<A: TransportAdapter>(
     fetch_verdict(status).and_then(|()| fetcher.package().ok_or(Error::InvalidBundle))
 }
 
-/// A finished fetch: the package it proved, and what its datagram path did
-/// summed over every rail.
+/// A finished fetch: the package it proved, and what its datagram path did.
+///
+/// The counts are summed over the primary and every rail that finished. A
+/// rail that failed abandons the plan and the primary repairs what it left,
+/// so the fetch still succeeds, and whatever that rail decoded before it
+/// failed is not in these numbers.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) struct Fetched {
     pub(crate) package: crate::PackageSummary,
+    /// Bytes this fetch placed itself, which on a resumed bundle is less
+    /// than the package holds.
+    pub(crate) moved: u64,
     pub(crate) fec: vot_scheduler::FecCounts,
 }
 
@@ -157,6 +164,7 @@ where
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
         return Ok(Fetched {
             package: fetched(&primary, status)?,
+            moved: primary.moved_bytes(),
             fec: primary.fec_counts(),
         });
     }
@@ -212,7 +220,11 @@ where
             }
         }
         match outcome {
-            Ok(package) => Ok(Fetched { package, fec }),
+            Ok(package) => Ok(Fetched {
+                package,
+                moved: primary.moved_bytes(),
+                fec,
+            }),
             // Report the rail's failure as the cause of a stalled primary.
             Err(Error::Stalled | Error::CarrierUnavailable) => {
                 Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
@@ -785,6 +797,10 @@ mod tests {
         })
         .expect("one rail, no provers, a whole fetch");
         assert_eq!(outcome.package, built);
+        assert_eq!(
+            outcome.moved, built.logical_length,
+            "a fetch into an empty destination moved the whole package"
+        );
         assert_eq!(
             outcome.fec,
             vot_scheduler::FecCounts::default(),

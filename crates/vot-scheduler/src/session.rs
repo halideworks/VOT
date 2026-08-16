@@ -697,7 +697,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// that is not the peer's fault is backpressure: the frame stays owed
     /// and goes out on a later poll.
     fn send_owed(&mut self) -> Result<(), Error> {
-        while let Some(owed) = self.fec.owed() {
+        // Bounded by what is owed now, so a pass ends whatever the carrier
+        // does with each frame.
+        for _ in 0..self.fec.owed_len() {
+            let Some(owed) = self.fec.owed() else {
+                break;
+            };
             match self.session.send_control(&fec::frame_of(owed)) {
                 Ok(()) => self.fec.settle_owed(),
                 Err(error)
@@ -2320,6 +2325,48 @@ mod tests {
             driver.pending_bundles(),
             2,
             "the whole-object bundle got no record of the other"
+        );
+    }
+
+    #[test]
+    fn everything_owed_goes_out_in_one_pass_once_the_carrier_takes_again() {
+        let (subject, bundle, records) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        // The carrier refuses everything while the credit, the epoch, the
+        // bundle, and both generations arrive: three frames end up owed.
+        driver.session_mut().driver().refuse_control = usize::MAX;
+        let (open, plan) = epoch_of(&bundle, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
+        for generation in 0..2 {
+            for datagram in symbols_of(&plan, generation, &records) {
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        assert!(sent_types(&mut driver).is_empty(), "all refused, all owed");
+        driver.session_mut().driver().refuse_control = 0;
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            sent_types(&mut driver),
+            vec![
+                vot_codec::frame_type::DATAGRAM_CREDIT,
+                vot_codec::frame_type::GEN_DONE,
+                vot_codec::frame_type::GEN_DONE
+            ],
+            "one pass sends everything owed"
         );
     }
 

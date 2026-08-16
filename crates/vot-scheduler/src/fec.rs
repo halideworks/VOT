@@ -244,6 +244,11 @@ impl Intake {
         self.owed.front()
     }
 
+    /// How many frames are owed, which bounds one sending pass.
+    pub(crate) fn owed_len(&self) -> usize {
+        self.owed.len()
+    }
+
     /// The front owed frame reached the carrier.
     pub(crate) fn settle_owed(&mut self) {
         self.owed.pop_front();

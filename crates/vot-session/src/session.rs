@@ -19,8 +19,9 @@ pub struct Session<A> {
     pub(super) negotiation: Negotiation,
     /// Named by the caller, because no policy exists to establish it.
     pub(super) authentication: Authentication,
-    /// Negotiation frames the backend has not accepted yet, at most two. A full
-    /// queue is backpressure, not a lost handshake.
+    /// Negotiation frames the backend has not accepted yet, at most four (the
+    /// server's whole reply). A full queue is backpressure, not a lost
+    /// handshake.
     pub(super) outbound: VecDeque<Vec<u8>>,
     /// Records the peer sent before this endpoint reached `Ready`. Held here
     /// rather than in the adapter, whose single queue would block the control
@@ -117,6 +118,14 @@ impl<A: TransportAdapter> Session<A> {
     #[must_use]
     pub const fn state(&self) -> State {
         self.negotiation.state()
+    }
+
+    /// Whether `extension` is in the negotiated set, so a frame that requires
+    /// it may be sent and will be accepted. False until the peer's `HELLO`
+    /// has arrived.
+    #[must_use]
+    pub fn extension_negotiated(&self, extension: u64) -> bool {
+        self.negotiation.extension_is_negotiated(extension)
     }
 
     /// Whether the application may use the data plane.
@@ -644,7 +653,13 @@ impl<A: TransportAdapter> Session<A> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        check_frame(frame, &peer, ExtensionPolicy::None, lane, Side::Peer)
+        check_frame(
+            frame,
+            &peer,
+            ExtensionPolicy::Negotiated(&self.negotiation),
+            lane,
+            Side::Peer,
+        )
     }
 
     /// Checks a frame the peer sent against the limits this endpoint

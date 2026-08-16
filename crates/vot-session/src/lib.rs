@@ -249,7 +249,7 @@ mod tests {
         assert!(server.is_ready());
 
         let answer = server.adapter.sent.clone();
-        assert_eq!(answer.len(), 3);
+        assert_eq!(answer.len(), 4);
         let types: Vec<u64> = answer
             .iter()
             .map(|frame| vot_codec::decode_one(frame, limits).unwrap().0.frame_type())
@@ -257,6 +257,7 @@ mod tests {
         assert_eq!(
             types,
             vec![
+                frame_type::HELLO,
                 frame_type::SETTINGS,
                 frame_type::SETTINGS_ACK,
                 frame_type::AUTH_CONTEXT
@@ -1278,6 +1279,9 @@ mod tests {
         let mut client = Negotiation::presenting_client(Settings::default(), BTreeSet::new());
         client.begin().unwrap();
         client
+            .accept_control(&server_hello_of(BTreeSet::new()))
+            .unwrap();
+        client
             .accept_control(&settings_of(Settings::default()))
             .unwrap();
         client
@@ -1917,12 +1921,79 @@ mod tests {
             Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         client.begin().unwrap();
-        client.adapter.events.push_back(control(&frame));
-        assert!(matches!(
-            client.poll().unwrap_err().kind(),
-            ErrorKind::OutOfSequence { .. }
-        ));
+        // The server-role HELLO is what a client expects; a client-role one
+        // there is the wrong role.
+        let mut client_role = Vec::new();
+        vot_codec::encode_hello(
+            &Hello {
+                endpoint_role: EndpointRole::Client,
+                ..wrong_role
+            },
+            &mut client_role,
+        )
+        .unwrap();
+        let mut misdirected = Vec::new();
+        vot_codec::encode_frame(frame_type::HELLO, &client_role, &mut misdirected).unwrap();
+        client.adapter.events.push_back(control(&misdirected));
+        assert!(
+            matches!(
+                client.poll().unwrap_err().kind(),
+                ErrorKind::Hello(HelloError::RoleMismatch { .. })
+            ),
+            "a client-role HELLO at a client is the wrong role"
+        );
+        the_client_needs_the_answer_first();
+    }
 
+    /// The server's SETTINGS before its HELLO is out of order, and a second
+    /// answer is too.
+    fn the_client_needs_the_answer_first() {
+        let mut unanswered = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        unanswered.begin().unwrap();
+        unanswered
+            .adapter
+            .events
+            .push_back(control(&settings_of(Settings::default())));
+        assert!(matches!(
+            unanswered.poll().unwrap_err().kind(),
+            ErrorKind::OutOfSequence {
+                frame_type: frame_type::SETTINGS,
+                ..
+            }
+        ));
+        // Once per direction: a second server HELLO at a client is refused.
+        let mut answered = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        answered.begin().unwrap();
+        answered
+            .adapter
+            .events
+            .push_back(control(&server_hello_of(BTreeSet::new())));
+        assert_eq!(answered.poll().unwrap(), None);
+        answered
+            .adapter
+            .events
+            .push_back(control(&server_hello_of(BTreeSet::new())));
+        assert!(matches!(
+            answered.poll().unwrap_err().kind(),
+            ErrorKind::OutOfSequence {
+                frame_type: frame_type::HELLO,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_settings_before_hello_at_a_server_is_refused() {
         let mut early = Session::server(
             Loopback::default(),
             Settings::default(),
@@ -2571,18 +2642,22 @@ mod tests {
         }
         assert_eq!(server.poll().unwrap(), None);
         assert!(server.is_ready());
-        assert_eq!(server.adapter().sent.len(), 1, "only SETTINGS fitted");
-        assert_eq!(server.unsent_negotiation_frames(), 2);
+        assert_eq!(server.adapter().sent.len(), 1, "only HELLO fitted");
+        assert_eq!(server.unsent_negotiation_frames(), 3);
         server.adapter.control_capacity = None;
         server.flush().unwrap();
-        assert_eq!(server.adapter().sent.len(), 3);
+        assert_eq!(server.adapter().sent.len(), 4);
         let held: Vec<u64> = server.adapter().sent[1..]
             .iter()
             .map(|frame| vot_codec::decode_one(frame, limits).unwrap().0.frame_type())
             .collect();
         assert_eq!(
             held,
-            vec![frame_type::SETTINGS_ACK, frame_type::AUTH_CONTEXT],
+            vec![
+                frame_type::SETTINGS,
+                frame_type::SETTINGS_ACK,
+                frame_type::AUTH_CONTEXT
+            ],
             "in the order the exchange gives them"
         );
 
@@ -2667,8 +2742,8 @@ mod tests {
         assert!(server.is_ready());
         assert_eq!(
             server.unsent_negotiation_frames(),
-            2,
-            "the ACK and the challenge did not fit"
+            3,
+            "the SETTINGS, ACK, and challenge did not fit"
         );
 
         for send in [
@@ -2677,7 +2752,7 @@ mod tests {
         ] {
             assert_eq!(
                 send.unwrap_err().kind(),
-                &ErrorKind::HandshakeUnsent { remaining: 2 }
+                &ErrorKind::HandshakeUnsent { remaining: 3 }
             );
         }
         assert_eq!(
@@ -2691,7 +2766,7 @@ mod tests {
         server.flush().unwrap();
         assert_eq!(server.unsent_negotiation_frames(), 0);
         server.send_control(&frame_of(frame_type::PING, 0)).unwrap();
-        assert_eq!(server.adapter().sent.len(), 4);
+        assert_eq!(server.adapter().sent.len(), 5);
     }
 
     #[test]
@@ -2798,7 +2873,23 @@ mod tests {
         frame
     }
 
-    /// One encoded `SETTINGS` frame carrying `settings`.
+    /// One encoded server `HELLO` answering with `extensions`.
+    fn server_hello_of(extensions: BTreeSet<u64>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        vot_codec::encode_hello(
+            &vot_codec::Hello {
+                draft_revision: vot_codec::DRAFT_REVISION,
+                endpoint_role: vot_codec::EndpointRole::Server,
+                extensions,
+            },
+            &mut payload,
+        )
+        .unwrap();
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(frame_type::HELLO, &payload, &mut frame).unwrap();
+        frame
+    }
+
     fn settings_of(settings: Settings) -> Vec<u8> {
         let mut payload = Vec::new();
         vot_codec::encode_settings(&settings, &mut payload).unwrap();
@@ -2827,11 +2918,12 @@ mod tests {
                 limit as u64,
                 "{frame_type:#x}"
             );
+            let nothing = Negotiation::client(Settings::default(), BTreeSet::new());
             for side in [Side::Local, Side::Peer] {
                 check_frame(
                     &frame_of(frame_type, limit),
                     &settings,
-                    ExtensionPolicy::None,
+                    ExtensionPolicy::Negotiated(&nothing),
                     lane,
                     side,
                 )
@@ -2839,7 +2931,7 @@ mod tests {
                 let error = check_frame(
                     &frame_of(frame_type, limit + 1),
                     &settings,
-                    ExtensionPolicy::None,
+                    ExtensionPolicy::Negotiated(&nothing),
                     lane,
                     side,
                 )
@@ -2997,6 +3089,14 @@ mod tests {
                 side: Side::Peer,
             }
         );
+        assert!(!error.kind().is_peer_fault());
+        assert!(
+            client.adapter().closed.is_empty(),
+            "a local refusal does not close the carrier"
+        );
+        assert!(!client.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+        assert!(client.negotiation.usable_extensions().is_empty());
+        assert!(server.negotiation.usable_extensions().is_empty());
 
         server.adapter.events.push_back(control(&credit));
         let error = server.poll().unwrap_err();
@@ -3027,22 +3127,18 @@ mod tests {
         }
         client.poll().unwrap();
 
-        assert_eq!(
-            server.negotiation.negotiated_extensions(),
-            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
-        );
-        assert!(client.negotiation.negotiated_extensions().is_empty());
-        assert!(client.send_control(&credit).is_err());
-
-        assert!(server.negotiation.usable_extensions().is_empty());
-        assert!(client.negotiation.usable_extensions().is_empty());
-        let error = server.send_control(&credit).unwrap_err();
-        assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
-        assert!(!error.kind().is_peer_fault());
-        assert!(
-            server.adapter().closed.is_empty(),
-            "a local refusal does not close the carrier"
-        );
+        // Both ends hold the same set once the server's HELLO has answered,
+        // and both may send under it (ADR-0041).
+        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        assert_eq!(server.negotiation.negotiated_extensions(), fec);
+        assert_eq!(client.negotiation.negotiated_extensions(), fec);
+        assert_eq!(server.negotiation.usable_extensions(), fec);
+        assert_eq!(client.negotiation.usable_extensions(), fec);
+        assert!(server.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+        assert!(client.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+        assert!(!client.extension_negotiated(vot_codec::extension_id::VCRC));
+        client.send_control(&credit).unwrap();
+        server.send_control(&credit).unwrap();
 
         // The negotiated side accepts the frame inbound: membership answers
         // true only through the intersection.
@@ -3093,6 +3189,81 @@ mod tests {
         unextended.adapter.events.push_back(control(&credit));
         let error = unextended.poll().unwrap_err();
         assert_eq!(error.close_code(), error_code::EXPERIMENT_NOT_NEGOTIATED);
+    }
+
+    #[test]
+    fn the_answer_is_the_intersection_and_nothing_more() {
+        // The server supports two, the client offers one of them plus one
+        // the server lacks: the answer lists exactly the one in common, and
+        // neither end can send under anything else.
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::ZSTD_RECORDS,
+            ]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::VCRC,
+            ]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: 4096,
+            max_frames: 1,
+        };
+        let answer = server.adapter.sent[0].clone();
+        let (decoded, _) = vot_codec::decode_one(&answer, limits).unwrap();
+        let vot_codec::DecodedFrame::Known { payload, .. } = decoded else {
+            panic!("the answer is a known frame");
+        };
+        let payload = payload.to_vec();
+        let hello = vot_codec::decode_hello(&payload, EndpointRole::Server).unwrap();
+        assert_eq!(
+            hello.extensions,
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            "the answer is the intersection"
+        );
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        client.poll().unwrap();
+        for session in [&client, &server] {
+            assert!(session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+            assert!(!session.extension_negotiated(vot_codec::extension_id::VCRC));
+            assert!(!session.extension_negotiated(vot_codec::extension_id::ZSTD_RECORDS));
+        }
+        // An answer that over-claims is harmless: the client keeps only what
+        // it offered.
+        let mut offered_one = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        offered_one.begin().unwrap();
+        offered_one
+            .adapter
+            .events
+            .push_back(control(&server_hello_of(BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::VCRC,
+            ]))));
+        assert_eq!(offered_one.poll().unwrap(), None);
+        assert!(offered_one.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+        assert!(!offered_one.extension_negotiated(vot_codec::extension_id::VCRC));
     }
 
     #[test]

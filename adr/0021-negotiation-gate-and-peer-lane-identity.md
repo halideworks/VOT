@@ -34,11 +34,11 @@ runs that machine over it. Backends keep their ability to open streams and move
 bytes on their own, which is what makes them testable in isolation; the session
 is what stops a deployment doing it before there is anything to send under.
 
-`HELLO` is sent by the client only. `spec/wire.md` section 5 lists it as "once
-per VOT session" while `SETTINGS` is "once per direction", and section 1 says a
-role inconsistent with the stream initiator is `MALFORMED_FRAME`. On a
-client-initiated stream that leaves exactly one sender. A server therefore never
-sends `HELLO` and never advertises `EndpointRole::Server`.
+`HELLO` was sent by the client only when this was written. ADR-0041 amends
+that: the server answers with its own `HELLO`, role server, listing the
+extensions it accepts, so `spec/wire.md` section 5 now lists `HELLO` as once
+per direction and section 1 makes a role inconsistent with the sender
+`MALFORMED_FRAME`.
 
 Readiness means negotiated and authenticated, and those are two states rather
 than one. ADR-0022 records the section 1.1 exchange that separates them; the

@@ -12,9 +12,10 @@ Runs on QUIC stream zero (first client-initiated bidirectional stream).
 | 1 | sends `HELLO` | |
 | 2 | sends `SETTINGS` | |
 | 3 | | reads `HELLO` |
-| 4 | | reads `SETTINGS`, sends own, sends `SETTINGS_ACK` |
+| 4 | | reads `SETTINGS`, sends own `HELLO` (the accepted extensions), own `SETTINGS`, `SETTINGS_ACK` |
+| 5 | reads the server's `HELLO`, then `SETTINGS`, then `SETTINGS_ACK` | |
 
-Only the client sends `HELLO`. `SETTINGS` is once per direction.
+`HELLO` and `SETTINGS` are once per direction (ADR-0041).
 
 States: `Connecting`, `ControlReserved`, `HelloSent`, `SettingsExchanged`,
 `Negotiated`, `Authenticated`, `Closed`.
@@ -143,10 +144,11 @@ identifiers (only grows).
 
 ## Extensions
 
-`HELLO` carries the client's offered extensions. The server learns the
-intersection; the client learns nothing about the server's set. Experimental
-frames are refused with `EXPERIMENT_NOT_NEGOTIATED` in both directions until a
-spec defines server-side reporting.
+The client's `HELLO` carries its offered extensions; the server's `HELLO`
+answers with exactly the intersection of that offer and its own support, so
+both ends hold the same negotiated set (`Session::extension_negotiated`).
+An experimental frame is refused with `EXPERIMENT_NOT_NEGOTIATED` in both
+directions unless its extension is in that set (ADR-0041).
 
 ## Lane identity
 

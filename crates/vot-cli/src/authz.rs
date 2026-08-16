@@ -119,8 +119,6 @@ impl Requirement {
         .ok()?;
         // Both, because a fetch reads the manifest and then its ranges, and a
         // token that allows one without the other authorizes half a transfer.
-        // The range grant is checked when the fetch names bytes; here we only
-        // need the token to name ReadRanges on this subject.
         authorized
             .allows(AuthorizedRequest::ReadManifest {
                 suite: PACKAGE_SUITE,
@@ -128,6 +126,14 @@ impl Requirement {
             })
             .ok()?;
         if !authorized.capability().allows(Operation::ReadRanges) {
+            return None;
+        }
+        // The scope names the package root (ADR-0036), so a length or range
+        // list has no object to apply to and nothing on the serve path
+        // consults either; a token that narrows is refused rather than half
+        // honoured, as an unenforceable limit is.
+        let scope = &authorized.capability().scope;
+        if scope.length.is_some() || !scope.ranges.is_empty() {
             return None;
         }
         // The whole scope the token carries. A client asking for a subset is
@@ -403,6 +409,51 @@ mod tests {
             vot_capability::encode_scope(&package_scope(ROOT)).expect("the scope"),
             "the grant is the scope the token carries"
         );
+    }
+
+    #[test]
+    fn a_token_that_narrows_its_scope_is_refused() {
+        let issuer_key = keypair(1);
+        let requirement = requirement(&issuer_key);
+        let challenge = requirement.challenge([9; 32]);
+        let holder_key = keypair(2);
+        let ranged = Scope {
+            ranges: vec![vot_capability::Range::new(0, 65_536).expect("a range")],
+            ..package_scope(ROOT)
+        };
+        let measured = Scope {
+            length: Some(1),
+            ..package_scope(ROOT)
+        };
+        for (name, scope) in [("a range list", ranged), ("a length", measured)] {
+            let capability = Capability {
+                issuer: ISSUER.to_owned(),
+                audience: AUDIENCE.to_owned(),
+                holder_key: holder_key.verifying_key().to_bytes(),
+                operations: package_operations(),
+                scope,
+                limits: Vec::new(),
+                not_before: NOW,
+                expiry: NOW + 3_600,
+                token_id: [7; 16],
+                delegation: vot_capability::NO_FURTHER_DELEGATION,
+            };
+            let signed = vot_capability::sign(
+                &capability,
+                &key_id_of(&issuer_key.verifying_key()),
+                &issuer_key,
+            )
+            .expect("a signed token");
+            let token = vot_capability::encode(&signed).expect("an encoded token");
+            let narrowed = Holder::new(token, holder_key.clone()).expect("a holder");
+            let request = narrowed.answer(&challenge, channel(5)).expect("a request");
+            assert!(
+                requirement
+                    .decide(&challenge, &request, channel(5), NOW)
+                    .is_none(),
+                "{name} this serve cannot enforce must fail closed"
+            );
+        }
     }
 
     #[test]

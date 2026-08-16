@@ -189,10 +189,12 @@ negotiated (`EXPERIMENT_NOT_NEGOTIATED`).
 A field outside its constraint is `MALFORMED_FRAME`, as for any payload. An
 exact repeat is idempotent. A repeat of the same `epoch` with any other
 field is `CODING_EPOCH_CONFLICT`. An open that would take the receiver past
-`max_open_epochs` is ignored: the epoch stays unknown to the receiver, its
-symbols drop, and the receiver answers with `GEN_DONE` outcome `2` so the
-sender closes it and moves the bytes to the reliable path. Epochs already
-open when credit shrinks stay open.
+`max_open_epochs`, or whose generation count is more than the receiver is
+willing to track (it keeps one bit per generation for the epoch's life), is
+ignored: the epoch stays unknown to the receiver, its symbols drop, and the
+receiver answers with `GEN_DONE` outcome `2` so the sender closes it and
+moves the bytes to the reliable path. Epochs already open when credit shrinks
+stay open.
 
 `GEN_STATE` (receiver to sender, advisory):
 
@@ -270,9 +272,10 @@ would without FEC, and abandonment is a decision it reports.
 | Symbol whose datagram length is not `9 + L` | dropped |
 | Symbol whose `esi >= k + r`, whose generation lies past the epoch, or whose source ESI lies entirely past `offset + length` | dropped |
 | Duplicate `(epoch, generation, esi)` | dropped |
+| Symbol for a generation that already has a `GEN_DONE` | dropped |
 | Symbol that would make active generations or unretired bytes exceed credit | dropped |
 | Symbol before any `DATAGRAM_CREDIT` was accepted | dropped |
-| `CODING_EPOCH_OPEN` past `max_open_epochs` | ignored, the epoch stays unknown |
+| `CODING_EPOCH_OPEN` past `max_open_epochs`, or with more generations than the receiver will track | ignored, the epoch stays unknown, answered with `GEN_DONE` outcome `2` |
 | `GEN_STATE` or `GEN_DONE` arriving at a sender for an epoch it does not have open, or a `GEN_STATE` for a generation already done | ignored |
 | `CODING_EPOCH_CLOSE` naming an epoch the receiver does not have open | ignored |
 | `CODING_EPOCH_OPEN` repeating a known epoch with any field changed | `CODING_EPOCH_CONFLICT`, session closes |

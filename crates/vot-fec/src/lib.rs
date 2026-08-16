@@ -15,8 +15,10 @@ mod tests;
 mod wire_tests;
 
 pub use plan::{EpochPlan, SourceSpan};
-pub use receiver::{Credit, Decoded, Drop, Open, Receiver, Report, Symbol};
-pub use sender::{Done, Sender, encode_generation};
+pub use receiver::{
+    Credit, Decoded, Drop, MAX_TRACKED_GENERATIONS, Open, Receiver, Report, Symbol,
+};
+pub use sender::{Done, Sender, State, encode_generation};
 
 /// The frozen v0.3 caps on one generation (`spec/architecture.md` section 9).
 pub const MAX_SOURCE_SYMBOLS: usize = 64;

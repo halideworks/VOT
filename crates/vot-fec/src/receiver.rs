@@ -73,25 +73,47 @@ pub struct Report {
     pub missing_sources: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Outcome {
-    Decoded,
-    Abandoned,
-}
+/// The most generations one epoch may have for this receiver to track it:
+/// one bit per generation is allocated at open, so this bounds that
+/// allocation (128 KiB) and an epoch past it is refused like one past
+/// `max_open_epochs`. At the shipped profile it is 64 GiB per epoch.
+pub const MAX_TRACKED_GENERATIONS: u64 = 1 << 20;
 
+/// A live generation: only the symbols that arrived, at most `k - 1` of them
+/// since the `k`-th completes it.
 #[derive(Debug)]
 struct Generation {
-    symbols: Vec<Option<Vec<u8>>>,
+    symbols: Vec<(u8, Vec<u8>)>,
+    /// One bit per ESI in hand, so a duplicate is found without a scan.
+    seen: u128,
     /// Distinct symbols in hand, zero sources included.
     received: usize,
     sequence: u64,
-    done: Option<Outcome>,
+}
+
+impl Generation {
+    fn has(&self, esi: u8) -> bool {
+        self.seen & (1_u128 << esi) != 0
+    }
 }
 
 #[derive(Debug)]
 struct Epoch {
     plan: EpochPlan,
-    generations: BTreeMap<u32, Generation>,
+    /// Live generations only; a done one leaves the map and sets its bit.
+    live: BTreeMap<u32, Generation>,
+    /// One bit per generation of the epoch, set when it retires.
+    done: Vec<u64>,
+}
+
+impl Epoch {
+    fn is_done(&self, generation: u32) -> bool {
+        self.done[(generation / 64) as usize] & (1_u64 << (generation % 64)) != 0
+    }
+
+    fn mark_done(&mut self, generation: u32) {
+        self.done[(generation / 64) as usize] |= 1_u64 << (generation % 64);
+    }
 }
 
 /// The two levels credit caps, kept apart from the epoch table so the two
@@ -153,14 +175,15 @@ fn admit(plan: &EpochPlan, generation: u32, esi: u8, bytes: &[u8]) -> Result<usi
 
 /// Every sent source in hand: the sources themselves, no elimination.
 fn take_sources(slot: &mut Generation, sent_sources: usize) -> Option<Vec<Vec<u8>>> {
-    if !(0..sent_sources).all(|j| slot.symbols[j].is_some()) {
+    if (0..sent_sources).any(|j| !slot.has(u8::try_from(j).expect("a source ESI"))) {
         return None;
     }
-    Some(
-        (0..sent_sources)
-            .map(|j| slot.symbols[j].take().expect("checked"))
-            .collect(),
-    )
+    // `k` in hand and every sent source among them: the zero sources make
+    // up the rest, so what is stored is exactly the sent sources.
+    let mut symbols = std::mem::take(&mut slot.symbols);
+    debug_assert_eq!(symbols.len(), sent_sources);
+    symbols.sort_by_key(|(esi, _)| *esi);
+    Some(symbols.into_iter().map(|(_, symbol)| symbol).collect())
 }
 
 /// `k` distinct symbols in hand, not all of them sources: eliminate.
@@ -168,10 +191,8 @@ fn eliminate(plan: &EpochPlan, slot: &Generation, sent_sources: usize) -> Vec<Ve
     let geometry = plan.geometry();
     let zero = vec![0_u8; geometry.symbol_length()];
     let mut received: Vec<(usize, &[u8])> = Vec::with_capacity(geometry.source_count());
-    for (esi, symbol) in slot.symbols.iter().enumerate() {
-        if let Some(symbol) = symbol {
-            received.push((esi, symbol.as_slice()));
-        }
+    for (esi, symbol) in &slot.symbols {
+        received.push((usize::from(*esi), symbol.as_slice()));
     }
     for esi in sent_sources..geometry.source_count() {
         received.push((esi, zero.as_slice()));
@@ -224,6 +245,9 @@ impl Receiver {
     /// # Errors
     /// A repeat of a known epoch with a different plan is
     /// `CODING_EPOCH_CONFLICT`, reported as `InvalidGeometry` here.
+    ///
+    /// # Panics
+    /// Never: the bitmap size is bounded by `MAX_TRACKED_GENERATIONS`.
     pub fn open(&mut self, plan: EpochPlan) -> Result<Open, Error> {
         if let Some(known) = self.epochs.get(&plan.epoch()) {
             return if known.plan == plan {
@@ -235,14 +259,18 @@ impl Receiver {
         let Some(credit) = self.credit else {
             return Ok(Open::Refused);
         };
-        if self.epochs.len() as u64 >= credit.max_open_epochs {
+        if self.epochs.len() as u64 >= credit.max_open_epochs
+            || plan.generation_count() > MAX_TRACKED_GENERATIONS
+        {
             return Ok(Open::Refused);
         }
+        let words = usize::try_from(plan.generation_count().div_ceil(64)).expect("bounded above");
         self.epochs.insert(
             plan.epoch(),
             Epoch {
                 plan,
-                generations: BTreeMap::new(),
+                live: BTreeMap::new(),
+                done: vec![0; words],
             },
         );
         Ok(Open::Opened)
@@ -266,33 +294,31 @@ impl Receiver {
             Err(drop) => return Symbol::Dropped(drop),
         };
         let geometry = plan.geometry();
-        if let Some(existing) = state.generations.get(&generation) {
-            if existing.done.is_some() {
-                return Symbol::Dropped(Drop::GenerationDone);
-            }
-            if existing.symbols[usize::from(esi)].is_some() {
+        if state.is_done(generation) {
+            return Symbol::Dropped(Drop::GenerationDone);
+        }
+        if let Some(existing) = state.live.get(&generation) {
+            if existing.has(esi) {
                 return Symbol::Dropped(Drop::Duplicate);
             }
         } else {
             if !self.counters.admit(credit, plan.generation_bytes()) {
                 return Symbol::Dropped(Drop::PastCredit);
             }
-            state.generations.insert(
+            state.live.insert(
                 generation,
                 Generation {
-                    symbols: vec![None; geometry.symbol_count()],
+                    symbols: Vec::new(),
+                    seen: 0,
                     // Zero sources are in hand from the start.
                     received: geometry.source_count() - sent_sources,
                     sequence: 0,
-                    done: None,
                 },
             );
         }
-        let slot = state
-            .generations
-            .get_mut(&generation)
-            .expect("inserted above");
-        slot.symbols[usize::from(esi)] = Some(bytes.to_vec());
+        let slot = state.live.get_mut(&generation).expect("inserted above");
+        slot.symbols.push((esi, bytes.to_vec()));
+        slot.seen |= 1_u128 << esi;
         slot.received += 1;
         if slot.received < geometry.source_count() {
             return Symbol::Stored;
@@ -306,16 +332,16 @@ impl Receiver {
                 .checked_add(work)
                 .is_none_or(|spent| spent > credit.max_decode_work)
             {
-                slot.done = Some(Outcome::Abandoned);
-                slot.symbols = Vec::new();
+                state.live.remove(&generation);
+                state.mark_done(generation);
                 self.counters.retire(plan.generation_bytes());
                 return Symbol::Abandoned { generation };
             }
             self.decode_work_spent += work;
             eliminate(&plan, slot, sent_sources)
         };
-        slot.done = Some(Outcome::Decoded);
-        slot.symbols = Vec::new();
+        state.live.remove(&generation);
+        state.mark_done(generation);
         self.counters.retire(plan.generation_bytes());
         Symbol::Decoded(assemble(&plan, generation, &sources))
     }
@@ -329,18 +355,15 @@ impl Receiver {
     pub fn report(&mut self, epoch: u32, generation: u32) -> Option<Report> {
         let state = self.epochs.get_mut(&epoch)?;
         let plan = state.plan;
-        let slot = state.generations.get_mut(&generation)?;
-        if slot.done.is_some() {
-            return None;
-        }
+        let slot = state.live.get_mut(&generation)?;
         slot.sequence += 1;
         let sent = plan.sent_source_count(generation);
         Some(Report {
             sequence: slot.sequence,
             received: u8::try_from(slot.received).expect("at most k + r"),
             missing_sources: (0..sent)
-                .filter(|j| slot.symbols[*j].is_none())
                 .map(|j| u8::try_from(j).expect("a source ESI"))
+                .filter(|j| !slot.has(*j))
                 .collect(),
         })
     }
@@ -353,14 +376,10 @@ impl Receiver {
             return false;
         };
         let plan = state.plan;
-        let Some(slot) = state.generations.get_mut(&generation) else {
-            return false;
-        };
-        if slot.done.is_some() {
+        if state.live.remove(&generation).is_none() {
             return false;
         }
-        slot.done = Some(Outcome::Abandoned);
-        slot.symbols = Vec::new();
+        state.mark_done(generation);
         self.counters.retire(plan.generation_bytes());
         true
     }
@@ -371,12 +390,7 @@ impl Receiver {
         let Some(state) = self.epochs.remove(&epoch) else {
             return false;
         };
-        let live = state
-            .generations
-            .values()
-            .filter(|slot| slot.done.is_none())
-            .count();
-        for _ in 0..live {
+        for _ in 0..state.live.len() {
             self.counters.retire(state.plan.generation_bytes());
         }
         true

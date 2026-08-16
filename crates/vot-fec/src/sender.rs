@@ -70,6 +70,15 @@ pub enum Done {
     Abandoned,
 }
 
+/// A `GEN_STATE` as the receiver sent it, for this end to check against the
+/// epoch it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct State<'a> {
+    pub sequence: u64,
+    pub received: u8,
+    pub missing_sources: &'a [u8],
+}
+
 #[derive(Debug)]
 struct Epoch {
     plan: EpochPlan,
@@ -84,6 +93,9 @@ struct Epoch {
 pub struct Sender {
     credit: Option<Credit>,
     epochs: BTreeMap<u32, Epoch>,
+    /// Every identifier at or below this has been used; an identifier is
+    /// never reused after close, so new ones only rise.
+    highest_epoch: Option<u32>,
     active_generations: u64,
     unretired_bytes: u64,
 }
@@ -113,14 +125,23 @@ impl Sender {
             .is_some_and(|credit| (self.epochs.len() as u64) < credit.max_open_epochs)
     }
 
+    /// The next identifier this end may open, `None` when all are spent.
+    #[must_use]
+    pub fn next_epoch(&self) -> Option<u32> {
+        self.highest_epoch
+            .map_or(Some(0), |used| used.checked_add(1))
+    }
+
     /// Records an epoch this end is about to announce.
     ///
     /// # Errors
-    /// `InvalidGeometry` when the identifier is in use or credit forbids it.
+    /// `InvalidGeometry` when the identifier is not above every one this
+    /// end has used, or credit forbids the open.
     pub fn open(&mut self, plan: EpochPlan) -> Result<(), Error> {
-        if self.epochs.contains_key(&plan.epoch()) || !self.may_open() {
+        if self.highest_epoch.is_some_and(|used| plan.epoch() <= used) || !self.may_open() {
             return Err(Error::InvalidGeometry);
         }
+        self.highest_epoch = Some(plan.epoch());
         self.epochs.insert(
             plan.epoch(),
             Epoch {
@@ -171,40 +192,78 @@ impl Sender {
         Ok(())
     }
 
-    /// `GEN_STATE` from the receiver. Returns whether it was newer than what
-    /// this end already had for that generation; ignored otherwise, and for
-    /// an epoch or generation this end does not have live.
-    pub fn state(&mut self, epoch: u32, generation: u32, sequence: u64) -> bool {
-        let Some(state) = self.epochs.get_mut(&epoch) else {
-            return false;
+    /// `GEN_STATE` from the receiver. `Ok(true)` when it was newer than what
+    /// this end already had for that generation; `Ok(false)` when ignored,
+    /// which covers an epoch this end does not have open, a generation not
+    /// begun or already done, and a stale sequence.
+    ///
+    /// # Errors
+    /// `InvalidSymbol` for a payload outside the epoch's constraints: a
+    /// generation past the epoch, `received` above `k + r`, or a missing
+    /// source that is not a sent source. That is `MALFORMED_FRAME` on the
+    /// wire.
+    pub fn state(&mut self, epoch: u32, generation: u32, state: State<'_>) -> Result<bool, Error> {
+        let Some(known) = self.epochs.get_mut(&epoch) else {
+            return Ok(false);
         };
-        if state.generations.get(&generation) != Some(&None) {
-            return false;
+        let plan = known.plan;
+        if !plan.holds(generation) {
+            return Err(Error::InvalidSymbol);
         }
-        let held = state.sequences.entry(generation).or_insert(0);
-        if sequence <= *held {
-            return false;
+        let sent = plan.sent_source_count(generation);
+        if usize::from(state.received) > plan.geometry().symbol_count()
+            || state
+                .missing_sources
+                .iter()
+                .any(|esi| usize::from(*esi) >= sent)
+        {
+            return Err(Error::InvalidSymbol);
         }
-        *held = sequence;
-        true
+        if known.generations.get(&generation) != Some(&None) {
+            return Ok(false);
+        }
+        if known
+            .sequences
+            .get(&generation)
+            .is_some_and(|held| state.sequence <= *held)
+        {
+            return Ok(false);
+        }
+        known.sequences.insert(generation, state.sequence);
+        Ok(true)
     }
 
-    /// `GEN_DONE` from the receiver for one generation. Retires it. Returns
-    /// whether it was live; a repeat or an unknown one is ignored.
-    pub fn done(&mut self, epoch: u32, generation: u32, done: Done) -> bool {
+    /// `GEN_DONE` from the receiver for one generation. Retires it.
+    /// `Ok(true)` when it was live; `Ok(false)` for an exact repeat, a
+    /// generation never begun, or an epoch this end does not have open.
+    ///
+    /// # Errors
+    /// `InvalidSymbol` for a generation past the epoch or a repeat with a
+    /// different outcome, both `MALFORMED_FRAME` on the wire.
+    pub fn done(&mut self, epoch: u32, generation: u32, done: Done) -> Result<bool, Error> {
         let Some(state) = self.epochs.get_mut(&epoch) else {
-            return false;
+            return Ok(false);
         };
+        if !state.plan.holds(generation) {
+            return Err(Error::InvalidSymbol);
+        }
         let bytes = state.plan.generation_bytes();
         match state.generations.get_mut(&generation) {
             Some(slot @ None) => {
                 *slot = Some(done);
                 self.active_generations -= 1;
                 self.unretired_bytes -= bytes;
-                true
+                Ok(true)
             }
-            _ => false,
+            Some(Some(earlier)) if *earlier != done => Err(Error::InvalidSymbol),
+            _ => Ok(false),
         }
+    }
+
+    /// The plan of an epoch this end has open.
+    #[must_use]
+    pub fn plan(&self, epoch: u32) -> Option<EpochPlan> {
+        self.epochs.get(&epoch).map(|state| state.plan)
     }
 
     /// `GEN_DONE` outcome refused: the receiver never held the epoch. Every

@@ -27,6 +27,14 @@ fn object_bytes(offset: u64, length: u64) -> Vec<u8> {
         .collect()
 }
 
+fn seq(sequence: u64) -> State<'static> {
+    State {
+        sequence,
+        received: 0,
+        missing_sources: &[],
+    }
+}
+
 fn symbols_of(plan: &EpochPlan, generation: u32) -> Vec<(u8, Vec<u8>)> {
     let (offset, length) = plan.generation_span(generation);
     encode_generation(plan, generation, &object_bytes(offset, length)).unwrap()
@@ -448,17 +456,95 @@ fn a_sender_tracks_what_credit_lets_it_open_and_begin() {
     assert_eq!(sender.unretired_bytes(), 12);
     assert_eq!(sender.outcome(1, 0), Some(None));
     assert_eq!(sender.outcome(1, 1), None);
-    // Feedback: a newer state is accepted once, done retires once.
-    assert!(sender.state(1, 0, 1));
-    assert!(!sender.state(1, 0, 1), "not newer");
-    assert!(sender.state(1, 0, 3));
-    assert!(!sender.state(1, 1, 1), "not begun");
-    assert!(!sender.state(2, 0, 1), "unknown epoch");
-    assert!(sender.done(1, 0, Done::Decoded));
-    assert!(!sender.done(1, 0, Done::Decoded), "a repeat");
-    assert!(!sender.done(1, 1, Done::Abandoned), "never begun");
-    assert!(!sender.done(2, 0, Done::Abandoned), "unknown epoch");
-    assert!(!sender.state(1, 0, 4), "done generations take no state");
+    feedback_rules(&mut sender, plan1);
+    close_rules(&mut sender, plan1);
+}
+
+/// A newer state is accepted once, done retires once, and payloads outside
+/// the epoch's constraints are errors rather than ignores.
+fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
+    assert_eq!(
+        sender.state(1, 0, seq(0)),
+        Ok(true),
+        "zero is a first sequence"
+    );
+    assert_eq!(sender.state(1, 0, seq(0)), Ok(false), "not newer");
+    assert_eq!(
+        sender.state(
+            1,
+            0,
+            State {
+                sequence: 3,
+                received: 6,
+                missing_sources: &[0, 3]
+            }
+        ),
+        Ok(true),
+        "received may reach k + r"
+    );
+    assert_eq!(sender.state(1, 0, seq(2)), Ok(false));
+    assert_eq!(sender.state(1, 1, seq(1)), Ok(false), "not begun");
+    assert_eq!(sender.state(2, 0, seq(1)), Ok(false), "unknown epoch");
+    assert_eq!(
+        sender.state(1, 2, seq(1)),
+        Err(Error::InvalidSymbol),
+        "past the epoch"
+    );
+    assert_eq!(
+        sender.state(
+            1,
+            0,
+            State {
+                sequence: 9,
+                received: 7,
+                missing_sources: &[]
+            }
+        ),
+        Err(Error::InvalidSymbol),
+        "received past k + r"
+    );
+    assert_eq!(
+        sender.state(
+            1,
+            0,
+            State {
+                sequence: 9,
+                received: 1,
+                missing_sources: &[4]
+            }
+        ),
+        Err(Error::InvalidSymbol),
+        "a repair ESI is not a missing source"
+    );
+    assert_eq!(sender.done(1, 0, Done::Decoded), Ok(true));
+    assert_eq!(sender.done(1, 0, Done::Decoded), Ok(false), "a repeat");
+    assert_eq!(
+        sender.done(1, 0, Done::Abandoned),
+        Err(Error::InvalidSymbol),
+        "a repeat with another outcome"
+    );
+    assert_eq!(sender.done(1, 1, Done::Abandoned), Ok(false), "never begun");
+    assert_eq!(
+        sender.done(2, 0, Done::Abandoned),
+        Ok(false),
+        "unknown epoch"
+    );
+    assert_eq!(
+        sender.done(1, 2, Done::Abandoned),
+        Err(Error::InvalidSymbol),
+        "past the epoch"
+    );
+    assert_eq!(
+        sender.state(1, 0, seq(4)),
+        Ok(false),
+        "done generations take no state"
+    );
+    assert_eq!(sender.plan(1), Some(plan1));
+    assert_eq!(sender.plan(2), None);
+}
+
+/// Retire on refusal or close, and never reuse an identifier.
+fn close_rules(sender: &mut Sender, plan1: EpochPlan) {
     assert_eq!(sender.outcome(1, 0), Some(Some(Done::Decoded)));
     assert_eq!(sender.active_generations(), 0);
     assert_eq!(sender.unretired_bytes(), 0);
@@ -477,12 +563,25 @@ fn a_sender_tracks_what_credit_lets_it_open_and_begin() {
     assert_eq!(sender.unretired_bytes(), 0);
     assert_eq!(sender.open_epochs(), 0);
     assert_eq!(sender.outcome(1, 1), None, "forgotten");
+    // An identifier is never reused after close: only higher ones open.
+    assert_eq!(sender.open(plan1), Err(Error::InvalidGeometry), "spent");
+    assert_eq!(
+        sender.open(plan(0, 0, 24, 4, 2, 3)),
+        Err(Error::InvalidGeometry)
+    );
+    assert_eq!(sender.next_epoch(), Some(2));
     let plan3 = plan(3, 0, 24, 4, 2, 3);
     assert_eq!(sender.open(plan3), Ok(()));
+    assert_eq!(sender.next_epoch(), Some(4));
     assert_eq!(sender.begin(3, 0), Ok(()));
     assert!(sender.close(3));
     assert!(!sender.close(3));
     assert_eq!(sender.active_generations(), 0);
+    let mut last = Sender::new();
+    last.credit(ample());
+    assert_eq!(last.next_epoch(), Some(0));
+    last.open(plan(u32::MAX, 0, 12, 4, 2, 3)).unwrap();
+    assert_eq!(last.next_epoch(), None, "every identifier is spent");
 }
 
 #[test]
@@ -511,7 +610,7 @@ fn a_sender_and_receiver_agree_on_a_lossy_epoch() {
                 Symbol::Decoded(decoded) => {
                     assert_eq!(decoded.generation, generation);
                     recovered.push((decoded.offset, decoded.bytes));
-                    assert!(sender.done(9, generation, Done::Decoded));
+                    assert_eq!(sender.done(9, generation, Done::Decoded), Ok(true));
                     done = true;
                 }
                 other => panic!("{other:?}"),
@@ -543,6 +642,44 @@ fn the_generation_count_binds_when_bytes_do_not() {
     assert_eq!(sender.begin(1, 1), Ok(()));
     assert!(!sender.may_begin(1), "two active generations is the cap");
     assert_eq!(sender.begin(1, 2), Err(Error::InvalidGeometry));
-    assert!(sender.done(1, 1, Done::Abandoned));
+    assert_eq!(sender.done(1, 1, Done::Abandoned), Ok(true));
     assert!(sender.may_begin(1));
+}
+
+#[test]
+fn a_done_generation_leaves_the_table_and_a_huge_epoch_is_refused() {
+    let mut receiver = Receiver::new();
+    receiver.credit(ample());
+    // k = 1, L = 1: every symbol decodes on arrival. The tracked table
+    // holds no entry per done generation, only its bit.
+    let plan = plan(1, 0, 4096, 1, 0, 1);
+    receiver.open(plan).unwrap();
+    for generation in 0..4096_u32 {
+        assert!(matches!(
+            receiver.symbol(1, generation, 0, &[9]),
+            Symbol::Decoded(_)
+        ));
+    }
+    assert_eq!(receiver.active_generations(), 0);
+    assert_eq!(
+        receiver.symbol(1, 4095, 0, &[9]),
+        Symbol::Dropped(Drop::GenerationDone)
+    );
+    // Past MAX_TRACKED_GENERATIONS the open is refused like one past credit.
+    let huge = EpochPlan::new(
+        2,
+        0,
+        MAX_TRACKED_GENERATIONS + 1,
+        Geometry::new(1, 0, 1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receiver.open(huge), Ok(Open::Refused));
+    let largest = EpochPlan::new(
+        2,
+        0,
+        MAX_TRACKED_GENERATIONS,
+        Geometry::new(1, 0, 1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receiver.open(largest), Ok(Open::Opened));
 }

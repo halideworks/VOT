@@ -1,0 +1,42 @@
+name: fec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fec.yml"
+      - "adr/0039-datagram-fec-erasure-code.md"
+      - "spec/fec.md"
+      - "test-vectors/fec/**"
+      - "tools/validate_fec_vectors.py"
+  pull_request:
+    paths:
+      - ".github/workflows/fec.yml"
+      - "adr/0039-datagram-fec-erasure-code.md"
+      - "spec/fec.md"
+      - "test-vectors/fec/**"
+      - "tools/validate_fec_vectors.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: fec
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
+      - run: python3 tools/validate_fec_vectors.py

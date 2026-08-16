@@ -3171,6 +3171,81 @@ mod tests {
     }
 
     #[test]
+    fn the_answer_is_the_intersection_and_nothing_more() {
+        // The server supports two, the client offers one of them plus one
+        // the server lacks: the answer lists exactly the one in common, and
+        // neither end can send under anything else.
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::ZSTD_RECORDS,
+            ]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::VCRC,
+            ]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: 4096,
+            max_frames: 1,
+        };
+        let answer = server.adapter.sent[0].clone();
+        let (decoded, _) = vot_codec::decode_one(&answer, limits).unwrap();
+        let vot_codec::DecodedFrame::Known { payload, .. } = decoded else {
+            panic!("the answer is a known frame");
+        };
+        let payload = payload.to_vec();
+        let hello = vot_codec::decode_hello(&payload, EndpointRole::Server).unwrap();
+        assert_eq!(
+            hello.extensions,
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            "the answer is the intersection"
+        );
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        client.poll().unwrap();
+        for session in [&client, &server] {
+            assert!(session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+            assert!(!session.extension_negotiated(vot_codec::extension_id::VCRC));
+            assert!(!session.extension_negotiated(vot_codec::extension_id::ZSTD_RECORDS));
+        }
+        // An answer that over-claims is harmless: the client keeps only what
+        // it offered.
+        let mut offered_one = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        offered_one.begin().unwrap();
+        offered_one
+            .adapter
+            .events
+            .push_back(control(&server_hello_of(BTreeSet::from([
+                vot_codec::extension_id::DATAGRAM_FEC,
+                vot_codec::extension_id::VCRC,
+            ]))));
+        assert_eq!(offered_one.poll().unwrap(), None);
+        assert!(offered_one.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC));
+        assert!(!offered_one.extension_negotiated(vot_codec::extension_id::VCRC));
+    }
+
+    #[test]
     #[should_panic(expected = "assertion `left == right` failed")]
     fn a_drifted_pending_byte_total_fails_the_recomputation() {
         let mut pending = PendingEvents::default();

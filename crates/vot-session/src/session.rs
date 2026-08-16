@@ -19,8 +19,9 @@ pub struct Session<A> {
     pub(super) negotiation: Negotiation,
     /// Named by the caller, because no policy exists to establish it.
     pub(super) authentication: Authentication,
-    /// Negotiation frames the backend has not accepted yet, at most two. A full
-    /// queue is backpressure, not a lost handshake.
+    /// Negotiation frames the backend has not accepted yet, at most four (the
+    /// server's whole reply). A full queue is backpressure, not a lost
+    /// handshake.
     pub(super) outbound: VecDeque<Vec<u8>>,
     /// Records the peer sent before this endpoint reached `Ready`. Held here
     /// rather than in the adapter, whose single queue would block the control

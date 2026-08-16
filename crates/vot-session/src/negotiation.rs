@@ -17,7 +17,8 @@ pub enum State {
     Connecting,
     /// The negotiation stream exists and nothing has been sent on it.
     ControlReserved,
-    /// `HELLO` has been sent by the client, or seen by the server.
+    /// `HELLO` has been sent by the client (and, once the server answers,
+    /// its answer read), or seen by the server.
     HelloSent,
     /// Both `SETTINGS` frames have been accounted for.
     SettingsExchanged,

@@ -100,7 +100,7 @@
         "endpoint_role": 1,
         "extensions": []
       },
-      "note": "The role is encodable, but spec/wire.md section 1 has only the client send HELLO, on the stream it opened. A server sending this would contradict the stream initiator."
+      "note": "The server's answer to the client's HELLO (spec/wire.md section 1, ADR-0041): role server, listing the extensions it accepts from the client's offer."
     },
     {
       "name": "older-draft-rejected",

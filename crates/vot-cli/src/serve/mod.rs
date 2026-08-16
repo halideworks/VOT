@@ -728,12 +728,29 @@ mod tests {
         // back as reliable records: 16 left of the first piece and 6 of the
         // tail, the decoded one having settled.
         session.driver().records.clear();
-        let began = std::time::Instant::now();
-        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
-        assert_eq!(connection.fec.epochs.len(), 2, "the pass arms the clock");
+        // Both clocks are armed already, so measure from the later of them:
+        // an epoch is kept right up to its grace and goes once past it, and
+        // neither half depends on how long the passes above really took.
+        let armed = connection
+            .fec
+            .epochs
+            .values()
+            .filter_map(|opened| opened.quiet_since)
+            .max()
+            .expect("both are armed");
         assert!(
             server
-                .retire_quiet_epochs(&mut connection, began + server::EPOCH_QUIET_GRACE * 2)
+                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE / 2)
+                .is_ok()
+        );
+        assert_eq!(
+            connection.fec.epochs.len(),
+            2,
+            "inside the grace both are kept"
+        );
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE)
                 .is_ok()
         );
         assert!(connection.fec.epochs.is_empty(), "both are past the grace");

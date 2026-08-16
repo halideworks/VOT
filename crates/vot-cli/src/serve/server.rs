@@ -104,6 +104,8 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
+        // Whether this pass stopped before reading everything the peer sent.
+        let mut unread = false;
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -112,6 +114,10 @@ impl BundleServer {
                 return fail(fault, session, connection);
             }
             if connection.outbound.bytes() >= connection.budget {
+                // Broken on the budget rather than on an empty queue, so
+                // frames the peer has already sent may be sitting unread and
+                // an epoch's outcome may be among them.
+                unread = true;
                 break;
             }
             connection.fec_negotiated =
@@ -145,8 +151,10 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
-        if let Err(fault) = self.retire_quiet_epochs(connection, std::time::Instant::now()) {
-            return fail(fault, session, connection);
+        if !unread {
+            if let Err(fault) = self.retire_quiet_epochs(connection, std::time::Instant::now()) {
+                return fail(fault, session, connection);
+            }
         }
         connection.drain(session)?;
         if let Some(code) = connection.closed {
@@ -163,14 +171,15 @@ impl BundleServer {
     /// reports nothing: the receiver owes a `GEN_DONE` only for a generation
     /// it decoded or gave up on. Waiting for that outcome forever is what
     /// leaves the fetch with a record that never comes, so an epoch whose
-    /// symbols are all on the carrier and which has drawn no outcome for
-    /// `QUIET_PASSES_BEFORE_CLOSE` idle passes is repaired reliably and
-    /// closed, which is what `spec/fec.md` section 11 already says a close
-    /// means: every generation under it with no `GEN_DONE` retires as
-    /// abandoned.
+    /// symbols are all on the carrier and which has drawn nothing from the
+    /// receiver for [`EPOCH_QUIET_GRACE`] is repaired reliably and closed,
+    /// which is what `spec/fec.md` section 11 already says a close means:
+    /// every generation under it with no `GEN_DONE` retires as abandoned.
     ///
-    /// Counted in passes rather than timed, so the bound is the loop's own
-    /// and a test can spend it.
+    /// The instant to measure against is the caller's, so a test spends the
+    /// grace without waiting for it. A pass that stopped on the outbound
+    /// budget does not spend it at all: frames the peer already sent may be
+    /// unread, and an epoch's outcome may be among them.
     ///
     /// The budget is per epoch and is reset by anything the receiver says
     /// about that epoch: a `GEN_STATE`, which it sends as each generation's

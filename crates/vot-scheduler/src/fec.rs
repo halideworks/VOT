@@ -79,6 +79,8 @@ pub(crate) struct Intake {
     orphan_bytes: usize,
     owed: VecDeque<Owed>,
     credit_epoch: u64,
+    /// Generations decoded from the datagram path over the session's life.
+    decoded: u64,
 }
 
 impl Intake {
@@ -163,6 +165,7 @@ impl Intake {
                 offset,
                 bytes,
             }) => {
+                self.decoded += 1;
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
                     generation,
@@ -228,6 +231,11 @@ impl Intake {
         });
         self.orphan_bytes -= taken.iter().map(|joined| joined.bytes.len()).sum::<usize>();
         taken
+    }
+
+    /// Generations decoded from the datagram path so far.
+    pub(crate) const fn decoded(&self) -> u64 {
+        self.decoded
     }
 
     /// The next frame this end owes the sender, left in place: the caller

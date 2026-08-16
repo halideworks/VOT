@@ -654,6 +654,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.fec_armed
     }
 
+    /// Generations this session decoded from the datagram path.
+    #[must_use]
+    pub const fn fec_generations_decoded(&self) -> u64 {
+        self.fec.decoded()
+    }
+
     /// `CODING_EPOCH_OPEN` or `CODING_EPOCH_CLOSE` from the sender.
     fn accept_fec_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
         let limits = vot_codec::DecodeLimits {
@@ -2163,6 +2169,7 @@ mod tests {
             driver.is_verified(subject),
             "both generations decoded and verified"
         );
+        assert_eq!(driver.fec_generations_decoded(), 2);
         assert_eq!(driver.pending_bundles(), 0);
         let types = sent_types(&mut driver);
         assert_eq!(

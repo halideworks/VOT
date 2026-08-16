@@ -37,6 +37,23 @@ pub const DEFAULT_ORPHAN_BUNDLES: usize = 2;
 /// Bytes held for records that arrived before their proof.
 pub const DEFAULT_ORPHAN_BYTES: usize = DEFAULT_ORPHAN_BUNDLES * MAX_ORPHAN_BUNDLE_BYTES;
 
+/// Bundles one cover becomes when it is answered coded.
+///
+/// A coded answer is cut on fixed piece boundaries, so a cover spans the
+/// pieces its length covers and one more for being unaligned to them. A
+/// cover answered reliably is a single bundle, so this is the cost of
+/// inviting coding at all.
+pub const PIECES_PER_COVER: usize = 5;
+
+// Tied to the geometry it stands for, so a change to the cover bound, the
+// generation size, or the records a bundle carries breaks the build here.
+const _: () = assert!(
+    PIECES_PER_COVER as u64
+        == crate::MAX_PROOF_RANGE_BYTES.div_ceil(
+            fec::GENERATION_BYTES * vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64
+        ) + 1
+);
+
 /// Coding epochs a receiver will invite a sender to hold open at once.
 ///
 /// Public because each one pins a pending bundle for its whole life, so a
@@ -178,10 +195,18 @@ impl PendingBundles {
     /// An open epoch pins one pending bundle from its `CODING_EPOCH_OPEN`
     /// until the last of its generations lands, so a credit inviting more
     /// epochs than this admits bundles is one the sender spends and this end
-    /// then refuses, ending the fetch. One slot stays free for a range
-    /// answered reliably alongside the coded ones.
+    /// then refuses, ending the fetch.
+    ///
+    /// The reserve is a whole cover's worth of pieces rather than one slot.
+    /// Coding is what splits a cover into pieces at all: answered reliably a
+    /// cover is one bundle, and answered coded it is up to
+    /// [`PIECES_PER_COVER`] of them, the ones past this end's epochs
+    /// included, because those ride reliably as pieces of their own. A depth
+    /// under that cannot hold one coded cover in any arrangement, so it
+    /// promises nothing and the sender answers whole covers reliably, which
+    /// is the one shape that always fits.
     fn epoch_capacity(&self) -> u64 {
-        u64::try_from(self.bundle_limit.saturating_sub(1)).unwrap_or(u64::MAX)
+        u64::try_from(self.bundle_limit.saturating_sub(PIECES_PER_COVER)).unwrap_or(u64::MAX)
     }
 
     /// Bytes held across both budgets.
@@ -2086,10 +2111,21 @@ mod tests {
         session.poll().unwrap();
         assert!(session.is_ready());
         session.driver().sent.clear();
-        SessionReceiver::new(
+        let mut receiver = SessionReceiver::new(
             session,
             ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
-        )
+        );
+        // A depth that admits a coded cover, which is what a caller enabling
+        // this extension has to set: at the default an epoch would cost more
+        // bundles than there are and `epoch_capacity` invites none.
+        let depth = PIECES_PER_COVER + MAX_CODING_EPOCHS;
+        receiver
+            .set_pending_limits(depth, depth * MAX_PENDING_BUNDLE_BYTES)
+            .unwrap();
+        receiver
+            .set_orphan_limits(depth, depth * MAX_ORPHAN_BUNDLE_BYTES)
+            .unwrap();
+        receiver
     }
 
     /// The frame types the receiver put on the control stream, in order.
@@ -2496,16 +2532,6 @@ mod tests {
     fn a_conflicting_reopen_closes_and_a_refused_open_is_answered() {
         let (subject, bundle, _) = object();
         let mut driver = ready_fec();
-        // Room for every epoch the coding side would extend, plus the slot
-        // `epoch_capacity` keeps for a reliably answered range. Without it
-        // the credit clamps to the pending depth and the refusal under test
-        // happens earlier, for the other reason.
-        driver
-            .set_pending_limits(
-                MAX_CODING_EPOCHS + 1,
-                (MAX_CODING_EPOCHS + 1) * MAX_PENDING_BUNDLE_BYTES,
-            )
-            .unwrap();
         driver.admit(subject, Box::new(DiscardSink)).unwrap();
         let (open, _) = epoch_of(&bundle, 1);
         // Eight epochs is the cap this end extends; the ninth is refused

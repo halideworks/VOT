@@ -169,6 +169,11 @@ impl Intake {
         let unchanged = held.is_some_and(|held| {
             held.max_unretired_bytes == credit.max_unretired_bytes
                 && held.max_active_generations == credit.max_active_generations
+                // The epoch cap comes from mutable pending state, so a caller
+                // that narrows its depth has to reach the sender: leaving it
+                // out held the sender at the wider cap it had already been
+                // given, which is the invitation this end would then refuse.
+                && held.max_open_epochs == credit.max_open_epochs
         });
         let budget_fresh =
             held.is_some_and(|held| self.receiver.decode_work_spent() <= held.max_decode_work / 2);

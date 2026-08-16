@@ -4,13 +4,14 @@ use super::{
     Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap, DEFAULT_PROVING_THREADS,
     DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY,
     MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE,
-    ManifestReader, ManifestRequest, Mutex, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
-    PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf,
-    PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
-    ReliableReceiver, ResumeStore, Session, SessionReceiver, Settings, SharedPlan, Storage,
-    SubjectId, TransportAdapter, TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames,
-    fs, is_backpressure, package_sentinel, remove_store_files, reservations_of, resume_failure,
-    resumed_extents, subject_of, total_units_of,
+    ManifestReader, ManifestRequest, Mutex, ORPHAN_BUNDLE_BYTES, OUTSTANDING_COVERS,
+    OUTSTANDING_REQUEST_BYTES, PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT,
+    PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject, Proving,
+    ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
+    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter, TypedFrame,
+    UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
+    remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
+    total_units_of,
 };
 
 /// Credit advertised to the server: the covers this end asked for.
@@ -315,14 +316,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Every outstanding cover must be holdable in any arrival state;
         // the receiver defaults are too shallow and fail a conforming
         // transfer with `PendingBundlesExhausted`.
-        receiver.set_pending_limits(
-            PENDING_BUNDLE_DEPTH,
-            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
-        )?;
-        receiver.set_orphan_limits(
-            OUTSTANDING_COVERS,
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES,
-        )?;
+        receiver.set_pending_limits(PENDING_BUNDLE_DEPTH, PENDING_BUNDLE_BYTES)?;
+        // The same depth as the pending budget, for the same reason: a
+        // coded cover is answered in pieces and every piece is a bundle of
+        // its own, so records outrunning their proof can do it for as many
+        // bundles as there are pieces in flight, not as many as covers.
+        receiver.set_orphan_limits(PENDING_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
         let mut fetcher = Self {
             receiver,
             bundle: bundle.to_owned(),
@@ -373,14 +372,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)?;
         let mut receiver = SessionReceiver::new(session, receiver);
         // Same pipeline budgets as the primary: each rail carries the full depth.
-        receiver.set_pending_limits(
-            PENDING_BUNDLE_DEPTH,
-            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES,
-        )?;
-        receiver.set_orphan_limits(
-            OUTSTANDING_COVERS,
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES,
-        )?;
+        receiver.set_pending_limits(PENDING_BUNDLE_DEPTH, PENDING_BUNDLE_BYTES)?;
+        // The same depth as the pending budget, for the same reason: a
+        // coded cover is answered in pieces and every piece is a bundle of
+        // its own, so records outrunning their proof can do it for as many
+        // bundles as there are pieces in flight, not as many as covers.
+        receiver.set_orphan_limits(PENDING_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
         let mut fetcher = Self {
             receiver,
             bundle: bundle.to_owned(),

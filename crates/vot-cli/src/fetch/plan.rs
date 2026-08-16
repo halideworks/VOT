@@ -39,9 +39,9 @@ const PIECES_PER_COVER: usize = 5;
 /// the reliable path never noticed because it completes a bundle's records
 /// before the next bundle is announced.
 ///
-/// The byte budget beside it is unchanged and is what bounds the memory: a
-/// bundle of the shipped FEC profile is about a quarter of the worst case
-/// this counts, so the deeper count fits inside the same bytes.
+/// The byte budget beside it is [`PENDING_BUNDLE_BYTES`], which is sized for
+/// what the two pipelines actually hold rather than for this count of
+/// worst-case bundles.
 pub(crate) const PENDING_BUNDLE_DEPTH: usize = OUTSTANDING_COVERS * PIECES_PER_COVER;
 
 // Tied to the geometry it stands for, so a change to either the cover bound
@@ -52,6 +52,38 @@ const _: () = assert!(
         == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
 );
 const _: () = assert!(PENDING_BUNDLE_DEPTH == 20);
+
+/// Bytes a fetch may hold across part-built bundles.
+///
+/// The count above says how many bundles may be open; this says how much
+/// they may hold, and it is this that bounds the memory a peer can pin.
+/// Sized as the two pipelines at once rather than as `PENDING_BUNDLE_DEPTH`
+/// worst-case bundles: the reliable pipeline holds at most its own depth of
+/// full-sized bundles, and the coded pipeline holds pieces, which are a
+/// fixed `FEC_PIECE_BYTES` each and about a quarter of the record bound. The
+/// difference is not academic, since a peer that announces bundles and never
+/// completes them holds this much until the session ends: at the depth times
+/// the record bound it would be about 87 MB a rail, and four rails is the
+/// default.
+pub(crate) const PENDING_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
+    * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+    + PENDING_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+
+/// Orphan records are the same pieces before their proof, so they are
+/// bounded the same way, against the record bound a bundle without its proof
+/// carries.
+pub(crate) const ORPHAN_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
+    * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
+    + PENDING_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+
+// Spelled out, so a slip in either sum is a build failure rather than a
+// budget that silently refuses a conforming transfer or admits far more than
+// it meant to.
+const _: () = assert!(PENDING_BUNDLE_BYTES == 44_302_336);
+const _: () = assert!(ORPHAN_BUNDLE_BYTES == 40_108_032);
+
+const FEC_PIECE_BYTES_USIZE: usize = 1_114_112;
+const _: () = assert!(FEC_PIECE_BYTES_USIZE as u64 == crate::serve::server::FEC_PIECE_BYTES);
 
 /// Bytes this fetch may have asked for and not yet placed.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;

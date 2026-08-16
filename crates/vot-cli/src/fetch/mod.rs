@@ -411,12 +411,9 @@ mod tests {
         );
         assert_eq!(
             secondary.receiver.pending_byte_limit(),
-            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+            PENDING_BUNDLE_BYTES
         );
-        assert_eq!(
-            secondary.receiver.orphan_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-        );
+        assert_eq!(secondary.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
         discard(&[&bundle, &output]);
     }
 
@@ -1683,14 +1680,8 @@ mod tests {
             DEFAULT_PROVING_THREADS + 1
         );
         // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
-        assert_eq!(
-            fetcher.receiver.pending_byte_limit(),
-            PENDING_BUNDLE_DEPTH * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
-        );
-        assert_eq!(
-            fetcher.receiver.orphan_byte_limit(),
-            OUTSTANDING_COVERS * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-        );
+        assert_eq!(fetcher.receiver.pending_byte_limit(), PENDING_BUNDLE_BYTES);
+        assert_eq!(fetcher.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
         // A narrower pool: the bound follows the width.
         fetcher.set_proving_threads(2).unwrap();
         assert_eq!(fetcher.proving.width, 2);

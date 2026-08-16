@@ -8,6 +8,7 @@ constant vot_scheduler::session::DEFAULT_PENDING_BUNDLE_BYTES
 constant vot_scheduler::session::MAX_CODING_EPOCHS
 constant vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
 constant vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
+constant vot_scheduler::session::PIECES_PER_COVER
 constant vot_scheduler::session::REMEMBERED_BUNDLES
 enum vot_scheduler::Error
 module vot_scheduler::session

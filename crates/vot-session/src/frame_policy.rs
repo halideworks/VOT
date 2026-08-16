@@ -83,18 +83,15 @@ pub enum Side {
 }
 
 /// Which extensions a frame check consults, answered without building the
-/// intersection set. `None` is the outbound policy: the usable set is
-/// intentionally empty, see [`Negotiation::usable_extensions`].
+/// intersection set. Both directions consult the negotiated set (ADR-0041).
 #[derive(Clone, Copy)]
 pub(super) enum ExtensionPolicy<'a> {
-    None,
     Negotiated(&'a Negotiation),
 }
 
 impl ExtensionPolicy<'_> {
     fn contains(self, extension: u64) -> bool {
         match self {
-            Self::None => false,
             Self::Negotiated(negotiation) => negotiation.extension_is_negotiated(extension),
         }
     }

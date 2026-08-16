@@ -11,9 +11,9 @@ optional length-delimited frames.
 
 VOT v1 defines no mandatory custom QUIC transport parameters. Application
 negotiation starts on the first client-initiated bidirectional control stream.
-The client sends `HELLO` followed by `SETTINGS`. The server sends its `SETTINGS`
-and then `SETTINGS_ACK`. Section 1.1 gives what follows and when a frame that
-requires an authenticated session becomes valid.
+The client sends `HELLO` followed by `SETTINGS`. The server answers with its
+own `HELLO`, then its `SETTINGS`, then `SETTINGS_ACK`. Section 1.1 gives what
+follows and when a frame that requires an authenticated session becomes valid.
 
 The `HELLO` payload is:
 
@@ -25,8 +25,13 @@ extension_count * QUIC-varint extension_id
 ```
 
 An unsupported revision causes `UNSUPPORTED_VERSION`. A role inconsistent with
-the stream initiator causes `MALFORMED_FRAME`. Duplicate extension identifiers
-are rejected.
+the sender causes `MALFORMED_FRAME`. Duplicate extension identifiers are
+rejected. The client lists every extension it offers. The server's `HELLO`
+lists exactly the intersection of that offer with what the server supports,
+so both ends hold the same negotiated set (ADR-0041); the client MUST NOT
+accept the server's `SETTINGS` before the server's `HELLO`. An extension is
+negotiated when it is in that set, and only then may either end send a frame
+that requires it.
 
 The `SETTINGS` payload is a sequence of `(setting_id, setting_value)` QUIC-varint
 pairs bounded by the frame length. Duplicate identifiers are rejected. Values
@@ -181,7 +186,7 @@ send them would leave no way to reach one.
 
 | Frame | Maximum | Idempotence and replay | Auth | 0-RTT |
 |---|---:|---|---|---|
-| `HELLO` | 4 KiB | once per VOT session; duplicate is an error | no | no |
+| `HELLO` | 4 KiB | once per direction; a second from the same end is an error | no | no |
 | `SETTINGS` | 16 KiB | once per direction; duplicate setting or frame is an error | no | no |
 | `SETTINGS_ACK` | 0 | duplicate acknowledgement is ignored | no | no |
 | `AUTH_CONTEXT` | 64 KiB | policy-defined nonce/channel binding; replay is rejected | no | no |

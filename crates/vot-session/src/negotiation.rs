@@ -186,20 +186,16 @@ impl Negotiation {
         self.peer_settings
     }
 
-    /// The extensions this endpoint may send under.
-    ///
-    /// Always empty: only the client sends `HELLO`, so a server can compute an
-    /// intersection but a client cannot. Sending under the server's half would
-    /// put a frame on the wire the client is obliged to refuse.
-    ///
-    /// See [`negotiated_extensions`](Self::negotiated_extensions) for what is accepted.
+    /// The extensions this endpoint may send under: the negotiated set, the
+    /// same one that bounds what it accepts (ADR-0041).
     #[must_use]
     pub fn usable_extensions(&self) -> BTreeSet<u64> {
-        BTreeSet::new()
+        self.negotiated_extensions()
     }
 
-    /// The intersection of both endpoints' extensions, which bound what is accepted.
-    /// Empty until the peer's `HELLO` arrives.
+    /// The intersection of both endpoints' extensions, which bound what is
+    /// sent and accepted. Empty until the peer's `HELLO` arrives: the
+    /// client's offer at a server, the server's answer at a client.
     #[must_use]
     pub fn negotiated_extensions(&self) -> BTreeSet<u64> {
         let Some(hello) = &self.peer_hello else {
@@ -327,12 +323,17 @@ impl Negotiation {
     }
 
     fn accept_hello(&mut self, payload: &[u8]) -> Result<Accepted, Error> {
-        // spec/wire.md section 5: once per session, and only the client sends
-        // it, on the stream it opened.
-        if self.role != EndpointRole::Server || self.state != State::ControlReserved {
+        // spec/wire.md section 1: once per direction. The client's offer
+        // opens the exchange; the server's answer arrives while the client
+        // waits for the server's SETTINGS.
+        let (expected_state, peer_role) = match self.role {
+            EndpointRole::Server => (State::ControlReserved, EndpointRole::Client),
+            EndpointRole::Client => (State::HelloSent, EndpointRole::Server),
+        };
+        if self.state != expected_state || self.peer_hello.is_some() {
             return Err(self.out_of_sequence(frame_type::HELLO));
         }
-        let hello = vot_codec::decode_hello(payload, EndpointRole::Client).map_err(|error| {
+        let hello = vot_codec::decode_hello(payload, peer_role).map_err(|error| {
             let close = error.protocol_code();
             Error::new(ErrorKind::Hello(error), close)
         })?;
@@ -348,7 +349,8 @@ impl Negotiation {
             return Err(self.out_of_sequence(frame_type::SETTINGS));
         }
         // The same state on both sides: HELLO accounted for, SETTINGS not.
-        if self.state != State::HelloSent {
+        // At a client, accounted for means the server's answer has arrived.
+        if self.state != State::HelloSent || self.peer_hello.is_none() {
             return Err(self.out_of_sequence(frame_type::SETTINGS));
         }
         let settings = vot_codec::decode_settings(payload).map_err(|error| {
@@ -363,7 +365,15 @@ impl Negotiation {
                 // Answer, acknowledgement, and challenge together.
                 // spec/wire.md section 1.1 puts AUTH_CONTEXT straight after
                 // SETTINGS_ACK.
+                // The answer to HELLO leads: what this server accepts of the
+                // client's offer, so both ends hold the same set (ADR-0041).
+                let answer = Hello {
+                    draft_revision: vot_codec::DRAFT_REVISION,
+                    endpoint_role: EndpointRole::Server,
+                    extensions: self.negotiated_extensions(),
+                };
                 let reply = vec![
+                    Self::hello_frame(&answer)?,
                     self.settings_frame()?,
                     settings_ack_frame()?,
                     self.auth_context_frame()?,

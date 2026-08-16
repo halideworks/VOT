@@ -119,6 +119,14 @@ impl<A: TransportAdapter> Session<A> {
         self.negotiation.state()
     }
 
+    /// Whether `extension` is in the negotiated set, so a frame that requires
+    /// it may be sent and will be accepted. False until the peer's `HELLO`
+    /// has arrived.
+    #[must_use]
+    pub fn extension_negotiated(&self, extension: u64) -> bool {
+        self.negotiation.extension_is_negotiated(extension)
+    }
+
     /// Whether the application may use the data plane.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
@@ -631,7 +639,13 @@ impl<A: TransportAdapter> Session<A> {
         let Some(peer) = self.negotiation.peer_settings() else {
             return Ok(());
         };
-        check_frame(frame, &peer, ExtensionPolicy::None, lane, Side::Peer)
+        check_frame(
+            frame,
+            &peer,
+            ExtensionPolicy::Negotiated(&self.negotiation),
+            lane,
+            Side::Peer,
+        )
     }
 
     /// Checks a frame the peer sent against the limits this endpoint

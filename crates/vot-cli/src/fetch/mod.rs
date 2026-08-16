@@ -628,7 +628,7 @@ mod tests {
         serving.drop_datagram_every = 9;
         let serving_bundle = bundle.to_path_buf();
         let serving_offer = fec.clone();
-        let served = std::thread::spawn(move || {
+        let serving_thread = std::thread::spawn(move || {
             let server = BundleServer::open(&serving_bundle)?;
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
@@ -657,11 +657,14 @@ mod tests {
             fetcher.fec_generations_decoded()
         );
         drop(fetcher);
-        served.join().expect("the serving thread").expect("served");
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
         // A fetch offering nothing decodes nothing.
         let (client, serving) = crate::harness::duplex_pair();
         let serving_bundle = bundle.to_path_buf();
-        let served = std::thread::spawn(move || {
+        let serving_thread = std::thread::spawn(move || {
             let server = BundleServer::open(&serving_bundle)?;
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
@@ -682,7 +685,10 @@ mod tests {
         );
         assert_eq!(plain.fec_generations_decoded(), 0);
         drop(plain);
-        served.join().expect("the serving thread").expect("served");
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
     }
 
     #[test]

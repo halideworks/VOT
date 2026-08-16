@@ -200,17 +200,18 @@ where
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
         }
-        let mut decoded = primary.fec_generations_decoded();
+        let mut decoded = vec![primary.fec_generations_decoded()];
         let mut rail_failure = None;
         for rail in spawned {
             match rail.join().expect("a rail thread never panics") {
-                Ok(count) => decoded += count,
+                Ok(count) => decoded.push(count),
                 Err(error) => {
                     rail_failure.get_or_insert(error);
                 }
             }
         }
-        FEC_GENERATIONS_DECODED.fetch_add(decoded, std::sync::atomic::Ordering::Relaxed);
+        FEC_GENERATIONS_DECODED
+            .fetch_add(decoded.iter().sum(), std::sync::atomic::Ordering::Relaxed);
         match outcome {
             Ok(package) => Ok(package),
             // Report the rail's failure as the cause of a stalled primary.

@@ -11,7 +11,8 @@ credit that `spec/architecture.md` section 3 requires actually caps.
 
 The constraints already written down: datagram mode begins with zero credit; a
 monotonic `credit_epoch` supersedes older credit and places absolute caps on
-unretired bytes, active generations, and decode work; wall-clock expiry is
+unretired bytes, active generations, and decode work (this ADR adds open
+epochs as a fourth); wall-clock expiry is
 not a correctness mechanism; sequences and epochs are scoped fields of their
 owning payload (`spec/wire.md` section 4); every parser bounds before it
 allocates; the frames are invalid unless `DATAGRAM_FEC` is negotiated. The
@@ -37,7 +38,8 @@ through 12.**
   generation how many distinct symbols have arrived and which source ESIs
   are still missing, under a per-generation sequence; a stale sequence is
   ignored. `GEN_DONE` (receiver to sender) is terminal for the generation:
-  `decoded` or `abandoned`. `CODING_EPOCH_CLOSE` (sender to receiver) is
+  `decoded` or `abandoned`, or `refused` for a whole epoch whose open the
+  receiver ignored. `CODING_EPOCH_CLOSE` (sender to receiver) is
   terminal for the epoch and retires every generation under it that has not
   already reported.
 - `DATAGRAM_CREDIT` (receiver to sender) carries a `credit_epoch` and four

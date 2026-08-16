@@ -189,15 +189,16 @@ negotiated (`EXPERIMENT_NOT_NEGOTIATED`).
 A field outside its constraint is `MALFORMED_FRAME`, as for any payload. An
 exact repeat is idempotent. A repeat of the same `epoch` with any other
 field is `CODING_EPOCH_CONFLICT`. An open that would take the receiver past
-`max_open_epochs` is ignored: the epoch stays unknown to the receiver and
-its symbols drop, and the sender learns nothing until it retires an epoch,
-which is why a sender never opens past the credit it has seen.
+`max_open_epochs` is ignored: the epoch stays unknown to the receiver, its
+symbols drop, and the receiver answers with `GEN_DONE` outcome `2` so the
+sender closes it and moves the bytes to the reliable path. Epochs already
+open when credit shrinks stay open.
 
 `GEN_STATE` (receiver to sender, advisory):
 
 | Key | Field | Constraint |
 |---:|---|---|
-| 0 | `epoch` | an epoch the receiver has open; a frame naming any other epoch is ignored |
+| 0 | `epoch` | an epoch the sender (the end this frame arrives at) has open and not closed; a frame naming any other epoch is ignored |
 | 1 | `generation` | u32 range, inside the epoch |
 | 2 | `sequence` | scoped to `(epoch, generation)`; a lower or equal sequence than one already accepted is ignored |
 | 3 | `received` | distinct symbols so far, `0..=k+r`, counting all-zero sources past the end |
@@ -207,13 +208,17 @@ which is why a sender never opens past the credit it has seen.
 
 | Key | Field | Constraint |
 |---:|---|---|
-| 0 | `epoch` | an epoch the receiver has open; a frame naming any other epoch is ignored |
-| 1 | `generation` | u32 range, inside the epoch |
-| 2 | `outcome` | `0` decoded, `1` abandoned |
+| 0 | `epoch` | an epoch the sender (the end this frame arrives at) has open and not closed; a frame naming any other epoch is ignored |
+| 1 | `generation` | u32 range, inside the epoch; `0` when the outcome is `2` |
+| 2 | `outcome` | `0` decoded, `1` abandoned, `2` refused |
 
 An exact repeat is idempotent; a repeat with a different outcome is
 `MALFORMED_FRAME`. A generation with a `GEN_DONE` accepts no further
-`GEN_STATE`.
+`GEN_STATE`; a later one is ignored. Outcome `2` names the whole epoch: the
+receiver does not hold it (its open was ignored, section 11 above), every
+generation counts as abandoned, and the sender closes the epoch and moves the
+bytes to the reliable path. A receiver MUST send it once for each open it
+ignores.
 
 `CODING_EPOCH_CLOSE` (sender to receiver, terminal for the epoch):
 
@@ -268,7 +273,8 @@ would without FEC, and abandonment is a decision it reports.
 | Symbol that would make active generations or unretired bytes exceed credit | dropped |
 | Symbol before any `DATAGRAM_CREDIT` was accepted | dropped |
 | `CODING_EPOCH_OPEN` past `max_open_epochs` | ignored, the epoch stays unknown |
-| `GEN_STATE`, `GEN_DONE`, or `CODING_EPOCH_CLOSE` naming an epoch the receiver does not have open | ignored |
+| `GEN_STATE` or `GEN_DONE` arriving at a sender for an epoch it does not have open, or a `GEN_STATE` for a generation already done | ignored |
+| `CODING_EPOCH_CLOSE` naming an epoch the receiver does not have open | ignored |
 | `CODING_EPOCH_OPEN` repeating a known epoch with any field changed | `CODING_EPOCH_CONFLICT`, session closes |
 | Any FEC payload outside its field constraints, or a generation past the epoch's count | `MALFORMED_FRAME`, session closes |
 | Any FEC frame without `DATAGRAM_FEC` negotiated | `EXPERIMENT_NOT_NEGOTIATED`, session closes |
@@ -278,5 +284,9 @@ independent, and credit may shrink in flight, so in normal operation a
 symbol, an open, or a feedback frame can arrive for state its receiver no
 longer holds or credit it no longer extends. Every such case is a drop or an
 ignore and the reliable path repairs whatever it cost. Session errors are
-reserved for what only a broken sender can produce: a payload outside its
-constraints, and one epoch identifier opened twice with different content.
+reserved for what only a broken peer can produce: a payload outside its
+constraints, and one epoch identifier opened twice with different content. A
+receiver cannot detect a sender that reuses an identifier after close, since
+it retains nothing of a closed epoch; stale symbols that land in the reused
+epoch's table are caught only by range verification, which is why the
+identifier rule is on the sender.

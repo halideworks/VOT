@@ -9,6 +9,7 @@ use vot_codec::frames::{DataRecord, ProofBundle, TypedFrame};
 use vot_session::Session;
 use vot_transport_api::{Event, SubjectId, TransportAdapter};
 
+use crate::fec::{self, Cover, Intake, Joined};
 use crate::{Error, RangeSink, ReliableReceiver};
 
 /// Max bytes one bundle can hold. A lower bound would refuse a conforming
@@ -144,6 +145,17 @@ impl Default for PendingBundles {
 impl PendingBundles {
     fn get(&self, id: &[u8; 16]) -> Option<&Pending> {
         self.entries.get(id)
+    }
+
+    /// The bundle whose proof covers exactly `cover`, if one is held.
+    fn bundle_covering(&self, cover: Cover) -> Option<[u8; 16]> {
+        self.entries.iter().find_map(|(id, pending)| {
+            let bundle = pending.bundle.as_ref()?;
+            (bundle.object.root == cover.root
+                && bundle.covered_offset == cover.offset
+                && bundle.covered_length == cover.length)
+                .then_some(*id)
+        })
     }
 
     fn len(&self) -> usize {
@@ -293,6 +305,13 @@ fn is_proof_bundle(frame: &[u8]) -> bool {
         .is_ok_and(|(frame_type, _)| frame_type == vot_codec::frame_type::PROOF_BUNDLE)
 }
 
+fn is_fec_epoch_frame(frame: &[u8]) -> bool {
+    vot_codec::decode_varint(frame).is_ok_and(|(frame_type, _)| {
+        frame_type == vot_codec::frame_type::CODING_EPOCH_OPEN
+            || frame_type == vot_codec::frame_type::CODING_EPOCH_CLOSE
+    })
+}
+
 /// A complete bundle handed to a caller for off-thread verification.
 #[derive(Debug)]
 pub struct CompletedBundle {
@@ -343,6 +362,10 @@ pub struct SessionReceiver<A> {
     admitted: BTreeSet<SubjectId>,
     delivered: VecDeque<([u8; 16], Delivered)>,
     credit_applied: bool,
+    /// The datagram FEC intake, armed once the session is ready with
+    /// `DATAGRAM_FEC` negotiated; idle otherwise.
+    fec: Intake,
+    fec_armed: bool,
 }
 
 impl<A: TransportAdapter> SessionReceiver<A> {
@@ -360,6 +383,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             admitted: BTreeSet::new(),
             delivered: VecDeque::new(),
             credit_applied: false,
+            fec: Intake::default(),
+            fec_armed: false,
         }
     }
 
@@ -520,8 +545,11 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     pub fn poll(&mut self) -> Result<Option<Event>, Error> {
         while self.completed.len() < self.deferred_limit {
             let Some(event) = self.session.poll().map_err(Error::Session)? else {
+                self.arm_fec()?;
+                self.send_owed()?;
                 return Ok(None);
             };
+            self.arm_fec()?;
             match event {
                 Event::Connected(connection) => {
                     self.receiver.connected(connection);
@@ -542,6 +570,23 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 // ceiling, not the record limit, so it arrives here rather
                 // than on the lane its records travel.
                 Event::Control(bytes) if is_proof_bundle(&bytes) => self.accept_bundle(&bytes)?,
+                Event::Control(bytes) if self.fec_armed && is_fec_epoch_frame(&bytes) => {
+                    self.accept_fec_frame(&bytes)?;
+                }
+                // The session already dropped one before readiness or without
+                // the extension; what reaches here is a symbol.
+                Event::Datagram(bytes) => {
+                    if self.fec_armed {
+                        if let Some(joined) = self.fec.symbol(&bytes) {
+                            self.join(joined)?;
+                        }
+                        // The decode budget is a credit-epoch budget: once
+                        // it is half spent a new epoch goes out here, not
+                        // only when a bundle completes.
+                        self.fec.extend_credit(self.receiver.advertised_credit());
+                    }
+                    self.send_owed()?;
+                }
                 other => return Ok(Some(other)),
             }
         }
@@ -584,6 +629,96 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             }
             _ => Err(Error::ProofInvalid),
         }
+    }
+
+    /// Once ready with `DATAGRAM_FEC` negotiated, extends the first credit;
+    /// nothing again until the staging capacity moves.
+    fn arm_fec(&mut self) -> Result<(), Error> {
+        if self.fec_armed {
+            return Ok(());
+        }
+        let negotiated = self
+            .session
+            .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
+        if self.session.is_ready() && negotiated {
+            self.fec_armed = true;
+            self.fec.extend_credit(self.receiver.advertised_credit());
+            self.send_owed()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the datagram FEC intake is armed for this session.
+    #[must_use]
+    pub const fn fec_armed(&self) -> bool {
+        self.fec_armed
+    }
+
+    /// Generations this session decoded from the datagram path.
+    #[must_use]
+    pub const fn fec_generations_decoded(&self) -> u64 {
+        self.fec.decoded()
+    }
+
+    /// `CODING_EPOCH_OPEN` or `CODING_EPOCH_CLOSE` from the sender.
+    fn accept_fec_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: vot_codec::registered_payload_limit(
+                vot_codec::frame_type::CODING_EPOCH_OPEN,
+            )
+            .unwrap_or(0),
+            max_frames: 1,
+        };
+        let (typed, _) =
+            vot_codec::frames::decode(frame, limits).map_err(|_| Error::MalformedFecFrame)?;
+        match typed {
+            TypedFrame::CodingEpochOpen(open) => {
+                self.fec
+                    .open(&open)
+                    .map_err(|()| Error::CodingEpochConflict)?;
+            }
+            TypedFrame::CodingEpochClose(close) => self.fec.close(close),
+            _ => {}
+        }
+        self.send_owed()
+    }
+
+    /// A decoded generation joins the bundle for its exact covered range as
+    /// one record, or waits for that bundle.
+    fn join(&mut self, joined: Joined) -> Result<(), Error> {
+        let Some(id) = self.pending.bundle_covering(joined.cover) else {
+            self.fec.hold_orphan(joined);
+            return Ok(());
+        };
+        self.hold_record(fec::record_of(id, joined))
+    }
+
+    /// Puts what the intake owes the sender on the control stream. A refusal
+    /// that is not the peer's fault is backpressure: the frame stays owed
+    /// and goes out on a later poll.
+    fn send_owed(&mut self) -> Result<(), Error> {
+        // Bounded by what is owed now, so a pass ends whatever the carrier
+        // does with each frame.
+        for _ in 0..self.fec.owed_len() {
+            let Some(owed) = self.fec.owed() else {
+                break;
+            };
+            match self.session.send_control(&fec::frame_of(owed)) {
+                Ok(()) => self.fec.settle_owed(),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        vot_session::ErrorKind::Transport(
+                            vot_transport_api::Error::OutboundQueueFull
+                        ) | vot_session::ErrorKind::HandshakeUnsent { .. }
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(Error::Session(error)),
+            }
+        }
+        Ok(())
     }
 
     fn hold_bundle(&mut self, bundle: ProofBundle, identity: [u8; 32]) -> Result<(), Error> {
@@ -629,8 +764,18 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             self.pending.remove(&id);
             return Err(Error::ProofInvalid);
         }
+        let cover = Cover {
+            root: bundle.object.root,
+            offset: bundle.covered_offset,
+            length: bundle.covered_length,
+        };
         self.pending.attach_bundle(bundle, identity)?;
-        self.deliver(id)
+        self.deliver(id)?;
+        // Generations that arrived before their bundle join it now.
+        for joined in self.fec.take_orphans(cover) {
+            self.hold_record(fec::record_of(id, joined))?;
+        }
+        Ok(())
     }
 
     fn hold_record(&mut self, record: DataRecord) -> Result<(), Error> {
@@ -731,6 +876,10 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         // released what the bundle was holding.
         let credit = self.receiver.advertised_credit();
         self.credit_applied = self.session.driver().set_receive_credit(credit).is_ok();
+        if self.fec_armed {
+            self.fec.extend_credit(credit);
+            self.send_owed()?;
+        }
         Ok(())
     }
 
@@ -803,6 +952,7 @@ mod tests {
     use crate::DiscardSink;
     use std::collections::VecDeque;
     use vot_codec::frames::{ObjectId, encode};
+    use vot_fec::EpochPlan;
     use vot_transport_api::{Payload, StreamId};
     use vot_verifier::Suite;
 
@@ -813,10 +963,21 @@ mod tests {
         events: VecDeque<Event>,
         credit: Vec<u64>,
         refuse_credit: bool,
+        /// Control sends the backend refuses as a full queue before taking one.
+        refuse_control: usize,
+        /// A backend failure the next control send reports.
+        fail_control: Option<vot_transport_api::Error>,
     }
 
     impl TransportAdapter for Loopback {
         fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
+            if let Some(error) = self.fail_control.take() {
+                return Err(error);
+            }
+            if self.refuse_control > 0 {
+                self.refuse_control -= 1;
+                return Err(vot_transport_api::Error::OutboundQueueFull);
+            }
             self.sent.push(frame.to_vec());
             Ok(())
         }
@@ -1823,5 +1984,517 @@ mod tests {
                 .push_back(carried(&wire(&frame)));
         }
         assert_eq!(driver.poll().unwrap_err(), Error::ProofInvalid);
+    }
+
+    /// A ready session over a loopback with `DATAGRAM_FEC` negotiated on both
+    /// ends, so the intake arms on the first poll.
+    fn ready_fec() -> SessionReceiver<Loopback> {
+        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let mut session = Session::server(
+            Loopback::default(),
+            vot_codec::Settings::default(),
+            fec.clone(),
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        session.begin().unwrap();
+        let mut client = Session::client(
+            Loopback::default(),
+            vot_codec::Settings::default(),
+            fec,
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        client.begin().unwrap();
+        for frame in std::mem::take(&mut client.driver().sent) {
+            session
+                .driver()
+                .events
+                .push_back(Event::Control(Payload::from(frame.as_slice())));
+        }
+        session.poll().unwrap();
+        assert!(session.is_ready());
+        session.driver().sent.clear();
+        SessionReceiver::new(
+            session,
+            ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
+        )
+    }
+
+    /// The frame types the receiver put on the control stream, in order.
+    fn sent_types(driver: &mut SessionReceiver<Loopback>) -> Vec<u64> {
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: 1 << 16,
+            max_frames: 1,
+        };
+        std::mem::take(&mut driver.session_mut().driver().sent)
+            .iter()
+            .map(|frame| vot_codec::decode_one(frame, limits).unwrap().0.frame_type())
+            .collect()
+    }
+
+    /// The bundle's covered range as one coding epoch: 64 source symbols of
+    /// 1024 bytes per generation, so one generation is one 64 KiB unit and
+    /// the two-unit object is two generations.
+    fn epoch_of(
+        bundle: &ProofBundle,
+        epoch: u32,
+    ) -> (vot_codec::frames::CodingEpochOpen, EpochPlan) {
+        let geometry = vot_fec::Geometry::new(64, 4, 1024).unwrap();
+        let open = vot_codec::frames::CodingEpochOpen {
+            epoch,
+            object: bundle.object,
+            offset: bundle.covered_offset,
+            length: bundle.covered_length,
+            geometry,
+        };
+        let plan = EpochPlan::new(epoch, open.offset, open.length, geometry).unwrap();
+        (open, plan)
+    }
+
+    /// The symbol datagrams of one generation, in wire order.
+    fn symbols_of(plan: &EpochPlan, generation: u32, records: &[DataRecord]) -> Vec<Vec<u8>> {
+        let bytes: Vec<u8> = records
+            .iter()
+            .flat_map(|record| record.encoded.iter().copied())
+            .collect();
+        // `records` are the whole object from offset 0, so a generation's
+        // span is an absolute slice of them.
+        let (offset, length) = plan.generation_span(generation);
+        let start = usize::try_from(offset).unwrap();
+        let end = start + usize::try_from(length).unwrap();
+        vot_fec::encode_generation(plan, generation, &bytes[start..end])
+            .unwrap()
+            .into_iter()
+            .map(|(esi, symbol)| {
+                let mut out = Vec::new();
+                vot_codec::frames::encode_symbol(
+                    vot_codec::frames::SymbolHeader {
+                        epoch: plan.epoch(),
+                        generation,
+                        esi,
+                    },
+                    plan.geometry(),
+                    &symbol,
+                    &mut out,
+                )
+                .unwrap();
+                out
+            })
+            .collect()
+    }
+
+    fn push_datagram(driver: &mut SessionReceiver<Loopback>, datagram: &[u8]) {
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Datagram(Payload::from(datagram)));
+    }
+
+    #[test]
+    fn a_ready_session_with_fec_extends_credit_once() {
+        let mut driver = ready_fec();
+        // A full backend queue holds the credit rather than losing it or
+        // ending the session: it goes out on the next poll.
+        driver.session_mut().driver().refuse_control = 2;
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            sent_types(&mut driver).is_empty(),
+            "held under backpressure"
+        );
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            sent_types(&mut driver),
+            vec![vot_codec::frame_type::DATAGRAM_CREDIT],
+            "credit is offered on arming"
+        );
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            sent_types(&mut driver).is_empty(),
+            "and not again while nothing moved"
+        );
+        // Without the extension nothing is offered and nothing is armed.
+        let mut plain = ready();
+        plain.session_mut().driver().sent.clear();
+        assert_eq!(plain.poll().unwrap(), None);
+        assert!(sent_types(&mut plain).is_empty());
+        assert!(!plain.fec_armed());
+        assert!(driver.fec_armed());
+        // A session that offered the extension but is not ready yet arms
+        // nothing either.
+        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let mut early = Session::server(
+            Loopback::default(),
+            vot_codec::Settings::default(),
+            fec,
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        early.begin().unwrap();
+        let mut early = SessionReceiver::new(
+            early,
+            ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
+        );
+        assert_eq!(early.poll().unwrap(), None);
+        assert!(!early.fec_armed());
+        // A backend failure that is not backpressure ends the session.
+        let mut broken = ready_fec();
+        broken.session_mut().driver().fail_control = Some(vot_transport_api::Error::Backend);
+        assert!(matches!(broken.poll(), Err(Error::Session(_))));
+    }
+
+    #[test]
+    fn a_lossy_epoch_becomes_verified_state_through_its_bundle() {
+        // The bundle arrives first, then every generation loses four
+        // symbols; each decoded generation is one record of the bundle.
+        let (subject, bundle, records) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let (open, plan) = epoch_of(&bundle, 3);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
+        for generation in 0..2 {
+            for (i, datagram) in symbols_of(&plan, generation, &records).iter().enumerate() {
+                if i % 17 == 0 {
+                    continue;
+                }
+                push_datagram(&mut driver, datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            driver.is_verified(subject),
+            "both generations decoded and verified"
+        );
+        assert_eq!(driver.fec_generations_decoded(), 2);
+        assert_eq!(driver.pending_bundles(), 0);
+        let types = sent_types(&mut driver);
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| **t == vot_codec::frame_type::GEN_DONE)
+                .count(),
+            2,
+            "one GEN_DONE per generation: {types:?}"
+        );
+        assert_eq!(types[0], vot_codec::frame_type::DATAGRAM_CREDIT);
+        // A late symbol for a done generation is dropped without a word.
+        push_datagram(&mut driver, &symbols_of(&plan, 0, &records)[0]);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(sent_types(&mut driver).is_empty());
+        // Closing the epoch is quiet too, and an epoch closed before its
+        // symbols arrive takes none of them.
+        let (open4, plan4) = epoch_of(&bundle, 4);
+        for open in [open, open4] {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(Event::Control(Payload::from(
+                    wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+                )));
+        }
+        for epoch in [3, 4] {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(Event::Control(Payload::from(
+                    wire(&TypedFrame::CodingEpochClose(
+                        vot_codec::frames::CodingEpochClose { epoch },
+                    ))
+                    .as_slice(),
+                )));
+        }
+        for datagram in symbols_of(&plan4, 0, &records) {
+            push_datagram(&mut driver, &datagram);
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            sent_types(&mut driver).is_empty(),
+            "nothing decoded after close"
+        );
+        // A control frame that is not FEC still reaches the caller.
+        let mut ping = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::PING, &[], &mut ping).unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(ping.as_slice())));
+        assert!(matches!(driver.poll().unwrap(), Some(Event::Control(_))));
+    }
+
+    #[test]
+    fn a_generation_joins_only_the_bundle_that_covers_exactly_its_range() {
+        // A bundle over the first unit only, then an epoch over the second
+        // unit: same root, same length, different offset. The decoded
+        // generation must wait for its own bundle, not join the other.
+        let (subject, bundle, records) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let unit = crate::RANGE_UNIT_BYTES;
+        let all: Vec<u8> = records.iter().flat_map(|r| r.encoded.clone()).collect();
+        let half = |offset: u64, id: u8| {
+            let proof = vot_proof_blake3::prove(&all, offset, unit).unwrap();
+            ProofBundle {
+                request_id: [id; 16],
+                bundle_id: [id; 16],
+                object: bundle.object,
+                requested_offset: offset,
+                requested_length: unit,
+                covered_offset: proof.covered_offset,
+                covered_length: proof.data.len() as u64,
+                data_record_count: 1,
+                total_plaintext_length: proof.data.len() as u64,
+                proof: proof.proof,
+            }
+        };
+        let first = half(0, 0x11);
+        let second = half(unit, 0x22);
+        assert_eq!(second.covered_offset, unit);
+        let (open, plan) = epoch_of(&second, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(first))));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        for datagram in symbols_of(&plan, 0, &records) {
+            push_datagram(&mut driver, &datagram);
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            driver.pending_bundles(),
+            1,
+            "the first-unit bundle still waits for its record"
+        );
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(second))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            driver.pending_bundles(),
+            1,
+            "the second-unit bundle took the generation"
+        );
+        // And a bundle for another object over the same range is not it either.
+        let (other, other_bundle, _) = object_of(0x77, [3; 16]);
+        driver.admit(other, Box::new(DiscardSink)).unwrap();
+        let (open_other, plan_other) = epoch_of(&other_bundle, 2);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open_other)).as_slice(),
+            )));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
+        let (_, _, other_records) = object_of(0x77, [3; 16]);
+        for generation in 0..2 {
+            for datagram in symbols_of(&plan_other, generation, &other_records) {
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            !driver.is_verified(other),
+            "no bundle for the other object yet"
+        );
+        assert_eq!(
+            driver.pending_bundles(),
+            2,
+            "the whole-object bundle got no record of the other"
+        );
+    }
+
+    #[test]
+    fn everything_owed_goes_out_in_one_pass_once_the_carrier_takes_again() {
+        let (subject, bundle, records) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        // The carrier refuses everything while the credit, the epoch, the
+        // bundle, and both generations arrive: three frames end up owed.
+        driver.session_mut().driver().refuse_control = usize::MAX;
+        let (open, plan) = epoch_of(&bundle, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
+        for generation in 0..2 {
+            for datagram in symbols_of(&plan, generation, &records) {
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.is_verified(subject));
+        assert!(sent_types(&mut driver).is_empty(), "all refused, all owed");
+        driver.session_mut().driver().refuse_control = 0;
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            sent_types(&mut driver),
+            vec![
+                vot_codec::frame_type::DATAGRAM_CREDIT,
+                vot_codec::frame_type::GEN_DONE,
+                vot_codec::frame_type::GEN_DONE
+            ],
+            "one pass sends everything owed"
+        );
+    }
+
+    #[test]
+    fn generations_arriving_before_their_bundle_wait_for_it() {
+        let (subject, bundle, records) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let (open, plan) = epoch_of(&bundle, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        for generation in 0..2 {
+            for datagram in symbols_of(&plan, generation, &records) {
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(!driver.is_verified(subject), "no proof yet");
+        assert_eq!(
+            driver.pending_bundles(),
+            0,
+            "nothing in the bundle table either"
+        );
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            driver.is_verified(subject),
+            "the held generations joined the bundle"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_reopen_closes_and_a_refused_open_is_answered() {
+        let (subject, bundle, _) = object();
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let (open, _) = epoch_of(&bundle, 1);
+        // Eight epochs is the cap this end extends; the ninth is refused
+        // with GEN_DONE outcome refused, and an exact repeat is quiet.
+        for epoch in 1..=8 {
+            let (open, _) = epoch_of(&bundle, epoch);
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(Event::Control(Payload::from(
+                    wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+                )));
+        }
+        let (ninth, _) = epoch_of(&bundle, 9);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(ninth)).as_slice(),
+            )));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        assert_eq!(driver.poll().unwrap(), None);
+        let types = sent_types(&mut driver);
+        assert_eq!(
+            types,
+            vec![
+                vot_codec::frame_type::DATAGRAM_CREDIT,
+                vot_codec::frame_type::GEN_DONE
+            ],
+            "credit, then one refusal"
+        );
+        let mut conflicting = open;
+        conflicting.length = open.length - 1;
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(conflicting)).as_slice(),
+            )));
+        assert_eq!(driver.poll().unwrap_err(), Error::CodingEpochConflict);
+        // A payload outside its constraints is malformed, not a bad proof:
+        // an open past the object's length, encoded by hand.
+        let mut driver = ready_fec();
+        let mut payload = Vec::new();
+        vot_cbor::map(&mut payload, 7);
+        vot_cbor::uint(&mut payload, 0);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::array(&mut payload, 4);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::uint(&mut payload, u64::from(bundle.object.suite));
+        vot_cbor::bytes(&mut payload, &bundle.object.root);
+        vot_cbor::uint(&mut payload, bundle.object.length);
+        for (key, value) in [
+            (2, bundle.object.length),
+            (3, 1),
+            (4, 64),
+            (5, 4),
+            (6, 1024),
+        ] {
+            vot_cbor::uint(&mut payload, key);
+            vot_cbor::uint(&mut payload, value);
+        }
+        let mut framed = Vec::new();
+        vot_codec::encode_frame(
+            vot_codec::frame_type::CODING_EPOCH_OPEN,
+            &payload,
+            &mut framed,
+        )
+        .unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(framed.as_slice())));
+        assert_eq!(driver.poll().unwrap_err(), Error::MalformedFecFrame);
     }
 }

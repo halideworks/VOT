@@ -45,7 +45,7 @@ mod side_channel;
 #[cfg(feature = "wire")]
 mod wire;
 
-pub use drive::{Engine, FEC_GENERATIONS_DECODED, ServeSession, drive};
+pub use drive::{Engine, ServeSession, drive};
 pub use fetch::{BundleFetcher, FetchStatus};
 #[cfg(not(feature = "wire"))]
 pub use nowire::{

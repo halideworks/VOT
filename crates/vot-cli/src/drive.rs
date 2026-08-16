@@ -130,7 +130,8 @@ fn fetched<A: TransportAdapter>(
 /// Generations every fetch in this process decoded from the datagram path,
 /// summed over rails at the end of each. Diagnostic: the fetch report has
 /// no other place for it yet.
-pub static FEC_GENERATIONS_DECODED: std::sync::atomic::AtomicU64 =
+#[cfg(any(test, feature = "wire"))]
+pub(crate) static FEC_GENERATIONS_DECODED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Fetches at `rails` width. The primary builds the plan; rails join it

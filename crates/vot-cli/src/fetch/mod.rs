@@ -619,9 +619,10 @@ mod tests {
     #[test]
     pub(crate) fn a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it() {
         // Both ends offer DATAGRAM_FEC over an in-process pair that loses
-        // every ninth datagram: fewer than the eight repair symbols per
-        // generation, so every generation decodes and the fetch completes
-        // with the object having travelled as symbols.
+        // every ninth datagram: exactly eight of a full generation's 72, the
+        // repair count, so every generation decodes with nothing to spare
+        // and the fetch completes with the object having travelled as
+        // symbols.
         let (bundle, built) = built_bundle("in-process-fec", &[("big.bin", patterned(1_500_000))]);
         let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
         let (client, mut serving) = crate::harness::duplex_pair();

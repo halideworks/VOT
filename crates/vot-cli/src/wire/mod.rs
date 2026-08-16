@@ -1477,7 +1477,6 @@ mod tests {
             - before;
         // 1500000 bytes of object are 23 generations; the manifest and the
         // small tail travel reliably.
-        eprintln!("fec: {decoded} generations decoded over the wire");
         assert!(
             decoded >= 20,
             "the datagram path carried the object: {decoded} generations decoded"

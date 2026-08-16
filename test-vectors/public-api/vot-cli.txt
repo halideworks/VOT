@@ -31,7 +31,6 @@ function vot_cli::rendezvous_service
 function vot_cli::serve_bundle
 function vot_cli::verify_receipt_file
 module vot_cli::authz
-static vot_cli::FEC_GENERATIONS_DECODED
 struct vot_cli::BundleFetcher
 struct vot_cli::BundleServer
 struct vot_cli::ReceiveReport

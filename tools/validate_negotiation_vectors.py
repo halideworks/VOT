@@ -147,6 +147,19 @@ def validate(path: Path) -> None:
 
     registry = {entry["id"]: entry for entry in document["settings_registry"]}
     assert registry, "no settings registry entries"
+    # The vector's copy of the settings registry is held to spec/registries.yaml,
+    # so a changed default or range there fails here rather than drifting.
+    from registries import load_registries, setting_bounds
+
+    expected = {
+        int(row["value"], 16): (row["name"], *setting_bounds(row))
+        for row in load_registries()["settings"]
+    }
+    actual = {
+        entry["id"]: (entry["name"], entry["default"], entry["min"], entry["max"])
+        for entry in registry.values()
+    }
+    assert actual == expected, f"settings_registry differs from spec/registries.yaml: {actual} != {expected}"
     for entry in registry.values():
         assert entry["min"] <= entry["default"] <= entry["max"], entry["name"]
         assert entry["min"] < entry["max"], entry["name"]

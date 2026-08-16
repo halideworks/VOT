@@ -165,6 +165,21 @@ class RegistrySourceSync(unittest.TestCase):
         hello["extension"] = "DATAGRAM_FEC"
         self.assertTrue(any("HELLO" in item for item in gate_failures()))
 
+    def test_a_changed_setting_default_or_range_is_rejected(self) -> None:
+        document, markdown, rust, wire, generated, generated_frames = sources()
+        mutated = copy.deepcopy(document)
+        idle = next(row for row in mutated["settings"] if row["name"] == "IDLE_TIMEOUT_MS")
+        idle["default"] = "30000"
+        failures = check(mutated, markdown, rust, wire, generated, generated_frames)
+        self.assertTrue(any("generated.rs is stale" in item for item in failures), failures)
+        idle["default"] = "90000"
+        idle["range"] = "1000--60000"
+        failures = check(mutated, markdown, rust, wire, generated, generated_frames)
+        self.assertTrue(
+            any("IDLE_TIMEOUT_MS" in item and "outside range" in item for item in failures),
+            failures,
+        )
+
     def test_handling_parity_is_rejected(self) -> None:
         document, markdown, rust, wire, generated, generated_frames = sources()
         mutated = copy.deepcopy(document)

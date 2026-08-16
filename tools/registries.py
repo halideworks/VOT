@@ -158,6 +158,39 @@ def _const_block(rows: list[dict], ty: str) -> str:
     return "\n".join(lines)
 
 
+UNIT_BYTES = {None: 1, "KiB": 1024, "MiB": 1024 * 1024}
+
+
+def quantity(text: str) -> int:
+    """A registry quantity such as `16`, `64 KiB`, or `1 MiB`, in units."""
+    match = SPEC_LIMIT.fullmatch(text.strip())
+    if match is None:
+        raise ValueError(f"unparsed registry quantity {text!r}")
+    return int(match["amount"]) * UNIT_BYTES[match["unit"]]
+
+
+def setting_bounds(row: dict) -> tuple[int, int, int]:
+    """(default, minimum, maximum) of a settings row, checked for order."""
+    low, high = (quantity(part) for part in row["range"].split("--"))
+    default = quantity(row["default"])
+    if not low < high or not low <= default <= high:
+        raise ValueError(f"{row['name']}: default {default} outside range {low}..={high}")
+    return default, low, high
+
+
+def _setting_default_block(rows: list[dict]) -> str:
+    return "\n".join(
+        f"    pub const {row['name']}: u64 = {setting_bounds(row)[0]:_};" for row in rows
+    )
+
+
+def _setting_bounds_block(rows: list[dict]) -> str:
+    return "\n".join(
+        f"    pub const {row['name']}: (u64, u64) = ({setting_bounds(row)[1]:_}, {setting_bounds(row)[2]:_});"
+        for row in rows
+    )
+
+
 def render_identifiers(document: dict) -> str:
     """Rust identifier modules whose YAML rows are the complete set.
 
@@ -183,6 +216,16 @@ def render_identifiers(document: dict) -> str:
         "\n"
         "    /// Identifiers the registry retired, kept so nothing reassigns them.\n"
         f"    pub const RETIRED: [u64; {len(retired)}] = [{retired_values}];\n"
+        "}\n"
+        "\n"
+        "/// The registered default of each setting.\n"
+        "pub mod setting_default {\n"
+        f"{_setting_default_block(settings)}\n"
+        "}\n"
+        "\n"
+        "/// The inclusive value range of each setting.\n"
+        "pub mod setting_bounds {\n"
+        f"{_setting_bounds_block(settings)}\n"
         "}\n"
         "\n"
         "/// What a capability authorizes.\n"
@@ -425,7 +468,11 @@ def check_registries(
     """Failures that mean the YAML, the Markdown view, or vot-codec drifted."""
     failures: list[str] = []
     if generated is not None:
-        expected = render_identifiers(document)
+        try:
+            expected = render_identifiers(document)
+        except ValueError as error:
+            failures.append(str(error))
+            expected = generated
         if generated != expected:
             failures.append(
                 "crates/vot-codec/src/generated.rs is stale; "
@@ -605,7 +652,7 @@ def check_registries(
             f"registry-only={frame_names - behavior_rows.keys()}, "
             f"behavior-only={behavior_rows.keys() - frame_names}"
         )
-    unit_bytes = {None: 1, "KiB": 1024, "MiB": 1024 * 1024}
+    unit_bytes = UNIT_BYTES
     frame_status = {row["name"]: row["status"] for row in frames}
     # An experimental frame is gated by an experimental extension, and by no
     # other kind: wire.md section 5 names DATAGRAM_FEC and VCRC today, and a

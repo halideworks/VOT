@@ -84,6 +84,16 @@ constant vot_codec::operation::READ_RANGES
 constant vot_codec::resource_limit::CONCURRENT_LANES
 constant vot_codec::resource_limit::STORAGE_BYTES
 constant vot_codec::resource_limit::WIRE_BYTES
+constant vot_codec::setting_bounds::IDLE_TIMEOUT_MS
+constant vot_codec::setting_bounds::MAX_CONTROL_FRAME_PAYLOAD
+constant vot_codec::setting_bounds::MAX_DATA_RECORD_PAYLOAD
+constant vot_codec::setting_bounds::MAX_MANIFEST_PAGE_PAYLOAD
+constant vot_codec::setting_bounds::RELIABLE_LANE_LIMIT
+constant vot_codec::setting_default::IDLE_TIMEOUT_MS
+constant vot_codec::setting_default::MAX_CONTROL_FRAME_PAYLOAD
+constant vot_codec::setting_default::MAX_DATA_RECORD_PAYLOAD
+constant vot_codec::setting_default::MAX_MANIFEST_PAGE_PAYLOAD
+constant vot_codec::setting_default::RELIABLE_LANE_LIMIT
 constant vot_codec::setting_id::IDLE_TIMEOUT_MS
 constant vot_codec::setting_id::MAX_CONTROL_FRAME_PAYLOAD
 constant vot_codec::setting_id::MAX_DATA_RECORD_PAYLOAD
@@ -132,6 +142,8 @@ module vot_codec::frame_type
 module vot_codec::frames
 module vot_codec::operation
 module vot_codec::resource_limit
+module vot_codec::setting_bounds
+module vot_codec::setting_default
 module vot_codec::setting_id
 struct vot_codec::DecodeLimits
 struct vot_codec::FrameEnvelope

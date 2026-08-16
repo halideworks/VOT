@@ -12,6 +12,24 @@ pub mod setting_id {
     pub const RETIRED: [u64; 3] = [0x0b, 0x20, 0x22];
 }
 
+/// The registered default of each setting.
+pub mod setting_default {
+    pub const MAX_CONTROL_FRAME_PAYLOAD: u64 = 1_048_576;
+    pub const MAX_DATA_RECORD_PAYLOAD: u64 = 262_144;
+    pub const MAX_MANIFEST_PAGE_PAYLOAD: u64 = 1_048_576;
+    pub const RELIABLE_LANE_LIMIT: u64 = 16;
+    pub const IDLE_TIMEOUT_MS: u64 = 90_000;
+}
+
+/// The inclusive value range of each setting.
+pub mod setting_bounds {
+    pub const MAX_CONTROL_FRAME_PAYLOAD: (u64, u64) = (1_024, 16_777_216);
+    pub const MAX_DATA_RECORD_PAYLOAD: (u64, u64) = (65_536, 262_144);
+    pub const MAX_MANIFEST_PAGE_PAYLOAD: (u64, u64) = (65_536, 1_048_576);
+    pub const RELIABLE_LANE_LIMIT: (u64, u64) = (1, 256);
+    pub const IDLE_TIMEOUT_MS: (u64, u64) = (1_000, 600_000);
+}
+
 /// What a capability authorizes.
 pub mod operation {
     pub const PUBLISH: u64 = 0x0001;

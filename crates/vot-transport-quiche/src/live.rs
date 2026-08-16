@@ -66,6 +66,11 @@ const MAX_INBOUND_EVENTS: usize = 1_024;
 /// Datagrams quiche queues in each direction before it refuses or drops one.
 const DATAGRAM_QUEUE_LEN: usize = 1_024;
 
+/// Received datagram bytes the driver holds for a caller that has not drained
+/// them, on top of the shared budget. A quarter of that budget, so the stream
+/// reader's headroom precondition always survives a datagram flood.
+const MAX_DATAGRAM_INBOUND_BYTES: usize = MAX_ASSEMBLY_BYTES / 4;
+
 /// What the driver holds across every outbox before it stops taking submissions.
 ///
 /// Matches the caller's own queue byte bound. A peer that stops reading fills
@@ -112,6 +117,8 @@ struct Inbound {
     events: VecDeque<NativeEvent>,
     bytes: usize,
     assembling: usize,
+    /// Received datagram bytes among `bytes`, capped on their own.
+    datagram_bytes: usize,
     /// Raised on every push, waited on by `wait_for_event`. Shared so a
     /// waiter holds no lock the pump needs while it sleeps.
     arrived: Arc<vot_transport_api::EventSignal>,
@@ -122,7 +129,8 @@ impl Inbound {
         self.bytes + self.assembling
     }
 
-    /// Queues one event, or gives it back when either bound is met.
+    /// Queues one event, or gives it back when either bound is met. A
+    /// datagram is also bounded by its own byte cap.
     fn push(&mut self, event: NativeEvent) -> Result<(), NativeEvent> {
         let payload = native_payload_len(&event);
         let Some(next) = self.charged().checked_add(payload) else {
@@ -130,6 +138,12 @@ impl Inbound {
         };
         if self.events.len() >= MAX_INBOUND_EVENTS || next > MAX_ASSEMBLY_BYTES {
             return Err(event);
+        }
+        if matches!(event, NativeEvent::Datagram(_)) {
+            if self.datagram_bytes + payload > MAX_DATAGRAM_INBOUND_BYTES {
+                return Err(event);
+            }
+            self.datagram_bytes += payload;
         }
         self.events.push_back(event);
         self.bytes += payload;
@@ -149,7 +163,11 @@ impl Inbound {
 
     fn pop(&mut self) -> Option<NativeEvent> {
         let event = self.events.pop_front()?;
-        self.bytes = self.bytes.saturating_sub(native_payload_len(&event));
+        let payload = native_payload_len(&event);
+        self.bytes = self.bytes.saturating_sub(payload);
+        if matches!(event, NativeEvent::Datagram(_)) {
+            self.datagram_bytes = self.datagram_bytes.saturating_sub(payload);
+        }
         Some(event)
     }
 }
@@ -3760,6 +3778,31 @@ mod tests {
         assert_eq!(inbound.bytes, 10);
         let _ = inbound.pop();
         assert_eq!(inbound.bytes, 0, "a popped event kept its charge");
+
+        // Datagrams have a cap of their own: a flood stops at a quarter of
+        // the budget while a stream event still fits, and popping one gives
+        // its bytes back to both counts.
+        let mut inbound = Inbound::default();
+        let datagram = || NativeEvent::Datagram(vec![1_u8; MAX_DATAGRAM_INBOUND_BYTES / 4].into());
+        for _ in 0..4 {
+            assert!(inbound.push(datagram()).is_ok());
+        }
+        assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES);
+        assert!(inbound.push(datagram()).is_err(), "a fifth is past the cap");
+        assert!(
+            inbound
+                .push(NativeEvent::Reliable {
+                    lane: 1,
+                    sequence: 1,
+                    bytes: vec![2_u8; 1024].into(),
+                })
+                .is_ok(),
+            "the reliable path is untouched by the flood"
+        );
+        assert_eq!(inbound.bytes, MAX_DATAGRAM_INBOUND_BYTES + 1024);
+        let _ = inbound.pop();
+        assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES * 3 / 4);
+        assert!(inbound.push(datagram()).is_ok(), "room again");
     }
 
     #[test]

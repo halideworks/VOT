@@ -90,6 +90,8 @@ enum Lane {
     Control,
     Stream(StreamId),
     Datagram(u64),
+    /// A received datagram, which no carrier orders against anything.
+    Received,
     Connection,
 }
 
@@ -100,8 +102,8 @@ impl Lane {
             TransportEvent::Reliable { stream, .. } => Self::Stream(*stream),
             TransportEvent::Acknowledged(ack) => Self::Stream(ack.stream()),
             TransportEvent::DatagramState { context, .. } => Self::Datagram(*context),
-            // Unordered by nature, so every received datagram is its own lane.
-            TransportEvent::Datagram(_) => Self::Datagram(u64::MAX),
+            // Unordered by nature: placed by position below, not by lane.
+            TransportEvent::Datagram(_) => Self::Received,
             TransportEvent::Connected(_) | TransportEvent::Disconnected(_) => Self::Connection,
         }
     }
@@ -126,6 +128,15 @@ fn reorder_across_lanes(delivered: &mut Vec<TransportEvent>, depth: usize) {
             .entry(Lane::of(&event))
             .or_default()
             .push_back(event);
+    }
+    // Received datagrams have no order to keep, so they are reversed within
+    // the same windows rather than replayed in submission order.
+    if let Some(received) = by_lane.get_mut(&Lane::Received) {
+        let mut reversed: Vec<TransportEvent> = received.drain(..).collect();
+        for window in reversed.chunks_mut(depth + 1) {
+            window.reverse();
+        }
+        received.extend(reversed);
     }
     for lane in lanes {
         if let Some(event) = by_lane.get_mut(&lane).and_then(VecDeque::pop_front) {
@@ -2007,6 +2018,41 @@ mod tests {
             delivered,
             vec![b"first".to_vec()],
             "the sent datagram arrives, the lost one does not"
+        );
+    }
+
+    #[test]
+    fn received_datagrams_are_reordered_against_each_other() {
+        let mut adapter = SimulatorAdapter::with_impairment(Impairment {
+            reorder_depth: 1,
+            ..Impairment::default()
+        })
+        .unwrap();
+        adapter.send_datagram(1, b"first").unwrap();
+        adapter.send_datagram(2, b"second").unwrap();
+        adapter.flush().unwrap();
+        let mut delivered = Vec::new();
+        let mut states = Vec::new();
+        while let Some(event) = adapter.poll() {
+            match event {
+                TransportEvent::Datagram(bytes) => delivered.push(bytes.to_vec()),
+                TransportEvent::DatagramState { context, state } => states.push((context, state)),
+                _ => {}
+            }
+        }
+        assert_eq!(delivered, vec![b"second".to_vec(), b"first".to_vec()]);
+        // Each datagram's own lifecycle keeps its order.
+        let first: Vec<_> = states
+            .iter()
+            .filter(|(c, _)| *c == 1)
+            .map(|(_, s)| *s)
+            .collect();
+        assert_eq!(
+            first,
+            vec![
+                vot_transport_api::DatagramSendState::Queued,
+                vot_transport_api::DatagramSendState::Sent
+            ]
         );
     }
 

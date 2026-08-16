@@ -209,9 +209,12 @@ pub enum Event {
         context: u64,
         state: DatagramSendState,
     },
-    /// An unreliable datagram the peer sent. Bounded by the same inbound
-    /// budget as every other event; one the budget cannot hold is dropped,
-    /// which is what an unreliable carrier may do anyway.
+    /// An unreliable datagram the peer sent. Only a carrier with a datagram
+    /// path produces it (quiche, the simulator); the TCP and msquic adapters
+    /// never do. Bounded by an inbound budget of its own beside the one
+    /// every other event shares, so a flood of them cannot starve the
+    /// reliable and control lanes; one past the budget is dropped, which is
+    /// what an unreliable carrier may do anyway.
     Datagram(Payload),
 }
 

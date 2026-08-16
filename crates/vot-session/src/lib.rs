@@ -2488,6 +2488,10 @@ mod tests {
         server
             .adapter
             .events
+            .push_back(Event::Datagram(vot_transport_api::shared_payload(b"late")));
+        server
+            .adapter
+            .events
             .push_back(Event::Disconnected(vot_transport_api::ConnectionId(1)));
         assert_eq!(
             server.poll().unwrap(),
@@ -3047,6 +3051,23 @@ mod tests {
             matches!(server.poll().unwrap(), Some(Event::Control(_))),
             "a negotiated experimental frame is delivered"
         );
+        // A datagram reaches the application only under the negotiated
+        // extension and a ready session; otherwise it is dropped unheard.
+        let symbol = Event::Datagram(vot_transport_api::shared_payload(b"symbol"));
+        server.adapter.events.push_back(symbol.clone());
+        assert_eq!(server.poll().unwrap(), Some(symbol.clone()));
+        let (mut plain, _) = negotiated();
+        plain.adapter.events.push_back(symbol.clone());
+        assert_eq!(plain.poll().unwrap(), None, "not negotiated: dropped");
+        let mut early = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+            Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        early.begin().unwrap();
+        early.adapter.events.push_back(symbol);
+        assert_eq!(early.poll().unwrap(), None, "not ready: dropped");
 
         // One-sided advertisement is not negotiation: the client offered the
         // extension, this server did not, and the intersection is empty.

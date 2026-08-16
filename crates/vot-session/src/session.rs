@@ -334,6 +334,19 @@ impl<A: TransportAdapter> Session<A> {
                     }
                     self.hold(record)?;
                 }
+                // Unreliable, so never held: one that arrives before the
+                // session is ready or without DATAGRAM_FEC negotiated is
+                // dropped, as spec/fec.md section 12 has the receiver drop
+                // any symbol it has no state for.
+                Event::Datagram(bytes) => {
+                    if self.negotiation.is_ready()
+                        && self
+                            .negotiation
+                            .extension_is_negotiated(vot_codec::extension_id::DATAGRAM_FEC)
+                    {
+                        return Ok(Some(Event::Datagram(bytes)));
+                    }
+                }
                 other => return Ok(Some(other)),
             }
             if self.negotiation.is_ready()
@@ -589,7 +602,7 @@ impl<A: TransportAdapter> Session<A> {
     fn drain_lifecycle(&mut self) -> Option<Event> {
         while let Some(event) = self.adapter.poll() {
             match event {
-                Event::Control(_) | Event::Reliable { .. } => {}
+                Event::Control(_) | Event::Reliable { .. } | Event::Datagram(_) => {}
                 lifecycle => return Some(lifecycle),
             }
         }

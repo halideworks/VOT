@@ -40,28 +40,33 @@ through 12.**
   `decoded` or `abandoned`. `CODING_EPOCH_CLOSE` (sender to receiver) is
   terminal for the epoch and retires every generation under it that has not
   already reported.
-- `DATAGRAM_CREDIT` (receiver to sender) carries a `credit_epoch` and three
-  caps: unretired bytes, active generations, and decode work. A newer
-  epoch replaces older credit whole. Before the first credit frame both caps
-  are zero, so no epoch may be opened and no symbol may be sent.
+- `DATAGRAM_CREDIT` (receiver to sender) carries a `credit_epoch` and four
+  caps: unretired bytes, active generations, open epochs, and decode work.
+  A newer epoch replaces older credit whole and may shrink. Before the first
+  credit frame every cap is zero, so no epoch may be opened and no symbol
+  may be sent. The first three are levels both ends count from what they
+  exchanged; decode work is a budget only the receiver counts, spent in
+  symbol bytes handed to elimination, and when it is spent the receiver
+  abandons generations that need elimination until a newer credit epoch.
 - Retirement is event-driven: a generation's bytes retire on its `GEN_DONE`
-  or on `CODING_EPOCH_CLOSE`. Active generations are those opened by an
-  arriving symbol and not yet retired. Decode work is counted in symbol
-  bytes handed to elimination; a generation whose sources all arrive costs
-  none.
+  or on `CODING_EPOCH_CLOSE`, and a closed epoch is forgotten entirely;
+  because identifiers are never reused, anything that later names it is
+  simply unknown. Active generations are those opened by an arriving symbol
+  and not yet retired. Source symbols of a short last generation that lie
+  entirely past the range are all zero, never sent, and count as received.
 - The profile this project ships is `k = 64, L = 1024`: one generation is
   exactly one 64 KiB integrity group, its datagram is 1033 bytes, and the
   bytes a generation yields verify by the same range proof machinery as a
   reliable `DATA_RECORD` for that group. Proofs still travel reliably.
 - What a receiver drops and what it treats as misbehaviour is a table in
-  `spec/fec.md` section 12. Datagrams overtake the control stream in normal
-  operation, so a symbol for an epoch the receiver has not yet seen opened,
-  a symbol of the wrong length, an ESI the geometry has no row for, and a
-  duplicate ESI are dropped without effect. Opening an epoch with a
-  geometry that conflicts with an earlier open of the same epoch, opening
-  or sending past credit, and a `GEN_STATE` or `GEN_DONE` for an unknown
-  epoch are protocol errors that close the session with
-  `CODING_EPOCH_CONFLICT` (new, `0x0703`) or `FLOW_CONTROL_VIOLATION`.
+  `spec/fec.md` section 12. Datagrams overtake the control stream, the two
+  reliable directions are independent, and credit can shrink in flight, so
+  a symbol or frame for state the receiver no longer holds, or past credit
+  it no longer extends, is normal operation: dropped or ignored, never a
+  session error. Session errors are reserved for what only a broken sender
+  produces: a payload outside its constraints (`MALFORMED_FRAME`) and one
+  epoch identifier opened twice with different content
+  (`CODING_EPOCH_CONFLICT`, new, `0x0703`).
 - No timer anywhere in the lifecycle. A receiver that wants a generation's
   missing bytes asks for them on the reliable path exactly as it would have
   without FEC; abandonment is a decision it reports, not a timeout.

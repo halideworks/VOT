@@ -136,11 +136,15 @@ covers object bytes
 ```
 
 Source symbol `j` of generation `g` is the `L` bytes starting at
-`offset + (g * k + j) * L`. Only the last generation may be short; a short
-generation still has `k` source symbols, the trailing ones zero-padded to
-`L`, and a symbol that lies entirely past `offset + length` is all zero. The
-receiver discards padding by the declared `length`; padding is never handed
-to verification. Nothing else announces a generation.
+`offset + (g * k + j) * L`. Only the last generation may be short. Its
+source symbol that straddles `offset + length` is transmitted zero-padded to
+`L`. A source symbol that lies entirely at or past `offset + length` is
+all zero by definition: it is never transmitted, both ends count it as
+received from the start, it never appears in `missing_sources`, and repair
+symbols are computed over it as zeros. The receiver discards padding by the
+declared `length`; padding is never handed to verification. `length` MUST
+satisfy `ceil(length / (k * L)) <= 2^32` so every generation has an
+identifier. Nothing else announces a generation.
 
 The profile this project ships is `k = 64`, `L = 1024`, `offset` a multiple
 of 65536: one generation is exactly one 64 KiB integrity group, so the bytes
@@ -180,27 +184,30 @@ negotiated (`EXPERIMENT_NOT_NEGOTIATED`).
 | 3 | `length` | `> 0` |
 | 4 | `source_count` | `k`, `1..=64` |
 | 5 | `repair_count` | `r`, `0..=16` |
-| 6 | `symbol_length` | `L`, `1..=65535`; `9 + L` at or below the carrier's datagram size |
+| 6 | `symbol_length` | `L`, `1..=65535`; the sender chooses `9 + L` at or below the datagram size the path allows |
 
-An exact repeat is idempotent. A repeat of the same `epoch` with any other
-field is `CODING_EPOCH_CONFLICT`. Opening while active generations or
-unretired bytes would exceed credit is `FLOW_CONTROL_VIOLATION`.
+A field outside its constraint is `MALFORMED_FRAME`, as for any payload. An
+exact repeat is idempotent. A repeat of the same `epoch` with any other
+field is `CODING_EPOCH_CONFLICT`. An open that would take the receiver past
+`max_open_epochs` is ignored: the epoch stays unknown to the receiver and
+its symbols drop, and the sender learns nothing until it retires an epoch,
+which is why a sender never opens past the credit it has seen.
 
 `GEN_STATE` (receiver to sender, advisory):
 
 | Key | Field | Constraint |
 |---:|---|---|
-| 0 | `epoch` | an open epoch |
+| 0 | `epoch` | an epoch the receiver has open; a frame naming any other epoch is ignored |
 | 1 | `generation` | u32 range, inside the epoch |
 | 2 | `sequence` | scoped to `(epoch, generation)`; a lower or equal sequence than one already accepted is ignored |
-| 3 | `received` | distinct symbols so far, `0..=k+r` |
+| 3 | `received` | distinct symbols so far, `0..=k+r`, counting all-zero sources past the end |
 | 4 | `missing_sources` | array of source ESIs not yet received, ascending, at most `k` |
 
 `GEN_DONE` (receiver to sender, terminal for the generation):
 
 | Key | Field | Constraint |
 |---:|---|---|
-| 0 | `epoch` | an open epoch |
+| 0 | `epoch` | an epoch the receiver has open; a frame naming any other epoch is ignored |
 | 1 | `generation` | u32 range, inside the epoch |
 | 2 | `outcome` | `0` decoded, `1` abandoned |
 
@@ -212,10 +219,13 @@ An exact repeat is idempotent; a repeat with a different outcome is
 
 | Key | Field | Constraint |
 |---:|---|---|
-| 0 | `epoch` | an open epoch |
+| 0 | `epoch` | an epoch the receiver has open; a close naming any other epoch is ignored |
 
-Idempotent. Every generation under the epoch that has no `GEN_DONE` retires
-as abandoned; later symbols for the epoch are dropped.
+Every generation under the epoch that has no `GEN_DONE` retires as
+abandoned and the receiver forgets the epoch. Because an identifier is never
+reused, a later duplicate close, a `GEN_STATE` or `GEN_DONE` that crossed the
+close in flight, and any later symbol all name an unknown epoch and are
+ignored or dropped. Nothing about a closed epoch is retained.
 
 `DATAGRAM_CREDIT` (receiver to sender):
 
@@ -224,11 +234,20 @@ as abandoned; later symbols for the epoch are dropped.
 | 0 | `credit_epoch` | monotonic per session; a lower or equal value is ignored |
 | 1 | `max_unretired_bytes` | bytes of all active generations (`k * L` each) the sender may have outstanding |
 | 2 | `max_active_generations` | generations the sender may have opened by a symbol and not retired |
-| 3 | `max_decode_work` | symbol bytes the receiver will hand to elimination per credit epoch |
+| 3 | `max_decode_work` | symbol bytes the receiver will hand to elimination under this credit epoch |
+| 4 | `max_open_epochs` | epochs the sender may have opened and not closed |
 
 Before the first accepted `DATAGRAM_CREDIT` every cap is zero, so no epoch may
 be opened and no symbol may be sent. A newer credit epoch replaces the older
-one whole, never adds to it.
+one whole, never adds to it, and it may shrink: the sender then opens and
+sends nothing new until it is back inside every cap, and what it already sent
+under the older credit is dropped by the receiver, never punished.
+`max_unretired_bytes`, `max_active_generations`, and `max_open_epochs` are
+levels both ends can count from the frames and symbols they have exchanged.
+`max_decode_work` is a budget only the receiver counts: once elimination has
+consumed it, the receiver abandons every further generation that would need
+elimination (`GEN_DONE` outcome `1`) until a newer credit epoch, and a
+generation whose `k` sources all arrive costs nothing against it.
 
 ## 12. Retirement, drops, and errors
 
@@ -242,17 +261,22 @@ would without FEC, and abandonment is a decision it reports.
 
 | Event | Handling |
 |---|---|
-| Symbol for an epoch not yet opened or already closed | dropped |
+| Symbol for an epoch the receiver does not have open | dropped |
 | Symbol whose datagram length is not `9 + L` | dropped |
-| Symbol whose `esi >= k + r` or whose generation lies past the epoch | dropped |
+| Symbol whose `esi >= k + r`, whose generation lies past the epoch, or whose source ESI lies entirely past `offset + length` | dropped |
 | Duplicate `(epoch, generation, esi)` | dropped |
-| Symbol that would make active generations or unretired bytes exceed credit | dropped; the receiver MAY send `FLOW_CONTROL_VIOLATION` |
+| Symbol that would make active generations or unretired bytes exceed credit | dropped |
 | Symbol before any `DATAGRAM_CREDIT` was accepted | dropped |
-| `CODING_EPOCH_OPEN` with a conflicting geometry, object, or range for a known epoch | `CODING_EPOCH_CONFLICT`, session closes |
-| `CODING_EPOCH_OPEN` past credit | `FLOW_CONTROL_VIOLATION`, session closes |
-| Any FEC frame naming an unknown epoch or an out-of-range generation | `MALFORMED_FRAME`, session closes |
+| `CODING_EPOCH_OPEN` past `max_open_epochs` | ignored, the epoch stays unknown |
+| `GEN_STATE`, `GEN_DONE`, or `CODING_EPOCH_CLOSE` naming an epoch the receiver does not have open | ignored |
+| `CODING_EPOCH_OPEN` repeating a known epoch with any field changed | `CODING_EPOCH_CONFLICT`, session closes |
+| Any FEC payload outside its field constraints, or a generation past the epoch's count | `MALFORMED_FRAME`, session closes |
 | Any FEC frame without `DATAGRAM_FEC` negotiated | `EXPERIMENT_NOT_NEGOTIATED`, session closes |
 
-Datagrams overtake the control stream in normal operation, which is why the
-first three rows are drops and not errors: the reliable path repairs whatever
-a drop cost.
+Datagrams overtake the control stream, the two reliable directions are
+independent, and credit may shrink in flight, so in normal operation a
+symbol, an open, or a feedback frame can arrive for state its receiver no
+longer holds or credit it no longer extends. Every such case is a drop or an
+ignore and the reliable path repairs whatever it cost. Session errors are
+reserved for what only a broken sender can produce: a payload outside its
+constraints, and one epoch identifier opened twice with different content.

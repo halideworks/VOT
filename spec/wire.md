@@ -204,7 +204,7 @@ send them would leave no way to reach one.
 | `CHUNK_AT_REST_VERIFIED` | 64 KiB | monotonic receipt sequence; exact duplicate ignored | yes | no |
 | `PUBLISH_RECEIPT` | 64 KiB | monotonic receipt sequence; exact duplicate ignored | yes | no |
 | `DATAGRAM_CREDIT` | 4 KiB | newer credit epoch replaces; stale epoch ignored | yes | no |
-| `CODING_EPOCH_OPEN` | 64 KiB | exact epoch geometry is idempotent; geometry conflict rejected | yes | no |
+| `CODING_EPOCH_OPEN` | 64 KiB | exact epoch definition is idempotent; a differing repeat is rejected | yes | no |
 | `GEN_STATE` | 64 KiB | newer generation sequence supersedes | yes | no |
 | `GEN_DONE` | 64 KiB | terminal and idempotent for generation | yes | no |
 | `CODING_EPOCH_CLOSE` | 64 KiB | terminal and idempotent for epoch | yes | no |

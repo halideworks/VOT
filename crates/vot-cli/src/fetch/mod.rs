@@ -1620,6 +1620,10 @@ mod tests {
             error_code::RESOURCE_LIMIT
         );
         assert_eq!(
+            refusal_code(&vot_scheduler::Error::CodingEpochConflict),
+            error_code::CODING_EPOCH_CONFLICT
+        );
+        assert_eq!(
             refusal_code(&vot_scheduler::Error::Staging(
                 vot_transport_api::Error::StagingExhausted
             )),

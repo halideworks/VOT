@@ -2625,6 +2625,7 @@ dependencies = [
  "blake3",
  "vot-codec",
  "vot-coverage",
+ "vot-fec",
  "vot-platform-fs",
  "vot-proof-blake3",
  "vot-proof-sha256",

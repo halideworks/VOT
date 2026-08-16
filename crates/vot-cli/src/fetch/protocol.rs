@@ -187,6 +187,9 @@ pub(crate) fn refusal_code(error: &vot_scheduler::Error) -> u16 {
     match error {
         // This end could not write what it had already verified.
         Refusal::Sink => error_code::STORAGE_WRITE_FAILED,
+        // One epoch identifier opened twice with different content
+        // (spec/fec.md section 12).
+        Refusal::CodingEpochConflict => error_code::CODING_EPOCH_CONFLICT,
         // More than this end will hold, whoever's sizing is at fault.
         Refusal::Staging(_)
         | Refusal::PendingBundlesExhausted

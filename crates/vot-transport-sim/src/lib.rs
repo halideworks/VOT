@@ -100,6 +100,8 @@ impl Lane {
             TransportEvent::Reliable { stream, .. } => Self::Stream(*stream),
             TransportEvent::Acknowledged(ack) => Self::Stream(ack.stream()),
             TransportEvent::DatagramState { context, .. } => Self::Datagram(*context),
+            // Unordered by nature, so every received datagram is its own lane.
+            TransportEvent::Datagram(_) => Self::Datagram(u64::MAX),
             TransportEvent::Connected(_) | TransportEvent::Disconnected(_) => Self::Connection,
         }
     }
@@ -285,7 +287,11 @@ impl SimulatorAdapter {
                             vot_transport_api::DatagramSendState::Sent
                         },
                     });
-                    let _ = bytes;
+                    // The loopback delivers what the impairment did not lose,
+                    // which is what a peer would see.
+                    if !lost {
+                        delivered.push(TransportEvent::Datagram(bytes));
+                    }
                 }
                 Submission::ReceiveCredit(bytes) => self.receive_credit = bytes,
             }
@@ -1980,9 +1986,12 @@ mod tests {
         adapter.send_datagram(2, b"second").unwrap();
         adapter.flush().unwrap();
         let mut states = Vec::new();
+        let mut delivered = Vec::new();
         while let Some(event) = adapter.poll() {
-            if let TransportEvent::DatagramState { context, state } = event {
-                states.push((context, state));
+            match event {
+                TransportEvent::DatagramState { context, state } => states.push((context, state)),
+                TransportEvent::Datagram(bytes) => delivered.push(bytes.to_vec()),
+                _ => {}
             }
         }
         assert_eq!(
@@ -1993,6 +2002,11 @@ mod tests {
                 (2, vot_transport_api::DatagramSendState::Queued),
                 (2, vot_transport_api::DatagramSendState::SuspectedLost),
             ]
+        );
+        assert_eq!(
+            delivered,
+            vec![b"first".to_vec()],
+            "the sent datagram arrives, the lost one does not"
         );
     }
 

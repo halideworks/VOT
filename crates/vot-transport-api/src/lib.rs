@@ -209,6 +209,10 @@ pub enum Event {
         context: u64,
         state: DatagramSendState,
     },
+    /// An unreliable datagram the peer sent. Bounded by the same inbound
+    /// budget as every other event; one the budget cannot hold is dropped,
+    /// which is what an unreliable carrier may do anyway.
+    Datagram(Payload),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

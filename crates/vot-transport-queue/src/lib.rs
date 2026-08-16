@@ -58,7 +58,9 @@ pub const INBOUND_BYTE_CAPACITY: usize = DEFAULT_BYTE_LIMIT;
 
 fn event_payload_len(event: &Event) -> usize {
     match event {
-        Event::Control(bytes) | Event::Reliable { bytes, .. } => bytes.len(),
+        Event::Control(bytes) | Event::Reliable { bytes, .. } | Event::Datagram(bytes) => {
+            bytes.len()
+        }
         Event::Connected(_)
         | Event::Disconnected(_)
         | Event::Acknowledged(_)
@@ -371,6 +373,13 @@ impl Queue {
         match event {
             Event::Control(bytes) => validate_control_frame(bytes, self.control_receive_limit),
             Event::Reliable { bytes, .. } => validate_data_record(bytes),
+            Event::Datagram(bytes) => {
+                if bytes.len() > vot_transport_api::MAX_DATAGRAM_BYTES {
+                    Err(Error::RecordTooLarge)
+                } else {
+                    Ok(())
+                }
+            }
             Event::Connected(_)
             | Event::Disconnected(_)
             | Event::Acknowledged(_)
@@ -619,6 +628,24 @@ mod tests {
             queue
                 .send_datagram(1, &vec![0; vot_transport_api::MAX_DATAGRAM_BYTES])
                 .is_ok()
+        );
+        // Inbound, the same bound, and a datagram costs its bytes.
+        let largest = Event::Datagram(shared_payload(&vec![
+            0;
+            vot_transport_api::MAX_DATAGRAM_BYTES
+        ]));
+        assert_eq!(queue.validate_event(&largest), Ok(()));
+        assert_eq!(
+            queue.validate_event(&Event::Datagram(shared_payload(&vec![
+                0;
+                vot_transport_api::MAX_DATAGRAM_BYTES
+                    + 1
+            ]))),
+            Err(Error::RecordTooLarge)
+        );
+        assert_eq!(
+            event_payload_len(&largest),
+            vot_transport_api::MAX_DATAGRAM_BYTES
         );
     }
 

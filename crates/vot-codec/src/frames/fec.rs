@@ -78,6 +78,7 @@ impl CodingEpochOpen {
                 .offset
                 .checked_add(self.length)
                 .is_none_or(|end| end > self.object.length)
+            || self.generation_count() > u64::from(u32::MAX) + 1
         {
             return Err(Error::InvalidValue);
         }
@@ -532,7 +533,7 @@ mod tests {
         let mut out = Vec::new();
         let base = open();
         let bad =
-            |value: CodingEpochOpen| encode(&TypedFrame::CodingEpochOpen(value), &mut out.clone());
+            |value: CodingEpochOpen| encode(&TypedFrame::CodingEpochOpen(value), &mut Vec::new());
         assert_eq!(
             bad(CodingEpochOpen { length: 0, ..base }),
             Err(Error::InvalidValue)
@@ -583,6 +584,21 @@ mod tests {
                 .unwrap();
         wide_r[r_at + 1] = 17;
         assert_eq!(decode(&wide_r, limits()), Err(Error::InvalidValue));
+        // The generation space is u32: k = 1, L = 1 over 2^32 + 1 bytes needs
+        // one identifier too many, and exactly 2^32 bytes fits.
+        let narrow = |length: u64| CodingEpochOpen {
+            object: ObjectId {
+                suite: 1,
+                root: [3; 32],
+                length: 1 << 33,
+            },
+            offset: 0,
+            length,
+            geometry: Geometry::new(1, 0, 1).unwrap(),
+            ..base
+        };
+        assert_eq!(bad(narrow((1 << 32) + 1)), Err(Error::InvalidValue));
+        assert!(bad(narrow(1 << 32)).is_ok());
         assert_eq!(base.generation_count(), 2);
         assert_eq!(
             CodingEpochOpen {
@@ -658,6 +674,44 @@ mod tests {
                 ..good
             }),
             Err(Error::InvalidValue)
+        );
+        // The decoder re-checks what the encoder refuses, on bytes an
+        // encoder never writes: received 81, a repair ESI, and a descending
+        // pair, each a legal CBOR map of the right shape.
+        let framed = |received: u64, missing: &[u64]| {
+            let mut payload = Vec::new();
+            vot_cbor::map(&mut payload, 5);
+            for (key, value) in [(0, 1), (1, 2), (2, 3), (3, received)] {
+                vot_cbor::uint(&mut payload, key);
+                vot_cbor::uint(&mut payload, value);
+            }
+            vot_cbor::uint(&mut payload, 4);
+            vot_cbor::array(&mut payload, missing.len() as u64);
+            for esi in missing {
+                vot_cbor::uint(&mut payload, *esi);
+            }
+            let mut framed = Vec::new();
+            crate::encode_frame(crate::frame_type::GEN_STATE, &payload, &mut framed).unwrap();
+            framed
+        };
+        assert!(decode(&framed(80, &[0, 63]), limits()).is_ok());
+        assert_eq!(decode(&framed(81, &[]), limits()), Err(Error::InvalidValue));
+        assert_eq!(
+            decode(&framed(1, &[64]), limits()),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            decode(&framed(1, &[5, 4]), limits()),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(
+            decode(&framed(1, &[4, 4]), limits()),
+            Err(Error::InvalidValue)
+        );
+        let too_many: Vec<u64> = (0..65).collect();
+        assert_eq!(
+            decode(&framed(1, &too_many), limits()),
+            Err(Error::TooLarge)
         );
     }
 

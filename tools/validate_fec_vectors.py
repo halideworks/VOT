@@ -206,12 +206,12 @@ def cbor_object(suite: int, root: bytes, length: int) -> bytes:
     return cbor_uint(4, 4) + cbor_uint(0, 1) + cbor_uint(0, suite) + cbor_uint(2, 32) + root + cbor_uint(0, length)
 
 
-ROOT = bytes(range(32))
+OBJECT_ROOT = bytes(range(32))
 FRAMES = {
     "coding_epoch_open": {
         "epoch": 7,
         "suite": 1,
-        "root_hex": ROOT.hex(),
+        "root_hex": OBJECT_ROOT.hex(),
         "object_length": 200_000,
         "offset": 65_536,
         "length": 131_072,
@@ -231,7 +231,7 @@ def frame_vectors() -> dict:
     o = FRAMES["coding_epoch_open"]
     open_bytes = cbor_map([
         (0, cbor_uint(0, o["epoch"])),
-        (1, cbor_object(o["suite"], ROOT, o["object_length"])),
+        (1, cbor_object(o["suite"], OBJECT_ROOT, o["object_length"])),
         (2, cbor_uint(0, o["offset"])),
         (3, cbor_uint(0, o["length"])),
         (4, cbor_uint(0, o["source_count"])),

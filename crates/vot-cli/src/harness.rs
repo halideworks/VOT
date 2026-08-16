@@ -163,6 +163,9 @@ pub(crate) struct Duplex {
     channel_binding: Option<vot_transport_api::ChannelBinding>,
     sequence: u64,
     closed: bool,
+    datagrams_sent: u64,
+    /// Lose every nth datagram this end sends; zero loses none.
+    pub(crate) drop_datagram_every: u64,
 }
 
 /// A connected pair of [`Duplex`] ends.
@@ -181,6 +184,8 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
             channel_binding: None,
             sequence: 0,
             closed: false,
+            datagrams_sent: 0,
+            drop_datagram_every: 0,
         },
         Duplex {
             inbox: right,
@@ -188,6 +193,8 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
             channel_binding: None,
             sequence: 0,
             closed: false,
+            datagrams_sent: 0,
+            drop_datagram_every: 0,
         },
     )
 }
@@ -239,6 +246,21 @@ impl TransportAdapter for Duplex {
             sequence: self.sequence,
             bytes: shared_payload(record),
         });
+        Ok(())
+    }
+
+    fn send_datagram(
+        &mut self,
+        _context: u64,
+        payload: &[u8],
+    ) -> Result<(), vot_transport_api::Error> {
+        // Delivered unless the pair was told to lose every nth: what an
+        // unreliable path does, without a clock.
+        self.datagrams_sent += 1;
+        if self.drop_datagram_every != 0 && self.datagrams_sent % self.drop_datagram_every == 0 {
+            return Ok(());
+        }
+        self.outbox.push(Event::Datagram(shared_payload(payload)));
         Ok(())
     }
 

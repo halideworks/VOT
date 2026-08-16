@@ -1149,6 +1149,7 @@ mod tests {
             &output,
             None,
             Some(std::sync::Arc::clone(&held)),
+            std::collections::BTreeSet::new(),
         )
         .expect("a fetch holding a token");
         let handed = fetcher.holder().expect("the token, for a rail");
@@ -1157,9 +1158,14 @@ mod tests {
             "a rail would have opened its session with no capability"
         );
 
-        let without =
-            BundleFetcher::begin_with(crate::harness::Loopback::default(), &output, None, None)
-                .expect("a fetch holding none");
+        let without = BundleFetcher::begin_with(
+            crate::harness::Loopback::default(),
+            &output,
+            None,
+            None,
+            std::collections::BTreeSet::new(),
+        )
+        .expect("a fetch holding none");
         assert!(without.holder().is_none(), "a token appeared from nowhere");
     }
 
@@ -1327,6 +1333,26 @@ mod tests {
     }
 
     #[test]
+    fn the_datagram_fec_offer_is_off_unless_asked_for() {
+        assert!(extensions_from(None).unwrap().is_empty());
+        for off in ["0", "off", "false", " OFF "] {
+            assert!(extensions_from(Some(off)).unwrap().is_empty(), "{off}");
+        }
+        for on in ["1", "on", "true", " True\n"] {
+            assert_eq!(
+                extensions_from(Some(on)).unwrap(),
+                std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
+                "{on}"
+            );
+        }
+        assert!(extensions_from(Some("maybe")).is_err());
+        assert!(
+            std::env::var(DATAGRAM_FEC).is_err(),
+            "the suite owns no env"
+        );
+    }
+
+    #[test]
     fn an_ephemeral_certificate_goes_when_the_server_does() {
         let (certificate, key, directory) = {
             let written = Ephemeral::generate().expect("credentials");
@@ -1395,6 +1421,66 @@ mod tests {
         assert_eq!(
             std::fs::read(destination.join("a.txt")).unwrap(),
             vec![7_u8; 1000]
+        );
+    }
+
+    #[test]
+    fn a_bundle_crosses_a_quic_socket_over_the_datagram_path() {
+        // Both ends offer DATAGRAM_FEC, so every group-aligned answer rides
+        // as coded symbols and the fetch decodes them; the reliable path
+        // carries only what credit or loss left. The counter proves the
+        // symbols were what carried the bytes.
+        let source = crate::tests::temporary("fec-wire-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.bin"), vec![0x3c_u8; 1_500_000]).unwrap();
+        let bundle = crate::tests::temporary("fec-wire-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+
+        let (listening, address) = mpsc::channel();
+        let serving_offer = fec.clone();
+        let serving = std::thread::spawn(move || {
+            serve_bundle_offering(
+                &bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(1),
+                &serving_offer,
+                |at, root| {
+                    let _ = listening.send((at, root));
+                },
+            )
+        });
+        let (at, _) = address.recv().expect("the server reported its address");
+        let fetched = crate::tests::temporary("fec-wire-fetched");
+        let before =
+            crate::drive::FEC_GENERATIONS_DECODED.load(std::sync::atomic::Ordering::Relaxed);
+        let config = client_config().unwrap();
+        let connect = || {
+            Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config)
+                .map_err(carrier_failure)
+        };
+        let package = fetch_over_offering(
+            connect().unwrap(),
+            connect,
+            &fetched,
+            Some(built.root),
+            1,
+            fec,
+        )
+        .expect("a fetched bundle");
+        assert_eq!(package, built);
+        let served = serving.join().expect("the serving thread").expect("served");
+        assert_eq!(served, built);
+        let decoded = crate::drive::FEC_GENERATIONS_DECODED
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - before;
+        // 1500000 bytes of object are 23 generations; the manifest and the
+        // small tail travel reliably.
+        eprintln!("fec: {decoded} generations decoded over the wire");
+        assert!(
+            decoded >= 20,
+            "the datagram path carried the object: {decoded} generations decoded"
         );
     }
 
@@ -1735,9 +1821,14 @@ mod tests {
             &client,
         )
         .expect("a carrier");
-        let mut holding =
-            BundleFetcher::begin_with(carrier, &fetched, Some(built.root), Some(holder))
-                .expect("a fetch holding the token");
+        let mut holding = BundleFetcher::begin_with(
+            carrier,
+            &fetched,
+            Some(built.root),
+            Some(holder),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("a fetch holding the token");
         let status = crate::drive::drive(&mut holding).expect("a driven fetch");
         assert_eq!(
             status,

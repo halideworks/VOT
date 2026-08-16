@@ -127,6 +127,12 @@ fn fetched<A: TransportAdapter>(
     fetch_verdict(status).and_then(|()| fetcher.package().ok_or(Error::InvalidBundle))
 }
 
+/// Generations every fetch in this process decoded from the datagram path,
+/// summed over rails at the end of each. Diagnostic: the fetch report has
+/// no other place for it yet.
+pub static FEC_GENERATIONS_DECODED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Fetches at `rails` width. The primary builds the plan; rails join it
 /// on fresh connections. A rail failure abandons the plan.
 ///
@@ -147,6 +153,10 @@ where
         return Err(Error::InvalidArguments);
     }
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
+        FEC_GENERATIONS_DECODED.fetch_add(
+            primary.fec_generations_decoded(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return fetched(&primary, status);
     }
     let Some(plan) = primary.shared_plan() else {
@@ -157,6 +167,7 @@ where
     // Every rail opens its own session and answers its own challenge, under
     // the token the primary was given.
     let holder = primary.holder();
+    let extensions = primary.extensions();
     std::thread::scope(|scope| {
         let mut spawned = Vec::new();
         for _ in 1..rails {
@@ -164,13 +175,20 @@ where
             let connect = &connect;
             let bundle = bundle.clone();
             let holder = holder.clone();
+            let extensions = extensions.clone();
             spawned.push(scope.spawn(move || {
                 let outcome = (|| {
                     let carrier = connect()?;
-                    let mut rail =
-                        crate::BundleFetcher::join(carrier, &bundle, plan.clone(), holder)?;
+                    let mut rail = crate::BundleFetcher::join(
+                        carrier,
+                        &bundle,
+                        plan.clone(),
+                        holder,
+                        extensions,
+                    )?;
                     rail.set_proving_threads(provers)?;
-                    fetch_verdict(drive(&mut rail)?)
+                    fetch_verdict(drive(&mut rail)?)?;
+                    Ok(rail.fec_generations_decoded())
                 })();
                 if outcome.is_err() {
                     crate::fetch::abandon_plan(&plan);
@@ -182,12 +200,17 @@ where
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
         }
+        let mut decoded = primary.fec_generations_decoded();
         let mut rail_failure = None;
         for rail in spawned {
-            if let Err(error) = rail.join().expect("a rail thread never panics") {
-                rail_failure.get_or_insert(error);
+            match rail.join().expect("a rail thread never panics") {
+                Ok(count) => decoded += count,
+                Err(error) => {
+                    rail_failure.get_or_insert(error);
+                }
             }
         }
+        FEC_GENERATIONS_DECODED.fetch_add(decoded, std::sync::atomic::Ordering::Relaxed);
         match outcome {
             Ok(package) => Ok(package),
             // Report the rail's failure as the cause of a stalled primary.
@@ -247,7 +270,7 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
         let mut session = vot_session::Session::server(
             carrier,
             vot_codec::Settings::default(),
-            std::collections::BTreeSet::new(),
+            stance.extensions,
             stance.authentication,
         );
         session.begin()?;

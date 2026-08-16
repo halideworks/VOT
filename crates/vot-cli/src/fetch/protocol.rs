@@ -61,6 +61,8 @@ pub struct BundleFetcher<A: TransportAdapter> {
     /// Shared, because every rail opens its own session and answers its own
     /// challenge under the same token.
     pub(crate) holder: Option<Arc<crate::authz::Holder>>,
+    /// The extensions every rail of this fetch offers.
+    pub(crate) extensions: BTreeSet<u64>,
     pub(crate) rail: RailProgress,
     pub(crate) terminal: Terminal,
     pub(crate) report: ProgressReport,
@@ -247,7 +249,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// and durable ranges are skipped. A destination without a store is
     /// refused.
     pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
-        Self::begin_with(adapter, bundle, pin, None)
+        Self::begin_with(adapter, bundle, pin, None, BTreeSet::new())
     }
 
     /// [`Self::begin`] holding a capability to present.
@@ -259,6 +261,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         bundle: &Path,
         pin: Option<[u8; 32]>,
         holder: Option<Arc<crate::authz::Holder>>,
+        extensions: BTreeSet<u64>,
     ) -> Result<Self, Error> {
         let store_path = bundle.join(RESUME_STORE);
         let resuming = bundle.exists();
@@ -294,7 +297,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let mut session = Session::client(
             adapter,
             Settings::default(),
-            BTreeSet::new(),
+            extensions.clone(),
             client_stance(holder.as_deref()),
         );
         session.begin()?;
@@ -322,6 +325,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             resuming,
             secondary: false,
             holder,
+            extensions,
             rail: RailProgress::default(),
             terminal: Terminal::default(),
             report: ProgressReport::default(),
@@ -347,12 +351,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         bundle: &Path,
         plan: SharedPlan,
         holder: Option<Arc<crate::authz::Holder>>,
+        extensions: BTreeSet<u64>,
     ) -> Result<Self, Error> {
         let root = plan.lock().map_err(|_| Error::InvalidBundle)?.summary.root;
         let mut session = Session::client(
             adapter,
             Settings::default(),
-            BTreeSet::new(),
+            extensions.clone(),
             client_stance(holder.as_deref()),
         );
         session.begin()?;
@@ -378,6 +383,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             resuming: false,
             secondary: true,
             holder,
+            extensions,
             rail: RailProgress::default(),
             terminal: Terminal::default(),
             report: ProgressReport::default(),
@@ -409,6 +415,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     #[cfg(any(test, feature = "wire"))]
     pub(crate) fn holder(&self) -> Option<Arc<crate::authz::Holder>> {
         self.holder.clone()
+    }
+
+    /// The extensions this fetch offers, for its rails to offer too.
+    #[must_use]
+    pub fn extensions(&self) -> BTreeSet<u64> {
+        self.extensions.clone()
+    }
+
+    /// Generations this fetch's session decoded from the datagram path.
+    #[must_use]
+    pub fn fec_generations_decoded(&self) -> u64 {
+        self.receiver.fec_generations_decoded()
     }
 
     /// The bundle directory this fetch writes.

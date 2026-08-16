@@ -257,6 +257,9 @@ pub fn now_seconds() -> Result<u64, Error> {
 pub struct Stance<'a> {
     pub(crate) authentication: vot_session::Authentication,
     pub(crate) requirement: Option<&'a Requirement>,
+    /// The extensions this serve offers a session; empty by default, since
+    /// every extension is experimental and disabled until asked for.
+    pub(crate) extensions: std::collections::BTreeSet<u64>,
 }
 
 impl Stance<'_> {
@@ -266,7 +269,15 @@ impl Stance<'_> {
         Self {
             authentication: vot_session::Authentication::NotRequired { nonce },
             requirement: None,
+            extensions: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// The same stance, offering `extensions`.
+    #[must_use]
+    pub fn offering(mut self, extensions: std::collections::BTreeSet<u64>) -> Self {
+        self.extensions = extensions;
+        self
     }
 }
 
@@ -279,6 +290,7 @@ impl<'a> Stance<'a> {
                 challenge: requirement.challenge(nonce),
             },
             requirement: Some(requirement),
+            extensions: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -291,6 +303,7 @@ impl From<vot_session::Authentication> for Stance<'_> {
         Self {
             authentication,
             requirement: None,
+            extensions: std::collections::BTreeSet::new(),
         }
     }
 }

@@ -1624,6 +1624,10 @@ mod tests {
             error_code::CODING_EPOCH_CONFLICT
         );
         assert_eq!(
+            refusal_code(&vot_scheduler::Error::MalformedFecFrame),
+            error_code::MALFORMED_FRAME
+        );
+        assert_eq!(
             refusal_code(&vot_scheduler::Error::Staging(
                 vot_transport_api::Error::StagingExhausted
             )),

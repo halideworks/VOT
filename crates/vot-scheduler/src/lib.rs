@@ -42,6 +42,9 @@ pub enum Error {
     /// A `CODING_EPOCH_OPEN` repeated a known epoch with different content
     /// (`spec/fec.md` section 12).
     CodingEpochConflict,
+    /// An FEC payload outside its field constraints, `MALFORMED_FRAME` on
+    /// the wire (`spec/fec.md` section 12).
+    MalformedFecFrame,
 }
 
 impl From<vot_transport_api::Error> for Error {

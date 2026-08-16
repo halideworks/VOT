@@ -17,6 +17,7 @@ file-sink = ["dep:vot-platform-fs"]
 blake3.workspace = true
 vot-codec = { path = "../vot-codec" }
 vot-fec = { path = "../vot-fec" }
+vot-cbor = { path = "../vot-cbor" }
 vot-coverage = { path = "../vot-coverage" }
 vot-platform-fs = { path = "../vot-platform-fs", optional = true }
 vot-transport-api = { path = "../vot-transport-api" }

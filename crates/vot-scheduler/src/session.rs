@@ -546,6 +546,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         while self.completed.len() < self.deferred_limit {
             let Some(event) = self.session.poll().map_err(Error::Session)? else {
                 self.arm_fec()?;
+                self.send_owed()?;
                 return Ok(None);
             };
             self.arm_fec()?;
@@ -575,10 +576,14 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 // The session already dropped one before readiness or without
                 // the extension; what reaches here is a symbol.
                 Event::Datagram(bytes) => {
-                    if self.fec_armed
-                        && let Some(joined) = self.fec.symbol(&bytes)
-                    {
-                        self.join(joined)?;
+                    if self.fec_armed {
+                        if let Some(joined) = self.fec.symbol(&bytes) {
+                            self.join(joined)?;
+                        }
+                        // The decode budget is a credit-epoch budget: once
+                        // it is half spent a new epoch goes out here, not
+                        // only when a bundle completes.
+                        self.fec.extend_credit(self.receiver.advertised_credit());
                     }
                     self.send_owed()?;
                 }
@@ -629,17 +634,24 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// Once ready with `DATAGRAM_FEC` negotiated, extends the first credit;
     /// nothing again until the staging capacity moves.
     fn arm_fec(&mut self) -> Result<(), Error> {
-        if !self.fec_armed
-            && self.session.is_ready()
-            && self
-                .session
-                .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC)
-        {
+        if self.fec_armed {
+            return Ok(());
+        }
+        let negotiated = self
+            .session
+            .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
+        if self.session.is_ready() && negotiated {
             self.fec_armed = true;
             self.fec.extend_credit(self.receiver.advertised_credit());
             self.send_owed()?;
         }
         Ok(())
+    }
+
+    /// Whether the datagram FEC intake is armed for this session.
+    #[must_use]
+    pub const fn fec_armed(&self) -> bool {
+        self.fec_armed
     }
 
     /// `CODING_EPOCH_OPEN` or `CODING_EPOCH_CLOSE` from the sender.
@@ -652,7 +664,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             max_frames: 1,
         };
         let (typed, _) =
-            vot_codec::frames::decode(frame, limits).map_err(|_| Error::ProofInvalid)?;
+            vot_codec::frames::decode(frame, limits).map_err(|_| Error::MalformedFecFrame)?;
         match typed {
             TypedFrame::CodingEpochOpen(open) => {
                 self.fec
@@ -675,12 +687,25 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.hold_record(fec::record_of(id, joined))
     }
 
-    /// Puts what the intake owes the sender on the control stream.
+    /// Puts what the intake owes the sender on the control stream. A refusal
+    /// that is not the peer's fault is backpressure: the frame stays owed
+    /// and goes out on a later poll.
     fn send_owed(&mut self) -> Result<(), Error> {
-        while let Some(owed) = self.fec.take_owed() {
-            self.session
-                .send_control(&fec::frame_of(&owed))
-                .map_err(Error::Session)?;
+        while let Some(owed) = self.fec.owed() {
+            match self.session.send_control(&fec::frame_of(owed)) {
+                Ok(()) => self.fec.settle_owed(),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        vot_session::ErrorKind::Transport(
+                            vot_transport_api::Error::OutboundQueueFull
+                        ) | vot_session::ErrorKind::HandshakeUnsent { .. }
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(Error::Session(error)),
+            }
         }
         Ok(())
     }
@@ -927,10 +952,21 @@ mod tests {
         events: VecDeque<Event>,
         credit: Vec<u64>,
         refuse_credit: bool,
+        /// Control sends the backend refuses as a full queue before taking one.
+        refuse_control: usize,
+        /// A backend failure the next control send reports.
+        fail_control: Option<vot_transport_api::Error>,
     }
 
     impl TransportAdapter for Loopback {
         fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
+            if let Some(error) = self.fail_control.take() {
+                return Err(error);
+            }
+            if self.refuse_control > 0 {
+                self.refuse_control -= 1;
+                return Err(vot_transport_api::Error::OutboundQueueFull);
+            }
             self.sent.push(frame.to_vec());
             Ok(())
         }
@@ -2046,6 +2082,14 @@ mod tests {
     #[test]
     fn a_ready_session_with_fec_extends_credit_once() {
         let mut driver = ready_fec();
+        // A full backend queue holds the credit rather than losing it or
+        // ending the session: it goes out on the next poll.
+        driver.session_mut().driver().refuse_control = 2;
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(
+            sent_types(&mut driver).is_empty(),
+            "held under backpressure"
+        );
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(
             sent_types(&mut driver),
@@ -2057,11 +2101,33 @@ mod tests {
             sent_types(&mut driver).is_empty(),
             "and not again while nothing moved"
         );
-        // Without the extension nothing is offered.
+        // Without the extension nothing is offered and nothing is armed.
         let mut plain = ready();
         plain.session_mut().driver().sent.clear();
         assert_eq!(plain.poll().unwrap(), None);
         assert!(sent_types(&mut plain).is_empty());
+        assert!(!plain.fec_armed());
+        assert!(driver.fec_armed());
+        // A session that offered the extension but is not ready yet arms
+        // nothing either.
+        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let mut early = Session::server(
+            Loopback::default(),
+            vot_codec::Settings::default(),
+            fec,
+            vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
+        );
+        early.begin().unwrap();
+        let mut early = SessionReceiver::new(
+            early,
+            ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
+        );
+        assert_eq!(early.poll().unwrap(), None);
+        assert!(!early.fec_armed());
+        // A backend failure that is not backpressure ends the session.
+        let mut broken = ready_fec();
+        broken.session_mut().driver().fail_control = Some(vot_transport_api::Error::Backend);
+        assert!(matches!(broken.poll(), Err(Error::Session(_))));
     }
 
     #[test]
@@ -2340,5 +2406,41 @@ mod tests {
                 wire(&TypedFrame::CodingEpochOpen(conflicting)).as_slice(),
             )));
         assert_eq!(driver.poll().unwrap_err(), Error::CodingEpochConflict);
+        // A payload outside its constraints is malformed, not a bad proof:
+        // an open past the object's length, encoded by hand.
+        let mut driver = ready_fec();
+        let mut payload = Vec::new();
+        vot_cbor::map(&mut payload, 7);
+        vot_cbor::uint(&mut payload, 0);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::array(&mut payload, 4);
+        vot_cbor::uint(&mut payload, 1);
+        vot_cbor::uint(&mut payload, u64::from(bundle.object.suite));
+        vot_cbor::bytes(&mut payload, &bundle.object.root);
+        vot_cbor::uint(&mut payload, bundle.object.length);
+        for (key, value) in [
+            (2, bundle.object.length),
+            (3, 1),
+            (4, 64),
+            (5, 4),
+            (6, 1024),
+        ] {
+            vot_cbor::uint(&mut payload, key);
+            vot_cbor::uint(&mut payload, value);
+        }
+        let mut framed = Vec::new();
+        vot_codec::encode_frame(
+            vot_codec::frame_type::CODING_EPOCH_OPEN,
+            &payload,
+            &mut framed,
+        )
+        .unwrap();
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(framed.as_slice())));
+        assert_eq!(driver.poll().unwrap_err(), Error::MalformedFecFrame);
     }
 }

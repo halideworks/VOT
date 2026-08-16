@@ -19,9 +19,12 @@ use vot_codec::frames::{
 use vot_fec::{Credit, Decoded, EpochPlan, Open, Receiver, Symbol};
 
 /// Decoded generations held for a bundle that has not arrived yet, at most
-/// this many across every epoch. Datagrams overtake the control stream, so a
-/// few are normal; more than this and the reliable path repairs the rest.
+/// this many and this many bytes across every epoch. Datagrams overtake the
+/// control stream, so a few are normal; past either bound the oldest goes
+/// and the reliable path repairs it. Their FEC credit was released when they
+/// decoded, so this is the whole bound on them.
 pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 16;
+pub(crate) const MAX_ORPHAN_BYTES: usize = 16 * 65_536;
 
 /// The bundle a decoded generation belongs to: the object root and the exact
 /// covered range the epoch was opened over.
@@ -73,6 +76,7 @@ pub(crate) struct Intake {
     receiver: Receiver,
     epochs: BTreeMap<u32, Cover>,
     orphans: VecDeque<Orphan>,
+    orphan_bytes: usize,
     owed: VecDeque<Owed>,
     credit_epoch: u64,
 }
@@ -133,10 +137,13 @@ impl Intake {
         }
     }
 
-    /// `CODING_EPOCH_CLOSE`.
+    /// `CODING_EPOCH_CLOSE`. Orphans of the closed epoch go with it: their
+    /// bundle, if it ever comes, is answered by the reliable path.
     pub(crate) fn close(&mut self, close: CodingEpochClose) {
         self.receiver.close(close.epoch);
-        self.epochs.remove(&close.epoch);
+        if let Some(cover) = self.epochs.remove(&close.epoch) {
+            let _ = self.take_orphans(cover);
+        }
     }
 
     /// One symbol datagram. Returns the generation it completed, if any, for
@@ -180,12 +187,21 @@ impl Intake {
         }
     }
 
-    /// Holds a decoded generation until its bundle arrives. Past the bound
-    /// the oldest is dropped; the reliable path repairs it.
+    /// Holds a decoded generation until its bundle arrives. Past either
+    /// bound the oldest is dropped; the reliable path repairs it.
     pub(crate) fn hold_orphan(&mut self, joined: Joined) {
-        if self.orphans.len() >= MAX_ORPHAN_GENERATIONS {
-            self.orphans.pop_front();
+        if joined.bytes.len() > MAX_ORPHAN_BYTES {
+            return;
         }
+        while self.orphans.len() >= MAX_ORPHAN_GENERATIONS
+            || self.orphan_bytes + joined.bytes.len() > MAX_ORPHAN_BYTES
+        {
+            let Some(oldest) = self.orphans.pop_front() else {
+                break;
+            };
+            self.orphan_bytes -= oldest.bytes.len();
+        }
+        self.orphan_bytes += joined.bytes.len();
         self.orphans.push_back(Orphan {
             cover: joined.cover,
             generation: joined.generation,
@@ -210,10 +226,22 @@ impl Intake {
                 true
             }
         });
+        self.orphan_bytes -= taken.iter().map(|joined| joined.bytes.len()).sum::<usize>();
         taken
     }
 
-    /// The next frame this end owes the sender.
+    /// The next frame this end owes the sender, left in place: the caller
+    /// settles it once the carrier took it, so backpressure retries it.
+    pub(crate) fn owed(&self) -> Option<&Owed> {
+        self.owed.front()
+    }
+
+    /// The front owed frame reached the carrier.
+    pub(crate) fn settle_owed(&mut self) {
+        self.owed.pop_front();
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_owed(&mut self) -> Option<Owed> {
         self.owed.pop_front()
     }
@@ -433,6 +461,13 @@ mod tests {
             None,
             "unknown epoch"
         );
+    }
+
+    #[test]
+    fn orphans_are_bounded_by_count_and_bytes_and_leave_with_their_epoch() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20);
+        let _ = intake.take_owed();
         // Orphans are bounded: the oldest goes first.
         for i in 0..=u32::try_from(MAX_ORPHAN_GENERATIONS).unwrap() {
             intake.hold_orphan(Joined {
@@ -453,5 +488,76 @@ mod tests {
         });
         assert_eq!(kept.len(), MAX_ORPHAN_GENERATIONS);
         assert_eq!(kept[0].generation, 1, "generation 0 was dropped");
+        assert_eq!(intake.orphan_bytes, 0);
+        // Bytes bound too: two of half the cap, then one more evicts the first.
+        let big = |generation: u32| Joined {
+            cover: Cover {
+                root: [2; 32],
+                offset: 0,
+                length: 1,
+            },
+            generation,
+            plaintext_offset: 0,
+            bytes: vec![0; MAX_ORPHAN_BYTES / 2],
+        };
+        intake.hold_orphan(big(0));
+        intake.hold_orphan(big(1));
+        assert_eq!(intake.orphan_bytes, MAX_ORPHAN_BYTES);
+        intake.hold_orphan(big(2));
+        assert_eq!(intake.orphan_bytes, MAX_ORPHAN_BYTES);
+        let kept = intake.take_orphans(Cover {
+            root: [2; 32],
+            offset: 0,
+            length: 1,
+        });
+        assert_eq!(
+            kept.iter().map(|j| j.generation).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(intake.orphan_bytes, 0);
+        // Exactly the cap is held; larger than the whole cap never is.
+        intake.hold_orphan(Joined {
+            cover: Cover {
+                root: [2; 32],
+                offset: 0,
+                length: 1,
+            },
+            generation: 5,
+            plaintext_offset: 0,
+            bytes: vec![0; MAX_ORPHAN_BYTES],
+        });
+        assert_eq!(intake.orphan_bytes, MAX_ORPHAN_BYTES);
+        let _ = intake.take_orphans(Cover {
+            root: [2; 32],
+            offset: 0,
+            length: 1,
+        });
+        intake.hold_orphan(Joined {
+            cover: Cover {
+                root: [2; 32],
+                offset: 0,
+                length: 1,
+            },
+            generation: 0,
+            plaintext_offset: 0,
+            bytes: vec![0; MAX_ORPHAN_BYTES + 1],
+        });
+        assert_eq!(intake.orphan_bytes, 0);
+        // A closed epoch takes its orphans with it.
+        intake.open(&open_of(3, 0, 4, 1, 1, 4)).unwrap();
+        intake.hold_orphan(Joined {
+            cover: Cover::of(&open_of(3, 0, 4, 1, 1, 4)),
+            generation: 0,
+            plaintext_offset: 0,
+            bytes: vec![0; 4],
+        });
+        assert_eq!(intake.orphan_bytes, 4);
+        intake.close(CodingEpochClose { epoch: 3 });
+        assert_eq!(intake.orphan_bytes, 0);
+        assert!(
+            intake
+                .take_orphans(Cover::of(&open_of(3, 0, 4, 1, 1, 4)))
+                .is_empty()
+        );
     }
 }

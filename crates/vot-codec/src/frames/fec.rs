@@ -34,6 +34,8 @@ pub struct GenState {
 pub enum GenOutcome {
     Decoded,
     Abandoned,
+    /// The whole epoch: its open was ignored, every generation is abandoned.
+    Refused,
 }
 
 /// Receiver to sender, terminal for the generation.
@@ -214,6 +216,7 @@ pub(super) fn encode_gen_done(value: &GenDone, output: &mut Vec<u8>) {
         match value.outcome {
             GenOutcome::Decoded => 0,
             GenOutcome::Abandoned => 1,
+            GenOutcome::Refused => 2,
         },
     );
 }
@@ -229,6 +232,7 @@ pub(super) fn decode_gen_done(input: &[u8]) -> Result<GenDone, Error> {
     let outcome = match reader.uint()? {
         0 => GenOutcome::Decoded,
         1 => GenOutcome::Abandoned,
+        2 => GenOutcome::Refused,
         _ => return Err(Error::InvalidValue),
     };
     reader.finish()?;
@@ -678,10 +682,21 @@ mod tests {
                 outcome: GenOutcome::Abandoned,
             })
         );
-        // Outcome 1 is the last byte; 2 is not an outcome.
+        // Outcome 1 is the last byte; 2 is refused and 3 is not an outcome.
         let last = out.len() - 1;
         assert_eq!(out[last], 1);
         out[last] = 2;
+        assert!(matches!(
+            decode(&out, limits()),
+            Ok((
+                TypedFrame::GenDone(GenDone {
+                    outcome: GenOutcome::Refused,
+                    ..
+                }),
+                _
+            ))
+        ));
+        out[last] = 3;
         assert_eq!(decode(&out, limits()), Err(Error::InvalidValue));
         // An epoch of 2^32 does not fit the datagram header.
         let mut wide = Vec::new();

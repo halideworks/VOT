@@ -56,12 +56,23 @@ pub struct Decoded {
 /// What one symbol did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Symbol {
-    Stored,
+    /// Held for a generation that is not complete yet. `first` marks the
+    /// symbol that opened the generation, which is the one occasion a
+    /// caller reports its state unprompted: a generation nothing has
+    /// arrived for is one the sender has no reason to hear about.
+    Stored {
+        first: bool,
+    },
     Decoded(Decoded),
     /// The generation needed elimination and the decode budget is spent; it
-    /// is retired and the caller answers `GEN_DONE` outcome abandoned.
+    /// is retired and the caller answers `GEN_DONE` outcome abandoned. The
+    /// state travels with it because the generation is gone from `live` by
+    /// the time the caller sees this, so [`Receiver::report`] can no longer
+    /// answer for it, and what a generation was missing when it was given up
+    /// on is the loss sample worth keeping.
     Abandoned {
         generation: u32,
+        state: Report,
     },
     Dropped(Drop),
 }
@@ -72,6 +83,24 @@ pub struct Report {
     pub sequence: u64,
     pub received: u8,
     pub missing_sources: Vec<u8>,
+}
+
+/// The `GEN_STATE` for a live generation, and the sequence bump that makes
+/// it newer than any this end sent before.
+///
+/// One function for both the caller's own request and the state carried out
+/// of an abandonment, so the sequence advances in exactly one place.
+fn report_of(plan: &EpochPlan, generation: u32, slot: &mut Generation) -> Report {
+    slot.sequence += 1;
+    let sent = plan.sent_source_count(generation);
+    Report {
+        sequence: slot.sequence,
+        received: u8::try_from(slot.received).expect("at most k + r"),
+        missing_sources: (0..sent)
+            .map(|j| u8::try_from(j).expect("a source ESI"))
+            .filter(|j| !slot.has(*j))
+            .collect(),
+    }
 }
 
 /// The most generations one epoch may have for this receiver to track it:
@@ -298,6 +327,7 @@ impl Receiver {
         if state.is_done(generation) {
             return Symbol::Dropped(Drop::GenerationDone);
         }
+        let mut first = false;
         if let Some(existing) = state.live.get(&generation) {
             if existing.has(esi) {
                 return Symbol::Dropped(Drop::Duplicate);
@@ -316,13 +346,14 @@ impl Receiver {
                     sequence: 0,
                 },
             );
+            first = true;
         }
         let slot = state.live.get_mut(&generation).expect("inserted above");
         slot.symbols.push((esi, bytes.to_vec()));
         slot.seen |= 1_u128 << esi;
         slot.received += 1;
         if slot.received < geometry.source_count() {
-            return Symbol::Stored;
+            return Symbol::Stored { first };
         }
         let sources = if let Some(sources) = take_sources(slot, sent_sources) {
             sources
@@ -333,10 +364,18 @@ impl Receiver {
                 .checked_add(work)
                 .is_none_or(|spent| spent > credit.max_decode_work)
             {
+                let state_report = report_of(
+                    &plan,
+                    generation,
+                    state.live.get_mut(&generation).expect("live above"),
+                );
                 state.live.remove(&generation);
                 state.mark_done(generation);
                 self.counters.retire(plan.generation_bytes());
-                return Symbol::Abandoned { generation };
+                return Symbol::Abandoned {
+                    generation,
+                    state: state_report,
+                };
             }
             self.decode_work_spent += work;
             eliminate(&plan, slot, sent_sources)
@@ -356,17 +395,11 @@ impl Receiver {
     pub fn report(&mut self, epoch: u32, generation: u32) -> Option<Report> {
         let state = self.epochs.get_mut(&epoch)?;
         let plan = state.plan;
-        let slot = state.live.get_mut(&generation)?;
-        slot.sequence += 1;
-        let sent = plan.sent_source_count(generation);
-        Some(Report {
-            sequence: slot.sequence,
-            received: u8::try_from(slot.received).expect("at most k + r"),
-            missing_sources: (0..sent)
-                .map(|j| u8::try_from(j).expect("a source ESI"))
-                .filter(|j| !slot.has(*j))
-                .collect(),
-        })
+        Some(report_of(
+            &plan,
+            generation,
+            state.live.get_mut(&generation)?,
+        ))
     }
 
     /// Gives up on a generation this end holds; it retires as abandoned and

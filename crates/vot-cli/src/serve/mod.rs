@@ -694,6 +694,51 @@ mod tests {
     }
 
     #[test]
+    fn a_reporting_receiver_keeps_its_epochs() {
+        // What the receiver now sends while it works. A serve that took
+        // silence for a receiver that had gone would retire these epochs
+        // under it; the report is the proof it is still there, and it is the
+        // frame a working receiver actually produces rather than a stand-in.
+        let (bundle, _) = built_bundle("reporting", &[("big.bin", patterned(1_500_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [33; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.fec.epochs.len(), 2);
+
+        for sequence in 1..=u64::from(server::QUIET_PASSES_BEFORE_CLOSE * 2) {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                    epoch: 0,
+                    generation: 0,
+                    sequence,
+                    received: 1,
+                    missing_sources: vec![1, 2, 3],
+                })));
+            server.service(&mut session, &mut connection).unwrap();
+            assert_eq!(
+                connection.fec.epochs.len(),
+                2,
+                "a receiver reporting on one epoch is still there for both"
+            );
+        }
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     pub(crate) fn a_long_range_is_coded_in_pieces_of_at_most_seventeen_generations() {
         // 1500000 bytes is 23 generations: a piece of 17 and a piece of 6,
         // each its own bundle, proof, and epoch, the request partitioned

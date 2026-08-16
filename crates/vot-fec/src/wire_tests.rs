@@ -207,7 +207,10 @@ fn every_header_drop_row_is_a_drop() {
         Symbol::Dropped(Drop::ZeroSource),
         "source 1 of the short generation is never sent"
     );
-    assert_eq!(receiver.symbol(1, 0, 4, &[0; 3]), Symbol::Stored);
+    assert_eq!(
+        receiver.symbol(1, 0, 4, &[0; 3]),
+        Symbol::Stored { first: true }
+    );
     assert_eq!(
         receiver.symbol(1, 0, 4, &[0; 3]),
         Symbol::Dropped(Drop::Duplicate)
@@ -232,8 +235,11 @@ fn a_generation_with_every_source_assembles_without_elimination() {
     let plan = plan(1, 100, 27, 4, 2, 3);
     receiver.open(plan).unwrap();
     let symbols = symbols_of(&plan, 1);
-    for (esi, bytes) in &symbols[..3] {
-        assert_eq!(receiver.symbol(1, 1, *esi, bytes), Symbol::Stored);
+    for (index, (esi, bytes)) in symbols[..3].iter().enumerate() {
+        assert_eq!(
+            receiver.symbol(1, 1, *esi, bytes),
+            Symbol::Stored { first: index == 0 }
+        );
     }
     assert_eq!(
         receiver.report(1, 1),
@@ -277,7 +283,7 @@ fn a_generation_missing_sources_is_eliminated_and_charged() {
     for esi in [0_u8, 2, 4] {
         assert_eq!(
             receiver.symbol(1, 0, esi, &symbols[usize::from(esi)].1),
-            Symbol::Stored
+            Symbol::Stored { first: esi == 0 }
         );
     }
     assert_eq!(
@@ -308,12 +314,21 @@ fn a_generation_missing_sources_is_eliminated_and_charged() {
     for esi in [0_u8, 1, 2] {
         assert_eq!(
             receiver.symbol(1, 1, esi, &g1[usize::from(esi)].1),
-            Symbol::Stored
+            Symbol::Stored { first: esi == 0 }
         );
     }
     assert_eq!(
         receiver.symbol(1, 1, 4, &g1[4].1),
-        Symbol::Abandoned { generation: 1 }
+        Symbol::Abandoned {
+            generation: 1,
+            // Four symbols in hand and source 3 never arrived, which is the
+            // loss sample the sender gets for a generation given up on.
+            state: Report {
+                sequence: 1,
+                received: 4,
+                missing_sources: vec![3],
+            },
+        }
     );
     assert_eq!(receiver.active_generations(), 0);
     assert_eq!(
@@ -359,7 +374,10 @@ fn a_short_generation_decodes_from_one_repair_symbol() {
     assert_eq!(receiver.decode_work_spent(), 12, "elimination was needed");
     // A full generation with one repair in hand reports the three sources
     // it still lacks and the zero sources it never will.
-    assert_eq!(receiver.symbol(1, 0, 4, &[7; 3]), Symbol::Stored);
+    assert_eq!(
+        receiver.symbol(1, 0, 4, &[7; 3]),
+        Symbol::Stored { first: true }
+    );
     assert_eq!(
         receiver.report(1, 0),
         Some(Report {
@@ -376,7 +394,10 @@ fn credit_caps_active_generations_and_unretired_bytes() {
     receiver.credit(credit(1, 1, 24, 0));
     let plan = plan(1, 0, 36, 4, 2, 3);
     receiver.open(plan).unwrap();
-    assert_eq!(receiver.symbol(1, 0, 0, &[1; 3]), Symbol::Stored);
+    assert_eq!(
+        receiver.symbol(1, 0, 0, &[1; 3]),
+        Symbol::Stored { first: true }
+    );
     assert_eq!(
         receiver.symbol(1, 1, 0, &[1; 3]),
         Symbol::Dropped(Drop::PastCredit),
@@ -387,20 +408,32 @@ fn credit_caps_active_generations_and_unretired_bytes() {
     assert!(!receiver.abandon(1, 5), "never opened");
     assert!(!receiver.abandon(9, 0), "unknown epoch");
     assert_eq!(receiver.active_generations(), 0);
-    assert_eq!(receiver.symbol(1, 1, 0, &[1; 3]), Symbol::Stored);
+    assert_eq!(
+        receiver.symbol(1, 1, 0, &[1; 3]),
+        Symbol::Stored { first: true }
+    );
     // Bytes: 24 allows two generations of 12, gens allows one; raise gens.
     receiver.credit(Credit {
         credit_epoch: 2,
         ..credit(1, 4, 24, 0)
     });
-    assert_eq!(receiver.symbol(1, 2, 0, &[1; 3]), Symbol::Stored);
+    assert_eq!(
+        receiver.symbol(1, 2, 0, &[1; 3]),
+        Symbol::Stored { first: true }
+    );
     assert_eq!(receiver.unretired_bytes(), 24);
     // Generation 0 is done, so a fourth would be the third active one.
     let mut wide = Receiver::new();
     wide.credit(credit(1, 4, 24, 0));
     wide.open(plan).unwrap();
-    assert_eq!(wide.symbol(1, 0, 0, &[1; 3]), Symbol::Stored);
-    assert_eq!(wide.symbol(1, 1, 0, &[1; 3]), Symbol::Stored);
+    assert_eq!(
+        wide.symbol(1, 0, 0, &[1; 3]),
+        Symbol::Stored { first: true }
+    );
+    assert_eq!(
+        wide.symbol(1, 1, 0, &[1; 3]),
+        Symbol::Stored { first: true }
+    );
     assert_eq!(
         wide.symbol(1, 2, 0, &[1; 3]),
         Symbol::Dropped(Drop::PastCredit)
@@ -606,7 +639,7 @@ fn a_sender_and_receiver_agree_on_a_lossy_epoch() {
                 continue;
             }
             match receiver.symbol(9, generation, *esi, bytes) {
-                Symbol::Stored => {}
+                Symbol::Stored { .. } => {}
                 Symbol::Decoded(decoded) => {
                     assert_eq!(decoded.generation, generation);
                     recovered.push((decoded.offset, decoded.bytes));

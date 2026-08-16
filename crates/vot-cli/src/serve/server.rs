@@ -258,12 +258,14 @@ impl BundleServer {
                     frames::GenOutcome::Decoded => vot_fec::Done::Decoded,
                     _ => vot_fec::Done::Abandoned,
                 };
-                connection
+                let first = connection
                     .fec
                     .sender
                     .done(done.epoch, done.generation, verdict)
                     .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
-                if verdict == vot_fec::Done::Abandoned {
+                // A repeat is idempotent (spec/fec.md section 11): the record
+                // went out on the first.
+                if first && verdict == vot_fec::Done::Abandoned {
                     self.resend_generation(&opened, done.generation, connection)?;
                 }
                 let epoch = connection
@@ -371,36 +373,90 @@ impl BundleServer {
         if served.object != request.object {
             return Err(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH));
         }
-        // The codec bounded the request; the cover expands it to group boundaries.
-        let (covered_offset, covered_length, proof) = served
-            .layer
-            .prove(request.offset, request.length)
-            .map_err(Error::from)?
-            .into_parts();
-        let plaintext = served.read_covered(covered_offset, covered_length)?;
         // Bundle identity derives from the request bytes, for replay detection.
         let mut bundle_id = [0u8; 16];
         bundle_id.copy_from_slice(&blake3::hash(request_bytes).as_bytes()[..16]);
-        if let Some(plan) = Self::fec_plan(connection, covered_offset, covered_length) {
-            return Self::answer_range_coded(
-                request,
-                served.object,
+        if !connection.fec_negotiated || !connection.fec.sender.may_open() {
+            return Self::answer_reliably(
+                served,
+                request.request_id,
                 bundle_id,
-                covered_offset,
-                covered_length,
-                proof,
-                &plaintext,
-                plan,
+                request.offset,
+                request.length,
                 connection,
             );
         }
+        // Coded, in pieces of at most `MAX_DATA_RECORDS_PER_BUNDLE`
+        // generations, each its own bundle and epoch: a bundle carries one
+        // record per generation and the wire bounds records per bundle. The
+        // request's sub-ranges partition it, and the receiver deduplicates
+        // on request and range identity, so several bundles may answer one
+        // request. A piece the peer's credit no longer admits an epoch for
+        // rides reliably.
+        // Pieces are the object's fixed FEC_PIECE_BYTES windows cut to the
+        // request, so a piece's group cover never exceeds the record bound.
+        let request_end = request.offset.saturating_add(request.length);
+        let mut sub_offset = request.offset;
+        let mut index: u16 = 0;
+        while sub_offset < request_end {
+            let piece_end = (sub_offset / FEC_PIECE_BYTES)
+                .saturating_add(1)
+                .saturating_mul(FEC_PIECE_BYTES)
+                .min(request_end);
+            if piece_end <= sub_offset {
+                return Err(Error::InvalidBundle.into());
+            }
+            let sub_length = piece_end - sub_offset;
+            let mut piece_id = bundle_id;
+            piece_id[14..].copy_from_slice(&index.to_be_bytes());
+            if connection.fec.sender.may_open() {
+                Self::answer_coded(
+                    served,
+                    request.request_id,
+                    piece_id,
+                    sub_offset,
+                    sub_length,
+                    connection,
+                )?;
+            } else {
+                Self::answer_reliably(
+                    served,
+                    request.request_id,
+                    piece_id,
+                    sub_offset,
+                    sub_length,
+                    connection,
+                )?;
+            }
+            sub_offset = piece_end;
+            index = index.checked_add(1).ok_or(Error::InvalidBundle)?;
+        }
+        Ok(())
+    }
+
+    /// The reliable answer: the cover's proof and its bytes as records.
+    fn answer_reliably(
+        served: &ServedObject,
+        request_id: [u8; 16],
+        bundle_id: [u8; 16],
+        offset: u64,
+        length: u64,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        // The codec bounded the request; the cover expands it to group boundaries.
+        let (covered_offset, covered_length, proof) = served
+            .layer
+            .prove(offset, length)
+            .map_err(Error::from)?
+            .into_parts();
+        let plaintext = served.read_covered(covered_offset, covered_length)?;
         let chunks = plaintext.chunks(RECORD_PLAINTEXT_BYTES);
         let bundle = TypedFrame::ProofBundle(ProofBundle {
-            request_id: request.request_id,
+            request_id,
             bundle_id,
             object: served.object,
-            requested_offset: request.offset,
-            requested_length: request.length,
+            requested_offset: offset,
+            requested_length: length,
             covered_offset,
             covered_length,
             data_record_count: chunks.len() as u64,
@@ -408,63 +464,55 @@ impl BundleServer {
             proof,
         });
         connection.queue_control(encoded(&bundle)?);
-        let mut offset = covered_offset;
+        let mut record_offset = covered_offset;
         for (index, chunk) in plaintext.chunks(RECORD_PLAINTEXT_BYTES).enumerate() {
             let record = TypedFrame::DataRecord(DataRecord {
                 bundle_id,
                 record_index: index as u64,
-                plaintext_offset: offset,
+                plaintext_offset: record_offset,
                 plaintext_length: chunk.len() as u64,
                 compression: 0,
                 encoded: chunk.to_vec(),
             });
             connection.queue_record(encoded(&record)?);
-            offset = offset.saturating_add(chunk.len() as u64);
+            record_offset = record_offset.saturating_add(chunk.len() as u64);
         }
         Ok(())
     }
 
-    /// The epoch this answer would travel under, when the session negotiated
-    /// `DATAGRAM_FEC`, the peer's credit admits one more epoch, and the range
-    /// starts on a generation boundary so each generation is one integrity
-    /// group. `None` sends the answer reliably as ever.
-    fn fec_plan(
-        connection: &mut ServeConnection,
-        covered_offset: u64,
-        covered_length: u64,
-    ) -> Option<vot_fec::EpochPlan> {
-        if !connection.fec_negotiated
-            || !connection.fec.sender.may_open()
-            || covered_offset % FEC_GENERATION_BYTES != 0
-        {
-            return None;
-        }
-        let epoch = connection.fec.sender.next_epoch()?;
-        vot_fec::EpochPlan::new(epoch, covered_offset, covered_length, fec_geometry()).ok()
-    }
-
-    /// The coded answer: the same bundle with one record per generation,
-    /// then the epoch open, then each generation's symbols, or its record
-    /// when the peer's generation credit is spent.
-    #[allow(clippy::too_many_arguments)]
-    fn answer_range_coded(
-        request: &RangeRequest,
-        object: frames::ObjectId,
+    /// The coded answer for one piece: the same bundle with one record per
+    /// generation, then the epoch open, then each generation's symbols, or
+    /// its record when the peer's generation credit is spent.
+    fn answer_coded(
+        served: &ServedObject,
+        request_id: [u8; 16],
         bundle_id: [u8; 16],
-        covered_offset: u64,
-        covered_length: u64,
-        proof: Vec<u8>,
-        plaintext: &[u8],
-        plan: vot_fec::EpochPlan,
+        offset: u64,
+        length: u64,
         connection: &mut ServeConnection,
     ) -> Result<(), Fault> {
+        let (covered_offset, covered_length, proof) = served
+            .layer
+            .prove(offset, length)
+            .map_err(Error::from)?
+            .into_parts();
+        let epoch = connection
+            .fec
+            .sender
+            .next_epoch()
+            .ok_or(Error::InvalidBundle)?;
+        let plan = vot_fec::EpochPlan::new(epoch, covered_offset, covered_length, fec_geometry())
+            .map_err(|_| Error::InvalidBundle)?;
         let generations = plan.generation_count();
+        debug_assert!(generations <= vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64);
+        let plaintext = served.read_covered(covered_offset, covered_length)?;
+        let object = served.object;
         connection.queue_control(encoded(&TypedFrame::ProofBundle(ProofBundle {
-            request_id: request.request_id,
+            request_id,
             bundle_id,
             object,
-            requested_offset: request.offset,
-            requested_length: request.length,
+            requested_offset: offset,
+            requested_length: length,
             covered_offset,
             covered_length,
             data_record_count: generations,
@@ -487,10 +535,10 @@ impl BundleServer {
         ))?);
         let mut live = std::collections::BTreeSet::new();
         for generation in 0..u32::try_from(generations).map_err(|_| Error::InvalidBundle)? {
-            let (offset, length) = plan.generation_span(generation);
+            let (gen_offset, gen_length) = plan.generation_span(generation);
             let start =
-                usize::try_from(offset - covered_offset).map_err(|_| Error::InvalidBundle)?;
-            let end = start + usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
+                usize::try_from(gen_offset - covered_offset).map_err(|_| Error::InvalidBundle)?;
+            let end = start + usize::try_from(gen_length).map_err(|_| Error::InvalidBundle)?;
             let bytes = &plaintext[start..end];
             if connection
                 .fec
@@ -522,8 +570,8 @@ impl BundleServer {
                 connection.queue_record(encoded(&TypedFrame::DataRecord(DataRecord {
                     bundle_id,
                     record_index: u64::from(generation),
-                    plaintext_offset: offset,
-                    plaintext_length: length,
+                    plaintext_offset: gen_offset,
+                    plaintext_length: gen_length,
                     compression: 0,
                     encoded: bytes.to_vec(),
                 }))?);
@@ -556,6 +604,10 @@ impl BundleServer {
 /// this serve adds.
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
 pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
+/// The most a coded piece covers: one generation per record, and a bundle
+/// declares at most `MAX_DATA_RECORDS_PER_BUNDLE` of them.
+pub(crate) const FEC_PIECE_BYTES: u64 =
+    FEC_GENERATION_BYTES * vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64;
 
 fn fec_geometry() -> vot_fec::Geometry {
     vot_fec::Geometry::new(64, FEC_REPAIR_SYMBOLS, 1024).expect("the shipped profile")

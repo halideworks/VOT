@@ -23,8 +23,9 @@ pub enum Open {
     Opened,
     /// An exact repeat; nothing changed.
     Repeated,
-    /// Past `max_open_epochs` or before any credit: the epoch stays unknown
-    /// and the caller answers `GEN_DONE` outcome refused.
+    /// Past `max_open_epochs`, past `MAX_TRACKED_GENERATIONS`, or before
+    /// any credit: the epoch stays unknown and the caller answers `GEN_DONE`
+    /// outcome refused.
     Refused,
 }
 

@@ -1942,7 +1942,12 @@ mod tests {
             ),
             "a client-role HELLO at a client is the wrong role"
         );
-        // And the server's SETTINGS before its HELLO is out of order.
+        the_client_needs_the_answer_first();
+    }
+
+    /// The server's SETTINGS before its HELLO is out of order, and a second
+    /// answer is too.
+    fn the_client_needs_the_answer_first() {
         let mut unanswered = Session::client(
             Loopback::default(),
             Settings::default(),
@@ -1985,7 +1990,10 @@ mod tests {
                 ..
             }
         ));
+    }
 
+    #[test]
+    fn a_settings_before_hello_at_a_server_is_refused() {
         let mut early = Session::server(
             Loopback::default(),
             Settings::default(),

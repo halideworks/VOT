@@ -113,6 +113,16 @@ mod tests {
     use vot_scheduler::ReliableReceiver;
     use vot_transport_api::SubjectId;
 
+    #[test]
+    fn only_an_idle_pass_with_an_epoch_open_counts_as_quiet() {
+        // Both halves, all four ways round: an epoch still owed an outcome,
+        // and nothing of this end's own left to hand the carrier.
+        assert!(server::pass_is_quiet(true, true));
+        assert!(!server::pass_is_quiet(true, false), "symbols still queued");
+        assert!(!server::pass_is_quiet(false, true), "no epoch to close");
+        assert!(!server::pass_is_quiet(false, false));
+    }
+
     /// A ready server session with handshake replies cleared.
     pub(crate) fn ready_session() -> Session<Loopback> {
         ready_session_with(Settings::default())

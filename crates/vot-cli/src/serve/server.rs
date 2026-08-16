@@ -145,8 +145,62 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
+        if let Err(fault) = self.retire_quiet_epochs(connection) {
+            return fail(fault, session, connection);
+        }
+        connection.drain(session)?;
+        if let Some(code) = connection.closed {
+            return Ok(ServeStatus::Closed(code));
+        }
         session.flush()?;
         Ok(ServeStatus::Active)
+    }
+
+    /// Ends an epoch the receiver has stopped answering for.
+    ///
+    /// A symbol is a datagram, so one can be dropped anywhere between the two
+    /// ends, and a generation short of its source count decodes never and
+    /// reports nothing: the receiver owes a `GEN_DONE` only for a generation
+    /// it decoded or gave up on. Waiting for that outcome forever is what
+    /// leaves the fetch with a record that never comes, so an epoch whose
+    /// symbols are all on the carrier and which has drawn no outcome for
+    /// `QUIET_PASSES_BEFORE_CLOSE` idle passes is repaired reliably and
+    /// closed, which is what `spec/fec.md` section 11 already says a close
+    /// means: every generation under it with no `GEN_DONE` retires as
+    /// abandoned.
+    ///
+    /// Counted in passes rather than timed, so the bound is the loop's own
+    /// and a test can spend it. Only idle passes count: one that read an
+    /// event or left bytes queued has not given the receiver its chance.
+    fn retire_quiet_epochs(&self, connection: &mut ServeConnection) -> Result<(), Fault> {
+        if !pass_is_quiet(
+            !connection.fec.epochs.is_empty(),
+            connection.outbound.is_empty(),
+        ) {
+            return Ok(());
+        }
+        let mut spent = Vec::new();
+        for (epoch, opened) in &mut connection.fec.epochs {
+            opened.quiet_passes += 1;
+            if opened.quiet_passes >= QUIET_PASSES_BEFORE_CLOSE {
+                spent.push(*epoch);
+            }
+        }
+        for epoch in spent {
+            let opened = connection
+                .fec
+                .epochs
+                .remove(&epoch)
+                .expect("named by the pass above");
+            for generation in &opened.live {
+                self.resend_generation(&opened, *generation, connection)?;
+            }
+            connection.fec.sender.close(epoch);
+            connection.queue_control(encoded(&TypedFrame::CodingEpochClose(
+                frames::CodingEpochClose { epoch },
+            ))?);
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_announced(&self, connection: &mut ServeConnection, ready: bool) {
@@ -273,6 +327,9 @@ impl BundleServer {
                     .epochs
                     .get_mut(&done.epoch)
                     .expect("cloned above");
+                // The receiver is answering, so the quiet the close counts
+                // has not happened.
+                epoch.quiet_passes = 0;
                 epoch.live.remove(&done.generation);
                 if epoch.live.is_empty() {
                     connection.fec.sender.close(done.epoch);
@@ -592,6 +649,7 @@ impl BundleServer {
                     bundle_id,
                     plan,
                     live,
+                    quiet_passes: 0,
                 },
             );
         }
@@ -604,6 +662,28 @@ impl BundleServer {
 /// this serve adds.
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
 pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
+
+/// Whether a pass counts against an epoch's quiet budget: there is an epoch
+/// owed an outcome, and every symbol of it is already on the carrier rather
+/// than waiting in this end's own queue.
+///
+/// Pure, because both halves have to hold and neither is reachable from a
+/// test that drives a whole transfer: a queue that is never empty at the
+/// wrong moment is not something a caller can arrange.
+pub(crate) const fn pass_is_quiet(epochs_open: bool, outbound_empty: bool) -> bool {
+    epochs_open && outbound_empty
+}
+
+/// Idle passes an epoch may draw no outcome for before this end repairs it
+/// reliably and closes it.
+///
+/// An idle pass costs the driving loop's idle wait, so this is a few hundred
+/// milliseconds of a connection with nothing to read and nothing queued:
+/// long enough that a receiver's outcomes cross any path this serves before
+/// it expires, short enough that a wedged generation costs a pause rather
+/// than the fetch's whole stall budget. Every outcome the receiver reports
+/// resets it, so an epoch being answered never reaches it.
+pub(crate) const QUIET_PASSES_BEFORE_CLOSE: u32 = 8;
 /// The most a coded piece covers: one generation per record, and a bundle
 /// declares at most `MAX_DATA_RECORDS_PER_BUNDLE` of them.
 pub(crate) const FEC_PIECE_BYTES: u64 =

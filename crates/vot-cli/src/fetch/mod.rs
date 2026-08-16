@@ -617,6 +617,59 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_that_loses_more_than_its_repair_count_arrives_reliably() {
+        // Every eighth datagram goes: nine of a generation's 72 symbols, one
+        // past the repair count, so no generation ever reaches its source
+        // count. Such a generation decodes never and reports nothing, because
+        // the receiver owes a GEN_DONE only for one it decoded or gave up on.
+        // Before the serve closed a quiet epoch this hung until the fetch
+        // spent its whole stall budget; the object now arrives over the
+        // reliable path instead.
+        let (bundle, built) = built_bundle("fec-past-repair", &[("big.bin", patterned(300_000))]);
+        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let (client, mut serving) = crate::harness::duplex_pair();
+        serving.drop_datagram_every = 8;
+        let serving_bundle = bundle.to_path_buf();
+        let serving_offer = fec.clone();
+        let serving_thread = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]).offering(serving_offer.clone()),
+                )
+            })
+        });
+        let output = temporary("fec-past-repair-fetched");
+        let mut fetcher =
+            BundleFetcher::begin_with(client, &output, Some(built.root), None, fec.clone())
+                .expect("a fetch offering the extension");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        // 300000 bytes are five generations, four full and a short tail whose
+        // symbol count is small enough that every eighth still leaves it its
+        // sources. The four full ones decode never, so the reliable path is
+        // what carried them. The sim's loss is periodic rather than sampled,
+        // so this count is the same on every run.
+        assert_eq!(
+            fetcher.fec_generations_decoded(),
+            1,
+            "only the short tail had the symbols to decode"
+        );
+        drop(fetcher);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+    }
+
+    #[test]
     pub(crate) fn a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it() {
         // Both ends offer DATAGRAM_FEC over an in-process pair that loses
         // every ninth datagram: exactly eight of a full generation's 72, the

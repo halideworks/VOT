@@ -9,12 +9,14 @@ const GROUP_BYTES: u64 = 65_536;
 
 mod assurance;
 mod cbor;
+mod fec;
 mod manifest;
 mod session;
 mod transfer;
 
 pub use assurance::*;
 use cbor::{Reader, cbor_byte_string_len, cbor_head_len, decode_object, encode_object};
+pub use fec::*;
 pub use manifest::*;
 pub use session::*;
 pub use transfer::*;
@@ -73,6 +75,11 @@ pub enum TypedFrame {
     ChunkDurable(AssuranceFrame),
     ChunkAtRestVerified(AssuranceFrame),
     PublishReceipt(Vec<u8>),
+    DatagramCredit(DatagramCredit),
+    CodingEpochOpen(CodingEpochOpen),
+    GenState(GenState),
+    GenDone(GenDone),
+    CodingEpochClose(CodingEpochClose),
 }
 
 impl TypedFrame {
@@ -96,6 +103,11 @@ impl TypedFrame {
             Self::ChunkDurable(_) => frame_type::CHUNK_DURABLE,
             Self::ChunkAtRestVerified(_) => frame_type::CHUNK_AT_REST_VERIFIED,
             Self::PublishReceipt(_) => frame_type::PUBLISH_RECEIPT,
+            Self::DatagramCredit(_) => frame_type::DATAGRAM_CREDIT,
+            Self::CodingEpochOpen(_) => frame_type::CODING_EPOCH_OPEN,
+            Self::GenState(_) => frame_type::GEN_STATE,
+            Self::GenDone(_) => frame_type::GEN_DONE,
+            Self::CodingEpochClose(_) => frame_type::CODING_EPOCH_CLOSE,
         }
     }
 }
@@ -130,6 +142,11 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
             validate_receipt(bytes)?;
             payload.extend_from_slice(bytes);
         }
+        TypedFrame::DatagramCredit(value) => encode_datagram_credit(value, &mut payload),
+        TypedFrame::CodingEpochOpen(value) => encode_coding_epoch_open(value, &mut payload)?,
+        TypedFrame::GenState(value) => encode_gen_state(value, &mut payload)?,
+        TypedFrame::GenDone(value) => encode_gen_done(value, &mut payload),
+        TypedFrame::CodingEpochClose(value) => encode_coding_epoch_close(*value, &mut payload),
     }
     encode_frame(frame.frame_type(), &payload, output)?;
     Ok(())
@@ -175,6 +192,15 @@ pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize),
         frame_type::PUBLISH_RECEIPT => {
             validate_receipt(payload)?;
             TypedFrame::PublishReceipt(payload.to_vec())
+        }
+        frame_type::DATAGRAM_CREDIT => TypedFrame::DatagramCredit(decode_datagram_credit(payload)?),
+        frame_type::CODING_EPOCH_OPEN => {
+            TypedFrame::CodingEpochOpen(decode_coding_epoch_open(payload)?)
+        }
+        frame_type::GEN_STATE => TypedFrame::GenState(decode_gen_state(payload)?),
+        frame_type::GEN_DONE => TypedFrame::GenDone(decode_gen_done(payload)?),
+        frame_type::CODING_EPOCH_CLOSE => {
+            TypedFrame::CodingEpochClose(decode_coding_epoch_close(payload)?)
         }
         other => return Err(Error::WrongFrameType(other)),
     };

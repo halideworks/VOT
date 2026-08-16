@@ -105,6 +105,59 @@
       }
     ]
   },
+  "frames": {
+    "coding_epoch_open": {
+      "epoch": 7,
+      "suite": 1,
+      "root_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "object_length": 200000,
+      "offset": 65536,
+      "length": 131072,
+      "source_count": 64,
+      "repair_count": 16,
+      "symbol_length": 1024,
+      "generation_count": 2,
+      "payload_hex": "a70007018401015820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f1a00030d40021a00010000031a00020000041840051006190400"
+    },
+    "gen_state": {
+      "epoch": 7,
+      "generation": 1,
+      "sequence": 3,
+      "received": 61,
+      "missing_sources": [
+        2,
+        40,
+        63
+      ],
+      "payload_hex": "a500070101020303183d0483021828183f"
+    },
+    "gen_done": {
+      "epoch": 7,
+      "generation": 1,
+      "outcome": 0,
+      "payload_hex": "a3000701010200"
+    },
+    "coding_epoch_close": {
+      "epoch": 7,
+      "payload_hex": "a10007"
+    },
+    "datagram_credit": {
+      "credit_epoch": 1,
+      "max_unretired_bytes": 8388608,
+      "max_active_generations": 32,
+      "max_decode_work": 4194304,
+      "max_open_epochs": 4,
+      "payload_hex": "a50001011a00800000021820031a004000000404"
+    },
+    "symbol_datagram": {
+      "epoch": 7,
+      "generation": 1,
+      "esi": 5,
+      "symbol_length": 4,
+      "symbol_hex": "26374859",
+      "datagram_hex": "00000007000000010526374859"
+    }
+  },
   "matrices": [
     {
       "source_count": 1,

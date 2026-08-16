@@ -2398,6 +2398,7 @@ name = "vot-codec"
 version = "0.0.1"
 dependencies = [
  "vot-cbor",
+ "vot-fec",
  "vot-manifest",
  "vot-receipt",
 ]

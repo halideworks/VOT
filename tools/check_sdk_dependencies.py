@@ -47,6 +47,7 @@ ALLOWED_PACKAGES = frozenset(
         "vot-codec",
         "vot-commit-model",
         "vot-coverage",
+        "vot-fec",
         "vot-manifest",
         "vot-object",
         "vot-package",

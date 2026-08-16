@@ -183,6 +183,98 @@ INVALID_GEOMETRY = [
 ]
 
 
+# --- Wire payloads (spec/fec.md sections 10 and 11), CBOR by hand ---------
+
+
+def cbor_uint(major: int, value: int) -> bytes:
+    if value < 24:
+        return bytes([(major << 5) | value])
+    for size, marker in ((1, 24), (2, 25), (4, 26), (8, 27)):
+        if value < 1 << (8 * size):
+            return bytes([(major << 5) | marker]) + value.to_bytes(size, "big")
+    raise ValueError("uint too large")
+
+
+def cbor_map(pairs: list[tuple[int, bytes]]) -> bytes:
+    out = cbor_uint(5, len(pairs))
+    for key, value in pairs:
+        out += cbor_uint(0, key) + value
+    return out
+
+
+def cbor_object(suite: int, root: bytes, length: int) -> bytes:
+    return cbor_uint(4, 4) + cbor_uint(0, 1) + cbor_uint(0, suite) + cbor_uint(2, 32) + root + cbor_uint(0, length)
+
+
+ROOT = bytes(range(32))
+FRAMES = {
+    "coding_epoch_open": {
+        "epoch": 7,
+        "suite": 1,
+        "root_hex": ROOT.hex(),
+        "object_length": 200_000,
+        "offset": 65_536,
+        "length": 131_072,
+        "source_count": 64,
+        "repair_count": 16,
+        "symbol_length": 1024,
+        "generation_count": 2,
+    },
+    "gen_state": {"epoch": 7, "generation": 1, "sequence": 3, "received": 61, "missing_sources": [2, 40, 63]},
+    "gen_done": {"epoch": 7, "generation": 1, "outcome": 0},
+    "coding_epoch_close": {"epoch": 7},
+    "datagram_credit": {"credit_epoch": 1, "max_unretired_bytes": 8_388_608, "max_active_generations": 32, "max_decode_work": 4_194_304},
+}
+
+
+def frame_vectors() -> dict:
+    o = FRAMES["coding_epoch_open"]
+    open_bytes = cbor_map([
+        (0, cbor_uint(0, o["epoch"])),
+        (1, cbor_object(o["suite"], ROOT, o["object_length"])),
+        (2, cbor_uint(0, o["offset"])),
+        (3, cbor_uint(0, o["length"])),
+        (4, cbor_uint(0, o["source_count"])),
+        (5, cbor_uint(0, o["repair_count"])),
+        (6, cbor_uint(0, o["symbol_length"])),
+    ])
+    g = FRAMES["gen_state"]
+    state_bytes = cbor_map([
+        (0, cbor_uint(0, g["epoch"])),
+        (1, cbor_uint(0, g["generation"])),
+        (2, cbor_uint(0, g["sequence"])),
+        (3, cbor_uint(0, g["received"])),
+        (4, cbor_uint(4, len(g["missing_sources"])) + b"".join(cbor_uint(0, e) for e in g["missing_sources"])),
+    ])
+    d = FRAMES["gen_done"]
+    done_bytes = cbor_map([(0, cbor_uint(0, d["epoch"])), (1, cbor_uint(0, d["generation"])), (2, cbor_uint(0, d["outcome"]))])
+    close_bytes = cbor_map([(0, cbor_uint(0, FRAMES["coding_epoch_close"]["epoch"]))])
+    c = FRAMES["datagram_credit"]
+    credit_bytes = cbor_map([
+        (0, cbor_uint(0, c["credit_epoch"])),
+        (1, cbor_uint(0, c["max_unretired_bytes"])),
+        (2, cbor_uint(0, c["max_active_generations"])),
+        (3, cbor_uint(0, c["max_decode_work"])),
+    ])
+    symbol = pattern_symbol(5, 4)
+    datagram = (7).to_bytes(4, "big") + (1).to_bytes(4, "big") + bytes([5]) + symbol
+    return {
+        "coding_epoch_open": {**o, "payload_hex": open_bytes.hex()},
+        "gen_state": {**g, "payload_hex": state_bytes.hex()},
+        "gen_done": {**d, "payload_hex": done_bytes.hex()},
+        "coding_epoch_close": {**FRAMES["coding_epoch_close"], "payload_hex": close_bytes.hex()},
+        "datagram_credit": {**c, "payload_hex": credit_bytes.hex()},
+        "symbol_datagram": {
+            "epoch": 7,
+            "generation": 1,
+            "esi": 5,
+            "symbol_length": 4,
+            "symbol_hex": symbol.hex(),
+            "datagram_hex": datagram.hex(),
+        },
+    }
+
+
 def field_vectors() -> dict:
     return {
         "polynomial": POLYNOMIAL,
@@ -298,6 +390,7 @@ def build_vectors() -> dict:
         },
         "pattern": PATTERN,
         "field": field_vectors(),
+        "frames": frame_vectors(),
         "matrices": matrix_vectors(),
         "encode": encode_cases,
         "insufficient": insufficient,

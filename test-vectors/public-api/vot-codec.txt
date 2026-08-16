@@ -79,6 +79,7 @@ constant vot_codec::frame_type::TRANSIT_VERIFIED
 constant vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE
 constant vot_codec::frames::MAX_MANIFEST_REQUEST_PAGES
 constant vot_codec::frames::MAX_REQUESTED_RANGE
+constant vot_codec::frames::SYMBOL_HEADER_LEN
 constant vot_codec::operation::PUBLISH
 constant vot_codec::operation::READ_MANIFEST
 constant vot_codec::operation::READ_RANGES
@@ -109,6 +110,7 @@ enum vot_codec::Operation
 enum vot_codec::SettingsError
 enum vot_codec::frames::Binding
 enum vot_codec::frames::Error
+enum vot_codec::frames::GenOutcome
 enum vot_codec::frames::TypedFrame
 function vot_codec::decode_all
 function vot_codec::decode_hello
@@ -124,8 +126,10 @@ function vot_codec::frames::decode_auth_context_payload
 function vot_codec::frames::decode_session_accept_payload
 function vot_codec::frames::decode_session_open_payload
 function vot_codec::frames::decode_session_reject_payload
+function vot_codec::frames::decode_symbol
 function vot_codec::frames::encode
 function vot_codec::frames::encode_auth_context_payload
+function vot_codec::frames::encode_symbol
 function vot_codec::is_critical
 function vot_codec::is_grease
 function vot_codec::is_known
@@ -154,7 +158,12 @@ struct vot_codec::UnknownOperation
 struct vot_codec::frames::AssuranceFrame
 struct vot_codec::frames::AuthContext
 struct vot_codec::frames::Capacity
+struct vot_codec::frames::CodingEpochClose
+struct vot_codec::frames::CodingEpochOpen
 struct vot_codec::frames::DataRecord
+struct vot_codec::frames::DatagramCredit
+struct vot_codec::frames::GenDone
+struct vot_codec::frames::GenState
 struct vot_codec::frames::Have
 struct vot_codec::frames::HaveRun
 struct vot_codec::frames::ManifestRequest
@@ -165,3 +174,5 @@ struct vot_codec::frames::RangeRequest
 struct vot_codec::frames::SessionAccept
 struct vot_codec::frames::SessionOpen
 struct vot_codec::frames::SessionReject
+struct vot_codec::frames::SymbolHeader
+use vot_codec::frames::Geometry <- vot_fec::Geometry

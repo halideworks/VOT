@@ -71,6 +71,42 @@ pub(crate) struct Joined {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// What the datagram path did with what a sender offered this session.
+///
+/// `offered` bounds the other generation counts: `decoded` and `abandoned`
+/// are disjoint subsets of it, and every generation it holds that did not
+/// decode was carried by the reliable path instead, whether this end gave it
+/// up for want of decode budget or its symbols simply never reached the
+/// decode threshold before the epoch closed. `refused` counts epochs rather
+/// than generations, because an epoch this end would not open never said how
+/// many generations it held.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FecCounts {
+    /// Generations in every coding epoch this end opened.
+    pub offered: u64,
+    /// Generations decoded from symbols.
+    pub decoded: u64,
+    /// Generations dropped for want of decode budget, after enough symbols
+    /// arrived to attempt one.
+    pub abandoned: u64,
+    /// Coding epochs refused, whose generation count this end never learned.
+    pub refused: u64,
+}
+
+impl std::ops::Add for FecCounts {
+    type Output = Self;
+
+    /// Sums what several rails of one fetch each did.
+    fn add(self, other: Self) -> Self {
+        Self {
+            offered: self.offered.saturating_add(other.offered),
+            decoded: self.decoded.saturating_add(other.decoded),
+            abandoned: self.abandoned.saturating_add(other.abandoned),
+            refused: self.refused.saturating_add(other.refused),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Intake {
     receiver: Receiver,
@@ -79,8 +115,8 @@ pub(crate) struct Intake {
     orphan_bytes: usize,
     owed: VecDeque<Owed>,
     credit_epoch: u64,
-    /// Generations decoded from the datagram path over the session's life.
-    decoded: u64,
+    /// What the datagram path did over the session's life.
+    counts: FecCounts,
 }
 
 impl Intake {
@@ -121,13 +157,16 @@ impl Intake {
         let Ok(plan) = EpochPlan::new(open.epoch, open.offset, open.length, open.geometry) else {
             return Err(());
         };
+        let generations = plan.generation_count();
         match self.receiver.open(plan) {
             Ok(Open::Opened) => {
+                self.counts.offered += generations;
                 self.epochs.insert(open.epoch, Cover::of(open));
                 Ok(())
             }
             Ok(Open::Repeated) => Ok(()),
             Ok(Open::Refused) => {
+                self.counts.refused += 1;
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: open.epoch,
                     generation: 0,
@@ -165,7 +204,7 @@ impl Intake {
                 offset,
                 bytes,
             }) => {
-                self.decoded += 1;
+                self.counts.decoded += 1;
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
                     generation,
@@ -179,6 +218,7 @@ impl Intake {
                 })
             }
             Symbol::Abandoned { generation } => {
+                self.counts.abandoned += 1;
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
                     generation,
@@ -233,9 +273,9 @@ impl Intake {
         taken
     }
 
-    /// Generations decoded from the datagram path so far.
-    pub(crate) const fn decoded(&self) -> u64 {
-        self.decoded
+    /// What the datagram path has done so far.
+    pub(crate) const fn counts(&self) -> FecCounts {
+        self.counts
     }
 
     /// The next frame this end owes the sender, left in place: the caller
@@ -400,6 +440,95 @@ mod tests {
             None,
             "spent work was reset by the new epoch"
         );
+    }
+
+    #[test]
+    fn the_counts_account_for_every_epoch_and_generation_a_sender_offered() {
+        let mut intake = Intake::default();
+        assert_eq!(intake.counts(), FecCounts::default());
+        // No credit yet, so the epoch is refused, and a refusal never learns
+        // how many generations it held.
+        intake.open(&open_of(1, 0, 32, 1, 1, 1)).unwrap();
+        assert_eq!(
+            intake.counts(),
+            FecCounts {
+                offered: 0,
+                decoded: 0,
+                abandoned: 0,
+                refused: 1,
+            }
+        );
+        // One byte of staging is a decode budget of sixteen, against an epoch
+        // of thirty-two one-byte generations. The refusal and the credit are
+        // both owed to the sender; draining them leaves the loop below seeing
+        // only what each generation produced.
+        intake.extend_credit(1);
+        assert!(matches!(intake.take_owed(), Some(Owed::Done(_))));
+        assert!(matches!(intake.take_owed(), Some(Owed::Credit(_))));
+        assert_eq!(intake.take_owed(), None);
+        intake.open(&open_of(1, 0, 32, 1, 1, 1)).unwrap();
+        assert_eq!(intake.counts().offered, 32);
+        intake.open(&open_of(1, 0, 32, 1, 1, 1)).unwrap();
+        assert_eq!(
+            intake.counts().offered,
+            32,
+            "a repeated open is not a second offer"
+        );
+        // The repair symbol of a k = 1 generation completes it by
+        // elimination, which spends one of the sixteen. Past that the
+        // generation is dropped for the reliable path to repair.
+        for generation in 0..32_u32 {
+            let byte = u8::try_from(generation).unwrap();
+            let joined = intake.symbol(&datagram(1, generation, 1, &[byte]));
+            assert_eq!(joined.is_some(), generation < 16, "generation {generation}");
+            assert!(matches!(intake.take_owed(), Some(Owed::Done(_))));
+        }
+        assert_eq!(
+            intake.counts(),
+            FecCounts {
+                offered: 32,
+                decoded: 16,
+                abandoned: 16,
+                refused: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rail_counts_add_field_by_field() {
+        // Each field distinct in both terms, so a sum that reads one field
+        // into another's place cannot pass.
+        let left = FecCounts {
+            offered: 1,
+            decoded: 2,
+            abandoned: 4,
+            refused: 8,
+        };
+        let right = FecCounts {
+            offered: 16,
+            decoded: 32,
+            abandoned: 64,
+            refused: 128,
+        };
+        assert_eq!(
+            left + right,
+            FecCounts {
+                offered: 17,
+                decoded: 34,
+                abandoned: 68,
+                refused: 136,
+            }
+        );
+        assert_eq!(left + FecCounts::default(), left);
+        // Saturating, so a counter that ran away cannot panic a fetch that
+        // was otherwise fine.
+        let full = FecCounts {
+            offered: u64::MAX,
+            decoded: u64::MAX,
+            abandoned: u64::MAX,
+            refused: u64::MAX,
+        };
+        assert_eq!(full + right, full);
     }
 
     #[test]

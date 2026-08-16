@@ -423,10 +423,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.extensions.clone()
     }
 
-    /// Generations this fetch's session decoded from the datagram path.
+    /// What this fetch's session decoded, abandoned, and refused on the
+    /// datagram path.
     #[must_use]
-    pub fn fec_generations_decoded(&self) -> u64 {
-        self.receiver.fec_generations_decoded()
+    pub fn fec_counts(&self) -> vot_scheduler::FecCounts {
+        self.receiver.fec_counts()
     }
 
     /// The bundle directory this fetch writes.

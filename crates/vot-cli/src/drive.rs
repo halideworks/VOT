@@ -127,12 +127,13 @@ fn fetched<A: TransportAdapter>(
     fetch_verdict(status).and_then(|()| fetcher.package().ok_or(Error::InvalidBundle))
 }
 
-/// Generations every fetch in this process decoded from the datagram path,
-/// summed over rails at the end of each. Diagnostic: the fetch report has
-/// no other place for it yet.
+/// A finished fetch: the package it proved, and what its datagram path did
+/// summed over every rail.
 #[cfg(any(test, feature = "wire"))]
-pub(crate) static FEC_GENERATIONS_DECODED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) struct Fetched {
+    pub(crate) package: crate::PackageSummary,
+    pub(crate) fec: vot_scheduler::FecCounts,
+}
 
 /// Fetches at `rails` width. The primary builds the plan; rails join it
 /// on fresh connections. A rail failure abandons the plan.
@@ -145,7 +146,7 @@ pub(crate) fn fetch_striped<A, F>(
     mut primary: crate::BundleFetcher<A>,
     rails: usize,
     connect: F,
-) -> Result<crate::PackageSummary, Error>
+) -> Result<Fetched, Error>
 where
     A: TransportAdapter + Send,
     F: Fn() -> Result<A, Error> + Sync,
@@ -154,11 +155,10 @@ where
         return Err(Error::InvalidArguments);
     }
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
-        FEC_GENERATIONS_DECODED.fetch_add(
-            primary.fec_generations_decoded(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        return fetched(&primary, status);
+        return Ok(Fetched {
+            package: fetched(&primary, status)?,
+            fec: primary.fec_counts(),
+        });
     }
     let Some(plan) = primary.shared_plan() else {
         return Err(Error::InvalidBundle);
@@ -189,7 +189,7 @@ where
                     )?;
                     rail.set_proving_threads(provers)?;
                     fetch_verdict(drive(&mut rail)?)?;
-                    Ok(rail.fec_generations_decoded())
+                    Ok(rail.fec_counts())
                 })();
                 if outcome.is_err() {
                     crate::fetch::abandon_plan(&plan);
@@ -201,20 +201,18 @@ where
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
         }
-        let mut decoded = vec![primary.fec_generations_decoded()];
+        let mut fec = primary.fec_counts();
         let mut rail_failure = None;
         for rail in spawned {
             match rail.join().expect("a rail thread never panics") {
-                Ok(count) => decoded.push(count),
+                Ok(counts) => fec = fec + counts,
                 Err(error) => {
                     rail_failure.get_or_insert(error);
                 }
             }
         }
-        FEC_GENERATIONS_DECODED
-            .fetch_add(decoded.iter().sum(), std::sync::atomic::Ordering::Relaxed);
         match outcome {
-            Ok(package) => Ok(package),
+            Ok(package) => Ok(Fetched { package, fec }),
             // Report the rail's failure as the cause of a stalled primary.
             Err(Error::Stalled | Error::CarrierUnavailable) => {
                 Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
@@ -782,11 +780,16 @@ mod tests {
         let output = crate::tests::temporary("inlinewidth-fetched");
         let mut fetcher = crate::BundleFetcher::begin(client, &output, None).unwrap();
         fetcher.set_proving_threads(0).unwrap();
-        let package = fetch_striped(fetcher, 1, || {
+        let outcome = fetch_striped(fetcher, 1, || {
             Err::<crate::harness::Duplex, _>(Error::CarrierUnavailable)
         })
         .expect("one rail, no provers, a whole fetch");
-        assert_eq!(package, built);
+        assert_eq!(outcome.package, built);
+        assert_eq!(
+            outcome.fec,
+            vot_scheduler::FecCounts::default(),
+            "a fetch that never offered FEC counts nothing"
+        );
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
     }

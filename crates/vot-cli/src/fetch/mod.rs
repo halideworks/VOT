@@ -699,17 +699,29 @@ mod tests {
             BundleFetcher::begin_with(client, &output, Some(built.root), None, fec.clone())
                 .expect("a fetch offering the extension");
         assert_eq!(fetcher.extensions(), fec);
-        assert_eq!(fetcher.fec_generations_decoded(), 0, "nothing yet");
+        assert_eq!(
+            fetcher.fec_counts(),
+            vot_scheduler::FecCounts::default(),
+            "nothing yet"
+        );
         assert_eq!(
             crate::drive::drive(&mut fetcher).expect("a driven fetch"),
             FetchStatus::Complete
         );
         assert_eq!(fetcher.package().expect("a package"), built);
+        let counts = fetcher.fec_counts();
         assert!(
-            fetcher.fec_generations_decoded() >= 20,
-            "the object's 23 generations came as symbols: {}",
-            fetcher.fec_generations_decoded()
+            counts.decoded >= 20,
+            "the object's 23 generations came as symbols: {counts:?}"
         );
+        // Every generation an epoch opened is accounted for, and this loss
+        // rate spends no decode budget it does not have.
+        assert!(
+            counts.offered >= counts.decoded,
+            "offered bounds decoded: {counts:?}"
+        );
+        assert_eq!(counts.abandoned, 0, "decode budget was never short");
+        assert_eq!(counts.refused, 0, "credit admitted every epoch");
         drop(fetcher);
         serving_thread
             .join()
@@ -737,7 +749,7 @@ mod tests {
             crate::drive::drive(&mut plain).expect("a driven fetch"),
             FetchStatus::Complete
         );
-        assert_eq!(plain.fec_generations_decoded(), 0);
+        assert_eq!(plain.fec_counts(), vot_scheduler::FecCounts::default());
         drop(plain);
         serving_thread
             .join()
@@ -904,8 +916,8 @@ mod tests {
             Ok(client)
         };
         let fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
-        let package = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
-        assert_eq!(package, built);
+        let outcome = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
+        assert_eq!(outcome.package, built);
         assert_eq!(
             connects.load(Ordering::Relaxed),
             2,

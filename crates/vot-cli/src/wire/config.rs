@@ -85,6 +85,25 @@ pub(crate) fn extensions_from(pin: Option<&str>) -> Result<std::collections::BTr
     }
 }
 
+/// The environment variable that asks a fetch to report what it measured.
+pub(crate) const FETCH_STATS: &str = "VOT_FETCH_STATS";
+
+/// Whether [`FETCH_STATS`] asks for the report, spelled as
+/// [`extensions_from`] spells its switch.
+///
+/// # Errors
+/// Rejects any other value.
+pub(crate) fn stats_wanted(pin: Option<&str>) -> Result<bool, Error> {
+    match pin
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("0" | "off" | "false") => Ok(false),
+        Some("1" | "on" | "true") => Ok(true),
+        Some(_) => Err(Error::InvalidArguments),
+    }
+}
+
 /// The environment variable that sets how many rails a fetch runs.
 pub(crate) const FETCH_RAILS: &str = "VOT_FETCH_RAILS";
 

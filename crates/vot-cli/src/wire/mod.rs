@@ -1353,6 +1353,59 @@ mod tests {
     }
 
     #[test]
+    fn the_fetch_report_is_off_unless_asked_for() {
+        assert!(!stats_wanted(None).unwrap());
+        for off in ["0", "off", "false", " OFF "] {
+            assert!(!stats_wanted(Some(off)).unwrap(), "{off}");
+        }
+        for on in ["1", "on", "true", " True\n"] {
+            assert!(stats_wanted(Some(on)).unwrap(), "{on}");
+        }
+        assert!(stats_wanted(Some("maybe")).is_err());
+        assert!(std::env::var(FETCH_STATS).is_err(), "the suite owns no env");
+    }
+
+    #[test]
+    fn the_fetch_report_names_every_number_it_measured() {
+        // Every field distinct, so a line that reads one count into another
+        // field's place cannot pass.
+        assert_eq!(
+            fetch::stats_line(
+                4_294_967_296,
+                std::time::Duration::from_millis(8_500),
+                vot_scheduler::FecCounts {
+                    offered: 65_536,
+                    decoded: 65_500,
+                    abandoned: 36,
+                    refused: 2,
+                },
+            ),
+            "fetch stats bytes=4294967296 ms=8500 fec_offered=65536 \
+             fec_decoded=65500 fec_abandoned=36 fec_refused=2"
+        );
+        assert_eq!(
+            fetch::stats_line(
+                0,
+                std::time::Duration::ZERO,
+                vot_scheduler::FecCounts::default(),
+            ),
+            "fetch stats bytes=0 ms=0 fec_offered=0 fec_decoded=0 \
+             fec_abandoned=0 fec_refused=0"
+        );
+        // Sub-millisecond is reported as what it is rather than rounded up:
+        // a run this short is not a measurement, and saying 1 would hide it.
+        assert_eq!(
+            fetch::stats_line(
+                7,
+                std::time::Duration::from_micros(900),
+                vot_scheduler::FecCounts::default(),
+            ),
+            "fetch stats bytes=7 ms=0 fec_offered=0 fec_decoded=0 \
+             fec_abandoned=0 fec_refused=0"
+        );
+    }
+
+    #[test]
     fn an_ephemeral_certificate_goes_when_the_server_does() {
         let (certificate, key, directory) = {
             let written = Ephemeral::generate().expect("credentials");
@@ -1453,14 +1506,12 @@ mod tests {
         });
         let (at, _) = address.recv().expect("the server reported its address");
         let fetched = crate::tests::temporary("fec-wire-fetched");
-        let before =
-            crate::drive::FEC_GENERATIONS_DECODED.load(std::sync::atomic::Ordering::Relaxed);
         let config = client_config().unwrap();
         let connect = || {
             Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config)
                 .map_err(carrier_failure)
         };
-        let package = fetch_over_offering(
+        let outcome = fetch_over_offering(
             connect().unwrap(),
             connect,
             &fetched,
@@ -1469,18 +1520,21 @@ mod tests {
             fec,
         )
         .expect("a fetched bundle");
-        assert_eq!(package, built);
+        assert_eq!(outcome.package, built);
         let served = serving.join().expect("the serving thread").expect("served");
         assert_eq!(served, built);
-        let decoded = crate::drive::FEC_GENERATIONS_DECODED
-            .load(std::sync::atomic::Ordering::Relaxed)
-            - before;
         // 1500000 bytes of object are 23 generations; the manifest and the
         // small tail travel reliably.
+        let counts = outcome.fec;
         assert!(
-            decoded >= 20,
-            "the datagram path carried the object: {decoded} generations decoded"
+            counts.decoded >= 20,
+            "the datagram path carried the object: {counts:?}"
         );
+        assert!(
+            counts.offered >= counts.decoded,
+            "offered bounds decoded: {counts:?}"
+        );
+        assert_eq!(counts.refused, 0, "credit admitted every epoch");
     }
 
     #[test]

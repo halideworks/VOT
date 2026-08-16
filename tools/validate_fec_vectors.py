@@ -223,7 +223,7 @@ FRAMES = {
     "gen_state": {"epoch": 7, "generation": 1, "sequence": 3, "received": 61, "missing_sources": [2, 40, 63]},
     "gen_done": {"epoch": 7, "generation": 1, "outcome": 0},
     "coding_epoch_close": {"epoch": 7},
-    "datagram_credit": {"credit_epoch": 1, "max_unretired_bytes": 8_388_608, "max_active_generations": 32, "max_decode_work": 4_194_304},
+    "datagram_credit": {"credit_epoch": 1, "max_unretired_bytes": 8_388_608, "max_active_generations": 32, "max_decode_work": 4_194_304, "max_open_epochs": 4},
 }
 
 
@@ -255,6 +255,7 @@ def frame_vectors() -> dict:
         (1, cbor_uint(0, c["max_unretired_bytes"])),
         (2, cbor_uint(0, c["max_active_generations"])),
         (3, cbor_uint(0, c["max_decode_work"])),
+        (4, cbor_uint(0, c["max_open_epochs"])),
     ])
     symbol = pattern_symbol(5, 4)
     datagram = (7).to_bytes(4, "big") + (1).to_bytes(4, "big") + bytes([5]) + symbol

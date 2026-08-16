@@ -57,6 +57,7 @@ pub struct DatagramCredit {
     pub max_unretired_bytes: u64,
     pub max_active_generations: u64,
     pub max_decode_work: u64,
+    pub max_open_epochs: u64,
 }
 
 /// The nine bytes in front of every symbol.
@@ -254,7 +255,7 @@ pub(super) fn decode_coding_epoch_close(input: &[u8]) -> Result<CodingEpochClose
 }
 
 pub(super) fn encode_datagram_credit(value: &DatagramCredit, output: &mut Vec<u8>) {
-    vot_cbor::map(output, 4);
+    vot_cbor::map(output, 5);
     vot_cbor::uint(output, 0);
     vot_cbor::uint(output, value.credit_epoch);
     vot_cbor::uint(output, 1);
@@ -263,11 +264,13 @@ pub(super) fn encode_datagram_credit(value: &DatagramCredit, output: &mut Vec<u8
     vot_cbor::uint(output, value.max_active_generations);
     vot_cbor::uint(output, 3);
     vot_cbor::uint(output, value.max_decode_work);
+    vot_cbor::uint(output, 4);
+    vot_cbor::uint(output, value.max_open_epochs);
 }
 
 pub(super) fn decode_datagram_credit(input: &[u8]) -> Result<DatagramCredit, Error> {
     let mut reader = Reader::new(input);
-    reader.map(4)?;
+    reader.map(5)?;
     reader.key(0)?;
     let credit_epoch = reader.uint()?;
     reader.key(1)?;
@@ -276,12 +279,15 @@ pub(super) fn decode_datagram_credit(input: &[u8]) -> Result<DatagramCredit, Err
     let max_active_generations = reader.uint()?;
     reader.key(3)?;
     let max_decode_work = reader.uint()?;
+    reader.key(4)?;
+    let max_open_epochs = reader.uint()?;
     reader.finish()?;
     Ok(DatagramCredit {
         credit_epoch,
         max_unretired_bytes,
         max_active_generations,
         max_decode_work,
+        max_open_epochs,
     })
 }
 
@@ -458,6 +464,7 @@ mod tests {
                 max_unretired_bytes: 8_388_608,
                 max_active_generations: 32,
                 max_decode_work: 4_194_304,
+                max_open_epochs: 4,
             }),
             "datagram_credit",
         );

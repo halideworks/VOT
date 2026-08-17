@@ -66,6 +66,19 @@ const MAX_INBOUND_EVENTS: usize = 1_024;
 /// Datagrams quiche queues in each direction before it refuses or drops one.
 const DATAGRAM_QUEUE_LEN: usize = 1_024;
 
+/// Datagrams the driver holds for a connection whose own queue is full.
+///
+/// A refused datagram waits here instead of being thrown away, so a sender
+/// that offers a burst larger than the connection's queue loses none of it
+/// to a moment's fullness. Held apart from the outbox budget rather than
+/// charged to it: charging them starves the control stream behind them, and
+/// a fetch whose bundles cannot get out stalls instead of slowing down.
+///
+/// Bounded, because the unreliable path must not grow without one. Past this
+/// a datagram is dropped, which is what the connection did to every one of
+/// them before.
+const DATAGRAM_OUTBOX_LEN: usize = 4_096;
+
 /// Received datagram bytes the driver holds for a caller that has not drained
 /// them, on top of the shared budget. A quarter of that budget, so the stream
 /// reader's headroom precondition always survives a datagram flood.
@@ -1008,6 +1021,7 @@ fn run(
     // Allocated once to avoid a control-message allocation per packet.
     let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
+    let mut datagrams: VecDeque<(Payload, u64)> = VecDeque::new();
     let mut queued = Queued::default();
     let mut closing = false;
     let mut announced = false;
@@ -1018,6 +1032,7 @@ fn run(
         let orphaned = take_submissions(
             &mut conn,
             &mut streams,
+            &mut datagrams,
             &budget,
             control_limit,
             commands,
@@ -1032,6 +1047,7 @@ fn run(
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream, &mut queued);
         }
+        write_datagrams(&mut conn, &mut datagrams, inbound);
         let Ok(paced) = send_and_revalidate(socket, &mut conn, &mut out, &mut sending) else {
             return Ok(());
         };
@@ -2124,6 +2140,7 @@ fn datagram_too_large(error: &std::io::Error) -> bool {
 fn take_submissions(
     conn: &mut quiche::Connection,
     streams: &mut BTreeMap<u64, StreamState>,
+    datagrams: &mut VecDeque<(Payload, u64)>,
     budget: &SharedBudget,
     control_limit: &Arc<AtomicUsize>,
     commands: &mpsc::Receiver<Command>,
@@ -2134,9 +2151,16 @@ fn take_submissions(
     while !queued.is_full() {
         match commands.try_recv() {
             Ok(command) => {
-                if let Some(bytes) =
-                    apply(conn, streams, budget, control_limit, command, inbound, role)
-                {
+                if let Some(bytes) = apply(
+                    conn,
+                    streams,
+                    datagrams,
+                    budget,
+                    control_limit,
+                    command,
+                    inbound,
+                    role,
+                ) {
                     queued.charge(bytes);
                 }
             }
@@ -2166,9 +2190,14 @@ fn note_orphaned(conn: &mut quiche::Connection, closing: &mut bool) {
 ///
 /// Reports the bytes it left in an outbox, so the charge is taken where the
 /// record is queued and nowhere else.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one submission needs what the driver holds, and the driver holds no less"
+)]
 fn apply(
     conn: &mut quiche::Connection,
     streams: &mut BTreeMap<u64, StreamState>,
+    datagrams: &mut VecDeque<(Payload, u64)>,
     budget: &SharedBudget,
     control_limit: &Arc<AtomicUsize>,
     command: Command,
@@ -2204,17 +2233,19 @@ fn apply(
             state.outbox.push_back((bytes, 0));
             Some(charge)
         }
-        // Handed to the connection here rather than queued, so there is
-        // nothing for the bound to hold.
+        // Offered to the connection, and held for a later pass when it has
+        // no room rather than thrown away. Not charged to the outbox budget:
+        // that budget stops the driver taking submissions at all, so
+        // charging datagrams to it starves the control stream behind them.
         Command::Datagram { context, bytes } => {
-            let observed = if conn.dgram_send(&bytes).is_ok() {
-                NativeEvent::DatagramSent { context }
-            } else {
-                NativeEvent::DatagramDropped { context }
-            };
-            if let Ok(mut queue) = inbound.lock() {
-                let _ = queue.push(observed);
+            if !outbox_has_room(datagrams.len()) {
+                if let Ok(mut queue) = inbound.lock() {
+                    let _ = queue.push(NativeEvent::DatagramDropped { context });
+                }
+                return None;
             }
+            datagrams.push_back((bytes, context));
+            write_datagrams(conn, datagrams, inbound);
             None
         }
         // Refused at submission, so it cannot reach the driver. A silent success
@@ -2238,6 +2269,65 @@ fn stream_state<'a>(
         overflow: VecDeque::new(),
         id,
     })
+}
+
+/// What offering a datagram to the connection came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Offered {
+    Taken,
+    /// No room right now, so the same datagram is offered again later.
+    Waiting,
+    /// This datagram will never be taken, whatever room appears.
+    Refused,
+}
+
+/// Reads what the connection answered when offered a datagram.
+///
+/// `Done` is its datagram queue being full, which passes. Every other
+/// refusal is about this datagram rather than the moment, so holding it
+/// would block the ones behind it forever.
+///
+/// Pure, because this is the branch that decides between a symbol that waits
+/// and one that is thrown away, and a real connection cannot be made to
+/// refuse on demand.
+const fn offered(result: &Result<(), quiche::Error>) -> Offered {
+    match result {
+        Ok(()) => Offered::Taken,
+        Err(quiche::Error::Done) => Offered::Waiting,
+        Err(_) => Offered::Refused,
+    }
+}
+
+/// Whether the driver has room to hold another refused datagram.
+///
+/// Pure for the same reason: filling a real connection's queue four thousand
+/// deep to see the bound is not something a test can arrange.
+const fn outbox_has_room(held: usize) -> bool {
+    held < DATAGRAM_OUTBOX_LEN
+}
+
+/// Offers waiting datagrams to the connection while it has room.
+///
+/// `Done` is the connection's datagram queue being full, which is "not yet":
+/// the datagram stays at the front for a later pass. Anything else means
+/// this one will never go, so it is dropped and the caller told, because
+/// holding it would block every datagram behind it forever.
+fn write_datagrams(
+    conn: &mut quiche::Connection,
+    datagrams: &mut VecDeque<(Payload, u64)>,
+    inbound: &Arc<Mutex<Inbound>>,
+) {
+    while let Some((bytes, context)) = datagrams.front() {
+        let observed = match offered(&conn.dgram_send(bytes)) {
+            Offered::Taken => NativeEvent::DatagramSent { context: *context },
+            Offered::Waiting => return,
+            Offered::Refused => NativeEvent::DatagramDropped { context: *context },
+        };
+        datagrams.pop_front();
+        if let Ok(mut queue) = inbound.lock() {
+            let _ = queue.push(observed);
+        }
+    }
 }
 
 /// Writes what a stream has waiting, as far as flow control allows, giving
@@ -4048,6 +4138,49 @@ mod tests {
     }
 
     #[test]
+    fn a_full_connection_queue_holds_a_datagram_and_anything_else_drops_it() {
+        // The whole point of the outbox: a connection with no room right now
+        // is asked again, and a datagram it will never take is let go rather
+        // than blocking the ones behind it.
+        assert_eq!(offered(&Ok(())), Offered::Taken);
+        assert_eq!(
+            offered(&Err(quiche::Error::Done)),
+            Offered::Waiting,
+            "no room yet"
+        );
+        for refusal in [
+            quiche::Error::BufferTooShort,
+            quiche::Error::InvalidState,
+            quiche::Error::FinalSize,
+            quiche::Error::CongestionControl,
+        ] {
+            assert_eq!(
+                offered(&Err(refusal)),
+                Offered::Refused,
+                "{refusal:?} is about this one"
+            );
+        }
+    }
+
+    // Deeper than the connection's own queue, or the outbox could not
+    // absorb a burst that filled it.
+    const _: () = assert!(DATAGRAM_OUTBOX_LEN > DATAGRAM_QUEUE_LEN);
+
+    #[test]
+    fn the_datagram_outbox_bound_is_met_rather_than_passed() {
+        assert!(outbox_has_room(0));
+        assert!(
+            outbox_has_room(DATAGRAM_OUTBOX_LEN - 1),
+            "under the bound still holds"
+        );
+        assert!(
+            !outbox_has_room(DATAGRAM_OUTBOX_LEN),
+            "at the bound the next one goes"
+        );
+        assert!(!outbox_has_room(DATAGRAM_OUTBOX_LEN + 1));
+    }
+
+    #[test]
     fn the_outbox_bound_is_met_rather_than_passed() {
         assert!(!Queued::default().is_full());
         let under = Queued {
@@ -4108,6 +4241,7 @@ mod tests {
         let mut streams = BTreeMap::new();
         let mut conn = sans_io_pair(2_048).0;
 
+        let mut datagrams = VecDeque::new();
         let mut queued = Queued::default();
         // What the driver does with each: a queued record is charged, and a
         // datagram is handed to the connection with nothing left to hold.
@@ -4126,6 +4260,7 @@ mod tests {
             if let Some(bytes) = apply(
                 &mut conn,
                 &mut streams,
+                &mut datagrams,
                 &budget,
                 &control_limit,
                 command,
@@ -4135,6 +4270,9 @@ mod tests {
                 queued.charge(bytes);
             }
         }
+        // The datagram is not among them: it waits in its own outbox, which
+        // the outbox budget deliberately does not hold, because charging it
+        // would stop the driver taking the control frames behind it.
         assert_eq!(queued.bytes, 16 + 64);
         assert_eq!(queued.records, 2);
     }

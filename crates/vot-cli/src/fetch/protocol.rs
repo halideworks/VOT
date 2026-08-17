@@ -7,11 +7,11 @@ use super::{
     ManifestReader, ManifestRequest, Mutex, ORPHAN_BUNDLE_BYTES, OUTSTANDING_COVERS,
     OUTSTANDING_REQUEST_BYTES, PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT,
     PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject, Proving,
-    ProvingPool, RELIABLE_BUNDLE_DEPTH, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore,
-    Session, SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter,
-    TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure,
-    package_sentinel, remove_store_files, reservations_of, resume_failure, resumed_extents,
-    subject_of, total_units_of,
+    ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
+    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter, TypedFrame,
+    UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
+    remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
+    total_units_of,
 };
 
 /// Credit advertised to the server: the covers this end asked for.
@@ -317,12 +317,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // the receiver defaults are too shallow and fail a conforming
         // transfer with `PendingBundlesExhausted`.
         receiver.set_pending_limits(PENDING_BUNDLE_DEPTH, PENDING_BUNDLE_BYTES)?;
-        // The reliable depth rather than the pending one: only the reliable
-        // pipeline orphans records. A decoded generation waiting for its
-        // bundle is held by the coded intake instead, and a retired epoch's
-        // resends carry a bundle whose proof arrived when the piece was
-        // announced.
-        receiver.set_orphan_limits(RELIABLE_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
+        // The pending depth rather than the reliable one: the coded pipeline
+        // orphans records too. A piece's symbols travel as datagrams and its
+        // proof travels reliably, so under loss the decoded generations
+        // arrive while the proof is still behind a retransmission, and each
+        // piece waiting on its proof holds an entry. Sized at the reliable
+        // depth alone, a coded 1 GB fetch at 6% loss ran out of orphan
+        // entries with a sixth of the byte budget in hand.
+        receiver.set_orphan_limits(PENDING_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
         let mut fetcher = Self {
             receiver,
             bundle: bundle.to_owned(),
@@ -374,12 +376,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let mut receiver = SessionReceiver::new(session, receiver);
         // Same pipeline budgets as the primary: each rail carries the full depth.
         receiver.set_pending_limits(PENDING_BUNDLE_DEPTH, PENDING_BUNDLE_BYTES)?;
-        // The reliable depth rather than the pending one: only the reliable
-        // pipeline orphans records. A decoded generation waiting for its
-        // bundle is held by the coded intake instead, and a retired epoch's
-        // resends carry a bundle whose proof arrived when the piece was
-        // announced.
-        receiver.set_orphan_limits(RELIABLE_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
+        // The pending depth rather than the reliable one: the coded pipeline
+        // orphans records too. A piece's symbols travel as datagrams and its
+        // proof travels reliably, so under loss the decoded generations
+        // arrive while the proof is still behind a retransmission, and each
+        // piece waiting on its proof holds an entry. Sized at the reliable
+        // depth alone, a coded 1 GB fetch at 6% loss ran out of orphan
+        // entries with a sixth of the byte budget in hand.
+        receiver.set_orphan_limits(PENDING_BUNDLE_DEPTH, ORPHAN_BUNDLE_BYTES)?;
         let mut fetcher = Self {
             receiver,
             bundle: bundle.to_owned(),

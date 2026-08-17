@@ -570,6 +570,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.pending.orphan_byte_limit
     }
 
+    /// The bound on how many bundles hold records that arrived before their
+    /// proof, so a caller that derives it can hold the derivation to account.
+    #[must_use]
+    pub const fn orphan_bundle_limit(&self) -> usize {
+        self.pending.orphan_bundle_limit
+    }
+
     /// The bound on what [`Self::take_completed`] may owe at once.
     #[must_use]
     pub const fn deferred_limit(&self) -> usize {

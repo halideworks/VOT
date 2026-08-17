@@ -74,10 +74,20 @@ const DATAGRAM_QUEUE_LEN: usize = 1_024;
 /// charged to it: charging them starves the control stream behind them, and
 /// a fetch whose bundles cannot get out stalls instead of slowing down.
 ///
-/// Bounded, because the unreliable path must not grow without one. Past this
-/// a datagram is dropped, which is what the connection did to every one of
-/// them before.
-const DATAGRAM_OUTBOX_LEN: usize = 4_096;
+/// Bounded in both units, because a datagram may be as large as
+/// `MAX_DATAGRAM_BYTES` and a count alone would let a peer hold that many
+/// times 64 KiB against no budget at all. Past either bound a datagram is
+/// dropped, which is what the connection did to every refused one before.
+///
+/// Sized small on purpose. What waits here has left the sender's own queue
+/// but is not on the wire, and a serve reads its queue emptying as "the
+/// symbols are on the carrier" when it decides an epoch has gone quiet. Hold
+/// much more than this and an epoch is repaired reliably while its symbols
+/// are still going out, so the same bytes are paid for twice: a megabyte
+/// clears in well under the serve's grace on any path fast enough to be
+/// worth coding for.
+const DATAGRAM_OUTBOX_LEN: usize = 2_048;
+const DATAGRAM_OUTBOX_BYTES: usize = 1 << 20;
 
 /// Received datagram bytes the driver holds for a caller that has not drained
 /// them, on top of the shared budget. A quarter of that budget, so the stream
@@ -1049,6 +1059,7 @@ fn run(
         }
         write_datagrams(&mut conn, &mut datagrams, inbound);
         let Ok(paced) = send_and_revalidate(socket, &mut conn, &mut out, &mut sending) else {
+            abandon_datagrams(&mut datagrams, inbound);
             return Ok(());
         };
 
@@ -1066,6 +1077,7 @@ fn run(
         }
 
         if conn.is_closed() {
+            abandon_datagrams(&mut datagrams, inbound);
             return Ok(());
         }
 
@@ -2238,7 +2250,13 @@ fn apply(
         // that budget stops the driver taking submissions at all, so
         // charging datagrams to it starves the control stream behind them.
         Command::Datagram { context, bytes } => {
-            if !outbox_has_room(datagrams.len()) {
+            // Offered first, so room the connection freed since the last pass
+            // is room this datagram can have. Dropping against a bound that
+            // a drain would have cleared is the loss this outbox exists to
+            // stop, at the bound instead of at the queue.
+            write_datagrams(conn, datagrams, inbound);
+            let held_bytes: usize = datagrams.iter().map(|(held, _)| held.len()).sum();
+            if !outbox_has_room(datagrams.len(), held_bytes, bytes.len()) {
                 if let Ok(mut queue) = inbound.lock() {
                     let _ = queue.push(NativeEvent::DatagramDropped { context });
                 }
@@ -2298,12 +2316,26 @@ const fn offered(result: &Result<(), quiche::Error>) -> Offered {
     }
 }
 
-/// Whether the driver has room to hold another refused datagram.
+/// Whether the driver has room to hold another refused datagram of `bytes`.
 ///
-/// Pure for the same reason: filling a real connection's queue four thousand
+/// Pure for the same reason: filling a real connection's queue two thousand
 /// deep to see the bound is not something a test can arrange.
-const fn outbox_has_room(held: usize) -> bool {
-    held < DATAGRAM_OUTBOX_LEN
+const fn outbox_has_room(held: usize, held_bytes: usize, bytes: usize) -> bool {
+    held < DATAGRAM_OUTBOX_LEN && held_bytes + bytes <= DATAGRAM_OUTBOX_BYTES
+}
+
+/// Ends every datagram still waiting, for a driver that will not offer them
+/// again.
+///
+/// One `DatagramState` per submitted datagram is the contract the other
+/// carriers keep, and a caller counting what it is owed would otherwise wait
+/// on datagrams this end has forgotten.
+fn abandon_datagrams(datagrams: &mut VecDeque<(Payload, u64)>, inbound: &Arc<Mutex<Inbound>>) {
+    for (_, context) in datagrams.drain(..) {
+        if let Ok(mut queue) = inbound.lock() {
+            let _ = queue.push(NativeEvent::DatagramDropped { context });
+        }
+    }
 }
 
 /// Offers waiting datagrams to the connection while it has room.
@@ -4167,17 +4199,48 @@ mod tests {
     const _: () = assert!(DATAGRAM_OUTBOX_LEN > DATAGRAM_QUEUE_LEN);
 
     #[test]
+    fn a_driver_that_stops_ends_every_datagram_it_still_holds() {
+        // One state per submitted datagram is the contract the other
+        // carriers keep, so a caller counting what it is owed is not left
+        // waiting on datagrams this end has forgotten.
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let mut datagrams: VecDeque<(Payload, u64)> = (1..=3)
+            .map(|context| (vot_transport_api::shared_payload(&[7; 16]), context))
+            .collect();
+        abandon_datagrams(&mut datagrams, &inbound);
+        assert!(datagrams.is_empty(), "nothing is still held");
+        let mut held = inbound.lock().expect("the queue");
+        let contexts: Vec<u64> = std::iter::from_fn(|| held.events.pop_front())
+            .map(|event| match event {
+                NativeEvent::DatagramDropped { context } => context,
+                other => panic!("a held datagram ends as dropped, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(contexts, vec![1, 2, 3], "in the order they were held");
+    }
+
+    #[test]
     fn the_datagram_outbox_bound_is_met_rather_than_passed() {
-        assert!(outbox_has_room(0));
+        assert!(outbox_has_room(0, 0, 1));
         assert!(
-            outbox_has_room(DATAGRAM_OUTBOX_LEN - 1),
-            "under the bound still holds"
+            outbox_has_room(DATAGRAM_OUTBOX_LEN - 1, 0, 1),
+            "under both bounds still holds"
         );
         assert!(
-            !outbox_has_room(DATAGRAM_OUTBOX_LEN),
-            "at the bound the next one goes"
+            !outbox_has_room(DATAGRAM_OUTBOX_LEN, 0, 1),
+            "at the count the next one goes"
         );
-        assert!(!outbox_has_room(DATAGRAM_OUTBOX_LEN + 1));
+        // The byte bound binds on its own, for datagrams larger than the
+        // count alone would ever reach.
+        assert!(outbox_has_room(0, DATAGRAM_OUTBOX_BYTES - 1, 1));
+        assert!(
+            !outbox_has_room(0, DATAGRAM_OUTBOX_BYTES, 1),
+            "at the bytes the next one goes"
+        );
+        assert!(
+            !outbox_has_room(0, DATAGRAM_OUTBOX_BYTES - 1, 2),
+            "one that would pass the bytes goes"
+        );
     }
 
     #[test]

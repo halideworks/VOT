@@ -105,6 +105,12 @@ pub struct FecCounts {
     /// Generations spanned by every coding epoch this end opened, whether or
     /// not the sender coded them.
     pub offered: u64,
+    /// Generations at least one symbol arrived for. Of the offered ones, the
+    /// rest were answered on the reliable path without a symbol ever being
+    /// sent, so `decoded` against this is how well the coded path decodes
+    /// what it carries, and this against `offered` is how much of what was
+    /// offered it carried at all.
+    pub coded: u64,
     /// Generations decoded from symbols.
     pub decoded: u64,
     /// Generations dropped for want of decode budget, after enough symbols
@@ -121,6 +127,7 @@ impl std::ops::Add for FecCounts {
     fn add(self, other: Self) -> Self {
         Self {
             offered: self.offered.saturating_add(other.offered),
+            coded: self.coded.saturating_add(other.coded),
             decoded: self.decoded.saturating_add(other.decoded),
             abandoned: self.abandoned.saturating_add(other.abandoned),
             refused: self.refused.saturating_add(other.refused),
@@ -227,12 +234,27 @@ impl Intake {
     pub(crate) fn symbol(&mut self, datagram: &[u8]) -> Option<Joined> {
         let header = peek_header(datagram)?;
         let cover = *self.epochs.get(&header.epoch)?;
-        match self.receiver.symbol(
+        // Asked before the symbol is taken, because it is the only way to
+        // tell a generation's first symbol from a later one for every
+        // outcome. `Symbol::Stored` reports it, but a generation holding a
+        // single source symbol decodes on the symbol that opens it and is
+        // never stored, and the tail generation of an epoch is often exactly
+        // that.
+        let opens_generation = self
+            .receiver
+            .report(header.epoch, header.generation)
+            .is_none();
+        let outcome = self.receiver.symbol(
             header.epoch,
             header.generation,
             header.esi,
             &datagram[SYMBOL_HEADER_LEN..],
-        ) {
+        );
+        // A drop took nothing, so it carried nothing. Everything else did.
+        if opens_generation && !matches!(outcome, Symbol::Dropped(_)) {
+            self.counts.coded += 1;
+        }
+        match outcome {
             Symbol::Decoded(Decoded {
                 generation,
                 offset,
@@ -533,6 +555,7 @@ mod tests {
             intake.counts(),
             FecCounts {
                 offered: 0,
+                coded: 0,
                 decoded: 0,
                 abandoned: 0,
                 refused: 1,
@@ -577,6 +600,10 @@ mod tests {
             intake.counts(),
             FecCounts {
                 offered: 32,
+                // Every one of them took a symbol, including the sixteen
+                // that then had nowhere to decode: a generation completing
+                // on the symbol that opens it still carried it.
+                coded: 32,
                 decoded: 16,
                 abandoned: 16,
                 refused: 1,
@@ -723,23 +750,26 @@ mod tests {
         // into another's place cannot pass.
         let left = FecCounts {
             offered: 1,
-            decoded: 2,
-            abandoned: 4,
-            refused: 8,
+            coded: 2,
+            decoded: 4,
+            abandoned: 8,
+            refused: 16,
         };
         let right = FecCounts {
-            offered: 16,
-            decoded: 32,
-            abandoned: 64,
-            refused: 128,
+            offered: 32,
+            coded: 64,
+            decoded: 128,
+            abandoned: 256,
+            refused: 512,
         };
         assert_eq!(
             left + right,
             FecCounts {
-                offered: 17,
-                decoded: 34,
-                abandoned: 68,
-                refused: 136,
+                offered: 33,
+                coded: 66,
+                decoded: 132,
+                abandoned: 264,
+                refused: 528,
             }
         );
         assert_eq!(left + FecCounts::default(), left);
@@ -747,11 +777,77 @@ mod tests {
         // was otherwise fine.
         let full = FecCounts {
             offered: u64::MAX,
+            coded: u64::MAX,
             decoded: u64::MAX,
             abandoned: u64::MAX,
             refused: u64::MAX,
         };
         assert_eq!(full + right, full);
+    }
+
+    /// The last generation of an epoch holds whatever the length left over,
+    /// which is often a single source symbol. Such a generation decodes on
+    /// the symbol that opens it and is never stored, so a count taken from
+    /// the stored outcome alone misses it and reports decoding more
+    /// generations than were carried.
+    #[test]
+    fn a_generation_of_one_source_symbol_counts_as_carried() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // k = 4, L = 2: 8 bytes a generation, and a length of 9 leaves the
+        // second generation holding one byte, which is one source symbol.
+        intake.open(&open_of(7, 0, 9, 4, 2, 2)).unwrap();
+        assert_eq!(intake.counts().offered, 2);
+        let plan = EpochPlan::new(7, 0, 9, Geometry::new(4, 2, 2).unwrap()).unwrap();
+        let (esi, symbol) = vot_fec::encode_generation(&plan, 1, &[9_u8])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("a geometry has symbols");
+        assert!(
+            intake.symbol(&datagram(7, 1, esi, &symbol)).is_some(),
+            "one source symbol is the whole generation"
+        );
+        let counts = intake.counts();
+        assert_eq!(counts.decoded, 1);
+        assert_eq!(counts.coded, 1, "the generation it decoded was carried");
+    }
+
+    /// What the coded path carried and what it decoded are different
+    /// questions: a generation nothing was sent for was answered reliably,
+    /// and reading decoded against offered alone reports that as a decode
+    /// that failed.
+    #[test]
+    fn a_generation_symbols_arrive_for_counts_as_carried_whether_it_decodes_or_not() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // k = 4, L = 2: 8 bytes a generation, so 16 bytes is two of them.
+        intake.open(&open_of(5, 0, 16, 4, 2, 2)).unwrap();
+        assert_eq!(intake.counts().offered, 2);
+        let bytes: Vec<u8> = (0..16_u8).collect();
+        let plan = EpochPlan::new(5, 0, 16, Geometry::new(4, 2, 2).unwrap()).unwrap();
+
+        // The first generation gets every symbol and decodes.
+        for (esi, symbol) in vot_fec::encode_generation(&plan, 0, &bytes[..8]).unwrap() {
+            let _ = intake.symbol(&datagram(5, 0, esi, &symbol));
+        }
+        // The second gets one, which carries it no further than stored.
+        let (esi, symbol) = vot_fec::encode_generation(&plan, 1, &bytes[8..])
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("a geometry has symbols");
+        assert!(intake.symbol(&datagram(5, 1, esi, &symbol)).is_none());
+
+        let counts = intake.counts();
+        assert_eq!(counts.coded, 2, "a symbol arrived for both");
+        assert_eq!(counts.decoded, 1, "only one had enough of them");
+        assert!(
+            counts.coded <= counts.offered,
+            "nothing is carried that was not offered"
+        );
     }
 
     #[test]

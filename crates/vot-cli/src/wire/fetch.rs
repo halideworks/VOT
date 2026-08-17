@@ -132,6 +132,11 @@ where
 /// throughput, and the datagram-FEC counts that say how much of the object
 /// the coded path carried and how much fell back to the reliable one.
 ///
+/// `fec_coded` sits between offered and decoded because those two answer
+/// different questions: a generation an epoch spanned but no symbol was ever
+/// sent for was answered reliably and never coded at all, and reading
+/// decoded against offered alone reports that as a decode failure.
+///
 /// The bytes are this fetch's own, not the package's length: a fetch that
 /// resumed a bundle asks only for what is missing, and dividing the whole
 /// package by the time it took to move the remainder is a throughput of
@@ -149,10 +154,11 @@ pub(crate) fn stats_line(
     fec: vot_scheduler::FecCounts,
 ) -> String {
     format!(
-        "fetch stats bytes={bytes} ms={} fec_offered={} fec_decoded={} \
+        "fetch stats bytes={bytes} ms={} fec_offered={} fec_coded={} fec_decoded={} \
          fec_abandoned={} fec_refused={}",
         elapsed.as_millis(),
         fec.offered,
+        fec.coded,
         fec.decoded,
         fec.abandoned,
         fec.refused

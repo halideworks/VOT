@@ -2287,6 +2287,7 @@ mod tests {
             driver.fec_counts(),
             crate::FecCounts {
                 offered: plan.generation_count(),
+                coded: 2,
                 decoded: 2,
                 abandoned: 0,
                 refused: 0,

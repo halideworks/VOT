@@ -198,9 +198,9 @@ impl BundleServer {
     ///
     /// So the wait is per epoch and it is a queue position, not an empty
     /// queue: an epoch's symbols are all queued in one pass, and once the
-    /// carrier has taken that many bytes they are gone from this end. After
-    /// that, silence about the epoch is the receiver's silence, whatever else
-    /// this connection is sending.
+    /// carrier has taken that many bytes this end has handed all of them
+    /// over. After that, silence about the epoch is the receiver's silence,
+    /// whatever else this connection is sending.
     pub(crate) fn retire_quiet_epochs(
         &self,
         connection: &mut ServeConnection,

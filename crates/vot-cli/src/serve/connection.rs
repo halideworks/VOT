@@ -59,10 +59,10 @@ pub(crate) struct OpenedEpoch {
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,
-    /// The outbound mark this epoch's symbols sit behind. Its symbols are
-    /// all on the carrier once the queue has taken this many bytes, which is
-    /// what makes silence about the epoch mean the receiver is not
-    /// answering rather than that this end has not sent yet.
+    /// The outbound mark this epoch's symbols sit behind. The carrier has
+    /// taken all of them once it has taken this many bytes, which is what
+    /// makes silence about the epoch mean the receiver is not answering
+    /// rather than that this end has not handed them over yet.
     pub(crate) queued_through: u64,
     /// When this epoch was first seen with its symbols all on the carrier
     /// and nothing heard about it since. Cleared by anything the receiver

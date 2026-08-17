@@ -3,7 +3,7 @@
 //! Make a pass; if it left something to do without hearing from the peer,
 //! make another; otherwise wait on the carrier.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vot_transport_api::TransportAdapter;
 
@@ -24,6 +24,18 @@ const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 /// bounds cost what they actually wait. Quiche's idle timeout settles most
 /// sessions first; this is the backstop.
 const STALLED_WAIT_MS: u64 = 30_000;
+const STALLED_WAIT: Duration = Duration::from_millis(STALLED_WAIT_MS);
+
+/// No-progress passes before the loop paces itself.
+///
+/// A wait returns at once when an event is already queued, so a session that
+/// is making no progress while events keep arriving spins: it charges the
+/// budget nothing and burns a core. Past this many such passes the loop
+/// sleeps out the rest of the bound it asked for, which puts the budget back
+/// on a real clock and takes the core back. Above any run of zero-cost waits
+/// a healthy pass makes, since a pass that drains what woke it reports
+/// progress and resets this.
+const SPINNING_BEFORE_PACING: u64 = 64;
 
 /// One end of a session: a pass to make, a way to say the pass settled it,
 /// and the carrier to wait on.
@@ -46,8 +58,12 @@ pub trait Engine {
     /// Cumulative progress. Any increase resets the stall budget.
     fn progress(&self) -> u64;
 
-    /// Waits for the carrier to report something, or for `bound`.
-    fn wait(&mut self, bound: Duration);
+    /// Waits for the carrier to report something, or for `bound`, and
+    /// reports how long it actually waited.
+    ///
+    /// The duration is what the stall budget is spent from, so a wait that
+    /// returned at once because an event was already there costs nothing.
+    fn wait(&mut self, bound: Duration) -> Duration;
 }
 
 /// Drives `engine` until a pass settles it, and answers with that status.
@@ -59,15 +75,46 @@ pub fn drive<E: Engine>(engine: &mut E) -> Result<E::Status, Error> {
     drive_until(engine, |_| false)?.ok_or(Error::Stalled)
 }
 
+/// [`drive`] under a stall budget of the caller's choosing.
+///
+/// The budget is spent in real time, so a test that means to watch a session
+/// be given up on says how long it is willing to wait for that rather than
+/// waiting out the production half minute.
+///
+/// # Errors
+/// As [`drive`].
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn drive_within<E: Engine>(
+    engine: &mut E,
+    budget: Duration,
+) -> Result<E::Status, Error> {
+    drive_until_within(engine, |_| false, budget)?.ok_or(Error::Stalled)
+}
+
 /// Drives `engine` until a pass settles it or `done` holds.
 ///
 /// # Errors
 /// Surfaces the engine's own failure, or [`Error::Stalled`] as [`drive`].
 pub fn drive_until<E: Engine>(
     engine: &mut E,
-    mut done: impl FnMut(&E) -> bool,
+    done: impl FnMut(&E) -> bool,
 ) -> Result<Option<E::Status>, Error> {
-    let mut stalled_ms: u64 = 0;
+    drive_until_within(engine, done, STALLED_WAIT)
+}
+
+/// [`drive_until`] under a stall budget of the caller's choosing.
+///
+/// # Errors
+/// As [`drive_until`].
+pub(crate) fn drive_until_within<E: Engine>(
+    engine: &mut E,
+    mut done: impl FnMut(&E) -> bool,
+    stall_budget: Duration,
+) -> Result<Option<E::Status>, Error> {
+    // Counted down rather than up, and saturating, so the budget reaches
+    // exactly zero and stays there however long the loop runs.
+    let mut budget = stall_budget;
+    let mut spinning: u64 = 0;
     let mut settled_so_far = engine.progress();
     loop {
         let status = engine.service()?;
@@ -79,26 +126,37 @@ pub fn drive_until<E: Engine>(
         }
         // Always wait, even with a backlog: tight-looping a backpressured
         // carrier just burns a core.
-        let (wait, spent) = if engine.has_backlog() {
-            (BUSY_BOUND, BUSY_BOUND_MS)
+        let wait = if engine.has_backlog() {
+            BUSY_BOUND
         } else {
-            (IDLE_BOUND, IDLE_BOUND_MS)
+            IDLE_BOUND
         };
         let progress = engine.progress();
         match progress.cmp(&settled_so_far) {
             std::cmp::Ordering::Equal => {
-                // Saturating add so a stuck counter cannot overflow to the stall check.
-                stalled_ms = stalled_ms.saturating_add(spent);
-                if stalled_ms > STALLED_WAIT_MS {
+                spinning = spinning.saturating_add(1);
+                if budget.is_zero() {
                     return Err(Error::Stalled);
                 }
             }
             std::cmp::Ordering::Less | std::cmp::Ordering::Greater => {
                 settled_so_far = progress;
-                stalled_ms = 0;
+                budget = stall_budget;
+                spinning = 0;
             }
         }
-        engine.wait(wait);
+        // Spent on what the pass waited, not on what it asked to wait: a
+        // wait that returns at once because an event was already queued cost
+        // nothing, and charging it a whole bound is what let a busy session
+        // spend a half minute of budget in about a second.
+        let waited = engine.wait(wait);
+        budget = budget.saturating_sub(waited);
+        if spinning > SPINNING_BEFORE_PACING {
+            if let Some(rest) = wait.checked_sub(waited) {
+                std::thread::sleep(rest);
+                budget = budget.saturating_sub(rest);
+            }
+        }
     }
 }
 
@@ -254,8 +312,10 @@ impl<A: TransportAdapter> Engine for crate::BundleFetcher<A> {
         Self::progress(self)
     }
 
-    fn wait(&mut self, bound: Duration) {
+    fn wait(&mut self, bound: Duration) -> Duration {
+        let began = Instant::now();
         self.session_mut().driver().wait_for_event(bound);
+        began.elapsed()
     }
 }
 
@@ -347,7 +407,21 @@ pub(crate) const CONCURRENT_SESSIONS: usize = 8;
 /// Surfaces `next`'s failure always, and a session's failure only when
 /// `sessions` is bounded.
 #[cfg(any(test, feature = "wire"))]
-pub(crate) fn serve_sessions<'server, A, F>(sessions: Option<u32>, mut next: F) -> Result<(), Error>
+pub(crate) fn serve_sessions<'server, A, F>(sessions: Option<u32>, next: F) -> Result<(), Error>
+where
+    A: TransportAdapter + Send,
+    F: FnMut() -> Result<ServeSession<'server, A>, Error>,
+{
+    serve_sessions_within(sessions, STALLED_WAIT, next)
+}
+
+/// [`serve_sessions`] driving each session under `stall_budget`.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn serve_sessions_within<'server, A, F>(
+    sessions: Option<u32>,
+    stall_budget: Duration,
+    mut next: F,
+) -> Result<(), Error>
 where
     A: TransportAdapter + Send,
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
@@ -376,7 +450,9 @@ where
                 Ok(session) => session,
                 Err(error) => return running.finish().and(Err(error)),
             };
-            running.spawn(scope, move || drive(&mut session).map(|_| ()));
+            running.spawn(scope, move || {
+                drive_within(&mut session, stall_budget).map(|_| ())
+            });
         }
         running.finish()
     })
@@ -615,8 +691,10 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
         self.connection.progress()
     }
 
-    fn wait(&mut self, bound: Duration) {
+    fn wait(&mut self, bound: Duration) -> Duration {
+        let began = Instant::now();
         self.session.driver().wait_for_event(bound);
+        began.elapsed()
     }
 }
 
@@ -625,8 +703,13 @@ mod tests {
     use super::*;
 
     /// Passes the budget allows at each bound.
-    const IDLE_PASSES: u64 = STALLED_WAIT_MS / IDLE_BOUND_MS;
-    const BUSY_PASSES: u64 = STALLED_WAIT_MS / BUSY_BOUND_MS;
+    /// A budget the suite can spend in real time. The production one is a
+    /// half minute, and a test that watches a session be given up on waits
+    /// out whatever it names.
+    const TEST_STALL_MS: u64 = 500;
+    const TEST_STALL: Duration = Duration::from_millis(TEST_STALL_MS);
+    const IDLE_PASSES: u64 = TEST_STALL_MS / IDLE_BOUND_MS;
+    const BUSY_PASSES: u64 = TEST_STALL_MS / BUSY_BOUND_MS;
 
     #[test]
     fn every_terminal_status_names_its_error() {
@@ -653,7 +736,7 @@ mod tests {
         let (bundle, _) = built_bundle("outlives", &[("a.txt", patterned(1000))]);
         let server = crate::BundleServer::open(&bundle).unwrap();
         let mut sessions = 0_u32;
-        let outcome = serve_sessions(None, || {
+        let outcome = serve_sessions_within(None, TEST_STALL, || {
             sessions += 1;
             match sessions {
                 1 => ServeSession::begin(&server, Loopback::default(), not_required()),
@@ -674,7 +757,7 @@ mod tests {
         assert_eq!(sessions, 5, "the stalled session was survived");
 
         let mut bounded = 0_u32;
-        let outcome = serve_sessions(Some(2), || {
+        let outcome = serve_sessions_within(Some(2), TEST_STALL, || {
             bounded += 1;
             if bounded > 2 {
                 return Err(Error::CarrierUnavailable);
@@ -685,7 +768,7 @@ mod tests {
         assert_eq!(bounded, 2, "the bound was accepted, the failure surfaced");
 
         let mut counted = 0_u32;
-        let outcome = serve_sessions(Some(1), || {
+        let outcome = serve_sessions_within(Some(1), TEST_STALL, || {
             counted += 1;
             if counted > 1 {
                 return Err(Error::CarrierUnavailable);
@@ -741,7 +824,7 @@ mod tests {
             carrier
         };
         let mut accepts = 0_u32;
-        let outcome = serve_sessions(Some(2), || {
+        let outcome = serve_sessions_within(Some(2), TEST_STALL, || {
             accepts += 1;
             match accepts {
                 1 | 3 => ServeSession::begin(&server, clean(), not_required()),
@@ -782,7 +865,7 @@ mod tests {
         let serving = std::thread::spawn(move || {
             let server = crate::BundleServer::open(&serving_bundle)?;
             let mut half = Some(half);
-            serve_sessions(Some(1), || {
+            serve_sessions_within(Some(1), TEST_STALL, || {
                 half.take()
                     .map_or(Err(Error::CarrierUnavailable), |carrier| {
                         ServeSession::begin(&server, carrier, not_required())
@@ -849,7 +932,7 @@ mod tests {
         // whenever the plan finishes before they join.
         let (bundle, _) = built_bundle("silent", &[("a.txt", patterned(1000))]);
         let server = crate::BundleServer::open(&bundle).unwrap();
-        let outcome = serve_sessions(Some(1), || {
+        let outcome = serve_sessions_within(Some(1), TEST_STALL, || {
             let mut carrier = Loopback::default();
             carrier
                 .on_wait
@@ -893,7 +976,7 @@ mod tests {
         let gate = Rendezvous::expecting(2);
         let total = u32::try_from(CONCURRENT_SESSIONS).unwrap() + 2;
         let mut handed = 0_u32;
-        let outcome = serve_sessions(Some(total), || {
+        let outcome = serve_sessions_within(Some(total), TEST_STALL, || {
             handed += 1;
             if handed > total {
                 return Err(Error::CarrierUnavailable);
@@ -924,7 +1007,7 @@ mod tests {
         let server = crate::BundleServer::open(&bundle).unwrap();
         let gate = Rendezvous::expecting(2);
         let mut handed = 0_u32;
-        let outcome = serve_sessions(Some(2), || {
+        let outcome = serve_sessions_within(Some(2), TEST_STALL, || {
             handed += 1;
             if handed > 2 {
                 return Err(Error::CarrierUnavailable);
@@ -957,6 +1040,12 @@ mod tests {
         passes: u64,
         busy_waits: u64,
         idle_waits: u64,
+        /// What every wait reports as waited. `None` reports the whole
+        /// bound, which is what a carrier with nothing to say does.
+        waited: Option<Duration>,
+        /// A pass, counted from one, that reports progress however many
+        /// quiet passes came before it.
+        progress_on: Option<u64>,
     }
 
     impl Engine for Scripted {
@@ -970,6 +1059,9 @@ mod tests {
             self.unsettled -= 1;
             if self.with_progress > 0 {
                 self.with_progress -= 1;
+                self.settled += 1;
+            }
+            if self.progress_on == Some(self.passes) {
                 self.settled += 1;
             }
             Ok(false)
@@ -987,12 +1079,15 @@ mod tests {
             self.settled
         }
 
-        fn wait(&mut self, bound: Duration) {
+        /// Reports the whole bound as waited, so the budget a test spends is
+        /// the one it counts passes for rather than this machine's clock.
+        fn wait(&mut self, bound: Duration) -> Duration {
             if bound == BUSY_BOUND {
                 self.busy_waits = self.busy_waits.saturating_add(1);
             } else {
                 self.idle_waits = self.idle_waits.saturating_add(1);
             }
+            self.waited.unwrap_or(bound)
         }
     }
 
@@ -1114,7 +1209,7 @@ mod tests {
     #[test]
     fn a_settled_pass_ends_the_loop_without_waiting() {
         let mut engine = Scripted::default();
-        assert!(drive(&mut engine).unwrap());
+        assert!(drive_within(&mut engine, TEST_STALL).unwrap());
         assert_eq!(engine.passes, 1);
         assert_eq!(engine.busy_waits + engine.idle_waits, 0);
     }
@@ -1127,7 +1222,7 @@ mod tests {
             backlogged: true,
             ..Scripted::default()
         };
-        assert!(drive(&mut engine).unwrap());
+        assert!(drive_within(&mut engine, TEST_STALL).unwrap());
         assert_eq!(engine.busy_waits, 4, "a held pass waits the short bound");
         assert_eq!(engine.idle_waits, 0);
     }
@@ -1140,7 +1235,7 @@ mod tests {
             backlogged: false,
             ..Scripted::default()
         };
-        assert!(drive(&mut engine).unwrap());
+        assert!(drive_within(&mut engine, TEST_STALL).unwrap());
         assert_eq!(engine.idle_waits, 3, "an empty pass waits the long bound");
         assert_eq!(engine.busy_waits, 0);
         assert!(BUSY_BOUND < IDLE_BOUND);
@@ -1153,7 +1248,7 @@ mod tests {
             with_progress: 4 * IDLE_PASSES,
             ..Scripted::default()
         };
-        assert!(drive(&mut engine).unwrap());
+        assert!(drive_within(&mut engine, TEST_STALL).unwrap());
         assert_eq!(engine.passes, 4 * IDLE_PASSES + 1);
     }
 
@@ -1164,8 +1259,57 @@ mod tests {
             with_progress: 0,
             ..Scripted::default()
         };
-        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
         assert_eq!(engine.passes, IDLE_PASSES + 1);
+        assert_eq!(engine.idle_waits, IDLE_PASSES);
+    }
+
+    /// The budget is spent on what a pass waited, so a carrier that answers
+    /// halfway through its bound takes twice the passes to be given up on.
+    /// Charging the bound instead is what declared a busy serve stalled
+    /// inside a second.
+    #[test]
+    fn a_pass_that_waited_less_than_its_bound_spends_less_of_the_budget() {
+        let mut engine = Scripted {
+            unsettled: 8 * IDLE_PASSES,
+            with_progress: 0,
+            waited: Some(IDLE_BOUND / 2),
+            ..Scripted::default()
+        };
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
+        assert_eq!(
+            engine.passes,
+            2 * IDLE_PASSES + 1,
+            "half a bound a wait buys twice the passes a whole one does"
+        );
+    }
+
+    /// A carrier whose waits cost nothing at all would spend no budget and
+    /// spin, so past a run of them the loop sleeps out the rest of the bound
+    /// and gives up on the clock that restores.
+    #[test]
+    fn a_carrier_whose_waits_cost_nothing_is_still_given_up_on() {
+        let mut engine = Scripted {
+            unsettled: 8 * (SPINNING_BEFORE_PACING + IDLE_PASSES),
+            with_progress: 0,
+            waited: Some(Duration::ZERO),
+            ..Scripted::default()
+        };
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
+        assert_eq!(
+            engine.passes,
+            SPINNING_BEFORE_PACING + IDLE_PASSES + 1,
+            "free until pacing starts, then a bound a pass"
+        );
     }
 
     #[test]
@@ -1176,7 +1320,10 @@ mod tests {
             backlogged: true,
             ..Scripted::default()
         };
-        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
         assert_eq!(engine.passes, BUSY_PASSES + 1);
         assert_eq!(engine.busy_waits, BUSY_PASSES);
         assert_eq!(
@@ -1193,7 +1340,33 @@ mod tests {
             with_progress: 1,
             ..Scripted::default()
         };
-        assert!(matches!(drive(&mut engine), Err(Error::Stalled)));
-        assert_eq!(engine.passes, IDLE_PASSES + 2);
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
+        assert_eq!(engine.passes, IDLE_PASSES + 1);
+    }
+
+    /// One report of progress with the budget nearly spent buys a whole
+    /// fresh budget, so the loop runs a second one before giving up. Without
+    /// the reset it would give up at the end of the first.
+    #[test]
+    fn progress_with_the_budget_nearly_spent_buys_a_whole_new_one() {
+        let late = IDLE_PASSES - 1;
+        let mut engine = Scripted {
+            unsettled: 4 * IDLE_PASSES,
+            with_progress: 0,
+            progress_on: Some(late),
+            ..Scripted::default()
+        };
+        assert!(matches!(
+            drive_within(&mut engine, TEST_STALL),
+            Err(Error::Stalled)
+        ));
+        assert_eq!(
+            engine.passes,
+            late + IDLE_PASSES,
+            "the budget starts again from the pass that made progress"
+        );
     }
 }

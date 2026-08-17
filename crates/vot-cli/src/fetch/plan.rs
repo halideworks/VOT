@@ -100,6 +100,23 @@ const _: () = assert!(ORPHAN_BUNDLE_BYTES == 40_108_032);
 const FEC_PIECE_BYTES_USIZE: usize = 1_114_112;
 const _: () = assert!(FEC_PIECE_BYTES_USIZE as u64 == crate::serve::server::FEC_PIECE_BYTES);
 
+/// Bundles that may hold records which arrived before their proof.
+///
+/// Sized so [`ORPHAN_BUNDLE_BYTES`] is what binds, because it is the bytes
+/// that bound what a peer can pin and the count is bookkeeping. An entry
+/// holds whatever records of its piece have arrived, which on a coded
+/// transfer under loss is a few generations rather than a whole piece: at a
+/// count of whole pieces, a 4 GB coded fetch across a 216 ms path at 3% loss
+/// filled 36 entries of 36 while holding 10.9 MB of a 40 MB budget, and
+/// failed seven runs in nine. Divided by one generation, the smallest record
+/// such an entry holds, the same fetch completed six times in six.
+pub(crate) const ORPHAN_BUNDLE_DEPTH: usize = ORPHAN_BUNDLE_BYTES / FEC_GENERATION_BYTES_USIZE;
+
+const FEC_GENERATION_BYTES_USIZE: usize = 65_536;
+const _: () =
+    assert!(FEC_GENERATION_BYTES_USIZE as u64 == crate::serve::server::FEC_GENERATION_BYTES);
+const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 612);
+
 /// Bytes this fetch may have asked for and not yet placed.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;
 

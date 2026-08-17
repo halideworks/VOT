@@ -42,7 +42,12 @@ const PIECES_PER_COVER: usize = 5;
 /// The byte budget beside it is [`PENDING_BUNDLE_BYTES`], which is sized for
 /// what the two pipelines actually hold rather than for this count of
 /// worst-case bundles.
-pub(crate) const PENDING_BUNDLE_DEPTH: usize = OUTSTANDING_COVERS * PIECES_PER_COVER;
+pub(crate) const PENDING_BUNDLE_DEPTH: usize =
+    RELIABLE_BUNDLE_DEPTH + 2 * vot_scheduler::session::MAX_CODING_EPOCHS;
+
+/// Bundles the reliable pipeline alone can hold: every outstanding cover, in
+/// every piece it may be answered in.
+pub(crate) const RELIABLE_BUNDLE_DEPTH: usize = OUTSTANDING_COVERS * PIECES_PER_COVER;
 
 // Tied to the geometry it stands for, so a change to either the cover bound
 // or the piece size breaks the build here rather than showing up as a fetch
@@ -51,7 +56,17 @@ const _: () = assert!(
     PIECES_PER_COVER as u64
         == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
 );
-const _: () = assert!(PENDING_BUNDLE_DEPTH == 20);
+const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
+// An open epoch pins a bundle for its whole life, so the depth has to hold
+// the epochs on top of the reliable pipeline rather than carve them out of
+// it. At the depth alone a fetch at fifteen epochs died of
+// `PendingBundlesExhausted` under loss with the byte budget barely touched.
+//
+// Two bundles a slot, not one: retiring an epoch frees its slot the moment
+// the repair records are queued, so the next request opens a fresh epoch and
+// a fresh bundle while the retired one is still incomplete at the receiver,
+// a transit behind. One slot can hold both for that transit.
+const _: () = assert!(PENDING_BUNDLE_DEPTH == 36);
 
 /// Bytes a fetch may hold across part-built bundles.
 ///
@@ -67,14 +82,14 @@ const _: () = assert!(PENDING_BUNDLE_DEPTH == 20);
 /// default.
 pub(crate) const PENDING_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
     * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
-    + PENDING_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+    + RELIABLE_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
 
 /// Orphan records are the same pieces before their proof, so they are
 /// bounded the same way, against the record bound a bundle without its proof
 /// carries.
 pub(crate) const ORPHAN_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
     * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-    + PENDING_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+    + RELIABLE_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
 
 // Spelled out, so a slip in either sum is a build failure rather than a
 // budget that silently refuses a conforming transfer or admits far more than

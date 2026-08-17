@@ -570,6 +570,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.pending.orphan_byte_limit
     }
 
+    /// The bound on how many bundles hold records that arrived before their
+    /// proof, so a caller that derives it can hold the derivation to account.
+    #[must_use]
+    pub const fn orphan_bundle_limit(&self) -> usize {
+        self.pending.orphan_bundle_limit
+    }
+
     /// The bound on what [`Self::take_completed`] may owe at once.
     #[must_use]
     pub const fn deferred_limit(&self) -> usize {
@@ -1526,6 +1533,16 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(driver.orphan_byte_limit(), MAX_ORPHAN_BUNDLE_BYTES + 7);
+        // The count as well as the bytes: a caller sizing it for a coded
+        // pipeline that orphans records has to be able to read back what it
+        // asked for.
+        assert_eq!(driver.orphan_bundle_limit(), 1);
+        assert!(
+            driver
+                .set_orphan_limits(36, MAX_ORPHAN_BUNDLE_BYTES + 7)
+                .is_ok()
+        );
+        assert_eq!(driver.orphan_bundle_limit(), 36);
         assert!(
             driver
                 .set_pending_limits(0, MAX_PENDING_BUNDLE_BYTES)

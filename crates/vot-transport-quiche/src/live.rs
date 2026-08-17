@@ -61,6 +61,8 @@ const SEND_BUFFER_BYTES: u32 = 2_097_152;
 pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 
 /// Most events the driver holds for a caller that has not drained them.
+///
+/// Datagrams are not held to this bound; they have their own, below.
 const MAX_INBOUND_EVENTS: usize = 1_024;
 
 /// Datagrams quiche queues in each direction before it refuses or drops one.
@@ -93,6 +95,19 @@ const DATAGRAM_OUTBOX_BYTES: usize = 1 << 20;
 /// them, on top of the shared budget. A quarter of that budget, so the stream
 /// reader's headroom precondition always survives a datagram flood.
 const MAX_DATAGRAM_INBOUND_BYTES: usize = MAX_ASSEMBLY_BYTES / 4;
+
+/// Received datagrams the driver holds for a caller that has not drained them.
+///
+/// Counted apart from [`MAX_INBOUND_EVENTS`], which is a bound on how many
+/// records a caller may fall behind by and is met by a datagram burst long
+/// before the byte cap above is. A datagram count bound is still needed,
+/// because bytes alone do not bound a flood of tiny ones; at half a kilobyte
+/// each the byte cap is what governs, which is what it was sized to do.
+const MAX_DATAGRAM_INBOUND_EVENTS: usize = MAX_DATAGRAM_INBOUND_BYTES / 512;
+
+/// The bound datagrams left has to be the smaller of the two, or separating
+/// them holds them to a count tighter than the one they shared.
+const _: () = assert!(MAX_DATAGRAM_INBOUND_EVENTS > MAX_INBOUND_EVENTS);
 
 /// What the driver holds across every outbox before it stops taking submissions.
 ///
@@ -142,6 +157,9 @@ struct Inbound {
     assembling: usize,
     /// Received datagram bytes among `bytes`, capped on their own.
     datagram_bytes: usize,
+    /// Datagrams among `events`, counted on their own so a burst of them does
+    /// not meet a bound that exists for the records beside them.
+    datagram_events: usize,
     /// Raised on every push, waited on by `wait_for_event`. Shared so a
     /// waiter holds no lock the pump needs while it sleeps.
     arrived: Arc<vot_transport_api::EventSignal>,
@@ -152,21 +170,36 @@ impl Inbound {
         self.bytes + self.assembling
     }
 
+    /// Whether an event of this class is already at its count bound.
+    fn counted_out(&self, datagram: bool) -> bool {
+        // A datagram removed from `events` without `pop` would leave this
+        // count high, and the subtraction below would saturate to no bound at
+        // all rather than fail.
+        debug_assert!(self.datagram_events <= self.events.len());
+        if datagram {
+            self.datagram_events >= MAX_DATAGRAM_INBOUND_EVENTS
+        } else {
+            self.events.len().saturating_sub(self.datagram_events) >= MAX_INBOUND_EVENTS
+        }
+    }
+
     /// Queues one event, or gives it back when either bound is met. A
-    /// datagram is also bounded by its own byte cap.
+    /// datagram is also bounded by its own count and byte caps.
     fn push(&mut self, event: NativeEvent) -> Result<(), NativeEvent> {
         let payload = native_payload_len(&event);
         let Some(next) = self.charged().checked_add(payload) else {
             return Err(event);
         };
-        if self.events.len() >= MAX_INBOUND_EVENTS || next > MAX_ASSEMBLY_BYTES {
+        let datagram = matches!(event, NativeEvent::Datagram(_));
+        if self.counted_out(datagram) || next > MAX_ASSEMBLY_BYTES {
             return Err(event);
         }
-        if matches!(event, NativeEvent::Datagram(_)) {
+        if datagram {
             if self.datagram_bytes + payload > MAX_DATAGRAM_INBOUND_BYTES {
                 return Err(event);
             }
             self.datagram_bytes += payload;
+            self.datagram_events += 1;
         }
         self.events.push_back(event);
         self.bytes += payload;
@@ -190,6 +223,7 @@ impl Inbound {
         self.bytes = self.bytes.saturating_sub(payload);
         if matches!(event, NativeEvent::Datagram(_)) {
             self.datagram_bytes = self.datagram_bytes.saturating_sub(payload);
+            self.datagram_events = self.datagram_events.saturating_sub(1);
         }
         Some(event)
     }
@@ -3925,6 +3959,53 @@ mod tests {
         let _ = inbound.pop();
         assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES * 3 / 4);
         assert!(inbound.push(datagram()).is_ok(), "room again");
+    }
+
+    /// A datagram burst meets the count bound sized for datagrams, not the one
+    /// that exists for the records beside them, and neither class spends the
+    /// other's.
+    #[test]
+    fn a_datagram_is_counted_apart_from_the_events_beside_it() {
+        let mut inbound = Inbound::default();
+        for _ in 0..MAX_INBOUND_EVENTS {
+            assert!(inbound.push(NativeEvent::Control(vec![].into())).is_ok());
+        }
+        assert!(
+            inbound.push(NativeEvent::Control(vec![].into())).is_err(),
+            "an event past the count was accepted"
+        );
+        assert!(
+            inbound
+                .push(NativeEvent::Datagram(vec![1_u8].into()))
+                .is_ok(),
+            "a datagram was refused for a count it is not held to"
+        );
+
+        let mut inbound = Inbound::default();
+        for _ in 0..MAX_DATAGRAM_INBOUND_EVENTS {
+            assert!(
+                inbound
+                    .push(NativeEvent::Datagram(vec![1_u8].into()))
+                    .is_ok()
+            );
+        }
+        assert!(
+            inbound
+                .push(NativeEvent::Datagram(vec![1_u8].into()))
+                .is_err(),
+            "a datagram past its own count was accepted"
+        );
+        assert!(
+            inbound.push(NativeEvent::Control(vec![].into())).is_ok(),
+            "a record was refused for a count the datagrams filled"
+        );
+        let _ = inbound.pop();
+        assert!(
+            inbound
+                .push(NativeEvent::Datagram(vec![1_u8].into()))
+                .is_ok(),
+            "a popped datagram did not give its slot back"
+        );
     }
 
     #[test]

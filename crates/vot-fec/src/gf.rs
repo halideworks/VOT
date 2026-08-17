@@ -57,6 +57,32 @@ pub(crate) const fn inv(a: u8) -> u8 {
     EXP[255 - LOG[a as usize] as usize]
 }
 
+/// Every product of `coefficient`, so the kernel below spends one lookup a
+/// byte instead of two that depend on each other.
+///
+/// Building it is a flat cost and reading it saves per byte, so it pays from
+/// about half a kilobyte up. The protocol's own symbols are a kilobyte, where
+/// it is worth about a quarter of the kernel's time, but a peer names the
+/// symbol length in `CODING_EPOCH_OPEN` and a short one pays the table
+/// without earning it back. One kernel rather than two, because which of two
+/// ran is invisible in the bytes they produce and so is a branch no test can
+/// hold.
+///
+/// Never called with a zero coefficient: `LOG[0]` is not a logarithm, it is
+/// the zero the table was never written at, and the table this would build
+/// from it is the identity rather than all zeros. The caller returns early
+/// instead, and this says so out loud because the two are far apart.
+fn products_of(coefficient: u8) -> [u8; 256] {
+    debug_assert!(coefficient != 0, "zero has no logarithm to take");
+    let log_c = LOG[coefficient as usize] as usize;
+    let mut products = [0_u8; 256];
+    // Zero times anything is zero, and `LOG[0]` is not a logarithm.
+    for (value, product) in products.iter_mut().enumerate().skip(1) {
+        *product = EXP[log_c + LOG[value] as usize];
+    }
+    products
+}
+
 /// `out[i] ^= coefficient * symbol[i]` for every byte, the encode kernel.
 pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
     debug_assert_eq!(out.len(), symbol.len());
@@ -69,17 +95,33 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
         }
         return;
     }
-    let log_c = LOG[coefficient as usize] as usize;
+    let products = products_of(coefficient);
     for (o, s) in out.iter_mut().zip(symbol) {
-        if *s != 0 {
-            *o ^= EXP[log_c + LOG[*s as usize] as usize];
-        }
+        *o ^= products[*s as usize];
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table is the kernel's whole correctness: every entry has to be the
+    /// product the scalar rule gives, including the zero the logarithm cannot
+    /// take.
+    #[test]
+    fn every_product_table_matches_the_scalar_rule() {
+        for coefficient in 1..=u8::MAX {
+            let products = products_of(coefficient);
+            assert_eq!(products[0], 0, "zero times {coefficient}");
+            for value in 1..=u8::MAX {
+                assert_eq!(
+                    products[value as usize],
+                    mul(coefficient, value),
+                    "{coefficient} times {value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_non_zero_element_has_an_inverse_and_the_tables_agree() {
@@ -138,5 +180,35 @@ mod tests {
     #[should_panic(expected = "no inverse of zero")]
     fn zero_has_no_inverse() {
         let _ = inv(0);
+    }
+}
+
+#[cfg(test)]
+mod cost {
+    use super::*;
+
+    /// Not a gate: what the kernel costs over the symbol length the shipped
+    /// geometry uses. Run with
+    /// `cargo test --release -p vot-fec what_the_kernel_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement rather than a gate, and it wants a release build"]
+    fn what_the_kernel_costs() {
+        const LENGTH: u32 = 1_024;
+        let symbol: Vec<u8> = (0..LENGTH)
+            .map(|i| u8::try_from(i % 251).expect("under 251"))
+            .collect();
+        let mut out = vec![0_u8; symbol.len()];
+        let rounds: u32 = 400_000;
+        let began = std::time::Instant::now();
+        for round in 0..rounds {
+            let coefficient = u8::try_from(round % 254).expect("under 254") + 2;
+            mul_add(&mut out, coefficient, &symbol);
+        }
+        let spent = began.elapsed();
+        eprintln!(
+            "mul_add: {rounds} calls of {LENGTH} bytes in {spent:?}, {:.2} GB/s, sink={}",
+            (f64::from(rounds) * f64::from(LENGTH)) / spent.as_secs_f64() / 1e9,
+            out[0]
+        );
     }
 }

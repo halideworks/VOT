@@ -190,24 +190,33 @@ impl BundleServer {
     /// every pass retires epochs whose outcomes are still in flight, because
     /// the carrier's wait returns the moment anything is queued and a budget
     /// of passes is microseconds on a busy connection. Requiring the whole
-    /// connection to fall silent never fires at all during a transfer, so an
-    /// epoch holding one generation that cannot decode keeps its slot to the
-    /// end and every later piece is answered reliably: measured over a 1 GB
-    /// fetch, all eight slots were held for the whole run and under a tenth
-    /// of the object travelled coded.
+    /// outbound queue to be empty never fires during a transfer that fills a
+    /// path: measured over a 4 GB coded fetch across a 216 ms path at 1%
+    /// loss, no epoch was ever retired, the generations that never decoded
+    /// held their bundles part-built, and the fetch died of
+    /// `PendingBundlesExhausted` with a third of the object still to place.
+    ///
+    /// So the wait is per epoch and it is a queue position, not an empty
+    /// queue: an epoch's symbols are all queued in one pass, and once the
+    /// carrier has taken that many bytes this end has handed all of them
+    /// over. After that, silence about the epoch is the receiver's silence,
+    /// whatever else this connection is sending.
     pub(crate) fn retire_quiet_epochs(
         &self,
         connection: &mut ServeConnection,
         now: std::time::Instant,
     ) -> Result<(), Fault> {
-        if !epochs_are_waiting(
-            !connection.fec.epochs.is_empty(),
-            connection.outbound.is_empty(),
-        ) {
+        if connection.fec.epochs.is_empty() {
             return Ok(());
         }
+        let taken = connection.outbound.taken();
         let mut spent = Vec::new();
         for (epoch, opened) in &mut connection.fec.epochs {
+            if taken < opened.queued_through {
+                // Symbols still waiting in this end's own queue, so silence
+                // about the epoch says nothing about the receiver yet.
+                continue;
+            }
             let since = *opened.quiet_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= EPOCH_QUIET_GRACE {
                 spent.push(*epoch);
@@ -678,6 +687,7 @@ impl BundleServer {
                 },
             ))?);
         } else {
+            let queued_through = connection.outbound.queued_through();
             connection.fec.epochs.insert(
                 plan.epoch(),
                 OpenedEpoch {
@@ -685,6 +695,7 @@ impl BundleServer {
                     bundle_id,
                     plan,
                     live,
+                    queued_through,
                     quiet_since: None,
                 },
             );
@@ -698,18 +709,6 @@ impl BundleServer {
 /// this serve adds.
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
 pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
-
-/// Whether a pass may spend an epoch's grace: there is an epoch owed an
-/// outcome, and every symbol of it is already on the carrier rather than
-/// waiting in this end's own queue. It says nothing about whether the peer
-/// was heard, which is measured per epoch and not per pass.
-///
-/// Pure, because both halves have to hold and neither is reachable from a
-/// test that drives a whole transfer: a queue that is never empty at the
-/// wrong moment is not something a caller can arrange.
-pub(crate) const fn epochs_are_waiting(epochs_open: bool, outbound_empty: bool) -> bool {
-    epochs_open && outbound_empty
-}
 
 /// How long an epoch may draw nothing from the receiver before this end
 /// repairs its remaining generations reliably and closes it.

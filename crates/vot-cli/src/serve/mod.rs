@@ -113,22 +113,6 @@ mod tests {
     use vot_scheduler::ReliableReceiver;
     use vot_transport_api::SubjectId;
 
-    #[test]
-    fn a_grace_is_only_spent_with_an_epoch_open_and_nothing_queued() {
-        // Both halves, all four ways round: an epoch still owed an outcome,
-        // and nothing of this end's own left to hand the carrier.
-        assert!(server::epochs_are_waiting(true, true));
-        assert!(
-            !server::epochs_are_waiting(true, false),
-            "symbols still queued"
-        );
-        assert!(
-            !server::epochs_are_waiting(false, true),
-            "no epoch to close"
-        );
-        assert!(!server::epochs_are_waiting(false, false));
-    }
-
     /// A ready server session with handshake replies cleared.
     pub(crate) fn ready_session() -> Session<Loopback> {
         ready_session_with(Settings::default())
@@ -759,6 +743,185 @@ mod tests {
             session.driver().records.len(),
             22,
             "every live generation of both came back reliably"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn an_epoch_is_retired_while_this_end_is_still_sending() {
+        // What decides is whether this epoch's symbols have left, not
+        // whether the queue behind them is empty. A transfer that keeps the
+        // carrier busy never empties it, and every generation that never
+        // decoded then held its bundle part-built until the fetch ran out of
+        // admission.
+        let (bundle, _) = built_bundle("busy", &[("big.bin", patterned(1_500_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [23; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.fec.epochs.len(), 2, "a piece of 17 and one of 6");
+        let mark = connection.fec.epochs[&0].queued_through;
+        assert!(
+            connection.outbound.taken() >= mark,
+            "the carrier took this epoch's symbols"
+        );
+
+        // An answer of this end's own, queued behind them and still waiting.
+        connection.queue_record(
+            encoded(&TypedFrame::DataRecord(DataRecord {
+                bundle_id: [9; 16],
+                record_index: 0,
+                plaintext_offset: 0,
+                plaintext_length: 8,
+                compression: 0,
+                encoded: vec![7; 8],
+            }))
+            .unwrap(),
+        );
+        assert!(!connection.outbound.is_empty(), "still sending");
+
+        let began = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, began + server::EPOCH_QUIET_GRACE)
+                .is_ok()
+        );
+        assert!(
+            connection.fec.epochs.is_empty(),
+            "a busy queue is not the receiver's silence"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn an_epoch_is_not_retired_until_the_carrier_takes_its_symbols() {
+        // The mark an epoch keeps is the position its last symbol sits at,
+        // so it is what the queue had taken plus what it still holds. A
+        // carrier that takes nothing leaves the epoch unretirable however
+        // long the receiver stays silent.
+        let (bundle, _) = built_bundle("held", &[("big.bin", patterned(1_500_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().refuse_sends = usize::MAX;
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [25; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let opened = connection.fec.epochs.len();
+        assert!(opened > 0, "an epoch to hold");
+        let last = *connection.fec.epochs.keys().last().expect("an epoch");
+        assert!(
+            connection.fec.epochs[&0].queued_through > 0
+                && connection.fec.epochs[&last].queued_through
+                    <= connection.outbound.taken() + connection.outbound.bytes(),
+            "a mark is a real queue position"
+        );
+        assert!(
+            connection.fec.epochs[&0].queued_through < connection.fec.epochs[&last].queued_through,
+            "the piece queued second sits behind the piece queued first"
+        );
+        assert!(
+            connection.outbound.taken() < connection.fec.epochs[&0].queued_through,
+            "the carrier has taken none of them"
+        );
+
+        let began = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, began + server::EPOCH_QUIET_GRACE * 4)
+                .is_ok()
+        );
+        assert_eq!(
+            connection.fec.epochs.len(),
+            opened,
+            "silence about an epoch this end has not sent is not the receiver's"
+        );
+
+        // The carrier takes them, and the same silence now counts.
+        session.driver().refuse_sends = 0;
+        connection.drain(&mut session).unwrap();
+        let sent = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, sent).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, sent + server::EPOCH_QUIET_GRACE)
+                .is_ok()
+        );
+        assert!(
+            connection.fec.epochs.is_empty(),
+            "retired once its symbols had left"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn an_epoch_whose_symbols_are_still_queued_is_never_retired() {
+        // The other half: silence about an epoch this end has not finished
+        // sending says nothing about the receiver, however long it lasts.
+        let (bundle, _) = built_bundle("unsent", &[("big.bin", patterned(1_500_000))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [24; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        // As if the carrier had taken nothing of this epoch yet.
+        let unsent = connection.outbound.taken() + 1;
+        for opened in connection.fec.epochs.values_mut() {
+            opened.queued_through = unsent;
+            opened.quiet_since = None;
+        }
+
+        let began = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, began + server::EPOCH_QUIET_GRACE * 4)
+                .is_ok()
+        );
+        assert_eq!(
+            connection.fec.epochs.len(),
+            2,
+            "symbols still queued, so the grace never starts"
+        );
+        assert!(
+            connection
+                .fec
+                .epochs
+                .values()
+                .all(|opened| opened.quiet_since.is_none()),
+            "no clock is armed for an epoch this end is still sending"
         );
         crate::harness::discard(&[&bundle]);
     }

@@ -59,6 +59,11 @@ pub(crate) struct OpenedEpoch {
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,
+    /// The outbound mark this epoch's symbols sit behind. Its symbols are
+    /// all on the carrier once the queue has taken this many bytes, which is
+    /// what makes silence about the epoch mean the receiver is not
+    /// answering rather than that this end has not sent yet.
+    pub(crate) queued_through: u64,
     /// When this epoch was first seen with its symbols all on the carrier
     /// and nothing heard about it since. Cleared by anything the receiver
     /// says about it, so it measures one epoch's own silence.
@@ -115,6 +120,11 @@ impl Outbound {
 pub(crate) struct OutboundQueue {
     queue: VecDeque<Outbound>,
     bytes: u64,
+    /// Bytes the carrier has taken over this connection's life, only ever
+    /// going up. What is queued behind a given answer is `taken` at the
+    /// moment it was queued plus [`Self::bytes`], so a caller can say when
+    /// that answer has left this end without holding the answer itself.
+    taken: u64,
 }
 
 impl OutboundQueue {
@@ -136,6 +146,7 @@ impl OutboundQueue {
     pub(crate) fn pop_sent(&mut self) {
         if let Some(sent) = self.queue.pop_front() {
             self.bytes = self.bytes.saturating_sub(sent.len() as u64);
+            self.taken = self.taken.saturating_add(sent.len() as u64);
         }
         debug_assert_eq!(
             self.bytes,
@@ -147,6 +158,17 @@ impl OutboundQueue {
     /// Answer bytes queued and not yet taken.
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Bytes the carrier has taken over this connection's life.
+    pub(crate) fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    /// The mark an answer queued now would sit behind: everything already
+    /// taken plus everything still waiting.
+    pub(crate) fn queued_through(&self) -> u64 {
+        self.taken.saturating_add(self.bytes)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

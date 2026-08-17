@@ -1533,6 +1533,16 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(driver.orphan_byte_limit(), MAX_ORPHAN_BUNDLE_BYTES + 7);
+        // The count as well as the bytes: a caller sizing it for a coded
+        // pipeline that orphans records has to be able to read back what it
+        // asked for.
+        assert_eq!(driver.orphan_bundle_limit(), 1);
+        assert!(
+            driver
+                .set_orphan_limits(36, MAX_ORPHAN_BUNDLE_BYTES + 7)
+                .is_ok()
+        );
+        assert_eq!(driver.orphan_bundle_limit(), 36);
         assert!(
             driver
                 .set_pending_limits(0, MAX_PENDING_BUNDLE_BYTES)

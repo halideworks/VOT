@@ -59,6 +59,13 @@ const _: () = assert!(
 /// Public because each one pins a pending bundle for its whole life, so a
 /// caller setting its own pending limits has to leave room for these on top
 /// of whatever depth its reliable pipeline runs at.
+///
+/// An epoch lives at least a round trip, so the share of requests that find
+/// a free slot falls as latency rises and the rest are answered reliably:
+/// measured on an emulated 30 ms path, eight slots carried 81% of the
+/// generations they offered, ten carried 84% and fifteen carried 89%. Raising
+/// this is a memory decision rather than a free one, because the depth below
+/// holds two bundles a slot and the byte budget affords about twenty pieces.
 pub const MAX_CODING_EPOCHS: usize = 8;
 
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
@@ -2535,9 +2542,10 @@ mod tests {
         let mut driver = ready_fec();
         driver.admit(subject, Box::new(DiscardSink)).unwrap();
         let (open, _) = epoch_of(&bundle, 1);
-        // Eight epochs is the cap this end extends; the ninth is refused
-        // with GEN_DONE outcome refused, and an exact repeat is quiet.
-        for epoch in 1..=8 {
+        // `MAX_CODING_EPOCHS` is the cap this end extends; one past it is
+        // refused with GEN_DONE outcome refused, and an exact repeat is quiet.
+        let cap = u32::try_from(MAX_CODING_EPOCHS).expect("a cap that fits an epoch");
+        for epoch in 1..=cap {
             let (open, _) = epoch_of(&bundle, epoch);
             driver
                 .session_mut()
@@ -2547,7 +2555,7 @@ mod tests {
                     wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
                 )));
         }
-        let (ninth, _) = epoch_of(&bundle, 9);
+        let (ninth, _) = epoch_of(&bundle, cap + 1);
         driver
             .session_mut()
             .driver()

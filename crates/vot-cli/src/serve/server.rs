@@ -215,8 +215,8 @@ impl BundleServer {
         }
         for epoch in spent {
             // The budget bounds this the way it bounds the request loop: a
-            // retirement queues a whole epoch of records, and eight at once
-            // would put megabytes past it in a single pass.
+            // retirement queues a whole epoch of records, and every open
+            // epoch at once would put megabytes past it in a single pass.
             if connection.outbound.bytes() >= connection.budget {
                 break;
             }

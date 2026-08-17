@@ -160,6 +160,30 @@ pub(crate) fn drive_until_within<E: Engine>(
     }
 }
 
+/// Whether an error says only that the session ended, rather than why.
+///
+/// A rail whose plan another rail abandoned ends on a carrier that this end
+/// closed itself, so it reports the carrier as gone. That is true and it is
+/// not the cause, so it must never outrank an error that names one.
+#[cfg(any(test, feature = "wire"))]
+const fn unnamed_cause(error: &Error) -> bool {
+    matches!(error, Error::Stalled | Error::CarrierUnavailable)
+}
+
+/// The failure to report of two, keeping whichever names a cause.
+///
+/// Rails are joined in the order they were spawned, not the order they
+/// failed, so taking the first one reported the wind-down of a rail that was
+/// still running when the real failure happened.
+#[cfg(any(test, feature = "wire"))]
+fn named_failure(held: Option<Error>, error: Error) -> Error {
+    match held {
+        Some(held) if unnamed_cause(&held) && !unnamed_cause(&error) => error,
+        Some(held) => held,
+        None => error,
+    }
+}
+
 /// The error a terminal fetch status names, or completion.
 ///
 /// One mapping for the primary and every rail; what a completion yields
@@ -272,9 +296,7 @@ where
         for rail in spawned {
             match rail.join().expect("a rail thread never panics") {
                 Ok(counts) => fec = fec + counts,
-                Err(error) => {
-                    rail_failure.get_or_insert(error);
-                }
+                Err(error) => rail_failure = Some(named_failure(rail_failure, error)),
             }
         }
         match outcome {
@@ -726,6 +748,53 @@ mod tests {
             fetch_verdict(crate::FetchStatus::Active),
             Err(Error::InvalidBundle)
         ));
+    }
+
+    #[test]
+    fn the_rail_that_names_a_cause_is_the_one_reported() {
+        let named = || Error::Scheduler(vot_scheduler::Error::PendingBundlesExhausted);
+        let wound_down = || Error::CarrierUnavailable;
+
+        // Whichever order the rails are joined in.
+        assert!(matches!(
+            named_failure(Some(wound_down()), named()),
+            Error::Scheduler(vot_scheduler::Error::PendingBundlesExhausted)
+        ));
+        assert!(matches!(
+            named_failure(Some(named()), wound_down()),
+            Error::Scheduler(vot_scheduler::Error::PendingBundlesExhausted)
+        ));
+        // The first of two that both name a cause; neither is the wind-down.
+        assert!(matches!(
+            named_failure(Some(Error::InvalidBundle), named()),
+            Error::InvalidBundle
+        ));
+        // The first of two that name none, so the report is unchanged.
+        assert!(matches!(
+            named_failure(Some(Error::Stalled), wound_down()),
+            Error::Stalled
+        ));
+        assert!(matches!(
+            named_failure(None, named()),
+            Error::Scheduler(vot_scheduler::Error::PendingBundlesExhausted)
+        ));
+        assert!(matches!(
+            named_failure(None, wound_down()),
+            Error::CarrierUnavailable
+        ));
+    }
+
+    #[test]
+    fn only_the_ends_of_a_session_are_unnamed_causes() {
+        assert!(unnamed_cause(&Error::Stalled));
+        assert!(unnamed_cause(&Error::CarrierUnavailable));
+        assert!(!unnamed_cause(&Error::InvalidBundle));
+        assert!(!unnamed_cause(&Error::PeerClosed(
+            vot_codec::error_code::RESOURCE_LIMIT
+        )));
+        assert!(!unnamed_cause(&Error::Scheduler(
+            vot_scheduler::Error::PendingBundlesExhausted
+        )));
     }
 
     #[test]

@@ -414,11 +414,12 @@ mod tests {
             PENDING_BUNDLE_BYTES
         );
         assert_eq!(secondary.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
-        // The coded pipeline orphans records too, so the count that bounds
-        // them is the pending depth and not the reliable one.
+        // The coded pipeline orphans records too, and an entry holds a few
+        // generations rather than a whole piece, so the count is derived
+        // from the byte budget and not from pieces.
         assert_eq!(
             secondary.receiver.orphan_bundle_limit(),
-            PENDING_BUNDLE_DEPTH
+            ORPHAN_BUNDLE_DEPTH
         );
         discard(&[&bundle, &output]);
     }
@@ -1688,7 +1689,7 @@ mod tests {
         // Budgets are the pipeline depth (a product); a sum would be one bundle wide.
         assert_eq!(fetcher.receiver.pending_byte_limit(), PENDING_BUNDLE_BYTES);
         assert_eq!(fetcher.receiver.orphan_byte_limit(), ORPHAN_BUNDLE_BYTES);
-        assert_eq!(fetcher.receiver.orphan_bundle_limit(), PENDING_BUNDLE_DEPTH);
+        assert_eq!(fetcher.receiver.orphan_bundle_limit(), ORPHAN_BUNDLE_DEPTH);
         // A narrower pool: the bound follows the width.
         fetcher.set_proving_threads(2).unwrap();
         assert_eq!(fetcher.proving.width, 2);

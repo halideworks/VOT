@@ -1375,13 +1375,14 @@ mod tests {
                 std::time::Duration::from_millis(8_500),
                 vot_scheduler::FecCounts {
                     offered: 65_536,
+                    coded: 65_530,
                     decoded: 65_500,
                     abandoned: 36,
                     refused: 2,
                 },
             ),
             "fetch stats bytes=4294967296 ms=8500 fec_offered=65536 \
-             fec_decoded=65500 fec_abandoned=36 fec_refused=2"
+             fec_coded=65530 fec_decoded=65500 fec_abandoned=36 fec_refused=2"
         );
         assert_eq!(
             fetch::stats_line(
@@ -1389,7 +1390,7 @@ mod tests {
                 std::time::Duration::ZERO,
                 vot_scheduler::FecCounts::default(),
             ),
-            "fetch stats bytes=0 ms=0 fec_offered=0 fec_decoded=0 \
+            "fetch stats bytes=0 ms=0 fec_offered=0 fec_coded=0 fec_decoded=0 \
              fec_abandoned=0 fec_refused=0"
         );
         // Sub-millisecond is reported as what it is rather than rounded up:
@@ -1400,7 +1401,7 @@ mod tests {
                 std::time::Duration::from_micros(900),
                 vot_scheduler::FecCounts::default(),
             ),
-            "fetch stats bytes=7 ms=0 fec_offered=0 fec_decoded=0 \
+            "fetch stats bytes=7 ms=0 fec_offered=0 fec_coded=0 fec_decoded=0 \
              fec_abandoned=0 fec_refused=0"
         );
     }

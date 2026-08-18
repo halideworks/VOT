@@ -170,46 +170,62 @@ pub fn decode(geometry: Geometry, received: &[(usize, &[u8])]) -> Result<Vec<Vec
     let k = geometry.source_count;
     // At most 80 entries, so a fixed table rather than an allocation from
     // the peer's count.
-    let mut seen = [false; MAX_SYMBOLS];
+    let mut symbols = [None; MAX_SYMBOLS];
     for (esi, symbol) in received {
-        if *esi >= geometry.symbol_count() || seen[*esi] {
+        if *esi >= geometry.symbol_count() || symbols[*esi].is_some() {
             return Err(Error::InvalidSymbol);
         }
         geometry.check_symbol(symbol)?;
-        seen[*esi] = true;
+        symbols[*esi] = Some(*symbol);
     }
     if received.len() < k {
         return Err(Error::InsufficientSymbols);
     }
-    let symbol_of = |esi: usize| received.iter().find(|(e, _)| *e == esi).map(|(_, s)| *s);
-    let mut chosen = Vec::with_capacity(k);
-    chosen.extend((0..k).filter(|esi| seen[*esi]));
-    if chosen.len() == k {
+    let missing: Vec<usize> = (0..k).filter(|esi| symbols[*esi].is_none()).collect();
+    if missing.is_empty() {
         // Every source symbol arrived; nothing to solve.
-        return Ok(chosen
-            .iter()
-            .map(|esi| symbol_of(*esi).expect("seen").to_vec())
+        return Ok((0..k)
+            .map(|esi| symbols[esi].expect("seen").to_vec())
             .collect());
     }
-    chosen.extend((k..geometry.symbol_count()).filter(|esi| seen[*esi]));
-    chosen.truncate(k);
-    debug_assert_eq!(chosen.len(), k);
 
-    // Augmented rows: k coefficients then the symbol bytes.
-    let width = k + geometry.symbol_length;
-    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(k);
-    for esi in &chosen {
+    // Known sources move to the right-hand side, leaving one coefficient
+    // column and one repair row per missing source.
+    let m = missing.len();
+    let width = m + geometry.symbol_length;
+    let mut coefficients = [0_u8; MAX_SOURCE_SYMBOLS];
+    let mut rows = Vec::with_capacity(m);
+    for esi in (k..geometry.symbol_count())
+        .filter(|esi| symbols[*esi].is_some())
+        .take(m)
+    {
         let mut row = vec![0_u8; width];
-        if *esi < k {
-            row[*esi] = 1;
-        } else {
-            geometry.generator_row(*esi - k, &mut row[..k]);
+        geometry.generator_row(esi - k, &mut coefficients[..k]);
+        for (column, source_esi) in missing.iter().enumerate() {
+            row[column] = coefficients[*source_esi];
         }
-        row[k..].copy_from_slice(symbol_of(*esi).expect("seen"));
+        row[m..].copy_from_slice(symbols[esi].expect("seen"));
+        for source_esi in (0..k).filter(|source_esi| symbols[*source_esi].is_some()) {
+            gf::mul_add(
+                &mut row[m..],
+                coefficients[source_esi],
+                symbols[source_esi].expect("seen"),
+            );
+        }
         rows.push(row);
     }
-    gauss_jordan(&mut rows, k);
-    Ok(rows.into_iter().map(|row| row[k..].to_vec()).collect())
+    debug_assert_eq!(rows.len(), m);
+    gauss_jordan(&mut rows, m);
+
+    let mut solved = rows.into_iter().map(|row| row[m..].to_vec());
+    Ok((0..k)
+        .map(|esi| {
+            symbols[esi].map_or_else(
+                || solved.next().expect("one row per missing source"),
+                <[u8]>::to_vec,
+            )
+        })
+        .collect())
 }
 
 /// Reduces `rows` to the identity on the first `k` columns, carrying the

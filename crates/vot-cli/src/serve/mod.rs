@@ -1700,6 +1700,7 @@ mod tests {
         assert!(connection.pending_answer_bytes() >= OUTBOUND_BUDGET_BYTES);
         // No more requests to read; any progress change is handover only.
         session.driver().events.clear();
+        connection.deferred.clear();
 
         let stalled = connection.progress();
         server.service(&mut session, &mut connection).unwrap();
@@ -1725,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn backpressure_holds_answers_and_the_budget_stops_reading() {
+    pub(crate) fn backpressure_holds_answers_without_blocking_carrier_states() {
         let (bundle, _) = built_bundle("budget", &[("big.bin", patterned(4_300_000))]);
         let server = BundleServer::open(&bundle).unwrap();
         let object = server.objects.values().next().unwrap().object;
@@ -1745,20 +1746,27 @@ mod tests {
                     length: 4_194_304,
                 })));
         }
-        // Carrier refuses all sends; budget stops reading.
+        for context in 0..70 {
+            session.driver().events.push_back(Event::DatagramState {
+                context,
+                state: vot_transport_api::DatagramSendState::Sent,
+            });
+        }
+        // Carrier refuses all sends; the budget stops dispatching requests.
         session.driver().refuse_sends = usize::MAX;
         let status = server.service(&mut session, &mut connection).unwrap();
         assert_eq!(status, ServeStatus::Active);
         assert!(connection.pending_answer_bytes() >= OUTBOUND_BUDGET_BYTES);
         assert_eq!(
             session.driver().events.len(),
-            1,
-            "the budget left one request unread"
+            0,
+            "carrier states behind the deferred request were drained"
         );
+        assert_eq!(connection.deferred.len(), 1, "one request was deferred");
 
         session.driver().refuse_sends = 0;
         let mut passes = 0;
-        while session.driver().events.front().is_some() || connection.pending_answer_bytes() > 0 {
+        while session.driver().events.front().is_some() || connection.has_backlog() {
             let status = server.service(&mut session, &mut connection).unwrap();
             assert_eq!(status, ServeStatus::Active);
             passes += 1;
@@ -1781,6 +1789,119 @@ mod tests {
             let bytes = verified_bytes(object, bundle_frame, records);
             assert_eq!(bytes, disk[..4_194_304]);
         }
+    }
+
+    #[test]
+    fn too_many_deferred_requests_close_under_the_resource_limit() {
+        let (bundle, _) = built_bundle("deferred-limit", &[("a.bin", patterned(65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        connection.budget = 0;
+        connection.deferred.extend(std::iter::repeat_n(
+            shared_payload(&[]),
+            REMEMBERED_REQUESTS,
+        ));
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [19; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+
+        assert_eq!(
+            server.service(&mut session, &mut connection).unwrap(),
+            ServeStatus::Closed(error_code::RESOURCE_LIMIT)
+        );
+    }
+
+    #[test]
+    fn a_deferred_request_does_not_stop_a_silent_epoch_clock() {
+        let (bundle, _) = built_bundle("deferred-quiet", &[("a.bin", patterned(65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [20; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        connection.deferred.push_back(
+            encoded(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [21; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            }))
+            .unwrap(),
+        );
+        connection.budget = 0;
+
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.deferred.len(), 1);
+        assert!(!connection.fec.epochs.is_empty());
+        assert!(
+            connection
+                .fec
+                .epochs
+                .values()
+                .all(|epoch| epoch.quiet_since.is_some())
+        );
+    }
+
+    #[test]
+    fn only_answer_requests_are_deferred() {
+        let request = encoded(&TypedFrame::ManifestRequest(ManifestRequest {
+            request_id: [1; 16],
+            manifest_id: [2; 16],
+            first_page: 0,
+            page_count: 1,
+        }))
+        .unwrap();
+        let feedback = encoded(&TypedFrame::DatagramCredit(ample_credit())).unwrap();
+
+        assert!(server::answer_request(&request));
+        assert!(!server::answer_request(&feedback));
+        assert!(!server::answer_request(&[0xff]));
+    }
+
+    #[test]
+    fn malformed_request_is_refused_instead_of_deferred_under_backpressure() {
+        let (bundle, _) = built_bundle("malformed-deferred", &[("a.bin", patterned(1))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        connection.budget = 0;
+        let mut malformed_request = Vec::new();
+        vot_codec::encode_frame(
+            frame_type::RANGE_REQUEST,
+            &vec![0; 1024 * 1024],
+            &mut malformed_request,
+        )
+        .unwrap();
+        assert!(!server::answer_request(&malformed_request));
+        session
+            .driver()
+            .events
+            .push_back(Event::Control(shared_payload(&malformed_request)));
+
+        assert_eq!(
+            server.service(&mut session, &mut connection).unwrap(),
+            ServeStatus::Closed(error_code::MALFORMED_FRAME)
+        );
+        assert!(connection.deferred.is_empty());
     }
 
     #[test]

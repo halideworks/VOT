@@ -1072,6 +1072,7 @@ fn run(
     let mut closing = false;
     let mut announced = false;
     let mut sending = Sending::new(datagram_bytes, offload);
+    let mut read_timeout = None;
 
     let outcome = 'drive: loop {
         queued.debug_assert_matches(&streams);
@@ -1144,10 +1145,13 @@ fn run(
             );
         match &intake {
             Intake::Socket => {
-                if socket.set_read_timeout(Some(deadline)).is_err() {
-                    break 'drive Err(Error::Backend);
+                if read_timeout != Some(deadline) {
+                    if socket.set_read_timeout(Some(deadline)).is_err() {
+                        break 'drive Err(Error::Backend);
+                    }
+                    read_timeout = Some(deadline);
                 }
-                match receive_segmented(socket, &mut buffer, &mut space) {
+                match receive_segmented(socket, &mut buffer, &mut space, false) {
                     Ok((len, from, segment)) => {
                         feed_received(&mut conn, local, &mut buffer[..len], from, segment);
                         if let Err(error) =
@@ -1480,7 +1484,7 @@ fn route(
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space) {
+        let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space, false) {
             Ok(read) => read,
             Err(error) => {
                 if read_ran_out(&error) {
@@ -1798,15 +1802,21 @@ fn receive_segmented(
     socket: &UdpSocket,
     buffer: &mut [u8],
     space: &mut Vec<u8>,
+    nonblocking: bool,
 ) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
     use std::os::fd::AsRawFd as _;
 
+    let flags = if nonblocking {
+        nix::sys::socket::MsgFlags::MSG_DONTWAIT
+    } else {
+        nix::sys::socket::MsgFlags::empty()
+    };
     let mut slices = [std::io::IoSliceMut::new(buffer)];
     let message = nix::sys::socket::recvmsg::<nix::sys::socket::SockaddrStorage>(
         socket.as_raw_fd(),
         &mut slices,
         Some(space),
-        nix::sys::socket::MsgFlags::empty(),
+        flags,
     )
     .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     let segment = message.cmsgs().ok().and_then(|mut messages| {
@@ -1831,6 +1841,7 @@ fn receive_segmented(
     socket: &UdpSocket,
     buffer: &mut [u8],
     _space: &mut Vec<u8>,
+    _nonblocking: bool,
 ) -> std::io::Result<(usize, SocketAddr, Option<usize>)> {
     let (len, from) = socket.recv_from(buffer)?;
     Ok((len, from, None))
@@ -1910,9 +1921,15 @@ fn is_side_channel(lead: Option<u8>, bytes: &[u8], segment: Option<usize>) -> bo
 /// Takes what has already arrived without waiting, up to the counted budget.
 ///
 /// The wait was paid on the pass's first read; this hands the rest of the
-/// queue to the connection as one batch. Only behind a successful switch to
-/// non-blocking, because a drain that could block would turn a batch into a
-/// stall.
+/// queue to the connection as one batch. Linux applies `MSG_DONTWAIT` to each
+/// drain read; other systems temporarily switch the socket to non-blocking.
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "other platforms can fail to restore blocking mode"
+    )
+)]
 fn drain_arrivals(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
@@ -1920,12 +1937,13 @@ fn drain_arrivals(
     buffer: &mut [u8],
     space: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    #[cfg(not(target_os = "linux"))]
     if socket.set_nonblocking(true).is_err() {
         // Still blocking, so the pass loses nothing but the batch.
         return Ok(());
     }
     for _ in 0..DRAIN_BUDGET {
-        match receive_segmented(socket, buffer, space) {
+        match receive_segmented(socket, buffer, space, true) {
             Ok((len, from, segment)) => {
                 feed_received(conn, local, &mut buffer[..len], from, segment);
             }
@@ -1934,7 +1952,9 @@ fn drain_arrivals(
     }
     // A socket left non-blocking would turn the next pass's bounded wait into
     // a spin, so failing to restore it ends the driver instead.
-    socket.set_nonblocking(false).map_err(|_| Error::Backend)
+    #[cfg(not(target_os = "linux"))]
+    socket.set_nonblocking(false).map_err(|_| Error::Backend)?;
+    Ok(())
 }
 
 /// Sends what the connection has generated, and says when it wants to send more.

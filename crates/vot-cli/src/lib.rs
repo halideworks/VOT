@@ -1371,51 +1371,39 @@ mod tests {
     }
 
     #[test]
-    fn copying_an_object_rejects_a_length_or_root_mismatch() {
+    fn copying_an_object_names_it_and_refuses_a_length_that_moved() {
+        let directory = temporary("copy-objects");
+        fs::create_dir_all(&directory).unwrap();
         let source = temporary("copy-source");
-        let data = b"copy-and-verify";
+        let data = b"copy-and-name";
         fs::write(&source, data).unwrap();
         let root = vot_verifier::root(Suite::Sha256Bep52, data).unwrap();
 
-        let valid_destination = temporary("copy-valid");
-        copy_verify_and_prepare(
-            &source,
-            &valid_destination,
-            data.len() as u64,
-            root,
-            Suite::Sha256Bep52,
-        )
-        .unwrap();
-        fs::remove_file(valid_destination).unwrap();
+        // The pass names what it copied, and what it wrote is the source.
+        let copied =
+            copy_and_name(&directory, &source, data.len() as u64, Suite::Sha256Bep52).unwrap();
+        assert_eq!(copied.root, root, "the copy named something else");
+        assert_eq!(fs::read(&copied.temporary).unwrap(), data);
+        fs::remove_file(&copied.temporary).unwrap();
 
-        let length_destination = temporary("copy-length-mismatch");
+        // A source that is not the length the manifest pass saw is a source
+        // that moved, and the partial copy does not outlive the failure.
         assert!(matches!(
-            copy_verify_and_prepare(
+            copy_and_name(
+                &directory,
                 &source,
-                &length_destination,
                 data.len() as u64 + 1,
-                root,
-                Suite::Sha256Bep52,
+                Suite::Sha256Bep52
             ),
             Err(Error::SourceMutation)
         ));
-        fs::remove_file(length_destination).unwrap();
-
-        let root_destination = temporary("copy-root-mismatch");
-        let mut wrong_root = root;
-        wrong_root[0] ^= 1;
-        assert!(matches!(
-            copy_verify_and_prepare(
-                &source,
-                &root_destination,
-                data.len() as u64,
-                wrong_root,
-                Suite::Sha256Bep52,
-            ),
-            Err(Error::SourceMutation)
-        ));
-        fs::remove_file(root_destination).unwrap();
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            0,
+            "a failed copy left its bytes behind"
+        );
         fs::remove_file(source).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

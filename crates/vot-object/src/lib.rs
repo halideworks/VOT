@@ -594,6 +594,72 @@ impl PreparedObject {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_object_prepared_from_its_leaves_is_the_object_it_came_from() {
+        // What a serve keeps and what it prepares from, both suites: the
+        // leaves out of a prepared object rebuild an object of the same
+        // identity that proves the same ranges, without the bytes.
+        for suite in [Suite::Sha256Bep52, Suite::Blake3Bao64] {
+            let bytes: Vec<u8> = (0..GROUP_SIZE * 4 + 900)
+                .map(|byte| (byte % 253) as u8)
+                .collect();
+            let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
+            builder.update(&bytes).unwrap();
+            let prepared = builder.finish().unwrap();
+            let leaves = prepared.proof_leaves().expect("a memory store keeps them");
+            assert_eq!(
+                leaves.len(),
+                bytes.len().div_ceil(GROUP_SIZE),
+                "one leaf per group of the object"
+            );
+
+            let from_leaves =
+                PreparedObject::from_proof_leaves(suite, bytes.len() as u64, leaves).unwrap();
+            assert_eq!(
+                from_leaves.object_id(),
+                prepared.object_id(),
+                "the leaves name a different object"
+            );
+            for (offset, length) in [(0, bytes.len() as u64), (0, 65_536), (131_072, 65_536)] {
+                assert_eq!(
+                    from_leaves.prove(offset, length).unwrap().proof(),
+                    prepared.prove(offset, length).unwrap().proof(),
+                    "a proof from leaves differs"
+                );
+            }
+            // And what it proves from still checks the bytes it is given.
+            assert!(from_leaves.holds(0, &bytes[..GROUP_SIZE]));
+            assert!(!from_leaves.holds(0, &vec![0_u8; GROUP_SIZE]));
+        }
+    }
+
+    #[test]
+    fn leaves_that_cannot_describe_the_object_are_refused() {
+        let leaf = [3_u8; 32];
+        // Too few, too many, and an object of one group whose root is its
+        // own hash rather than a tree top.
+        assert!(
+            PreparedObject::from_proof_leaves(
+                Suite::Sha256Bep52,
+                (GROUP_SIZE * 4) as u64,
+                vec![leaf; 3]
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedObject::from_proof_leaves(
+                Suite::Sha256Bep52,
+                (GROUP_SIZE * 4) as u64,
+                vec![leaf; 5]
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedObject::from_proof_leaves(Suite::Blake3Bao64, GROUP_SIZE as u64, vec![leaf])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn a_finished_sha256_store_retains_its_tree() {
         // Without this the store rebuilds the whole piece tree for every
         // range it proves, which is the object hashed again per answer: a

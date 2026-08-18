@@ -784,6 +784,37 @@ mod tests {
     }
 
     #[test]
+    fn two_leaves_is_the_smallest_tree_there_is() {
+        // The boundary both ways: two leaves is a tree whose top is the
+        // object root, and one is not, so an object of exactly two is taken
+        // and its root answered.
+        let data: Vec<u8> = (0..PIECE_SIZE as usize * 2)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        let mut built = PieceHashes::new();
+        for leaf in data.chunks(PIECE_SIZE as usize) {
+            built.push(leaf).unwrap();
+        }
+        built.seal();
+        assert_eq!(built.piece_hashes().len(), 2);
+        assert_eq!(built.tree_root(), Some(root(&data)));
+        let rebuilt =
+            PieceHashes::from_piece_hashes(built.piece_hashes().to_vec(), data.len() as u64)
+                .expect("two describe it");
+        assert_eq!(rebuilt.tree_root(), Some(root(&data)));
+
+        // One leaf is not a tree: no root to answer and nothing to rebuild.
+        let single: Vec<u8> = (0..PIECE_SIZE as usize)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        let mut one = PieceHashes::new();
+        one.push(&single).unwrap();
+        one.seal();
+        assert_eq!(one.tree_root(), None, "one leaf names no tree top");
+        assert!(PieceHashes::from_piece_hashes(one.piece_hashes().to_vec(), PIECE_SIZE).is_err());
+    }
+
+    #[test]
     fn stored_leaves_are_refused_when_they_cannot_describe_the_object() {
         let leaf = [7_u8; 32];
         // A count that is not what the length implies, either way.

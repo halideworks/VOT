@@ -68,6 +68,13 @@ const _: () = assert!(
 /// holds two bundles a slot and the byte budget affords about twenty pieces.
 pub const MAX_CODING_EPOCHS: usize = 8;
 
+/// How coarsely [`PendingBundles::orphan_headroom`] is reported.
+///
+/// A credit is a control frame, so it is worth sending when the room left
+/// has really moved rather than every time a record lands. Four megabytes is
+/// about a coded piece's worth of records.
+const ORPHAN_HEADROOM_QUANTUM: usize = 4 * 1024 * 1024;
+
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
 pub const REMEMBERED_BUNDLES: usize = 64;
 
@@ -117,6 +124,9 @@ struct Pending {
     /// The hash of the frame the bundle arrived in, kept for the replay check.
     identity: Option<[u8; 32]>,
     records: Vec<DataRecord>,
+    /// When this entry was opened, counted in entries rather than time, so
+    /// the oldest orphan can be named without a clock.
+    opened: u64,
 }
 
 impl Pending {
@@ -159,6 +169,8 @@ struct PendingBundles {
     byte_limit: usize,
     orphan_bundle_limit: usize,
     orphan_byte_limit: usize,
+    /// Entries opened over this session's life, which orders them.
+    opened: u64,
 }
 
 impl Default for PendingBundles {
@@ -173,6 +185,7 @@ impl Default for PendingBundles {
             byte_limit: DEFAULT_PENDING_BUNDLE_BYTES,
             orphan_bundle_limit: DEFAULT_ORPHAN_BUNDLES,
             orphan_byte_limit: DEFAULT_ORPHAN_BYTES,
+            opened: 0,
         }
     }
 }
@@ -214,6 +227,23 @@ impl PendingBundles {
     /// is the one shape that always fits.
     fn epoch_capacity(&self) -> u64 {
         u64::try_from(self.bundle_limit.saturating_sub(PIECES_PER_COVER)).unwrap_or(u64::MAX)
+    }
+
+    /// Bytes the orphan budget has left, in whole quanta.
+    ///
+    /// Records that arrived before their proof are what the coded path fills
+    /// this with: its symbols are datagrams and its proofs are reliable, so
+    /// under loss the decoded generations arrive while the proof is still
+    /// behind a retransmission. Filling it is what used to end the fetch, so
+    /// the credit a sender is given is bounded by what is left here and the
+    /// sender slows instead.
+    ///
+    /// Quantised because a credit that changed with every record would put a
+    /// control frame behind each one; at this size it changes about as often
+    /// as a cover completes.
+    fn orphan_headroom(&self) -> u64 {
+        let left = self.orphan_byte_limit.saturating_sub(self.orphan_bytes);
+        u64::try_from(left / ORPHAN_HEADROOM_QUANTUM * ORPHAN_HEADROOM_QUANTUM).unwrap_or(u64::MAX)
     }
 
     /// Bytes held across both budgets.
@@ -258,6 +288,39 @@ impl PendingBundles {
         Ok(())
     }
 
+    /// The oldest entry holding records with no proof, if there is one.
+    ///
+    /// A record whose bundle was announced, completed, and forgotten arrives
+    /// as an orphan that no proof will ever finish: the coded path resends a
+    /// generation reliably long after its bundle was delivered, and delivered
+    /// identities are remembered only [`REMEMBERED_BUNDLES`] deep. Those pin
+    /// the orphan budget until the session ends, which is what ended a coded
+    /// fetch of 12 GB under loss with `PendingBundlesExhausted`.
+    fn oldest_orphan(&self) -> Option<[u8; 16]> {
+        self.entries
+            .iter()
+            .filter(|(_, pending)| pending.is_orphan())
+            .min_by_key(|(_, pending)| pending.opened)
+            .map(|(id, _)| *id)
+    }
+
+    /// Drops the oldest orphan to make room, and answers whether it did.
+    ///
+    /// What it drops is records whose bytes nobody has proved, so nothing
+    /// verified is lost: the extent stays uncovered and is asked for again.
+    fn drop_oldest_orphan(&mut self) -> bool {
+        let Some(id) = self.oldest_orphan() else {
+            return false;
+        };
+        let Some(pending) = self.entries.remove(&id) else {
+            return false;
+        };
+        self.orphan_bundles -= 1;
+        self.orphan_bytes -= pending.bytes();
+        self.assert_accounted();
+        true
+    }
+
     /// Attaches a proof to its entry, migrating any records held under the
     /// orphan budget into the admitted one along with it. The admitted budget
     /// is checked for the proof and the carried records together, so the
@@ -272,7 +335,12 @@ impl PendingBundles {
             .checked_add(carried)
             .ok_or(Error::LengthExceeded)?;
         self.refuse_over_budget(&id, bytes, false)?;
+        self.opened += 1;
+        let opened_at = self.opened;
         let entry = self.entries.entry(id).or_default();
+        if entry.opened == 0 {
+            entry.opened = opened_at;
+        }
         let was_orphan = entry.is_orphan();
         let existed = entry.bundle.is_some() || !entry.records.is_empty();
         entry.bundle = Some(bundle);
@@ -292,8 +360,20 @@ impl PendingBundles {
         let id = record.bundle_id;
         let orphan = self.entries.get(&id).is_none_or(Pending::is_orphan);
         let bytes = record.encoded.len();
+        // An orphan budget with no room is not a failed transfer: the oldest
+        // entry in it is holding records no proof is coming for, so it makes
+        // way and its extent is asked for again.
+        while orphan
+            && self.refuse_over_budget(&id, bytes, orphan).is_err()
+            && self.drop_oldest_orphan()
+        {}
         self.refuse_over_budget(&id, bytes, orphan)?;
+        self.opened += 1;
+        let opened_at = self.opened;
         let entry = self.entries.entry(id).or_default();
+        if entry.opened == 0 {
+            entry.opened = opened_at;
+        }
         let opened = entry.bundle.is_none() && entry.records.is_empty();
         entry.records.push(record);
         if orphan {
@@ -597,6 +677,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
 
     /// Bytes held for bundles that are not complete.
     #[must_use]
+    /// Whether an entry for this bundle is held, proved or not.
+    #[cfg(test)]
+    pub(crate) fn holds_bundle(&self, id: &[u8; 16]) -> bool {
+        self.pending.get(id).is_some()
+    }
+
     pub fn pending_bytes(&self) -> usize {
         self.pending.bytes()
     }
@@ -650,10 +736,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                         // The decode budget is a credit-epoch budget: once
                         // it is half spent a new epoch goes out here, not
                         // only when a bundle completes.
-                        self.fec.extend_credit(
-                            self.receiver.advertised_credit(),
-                            self.pending.epoch_capacity(),
-                        );
+                        self.fec
+                            .extend_credit(self.coded_credit(), self.pending.epoch_capacity());
                     }
                     self.send_owed()?;
                 }
@@ -712,10 +796,8 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
         if self.session.is_ready() && negotiated {
             self.fec_armed = true;
-            self.fec.extend_credit(
-                self.receiver.advertised_credit(),
-                self.pending.epoch_capacity(),
-            );
+            self.fec
+                .extend_credit(self.coded_credit(), self.pending.epoch_capacity());
             self.send_owed()?;
         }
         Ok(())
@@ -769,6 +851,25 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     /// Puts what the intake owes the sender on the control stream. A refusal
     /// that is not the peer's fault is backpressure: the frame stays owed
     /// and goes out on a later poll.
+    /// The bytes the coded path may have outstanding: what the reliable
+    /// pipeline's staging advertises, bounded by the room left for records
+    /// that arrive before their proof.
+    ///
+    /// Those two are not the same pool. A sender told only the first fills
+    /// the second, and a full second one used to end the fetch with
+    /// `PendingBundlesExhausted`; told the smaller of the two it slows and
+    /// the fetch finishes.
+    fn coded_credit(&self) -> u64 {
+        // Half the room, not all of it: a credit reaches the sender a round
+        // trip late and it keeps sending meanwhile, so promising every byte
+        // that is left promises bytes that arrive after it is gone. Half
+        // leaves a transit's worth on a path where a transit is what the
+        // staging window already sizes.
+        self.receiver
+            .advertised_credit()
+            .min(self.pending.orphan_headroom() / 2)
+    }
+
     fn send_owed(&mut self) -> Result<(), Error> {
         // Bounded by what is owed now, so a pass ends whatever the carrier
         // does with each frame.
@@ -951,7 +1052,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.credit_applied = self.session.driver().set_receive_credit(credit).is_ok();
         if self.fec_armed {
             self.fec
-                .extend_credit(credit, self.pending.epoch_capacity());
+                .extend_credit(self.coded_credit(), self.pending.epoch_capacity());
             self.send_owed()?;
         }
         Ok(())
@@ -1492,6 +1593,47 @@ mod tests {
     }
 
     #[test]
+    fn the_oldest_orphan_is_what_makes_way() {
+        // Which entry goes is not arbitrary: the one that has waited longest
+        // for a proof is the one least likely to get one, because the coded
+        // path resends a generation reliably long after its bundle was
+        // delivered and forgotten.
+        let mut pending = PendingBundles::default();
+        pending.orphan_bundle_limit = 3;
+        pending.orphan_byte_limit = usize::MAX;
+        for index in 0..3_u8 {
+            pending
+                .append_record(DataRecord {
+                    bundle_id: [index; 16],
+                    record_index: 0,
+                    plaintext_offset: 0,
+                    plaintext_length: 4,
+                    compression: 0,
+                    encoded: vec![index; 4],
+                })
+                .unwrap();
+        }
+        assert_eq!(pending.orphan_count(), 3);
+
+        // A fourth: the first one made way, the other two stayed.
+        pending
+            .append_record(DataRecord {
+                bundle_id: [9; 16],
+                record_index: 0,
+                plaintext_offset: 0,
+                plaintext_length: 4,
+                compression: 0,
+                encoded: vec![9; 4],
+            })
+            .unwrap();
+        assert_eq!(pending.orphan_count(), 3, "the bound is what it says");
+        assert!(pending.get(&[0; 16]).is_none(), "the oldest made way");
+        assert!(pending.get(&[1; 16]).is_some());
+        assert!(pending.get(&[2; 16]).is_some());
+        assert!(pending.get(&[9; 16]).is_some(), "the newest is held");
+    }
+
+    #[test]
     fn held_bundle_state_is_bounded() {
         let (subject, _bundle, records) = object();
         let mut driver = ready();
@@ -1508,7 +1650,8 @@ mod tests {
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bundles(), 1);
 
-        // A record for a second bundle is one bundle too many.
+        // A record for a second bundle is one bundle too many, so the first
+        // makes way: the count is what is bounded, not which entry holds it.
         let mut other = records[0].clone();
         other.bundle_id = [9; 16];
         driver
@@ -1516,7 +1659,9 @@ mod tests {
             .driver()
             .events
             .push_back(carried(&wire(&TypedFrame::DataRecord(other))));
-        assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bundles(), 1, "one is what one means");
+        assert!(driver.holds_bundle(&[9; 16]), "the newer record is held");
 
         // The bound itself is allowed, and one below it would refuse a
         // conforming transfer partway through rather than bound it. What
@@ -1672,6 +1817,10 @@ mod tests {
         assert_eq!(driver.poll().unwrap(), None);
         assert_eq!(driver.pending_bytes(), limit, "the bound itself is held");
 
+        // One more record than the bound holds: the oldest entry with no
+        // proof makes way for it, because a record no proof is coming for
+        // must not pin the budget until the session ends. The bound itself
+        // is what stays exact.
         let mut extra = records[0].clone();
         extra.bundle_id = [0xff; 16];
         driver
@@ -1679,8 +1828,16 @@ mod tests {
             .driver()
             .events
             .push_back(carried(&wire(&TypedFrame::DataRecord(extra))));
-        assert_eq!(driver.poll().unwrap_err(), Error::PendingBundlesExhausted);
-        assert_eq!(driver.pending_bytes(), limit, "a refusal holds nothing");
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.pending_bytes(), limit, "the bound is still exact");
+        assert!(
+            driver.holds_bundle(&[0xff; 16]),
+            "the record that arrived last is the one held"
+        );
+        assert!(
+            !driver.holds_bundle(&[0; 16]),
+            "the oldest orphan is the one that made way"
+        );
     }
 
     #[test]

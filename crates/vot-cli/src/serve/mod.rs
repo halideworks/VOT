@@ -156,6 +156,33 @@ mod tests {
             "the leaves beside the object were not used"
         );
 
+        // A mutated tail is caught by the sample too, which is what makes
+        // the check read the object's last group and not its first twice.
+        {
+            let object = fs::read_dir(&objects)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|kind| kind == "obj"))
+                .expect("the object");
+            let original = fs::read(&object).unwrap();
+            let mut tail_flipped = original.clone();
+            let last = tail_flipped.len() - 1;
+            tail_flipped[last] ^= 0xff;
+            fs::write(&object, &tail_flipped).unwrap();
+            assert!(
+                super::object::prepared_from_cache(
+                    &objects,
+                    identity.root,
+                    crate::parse_suite("sha256").unwrap(),
+                    identity.length,
+                )
+                .is_none(),
+                "a mutated last group was prepared from"
+            );
+            fs::write(&object, &original).unwrap();
+        }
+
         // Corrupt, truncated, for another object, and absent: all still open
         // and prove the same, because each falls back to reading it.
         let corrupt = {

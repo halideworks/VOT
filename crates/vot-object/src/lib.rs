@@ -600,7 +600,7 @@ mod tests {
         // identity that proves the same ranges, without the bytes.
         for suite in [Suite::Sha256Bep52, Suite::Blake3Bao64] {
             let bytes: Vec<u8> = (0..GROUP_SIZE * 4 + 900)
-                .map(|byte| (byte % 253) as u8)
+                .map(|byte| u8::try_from(byte % 253).expect("bounded by the modulus"))
                 .collect();
             let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
             builder.update(&bytes).unwrap();

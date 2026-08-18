@@ -12,9 +12,15 @@ pub(super) struct RangeState {
 }
 
 impl RangeState {
-    pub(super) fn new(sink: Box<dyn RangeSink>, reservation: vot_transport_api::Permit) -> Self {
+    /// The object's length decides how many extents its arrival order may
+    /// leave outstanding, so it is taken here rather than defaulted.
+    pub(super) fn new(
+        object_len: u64,
+        sink: Box<dyn RangeSink>,
+        reservation: vot_transport_api::Permit,
+    ) -> Self {
         Self {
-            coverage: vot_coverage::Coverage::new(),
+            coverage: vot_coverage::Coverage::for_object(object_len),
             sink,
             reservation,
         }

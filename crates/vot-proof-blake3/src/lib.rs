@@ -110,6 +110,11 @@ pub struct GroupCvs {
     /// Set once a group shorter than [`GROUP_SIZE`] has been taken, because
     /// only the last group may be short.
     ended: bool,
+    /// Level `k` holds the chaining value of every aligned node of `2^k`
+    /// groups, the way [`SealedGroupCvs`] holds them on storage, so a proof
+    /// reads a subtree rather than merging it again. Empty until
+    /// [`Self::seal`], and emptied by a later group.
+    levels: Vec<Vec<[u8; 32]>>,
 }
 
 impl GroupCvs {
@@ -137,7 +142,32 @@ impl GroupCvs {
         self.cvs.push(hasher.finalize_non_root());
         self.length += group.len() as u64;
         self.ended = (group.len() as u64) < GROUP_SIZE;
+        // Whatever was retained described a shorter object.
+        self.levels.clear();
         Ok(())
+    }
+
+    /// Retains the subtree chaining values every later proof reads.
+    ///
+    /// Levels pair adjacent nodes and drop an odd tail, as
+    /// [`SealedGroupCvs`] does on storage, so a node that is not aligned to
+    /// a power of two is merged from the levels below it.
+    pub fn seal(&mut self) {
+        let mut levels = vec![self.cvs.clone()];
+        while let Some(previous) = levels.last().filter(|level| level.len() >= 2) {
+            let next: Vec<[u8; 32]> = previous
+                .chunks_exact(2)
+                .map(|pair| merge_subtrees_non_root(&pair[0], &pair[1], Mode::Hash))
+                .collect();
+            levels.push(next);
+        }
+        self.levels = levels;
+    }
+
+    /// Whether the subtree values are retained.
+    #[must_use]
+    pub fn sealed(&self) -> bool {
+        !self.levels.is_empty()
     }
 
     /// The object length these cover.
@@ -489,6 +519,7 @@ pub fn prove_with(cvs: &GroupCvs, offset: u64, length: u64) -> Result<RangeCover
         first,
         end,
         &cvs.cvs,
+        &cvs.levels,
         &mut proof,
     );
     Ok(RangeCover {
@@ -635,27 +666,63 @@ fn encode_all(node: Node, data: &[u8], output: &mut Vec<u8>) {
 /// A node's chaining value, merged up from the group layer.
 ///
 /// The same value [`node_cv`] computes from the object, without reading it.
-fn node_cv_from(node: Node, cvs: &[[u8; 32]]) -> [u8; 32] {
+/// Where a node sits in the retained levels, if it sits in them at all.
+///
+/// A level holds nodes of `2^k` groups starting at a multiple of that many,
+/// which is every node the tree splits to except the ragged ones on its
+/// right edge. Those are merged from the levels below instead.
+///
+/// Pure and answered here rather than inline, because the two halves of the
+/// test are indistinguishable through a proof: reading a level and merging
+/// the same subtree give the same bytes, at very different cost.
+const fn retained_at(node: Node) -> Option<(usize, u64)> {
+    if node.count == 0 || !node.count.is_power_of_two() || node.start % node.count != 0 {
+        return None;
+    }
+    Some((
+        node.count.trailing_zeros() as usize,
+        node.start / node.count,
+    ))
+}
+
+/// A node's chaining value, read from the retained levels where it sits in
+/// them and merged from below where it does not.
+fn node_cv_retained(node: Node, cvs: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> [u8; 32] {
     if node.count == 1 {
         return cvs[node.start as usize];
     }
+    if let Some((level, index)) = retained_at(node) {
+        if let Some(cv) = levels
+            .get(level)
+            .and_then(|row| usize::try_from(index).ok().and_then(|index| row.get(index)))
+        {
+            return *cv;
+        }
+    }
     let (left, right) = node.split();
     merge_subtrees_non_root(
-        &node_cv_from(left, cvs),
-        &node_cv_from(right, cvs),
+        &node_cv_retained(left, cvs, levels),
+        &node_cv_retained(right, cvs, levels),
         Mode::Hash,
     )
 }
 
-fn encode_selected_from(node: Node, first: u64, end: u64, cvs: &[[u8; 32]], output: &mut Vec<u8>) {
+fn encode_selected_from(
+    node: Node,
+    first: u64,
+    end: u64,
+    cvs: &[[u8; 32]],
+    levels: &[Vec<[u8; 32]>],
+    output: &mut Vec<u8>,
+) {
     if node.count == 1 || !node.intersects(first, end) {
         return;
     }
     let (left, right) = node.split();
-    output.extend_from_slice(&node_cv_from(left, cvs));
-    output.extend_from_slice(&node_cv_from(right, cvs));
-    encode_selected_from(left, first, end, cvs, output);
-    encode_selected_from(right, first, end, cvs, output);
+    output.extend_from_slice(&node_cv_retained(left, cvs, levels));
+    output.extend_from_slice(&node_cv_retained(right, cvs, levels));
+    encode_selected_from(left, first, end, cvs, levels, output);
+    encode_selected_from(right, first, end, cvs, levels, output);
 }
 
 fn encode_selected_stored(
@@ -759,6 +826,85 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_aligned_powers_of_two_sit_in_the_retained_levels() {
+        // Every node the tree splits to, and the ragged ones it also makes.
+        assert_eq!(retained_at(Node { start: 0, count: 1 }), Some((0, 0)));
+        assert_eq!(retained_at(Node { start: 4, count: 1 }), Some((0, 4)));
+        assert_eq!(retained_at(Node { start: 0, count: 4 }), Some((2, 0)));
+        assert_eq!(retained_at(Node { start: 4, count: 4 }), Some((2, 1)));
+        assert_eq!(retained_at(Node { start: 4, count: 2 }), Some((1, 2)));
+        // Ragged: a count that is not a power of two, whatever it starts at.
+        assert_eq!(retained_at(Node { start: 0, count: 6 }), None);
+        assert_eq!(retained_at(Node { start: 0, count: 3 }), None);
+        assert_eq!(retained_at(Node { start: 4, count: 3 }), None);
+        // A power of two that does not start on its own boundary.
+        assert_eq!(retained_at(Node { start: 2, count: 4 }), None);
+        assert_eq!(retained_at(Node { start: 1, count: 2 }), None);
+        assert_eq!(retained_at(Node { start: 0, count: 0 }), None);
+    }
+
+    #[test]
+    fn a_proof_reads_the_retained_levels_rather_than_merging_again() {
+        // The retained levels are read, not recomputed: corrupt one and the
+        // proof has to change. Without this the level lookup could be
+        // skipped entirely and every proof would still be right, because
+        // merging from the leaves gives the same bytes at ten times the
+        // cost.
+        let data = vec![5_u8; GROUP_SIZE as usize * 4];
+        let mut cvs = GroupCvs::new();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            cvs.push(group).unwrap();
+        }
+        cvs.seal();
+        let honest = prove_with(&cvs, 0, GROUP_SIZE).unwrap();
+        // A level above the leaves, which a proof of the first group reads
+        // as the sibling of its own subtree.
+        cvs.levels[1][1][0] ^= 0xff;
+        assert_ne!(
+            prove_with(&cvs, 0, GROUP_SIZE).unwrap(),
+            honest,
+            "the proof did not come from the retained levels"
+        );
+    }
+
+    #[test]
+    fn retained_subtrees_prove_what_merged_ones_prove() {
+        // The retained levels are a cost decision, so every shape of range
+        // has to prove the same with them as without: a whole object, one
+        // group, a range inside one, one that spans two, and the tail of an
+        // object whose group count is not a power of two.
+        let data: Vec<u8> = (0..GROUP_SIZE as usize * 5 + 1000)
+            .map(|byte| (byte % 241) as u8)
+            .collect();
+        let mut cvs = GroupCvs::new();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            cvs.push(group).unwrap();
+        }
+        assert!(!cvs.sealed(), "a store is unsealed until asked");
+        let ranges = [
+            (0, data.len() as u64),
+            (0, GROUP_SIZE),
+            (7, 30),
+            (GROUP_SIZE - 3, 9),
+            (GROUP_SIZE * 4, GROUP_SIZE + 1000),
+            (data.len() as u64 - 1, 1),
+        ];
+        let merged: Vec<RangeCover> = ranges
+            .iter()
+            .map(|(offset, length)| prove_with(&cvs, *offset, *length).unwrap())
+            .collect();
+        cvs.seal();
+        assert!(cvs.sealed(), "sealing retains the levels");
+        for (cover, (offset, length)) in merged.iter().zip(ranges) {
+            assert_eq!(
+                &prove_with(&cvs, offset, length).unwrap(),
+                cover,
+                "range {offset}+{length} proved differently from the retained levels"
+            );
+        }
+    }
+
     use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

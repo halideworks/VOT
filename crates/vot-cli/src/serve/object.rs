@@ -4,6 +4,7 @@ use super::{
     Error, File, GROUP_SIZE, ObjectBuilder, Path, PathBuf, PreparedObject, Read, Seek, SeekFrom,
     Suite, SystemTime, frames, io,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Plaintext bytes per data record. Bounded by the codec record limit and the
 /// largest cover across the bundle's record cap.
@@ -57,14 +58,74 @@ pub(crate) struct ServedObject {
     pub(crate) layer: PreparedObject,
     pub(crate) path: PathBuf,
     pub(crate) witness: Witness,
-    /// Whether every read is checked against the proving layer.
+    /// The groups already checked against the proving layer, when this end
+    /// prepared from the leaves beside the object rather than by reading it.
     ///
-    /// Set when this end prepared from the leaves beside the object rather
-    /// than by reading it, because then nothing has read the bytes yet and
-    /// the witness only says they have not changed since. The check costs a
-    /// hash of what is actually served rather than of the whole object at
-    /// start.
-    pub(crate) verify_reads: bool,
+    /// `None` where the object was read at open, because reading it checked
+    /// every group already. Otherwise nothing has read the bytes yet and the
+    /// witness only says they have not changed since open, so a group is
+    /// hashed the first time it is served and remembered.
+    pub(crate) verified: Option<GroupSet>,
+}
+
+/// The groups of one object already checked against its proving layer.
+///
+/// Shared by every connection thread, so a group one served pays for is free
+/// to the rest.
+pub(crate) struct GroupSet {
+    words: Vec<AtomicU64>,
+}
+
+impl GroupSet {
+    /// A set holding nothing, sized for an object of `length`.
+    fn for_length(length: u64) -> Self {
+        let groups = length.div_ceil(GROUP_SIZE as u64);
+        let words = usize::try_from(groups.div_ceil(u64::BITS.into())).unwrap_or(usize::MAX);
+        Self {
+            words: (0..words).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// True when every group of the span is held. A span reaching past the
+    /// object is not held, which leaves the read to hash it.
+    fn holds_span(&self, first: usize, count: usize) -> bool {
+        let Some(end) = first.checked_add(count) else {
+            return false;
+        };
+        (first..end).all(|group| {
+            self.words
+                .get(group / 64)
+                .is_some_and(|word| word.load(Ordering::Relaxed) & bit(group) != 0)
+        })
+    }
+
+    /// Records every group of the span. Groups past the object are dropped
+    /// rather than wrapping into another word.
+    fn insert_span(&self, first: usize, count: usize) {
+        let Some(end) = first.checked_add(count) else {
+            return;
+        };
+        for group in first..end {
+            if let Some(word) = self.words.get(group / 64) {
+                word.fetch_or(bit(group), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The bit one group occupies in its word.
+const fn bit(group: usize) -> u64 {
+    1_u64 << (group % 64)
+}
+
+/// The groups a cover of `length` bytes at `offset` spans, or `None` where
+/// the cover is not group-aligned or does not fit a `usize`.
+fn spanned_groups(offset: u64, length: usize) -> Option<(usize, usize)> {
+    if offset % GROUP_SIZE as u64 != 0 {
+        return None;
+    }
+    let first = usize::try_from(offset / GROUP_SIZE as u64).ok()?;
+    Some((first, length.div_ceil(GROUP_SIZE)))
 }
 
 /// A file's length and modification time at open, for cheap mutation detection.
@@ -120,7 +181,7 @@ impl ServedObject {
                 layer,
                 path,
                 witness,
-                verify_reads: true,
+                verified: Some(GroupSet::for_length(length)),
             });
         }
         let mut builder = ObjectBuilder::new(suite, Some(length))?;
@@ -150,7 +211,7 @@ impl ServedObject {
             layer,
             path,
             witness,
-            verify_reads: false,
+            verified: None,
         })
     }
 
@@ -163,11 +224,18 @@ impl ServedObject {
         let size = usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
         let mut plaintext = vec![0u8; size];
         file.read_exact(&mut plaintext).map_err(short_read)?;
-        if !self.verify_reads && self.witness.reports_untouched(&Witness::of(&file)?) {
+        let span = spanned_groups(offset, plaintext.len());
+        let checked = self.verified.as_ref().is_none_or(|verified| {
+            span.is_some_and(|(first, count)| verified.holds_span(first, count))
+        });
+        if checked && self.witness.reports_untouched(&Witness::of(&file)?) {
             return Ok(plaintext);
         }
         if !self.layer.holds(offset, &plaintext) {
             return Err(Error::SourceMutation);
+        }
+        if let (Some(verified), Some((first, count))) = (self.verified.as_ref(), span) {
+            verified.insert_span(first, count);
         }
         Ok(plaintext)
     }
@@ -189,5 +257,60 @@ pub(crate) fn short_read(error: io::Error) -> Error {
         Error::SourceMutation
     } else {
         Error::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GROUP_SIZE, GroupSet, spanned_groups};
+
+    #[test]
+    fn a_group_set_holds_only_the_spans_it_was_given() {
+        let object = GROUP_SIZE as u64 * 65 + 1;
+        let set = GroupSet::for_length(object);
+        // 66 groups need two words, and nothing is held before a read.
+        assert_eq!(set.words.len(), 2);
+        assert!(!set.holds_span(0, 1));
+
+        // A span crossing the word boundary holds both sides and neither
+        // neighbour.
+        set.insert_span(63, 2);
+        assert!(set.holds_span(63, 2));
+        assert!(set.holds_span(63, 1));
+        assert!(set.holds_span(64, 1));
+        assert!(!set.holds_span(62, 1));
+        assert!(!set.holds_span(62, 2));
+        assert!(!set.holds_span(65, 1));
+
+        // A span reaching past the object is never held, however far it
+        // reaches, so the read hashes it rather than trusting the set.
+        assert!(!set.holds_span(65, 2));
+        assert!(!set.holds_span(usize::MAX, 1));
+        set.insert_span(usize::MAX, 2);
+        assert!(
+            !set.holds_span(0, 1),
+            "a span past the end wrapped into a word"
+        );
+    }
+
+    #[test]
+    fn an_empty_object_holds_no_group() {
+        let set = GroupSet::for_length(0);
+        assert_eq!(set.words.len(), 0);
+        assert!(!set.holds_span(0, 1));
+    }
+
+    #[test]
+    fn covers_name_the_groups_they_span() {
+        let group = GROUP_SIZE as u64;
+        assert_eq!(spanned_groups(0, GROUP_SIZE), Some((0, 1)));
+        assert_eq!(spanned_groups(0, GROUP_SIZE + 1), Some((0, 2)));
+        assert_eq!(spanned_groups(group * 3, GROUP_SIZE * 2), Some((3, 2)));
+        // A partial final group still counts, and an empty cover spans none.
+        assert_eq!(spanned_groups(group, 1), Some((1, 1)));
+        assert_eq!(spanned_groups(group, 0), Some((1, 0)));
+        // Only a group-aligned cover can name groups.
+        assert_eq!(spanned_groups(1, GROUP_SIZE), None);
+        assert_eq!(spanned_groups(group + 1, GROUP_SIZE), None);
     }
 }

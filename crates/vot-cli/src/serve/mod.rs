@@ -484,6 +484,84 @@ mod tests {
         }
     }
 
+    fn ample_receiver_credit() -> vot_fec::Credit {
+        vot_fec::Credit {
+            credit_epoch: 1,
+            max_unretired_bytes: 1 << 24,
+            max_active_generations: 64,
+            max_decode_work: 1 << 30,
+            max_open_epochs: 4,
+        }
+    }
+
+    #[test]
+    fn repair_count_tracks_real_loss_after_startup() {
+        let repair = |lost, spurious, sent| {
+            server::fec_repair_symbols(Some(vot_transport_api::PathStats {
+                lost_packets: Some(lost),
+                spurious_lost_packets: Some(spurious),
+                packets_sent: Some(sent),
+                ..vot_transport_api::PathStats::default()
+            }))
+        };
+        assert_eq!(server::fec_repair_symbols(None), 8);
+        assert_eq!(
+            server::fec_repair_symbols(Some(vot_transport_api::PathStats::default())),
+            8
+        );
+        assert_eq!(repair(0, 0, 1023), 8);
+        assert_eq!(repair(0, 0, 1024), 1);
+        assert_eq!(repair(9, 0, 2000), 1);
+        assert_eq!(repair(10, 0, 2000), 4);
+        assert_eq!(repair(29, 0, 2000), 4);
+        assert_eq!(repair(30, 0, 2000), 6);
+        assert_eq!(repair(49, 0, 2000), 6);
+        assert_eq!(repair(50, 0, 2000), 8);
+        assert_eq!(repair(50, 49, 2000), 1, "spurious losses do not buy repair");
+    }
+
+    #[test]
+    fn each_service_pass_uses_its_path_sample_for_new_epochs() {
+        let (bundle, _) = built_bundle("adaptive-fec", &[("two-groups.bin", patterned(131_072))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+
+        for (request_id, offset, lost, expected_repair) in
+            [(1, 0, 0, 1), (2, 65_536, 60, server::FEC_REPAIR_SYMBOLS)]
+        {
+            session.driver().path_stats = Some(vot_transport_api::PathStats {
+                lost_packets: Some(lost),
+                spurious_lost_packets: Some(0),
+                packets_sent: Some(2000),
+                ..vot_transport_api::PathStats::default()
+            });
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                    request_id: [request_id; 16],
+                    object,
+                    offset,
+                    length: 65_536,
+                })));
+            server.service(&mut session, &mut connection).unwrap();
+            let frames = fec_frames(&mut session);
+            let TypedFrame::CodingEpochOpen(open) = &frames[1] else {
+                panic!("proof then coding epoch open, got {frames:?}");
+            };
+            assert_eq!(open.geometry.repair_count(), expected_repair);
+            assert_eq!(session.driver().datagrams.len(), 64 + expected_repair);
+            assert_eq!(
+                decoded_generations(&mut session, open, ample_receiver_credit()).len(),
+                1
+            );
+        }
+    }
+
     /// Decodes every queued symbol datagram through a receiver and returns
     /// each generation's bytes by generation.
     fn decoded_generations(
@@ -580,17 +658,7 @@ mod tests {
         );
         // Decoded through a receiver, the generations are the bundle's records
         // and verify against its proof.
-        let generations = decoded_generations(
-            &mut session,
-            open,
-            vot_fec::Credit {
-                credit_epoch: 1,
-                max_unretired_bytes: 1 << 24,
-                max_active_generations: 64,
-                max_decode_work: 1 << 30,
-                max_open_epochs: 4,
-            },
-        );
+        let generations = decoded_generations(&mut session, open, ample_receiver_credit());
         assert_eq!(generations.len(), 5);
         let records: Vec<DataRecord> = generations
             .iter()

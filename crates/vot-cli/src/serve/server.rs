@@ -104,8 +104,6 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
-        // Whether this pass stopped before reading everything the peer sent.
-        let mut unread = false;
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -113,17 +111,27 @@ impl BundleServer {
             if let Err(fault) = self.pump_manifest(connection) {
                 return fail(fault, session, connection);
             }
-            if connection.outbound.bytes() >= connection.budget {
-                // Broken on the budget rather than on an empty queue, so
-                // frames the peer has already sent may be sitting unread and
-                // an epoch's outcome may be among them.
-                unread = true;
-                break;
-            }
             connection.fec_negotiated =
                 session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
-            match session.poll() {
+            let over_budget = connection.outbound.bytes() >= connection.budget;
+            let polled = if over_budget || connection.deferred.is_empty() {
+                session.poll()
+            } else {
+                Ok(connection.deferred.pop_front().map(Event::Control))
+            };
+            match polled {
                 Ok(Some(Event::Control(bytes))) => {
+                    if let (true, true) = (over_budget, answer_request(&bytes)) {
+                        if connection.deferred.len() == super::connection::REMEMBERED_REQUESTS {
+                            return fail(
+                                Fault::Peer(error_code::RESOURCE_LIMIT),
+                                session,
+                                connection,
+                            );
+                        }
+                        connection.deferred.push_back(bytes);
+                        continue;
+                    }
                     // Announce before the first answer.
                     self.ensure_announced(connection, session.is_ready());
                     if let Err(fault) = self.dispatch(&bytes, connection) {
@@ -151,10 +159,8 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
-        if !unread {
-            if let Err(fault) = self.retire_quiet_epochs(connection, std::time::Instant::now()) {
-                return fail(fault, session, connection);
-            }
+        if let Err(fault) = self.retire_quiet_epochs(connection, std::time::Instant::now()) {
+            return fail(fault, session, connection);
         }
         connection.drain(session)?;
         if let Some(code) = connection.closed {
@@ -177,9 +183,8 @@ impl BundleServer {
     /// every generation under it with no `GEN_DONE` retires as abandoned.
     ///
     /// The instant to measure against is the caller's, so a test spends the
-    /// grace without waiting for it. A pass that stopped on the outbound
-    /// budget does not spend it at all: frames the peer already sent may be
-    /// unread, and an epoch's outcome may be among them.
+    /// grace without waiting for it. The service loop drains carrier feedback
+    /// before calling this even while answer requests are deferred.
     ///
     /// The budget is per epoch and is reset by anything the receiver says
     /// about that epoch: a `GEN_STATE`, which it sends as each generation's
@@ -717,6 +722,31 @@ impl BundleServer {
         }
         Ok(())
     }
+}
+
+/// Whether consuming this frame can add a new answer batch.
+pub(super) fn answer_request(bytes: &[u8]) -> bool {
+    let limits = DecodeLimits {
+        max_unknown_payload: MAX_CONTROL_FRAME_PAYLOAD,
+        max_frames: 1,
+    };
+    if !vot_codec::peek_envelope(bytes, limits).is_ok_and(|frame| {
+        matches!(
+            frame.frame_type,
+            frame_type::MANIFEST_REQUEST | frame_type::RANGE_REQUEST
+        )
+    }) {
+        return false;
+    }
+    frames::decode(bytes, limits).is_ok_and(|(frame, consumed)| {
+        matches!(
+            (consumed == bytes.len(), frame),
+            (
+                true,
+                TypedFrame::ManifestRequest(_) | TypedFrame::RangeRequest(_)
+            )
+        )
+    })
 }
 
 /// The shipped FEC profile (spec/fec.md section 9): one generation is one

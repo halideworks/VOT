@@ -429,6 +429,39 @@ fn every_erasure_pattern_within_the_repair_count_decodes() {
 }
 
 #[test]
+#[ignore = "performance measurement"]
+fn decode_costs() {
+    let geometry = Geometry::new(64, 8, 1024).unwrap();
+    let source: Vec<Vec<u8>> = (0..64).map(|esi| pattern(esi, 1024)).collect();
+    let borrowed: Vec<&[u8]> = source.iter().map(Vec::as_slice).collect();
+    let repair = encode(geometry, &borrowed).unwrap();
+
+    for missing in [1, 8] {
+        let received: Vec<(usize, &[u8])> = borrowed
+            .iter()
+            .enumerate()
+            .skip(missing)
+            .map(|(esi, symbol)| (esi, *symbol))
+            .chain(
+                repair
+                    .iter()
+                    .take(missing)
+                    .enumerate()
+                    .map(|(i, symbol)| (64 + i, symbol.as_slice())),
+            )
+            .collect();
+        let started = std::time::Instant::now();
+        for _ in 0..200 {
+            std::hint::black_box(decode(geometry, &received).unwrap());
+        }
+        eprintln!(
+            "missing {missing}: {:?} per decode",
+            started.elapsed() / 200
+        );
+    }
+}
+
+#[test]
 fn errors_display() {
     assert_eq!(Error::InvalidGeometry.to_string(), "invalid FEC geometry");
     assert_eq!(Error::InvalidSymbol.to_string(), "invalid FEC symbol");

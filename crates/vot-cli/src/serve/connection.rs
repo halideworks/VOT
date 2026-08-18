@@ -26,6 +26,9 @@ pub struct ServeConnection {
     pub(crate) progress: u64,
     /// Answers the carrier has taken, which the outbound budget may hide.
     pub(crate) handed_over: u64,
+    /// Requests read while answers are backpressured. Kept in wire order so
+    /// carrier-state events behind them can still be drained.
+    pub(crate) deferred: VecDeque<Payload>,
     /// The datagram FEC sending state: what the peer's credit lets this end
     /// open and send. Used only while `fec_negotiated`.
     pub(crate) fec: FecSender,
@@ -44,6 +47,7 @@ impl Default for ServeConnection {
             closed: None,
             progress: 0,
             handed_over: 0,
+            deferred: VecDeque::new(),
             fec: FecSender::default(),
             fec_negotiated: false,
         }
@@ -232,10 +236,11 @@ impl ServeConnection {
         self.outbound.bytes()
     }
 
-    /// Whether answers are still owed: queued frames or unpaged manifest pages.
+    /// Whether answers are still owed: queued frames, deferred requests, or
+    /// unpaged manifest pages.
     #[must_use]
     pub fn has_backlog(&self) -> bool {
-        !self.outbound.is_empty() || self.manifest_cursor.is_some()
+        !self.outbound.is_empty() || self.manifest_cursor.is_some() || !self.deferred.is_empty()
     }
 
     /// Records the close and drops pending answers.
@@ -243,6 +248,7 @@ impl ServeConnection {
         self.closed = Some(code);
         self.outbound = OutboundQueue::default();
         self.manifest_cursor = None;
+        self.deferred.clear();
     }
 
     /// Admits a request as new or an exact replay, which is re-answered.

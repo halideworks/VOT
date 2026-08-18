@@ -2299,6 +2299,58 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_prepared_read_hashes_a_group_once_and_remembers_it() {
+        // Stored rather than packed, so `send` keeps leaves beside it and
+        // the serve prepares from them without reading the object.
+        let (bundle, _) = built_bundle(
+            "groupset",
+            &[("big.bin", patterned(vot_pack::CANDIDATE_MAX + 1))],
+        );
+        let mut server = BundleServer::open(&bundle).unwrap();
+        let stored = server.objects.values_mut().next().unwrap();
+        assert!(stored.verified.is_some(), "the leaves prepared it");
+
+        // A layer holding nothing stands in for bytes that do not match.
+        let refusing = || {
+            ObjectBuilder::new(Suite::Blake3Bao64, Some(0))
+                .unwrap()
+                .finish()
+                .unwrap()
+        };
+
+        // Nothing has read the bytes yet, so the first read hashes them.
+        let honest = std::mem::replace(&mut stored.layer, refusing());
+        let outcome = stored.read_covered(0, GROUP_SIZE as u64);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+
+        // Read once against the layer it was prepared with, and that group
+        // is served again without consulting the layer at all.
+        stored.layer = honest;
+        stored
+            .read_covered(0, GROUP_SIZE as u64)
+            .expect("the first group");
+        let honest = std::mem::replace(&mut stored.layer, refusing());
+        stored
+            .read_covered(0, GROUP_SIZE as u64)
+            .expect("the group it already checked");
+
+        // A group nothing has read is still hashed, so the same layer stops
+        // it. The set remembers what was served, not the whole object.
+        let outcome = stored.read_covered(GROUP_SIZE as u64, GROUP_SIZE as u64);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+
+        // And once the file is touched, a remembered group is hashed again.
+        stored.layer = honest;
+        stored
+            .read_covered(GROUP_SIZE as u64, GROUP_SIZE as u64)
+            .expect("the second group");
+        stored.witness.modified = None;
+        stored.layer = refusing();
+        let outcome = stored.read_covered(0, GROUP_SIZE as u64);
+        assert!(matches!(outcome, Err(Error::SourceMutation)));
+    }
+
+    #[test]
     pub(crate) fn an_object_removed_after_open_is_reported_and_closed() {
         // An object removed between open and the request.
         let (bundle, _) = built_bundle("removed", &[("big.bin", patterned(150_000))]);

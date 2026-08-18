@@ -180,6 +180,19 @@ mod tests {
         alien[0] ^= 0xff;
         std::fs::write(&file, alien).unwrap();
         assert_eq!(read(&directory, &root, Suite::Sha256Bep52, length), None);
+
+        // A header and nothing after it is the smallest thing that parses:
+        // it holds no leaves, which describes no tree, and what refuses it
+        // is the caller that cannot build one. Exactly the header, so the
+        // bound on the header's own size is the one being read here.
+        let mut header = bytes[..HEADER_BYTES].to_vec();
+        header[MAGIC.len() + 1 + 8..HEADER_BYTES].copy_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(header.len(), HEADER_BYTES);
+        std::fs::write(&file, header).unwrap();
+        assert_eq!(
+            read(&directory, &root, Suite::Sha256Bep52, length),
+            Some(Vec::new())
+        );
         crate::harness::discard(&[&directory]);
     }
 }

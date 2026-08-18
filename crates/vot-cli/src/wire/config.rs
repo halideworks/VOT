@@ -111,13 +111,13 @@ pub(crate) const FETCH_RAILS: &str = "VOT_FETCH_RAILS";
 /// excess rails stall waiting for accepts.
 pub(crate) const MAX_FETCH_RAILS: usize = crate::drive::CONCURRENT_SESSIONS;
 
-/// The width [`FETCH_RAILS`] names, or `min(4, available cores)` when unset.
+/// The width [`FETCH_RAILS`] names, or two rails per available core when unset.
 ///
 /// # Errors
 /// Rejects a value that is not a number, zero, or a width past the bound.
 pub(crate) fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error> {
     let Some(value) = pin else {
-        return Ok(4.min(cores.max(1)));
+        return Ok(cores.saturating_mul(2).clamp(1, MAX_FETCH_RAILS));
     };
     bounded(value, 1..=MAX_FETCH_RAILS)
 }

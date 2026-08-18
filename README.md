@@ -137,7 +137,7 @@ authenticates received content. See ADR-0037.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
-| `VOT_FETCH_RAILS` | `min(4, cores)` | Concurrent fetch sessions (multi-rail) |
+| `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_DATAGRAM_FEC` | unset | Set to `1` at both ends to offer the experimental datagram FEC extension; group-aligned answers then travel as coded symbols and the reliable path carries the rest |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |

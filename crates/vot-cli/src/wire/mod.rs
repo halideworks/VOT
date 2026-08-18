@@ -1058,10 +1058,10 @@ mod tests {
 
     #[test]
     fn the_width_is_the_value_given_or_the_machines_own() {
-        assert_eq!(rails_from(None, 1).unwrap(), 1);
-        assert_eq!(rails_from(None, 3).unwrap(), 3);
-        assert_eq!(rails_from(None, 4).unwrap(), 4);
-        assert_eq!(rails_from(None, 64).unwrap(), 4, "the default caps at 4");
+        assert_eq!(rails_from(None, 1).unwrap(), 2);
+        assert_eq!(rails_from(None, 3).unwrap(), 6);
+        assert_eq!(rails_from(None, 4).unwrap(), 8);
+        assert_eq!(rails_from(None, 64).unwrap(), 8, "the default caps at 8");
         assert_eq!(rails_from(None, 0).unwrap(), 1, "no cores is still one");
         assert_eq!(
             rails_from(Some(" 2\n"), 1).unwrap(),

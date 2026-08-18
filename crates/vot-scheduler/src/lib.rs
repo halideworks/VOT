@@ -313,6 +313,7 @@ mod tests {
         let mut receiver =
             ReliableReceiver::new(4 * VERIFIER_RESERVATION, 1, 4 * VERIFIER_RESERVATION).unwrap();
         let mut partial = RangeState::new(
+            object.length(),
             Box::new(DiscardSink),
             receiver.staging.reserve(VERIFIER_RESERVATION).unwrap(),
         );
@@ -323,6 +324,7 @@ mod tests {
         receiver.range_active.insert(object, partial);
         assert_eq!(receiver.finish_ranges(object), Err(Error::LengthMismatch));
         let mut complete = RangeState::new(
+            object.length(),
             Box::new(DiscardSink),
             receiver.staging.reserve(VERIFIER_RESERVATION).unwrap(),
         );

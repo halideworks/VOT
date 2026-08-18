@@ -4,8 +4,29 @@
 
 use std::collections::BTreeMap;
 
-/// Maximum disjoint covered extents retained for one object.
+/// Disjoint covered extents retained for an object of unstated length, and
+/// the floor for one whose length is known.
 pub const MAX_FRAGMENTS: usize = 4096;
+
+/// Object bytes a retained extent is allowed for, above the floor.
+///
+/// The extents a transfer holds grow with the object rather than with what
+/// is in flight, because rails complete ranges out of order and a hole lives
+/// until both its neighbours land. Measured over loopback fetches the peak
+/// was about 40 extents a gigabyte, 500 at 12 GB and 1750 at 50 GB, so the
+/// flat floor failed a 100 GB fetch at 96% placed. One per 8 MB is four
+/// times that density.
+///
+/// The ceiling this sets is memory: an extent is a pair of offsets in a map,
+/// so a terabyte object allows about 131000 of them, a few megabytes.
+pub const FRAGMENT_PER_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Extents an object of this length may be covered in.
+#[must_use]
+pub fn fragment_limit(object_len: u64) -> usize {
+    let scaled = usize::try_from(object_len / FRAGMENT_PER_BYTES).unwrap_or(usize::MAX);
+    scaled.max(MAX_FRAGMENTS)
+}
 
 /// A coverage check or commit failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +88,8 @@ impl Booking<'_> {
 pub struct Coverage {
     extents: BTreeMap<u64, u64>,
     bytes: u64,
+    /// Extents this object may be covered in, from its length.
+    limit: usize,
 }
 
 impl Coverage {
@@ -76,7 +99,25 @@ impl Coverage {
         Self {
             extents: BTreeMap::new(),
             bytes: 0,
+            limit: MAX_FRAGMENTS,
         }
+    }
+
+    /// Coverage for an object of a known length, which is what decides how
+    /// many extents it may be covered in.
+    #[must_use]
+    pub fn for_object(object_len: u64) -> Self {
+        Self {
+            extents: BTreeMap::new(),
+            bytes: 0,
+            limit: fragment_limit(object_len),
+        }
+    }
+
+    /// Extents this coverage may hold.
+    #[must_use]
+    pub const fn fragment_limit(&self) -> usize {
+        self.limit
     }
 
     /// Checks whether a range is new, a replay, or conflicts with coverage.
@@ -115,7 +156,7 @@ impl Coverage {
         let next_bytes = self.bytes.checked_add(bytes).ok_or(Error::LengthExceeded)?;
         let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
         let merges_later = self.extents.contains_key(&covered_end);
-        if !merges_earlier && !merges_later && self.extents.len() >= MAX_FRAGMENTS {
+        if !merges_earlier && !merges_later && self.extents.len() >= self.limit {
             return Err(Error::FragmentsExhausted);
         }
         Ok(Check::New(Booking {
@@ -162,6 +203,26 @@ mod tests {
             commit(&mut coverage, first_offset + index * 2, 1);
         }
         coverage
+    }
+
+    #[test]
+    fn the_extent_bound_follows_the_object() {
+        // Flat, an object big enough outgrows it: the extents a transfer
+        // holds track the object rather than what is in flight, about 40 a
+        // gigabyte measured, and a 100 GB fetch died at 96% placed.
+        assert_eq!(fragment_limit(0), MAX_FRAGMENTS);
+        assert_eq!(fragment_limit(1), MAX_FRAGMENTS);
+        // Below the floor the floor holds.
+        assert_eq!(fragment_limit(8 * 1024 * 1024 * 4095), MAX_FRAGMENTS);
+        // Above it, one per FRAGMENT_PER_BYTES.
+        assert_eq!(fragment_limit(FRAGMENT_PER_BYTES * 12_000), 12_000);
+        assert_eq!(fragment_limit(100 * 1024 * 1024 * 1024), 12_800);
+        // And the coverage it builds carries that bound.
+        assert_eq!(
+            Coverage::for_object(100 * 1024 * 1024 * 1024).fragment_limit(),
+            12_800
+        );
+        assert_eq!(Coverage::new().fragment_limit(), MAX_FRAGMENTS);
     }
 
     #[test]

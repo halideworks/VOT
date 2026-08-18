@@ -111,8 +111,10 @@ impl ReliableReceiver {
         }
         let reservation = self.staging.reserve(VERIFIER_RESERVATION)?;
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        self.range_active
-            .insert(subject, RangeState::new(sink, reservation));
+        self.range_active.insert(
+            subject,
+            RangeState::new(subject.length(), sink, reservation),
+        );
         Ok(())
     }
 

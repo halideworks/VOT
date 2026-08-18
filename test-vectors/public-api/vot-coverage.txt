@@ -1,5 +1,7 @@
+constant vot_coverage::FRAGMENT_PER_BYTES
 constant vot_coverage::MAX_FRAGMENTS
 enum vot_coverage::Check
 enum vot_coverage::Error
+function vot_coverage::fragment_limit
 struct vot_coverage::Booking
 struct vot_coverage::Coverage

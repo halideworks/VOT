@@ -76,9 +76,8 @@ pub const MAX_CODING_EPOCHS: usize = 8;
 /// sending meanwhile: every byte that is left is not left by the time the
 /// credit gets there. Pure, because a transfer finishes at either number and
 /// what differs is whether the budget it fills is the one that ends it.
-const fn coded_allowance(staging: u64, orphan_headroom: u64) -> u64 {
-    let half = orphan_headroom / 2;
-    if staging < half { staging } else { half }
+fn coded_allowance(staging: u64, orphan_headroom: u64) -> u64 {
+    staging.min(orphan_headroom / 2)
 }
 
 /// `value` rounded down to a whole number of `quantum`.

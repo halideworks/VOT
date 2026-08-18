@@ -221,7 +221,14 @@ pub(crate) struct Fetched {
     /// Bytes this fetch placed itself, which on a resumed bundle is less
     /// than the package holds.
     pub(crate) moved: u64,
+    /// When any rail first observed verified bytes from this run.
+    pub(crate) first_moved: Option<Instant>,
     pub(crate) fec: vot_scheduler::FecCounts,
+}
+
+#[cfg(any(test, feature = "wire"))]
+fn earliest_observation(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    [first, second].into_iter().flatten().min()
 }
 
 /// Fetches at `rails` width. The primary builds the plan; rails join it
@@ -247,6 +254,7 @@ where
         return Ok(Fetched {
             package: fetched(&primary, status)?,
             moved: primary.moved_bytes(),
+            first_moved: primary.first_moved(),
             fec: primary.fec_counts(),
         });
     }
@@ -279,7 +287,7 @@ where
                     )?;
                     rail.set_proving_threads(provers)?;
                     fetch_verdict(drive(&mut rail)?)?;
-                    Ok(rail.fec_counts())
+                    Ok((rail.fec_counts(), rail.first_moved()))
                 })();
                 if outcome.is_err() {
                     crate::fetch::abandon_plan(&plan);
@@ -292,10 +300,14 @@ where
             crate::fetch::abandon_plan(&plan);
         }
         let mut fec = primary.fec_counts();
+        let mut first_moved = primary.first_moved();
         let mut rail_failure = None;
         for rail in spawned {
             match rail.join().expect("a rail thread never panics") {
-                Ok(counts) => fec = fec + counts,
+                Ok((counts, first)) => {
+                    fec = fec + counts;
+                    first_moved = earliest_observation(first_moved, first);
+                }
                 Err(error) => rail_failure = Some(named_failure(rail_failure, error)),
             }
         }
@@ -303,6 +315,7 @@ where
             Ok(package) => Ok(Fetched {
                 package,
                 moved: primary.moved_bytes(),
+                first_moved,
                 fec,
             }),
             // Report the rail's failure as the cause of a stalled primary.
@@ -748,6 +761,23 @@ mod tests {
             fetch_verdict(crate::FetchStatus::Active),
             Err(Error::InvalidBundle)
         ));
+    }
+
+    #[test]
+    fn first_payload_is_the_earliest_rail_observation() {
+        let later = Instant::now();
+        let earlier = later.checked_sub(Duration::from_millis(1)).unwrap();
+        assert_eq!(
+            earliest_observation(Some(later), Some(earlier)),
+            Some(earlier)
+        );
+        assert_eq!(
+            earliest_observation(Some(earlier), Some(later)),
+            Some(earlier)
+        );
+        assert_eq!(earliest_observation(None, Some(earlier)), Some(earlier));
+        assert_eq!(earliest_observation(Some(earlier), None), Some(earlier));
+        assert_eq!(earliest_observation(None, None), None);
     }
 
     #[test]

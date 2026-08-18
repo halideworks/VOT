@@ -68,6 +68,15 @@ const _: () = assert!(
 /// holds two bundles a slot and the byte budget affords about twenty pieces.
 pub const MAX_CODING_EPOCHS: usize = 8;
 
+/// `value` rounded down to a whole number of `quantum`.
+///
+/// Pure and answered here because what it is for cannot be seen from a
+/// transfer: reporting every byte of room and reporting it in steps both
+/// finish, at very different numbers of control frames.
+const fn quantised_down(value: usize, quantum: usize) -> usize {
+    value / quantum * quantum
+}
+
 /// How coarsely [`PendingBundles::orphan_headroom`] is reported.
 ///
 /// A credit is a control frame, so it is worth sending when the room left
@@ -243,7 +252,7 @@ impl PendingBundles {
     /// as a cover completes.
     fn orphan_headroom(&self) -> u64 {
         let left = self.orphan_byte_limit.saturating_sub(self.orphan_bytes);
-        u64::try_from(left / ORPHAN_HEADROOM_QUANTUM * ORPHAN_HEADROOM_QUANTUM).unwrap_or(u64::MAX)
+        u64::try_from(quantised_down(left, ORPHAN_HEADROOM_QUANTUM)).unwrap_or(u64::MAX)
     }
 
     /// Bytes held across both budgets.
@@ -363,10 +372,19 @@ impl PendingBundles {
         // An orphan budget with no room is not a failed transfer: the oldest
         // entry in it is holding records no proof is coming for, so it makes
         // way and its extent is asked for again.
-        while orphan
-            && self.refuse_over_budget(&id, bytes, orphan).is_err()
-            && self.drop_oldest_orphan()
-        {}
+        //
+        // Bounded by the entries there are, because each pass drops one: a
+        // budget that cannot be made to fit stops here rather than spinning.
+        if orphan {
+            for _ in 0..self.orphan_bundles {
+                if self.refuse_over_budget(&id, bytes, orphan).is_ok() {
+                    break;
+                }
+                if !self.drop_oldest_orphan() {
+                    break;
+                }
+            }
+        }
         self.refuse_over_budget(&id, bytes, orphan)?;
         self.opened += 1;
         let opened_at = self.opened;
@@ -1590,6 +1608,40 @@ mod tests {
             1,
             "a refusal changes nothing"
         );
+    }
+
+    #[test]
+    fn room_is_reported_in_whole_steps() {
+        // A credit is a control frame, so the room left is reported in steps
+        // rather than byte by byte. The step is what makes the difference
+        // between one frame a cover and one frame a record.
+        assert_eq!(quantised_down(0, 4), 0);
+        assert_eq!(quantised_down(3, 4), 0);
+        assert_eq!(quantised_down(4, 4), 4);
+        assert_eq!(quantised_down(7, 4), 4);
+        assert_eq!(quantised_down(8, 4), 8);
+        assert_eq!(
+            quantised_down(ORPHAN_HEADROOM_QUANTUM * 3 - 1, ORPHAN_HEADROOM_QUANTUM),
+            ORPHAN_HEADROOM_QUANTUM * 2
+        );
+
+        // And what the budget reports as it fills: the whole budget when
+        // empty, nothing once what is left is under one step.
+        let mut pending = PendingBundles::default();
+        pending.orphan_byte_limit = ORPHAN_HEADROOM_QUANTUM * 4;
+        assert_eq!(
+            pending.orphan_headroom(),
+            (ORPHAN_HEADROOM_QUANTUM * 4) as u64
+        );
+        pending.orphan_bytes = ORPHAN_HEADROOM_QUANTUM * 2;
+        assert_eq!(
+            pending.orphan_headroom(),
+            (ORPHAN_HEADROOM_QUANTUM * 2) as u64
+        );
+        pending.orphan_bytes = ORPHAN_HEADROOM_QUANTUM * 4 - 1;
+        assert_eq!(pending.orphan_headroom(), 0, "under a step is no room");
+        pending.orphan_bytes = ORPHAN_HEADROOM_QUANTUM * 5;
+        assert_eq!(pending.orphan_headroom(), 0, "past the budget is no room");
     }
 
     #[test]

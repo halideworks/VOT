@@ -132,6 +132,8 @@ pub(crate) struct ProgressReport {
     ///
     /// A driving loop reads it to tell a slow transfer from a stuck one.
     pub(crate) progress: u64,
+    /// When this fetch first observed bytes it placed itself.
+    pub(crate) first_moved: Option<std::time::Instant>,
     /// Where placed-byte crossings are reported, if anywhere.
     pub(crate) placed: Option<PlacedReport>,
 }
@@ -477,6 +479,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         })
     }
 
+    /// When this fetch first observed verified bytes from this run.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn first_moved(&self) -> Option<std::time::Instant> {
+        self.report.first_moved
+    }
+
     /// The plan under its lock, or nothing before the manifest settles it.
     ///
     /// A poisoned lock reads as no plan; callers have a conservative
@@ -510,8 +518,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
 
     /// One report if placed bytes crossed the next quantum, none otherwise.
     pub(crate) fn note_placed(&mut self) {
-        let placed = self.placed_bytes();
-        let total = self.locked_plan().map(|plan| plan.summary.logical_length);
+        let Some(plan) = self.locked_plan() else {
+            return;
+        };
+        let placed = placed_in(&plan);
+        let moved = placed.saturating_sub(plan.carried_before);
+        let total = Some(plan.summary.logical_length);
+        drop(plan);
+        if self.report.first_moved.is_none() && moved != 0 {
+            self.report.first_moved = Some(std::time::Instant::now());
+        }
         let Some(report) = &mut self.report.placed else {
             return;
         };

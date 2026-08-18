@@ -516,14 +516,14 @@ mod tests {
         fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary: PackageSummary {
                 root: [0; 32],
-                logical_length: 0,
+                logical_length: 7,
                 entries: 0,
             },
             objects: Vec::new(),
             current: 0,
             active: None,
-            placed_before: 0,
-            carried_before: 0,
+            placed_before: 7,
+            carried_before: 7,
             next_offset: 0,
             covered: CoverageMap::new(),
             syncing: false,
@@ -534,7 +534,12 @@ mod tests {
         })));
         fs::remove_dir_all(&output).unwrap();
         fetcher.advance().unwrap();
+        fetcher.note_placed();
         assert!(fetcher.complete());
+        assert!(
+            fetcher.first_moved().is_none(),
+            "bytes from a prior run have no first-payload time in this run"
+        );
     }
 
     #[test]
@@ -937,9 +942,14 @@ mod tests {
             arrived.notify_all();
             Ok(client)
         };
-        let fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        let mut fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        fetcher.rail.window_bytes = 0;
         let outcome = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
         assert_eq!(outcome.package, built);
+        assert!(
+            outcome.first_moved.is_some(),
+            "the secondary rail's first payload is retained"
+        );
         assert_eq!(
             connects.load(Ordering::Relaxed),
             2,
@@ -1069,6 +1079,10 @@ mod tests {
             resumed.moved_bytes(),
             second_length,
             "the resumed fetch moved only the object that was missing"
+        );
+        assert!(
+            resumed.first_moved().is_some(),
+            "newly moved resume bytes have a first-payload time"
         );
         assert_eq!(
             resumed.placed_bytes(),
@@ -1550,9 +1564,11 @@ mod tests {
                 Box::new(move |placed, total| observed.lock().unwrap().push((placed, total))),
             )
             .unwrap();
+        assert!(fetcher.first_moved().is_none());
         let status =
             run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap();
         assert_eq!(status, FetchStatus::Complete);
+        assert!(fetcher.first_moved().is_some());
 
         let seen = seen.lock().unwrap();
         assert!(!seen.is_empty(), "8.5 MB against a 1 MB quantum reports");

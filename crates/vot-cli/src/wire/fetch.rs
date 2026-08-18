@@ -122,7 +122,10 @@ where
     let outcome = crate::drive::fetch_striped(fetcher, rails, connect)?;
     let elapsed = began.elapsed();
     if wanted {
-        eprintln!("{}", stats_line(outcome.moved, elapsed, outcome.fec));
+        let first = outcome
+            .first_moved
+            .map(|at| at.saturating_duration_since(began));
+        eprintln!("{}", stats_line(outcome.moved, elapsed, first, outcome.fec));
     }
     Ok(outcome)
 }
@@ -151,10 +154,12 @@ where
 pub(crate) fn stats_line(
     bytes: u64,
     elapsed: std::time::Duration,
+    first: Option<std::time::Duration>,
     fec: vot_scheduler::FecCounts,
 ) -> String {
+    let first = first.map_or_else(|| "none".to_owned(), |time| time.as_millis().to_string());
     format!(
-        "fetch stats bytes={bytes} ms={} fec_offered={} fec_coded={} fec_decoded={} \
+        "fetch stats bytes={bytes} ms={} first_ms={first} fec_offered={} fec_coded={} fec_decoded={} \
          fec_abandoned={} fec_refused={}",
         elapsed.as_millis(),
         fec.offered,

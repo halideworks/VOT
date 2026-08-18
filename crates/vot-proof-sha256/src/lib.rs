@@ -72,6 +72,14 @@ pub struct PieceHashes {
     hashes: Vec<[u8; 32]>,
     length: u64,
     ended: bool,
+    /// The padded piece tree, kept so a proof reads the siblings it needs
+    /// instead of building the whole tree again. Empty until [`Self::seal`],
+    /// and emptied by a later piece.
+    ///
+    /// It costs what the hashes themselves cost, about half a megabyte a
+    /// gigabyte, and it is the difference between a proof costing one hash
+    /// per level and one per piece of the object.
+    layers: Vec<Vec<[u8; 32]>>,
 }
 
 impl PieceHashes {
@@ -95,7 +103,24 @@ impl PieceHashes {
         self.hashes.push(piece_hash(piece));
         self.length += piece.len() as u64;
         self.ended = (piece.len() as u64) < PIECE_SIZE;
+        // Whatever was retained described a shorter object.
+        self.layers.clear();
         Ok(())
+    }
+
+    /// Retains the tree every later proof reads.
+    ///
+    /// Called once the pieces are all in. A proof without it is still
+    /// correct, it just pays for the tree again, so this is a cost decision
+    /// rather than a correctness one.
+    pub fn seal(&mut self) {
+        self.layers = padded_piece_tree(&self.hashes);
+    }
+
+    /// Whether the tree is retained.
+    #[must_use]
+    pub fn sealed(&self) -> bool {
+        !self.layers.is_empty()
     }
 
     /// The object length these cover.
@@ -426,7 +451,11 @@ pub fn prove_with(pieces: &PieceHashes, offset: u64, length: u64) -> Result<Rang
     Ok(RangeCover {
         covered_offset,
         covered_length: covered_end - covered_offset,
-        proof: encode_proof(&pieces.hashes, first, end),
+        proof: if pieces.sealed() {
+            encode_proof_from(&pieces.layers, pieces.hashes.len(), first, end)
+        } else {
+            encode_proof(&pieces.hashes, first, end)
+        },
     })
 }
 
@@ -559,12 +588,25 @@ fn encode_proof(pieces: &[[u8; 32]], first: u64, end: u64) -> Vec<u8> {
     if pieces.len() <= 1 {
         return Vec::new();
     }
-    let layers = padded_piece_tree(pieces);
+    encode_proof_from(&padded_piece_tree(pieces), pieces.len(), first, end)
+}
+
+/// The proof for a range, read out of a tree already built.
+fn encode_proof_from(
+    layers: &[Vec<[u8; 32]>],
+    piece_count: usize,
+    first: u64,
+    end: u64,
+) -> Vec<u8> {
+    if piece_count <= 1 {
+        return Vec::new();
+    }
+    let pieces_len = piece_count;
     let tree_width = layers[0].len() as u64;
     let (window_start, window_width) = proof_window(first, end, tree_width);
     let mut output = Vec::new();
     for index in window_start..window_start + window_width {
-        if (index < first || index >= end) && index < pieces.len() as u64 {
+        if (index < first || index >= end) && index < pieces_len as u64 {
             output.extend_from_slice(&layers[0][index as usize]);
         }
     }
@@ -575,7 +617,7 @@ fn encode_proof(pieces: &[[u8; 32]], first: u64, end: u64) -> Vec<u8> {
         let node_index = start / width;
         let sibling = node_index ^ 1;
         let sibling_start = sibling * width;
-        if sibling_start < pieces.len() as u64 {
+        if sibling_start < pieces_len as u64 {
             output.extend_from_slice(&layers[level][sibling as usize]);
         }
         start = start.min(sibling_start);
@@ -665,6 +707,64 @@ fn decode_root(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_retained_tree_proves_what_a_rebuilt_one_proves() {
+        // The retained tree is a cost decision, so the proofs it reads out
+        // have to be the ones the rebuild produced, at every shape of range:
+        // a whole object, one piece, a range inside a piece, one that spans
+        // two, and the last piece of an object whose piece count is not a
+        // power of two.
+        let data: Vec<u8> = (0..PIECE_SIZE as usize * 5 + 700)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        let mut pieces = PieceHashes::new();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            pieces.push(piece).unwrap();
+        }
+        assert!(!pieces.sealed(), "a store is unsealed until asked");
+        let ranges = [
+            (0, data.len() as u64),
+            (0, PIECE_SIZE),
+            (10, 20),
+            (PIECE_SIZE - 5, 10),
+            (PIECE_SIZE * 4, PIECE_SIZE + 700),
+            (data.len() as u64 - 1, 1),
+        ];
+        let rebuilt: Vec<RangeCover> = ranges
+            .iter()
+            .map(|(offset, length)| prove_with(&pieces, *offset, *length).unwrap())
+            .collect();
+        pieces.seal();
+        assert!(pieces.sealed(), "sealing retains the tree");
+        for (cover, (offset, length)) in rebuilt.iter().zip(ranges) {
+            assert_eq!(
+                &prove_with(&pieces, offset, length).unwrap(),
+                cover,
+                "range {offset}+{length} proved differently from the retained tree"
+            );
+        }
+        // And a piece arriving after the seal describes a longer object, so
+        // what was retained must not answer for it. On its own store,
+        // because the one above ended on a short piece and takes no more.
+        let full = vec![9_u8; PIECE_SIZE as usize];
+        let mut growing = PieceHashes::new();
+        growing.push(&full).unwrap();
+        growing.push(&full).unwrap();
+        growing.seal();
+        assert!(growing.sealed());
+        growing.push(&full).unwrap();
+        assert!(!growing.sealed(), "a later piece drops the retained tree");
+        assert_eq!(
+            prove_with(&growing, 0, PIECE_SIZE * 3).unwrap().proof,
+            {
+                let mut sealed = growing.clone();
+                sealed.seal();
+                prove_with(&sealed, 0, PIECE_SIZE * 3).unwrap().proof
+            },
+            "the dropped tree is rebuilt rather than answered from stale"
+        );
+    }
+
     use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

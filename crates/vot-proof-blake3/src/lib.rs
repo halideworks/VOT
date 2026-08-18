@@ -811,6 +811,30 @@ fn verify_child(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_proof_reads_the_retained_levels_rather_than_merging_again() {
+        // The retained levels are read, not recomputed: corrupt one and the
+        // proof has to change. Without this the level lookup could be
+        // skipped entirely and every proof would still be right, because
+        // merging from the leaves gives the same bytes at ten times the
+        // cost.
+        let data = vec![5_u8; GROUP_SIZE as usize * 4];
+        let mut cvs = GroupCvs::new();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            cvs.push(group).unwrap();
+        }
+        cvs.seal();
+        let honest = prove_with(&cvs, 0, GROUP_SIZE).unwrap();
+        // A level above the leaves, which a proof of the first group reads
+        // as the sibling of its own subtree.
+        cvs.levels[1][1][0] ^= 0xff;
+        assert_ne!(
+            prove_with(&cvs, 0, GROUP_SIZE).unwrap(),
+            honest,
+            "the proof did not come from the retained levels"
+        );
+    }
+
+    #[test]
     fn retained_subtrees_prove_what_merged_ones_prove() {
         // The retained levels are a cost decision, so every shape of range
         // has to prove the same with them as without: a whole object, one

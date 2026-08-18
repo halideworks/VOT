@@ -708,6 +708,27 @@ fn decode_root(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_proof_reads_the_retained_tree_rather_than_building_again() {
+        // The retained tree is read, not rebuilt: corrupt a node and the
+        // proof has to change. Without this the retained path could be
+        // skipped and every proof would still be right, at the cost the
+        // whole change exists to remove.
+        let data = vec![4_u8; PIECE_SIZE as usize * 4];
+        let mut pieces = PieceHashes::new();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            pieces.push(piece).unwrap();
+        }
+        pieces.seal();
+        let honest = prove_with(&pieces, 0, PIECE_SIZE).unwrap();
+        pieces.layers[1][1][0] ^= 0xff;
+        assert_ne!(
+            prove_with(&pieces, 0, PIECE_SIZE).unwrap(),
+            honest,
+            "the proof did not come from the retained tree"
+        );
+    }
+
+    #[test]
     fn a_retained_tree_proves_what_a_rebuilt_one_proves() {
         // The retained tree is a cost decision, so the proofs it reads out
         // have to be the ones the rebuild produced, at every shape of range:

@@ -274,7 +274,10 @@ pub(crate) fn copy_and_name(
     expected_length: u64,
     suite: Suite,
 ) -> Result<Copied, Error> {
-    let temporary = objects.join(format!(".partial-{}", temporary_name(source)));
+    // One name, because a build copies one object at a time and this is
+    // renamed or removed before the next one starts. A build that ever copies
+    // two at once needs a name per copy.
+    let temporary = objects.join(".partial");
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .create(true)
@@ -315,13 +318,6 @@ pub(crate) fn copy_and_name(
         root: prepared.object_id().root,
         leaves: prepared.proof_leaves(),
     })
-}
-
-/// A name for the copy in progress, unique within one bundle build: the
-/// source path decides it, and one build takes each source once.
-fn temporary_name(source: &Path) -> String {
-    let digest = blake3::hash(source.as_os_str().as_encoded_bytes());
-    digest.to_hex().chars().take(32).collect::<String>()
 }
 
 pub(crate) fn stream_root(

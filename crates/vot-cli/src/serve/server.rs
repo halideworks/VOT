@@ -21,6 +21,12 @@ pub struct BundleServer {
     pub(crate) objects: BTreeMap<[u8; 32], ServedObject>,
 }
 
+struct CodedGeneration<'a> {
+    generation: u32,
+    source: std::borrow::Cow<'a, [u8]>,
+    repair: Vec<Vec<u8>>,
+}
+
 impl BundleServer {
     /// Opens a bundle for serving: the chain walk `receive_bundle` trusts,
     /// then a proving layer per stored object, built once.
@@ -654,9 +660,29 @@ impl BundleServer {
                 .begin(plan.epoch(), generation)
                 .is_ok()
             {
-                let symbols = vot_fec::encode_generation(&plan, generation, bytes)
+                let geometry = plan.geometry();
+                let source_bytes = geometry.source_count() * geometry.symbol_length();
+                let source = if bytes.len() == source_bytes {
+                    std::borrow::Cow::Borrowed(bytes)
+                } else {
+                    let mut padded = vec![0; source_bytes];
+                    padded[..bytes.len()].copy_from_slice(bytes);
+                    std::borrow::Cow::Owned(padded)
+                };
+                let mut borrowed = [&[][..]; vot_fec::MAX_SOURCE_SYMBOLS];
+                for (slot, symbol) in borrowed
+                    .iter_mut()
+                    .zip(source.chunks_exact(geometry.symbol_length()))
+                {
+                    *slot = symbol;
+                }
+                let repair = vot_fec::encode(geometry, &borrowed[..geometry.source_count()])
                     .map_err(|_| Error::InvalidBundle)?;
-                coded.push((generation, std::collections::VecDeque::from(symbols)));
+                coded.push(CodedGeneration {
+                    generation,
+                    source,
+                    repair,
+                });
                 live.insert(generation);
             } else {
                 // Past the peer's generation credit: this one rides reliably
@@ -676,29 +702,34 @@ impl BundleServer {
         // generation instead of enough adjacent symbols to defeat its repair
         // budget outright.
         for esi in 0..plan.geometry().symbol_count() {
-            for (generation, symbols) in &mut coded {
-                if symbols
-                    .front()
-                    .is_some_and(|(next, _)| usize::from(*next) == esi)
-                {
-                    let (_, symbol) = symbols.pop_front().expect("front checked above");
-                    let mut datagram = Vec::new();
-                    frames::encode_symbol(
-                        frames::SymbolHeader {
-                            epoch: plan.epoch(),
-                            generation: *generation,
-                            esi: u8::try_from(esi).expect("inside the geometry"),
-                        },
-                        plan.geometry(),
-                        &symbol,
-                        &mut datagram,
-                    )
-                    .map_err(|_| Error::InvalidBundle)?;
-                    connection.queue_datagram(Payload::from(datagram));
-                }
+            for generation in &coded {
+                let geometry = plan.geometry();
+                let symbol = if esi < geometry.source_count() {
+                    if esi >= plan.sent_source_count(generation.generation) {
+                        continue;
+                    }
+                    let start = esi * geometry.symbol_length();
+                    &generation.source[start..start + geometry.symbol_length()]
+                } else {
+                    &generation.repair[esi - geometry.source_count()]
+                };
+                let mut datagram = Vec::with_capacity(
+                    vot_codec::frames::SYMBOL_HEADER_LEN + geometry.symbol_length(),
+                );
+                frames::encode_symbol(
+                    frames::SymbolHeader {
+                        epoch: plan.epoch(),
+                        generation: generation.generation,
+                        esi: u8::try_from(esi).expect("inside the geometry"),
+                    },
+                    geometry,
+                    symbol,
+                    &mut datagram,
+                )
+                .map_err(|_| Error::InvalidBundle)?;
+                connection.queue_datagram(Payload::from(datagram));
             }
         }
-        debug_assert!(coded.iter().all(|(_, symbols)| symbols.is_empty()));
         if live.is_empty() {
             connection.fec.sender.close(plan.epoch());
             connection.queue_control(encoded(&TypedFrame::CodingEpochClose(

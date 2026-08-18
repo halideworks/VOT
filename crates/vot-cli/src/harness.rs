@@ -9,7 +9,7 @@ use vot_codec::DecodeLimits;
 use vot_codec::frames::{self, TypedFrame};
 use vot_session::Authentication;
 use vot_transport_api::{
-    Event, MAX_CONTROL_FRAME_PAYLOAD, StreamId, TransportAdapter, shared_payload,
+    Event, MAX_CONTROL_FRAME_PAYLOAD, PathStats, StreamId, TransportAdapter, shared_payload,
 };
 
 use crate::tests::temporary;
@@ -26,6 +26,7 @@ pub(crate) struct Loopback {
     pub(crate) refuse_sends: usize,
     pub(crate) fail_sends_with: Option<vot_transport_api::Error>,
     pub(crate) closed: Option<u16>,
+    pub(crate) path_stats: Option<PathStats>,
     /// What the carrier reports when a driving loop waits on it.
     pub(crate) on_wait: VecDeque<Event>,
     /// A rendezvous for concurrency tests. A wait blocks until the expected
@@ -84,6 +85,10 @@ impl Loopback {
 }
 
 impl TransportAdapter for Loopback {
+    fn path_stats(&self) -> Option<PathStats> {
+        self.path_stats
+    }
+
     fn send_control(&mut self, frame: &[u8]) -> Result<(), vot_transport_api::Error> {
         self.refuse_send()?;
         self.control.push(frame.to_vec());

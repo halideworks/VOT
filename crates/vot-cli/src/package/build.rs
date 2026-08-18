@@ -206,18 +206,27 @@ pub(crate) fn emit_direct(
     source: &SourceFile,
     suite: Suite,
 ) -> Result<(), Error> {
-    let root = stream_root(&source.source, source.length, suite)?;
+    // One pass: the copy names the object rather than a read before it. The
+    // bytes land under a temporary name because the name is what the pass is
+    // computing, and the rename is what publishes them.
+    let copied = copy_and_name(objects, &source.source, source.length, suite)?;
+    let root = copied.root;
     let object = objects.join(object_name(&root));
     if object.exists() {
+        // The same bytes already under this name: what is there is what
+        // would have been written, so the copy is dropped rather than
+        // replacing it.
+        fs::remove_file(&copied.temporary)?;
         if stream_root(&object, source.length, suite)? != root {
             return Err(Error::RootMismatch);
         }
     } else {
-        let leaves = copy_verify_and_prepare(&source.source, &object, source.length, root, suite)?;
+        fs::rename(&copied.temporary, &object)?;
+        sync_directory(objects)?;
         // A serve that finds these prepares from them instead of reading the
         // object; one that does not, or finds them stale, reads it. So a
         // failure to write them is not a failure to build the bundle.
-        if let Some(leaves) = leaves {
+        if let Some(leaves) = copied.leaves {
             let _ =
                 crate::package::proof_cache::write(objects, &root, suite, source.length, &leaves);
         }
@@ -241,38 +250,74 @@ pub(crate) fn emit_direct(
 ///
 /// The builder verifies exactly as the plain stream did and retains the
 /// leaves on the way past, so the leaves cost this pass and not another.
-pub(crate) fn copy_verify_and_prepare(
+/// What one pass over a source produced: the bytes under a temporary name,
+/// the root they hash to, and the leaves a serve would otherwise rebuild.
+pub(crate) struct Copied {
+    pub(crate) temporary: PathBuf,
+    pub(crate) root: [u8; 32],
+    pub(crate) leaves: Option<Vec<[u8; 32]>>,
+}
+
+/// Copies a source into `objects` under a temporary name, hashing as it goes.
+///
+/// The object's name is its root, which this pass is what computes, so the
+/// bytes cannot be written under it until the pass is done. A source that
+/// changes length underneath is a mutation, as it was when a read before the
+/// copy would have caught it.
+///
+/// # Errors
+/// Surfaces the read and write, and reports a source that changed as
+/// [`Error::SourceMutation`].
+pub(crate) fn copy_and_name(
+    objects: &Path,
     source: &Path,
-    destination: &Path,
     expected_length: u64,
-    expected_root: [u8; 32],
     suite: Suite,
-) -> Result<Option<Vec<[u8; 32]>>, Error> {
+) -> Result<Copied, Error> {
+    // One name, because a build copies one object at a time and this is
+    // renamed or removed before the next one starts. A build that ever copies
+    // two at once needs a name per copy.
+    let temporary = objects.join(".partial");
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .write(true)
-        .open(destination)?;
+        .open(&temporary)?;
     let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
         .map_err(|_| Error::InvalidBundle)?;
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let copied = (|| -> Result<vot_object::PreparedObject, Error> {
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+            builder
+                .update(&buffer[..read])
+                .map_err(|_| Error::SourceMutation)?;
         }
-        output.write_all(&buffer[..read])?;
-        builder
-            .update(&buffer[..read])
-            .map_err(|_| Error::SourceMutation)?;
-    }
-    output.sync_all()?;
-    let prepared = builder.finish().map_err(|_| Error::SourceMutation)?;
-    if prepared.object_id().root != expected_root || prepared.object_id().length != expected_length
-    {
-        return Err(Error::SourceMutation);
-    }
-    Ok(prepared.proof_leaves())
+        output.sync_all()?;
+        let prepared = builder.finish().map_err(|_| Error::SourceMutation)?;
+        if prepared.object_id().length != expected_length {
+            return Err(Error::SourceMutation);
+        }
+        Ok(prepared)
+    })();
+    let prepared = match copied {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Nothing names these bytes, so nothing will ever read them.
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    Ok(Copied {
+        temporary,
+        root: prepared.object_id().root,
+        leaves: prepared.proof_leaves(),
+    })
 }
 
 pub(crate) fn stream_root(

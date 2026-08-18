@@ -207,11 +207,11 @@ impl Inbound {
         Ok(())
     }
 
-    /// Queues a connection lifecycle event past both bounds.
+    /// Queues a zero-byte event that cannot be lost past both bounds.
     ///
-    /// Losing one is not survivable: a caller that never hears the disconnect
-    /// waits for a peer that has gone. There are at most two per connection.
-    fn push_lifecycle(&mut self, event: NativeEvent) {
+    /// Lifecycle events number at most two per connection. Datagram states use
+    /// this only while the driver exits, bounded by its fixed outbox.
+    fn push_unlosable(&mut self, event: NativeEvent) {
         debug_assert_eq!(native_payload_len(&event), 0);
         self.events.push_back(event);
         self.arrived.raise();
@@ -617,7 +617,7 @@ impl Transport {
                 // A driver that stops for any reason still owes the caller the
                 // disconnect, or the caller waits for a peer that has gone.
                 if let Ok(mut inbound) = driver_inbound.lock() {
-                    inbound.push_lifecycle(NativeEvent::Disconnected(connection.0));
+                    inbound.push_unlosable(NativeEvent::Disconnected(connection.0));
                 }
             })
             .map_err(|_| Error::Backend)?;
@@ -1067,12 +1067,13 @@ fn run(
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut datagrams: VecDeque<(Payload, u64)> = VecDeque::new();
     let mut pending_datagram = None;
+    let mut pending_datagram_state = None;
     let mut queued = Queued::default();
     let mut closing = false;
     let mut announced = false;
     let mut sending = Sending::new(datagram_bytes, offload);
 
-    loop {
+    let outcome = 'drive: loop {
         queued.debug_assert_matches(&streams);
         let orphaned = take_submissions(
             &mut conn,
@@ -1085,6 +1086,7 @@ fn run(
             role,
             &mut queued,
             &mut pending_datagram,
+            &mut pending_datagram_state,
         );
         note_close_request(&mut conn, close, &mut closing);
         if orphaned {
@@ -1093,28 +1095,37 @@ fn run(
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream, &mut queued);
         }
-        write_datagrams(&mut conn, &mut datagrams, inbound);
+        write_datagrams(
+            &mut conn,
+            &mut datagrams,
+            &mut pending_datagram_state,
+            inbound,
+        );
         let Ok(paced) = send_and_revalidate(socket, &mut conn, &mut out, &mut sending) else {
-            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
-            return Ok(());
+            break 'drive Ok(());
         };
 
         if conn.is_established() && !announced {
             let mut bytes = [0; CHANNEL_BINDING_LEN];
-            conn.export_keying_material(&mut bytes, CHANNEL_BINDING_EXPORTER_LABEL, None)
-                .map_err(|_| Error::Backend)?;
-            let mut binding = channel_binding.lock().map_err(|_| Error::Backend)?;
+            if conn
+                .export_keying_material(&mut bytes, CHANNEL_BINDING_EXPORTER_LABEL, None)
+                .is_err()
+            {
+                break 'drive Err(Error::Backend);
+            }
+            let Ok(mut binding) = channel_binding.lock() else {
+                break 'drive Err(Error::Backend);
+            };
             *binding = Some(ChannelBinding::from_bytes(bytes));
             drop(binding);
             announced = true;
             if let Ok(mut queue) = inbound.lock() {
-                queue.push_lifecycle(NativeEvent::Connected(connection));
+                queue.push_unlosable(NativeEvent::Connected(connection));
             }
         }
 
         if conn.is_closed() {
-            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
-            return Ok(());
+            break 'drive Ok(());
         }
 
         // The soonest of what the connection asked for: its own timer, the
@@ -1133,18 +1144,21 @@ fn run(
             );
         match &intake {
             Intake::Socket => {
-                socket
-                    .set_read_timeout(Some(deadline))
-                    .map_err(|_| Error::Backend)?;
+                if socket.set_read_timeout(Some(deadline)).is_err() {
+                    break 'drive Err(Error::Backend);
+                }
                 match receive_segmented(socket, &mut buffer, &mut space) {
                     Ok((len, from, segment)) => {
                         feed_received(&mut conn, local, &mut buffer[..len], from, segment);
-                        drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)?;
+                        if let Err(error) =
+                            drain_arrivals(socket, &mut conn, local, &mut buffer, &mut space)
+                        {
+                            break 'drive Err(error);
+                        }
                     }
                     Err(error) => {
                         if !read_ran_out(&error) {
-                            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
-                            return Ok(());
+                            break 'drive Ok(());
                         }
                         conn.on_timeout();
                     }
@@ -1178,8 +1192,7 @@ fn run(
                 Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
                 // The router is gone, so nothing further can ever arrive.
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
-                    return Ok(());
+                    break 'drive Ok(());
                 }
             },
         }
@@ -1199,7 +1212,14 @@ fn run(
                 *slot = Some(sample);
             }
         }
-    }
+    };
+    finish_datagrams(
+        outcome,
+        &mut pending_datagram_state,
+        &mut pending_datagram,
+        &mut datagrams,
+        inbound,
+    )
 }
 
 /// Whether a socket read failed only for want of a packet within its
@@ -1638,7 +1658,7 @@ fn accept_routed(
             // the caller still hears the disconnect.
             pump_done.store(true, Ordering::Relaxed);
             if let Ok(mut inbound) = pump_inbound.lock() {
-                inbound.push_lifecycle(NativeEvent::Disconnected(connection.0));
+                inbound.push_unlosable(NativeEvent::Disconnected(connection.0));
             }
         })
         .ok()?;
@@ -2200,6 +2220,7 @@ fn take_submissions(
     role: Role,
     queued: &mut Queued,
     pending_datagram: &mut Option<Command>,
+    pending_datagram_state: &mut Option<NativeEvent>,
 ) -> bool {
     while !queued.is_full() {
         let command = if let Some(command) = pending_datagram.take() {
@@ -2222,6 +2243,7 @@ fn take_submissions(
             command,
             inbound,
             role,
+            pending_datagram_state,
         ) {
             Ok(Some(bytes)) => queued.charge(bytes),
             Ok(None) => {}
@@ -2264,6 +2286,7 @@ fn apply(
     command: Command,
     inbound: &Arc<Mutex<Inbound>>,
     role: Role,
+    pending_datagram_state: &mut Option<NativeEvent>,
 ) -> Result<Option<usize>, Command> {
     match command {
         Command::Control(bytes) => {
@@ -2301,13 +2324,13 @@ fn apply(
             // Offered first, so room the connection freed since the last pass
             // is room this datagram can have. At the bound, keep this exact
             // command and stop taking later submissions until room appears.
-            write_datagrams(conn, datagrams, inbound);
+            write_datagrams(conn, datagrams, pending_datagram_state, inbound);
             let held_bytes: usize = datagrams.iter().map(|(held, _)| held.len()).sum();
             if !outbox_has_room(datagrams.len(), held_bytes, bytes.len()) {
                 return Err(Command::Datagram { context, bytes });
             }
             datagrams.push_back((bytes, context));
-            write_datagrams(conn, datagrams, inbound);
+            write_datagrams(conn, datagrams, pending_datagram_state, inbound);
             Ok(None)
         }
         // Refused at submission, so it cannot reach the driver. A silent success
@@ -2375,30 +2398,48 @@ const fn outbox_has_room(held: usize, held_bytes: usize, bytes: usize) -> bool {
 /// carriers keep, and a caller counting what it is owed would otherwise wait
 /// on datagrams this end has forgotten.
 fn abandon_datagrams(datagrams: &mut VecDeque<(Payload, u64)>, inbound: &Arc<Mutex<Inbound>>) {
+    let mut queue = inbound.lock().unwrap_or_else(PoisonError::into_inner);
     for (_, context) in datagrams.drain(..) {
-        if let Ok(mut queue) = inbound.lock() {
-            let _ = queue.push(NativeEvent::DatagramDropped { context });
-        }
+        queue.push_unlosable(NativeEvent::DatagramDropped { context });
     }
 }
 
 /// Ends every datagram held between the command channel and the connection.
 fn abandon_all_datagrams(
+    pending_state: &mut Option<NativeEvent>,
     pending: &mut Option<Command>,
     datagrams: &mut VecDeque<(Payload, u64)>,
     inbound: &Arc<Mutex<Inbound>>,
 ) {
+    if let Some(state) = pending_state.take() {
+        inbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_unlosable(state);
+    }
     // The pending command was submitted after everything in the outbox.
     abandon_datagrams(datagrams, inbound);
     match pending.take() {
         Some(Command::Datagram { context, .. }) => {
-            if let Ok(mut queue) = inbound.lock() {
-                let _ = queue.push(NativeEvent::DatagramDropped { context });
-            }
+            inbound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_unlosable(NativeEvent::DatagramDropped { context });
         }
         Some(_) => unreachable!("only a datagram can wait here"),
         None => {}
     }
+}
+
+fn finish_datagrams(
+    outcome: Result<(), Error>,
+    pending_state: &mut Option<NativeEvent>,
+    pending: &mut Option<Command>,
+    datagrams: &mut VecDeque<(Payload, u64)>,
+    inbound: &Arc<Mutex<Inbound>>,
+) -> Result<(), Error> {
+    abandon_all_datagrams(pending_state, pending, datagrams, inbound);
+    outcome
 }
 
 /// Offers waiting datagrams to the connection while it has room.
@@ -2410,8 +2451,16 @@ fn abandon_all_datagrams(
 fn write_datagrams(
     conn: &mut quiche::Connection,
     datagrams: &mut VecDeque<(Payload, u64)>,
+    pending_state: &mut Option<NativeEvent>,
     inbound: &Arc<Mutex<Inbound>>,
 ) {
+    if let Some(state) = pending_state.take() {
+        let mut queue = inbound.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(state) = queue.push(state) {
+            *pending_state = Some(state);
+            return;
+        }
+    }
     while let Some((bytes, context)) = datagrams.front() {
         let observed = match offered(&conn.dgram_send(bytes)) {
             Offered::Taken => NativeEvent::DatagramSent { context: *context },
@@ -2419,8 +2468,10 @@ fn write_datagrams(
             Offered::Refused => NativeEvent::DatagramDropped { context: *context },
         };
         datagrams.pop_front();
-        if let Ok(mut queue) = inbound.lock() {
-            let _ = queue.push(observed);
+        let mut queue = inbound.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(observed) = queue.push(observed) {
+            *pending_state = Some(observed);
+            return;
         }
     }
 }
@@ -4323,7 +4374,8 @@ mod tests {
             context: 4,
             bytes: vot_transport_api::shared_payload(&[7; 16]),
         });
-        abandon_all_datagrams(&mut pending, &mut datagrams, &inbound);
+        let mut pending_state = None;
+        abandon_all_datagrams(&mut pending_state, &mut pending, &mut datagrams, &inbound);
         assert!(datagrams.is_empty(), "nothing is still held");
         assert!(pending.is_none(), "the pending command is still held");
         let mut held = inbound.lock().expect("the queue");
@@ -4334,6 +4386,95 @@ mod tests {
             })
             .collect();
         assert_eq!(contexts, vec![1, 2, 3, 4], "in submission order");
+    }
+
+    #[test]
+    fn a_driver_that_stops_preserves_states_past_the_normal_event_bound() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        {
+            let mut queue = inbound.lock().expect("the queue");
+            for _ in 0..MAX_INBOUND_EVENTS {
+                queue
+                    .push(NativeEvent::Control(vot_transport_api::shared_payload(&[])))
+                    .expect("room to the normal bound");
+            }
+        }
+        let symbol = vot_transport_api::shared_payload(&[7; 16]);
+        let mut datagrams = (1..=DATAGRAM_OUTBOX_LEN)
+            .map(|context| (symbol.clone(), context as u64))
+            .collect();
+        let mut pending = Some(Command::Datagram {
+            context: DATAGRAM_OUTBOX_LEN as u64 + 1,
+            bytes: symbol,
+        });
+        let mut pending_state = Some(NativeEvent::DatagramSent { context: 0 });
+
+        let outcome = finish_datagrams(
+            Err(Error::Backend),
+            &mut pending_state,
+            &mut pending,
+            &mut datagrams,
+            &inbound,
+        );
+        assert!(matches!(outcome, Err(Error::Backend)));
+
+        let mut queue = inbound.lock().expect("the queue");
+        for _ in 0..MAX_INBOUND_EVENTS {
+            assert!(matches!(queue.pop(), Some(NativeEvent::Control(_))));
+        }
+        let contexts: Vec<u64> = std::iter::from_fn(|| queue.pop())
+            .map(|event| match event {
+                NativeEvent::DatagramSent { context }
+                | NativeEvent::DatagramDropped { context } => context,
+                other => panic!("a terminal datagram state, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            contexts,
+            (0..=DATAGRAM_OUTBOX_LEN as u64 + 1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_full_event_queue_holds_a_datagram_state_before_sending_more() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        {
+            let mut queue = inbound.lock().expect("the queue");
+            for _ in 0..MAX_INBOUND_EVENTS {
+                queue
+                    .push(NativeEvent::Control(vot_transport_api::shared_payload(&[])))
+                    .expect("room to the normal bound");
+            }
+        }
+        let mut conn = sans_io_pair(2_048).0;
+        let symbol = vot_transport_api::shared_payload(&[7; 16]);
+        let mut datagrams = VecDeque::from([(symbol.clone(), 1), (symbol, 2)]);
+        let mut pending_state = None;
+
+        write_datagrams(&mut conn, &mut datagrams, &mut pending_state, &inbound);
+        assert!(matches!(
+            &pending_state,
+            Some(NativeEvent::DatagramSent { context: 1 })
+        ));
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(conn.dgram_send_queue_len(), 1);
+
+        write_datagrams(&mut conn, &mut datagrams, &mut pending_state, &inbound);
+        assert_eq!(datagrams.len(), 1, "a later datagram passed its state");
+        assert_eq!(conn.dgram_send_queue_len(), 1);
+
+        let _ = inbound.lock().expect("the queue").pop();
+        write_datagrams(&mut conn, &mut datagrams, &mut pending_state, &inbound);
+        assert!(matches!(
+            &pending_state,
+            Some(NativeEvent::DatagramSent { context: 2 })
+        ));
+        assert!(datagrams.is_empty());
+        assert_eq!(conn.dgram_send_queue_len(), 2);
+
+        let _ = inbound.lock().expect("the queue").pop();
+        write_datagrams(&mut conn, &mut datagrams, &mut pending_state, &inbound);
+        assert!(pending_state.is_none());
     }
 
     #[test]
@@ -4422,6 +4563,7 @@ mod tests {
         let mut conn = sans_io_pair(2_048).0;
 
         let mut datagrams = VecDeque::new();
+        let mut pending_state = None;
         let mut queued = Queued::default();
         // What the driver does with each: a queued record is charged, and a
         // datagram is handed to the connection with nothing left to hold.
@@ -4446,6 +4588,7 @@ mod tests {
                 command,
                 &inbound,
                 Role::Client,
+                &mut pending_state,
             )
             .expect("room for the submission")
             {
@@ -4483,6 +4626,7 @@ mod tests {
         .unwrap();
         let mut queued = Queued::default();
         let mut pending = None;
+        let mut pending_state = None;
 
         assert!(!take_submissions(
             &mut conn,
@@ -4495,6 +4639,7 @@ mod tests {
             Role::Client,
             &mut queued,
             &mut pending,
+            &mut pending_state,
         ));
         assert!(
             matches!(&pending, Some(Command::Datagram { context: 9, .. })),
@@ -4522,6 +4667,7 @@ mod tests {
             Role::Client,
             &mut queued,
             &mut pending,
+            &mut pending_state,
         ));
         assert!(pending.is_none(), "the held submission was not retried");
         assert_eq!(datagrams.len(), DATAGRAM_OUTBOX_LEN);

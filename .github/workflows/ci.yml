@@ -284,7 +284,7 @@ jobs:
       # The wire and live features are part of the snapshotted surface, and
       # quiche builds BoringSSL through cmake.
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+        run: sh tools/ci_apt_install.sh cmake openssl
 
       - name: Compare public API snapshots
         run: python3 tools/check_public_api.py
@@ -328,7 +328,7 @@ jobs:
 
       # quiche builds BoringSSL, and the tests generate their own certificate.
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+        run: sh tools/ci_apt_install.sh cmake openssl
 
       - name: Fingerprint native toolchain
         id: quiche-toolchain
@@ -479,7 +479,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Install storage harness tools
-        run: sudo apt-get update && sudo apt-get install -y dmsetup e2fsprogs util-linux
+        run: sh tools/ci_apt_install.sh dmsetup e2fsprogs util-linux
 
       - name: Test Strict against backing corruption
         run: sh tools/test_strict_backing_corruption.sh
@@ -496,7 +496,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+        run: sh tools/ci_apt_install.sh cmake openssl
 
       - name: Test live MsQuic interop
         run: cargo +1.88.0 test -p vot-transport-msquic --features live --locked
@@ -532,7 +532,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+        run: sh tools/ci_apt_install.sh cmake openssl
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0
@@ -627,7 +627,7 @@ jobs:
       # openssl binary for its test certificate, and the baseline run pays for
       # the whole job if the runner image stops carrying it.
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake openssl
+        run: sh tools/ci_apt_install.sh cmake openssl
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0
@@ -687,7 +687,7 @@ jobs:
         run: rustup toolchain install nightly-2026-07-15 --profile minimal
 
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y binutils cmake openssl
+        run: sh tools/ci_apt_install.sh binutils cmake openssl
 
       - name: Run live ASan and LSan gate
         env:
@@ -739,7 +739,7 @@ jobs:
 
       # quiche builds BoringSSL through cmake.
       - name: Install native build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        run: sh tools/ci_apt_install.sh cmake
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0

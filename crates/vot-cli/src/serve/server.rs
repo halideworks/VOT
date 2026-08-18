@@ -7,6 +7,7 @@ use super::{
     ServeConnection, ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter,
     TypedFrame, encoded, error_code, fail, frame_type, frames,
 };
+use vot_transport_api::PathStats;
 
 /// One bundle, opened and proved once, answering any number of sessions.
 pub struct BundleServer {
@@ -110,6 +111,7 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
+        let repair_symbols = fec_repair_symbols(session.adapter().path_stats());
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -140,7 +142,7 @@ impl BundleServer {
                     }
                     // Announce before the first answer.
                     self.ensure_announced(connection, session.is_ready());
-                    if let Err(fault) = self.dispatch(&bytes, connection) {
+                    if let Err(fault) = self.dispatch(&bytes, connection, repair_symbols) {
                         return fail(fault, session, connection);
                     }
                 }
@@ -271,6 +273,7 @@ impl BundleServer {
         &self,
         bytes: &[u8],
         connection: &mut ServeConnection,
+        repair_symbols: usize,
     ) -> Result<(), Fault> {
         let limits = DecodeLimits {
             max_unknown_payload: MAX_CONTROL_FRAME_PAYLOAD,
@@ -300,7 +303,7 @@ impl BundleServer {
             }
             TypedFrame::RangeRequest(request) => {
                 connection.admit_request(frame_type::RANGE_REQUEST, request.request_id, bytes)?;
-                self.answer_range(&request, bytes, connection)
+                self.answer_range(&request, bytes, connection, repair_symbols)
             }
             // The receiver's side of datagram FEC (spec/fec.md section 11).
             TypedFrame::DatagramCredit(credit) => {
@@ -478,6 +481,7 @@ impl BundleServer {
         request: &RangeRequest,
         request_bytes: &[u8],
         connection: &mut ServeConnection,
+        repair_symbols: usize,
     ) -> Result<(), Fault> {
         let served = self
             .objects
@@ -530,6 +534,7 @@ impl BundleServer {
                     sub_offset,
                     sub_length,
                     connection,
+                    repair_symbols,
                 )?;
             } else {
                 Self::answer_reliably(
@@ -603,6 +608,7 @@ impl BundleServer {
         offset: u64,
         length: u64,
         connection: &mut ServeConnection,
+        repair_symbols: usize,
     ) -> Result<(), Fault> {
         let (covered_offset, covered_length, proof) = served
             .layer
@@ -614,8 +620,13 @@ impl BundleServer {
             .sender
             .next_epoch()
             .ok_or(Error::InvalidBundle)?;
-        let plan = vot_fec::EpochPlan::new(epoch, covered_offset, covered_length, fec_geometry())
-            .map_err(|_| Error::InvalidBundle)?;
+        let plan = vot_fec::EpochPlan::new(
+            epoch,
+            covered_offset,
+            covered_length,
+            fec_geometry(repair_symbols),
+        )
+        .map_err(|_| Error::InvalidBundle)?;
         let generations = plan.generation_count();
         debug_assert!(generations <= vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64);
         let plaintext = served.read_covered(covered_offset, covered_length)?;
@@ -781,8 +792,8 @@ pub(super) fn answer_request(bytes: &[u8]) -> bool {
 }
 
 /// The shipped FEC profile (spec/fec.md section 9): one generation is one
-/// 64 KiB integrity group, 64 sources of 1024 bytes, with the repair count
-/// this serve adds.
+/// 64 KiB integrity group and 64 sources of 1024 bytes. Eight repairs are the
+/// conservative startup/fallback profile; measured paths may use fewer.
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
 pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
 
@@ -808,6 +819,30 @@ pub(crate) const EPOCH_QUIET_GRACE: std::time::Duration = std::time::Duration::f
 pub(crate) const FEC_PIECE_BYTES: u64 =
     FEC_GENERATION_BYTES * vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64;
 
-fn fec_geometry() -> vot_fec::Geometry {
-    vot_fec::Geometry::new(64, FEC_REPAIR_SYMBOLS, 1024).expect("the shipped profile")
+fn fec_geometry(repair_symbols: usize) -> vot_fec::Geometry {
+    vot_fec::Geometry::new(64, repair_symbols, 1024).expect("the selected profile")
+}
+
+/// Chooses enough repair for the path without paying the full encoding cost
+/// on a clean bulk transfer. Startup and incomplete samples stay conservative.
+pub(super) fn fec_repair_symbols(stats: Option<PathStats>) -> usize {
+    let Some(PathStats {
+        lost_packets: Some(lost),
+        spurious_lost_packets: Some(spurious),
+        packets_sent: Some(sent),
+        ..
+    }) = stats
+    else {
+        return FEC_REPAIR_SYMBOLS;
+    };
+    if sent < 1024 {
+        return FEC_REPAIR_SYMBOLS;
+    }
+    let per_thousand = u128::from(lost.saturating_sub(spurious)) * 1000 / u128::from(sent);
+    match per_thousand {
+        0..=4 => 1,
+        5..=14 => 4,
+        15..=24 => 6,
+        _ => FEC_REPAIR_SYMBOLS,
+    }
 }

@@ -484,6 +484,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repair_count_tracks_real_loss_after_startup() {
+        let repair = |lost, spurious, sent| {
+            server::fec_repair_symbols(Some(vot_transport_api::PathStats {
+                lost_packets: Some(lost),
+                spurious_lost_packets: Some(spurious),
+                packets_sent: Some(sent),
+                ..vot_transport_api::PathStats::default()
+            }))
+        };
+        assert_eq!(server::fec_repair_symbols(None), 8);
+        assert_eq!(
+            server::fec_repair_symbols(Some(vot_transport_api::PathStats::default())),
+            8
+        );
+        assert_eq!(repair(0, 0, 1023), 8);
+        assert_eq!(repair(0, 0, 1024), 1);
+        assert_eq!(repair(9, 0, 2000), 1);
+        assert_eq!(repair(10, 0, 2000), 4);
+        assert_eq!(repair(29, 0, 2000), 4);
+        assert_eq!(repair(30, 0, 2000), 6);
+        assert_eq!(repair(49, 0, 2000), 6);
+        assert_eq!(repair(50, 0, 2000), 8);
+        assert_eq!(repair(50, 49, 2000), 1, "spurious losses do not buy repair");
+    }
+
     /// Decodes every queued symbol datagram through a receiver and returns
     /// each generation's bytes by generation.
     fn decoded_generations(

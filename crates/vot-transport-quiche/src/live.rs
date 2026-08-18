@@ -1072,7 +1072,15 @@ fn run(
     let mut closing = false;
     let mut announced = false;
     let mut sending = Sending::new(datagram_bytes, offload);
-    let mut read_timeout = None;
+    let mut read_timeout = match intake {
+        Intake::Socket => {
+            socket
+                .set_read_timeout(Some(TICK))
+                .map_err(|_| Error::Backend)?;
+            Some(TICK)
+        }
+        Intake::Routed(_) => None,
+    };
 
     let outcome = 'drive: loop {
         queued.debug_assert_matches(&streams);
@@ -1145,11 +1153,8 @@ fn run(
             );
         match &intake {
             Intake::Socket => {
-                if read_timeout != Some(deadline) {
-                    if socket.set_read_timeout(Some(deadline)).is_err() {
-                        break 'drive Err(Error::Backend);
-                    }
-                    read_timeout = Some(deadline);
+                if let Err(error) = install_read_timeout(socket, &mut read_timeout, deadline) {
+                    break 'drive Err(error);
                 }
                 match receive_segmented(socket, &mut buffer, &mut space, false) {
                     Ok((len, from, segment)) => {
@@ -1224,6 +1229,20 @@ fn run(
         &mut datagrams,
         inbound,
     )
+}
+
+fn install_read_timeout(
+    socket: &UdpSocket,
+    cached: &mut Option<Duration>,
+    timeout: Duration,
+) -> Result<(), Error> {
+    if *cached != Some(timeout) {
+        socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| Error::Backend)?;
+        *cached = Some(timeout);
+    }
+    Ok(())
 }
 
 /// Whether a socket read failed only for want of a packet within its
@@ -2690,6 +2709,18 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn a_changed_read_timeout_is_installed_and_cached() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
+        socket.set_read_timeout(Some(TICK)).unwrap();
+        let timeout = Duration::from_micros(500);
+        let mut cached = Some(TICK);
+
+        install_read_timeout(&socket, &mut cached, timeout).unwrap();
+
+        assert_eq!(cached, Some(timeout));
+    }
 
     /// Generates a test certificate exactly once per process.
     ///

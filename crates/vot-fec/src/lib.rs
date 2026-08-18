@@ -167,6 +167,37 @@ pub fn encode(geometry: Geometry, source: &[&[u8]]) -> Result<Vec<Vec<u8>>, Erro
 /// Never for a valid geometry: every `k`-row selection of the generator is
 /// invertible, so elimination always finds a pivot.
 pub fn decode(geometry: Geometry, received: &[(usize, &[u8])]) -> Result<Vec<Vec<u8>>, Error> {
+    let (symbols, recovered) = solve_missing(geometry, received)?;
+    let k = geometry.source_count;
+    let mut recovered = recovered.into_iter();
+    Ok((0..k)
+        .map(|esi| {
+            symbols[esi].map_or_else(
+                || {
+                    let (missing, symbol) = recovered.next().expect("one row per missing source");
+                    debug_assert_eq!(missing, esi);
+                    symbol
+                },
+                <[u8]>::to_vec,
+            )
+        })
+        .collect())
+}
+
+/// Reconstructs only the absent source symbols, in ascending ESI order.
+pub(crate) fn recover_missing(
+    geometry: Geometry,
+    received: &[(usize, &[u8])],
+) -> Result<Vec<(usize, Vec<u8>)>, Error> {
+    solve_missing(geometry, received).map(|(_, recovered)| recovered)
+}
+
+type MissingSolution<'a> = ([Option<&'a [u8]>; MAX_SYMBOLS], Vec<(usize, Vec<u8>)>);
+
+fn solve_missing<'a>(
+    geometry: Geometry,
+    received: &[(usize, &'a [u8])],
+) -> Result<MissingSolution<'a>, Error> {
     let k = geometry.source_count;
     // At most 80 entries, so a fixed table rather than an allocation from
     // the peer's count.
@@ -183,10 +214,7 @@ pub fn decode(geometry: Geometry, received: &[(usize, &[u8])]) -> Result<Vec<Vec
     }
     let missing: Vec<usize> = (0..k).filter(|esi| symbols[*esi].is_none()).collect();
     if missing.is_empty() {
-        // Every source symbol arrived; nothing to solve.
-        return Ok((0..k)
-            .map(|esi| symbols[esi].expect("seen").to_vec())
-            .collect());
+        return Ok((symbols, Vec::new()));
     }
 
     // Known sources move to the right-hand side, leaving one coefficient
@@ -216,16 +244,15 @@ pub fn decode(geometry: Geometry, received: &[(usize, &[u8])]) -> Result<Vec<Vec
     }
     debug_assert_eq!(rows.len(), m);
     gauss_jordan(&mut rows, m);
-
-    let mut solved = rows.into_iter().map(|row| row[m..].to_vec());
-    Ok((0..k)
-        .map(|esi| {
-            symbols[esi].map_or_else(
-                || solved.next().expect("one row per missing source"),
-                <[u8]>::to_vec,
-            )
-        })
-        .collect())
+    let recovered = missing
+        .into_iter()
+        .zip(rows.into_iter().map(|mut row| {
+            row.copy_within(m.., 0);
+            row.truncate(geometry.symbol_length);
+            row
+        }))
+        .collect();
+    Ok((symbols, recovered))
 }
 
 /// Reduces `rows` to the identity on the first `k` columns, carrying the

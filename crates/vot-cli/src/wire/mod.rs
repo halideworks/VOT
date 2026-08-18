@@ -1107,6 +1107,8 @@ mod tests {
         assert_eq!(package, built);
         let served = serving.join().expect("the serving thread").expect("served");
         assert_eq!(served, built);
+        // The leaves a send keeps beside an object are skipped: a cache a
+        // serve rebuilds by reading the object, which a fetch does not write.
         let objects = |root: &Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
             let mut all: Vec<_> = std::fs::read_dir(root.join("objects"))
                 .unwrap()
@@ -1114,6 +1116,7 @@ mod tests {
                     let entry = entry.unwrap();
                     (entry.file_name(), std::fs::read(entry.path()).unwrap())
                 })
+                .filter(|(name, _)| !name.to_string_lossy().ends_with(".leaves"))
                 .collect();
             all.sort();
             all

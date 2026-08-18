@@ -8,7 +8,6 @@ use crate::{
     fs, manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
     write_new_synced,
 };
-use vot_verifier::ExpectedObject;
 
 pub(crate) struct SourceFile {
     pub(crate) path: PackagePath,
@@ -214,7 +213,14 @@ pub(crate) fn emit_direct(
             return Err(Error::RootMismatch);
         }
     } else {
-        copy_and_verify(&source.source, &object, source.length, root, suite)?;
+        let leaves = copy_verify_and_prepare(&source.source, &object, source.length, root, suite)?;
+        // A serve that finds these prepares from them instead of reading the
+        // object; one that does not, or finds them stale, reads it. So a
+        // failure to write them is not a failure to build the bundle.
+        if let Some(leaves) = leaves {
+            let _ =
+                crate::package::proof_cache::write(objects, &root, suite, source.length, &leaves);
+        }
     }
     let record = EntryRecord {
         path: source.path.clone(),
@@ -229,19 +235,26 @@ pub(crate) fn emit_direct(
     Ok(())
 }
 
-pub(crate) fn copy_and_verify(
+/// Copies the object, verifies it against the root it is named for, and
+/// answers the leaf hashes a serve would otherwise rebuild by reading it
+/// again.
+///
+/// The builder verifies exactly as the plain stream did and retains the
+/// leaves on the way past, so the leaves cost this pass and not another.
+pub(crate) fn copy_verify_and_prepare(
     source: &Path,
     destination: &Path,
     expected_length: u64,
     expected_root: [u8; 32],
     suite: Suite,
-) -> Result<(), Error> {
+) -> Result<Option<Vec<[u8; 32]>>, Error> {
     let mut input = File::open(source)?;
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(destination)?;
-    let mut verifier = StreamVerifier::new(suite);
+    let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
+        .map_err(|_| Error::InvalidBundle)?;
     let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
     loop {
         let read = input.read(&mut buffer)?;
@@ -249,19 +262,17 @@ pub(crate) fn copy_and_verify(
             break;
         }
         output.write_all(&buffer[..read])?;
-        verifier.update(&buffer[..read])?;
+        builder
+            .update(&buffer[..read])
+            .map_err(|_| Error::SourceMutation)?;
     }
     output.sync_all()?;
-    match verifier.finish(ExpectedObject::new(suite, expected_root, expected_length)) {
-        Ok(_) => {}
-        Err(
-            vot_verifier::VerifyError::RootMismatch
-            | vot_verifier::VerifyError::LengthMismatch
-            | vot_verifier::VerifyError::SuiteMismatch,
-        ) => return Err(Error::SourceMutation),
-        Err(error) => return Err(error.into()),
+    let prepared = builder.finish().map_err(|_| Error::SourceMutation)?;
+    if prepared.object_id().root != expected_root || prepared.object_id().length != expected_length
+    {
+        return Err(Error::SourceMutation);
     }
-    Ok(())
+    Ok(prepared.proof_leaves())
 }
 
 pub(crate) fn stream_root(

@@ -1371,14 +1371,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_and_verify_rejects_length_or_root_mismatch() {
+    fn copying_an_object_rejects_a_length_or_root_mismatch() {
         let source = temporary("copy-source");
         let data = b"copy-and-verify";
         fs::write(&source, data).unwrap();
         let root = vot_verifier::root(Suite::Sha256Bep52, data).unwrap();
 
         let valid_destination = temporary("copy-valid");
-        copy_and_verify(
+        copy_verify_and_prepare(
             &source,
             &valid_destination,
             data.len() as u64,
@@ -1390,7 +1390,7 @@ mod tests {
 
         let length_destination = temporary("copy-length-mismatch");
         assert!(matches!(
-            copy_and_verify(
+            copy_verify_and_prepare(
                 &source,
                 &length_destination,
                 data.len() as u64 + 1,
@@ -1405,7 +1405,7 @@ mod tests {
         let mut wrong_root = root;
         wrong_root[0] ^= 1;
         assert!(matches!(
-            copy_and_verify(
+            copy_verify_and_prepare(
                 &source,
                 &root_destination,
                 data.len() as u64,

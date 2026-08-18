@@ -83,6 +83,12 @@ trait RetainedProof: Send + Sync + UnwindSafe + RefUnwindSafe {
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error>;
     fn holds(&self, first: usize, bytes: &[u8]) -> bool;
 
+    /// The leaf hashes this store proves from, for a caller that means to
+    /// keep them. `None` for a store that does not hold them in memory.
+    fn leaves(&self) -> Option<Vec<[u8; 32]>> {
+        None
+    }
+
     #[cfg(test)]
     fn retained_units(&self) -> usize;
 
@@ -159,6 +165,13 @@ impl RetainedProof for MemoryProofStore {
                 },
                 None => false,
             }
+        })
+    }
+
+    fn leaves(&self) -> Option<Vec<[u8; 32]>> {
+        Some(match self {
+            Self::Sha256(pieces) => pieces.piece_hashes().to_vec(),
+            Self::Blake3(cvs) => cvs.group_cvs().to_vec(),
         })
     }
 
@@ -495,6 +508,53 @@ impl PreparedObject {
         &self.object
     }
 
+    /// The leaf hashes the proofs are read from, for a caller that means to
+    /// keep them beside the object and prepare from them next time.
+    #[must_use]
+    pub fn proof_leaves(&self) -> Option<Vec<[u8; 32]>> {
+        self.proof.leaves()
+    }
+
+    /// Prepares an object from leaf hashes a caller kept, without reading
+    /// the object itself.
+    ///
+    /// The leaves are not an authority: what comes back names the object
+    /// they describe, and a caller that already knows the root compares the
+    /// two before serving anything. A caller that does not know the root has
+    /// no business calling this.
+    ///
+    /// # Errors
+    /// Rejects leaves that cannot describe an object of this length, and an
+    /// object short enough that its root is not the top of a tree.
+    pub fn from_proof_leaves(
+        suite: Suite,
+        length: u64,
+        leaves: Vec<[u8; 32]>,
+    ) -> Result<Self, Error> {
+        let (proof, root): (Box<dyn RetainedProof>, [u8; 32]) = match suite {
+            Suite::Sha256Bep52 => {
+                let pieces = vot_proof_sha256::PieceHashes::from_piece_hashes(leaves, length)
+                    .map_err(map_sha256_error)?;
+                let root = pieces.tree_root().ok_or(Error::Proof)?;
+                (Box::new(MemoryProofStore::Sha256(pieces)), root)
+            }
+            Suite::Blake3Bao64 => {
+                let cvs = vot_proof_blake3::GroupCvs::from_group_cvs(leaves, length)
+                    .map_err(map_blake3_error)?;
+                let root = cvs.tree_root().ok_or(Error::Proof)?;
+                (Box::new(MemoryProofStore::Blake3(cvs)), root)
+            }
+        };
+        Ok(Self {
+            object: ObjectId {
+                suite: suite.identifier(),
+                root,
+                length,
+            },
+            proof,
+        })
+    }
+
     /// Creates the canonical proof for a requested range.
     ///
     /// # Errors
@@ -533,6 +593,92 @@ impl PreparedObject {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_object_prepared_from_its_leaves_is_the_object_it_came_from() {
+        // What a serve keeps and what it prepares from, both suites: the
+        // leaves out of a prepared object rebuild an object of the same
+        // identity that proves the same ranges, without the bytes.
+        for suite in [Suite::Sha256Bep52, Suite::Blake3Bao64] {
+            let bytes: Vec<u8> = (0..GROUP_SIZE * 4 + 900)
+                .map(|byte| u8::try_from(byte % 253).expect("bounded by the modulus"))
+                .collect();
+            let mut builder = ObjectBuilder::new(suite, Some(bytes.len() as u64)).unwrap();
+            builder.update(&bytes).unwrap();
+            let prepared = builder.finish().unwrap();
+            let leaves = prepared.proof_leaves().expect("a memory store keeps them");
+            assert_eq!(
+                leaves.len(),
+                bytes.len().div_ceil(GROUP_SIZE),
+                "one leaf per group of the object"
+            );
+
+            let from_leaves =
+                PreparedObject::from_proof_leaves(suite, bytes.len() as u64, leaves).unwrap();
+            assert_eq!(
+                from_leaves.object_id(),
+                prepared.object_id(),
+                "the leaves name a different object"
+            );
+            for (offset, length) in [(0, bytes.len() as u64), (0, 65_536), (131_072, 65_536)] {
+                assert_eq!(
+                    from_leaves.prove(offset, length).unwrap().proof(),
+                    prepared.prove(offset, length).unwrap().proof(),
+                    "a proof from leaves differs"
+                );
+            }
+            // And what it proves from still checks the bytes it is given.
+            assert!(from_leaves.holds(0, &bytes[..GROUP_SIZE]));
+            assert!(!from_leaves.holds(0, &vec![0_u8; GROUP_SIZE]));
+        }
+    }
+
+    #[test]
+    fn a_store_that_keeps_its_nodes_elsewhere_has_no_leaves_to_hand_back() {
+        // Only a store holding the leaves in memory can hand them over. One
+        // proving from node storage answers nothing, so a caller writes no
+        // cache for it rather than writing a wrong one.
+        let bytes = vec![4_u8; GROUP_SIZE * 3];
+        let mut builder = ObjectBuilder::with_proof_storage(
+            Suite::Sha256Bep52,
+            Some(bytes.len() as u64),
+            Box::new(MemoryNodeStorage::default()),
+        )
+        .unwrap();
+        builder.update(&bytes).unwrap();
+        let prepared = builder.finish().unwrap();
+        assert!(
+            prepared.proof_leaves().is_none(),
+            "a stored proof has no leaves in memory to keep"
+        );
+    }
+
+    #[test]
+    fn leaves_that_cannot_describe_the_object_are_refused() {
+        let leaf = [3_u8; 32];
+        // Too few, too many, and an object of one group whose root is its
+        // own hash rather than a tree top.
+        assert!(
+            PreparedObject::from_proof_leaves(
+                Suite::Sha256Bep52,
+                (GROUP_SIZE * 4) as u64,
+                vec![leaf; 3]
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedObject::from_proof_leaves(
+                Suite::Sha256Bep52,
+                (GROUP_SIZE * 4) as u64,
+                vec![leaf; 5]
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedObject::from_proof_leaves(Suite::Blake3Bao64, GROUP_SIZE as u64, vec![leaf])
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_finished_sha256_store_retains_its_tree() {
         // Without this the store rebuilds the whole piece tree for every

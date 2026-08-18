@@ -170,6 +170,54 @@ impl GroupCvs {
         !self.levels.is_empty()
     }
 
+    /// The group chaining values themselves, for a caller that means to
+    /// store them.
+    #[must_use]
+    pub fn group_cvs(&self) -> &[[u8; 32]] {
+        &self.cvs
+    }
+
+    /// Rebuilds from chaining values a caller stored, sealed and ready to
+    /// prove.
+    ///
+    /// The values are not trusted: [`Self::tree_root`] says what object they
+    /// describe, and a caller compares that against the root it already
+    /// knows before proving anything from them.
+    ///
+    /// # Errors
+    /// Rejects a count that is not what the length implies, and an object of
+    /// one group or none, whose root is that group's own root-mode hash
+    /// rather than a merge of two subtrees.
+    pub fn from_group_cvs(cvs: Vec<[u8; 32]>, length: u64) -> Result<Self, Error> {
+        let expected = group_count(length);
+        if expected < 2 || u64::try_from(cvs.len()).map_err(|_| Error::OutOfBounds)? != expected {
+            return Err(Error::OutOfBounds);
+        }
+        let mut groups = Self {
+            cvs,
+            length,
+            ended: true,
+            levels: Vec::new(),
+        };
+        groups.seal();
+        Ok(groups)
+    }
+
+    /// The object root this tree proves to, for an object of more than one
+    /// group, merged the way a verifier merges the root's two children.
+    /// `None` for an object whose root is a single group's own hash.
+    #[must_use]
+    pub fn tree_root(&self) -> Option<[u8; 32]> {
+        let count = group_count(self.length);
+        if count < 2 {
+            return None;
+        }
+        let (left, right) = Node { start: 0, count }.split();
+        let left = node_cv_retained(left, &self.cvs, &self.levels);
+        let right = node_cv_retained(right, &self.cvs, &self.levels);
+        Some(*merge_subtrees_root(&left, &right, Mode::Hash).as_bytes())
+    }
+
     /// The object length these cover.
     #[must_use]
     pub const fn object_len(&self) -> u64 {
@@ -826,6 +874,82 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_leaves_rebuild_the_object_they_came_from() {
+        // What a serve does with a cache it kept: rebuild, ask what object
+        // the leaves describe, and compare against the root it already knows
+        // before proving anything from them.
+        for size in [GROUP_SIZE as usize * 4, GROUP_SIZE as usize * 5 + 700] {
+            let data: Vec<u8> = (0..size).map(|byte| (byte % 251) as u8).collect();
+            let mut built = GroupCvs::new();
+            for leaf in data.chunks(GROUP_SIZE as usize) {
+                built.push(leaf).unwrap();
+            }
+            built.seal();
+            let stored = built.group_cvs().to_vec();
+            let rebuilt = GroupCvs::from_group_cvs(stored, data.len() as u64).unwrap();
+            assert_eq!(
+                rebuilt.tree_root(),
+                Some(root(&data)),
+                "the rebuilt tree names a different object"
+            );
+            for (offset, length) in [
+                (0, data.len() as u64),
+                (0, GROUP_SIZE),
+                (GROUP_SIZE * 2, GROUP_SIZE),
+            ] {
+                assert_eq!(
+                    prove_with(&rebuilt, offset, length).unwrap(),
+                    prove_with(&built, offset, length).unwrap(),
+                    "a proof from stored leaves differs at {offset}+{length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_leaves_is_the_smallest_tree_there_is() {
+        // The boundary both ways: two leaves is a tree whose top is the
+        // object root, and one is not, so an object of exactly two is taken
+        // and its root answered.
+        let data: Vec<u8> = (0..GROUP_SIZE as usize * 2)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        let mut built = GroupCvs::new();
+        for leaf in data.chunks(GROUP_SIZE as usize) {
+            built.push(leaf).unwrap();
+        }
+        built.seal();
+        assert_eq!(built.group_cvs().len(), 2);
+        assert_eq!(built.tree_root(), Some(root(&data)));
+        let rebuilt = GroupCvs::from_group_cvs(built.group_cvs().to_vec(), data.len() as u64)
+            .expect("two describe it");
+        assert_eq!(rebuilt.tree_root(), Some(root(&data)));
+
+        // One leaf is not a tree: no root to answer and nothing to rebuild.
+        let single: Vec<u8> = (0..GROUP_SIZE as usize)
+            .map(|byte| (byte % 251) as u8)
+            .collect();
+        let mut one = GroupCvs::new();
+        one.push(&single).unwrap();
+        one.seal();
+        assert_eq!(one.tree_root(), None, "one leaf names no tree top");
+        assert!(GroupCvs::from_group_cvs(one.group_cvs().to_vec(), GROUP_SIZE).is_err());
+    }
+
+    #[test]
+    fn stored_leaves_are_refused_when_they_cannot_describe_the_object() {
+        let leaf = [7_u8; 32];
+        // A count that is not what the length implies, either way.
+        assert!(GroupCvs::from_group_cvs(vec![leaf; 3], GROUP_SIZE * 4).is_err());
+        assert!(GroupCvs::from_group_cvs(vec![leaf; 5], GROUP_SIZE * 4).is_err());
+        // One leaf or none: the root is not a tree top there.
+        assert!(GroupCvs::from_group_cvs(vec![leaf], GROUP_SIZE).is_err());
+        assert!(GroupCvs::from_group_cvs(Vec::new(), 0).is_err());
+        // And the shape that does describe it.
+        assert!(GroupCvs::from_group_cvs(vec![leaf; 4], GROUP_SIZE * 4).is_ok());
+    }
+
     #[test]
     fn only_aligned_powers_of_two_sit_in_the_retained_levels() {
         // Every node the tree splits to, and the ragged ones it also makes.

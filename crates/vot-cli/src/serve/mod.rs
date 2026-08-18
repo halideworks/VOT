@@ -100,6 +100,124 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Payload, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_serve_prepares_from_the_leaves_beside_the_object_and_falls_back_without_them() {
+        // Preparation reads every byte of every object, about 1.4 seconds a
+        // gigabyte, so `send` keeps the leaves and a serve prepares from
+        // them. They are a cache: anything unreadable, stale, or describing
+        // another object is ignored in favour of reading the object, and
+        // every one of those cases still serves.
+        use std::fs;
+
+        // Stored directly rather than packed, and more than one piece, or
+        // there is nothing to keep leaves for.
+        let (bundle, _) = built_bundle(
+            "leafcache",
+            &[("big.bin", patterned(vot_pack::CANDIDATE_MAX + 200_000))],
+        );
+        let objects = bundle.join("objects");
+        let cache = fs::read_dir(&objects)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|kind| kind == "leaves"))
+            .expect("send kept the leaves");
+        let kept = fs::read(&cache).unwrap();
+        let served = BundleServer::open(&bundle).unwrap();
+        let object = served.objects.values().next().unwrap();
+        let honest = object.layer.prove(0, 65_536).unwrap();
+
+        let reopen = |bundle: &std::path::Path| {
+            let opened = BundleServer::open(bundle).unwrap();
+            let object = opened.objects.values().next().unwrap().object;
+            let proof = opened
+                .objects
+                .values()
+                .next()
+                .unwrap()
+                .layer
+                .prove(0, 65_536)
+                .unwrap();
+            (object, proof)
+        };
+
+        // The cache in place proves exactly what reading the object proves,
+        // and it is the cache that answered rather than the object.
+        let (identity, proof) = reopen(&bundle);
+        assert_eq!(proof.proof(), honest.proof());
+        assert!(
+            super::object::prepared_from_cache(
+                &objects,
+                identity.root,
+                crate::parse_suite("sha256").unwrap(),
+                identity.length,
+            )
+            .is_some(),
+            "the leaves beside the object were not used"
+        );
+
+        // A mutated tail is caught by the sample too, which is what makes
+        // the check read the object's last group and not its first twice.
+        {
+            let object = fs::read_dir(&objects)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|kind| kind == "obj"))
+                .expect("the object");
+            let original = fs::read(&object).unwrap();
+            let mut tail_flipped = original.clone();
+            let last = tail_flipped.len() - 1;
+            tail_flipped[last] ^= 0xff;
+            fs::write(&object, &tail_flipped).unwrap();
+            assert!(
+                super::object::prepared_from_cache(
+                    &objects,
+                    identity.root,
+                    crate::parse_suite("sha256").unwrap(),
+                    identity.length,
+                )
+                .is_none(),
+                "a mutated last group was prepared from"
+            );
+            fs::write(&object, &original).unwrap();
+        }
+
+        // Corrupt, truncated, for another object, and absent: all still open
+        // and prove the same, because each falls back to reading it.
+        let corrupt = {
+            let mut bytes = kept.clone();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            bytes
+        };
+        for (case, bytes) in [
+            ("corrupt", Some(corrupt)),
+            ("truncated", Some(kept[..kept.len() / 2].to_vec())),
+            ("header only", Some(kept[..8].to_vec())),
+            ("absent", None),
+        ] {
+            match bytes {
+                Some(bytes) => fs::write(&cache, bytes).unwrap(),
+                None => fs::remove_file(&cache).unwrap(),
+            }
+            assert!(
+                super::object::prepared_from_cache(
+                    &objects,
+                    identity.root,
+                    crate::parse_suite("sha256").unwrap(),
+                    identity.length,
+                )
+                .is_none(),
+                "{case} was prepared from rather than ignored"
+            );
+            let (again, proof) = reopen(&bundle);
+            assert_eq!(again, identity, "{case} changed what the bundle serves");
+            assert_eq!(proof.proof(), honest.proof(), "{case} changed a proof");
+        }
+        crate::harness::discard(&[&bundle]);
+    }
+
     use super::*;
     use crate::build_bundle_with_suite;
     use crate::harness::{
@@ -1736,8 +1854,14 @@ mod tests {
     pub(crate) fn open_refuses_an_object_that_is_not_what_its_name_claims() {
         let (bundle, _) = built_bundle("mutated", &[("big.bin", patterned(300_000))]);
         let objects = bundle.join("objects");
-        let name = fs::read_dir(&objects).unwrap().next().unwrap().unwrap();
-        let path = name.path();
+        // The object itself, not the leaves kept beside it: what this test
+        // mutates is the bytes the bundle names.
+        let path = fs::read_dir(&objects)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|kind| kind == "obj"))
+            .expect("the object");
         let original = fs::read(&path).unwrap();
 
         let mut flipped = original.clone();

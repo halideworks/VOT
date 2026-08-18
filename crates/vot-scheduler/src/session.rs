@@ -358,12 +358,9 @@ impl PendingBundles {
             .checked_add(carried)
             .ok_or(Error::LengthExceeded)?;
         self.refuse_over_budget(&id, bytes, false)?;
-        self.opened += 1;
-        let opened_at = self.opened;
+        // No opening order here: what it orders is which orphan makes way,
+        // and an entry holding a proof is not one.
         let entry = self.entries.entry(id).or_default();
-        if entry.opened == 0 {
-            entry.opened = opened_at;
-        }
         let was_orphan = entry.is_orphan();
         let existed = entry.bundle.is_some() || !entry.records.is_empty();
         entry.bundle = Some(bundle);
@@ -1640,8 +1637,10 @@ mod tests {
 
         // And what the budget reports as it fills: the whole budget when
         // empty, nothing once what is left is under one step.
-        let mut pending = PendingBundles::default();
-        pending.orphan_byte_limit = ORPHAN_HEADROOM_QUANTUM * 4;
+        let mut pending = PendingBundles {
+            orphan_byte_limit: ORPHAN_HEADROOM_QUANTUM * 4,
+            ..PendingBundles::default()
+        };
         assert_eq!(
             pending.orphan_headroom(),
             (ORPHAN_HEADROOM_QUANTUM * 4) as u64
@@ -1665,9 +1664,10 @@ mod tests {
         assert_eq!(coded_allowance(10_000, 1_000), 500, "half the room binds");
         assert_eq!(coded_allowance(10_000, 0), 0, "no room is no credit");
         assert_eq!(coded_allowance(0, 10_000), 0);
-        // Half, not all: the boundary where the two meet.
+        // Half, not all, and what happens where the two are equal.
         assert_eq!(coded_allowance(500, 1_000), 500);
         assert_eq!(coded_allowance(501, 1_000), 500);
+        assert_eq!(coded_allowance(499, 1_000), 499);
     }
 
     #[test]
@@ -1685,9 +1685,11 @@ mod tests {
             encoded: vec![id; bytes],
         };
 
-        let mut pending = PendingBundles::default();
-        pending.orphan_bundle_limit = 3;
-        pending.orphan_byte_limit = usize::MAX;
+        let mut pending = PendingBundles {
+            orphan_bundle_limit: 3,
+            orphan_byte_limit: usize::MAX,
+            ..PendingBundles::default()
+        };
         // Arriving in the opposite order to their identities, so the oldest
         // is not simply the first the map holds.
         for id in [30_u8, 20, 10] {
@@ -1720,9 +1722,11 @@ mod tests {
             compression: 0,
             encoded: vec![id; bytes],
         };
-        let mut pending = PendingBundles::default();
-        pending.orphan_bundle_limit = 8;
-        pending.orphan_byte_limit = 400;
+        let mut pending = PendingBundles {
+            orphan_bundle_limit: 8,
+            orphan_byte_limit: 400,
+            ..PendingBundles::default()
+        };
         for id in [1_u8, 2, 3, 4] {
             pending.append_record(record(id, 100)).unwrap();
         }

@@ -110,6 +110,11 @@ pub struct GroupCvs {
     /// Set once a group shorter than [`GROUP_SIZE`] has been taken, because
     /// only the last group may be short.
     ended: bool,
+    /// Level `k` holds the chaining value of every aligned node of `2^k`
+    /// groups, the way [`SealedGroupCvs`] holds them on storage, so a proof
+    /// reads a subtree rather than merging it again. Empty until
+    /// [`Self::seal`], and emptied by a later group.
+    levels: Vec<Vec<[u8; 32]>>,
 }
 
 impl GroupCvs {
@@ -137,7 +142,32 @@ impl GroupCvs {
         self.cvs.push(hasher.finalize_non_root());
         self.length += group.len() as u64;
         self.ended = (group.len() as u64) < GROUP_SIZE;
+        // Whatever was retained described a shorter object.
+        self.levels.clear();
         Ok(())
+    }
+
+    /// Retains the subtree chaining values every later proof reads.
+    ///
+    /// Levels pair adjacent nodes and drop an odd tail, as
+    /// [`SealedGroupCvs`] does on storage, so a node that is not aligned to
+    /// a power of two is merged from the levels below it.
+    pub fn seal(&mut self) {
+        let mut levels = vec![self.cvs.clone()];
+        while let Some(previous) = levels.last().filter(|level| level.len() >= 2) {
+            let next: Vec<[u8; 32]> = previous
+                .chunks_exact(2)
+                .map(|pair| merge_subtrees_non_root(&pair[0], &pair[1], Mode::Hash))
+                .collect();
+            levels.push(next);
+        }
+        self.levels = levels;
+    }
+
+    /// Whether the subtree values are retained.
+    #[must_use]
+    pub fn sealed(&self) -> bool {
+        !self.levels.is_empty()
     }
 
     /// The object length these cover.
@@ -489,6 +519,7 @@ pub fn prove_with(cvs: &GroupCvs, offset: u64, length: u64) -> Result<RangeCover
         first,
         end,
         &cvs.cvs,
+        &cvs.levels,
         &mut proof,
     );
     Ok(RangeCover {
@@ -635,27 +666,47 @@ fn encode_all(node: Node, data: &[u8], output: &mut Vec<u8>) {
 /// A node's chaining value, merged up from the group layer.
 ///
 /// The same value [`node_cv`] computes from the object, without reading it.
-fn node_cv_from(node: Node, cvs: &[[u8; 32]]) -> [u8; 32] {
+/// A node's chaining value, read from the retained levels where it is
+/// aligned to one and merged from below where it is not.
+fn node_cv_retained(node: Node, cvs: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> [u8; 32] {
     if node.count == 1 {
         return cvs[node.start as usize];
     }
+    if node.count.is_power_of_two() && node.start % node.count == 0 {
+        let level = node.count.trailing_zeros() as usize;
+        if let Some(row) = levels.get(level) {
+            if let Some(cv) = usize::try_from(node.start / node.count)
+                .ok()
+                .and_then(|index| row.get(index))
+            {
+                return *cv;
+            }
+        }
+    }
     let (left, right) = node.split();
     merge_subtrees_non_root(
-        &node_cv_from(left, cvs),
-        &node_cv_from(right, cvs),
+        &node_cv_retained(left, cvs, levels),
+        &node_cv_retained(right, cvs, levels),
         Mode::Hash,
     )
 }
 
-fn encode_selected_from(node: Node, first: u64, end: u64, cvs: &[[u8; 32]], output: &mut Vec<u8>) {
+fn encode_selected_from(
+    node: Node,
+    first: u64,
+    end: u64,
+    cvs: &[[u8; 32]],
+    levels: &[Vec<[u8; 32]>],
+    output: &mut Vec<u8>,
+) {
     if node.count == 1 || !node.intersects(first, end) {
         return;
     }
     let (left, right) = node.split();
-    output.extend_from_slice(&node_cv_from(left, cvs));
-    output.extend_from_slice(&node_cv_from(right, cvs));
-    encode_selected_from(left, first, end, cvs, output);
-    encode_selected_from(right, first, end, cvs, output);
+    output.extend_from_slice(&node_cv_retained(left, cvs, levels));
+    output.extend_from_slice(&node_cv_retained(right, cvs, levels));
+    encode_selected_from(left, first, end, cvs, levels, output);
+    encode_selected_from(right, first, end, cvs, levels, output);
 }
 
 fn encode_selected_stored(
@@ -759,6 +810,43 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_subtrees_prove_what_merged_ones_prove() {
+        // The retained levels are a cost decision, so every shape of range
+        // has to prove the same with them as without: a whole object, one
+        // group, a range inside one, one that spans two, and the tail of an
+        // object whose group count is not a power of two.
+        let data: Vec<u8> = (0..GROUP_SIZE as usize * 5 + 1000)
+            .map(|byte| (byte % 241) as u8)
+            .collect();
+        let mut cvs = GroupCvs::new();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            cvs.push(group).unwrap();
+        }
+        assert!(!cvs.sealed(), "a store is unsealed until asked");
+        let ranges = [
+            (0, data.len() as u64),
+            (0, GROUP_SIZE),
+            (7, 30),
+            (GROUP_SIZE - 3, 9),
+            (GROUP_SIZE * 4, GROUP_SIZE + 1000),
+            (data.len() as u64 - 1, 1),
+        ];
+        let merged: Vec<RangeCover> = ranges
+            .iter()
+            .map(|(offset, length)| prove_with(&cvs, *offset, *length).unwrap())
+            .collect();
+        cvs.seal();
+        assert!(cvs.sealed(), "sealing retains the levels");
+        for (cover, (offset, length)) in merged.iter().zip(ranges) {
+            assert_eq!(
+                &prove_with(&cvs, offset, length).unwrap(),
+                cover,
+                "range {offset}+{length} proved differently from the retained levels"
+            );
+        }
+    }
+
     use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

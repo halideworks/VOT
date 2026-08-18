@@ -122,8 +122,9 @@ impl RetainedProofBuilder for MemoryProofStore {
         // per piece of the object for every range it answers, which is the
         // whole object hashed again per answer: a 12 GB transfer spent 40 of
         // its 95 seconds of processor time there.
-        if let Self::Sha256(pieces) = self.as_mut() {
-            pieces.seal();
+        match self.as_mut() {
+            Self::Sha256(pieces) => pieces.seal(),
+            Self::Blake3(cvs) => cvs.seal(),
         }
         Ok(self)
     }
@@ -165,7 +166,7 @@ impl RetainedProof for MemoryProofStore {
     fn proof_tree_retained(&self) -> bool {
         match self {
             Self::Sha256(pieces) => pieces.sealed(),
-            Self::Blake3(_) => false,
+            Self::Blake3(cvs) => cvs.sealed(),
         }
     }
 

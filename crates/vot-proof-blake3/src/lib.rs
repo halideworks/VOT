@@ -666,21 +666,37 @@ fn encode_all(node: Node, data: &[u8], output: &mut Vec<u8>) {
 /// A node's chaining value, merged up from the group layer.
 ///
 /// The same value [`node_cv`] computes from the object, without reading it.
-/// A node's chaining value, read from the retained levels where it is
-/// aligned to one and merged from below where it is not.
+/// Where a node sits in the retained levels, if it sits in them at all.
+///
+/// A level holds nodes of `2^k` groups starting at a multiple of that many,
+/// which is every node the tree splits to except the ragged ones on its
+/// right edge. Those are merged from the levels below instead.
+///
+/// Pure and answered here rather than inline, because the two halves of the
+/// test are indistinguishable through a proof: reading a level and merging
+/// the same subtree give the same bytes, at very different cost.
+const fn retained_at(node: Node) -> Option<(usize, u64)> {
+    if node.count == 0 || !node.count.is_power_of_two() || node.start % node.count != 0 {
+        return None;
+    }
+    Some((
+        node.count.trailing_zeros() as usize,
+        node.start / node.count,
+    ))
+}
+
+/// A node's chaining value, read from the retained levels where it sits in
+/// them and merged from below where it does not.
 fn node_cv_retained(node: Node, cvs: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> [u8; 32] {
     if node.count == 1 {
         return cvs[node.start as usize];
     }
-    if node.count.is_power_of_two() && node.start % node.count == 0 {
-        let level = node.count.trailing_zeros() as usize;
-        if let Some(row) = levels.get(level) {
-            if let Some(cv) = usize::try_from(node.start / node.count)
-                .ok()
-                .and_then(|index| row.get(index))
-            {
-                return *cv;
-            }
+    if let Some((level, index)) = retained_at(node) {
+        if let Some(cv) = levels
+            .get(level)
+            .and_then(|row| usize::try_from(index).ok().and_then(|index| row.get(index)))
+        {
+            return *cv;
         }
     }
     let (left, right) = node.split();
@@ -810,6 +826,24 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_aligned_powers_of_two_sit_in_the_retained_levels() {
+        // Every node the tree splits to, and the ragged ones it also makes.
+        assert_eq!(retained_at(Node { start: 0, count: 1 }), Some((0, 0)));
+        assert_eq!(retained_at(Node { start: 4, count: 1 }), Some((0, 4)));
+        assert_eq!(retained_at(Node { start: 0, count: 4 }), Some((2, 0)));
+        assert_eq!(retained_at(Node { start: 4, count: 4 }), Some((2, 1)));
+        assert_eq!(retained_at(Node { start: 4, count: 2 }), Some((1, 2)));
+        // Ragged: a count that is not a power of two, whatever it starts at.
+        assert_eq!(retained_at(Node { start: 0, count: 6 }), None);
+        assert_eq!(retained_at(Node { start: 0, count: 3 }), None);
+        assert_eq!(retained_at(Node { start: 4, count: 3 }), None);
+        // A power of two that does not start on its own boundary.
+        assert_eq!(retained_at(Node { start: 2, count: 4 }), None);
+        assert_eq!(retained_at(Node { start: 1, count: 2 }), None);
+        assert_eq!(retained_at(Node { start: 0, count: 0 }), None);
+    }
+
     #[test]
     fn a_proof_reads_the_retained_levels_rather_than_merging_again() {
         // The retained levels are read, not recomputed: corrupt one and the

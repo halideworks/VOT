@@ -633,6 +633,26 @@ mod tests {
     }
 
     #[test]
+    fn a_store_that_keeps_its_nodes_elsewhere_has_no_leaves_to_hand_back() {
+        // Only a store holding the leaves in memory can hand them over. One
+        // proving from node storage answers nothing, so a caller writes no
+        // cache for it rather than writing a wrong one.
+        let bytes = vec![4_u8; GROUP_SIZE * 3];
+        let mut builder = ObjectBuilder::with_proof_storage(
+            Suite::Sha256Bep52,
+            Some(bytes.len() as u64),
+            Box::new(MemoryNodeStorage::default()),
+        )
+        .unwrap();
+        builder.update(&bytes).unwrap();
+        let prepared = builder.finish().unwrap();
+        assert!(
+            prepared.proof_leaves().is_none(),
+            "a stored proof has no leaves in memory to keep"
+        );
+    }
+
+    #[test]
     fn leaves_that_cannot_describe_the_object_are_refused() {
         let leaf = [3_u8; 32];
         // Too few, too many, and an object of one group whose root is its

@@ -183,11 +183,16 @@ mod tests {
     }
 
     /// Recursively compares two directory trees by structure and bytes.
+    ///
+    /// The leaves a `send` keeps beside an object are skipped: they are a
+    /// cache a serve rebuilds by reading the object, the manifest and seal do
+    /// not cover them, and a fetch does not write them yet.
     pub(crate) fn assert_same_tree(left: &Path, right: &Path) {
         let names = |root: &Path| {
             let mut entries: Vec<_> = fs::read_dir(root)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
+                .filter(|name| !name.to_string_lossy().ends_with(".leaves"))
                 .collect();
             entries.sort();
             entries

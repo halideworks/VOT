@@ -123,6 +123,49 @@ impl PieceHashes {
         !self.layers.is_empty()
     }
 
+    /// The piece hashes themselves, for a caller that means to store them.
+    #[must_use]
+    pub fn piece_hashes(&self) -> &[[u8; 32]] {
+        &self.hashes
+    }
+
+    /// Rebuilds from piece hashes a caller stored, sealed and ready to prove.
+    ///
+    /// The hashes are not trusted: [`Self::tree_root`] says what object they
+    /// describe, and a caller compares that against the root it already
+    /// knows before proving anything from them.
+    ///
+    /// # Errors
+    /// Rejects a count that is not what the length implies, and an object of
+    /// one piece or none, whose root is the object's own hash rather than
+    /// the top of a tree.
+    pub fn from_piece_hashes(hashes: Vec<[u8; 32]>, length: u64) -> Result<Self, Error> {
+        let expected = length.div_ceil(PIECE_SIZE);
+        if expected < 2 || u64::try_from(hashes.len()).map_err(|_| Error::OutOfBounds)? != expected
+        {
+            return Err(Error::OutOfBounds);
+        }
+        let mut pieces = Self {
+            hashes,
+            length,
+            ended: true,
+            layers: Vec::new(),
+        };
+        pieces.seal();
+        Ok(pieces)
+    }
+
+    /// The object root this tree proves to, for an object of more than one
+    /// piece. `None` before sealing, and for an object whose root is not a
+    /// tree top.
+    #[must_use]
+    pub fn tree_root(&self) -> Option<[u8; 32]> {
+        if self.hashes.len() < 2 {
+            return None;
+        }
+        self.layers.last().and_then(|top| top.first()).copied()
+    }
+
     /// The object length these cover.
     #[must_use]
     pub const fn object_len(&self) -> u64 {
@@ -707,6 +750,52 @@ fn decode_root(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_leaves_rebuild_the_object_they_came_from() {
+        // What a serve does with a cache it kept: rebuild, ask what object
+        // the leaves describe, and compare against the root it already knows
+        // before proving anything from them.
+        for size in [PIECE_SIZE as usize * 4, PIECE_SIZE as usize * 5 + 700] {
+            let data: Vec<u8> = (0..size).map(|byte| (byte % 251) as u8).collect();
+            let mut built = PieceHashes::new();
+            for leaf in data.chunks(PIECE_SIZE as usize) {
+                built.push(leaf).unwrap();
+            }
+            built.seal();
+            let stored = built.piece_hashes().to_vec();
+            let rebuilt = PieceHashes::from_piece_hashes(stored, data.len() as u64).unwrap();
+            assert_eq!(
+                rebuilt.tree_root(),
+                Some(root(&data)),
+                "the rebuilt tree names a different object"
+            );
+            for (offset, length) in [
+                (0, data.len() as u64),
+                (0, PIECE_SIZE),
+                (PIECE_SIZE * 2, PIECE_SIZE),
+            ] {
+                assert_eq!(
+                    prove_with(&rebuilt, offset, length).unwrap(),
+                    prove_with(&built, offset, length).unwrap(),
+                    "a proof from stored leaves differs at {offset}+{length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_leaves_are_refused_when_they_cannot_describe_the_object() {
+        let leaf = [7_u8; 32];
+        // A count that is not what the length implies, either way.
+        assert!(PieceHashes::from_piece_hashes(vec![leaf; 3], PIECE_SIZE * 4).is_err());
+        assert!(PieceHashes::from_piece_hashes(vec![leaf; 5], PIECE_SIZE * 4).is_err());
+        // One leaf or none: the root is not a tree top there.
+        assert!(PieceHashes::from_piece_hashes(vec![leaf], PIECE_SIZE).is_err());
+        assert!(PieceHashes::from_piece_hashes(Vec::new(), 0).is_err());
+        // And the shape that does describe it.
+        assert!(PieceHashes::from_piece_hashes(vec![leaf; 4], PIECE_SIZE * 4).is_ok());
+    }
+
     #[test]
     fn a_proof_reads_the_retained_tree_rather_than_building_again() {
         // The retained tree is read, not rebuilt: corrupt a node and the

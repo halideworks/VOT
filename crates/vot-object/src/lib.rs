@@ -83,6 +83,12 @@ trait RetainedProof: Send + Sync + UnwindSafe + RefUnwindSafe {
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error>;
     fn holds(&self, first: usize, bytes: &[u8]) -> bool;
 
+    /// The leaf hashes this store proves from, for a caller that means to
+    /// keep them. `None` for a store that does not hold them in memory.
+    fn leaves(&self) -> Option<Vec<[u8; 32]>> {
+        None
+    }
+
     #[cfg(test)]
     fn retained_units(&self) -> usize;
 
@@ -159,6 +165,13 @@ impl RetainedProof for MemoryProofStore {
                 },
                 None => false,
             }
+        })
+    }
+
+    fn leaves(&self) -> Option<Vec<[u8; 32]>> {
+        Some(match self {
+            Self::Sha256(pieces) => pieces.piece_hashes().to_vec(),
+            Self::Blake3(cvs) => cvs.group_cvs().to_vec(),
         })
     }
 
@@ -493,6 +506,53 @@ impl PreparedObject {
     #[must_use]
     pub const fn object_id(&self) -> &ObjectId {
         &self.object
+    }
+
+    /// The leaf hashes the proofs are read from, for a caller that means to
+    /// keep them beside the object and prepare from them next time.
+    #[must_use]
+    pub fn proof_leaves(&self) -> Option<Vec<[u8; 32]>> {
+        self.proof.leaves()
+    }
+
+    /// Prepares an object from leaf hashes a caller kept, without reading
+    /// the object itself.
+    ///
+    /// The leaves are not an authority: what comes back names the object
+    /// they describe, and a caller that already knows the root compares the
+    /// two before serving anything. A caller that does not know the root has
+    /// no business calling this.
+    ///
+    /// # Errors
+    /// Rejects leaves that cannot describe an object of this length, and an
+    /// object short enough that its root is not the top of a tree.
+    pub fn from_proof_leaves(
+        suite: Suite,
+        length: u64,
+        leaves: Vec<[u8; 32]>,
+    ) -> Result<Self, Error> {
+        let (proof, root): (Box<dyn RetainedProof>, [u8; 32]) = match suite {
+            Suite::Sha256Bep52 => {
+                let pieces = vot_proof_sha256::PieceHashes::from_piece_hashes(leaves, length)
+                    .map_err(map_sha256_error)?;
+                let root = pieces.tree_root().ok_or(Error::Proof)?;
+                (Box::new(MemoryProofStore::Sha256(pieces)), root)
+            }
+            Suite::Blake3Bao64 => {
+                let cvs = vot_proof_blake3::GroupCvs::from_group_cvs(leaves, length)
+                    .map_err(map_blake3_error)?;
+                let root = cvs.tree_root().ok_or(Error::Proof)?;
+                (Box::new(MemoryProofStore::Blake3(cvs)), root)
+            }
+        };
+        Ok(Self {
+            object: ObjectId {
+                suite: suite.identifier(),
+                root,
+                length,
+            },
+            proof,
+        })
     }
 
     /// Creates the canonical proof for a requested range.

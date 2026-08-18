@@ -429,6 +429,25 @@ fn every_erasure_pattern_within_the_repair_count_decodes() {
 }
 
 #[test]
+fn recovery_returns_only_the_missing_sources() {
+    let geometry = Geometry::new(4, 2, 32).unwrap();
+    let source: Vec<Vec<u8>> = (0..4).map(|esi| pattern(esi + 20, 32)).collect();
+    let borrowed: Vec<&[u8]> = source.iter().map(Vec::as_slice).collect();
+    let repair = encode(geometry, &borrowed).unwrap();
+    let received = [
+        (0, borrowed[0]),
+        (2, borrowed[2]),
+        (4, repair[0].as_slice()),
+        (5, repair[1].as_slice()),
+    ];
+
+    assert_eq!(
+        crate::recover_missing(geometry, &received).unwrap(),
+        vec![(1, source[1].clone()), (3, source[3].clone())]
+    );
+}
+
+#[test]
 #[ignore = "performance measurement"]
 fn decode_costs() {
     let geometry = Geometry::new(64, 8, 1024).unwrap();

@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::plan::{EpochPlan, SourceSpan};
-use crate::{Error, decode};
+use crate::plan::EpochPlan;
+use crate::{Error, recover_missing};
 
 /// One `DATAGRAM_CREDIT`: the caps a newer credit epoch replaces whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,11 +109,14 @@ fn report_of(plan: &EpochPlan, generation: u32, slot: &mut Generation) -> Report
 /// `max_open_epochs`. At the shipped profile it is 64 GiB per epoch.
 pub const MAX_TRACKED_GENERATIONS: u64 = 1 << 20;
 
-/// A live generation: only the symbols that arrived, at most `k - 1` of them
-/// since the `k`-th completes it.
+/// A live generation: one final source buffer and only the repair symbols that
+/// arrived, at most `k - 1` distinct arrivals since the `k`-th completes it.
 #[derive(Debug)]
 struct Generation {
-    symbols: Vec<(u8, Vec<u8>)>,
+    /// Source positions in wire order. Missing sources remain zero until
+    /// repair reconstructs them.
+    sources: Vec<u8>,
+    repairs: Vec<(u8, Vec<u8>)>,
     /// One bit per ESI in hand, so a duplicate is found without a scan.
     seen: u128,
     /// Distinct symbols in hand, zero sources included.
@@ -203,50 +206,44 @@ fn admit(plan: &EpochPlan, generation: u32, esi: u8, bytes: &[u8]) -> Result<usi
     Ok(sent_sources)
 }
 
-/// Every sent source in hand: the sources themselves, no elimination.
-fn take_sources(slot: &mut Generation, sent_sources: usize) -> Option<Vec<Vec<u8>>> {
-    if (0..sent_sources).any(|j| !slot.has(u8::try_from(j).expect("a source ESI"))) {
-        return None;
-    }
-    // `k` in hand and every sent source among them: the zero sources make
-    // up the rest, so what is stored is exactly the sent sources.
-    let mut symbols = std::mem::take(&mut slot.symbols);
-    debug_assert_eq!(symbols.len(), sent_sources);
-    symbols.sort_by_key(|(esi, _)| *esi);
-    Some(symbols.into_iter().map(|(_, symbol)| symbol).collect())
+/// Every sent source in hand needs no elimination.
+fn has_sources(slot: &Generation, sent_sources: usize) -> bool {
+    (0..sent_sources).all(|j| slot.has(u8::try_from(j).expect("a source ESI")))
 }
 
 /// `k` distinct symbols in hand, not all of them sources: eliminate.
-fn eliminate(plan: &EpochPlan, slot: &Generation, sent_sources: usize) -> Vec<Vec<u8>> {
+fn eliminate(plan: &EpochPlan, slot: &mut Generation, sent_sources: usize) {
     let geometry = plan.geometry();
     let zero = vec![0_u8; geometry.symbol_length()];
     let mut received: Vec<(usize, &[u8])> = Vec::with_capacity(geometry.source_count());
-    for (esi, symbol) in &slot.symbols {
-        received.push((usize::from(*esi), symbol.as_slice()));
+    for esi in 0..sent_sources {
+        if slot.has(u8::try_from(esi).expect("a source ESI")) {
+            let start = esi * geometry.symbol_length();
+            received.push((esi, &slot.sources[start..start + geometry.symbol_length()]));
+        }
+    }
+    for (esi, symbol) in &slot.repairs {
+        received.push((usize::from(*esi), symbol));
     }
     for esi in sent_sources..geometry.source_count() {
         received.push((esi, zero.as_slice()));
     }
-    let mut decoded = decode(geometry, &received).expect("k distinct symbols in hand");
-    decoded.truncate(sent_sources);
-    decoded
+    let recovered = recover_missing(geometry, &received).expect("k distinct symbols in hand");
+    drop(received);
+    for (esi, symbol) in recovered {
+        let start = esi * geometry.symbol_length();
+        slot.sources[start..start + geometry.symbol_length()].copy_from_slice(&symbol);
+    }
 }
 
 /// The object bytes of a generation from its sent sources, padding removed.
-fn assemble(plan: &EpochPlan, generation: u32, sources: &[Vec<u8>]) -> Decoded {
+fn assemble(plan: &EpochPlan, generation: u32, mut sources: Vec<u8>) -> Decoded {
     let (offset, length) = plan.generation_span(generation);
-    let mut out = Vec::with_capacity(usize::try_from(length).expect("at most k * L"));
-    for (j, symbol) in sources.iter().enumerate() {
-        match plan.source_span(generation, u8::try_from(j).expect("a source ESI")) {
-            SourceSpan::Bytes { bytes, .. } => out.extend_from_slice(&symbol[..bytes]),
-            SourceSpan::Zero => unreachable!("only sent sources are assembled"),
-        }
-    }
-    debug_assert_eq!(out.len() as u64, length);
+    sources.truncate(usize::try_from(length).expect("at most k * L"));
     Decoded {
         generation,
         offset,
-        bytes: out,
+        bytes: sources,
     }
 }
 
@@ -339,7 +336,8 @@ impl Receiver {
             state.live.insert(
                 generation,
                 Generation {
-                    symbols: Vec::new(),
+                    sources: vec![0; geometry.source_count() * geometry.symbol_length()],
+                    repairs: Vec::with_capacity(geometry.repair_count()),
                     seen: 0,
                     // Zero sources are in hand from the start.
                     received: geometry.source_count() - sent_sources,
@@ -349,15 +347,19 @@ impl Receiver {
             first = true;
         }
         let slot = state.live.get_mut(&generation).expect("inserted above");
-        slot.symbols.push((esi, bytes.to_vec()));
+        if usize::from(esi) < geometry.source_count() {
+            let start = usize::from(esi) * geometry.symbol_length();
+            slot.sources[start..start + geometry.symbol_length()].copy_from_slice(bytes);
+        } else {
+            slot.repairs.push((esi, bytes.to_vec()));
+        }
         slot.seen |= 1_u128 << esi;
         slot.received += 1;
         if slot.received < geometry.source_count() {
             return Symbol::Stored { first };
         }
-        let sources = if let Some(sources) = take_sources(slot, sent_sources) {
-            sources
-        } else {
+        let needs_elimination = !has_sources(slot, sent_sources);
+        if needs_elimination {
             let work = plan.generation_bytes();
             if self
                 .decode_work_spent
@@ -378,12 +380,14 @@ impl Receiver {
                 };
             }
             self.decode_work_spent += work;
-            eliminate(&plan, slot, sent_sources)
-        };
-        state.live.remove(&generation);
+        }
+        let mut slot = state.live.remove(&generation).expect("live above");
+        if needs_elimination {
+            eliminate(&plan, &mut slot, sent_sources);
+        }
         state.mark_done(generation);
         self.counters.retire(plan.generation_bytes());
-        Symbol::Decoded(assemble(&plan, generation, &sources))
+        Symbol::Decoded(assemble(&plan, generation, slot.sources))
     }
 
     /// The `GEN_STATE` to send for a generation this end holds, with the

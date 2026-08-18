@@ -639,9 +639,9 @@ mod tests {
 
     #[test]
     fn a_generation_that_loses_more_than_its_repair_count_arrives_reliably() {
-        // Every eighth datagram goes: nine of a generation's 72 symbols, one
-        // past the repair count, so no generation ever reaches its source
-        // count. Such a generation decodes never and reports nothing, because
+        // Every eighth datagram goes. Interleaving spreads most losses across
+        // the piece, but one generation still loses more than its eight repair
+        // symbols. Such a generation decodes never and reports nothing, because
         // the receiver owes a GEN_DONE only for one it decoded or gave up on.
         // Before the serve closed a quiet epoch this hung until the fetch
         // spent its whole stall budget; the object now arrives over the
@@ -673,13 +673,12 @@ mod tests {
             FetchStatus::Complete
         );
         assert_eq!(fetcher.package().expect("a package"), built);
-        // 300000 bytes are five generations, four full and a short tail whose
-        // symbol count is small enough that every eighth still leaves it its
-        // sources. The four full ones decode never, so the reliable path is
-        // what carried them. The sim's loss is periodic rather than sampled,
-        // so this count is the same on every run.
+        // 300000 bytes are five generations. Four decode from the interleaved
+        // symbols and the one over its repair budget arrives reliably. The
+        // sim's loss is periodic rather than sampled, so this count is the
+        // same on every run.
         let counts = fetcher.fec_counts();
-        assert_eq!(counts.decoded, 1, "only the short tail had the symbols");
+        assert_eq!(counts.decoded, 4, "one generation needed the fallback");
         assert_eq!(counts.offered, 5, "every generation was offered coded");
         assert_eq!(
             counts.abandoned, 0,

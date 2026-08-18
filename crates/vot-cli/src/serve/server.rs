@@ -636,6 +636,7 @@ impl BundleServer {
             },
         ))?);
         let mut live = std::collections::BTreeSet::new();
+        let mut coded = Vec::new();
         for generation in 0..u32::try_from(generations).map_err(|_| Error::InvalidBundle)? {
             let (gen_offset, gen_length) = plan.generation_span(generation);
             let start =
@@ -648,23 +649,9 @@ impl BundleServer {
                 .begin(plan.epoch(), generation)
                 .is_ok()
             {
-                for (esi, symbol) in vot_fec::encode_generation(&plan, generation, bytes)
-                    .map_err(|_| Error::InvalidBundle)?
-                {
-                    let mut datagram = Vec::new();
-                    frames::encode_symbol(
-                        frames::SymbolHeader {
-                            epoch: plan.epoch(),
-                            generation,
-                            esi,
-                        },
-                        plan.geometry(),
-                        &symbol,
-                        &mut datagram,
-                    )
+                let symbols = vot_fec::encode_generation(&plan, generation, bytes)
                     .map_err(|_| Error::InvalidBundle)?;
-                    connection.queue_datagram(Payload::from(datagram));
-                }
+                coded.push((generation, std::collections::VecDeque::from(symbols)));
                 live.insert(generation);
             } else {
                 // Past the peer's generation credit: this one rides reliably
@@ -679,6 +666,34 @@ impl BundleServer {
                 }))?);
             }
         }
+        // Spread each ESI across the piece before sending the next one. A
+        // dropped UDP segmentation burst then costs a few symbols from each
+        // generation instead of enough adjacent symbols to defeat its repair
+        // budget outright.
+        for esi in 0..plan.geometry().symbol_count() {
+            for (generation, symbols) in &mut coded {
+                if symbols
+                    .front()
+                    .is_some_and(|(next, _)| usize::from(*next) == esi)
+                {
+                    let (_, symbol) = symbols.pop_front().expect("front checked above");
+                    let mut datagram = Vec::new();
+                    frames::encode_symbol(
+                        frames::SymbolHeader {
+                            epoch: plan.epoch(),
+                            generation: *generation,
+                            esi: u8::try_from(esi).expect("inside the geometry"),
+                        },
+                        plan.geometry(),
+                        &symbol,
+                        &mut datagram,
+                    )
+                    .map_err(|_| Error::InvalidBundle)?;
+                    connection.queue_datagram(Payload::from(datagram));
+                }
+            }
+        }
+        debug_assert!(coded.iter().all(|(_, symbols)| symbols.is_empty()));
         if live.is_empty() {
             connection.fec.sender.close(plan.epoch());
             connection.queue_control(encoded(&TypedFrame::CodingEpochClose(

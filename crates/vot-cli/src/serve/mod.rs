@@ -564,6 +564,20 @@ mod tests {
                 + (server::FEC_REPAIR_SYMBOLS + 300_000_usize.div_ceil(1024) - 4 * 64),
             "every sent source and every repair symbol, the short tail's zero sources omitted"
         );
+        let first_ten: Vec<u32> = session.driver().datagrams[..10]
+            .iter()
+            .map(|datagram| {
+                frames::decode_symbol(datagram, open.geometry)
+                    .unwrap()
+                    .0
+                    .generation
+            })
+            .collect();
+        assert_eq!(
+            first_ten,
+            vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4],
+            "symbols are interleaved across generations before the next ESI"
+        );
         // Decoded through a receiver, the generations are the bundle's records
         // and verify against its proof.
         let generations = decoded_generations(

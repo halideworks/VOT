@@ -78,8 +78,8 @@ const DATAGRAM_QUEUE_LEN: usize = 1_024;
 ///
 /// Bounded in both units, because a datagram may be as large as
 /// `MAX_DATAGRAM_BYTES` and a count alone would let a peer hold that many
-/// times 64 KiB against no budget at all. Past either bound a datagram is
-/// dropped, which is what the connection did to every refused one before.
+/// times 64 KiB against no budget at all. At either bound the driver stops
+/// taking submissions until the connection makes room.
 ///
 /// Sized small on purpose. What waits here has left the sender's own queue
 /// but is not on the wire, and a serve reads its queue emptying as "the
@@ -1066,6 +1066,7 @@ fn run(
     let mut space = receive_space();
     let mut streams: BTreeMap<u64, StreamState> = BTreeMap::new();
     let mut datagrams: VecDeque<(Payload, u64)> = VecDeque::new();
+    let mut pending_datagram = None;
     let mut queued = Queued::default();
     let mut closing = false;
     let mut announced = false;
@@ -1083,6 +1084,7 @@ fn run(
             inbound,
             role,
             &mut queued,
+            &mut pending_datagram,
         );
         note_close_request(&mut conn, close, &mut closing);
         if orphaned {
@@ -1093,7 +1095,7 @@ fn run(
         }
         write_datagrams(&mut conn, &mut datagrams, inbound);
         let Ok(paced) = send_and_revalidate(socket, &mut conn, &mut out, &mut sending) else {
-            abandon_datagrams(&mut datagrams, inbound);
+            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
             return Ok(());
         };
 
@@ -1111,7 +1113,7 @@ fn run(
         }
 
         if conn.is_closed() {
-            abandon_datagrams(&mut datagrams, inbound);
+            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
             return Ok(());
         }
 
@@ -1141,6 +1143,7 @@ fn run(
                     }
                     Err(error) => {
                         if !read_ran_out(&error) {
+                            abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
                             return Ok(());
                         }
                         conn.on_timeout();
@@ -1174,7 +1177,10 @@ fn run(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
                 // The router is gone, so nothing further can ever arrive.
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    abandon_all_datagrams(&mut pending_datagram, &mut datagrams, inbound);
+                    return Ok(());
+                }
             },
         }
 
@@ -2193,27 +2199,36 @@ fn take_submissions(
     inbound: &Arc<Mutex<Inbound>>,
     role: Role,
     queued: &mut Queued,
+    pending_datagram: &mut Option<Command>,
 ) -> bool {
     while !queued.is_full() {
-        match commands.try_recv() {
-            Ok(command) => {
-                if let Some(bytes) = apply(
-                    conn,
-                    streams,
-                    datagrams,
-                    budget,
-                    control_limit,
-                    command,
-                    inbound,
-                    role,
-                ) {
-                    queued.charge(bytes);
-                }
+        let command = if let Some(command) = pending_datagram.take() {
+            command
+        } else {
+            match commands.try_recv() {
+                Ok(command) => command,
+                // The sender is gone: the endpoint was dropped, and nothing
+                // more will ever arrive here.
+                Err(mpsc::TryRecvError::Disconnected) => return true,
+                Err(mpsc::TryRecvError::Empty) => return false,
             }
-            // The sender is gone: the endpoint was dropped, and nothing
-            // more will ever arrive here.
-            Err(mpsc::TryRecvError::Disconnected) => return true,
-            Err(mpsc::TryRecvError::Empty) => return false,
+        };
+        match apply(
+            conn,
+            streams,
+            datagrams,
+            budget,
+            control_limit,
+            command,
+            inbound,
+            role,
+        ) {
+            Ok(Some(bytes)) => queued.charge(bytes),
+            Ok(None) => {}
+            Err(command) => {
+                *pending_datagram = Some(command);
+                return false;
+            }
         }
     }
     false
@@ -2249,7 +2264,7 @@ fn apply(
     command: Command,
     inbound: &Arc<Mutex<Inbound>>,
     role: Role,
-) -> Option<usize> {
+) -> Result<Option<usize>, Command> {
     match command {
         Command::Control(bytes) => {
             let state = stream_state(
@@ -2261,12 +2276,12 @@ fn apply(
             );
             let charge = bytes.len();
             state.outbox.push_back((bytes, 0));
-            Some(charge)
+            Ok(Some(charge))
         }
         Command::Reliable { stream, bytes } => {
             // Refused at submission, so this cannot be a lane with no stream.
             let Ok(id) = stream_for_lane(stream.0, role) else {
-                return None;
+                return Ok(None);
             };
             let state = stream_state(
                 streams,
@@ -2277,32 +2292,27 @@ fn apply(
             );
             let charge = bytes.len();
             state.outbox.push_back((bytes, 0));
-            Some(charge)
+            Ok(Some(charge))
         }
         // Offered to the connection, and held for a later pass when it has
-        // no room rather than thrown away. Not charged to the outbox budget:
-        // that budget stops the driver taking submissions at all, so
-        // charging datagrams to it starves the control stream behind them.
+        // no room rather than thrown away. The bounded datagram queues supply
+        // their own budget, so do not charge these bytes twice.
         Command::Datagram { context, bytes } => {
             // Offered first, so room the connection freed since the last pass
-            // is room this datagram can have. Dropping against a bound that
-            // a drain would have cleared is the loss this outbox exists to
-            // stop, at the bound instead of at the queue.
+            // is room this datagram can have. At the bound, keep this exact
+            // command and stop taking later submissions until room appears.
             write_datagrams(conn, datagrams, inbound);
             let held_bytes: usize = datagrams.iter().map(|(held, _)| held.len()).sum();
             if !outbox_has_room(datagrams.len(), held_bytes, bytes.len()) {
-                if let Ok(mut queue) = inbound.lock() {
-                    let _ = queue.push(NativeEvent::DatagramDropped { context });
-                }
-                return None;
+                return Err(Command::Datagram { context, bytes });
             }
             datagrams.push_back((bytes, context));
             write_datagrams(conn, datagrams, inbound);
-            None
+            Ok(None)
         }
         // Refused at submission, so it cannot reach the driver. A silent success
         // here would hide it if that ever changed.
-        Command::ReceiveCredit(_) => None,
+        Command::ReceiveCredit(_) => Ok(None),
     }
 }
 
@@ -2369,6 +2379,25 @@ fn abandon_datagrams(datagrams: &mut VecDeque<(Payload, u64)>, inbound: &Arc<Mut
         if let Ok(mut queue) = inbound.lock() {
             let _ = queue.push(NativeEvent::DatagramDropped { context });
         }
+    }
+}
+
+/// Ends every datagram held between the command channel and the connection.
+fn abandon_all_datagrams(
+    pending: &mut Option<Command>,
+    datagrams: &mut VecDeque<(Payload, u64)>,
+    inbound: &Arc<Mutex<Inbound>>,
+) {
+    // The pending command was submitted after everything in the outbox.
+    abandon_datagrams(datagrams, inbound);
+    match pending.take() {
+        Some(Command::Datagram { context, .. }) => {
+            if let Ok(mut queue) = inbound.lock() {
+                let _ = queue.push(NativeEvent::DatagramDropped { context });
+            }
+        }
+        Some(_) => unreachable!("only a datagram can wait here"),
+        None => {}
     }
 }
 
@@ -4103,6 +4132,7 @@ mod tests {
         client_config.set_initial_max_stream_data_bidi_local(window);
         client_config.set_initial_max_stream_data_bidi_remote(window);
         client_config.set_initial_max_streams_bidi(16);
+        client_config.enable_dgram(true, DATAGRAM_QUEUE_LEN, DATAGRAM_QUEUE_LEN);
         let mut server_config =
             quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a configuration");
         server_config
@@ -4118,6 +4148,7 @@ mod tests {
         server_config.set_initial_max_stream_data_bidi_local(window);
         server_config.set_initial_max_stream_data_bidi_remote(window);
         server_config.set_initial_max_streams_bidi(16);
+        server_config.enable_dgram(true, DATAGRAM_QUEUE_LEN, DATAGRAM_QUEUE_LEN);
         let mut client = quiche::connect(
             Some("localhost"),
             &scid_for(local),
@@ -4288,8 +4319,13 @@ mod tests {
         let mut datagrams: VecDeque<(Payload, u64)> = (1..=3)
             .map(|context| (vot_transport_api::shared_payload(&[7; 16]), context))
             .collect();
-        abandon_datagrams(&mut datagrams, &inbound);
+        let mut pending = Some(Command::Datagram {
+            context: 4,
+            bytes: vot_transport_api::shared_payload(&[7; 16]),
+        });
+        abandon_all_datagrams(&mut pending, &mut datagrams, &inbound);
         assert!(datagrams.is_empty(), "nothing is still held");
+        assert!(pending.is_none(), "the pending command is still held");
         let mut held = inbound.lock().expect("the queue");
         let contexts: Vec<u64> = std::iter::from_fn(|| held.events.pop_front())
             .map(|event| match event {
@@ -4297,7 +4333,7 @@ mod tests {
                 other => panic!("a held datagram ends as dropped, got {other:?}"),
             })
             .collect();
-        assert_eq!(contexts, vec![1, 2, 3], "in the order they were held");
+        assert_eq!(contexts, vec![1, 2, 3, 4], "in submission order");
     }
 
     #[test]
@@ -4410,7 +4446,9 @@ mod tests {
                 command,
                 &inbound,
                 Role::Client,
-            ) {
+            )
+            .expect("room for the submission")
+            {
                 queued.charge(bytes);
             }
         }
@@ -4419,6 +4457,75 @@ mod tests {
         // would stop the driver taking the control frames behind it.
         assert_eq!(queued.bytes, 16 + 64);
         assert_eq!(queued.records, 2);
+    }
+
+    #[test]
+    fn a_full_datagram_outbox_backpressures_without_loss() {
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let mut conn = sans_io_pair(2_048).0;
+        for _ in 0..DATAGRAM_QUEUE_LEN {
+            conn.dgram_send(&[0x27; 16]).expect("connection queue room");
+        }
+        let symbol = vot_transport_api::shared_payload(&[0x27; 512]);
+        let mut datagrams = std::iter::repeat_n((symbol, 1), DATAGRAM_OUTBOX_LEN).collect();
+        let (sent, commands) = mpsc::sync_channel(2);
+        sent.send(Command::Datagram {
+            context: 9,
+            bytes: vot_transport_api::shared_payload(&[0x27; 16]),
+        })
+        .unwrap();
+        sent.send(Command::Control(vot_transport_api::shared_payload(
+            &[0x27; 16],
+        )))
+        .unwrap();
+        let mut queued = Queued::default();
+        let mut pending = None;
+
+        assert!(!take_submissions(
+            &mut conn,
+            &mut streams,
+            &mut datagrams,
+            &budget,
+            &control_limit,
+            &commands,
+            &inbound,
+            Role::Client,
+            &mut queued,
+            &mut pending,
+        ));
+        assert!(
+            matches!(&pending, Some(Command::Datagram { context: 9, .. })),
+            "the refused submission was not held"
+        );
+        assert!(
+            inbound.lock().expect("the queue").events.is_empty(),
+            "backpressure was reported as a dropped datagram"
+        );
+        let later = commands
+            .try_recv()
+            .expect("the later command stayed queued");
+        assert!(matches!(&later, Command::Control(_)));
+        sent.send(later).unwrap();
+
+        datagrams.pop_front();
+        assert!(!take_submissions(
+            &mut conn,
+            &mut streams,
+            &mut datagrams,
+            &budget,
+            &control_limit,
+            &commands,
+            &inbound,
+            Role::Client,
+            &mut queued,
+            &mut pending,
+        ));
+        assert!(pending.is_none(), "the held submission was not retried");
+        assert_eq!(datagrams.len(), DATAGRAM_OUTBOX_LEN);
+        assert_eq!(queued.records, 1, "the later command was not applied");
     }
 
     #[test]

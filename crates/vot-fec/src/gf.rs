@@ -57,30 +57,27 @@ pub(crate) const fn inv(a: u8) -> u8 {
     EXP[255 - LOG[a as usize] as usize]
 }
 
-/// Every product of `coefficient`, so the kernel below spends one lookup a
-/// byte instead of two that depend on each other.
-///
-/// Building it is a flat cost and reading it saves per byte, so it pays from
-/// about half a kilobyte up. The protocol's own symbols are a kilobyte, where
-/// it is worth about a quarter of the kernel's time, but a peer names the
-/// symbol length in `CODING_EPOCH_OPEN` and a short one pays the table
-/// without earning it back. One kernel rather than two, because which of two
-/// ran is invisible in the bytes they produce and so is a branch no test can
-/// hold.
-///
-/// Never called with a zero coefficient: `LOG[0]` is not a logarithm, it is
-/// the zero the table was never written at, and the table this would build
-/// from it is the identity rather than all zeros. The caller returns early
-/// instead, and this says so out loud because the two are far apart.
-fn products_of(coefficient: u8) -> [u8; 256] {
-    debug_assert!(coefficient != 0, "zero has no logarithm to take");
-    let log_c = LOG[coefficient as usize] as usize;
-    let mut products = [0_u8; 256];
-    // Zero times anything is zero, and `LOG[0]` is not a logarithm.
-    for (value, product) in products.iter_mut().enumerate().skip(1) {
-        *product = EXP[log_c + LOG[value] as usize];
+/// Every byte product, built once rather than once per encode-kernel call.
+#[allow(clippy::large_stack_arrays)] // Const-evaluated directly into static storage.
+const fn product_tables() -> [[u8; 256]; 256] {
+    let mut products = [[0_u8; 256]; 256];
+    let mut coefficient = 1;
+    while coefficient < 256 {
+        let log_c = LOG[coefficient] as usize;
+        let mut value = 1;
+        while value < 256 {
+            products[coefficient][value] = EXP[log_c + LOG[value] as usize];
+            value += 1;
+        }
+        coefficient += 1;
     }
     products
+}
+
+static PRODUCTS: [[u8; 256]; 256] = product_tables();
+
+fn products_of(coefficient: u8) -> &'static [u8; 256] {
+    &PRODUCTS[coefficient as usize]
 }
 
 /// `out[i] ^= coefficient * symbol[i]` for every byte, the encode kernel.

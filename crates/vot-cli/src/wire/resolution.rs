@@ -209,10 +209,10 @@ pub(crate) fn read_until<D, T>(
             Ok(arrival) => arrival,
             Err(error) => return read_failure(&error).map_or(Ok(None), Err),
         };
-        if let Some(datagram) = decode(&buffer[..length]) {
-            if let Some(found) = accept(datagram, source) {
-                return Ok(Some(found));
-            }
+        if let Some(datagram) = decode(&buffer[..length])
+            && let Some(found) = accept(datagram, source)
+        {
+            return Ok(Some(found));
         }
     }
     Ok(None)

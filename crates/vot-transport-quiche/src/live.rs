@@ -714,11 +714,11 @@ impl Transport {
         // The sample first: the disconnect that clears it is drained below, and a
         // caller reading a Careful Resume observation needs the sample to still be
         // there when it sees the disconnect beside it.
-        if let Ok(sample) = self.path.lock() {
-            if let Some(stats) = *sample {
-                drop(sample);
-                self.adapter.record_path_stats(self.connection, stats);
-            }
+        if let Ok(sample) = self.path.lock()
+            && let Some(stats) = *sample
+        {
+            drop(sample);
+            self.adapter.record_path_stats(self.connection, stats);
         }
         if let Some(event) = self.held.take() {
             match self.adapter.try_record_native_event(event) {
@@ -1219,10 +1219,10 @@ fn run(
             &mut buffer,
         );
         drain_datagrams(&mut conn, inbound, &mut buffer);
-        if let Some(sample) = path_sample(&conn) {
-            if let Ok(mut slot) = path.lock() {
-                *slot = Some(sample);
-            }
+        if let Some(sample) = path_sample(&conn)
+            && let Ok(mut slot) = path.lock()
+        {
+            *slot = Some(sample);
         }
     };
     finish_datagrams(

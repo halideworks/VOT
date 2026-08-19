@@ -49,6 +49,7 @@ mod tests {
         /// Control frames the backend will take before reporting a full queue.
         control_capacity: Option<usize>,
         refuse_control: Option<TransportError>,
+        shared_controls: Vec<Payload>,
         closed: Vec<u16>,
         receive_limits: Option<vot_transport_api::ReceiveLimits>,
         channel_binding: Option<vot_transport_api::ChannelBinding>,
@@ -72,11 +73,25 @@ mod tests {
             }
             if self
                 .control_capacity
-                .is_some_and(|room| self.sent.len() >= room)
+                .is_some_and(|room| self.sent.len() + self.shared_controls.len() >= room)
             {
                 return Err(TransportError::OutboundQueueFull);
             }
             self.sent.push(frame.to_vec());
+            Ok(())
+        }
+
+        fn send_control_shared(&mut self, frame: Payload) -> Result<(), TransportError> {
+            if let Some(error) = self.refuse_control {
+                return Err(error);
+            }
+            if self
+                .control_capacity
+                .is_some_and(|room| self.sent.len() + self.shared_controls.len() >= room)
+            {
+                return Err(TransportError::OutboundQueueFull);
+            }
+            self.shared_controls.push(frame);
             Ok(())
         }
 
@@ -2191,6 +2206,12 @@ mod tests {
     fn every_submission_path_reaches_the_backend() {
         let (mut client, _server) = negotiated();
         let flushes = client.adapter().flushes;
+        let control = vot_transport_api::shared_payload(&frame_of(frame_type::PING, 0));
+        client.send_control_shared(control.clone()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &control,
+            &client.adapter().shared_controls[0]
+        ));
         client
             .send_reliable_shared(
                 StreamId(3),

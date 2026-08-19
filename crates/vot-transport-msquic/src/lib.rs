@@ -3161,7 +3161,7 @@ pub mod live {
             ]);
             assert!(
                 accepted
-                    .preflight_reliable_batch(StreamId(1), &[oversized.clone()])
+                    .preflight_reliable_batch(StreamId(1), std::slice::from_ref(&oversized))
                     .is_err()
             );
             assert!(

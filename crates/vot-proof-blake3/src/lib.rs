@@ -412,6 +412,24 @@ pub struct SealedGroupCvs {
 }
 
 impl SealedGroupCvs {
+    /// The object root this tree proves to, for an object of more than one group.
+    ///
+    /// # Errors
+    ///
+    /// Reports unavailable or corrupt retained storage.
+    pub fn tree_root(&self) -> Result<Option<[u8; 32]>, Error> {
+        let count = group_count(self.length);
+        if count < 2 {
+            return Ok(None);
+        }
+        let (left, right) = Node { start: 0, count }.split();
+        let left = self.node_cv(left)?;
+        let right = self.node_cv(right)?;
+        Ok(Some(
+            *merge_subtrees_root(&left, &right, Mode::Hash).as_bytes(),
+        ))
+    }
+
     /// The object length these nodes cover.
     #[must_use]
     pub const fn object_len(&self) -> u64 {
@@ -1177,6 +1195,7 @@ mod tests {
             let stored = stored_cvs_of(&data);
             assert_eq!(stored.object_len(), memory.object_len());
             assert_eq!(stored.groups(), memory.groups());
+            assert_eq!(stored.tree_root().unwrap(), memory.tree_root());
 
             for (index, group) in data.chunks(GROUP_SIZE as usize).enumerate() {
                 assert_eq!(stored.holds(index, group), memory.holds(index, group));

@@ -340,6 +340,19 @@ pub struct SealedPieceHashes {
 }
 
 impl SealedPieceHashes {
+    /// The object root this tree proves to, for an object of more than one piece.
+    ///
+    /// # Errors
+    ///
+    /// Reports unavailable or corrupt retained storage.
+    pub fn tree_root(&self) -> Result<Option<[u8; 32]>, Error> {
+        if self.pieces < 2 || self.level_count == 0 {
+            return Ok(None);
+        }
+        let top = self.layers[self.level_count - 1];
+        read_stored_node(self.storage.as_ref(), top, 0).map(Some)
+    }
+
     /// The object length represented by this store.
     #[must_use]
     pub const fn object_len(&self) -> u64 {
@@ -1042,6 +1055,10 @@ mod tests {
             let stored = stored_pieces_of(&data);
             assert_eq!(stored.object_len(), memory.object_len());
             assert_eq!(stored.pieces(), piece_count as u64);
+            assert_eq!(
+                stored.tree_root().unwrap(),
+                (piece_count > 1).then(|| root(&data))
+            );
             for first in 0..piece_count {
                 for end in first + 1..=piece_count {
                     let offset = first as u64 * PIECE_SIZE;

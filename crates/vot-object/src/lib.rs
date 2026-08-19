@@ -82,6 +82,7 @@ trait RetainedProofBuilder: Send + Sync + UnwindSafe + RefUnwindSafe {
 trait RetainedProof: Send + Sync + UnwindSafe + RefUnwindSafe {
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error>;
     fn holds(&self, first: usize, bytes: &[u8]) -> bool;
+    fn tree_root(&self) -> Result<Option<[u8; 32]>, Error>;
 
     /// The leaf hashes this store proves from, for a caller that means to
     /// keep them. `None` for a store that does not hold them in memory.
@@ -137,6 +138,13 @@ impl RetainedProofBuilder for MemoryProofStore {
 }
 
 impl RetainedProof for MemoryProofStore {
+    fn tree_root(&self) -> Result<Option<[u8; 32]>, Error> {
+        Ok(match self {
+            Self::Blake3(cvs) => cvs.tree_root(),
+            Self::Sha256(pieces) => pieces.tree_root(),
+        })
+    }
+
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
         match self {
             Self::Blake3(cvs) => vot_proof_blake3::prove_with(cvs, offset, length)
@@ -233,6 +241,10 @@ impl RetainedProofBuilder for StoredProofBuilder {
 }
 
 impl RetainedProof for vot_proof_blake3::SealedGroupCvs {
+    fn tree_root(&self) -> Result<Option<[u8; 32]>, Error> {
+        vot_proof_blake3::SealedGroupCvs::tree_root(self).map_err(map_blake3_error)
+    }
+
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
         vot_proof_blake3::SealedGroupCvs::prove(self, offset, length)
             .map(|cover| RangeCover {
@@ -259,6 +271,10 @@ impl RetainedProof for vot_proof_blake3::SealedGroupCvs {
 }
 
 impl RetainedProof for vot_proof_sha256::SealedPieceHashes {
+    fn tree_root(&self) -> Result<Option<[u8; 32]>, Error> {
+        vot_proof_sha256::SealedPieceHashes::tree_root(self).map_err(map_sha256_error)
+    }
+
     fn prove(&self, offset: u64, length: u64) -> Result<RangeCover, Error> {
         vot_proof_sha256::SealedPieceHashes::prove(self, offset, length)
             .map(|cover| RangeCover {
@@ -315,7 +331,8 @@ pub struct ObjectBuilder {
     suite: Suite,
     expected_length: Option<u64>,
     length: u64,
-    verifier: StreamVerifier,
+    verifier: Option<StreamVerifier>,
+    groups: usize,
     proof: Box<dyn RetainedProofBuilder>,
     pending: Vec<u8>,
     failure: Option<Error>,
@@ -369,7 +386,8 @@ impl ObjectBuilder {
             suite,
             expected_length,
             length: 0,
-            verifier: StreamVerifier::new(suite),
+            verifier: Some(StreamVerifier::new(suite)),
+            groups: 0,
             proof,
             pending: Vec::with_capacity(GROUP_SIZE),
             failure: None,
@@ -455,13 +473,19 @@ impl ObjectBuilder {
     }
 
     fn feed_group(&mut self, group: &[u8]) -> Result<(), Error> {
-        self.verifier.update(group)?;
+        if self.groups == 0 {
+            self.verifier.as_mut().ok_or(Error::Proof)?.update(group)?;
+        } else {
+            self.verifier = None;
+        }
         #[cfg(test)]
         if self.fail_after_verifier {
             self.fail_after_verifier = false;
             return Err(Error::Proof);
         }
-        self.proof.push(group)
+        self.proof.push(group)?;
+        self.groups = self.groups.checked_add(1).ok_or(Error::LengthOverflow)?;
+        Ok(())
     }
 
     /// Finishes the object and binds its proof material to the resulting identity.
@@ -482,8 +506,11 @@ impl ObjectBuilder {
         if !self.pending.is_empty() {
             self.feed_pending()?;
         }
-        let root = self.verifier.digest()?;
         let proof = self.proof.finish()?;
+        let root = match proof.tree_root()? {
+            Some(root) => root,
+            None => self.verifier.ok_or(Error::Proof)?.digest()?,
+        };
         Ok(PreparedObject {
             object: ObjectId {
                 suite: self.suite.identifier(),
@@ -1110,6 +1137,18 @@ mod tests {
             exact.update(&bytes).unwrap();
             assert_eq!(exact.buffered_bytes(), 0);
             assert_eq!(exact.finish().unwrap().retained_units(), 1);
+        }
+    }
+
+    #[test]
+    fn multi_group_objects_drop_the_redundant_stream_verifier() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let mut builder = ObjectBuilder::new(suite, Some((2 * GROUP_SIZE) as u64)).unwrap();
+            builder.update(&vec![3; GROUP_SIZE]).unwrap();
+            assert!(builder.verifier.is_some());
+            builder.update(&vec![5; GROUP_SIZE]).unwrap();
+            assert!(builder.verifier.is_none());
+            builder.finish().unwrap();
         }
     }
 

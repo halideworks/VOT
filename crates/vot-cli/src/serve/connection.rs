@@ -34,6 +34,8 @@ pub struct ServeConnection {
     pub(crate) fec: FecSender,
     /// Whether the session negotiated `DATAGRAM_FEC`, refreshed each pass.
     pub(crate) fec_negotiated: bool,
+    /// Whether this path currently justifies coding new range answers.
+    pub(crate) fec_coding: bool,
 }
 
 impl Default for ServeConnection {
@@ -50,6 +52,7 @@ impl Default for ServeConnection {
             deferred: VecDeque::new(),
             fec: FecSender::default(),
             fec_negotiated: false,
+            fec_coding: true,
         }
     }
 }

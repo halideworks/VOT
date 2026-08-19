@@ -3,8 +3,9 @@
 use super::{
     BundleServer, CONGESTION, Config, Credentials, DATAGRAM_FEC, Ephemeral, Error, Listener,
     PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME,
-    ServeSession, SocketAddr, apply_datagram_bytes, carrier_failure, congestion_from,
-    extensions_from, limits, rendezvous_from, requirement_from, start_registration,
+    ServeSession, SocketAddr, apply_datagram_bytes, automatic_fec, carrier_failure,
+    congestion_from, extensions_from, limits, rendezvous_from, requirement_from,
+    start_registration,
 };
 
 /// The serve's stance for one session: what it asks of the peer, with a fresh
@@ -48,13 +49,15 @@ pub fn serve_bundle(
     sessions: Option<u32>,
     listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
-    let extensions = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
+    let pin = std::env::var(DATAGRAM_FEC).ok();
+    let extensions = extensions_from(pin.as_deref())?;
     serve_bundle_offering(
         bundle,
         address,
         credentials,
         sessions,
         &extensions,
+        automatic_fec(pin.as_deref()),
         listening,
     )
 }
@@ -66,9 +69,11 @@ pub(crate) fn serve_bundle_offering(
     credentials: &Credentials,
     sessions: Option<u32>,
     extensions: &std::collections::BTreeSet<u64>,
+    automatic_fec: bool,
     mut listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
-    let server = BundleServer::open(bundle)?;
+    let mut server = BundleServer::open(bundle)?;
+    server.automatic_fec = automatic_fec;
     // Read before the port is bound, so a misconfigured requirement is an
     // argument error rather than a serve that listens and refuses everyone.
     let requirement = requirement_from(

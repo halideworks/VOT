@@ -511,13 +511,67 @@ mod tests {
         );
         assert_eq!(repair(0, 0, 1023), 8);
         assert_eq!(repair(0, 0, 1024), 1);
-        assert_eq!(repair(9, 0, 2000), 1);
-        assert_eq!(repair(10, 0, 2000), 4);
-        assert_eq!(repair(29, 0, 2000), 4);
-        assert_eq!(repair(30, 0, 2000), 6);
-        assert_eq!(repair(49, 0, 2000), 6);
-        assert_eq!(repair(50, 0, 2000), 8);
-        assert_eq!(repair(50, 49, 2000), 1, "spurious losses do not buy repair");
+        assert_eq!(repair(9, 0, 2000), 2);
+        assert_eq!(repair(10, 0, 2000), 2);
+        assert_eq!(repair(29, 0, 2000), 2);
+        assert_eq!(repair(30, 0, 2000), 2);
+        assert_eq!(repair(49, 0, 2000), 3);
+        assert_eq!(repair(50, 0, 2000), 3);
+        assert_eq!(repair(100, 0, 2000), 5);
+        assert_eq!(repair(50, 49, 2000), 2, "spurious losses do not buy repair");
+    }
+
+    #[test]
+    fn automatic_fec_waits_for_a_real_five_percent_loss_sample() {
+        let worthwhile = |lost, spurious, sent| {
+            server::fec_worthwhile(Some(vot_transport_api::PathStats {
+                lost_packets: Some(lost),
+                spurious_lost_packets: Some(spurious),
+                packets_sent: Some(sent),
+                ..vot_transport_api::PathStats::default()
+            }))
+        };
+        assert!(!server::fec_worthwhile(None));
+        assert!(!worthwhile(100, 0, 1023));
+        assert!(!worthwhile(99, 0, 2000));
+        assert!(worthwhile(100, 0, 2000));
+        assert!(!worthwhile(100, 1, 2000));
+    }
+
+    #[test]
+    fn automatic_fec_keeps_clean_ranges_reliable_then_codes_lossy_ranges() {
+        let (bundle, _) = built_bundle("automatic-fec", &[("two-groups.bin", patterned(131_072))]);
+        let mut server = BundleServer::open(&bundle).unwrap();
+        server.automatic_fec = true;
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+
+        for (request_id, offset, lost, coded) in [(1, 0, 0, false), (2, 65_536, 100, true)] {
+            session.driver().path_stats = Some(vot_transport_api::PathStats {
+                lost_packets: Some(lost),
+                spurious_lost_packets: Some(0),
+                packets_sent: Some(2000),
+                ..vot_transport_api::PathStats::default()
+            });
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                    request_id: [request_id; 16],
+                    object,
+                    offset,
+                    length: 65_536,
+                })));
+            server.service(&mut session, &mut connection).unwrap();
+            assert_eq!(!session.driver().datagrams.is_empty(), coded);
+            assert_eq!(session.driver().records.is_empty(), coded);
+            session.driver().control.clear();
+            session.driver().records.clear();
+            session.driver().datagrams.clear();
+        }
     }
 
     #[test]
@@ -530,9 +584,7 @@ mod tests {
         server.service(&mut session, &mut connection).unwrap();
         session.driver().control.clear();
 
-        for (request_id, offset, lost, expected_repair) in
-            [(1, 0, 0, 1), (2, 65_536, 60, server::FEC_REPAIR_SYMBOLS)]
-        {
+        for (request_id, offset, lost, expected_repair) in [(1, 0, 0, 1), (2, 65_536, 60, 3)] {
             session.driver().path_stats = Some(vot_transport_api::PathStats {
                 lost_packets: Some(lost),
                 spurious_lost_packets: Some(0),

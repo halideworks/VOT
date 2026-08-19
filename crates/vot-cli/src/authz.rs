@@ -259,6 +259,7 @@ pub struct Stance<'a> {
     pub(crate) requirement: Option<&'a Requirement>,
     /// The extensions this serve offers a session.
     pub(crate) extensions: std::collections::BTreeSet<u64>,
+    pub(crate) use_default_extensions: bool,
 }
 
 pub(crate) fn default_extensions() -> std::collections::BTreeSet<u64> {
@@ -268,11 +269,12 @@ pub(crate) fn default_extensions() -> std::collections::BTreeSet<u64> {
 impl Stance<'_> {
     /// A serve that requires nothing and offers the default extensions.
     #[must_use]
-    pub fn open(nonce: [u8; 32]) -> Self {
+    pub const fn open(nonce: [u8; 32]) -> Self {
         Self {
             authentication: vot_session::Authentication::NotRequired { nonce },
             requirement: None,
-            extensions: default_extensions(),
+            extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 
@@ -281,6 +283,7 @@ impl Stance<'_> {
     #[must_use]
     pub fn offering(mut self, extensions: std::collections::BTreeSet<u64>) -> Self {
         self.extensions = extensions;
+        self.use_default_extensions = false;
         self
     }
 }
@@ -294,7 +297,8 @@ impl<'a> Stance<'a> {
                 challenge: requirement.challenge(nonce),
             },
             requirement: Some(requirement),
-            extensions: default_extensions(),
+            extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 }
@@ -307,7 +311,8 @@ impl From<vot_session::Authentication> for Stance<'_> {
         Self {
             authentication,
             requirement: None,
-            extensions: default_extensions(),
+            extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 }
@@ -412,22 +417,15 @@ mod tests {
 
     #[test]
     fn every_public_stance_defaults_to_fec_and_can_explicitly_disable_it() {
-        let expected = default_extensions();
-        assert_eq!(Stance::open([1; 32]).extensions, expected);
-        assert_eq!(
-            Stance::required(&requirement(&keypair(1)), [2; 32]).extensions,
-            expected
-        );
-        assert_eq!(
-            Stance::from(vot_session::Authentication::NotRequired { nonce: [3; 32] }).extensions,
-            expected
-        );
+        assert!(Stance::open([1; 32]).use_default_extensions);
+        assert!(Stance::required(&requirement(&keypair(1)), [2; 32]).use_default_extensions);
         assert!(
-            Stance::open([4; 32])
-                .offering(std::collections::BTreeSet::new())
-                .extensions
-                .is_empty()
+            Stance::from(vot_session::Authentication::NotRequired { nonce: [3; 32] })
+                .use_default_extensions
         );
+        let off = Stance::open([4; 32]).offering(std::collections::BTreeSet::new());
+        assert!(!off.use_default_extensions);
+        assert!(off.extensions.is_empty());
     }
 
     #[test]

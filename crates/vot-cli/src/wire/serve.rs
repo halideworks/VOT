@@ -73,7 +73,7 @@ pub(crate) fn serve_bundle_offering(
     mut listening: impl FnMut(SocketAddr, [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let mut server = BundleServer::open(bundle)?;
-    server.automatic_fec = automatic_fec;
+    server.set_automatic_fec(automatic_fec);
     // Read before the port is bound, so a misconfigured requirement is an
     // argument error rather than a serve that listens and refuses everyone.
     let requirement = requirement_from(

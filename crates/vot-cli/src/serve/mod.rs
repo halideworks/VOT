@@ -233,7 +233,7 @@ mod tests {
 
     fn forced_fec_server(bundle: &std::path::Path) -> BundleServer {
         let mut server = BundleServer::open(bundle).unwrap();
-        server.automatic_fec = false;
+        server.set_automatic_fec(false);
         server
     }
 

@@ -659,7 +659,7 @@ mod tests {
         let serving_offer = fec.clone();
         let serving_thread = std::thread::spawn(move || {
             let mut server = BundleServer::open(&serving_bundle)?;
-            server.automatic_fec = false;
+            server.set_automatic_fec(false);
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
                 let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
@@ -717,7 +717,7 @@ mod tests {
             );
             // This test pins the coded path rather than the automatic policy,
             // whose changing path samples are covered in the serve tests.
-            server.automatic_fec = false;
+            server.set_automatic_fec(false);
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
                 let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;

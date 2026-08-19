@@ -374,10 +374,15 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     ) -> Result<Self, Error> {
         let stance = stance.into();
         let requirement = stance.requirement;
+        let extensions = if stance.use_default_extensions {
+            crate::authz::default_extensions()
+        } else {
+            stance.extensions
+        };
         let mut session = vot_session::Session::server(
             carrier,
             vot_codec::Settings::default(),
-            stance.extensions,
+            extensions,
             stance.authentication,
         );
         session.begin()?;

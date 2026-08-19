@@ -102,6 +102,12 @@ impl BundleServer {
         self.package
     }
 
+    /// Chooses whether negotiated FEC follows measured path loss. Passing
+    /// `false` forces coding whenever the peer negotiates the extension.
+    pub const fn set_automatic_fec(&mut self, automatic: bool) {
+        self.automatic_fec = automatic;
+    }
+
     /// One non-blocking pass: drains queued answers, reads events up to the
     /// outbound budget, and answers every request.
     pub fn service<A: TransportAdapter>(

@@ -9,8 +9,8 @@ publish = false
 [features]
 default = []
 # The quiche backend, which carries the case over a real socket. Off by default
-# because it builds BoringSSL through cmake, which costs minutes where the rest
-# of this workspace costs seconds.
+# because it builds BoringSSL through bindgen and cmake, which costs minutes
+# where the rest of this workspace costs seconds.
 quiche = ["dep:vot-transport-quiche"]
 # The MsQuic backend, which carries the case over a real socket. Off by default
 # because it builds MsQuic's bundled C library, which costs minutes.

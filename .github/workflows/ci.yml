@@ -282,9 +282,9 @@ jobs:
         run: rustup toolchain install nightly-2026-07-15 --profile minimal
 
       # The wire and live features are part of the snapshotted surface, and
-      # quiche builds BoringSSL through cmake.
+      # quiche builds BoringSSL through cmake and bindgen needs clang.
       - name: Install native build tools
-        run: sh tools/ci_apt_install.sh cmake openssl
+        run: sh tools/ci_apt_install.sh clang cmake openssl
 
       - name: Compare public API snapshots
         run: python3 tools/check_public_api.py
@@ -326,9 +326,10 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
 
-      # quiche builds BoringSSL, and the tests generate their own certificate.
+      # quiche builds BoringSSL through bindgen and cmake, and the tests
+      # generate their own certificate.
       - name: Install native build tools
-        run: sh tools/ci_apt_install.sh cmake openssl
+        run: sh tools/ci_apt_install.sh clang cmake openssl
 
       - name: Fingerprint native toolchain
         id: quiche-toolchain
@@ -623,11 +624,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
-      # openssl beside cmake: the suite's credentials() shells out to the
-      # openssl binary for its test certificate, and the baseline run pays for
-      # the whole job if the runner image stops carrying it.
+      # openssl beside clang and cmake: the suite's credentials() shells out
+      # to the openssl binary for its test certificate, and the baseline run
+      # pays for the whole job if the runner image stops carrying it.
       - name: Install native build tools
-        run: sh tools/ci_apt_install.sh cmake openssl
+        run: sh tools/ci_apt_install.sh clang cmake openssl
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0
@@ -737,9 +738,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal
 
-      # quiche builds BoringSSL through cmake.
+      # quiche builds BoringSSL through cmake and bindgen needs clang.
       - name: Install native build tools
-        run: sh tools/ci_apt_install.sh cmake
+        run: sh tools/ci_apt_install.sh clang cmake
 
       - name: Restore pinned tool binaries
         uses: actions/cache@v6.1.0

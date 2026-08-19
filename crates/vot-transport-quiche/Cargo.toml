@@ -9,12 +9,12 @@ publish = false
 [features]
 default = []
 # The pump: a UDP socket, a quiche connection, and the timer that drives loss
-# recovery. Off by default because quiche builds BoringSSL through cmake, which
-# costs minutes where the rest of this workspace costs seconds.
+# recovery. Off by default because quiche builds BoringSSL through bindgen and
+# cmake, which costs minutes where the rest of this workspace costs seconds.
 live = ["dep:quiche", "dep:nix", "dep:vot-platform-net"]
 
 [dependencies]
-quiche = { version = "=0.24.9", optional = true }
+quiche = { version = "=0.29.3", optional = true }
 vot-codec = { path = "../vot-codec" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-transport-framing = { path = "../vot-transport-framing" }

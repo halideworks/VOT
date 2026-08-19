@@ -10,7 +10,7 @@ publish = false
 default = []
 # The socket-owning carrier. Off, the crate builds in seconds and the wire
 # commands report the feature they need; on, the binary carries a QUIC
-# endpoint, and quiche builds BoringSSL through cmake to provide it.
+# endpoint, and quiche builds BoringSSL through bindgen and cmake to provide it.
 wire = ["dep:vot-transport-quiche", "vot-transport-quiche/live", "dep:rcgen"]
 
 [dependencies]

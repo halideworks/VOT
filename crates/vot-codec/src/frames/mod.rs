@@ -2,7 +2,9 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::missing_errors_doc)]
 
-use super::{DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, frame_type};
+use super::{
+    DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, encode_varint, frame_type,
+};
 
 const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 const GROUP_BYTES: u64 = 65_536;
@@ -114,6 +116,15 @@ impl TypedFrame {
 
 /// Encodes one typed frame and its bounded envelope.
 pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
+    if let TypedFrame::DataRecord(value) = frame {
+        validate_data_record(value)?;
+        let payload_len = data_record_payload_len(value);
+        output.reserve(payload_len + 9);
+        encode_varint(frame_type::DATA_RECORD, output)?;
+        encode_varint(payload_len as u64, output)?;
+        encode_validated_data_record(value, output);
+        return Ok(());
+    }
     let mut payload = Vec::new();
     match frame {
         TypedFrame::AuthContext(value) => encode_auth_context(value, &mut payload)?,
@@ -133,7 +144,7 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
         TypedFrame::Have(value) => encode_have(value, &mut payload)?,
         TypedFrame::RangeRequest(value) => encode_range_request(value, &mut payload)?,
         TypedFrame::ProofBundle(value) => encode_proof_bundle(value, &mut payload)?,
-        TypedFrame::DataRecord(value) => encode_data_record(value, &mut payload)?,
+        TypedFrame::DataRecord(_) => unreachable!("data records return above"),
         TypedFrame::Capacity(value) => encode_capacity(value, &mut payload),
         TypedFrame::TransitVerified(value)
         | TypedFrame::ChunkDurable(value)
@@ -1442,6 +1453,33 @@ mod tests {
         let (decoded_data, _) = decode(&encoded[used..], DecodeLimits::default()).unwrap();
         assert_eq!(decoded_bundle, bundle);
         assert_eq!(decoded_data, data);
+    }
+
+    #[test]
+    fn direct_data_record_envelope_matches_generic_framing_and_fails_atomically() {
+        let mut data = DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: GROUP_BYTES,
+            plaintext_length: 3,
+            compression: 0,
+            encoded: vec![1, 2, 3],
+        };
+        let mut payload = Vec::new();
+        encode_validated_data_record(&data, &mut payload);
+        let mut expected = vec![0xaa];
+        encode_frame(frame_type::DATA_RECORD, &payload, &mut expected).unwrap();
+        let mut actual = vec![0xaa];
+        encode(&TypedFrame::DataRecord(data.clone()), &mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        data.record_index = 17;
+        let before = actual.clone();
+        assert_eq!(
+            encode(&TypedFrame::DataRecord(data), &mut actual),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(actual, before);
     }
 
     #[test]

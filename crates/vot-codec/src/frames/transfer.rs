@@ -281,8 +281,7 @@ pub(super) fn proof_bundle_payload_len_with(value: &ProofBundle, proof_len: usiz
         .saturating_add(cbor_byte_string_len(proof_len))
 }
 
-pub(super) fn encode_data_record(value: &DataRecord, output: &mut Vec<u8>) -> Result<(), Error> {
-    validate_data_record(value)?;
+pub(super) fn encode_validated_data_record(value: &DataRecord, output: &mut Vec<u8>) {
     vot_cbor::map(output, 8);
     vot_cbor::uint(output, 0);
     vot_cbor::uint(output, 0);
@@ -300,7 +299,6 @@ pub(super) fn encode_data_record(value: &DataRecord, output: &mut Vec<u8>) -> Re
     vot_cbor::uint(output, value.encoded.len() as u64);
     vot_cbor::uint(output, 7);
     vot_cbor::bytes(output, &value.encoded);
-    Ok(())
 }
 
 pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {

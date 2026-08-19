@@ -20,6 +20,8 @@ pub struct BundleServer {
     /// The descriptor and seal frames, encoded once, announced at readiness.
     pub(crate) announcement: [Payload; 2],
     pub(crate) objects: BTreeMap<[u8; 32], ServedObject>,
+    /// Whether new range answers wait for measured loss before using FEC.
+    pub(crate) automatic_fec: bool,
 }
 
 struct CodedGeneration<'a> {
@@ -91,6 +93,7 @@ impl BundleServer {
             manifest_directory,
             announcement,
             objects,
+            automatic_fec: false,
         })
     }
 
@@ -111,7 +114,9 @@ impl BundleServer {
             return Ok(ServeStatus::Closed(code));
         }
         connection.drain(session)?;
-        let repair_symbols = fec_repair_symbols(session.adapter().path_stats());
+        let path = session.adapter().path_stats();
+        let repair_symbols = fec_repair_symbols(path);
+        connection.fec_coding = !self.automatic_fec || fec_worthwhile(path);
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -493,7 +498,8 @@ impl BundleServer {
         // Bundle identity derives from the request bytes, for replay detection.
         let mut bundle_id = [0u8; 16];
         bundle_id.copy_from_slice(&blake3::hash(request_bytes).as_bytes()[..16]);
-        if !connection.fec_negotiated || !connection.fec.sender.may_open() {
+        if !connection.fec_negotiated || !connection.fec_coding || !connection.fec.sender.may_open()
+        {
             return Self::answer_reliably(
                 served,
                 request.request_id,
@@ -838,11 +844,24 @@ pub(super) fn fec_repair_symbols(stats: Option<PathStats>) -> usize {
     if sent < 1024 {
         return FEC_REPAIR_SYMBOLS;
     }
-    let per_thousand = u128::from(lost.saturating_sub(spurious)) * 1000 / u128::from(sent);
-    match per_thousand {
-        0..=4 => 1,
-        5..=14 => 4,
-        15..=24 => 6,
-        _ => FEC_REPAIR_SYMBOLS,
-    }
+    let lost = u128::from(lost.saturating_sub(spurious));
+    let received = u128::from(sent).saturating_sub(lost).max(1);
+    usize::try_from((lost * 64).div_ceil(received) + 1)
+        .unwrap_or(FEC_REPAIR_SYMBOLS)
+        .clamp(1, FEC_REPAIR_SYMBOLS)
+}
+
+/// FEC's measured crossover on a high-BDP WAN: at least five corrected losses
+/// per hundred packets after enough traffic to make the sample meaningful.
+pub(super) fn fec_worthwhile(stats: Option<PathStats>) -> bool {
+    let Some(PathStats {
+        lost_packets: Some(lost),
+        spurious_lost_packets: Some(spurious),
+        packets_sent: Some(sent),
+        ..
+    }) = stats
+    else {
+        return false;
+    };
+    sent >= 1024 && lost.saturating_sub(spurious).saturating_mul(20) >= sent
 }

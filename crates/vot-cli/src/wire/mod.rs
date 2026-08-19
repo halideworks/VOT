@@ -1341,13 +1341,16 @@ mod tests {
         for off in ["0", "off", "false", " OFF "] {
             assert!(extensions_from(Some(off)).unwrap().is_empty(), "{off}");
         }
-        for on in ["1", "on", "true", " True\n"] {
+        for on in ["1", "on", "true", " True\n", "auto"] {
             assert_eq!(
                 extensions_from(Some(on)).unwrap(),
                 std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
                 "{on}"
             );
         }
+        assert!(automatic_fec(Some(" AUTO\n")));
+        assert!(!automatic_fec(None));
+        assert!(!automatic_fec(Some("on")));
         assert!(extensions_from(Some("maybe")).is_err());
         assert!(
             std::env::var(DATAGRAM_FEC).is_err(),
@@ -1506,6 +1509,7 @@ mod tests {
                 &Credentials::Ephemeral,
                 Some(1),
                 &serving_offer,
+                false,
                 |at, root| {
                     let _ = listening.send((at, root));
                 },

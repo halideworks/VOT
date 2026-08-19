@@ -67,7 +67,7 @@ pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
 /// feature disabled by default.
 pub(crate) const DATAGRAM_FEC: &str = "VOT_DATAGRAM_FEC";
 
-/// The extensions [`DATAGRAM_FEC`] names: `1`, `on`, or `true` offer
+/// The extensions [`DATAGRAM_FEC`] names: `1`, `on`, `true`, or `auto` offer
 /// `DATAGRAM_FEC`; unset, `0`, `off`, or `false` offer nothing.
 ///
 /// # Errors
@@ -78,11 +78,17 @@ pub(crate) fn extensions_from(pin: Option<&str>) -> Result<std::collections::BTr
         .as_deref()
     {
         None | Some("0" | "off" | "false") => Ok(std::collections::BTreeSet::new()),
-        Some("1" | "on" | "true") => Ok(std::collections::BTreeSet::from([
+        Some("1" | "on" | "true" | "auto") => Ok(std::collections::BTreeSet::from([
             vot_codec::extension_id::DATAGRAM_FEC,
         ])),
         Some(_) => Err(Error::InvalidArguments),
     }
+}
+
+/// Whether a validated [`DATAGRAM_FEC`] value asks the server to activate it
+/// only after measured loss reaches its WAN crossover.
+pub(crate) fn automatic_fec(pin: Option<&str>) -> bool {
+    pin.is_some_and(|value| value.trim().eq_ignore_ascii_case("auto"))
 }
 
 /// The environment variable that asks a fetch to report what it measured.

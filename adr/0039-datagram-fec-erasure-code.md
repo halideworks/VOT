@@ -58,5 +58,5 @@ its crate exist.
   a receiver accepted.
 - Changing the field, polynomial, or matrix is a new code and needs a new
   extension identifier; version zero of the vectors is frozen.
-- The extension stays negotiated and disabled by default; nothing on the
-  reliable path changes.
+- The extension is offered by default. Local path-loss policy enables coding;
+  clean traffic stays on the reliable path.

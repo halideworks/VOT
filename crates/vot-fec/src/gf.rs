@@ -121,6 +121,12 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
         return;
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if SIMD_LEVEL.as_sse4_2().is_none() {
+        mul_add_scalar(out, coefficient, symbol);
+        return;
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
     fearless_simd::dispatch!(*SIMD_LEVEL, simd => mul_add_simd(simd, out, coefficient, symbol));
 

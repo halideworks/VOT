@@ -7,7 +7,6 @@ use super::{
     ServeConnection, ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter,
     TypedFrame, encoded, error_code, fail, frame_type, frames,
 };
-use vot_transport_api::PathStats;
 
 /// One bundle, opened and proved once, answering any number of sessions.
 pub struct BundleServer {
@@ -115,8 +114,9 @@ impl BundleServer {
         }
         connection.drain(session)?;
         let path = session.adapter().path_stats();
-        let repair_symbols = fec_repair_symbols(path);
-        connection.fec_coding = !self.automatic_fec || fec_worthwhile(path);
+        connection.fec_policy.observe(path);
+        let repair_symbols = connection.fec_policy.repair_symbols();
+        connection.fec_coding = !self.automatic_fec || connection.fec_policy.coding();
         loop {
             if let Some(code) = connection.closed {
                 return Ok(ServeStatus::Closed(code));
@@ -827,41 +827,4 @@ pub(crate) const FEC_PIECE_BYTES: u64 =
 
 fn fec_geometry(repair_symbols: usize) -> vot_fec::Geometry {
     vot_fec::Geometry::new(64, repair_symbols, 1024).expect("the selected profile")
-}
-
-/// Chooses enough repair for the path without paying the full encoding cost
-/// on a clean bulk transfer. Startup and incomplete samples stay conservative.
-pub(super) fn fec_repair_symbols(stats: Option<PathStats>) -> usize {
-    let Some(PathStats {
-        lost_packets: Some(lost),
-        spurious_lost_packets: Some(spurious),
-        packets_sent: Some(sent),
-        ..
-    }) = stats
-    else {
-        return FEC_REPAIR_SYMBOLS;
-    };
-    if sent < 1024 {
-        return FEC_REPAIR_SYMBOLS;
-    }
-    let lost = u128::from(lost.saturating_sub(spurious));
-    let received = u128::from(sent).saturating_sub(lost).max(1);
-    usize::try_from((lost * 64).div_ceil(received) + 1)
-        .unwrap_or(FEC_REPAIR_SYMBOLS)
-        .clamp(1, FEC_REPAIR_SYMBOLS)
-}
-
-/// FEC's measured crossover on a high-BDP WAN: at least five corrected losses
-/// per hundred packets after enough traffic to make the sample meaningful.
-pub(super) fn fec_worthwhile(stats: Option<PathStats>) -> bool {
-    let Some(PathStats {
-        lost_packets: Some(lost),
-        spurious_lost_packets: Some(spurious),
-        packets_sent: Some(sent),
-        ..
-    }) = stats
-    else {
-        return false;
-    };
-    sent >= 1024 && lost.saturating_sub(spurious).saturating_mul(20) >= sent
 }

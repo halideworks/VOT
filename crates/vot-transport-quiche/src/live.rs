@@ -451,9 +451,12 @@ impl Config {
         let stream_window = u64::try_from(self.limits.control_payload())
             .map_err(|_| Error::InvalidConfiguration)?
             .saturating_add(vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64);
-        config.set_initial_max_data(stream_window.saturating_mul(8));
-        config.set_initial_max_stream_data_bidi_local(stream_window);
-        config.set_initial_max_stream_data_bidi_remote(stream_window);
+        let connection_window = stream_window.saturating_mul(8);
+        config.set_initial_max_data(connection_window);
+        // The aggregate window remains the memory bound. Let one bulk stream
+        // use all of it instead of stalling after one eighth of the credit.
+        config.set_initial_max_stream_data_bidi_local(connection_window);
+        config.set_initial_max_stream_data_bidi_remote(connection_window);
         // The control stream plus what was advertised, so a peer opening the
         // lanes it was promised is never refused by the carrier.
         let lanes = u64::try_from(self.limits.lanes()).map_err(|_| Error::InvalidConfiguration)?;

@@ -131,7 +131,7 @@ type GroupSource =
     std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Result<Vec<RangedFrame>, Error>>>>;
 
 /// How long a rail's accept may wait once every port is bound.
-const ROLE_RAIL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const ROLE_RAIL_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Whether the backend can bind a listener without waiting on its handshake.
 fn binds_before_accepting(config: &Config) -> bool {

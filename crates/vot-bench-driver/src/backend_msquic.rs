@@ -85,7 +85,7 @@ fn advertised_limits() -> Result<ReceiveLimits, Error> {
 
 /// Handshake timeout for two-machine runs. Longer than loopback because a
 /// human starts each half.
-const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Listens on `address` and waits for the sending half to connect.
 ///
@@ -185,10 +185,8 @@ fn handshake(
         while let Some(event) = client.poll() {
             client_up |= matches!(event, Event::Connected(_));
         }
-        if client_up {
-            if let Some(accepted) = server.accept() {
-                return Ok(accepted);
-            }
+        if client_up && let Some(accepted) = server.accept() {
+            return Ok(accepted);
         }
         std::thread::sleep(Duration::from_millis(1));
     }

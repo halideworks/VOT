@@ -69,8 +69,9 @@ Every implementation and test harness MUST preserve these invariants:
 - A parser never allocates from an untrusted length before enforcing a bound.
 - Proprietary implementations are not source material for VOT.
 
-Experimental features are disabled by default: datagram FEC, VCRC, public
-multi-rail, custom congestion control, and Multipath QUIC.
+Datagram FEC is offered by default, but sends no repair symbols until local
+path-loss policy activates it. Other experimental features are disabled by
+default: VCRC, public multi-rail, custom congestion control, and Multipath QUIC.
 
 ## 4. Object and proof architecture
 

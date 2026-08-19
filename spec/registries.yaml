@@ -358,7 +358,7 @@
       "value": "0x01",
       "name": "DATAGRAM_FEC",
       "status": "experimental",
-      "default": "disabled"
+      "default": "enabled"
     },
     {
       "value": "0x02",

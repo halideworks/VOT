@@ -257,8 +257,8 @@ pub fn now_seconds() -> Result<u64, Error> {
 pub struct Stance<'a> {
     pub(crate) authentication: vot_session::Authentication,
     pub(crate) requirement: Option<&'a Requirement>,
-    /// The extensions this serve offers a session; empty by default, since
-    /// every extension is experimental and disabled until asked for.
+    /// The extensions this serve offers a session; the wire caller installs
+    /// its current defaults with [`Self::offering`].
     pub(crate) extensions: std::collections::BTreeSet<u64>,
 }
 

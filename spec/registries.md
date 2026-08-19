@@ -93,7 +93,7 @@ thing it configures.
 | Value | Name | Status | Default |
 |---:|---|---|---|
 | `0x00` | `CORE_RELIABLE` | draft | enabled |
-| `0x01` | `DATAGRAM_FEC` | experimental | disabled |
+| `0x01` | `DATAGRAM_FEC` | experimental | enabled |
 | `0x02` | `ZSTD_RECORDS` | draft optional | disabled |
 | `0x03` | `VCRC` | experimental | disabled |
 | `0x04` | `PUBLIC_MULTI_RAIL` | experimental | disabled |

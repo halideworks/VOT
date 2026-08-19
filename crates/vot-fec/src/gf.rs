@@ -4,20 +4,7 @@
 use std::sync::LazyLock;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-use fearless_simd::Level;
-
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::{uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vqtbl1q_u8, vshrq_n_u8};
-#[cfg(target_arch = "x86")]
-use core::arch::x86::{
-    __m256i, _mm256_and_si256, _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi16,
-    _mm256_xor_si256,
-};
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::{
-    __m256i, _mm256_and_si256, _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi16,
-    _mm256_xor_si256,
-};
+use fearless_simd::{Level, Simd, prelude::*, u8x16};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 static SIMD_LEVEL: LazyLock<Level> = LazyLock::new(Level::new);
@@ -134,19 +121,11 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
         return;
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(avx2) = SIMD_LEVEL.as_avx2() {
-        mul_add_avx2(avx2, out, coefficient, symbol);
-        return;
-    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    fearless_simd::dispatch!(*SIMD_LEVEL, simd => mul_add_simd(simd, out, coefficient, symbol));
 
-    #[cfg(target_arch = "aarch64")]
-    if let Some(neon) = SIMD_LEVEL.as_neon() {
-        mul_add_neon(neon, out, coefficient, symbol);
-        return;
-    }
-
-    mul_add_scalar(out, coefficient, symbol);
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    mul_add_scalar(out, coefficient, symbol)
 }
 
 fn mul_add_scalar(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
@@ -172,65 +151,34 @@ fn mul_add_scalar(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fearless_simd::kernel!(
-    #[inline]
-    fn mul_add_avx2(avx2: Avx2, out: &mut [u8], coefficient: u8, symbol: &[u8]) {
-        use fearless_simd::{SimdBase, SimdInto, u8x16, u8x32};
-
-        let tables = &NIBBLES[coefficient as usize];
-        let low_table: __m256i = u8x32::block_splat(u8x16::from_slice(avx2, &tables[0])).into();
-        let high_table: __m256i = u8x32::block_splat(u8x16::from_slice(avx2, &tables[1])).into();
-        let mask = _mm256_set1_epi8(0x0f);
-        let mut out_chunks = out.chunks_exact_mut(32);
-        let mut symbol_chunks = symbol.chunks_exact(32);
-        for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
-            let output: __m256i = u8x32::from_slice(avx2, o).into();
-            let input: __m256i = u8x32::from_slice(avx2, s).into();
-            let low = _mm256_and_si256(input, mask);
-            let high = _mm256_and_si256(_mm256_srli_epi16::<4>(input), mask);
-            let product = _mm256_xor_si256(
-                _mm256_shuffle_epi8(low_table, low),
-                _mm256_shuffle_epi8(high_table, high),
-            );
-            let result: u8x32<_> = _mm256_xor_si256(output, product).simd_into(avx2);
-            result.store_slice(o);
-        }
-        mul_add_scalar(
-            out_chunks.into_remainder(),
-            coefficient,
-            symbol_chunks.remainder(),
-        );
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[allow(
+    clippy::inline_always,
+    reason = "fearless_simd requires inlining to preserve target features after dispatch"
+)]
+#[inline(always)]
+fn mul_add_simd<S: Simd>(simd: S, out: &mut [u8], coefficient: u8, symbol: &[u8]) {
+    let tables = &NIBBLES[coefficient as usize];
+    let low_table = S::u8s::block_splat(u8x16::from_slice(simd, &tables[0]));
+    let high_table = S::u8s::block_splat(u8x16::from_slice(simd, &tables[1]));
+    let mask = S::u8s::splat(simd, 0x0f);
+    let mut out_chunks = out.chunks_exact_mut(S::u8s::N);
+    let mut symbol_chunks = symbol.chunks_exact(S::u8s::N);
+    for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
+        let output = S::u8s::from_slice(simd, o);
+        let input = S::u8s::from_slice(simd, s);
+        let low = input & mask;
+        let high = input >> 4;
+        let product =
+            low_table.swizzle_dyn_within_blocks(low) ^ high_table.swizzle_dyn_within_blocks(high);
+        (output ^ product).store_slice(o);
     }
-);
-
-#[cfg(target_arch = "aarch64")]
-fearless_simd::kernel!(
-    #[inline]
-    fn mul_add_neon(neon: Neon, out: &mut [u8], coefficient: u8, symbol: &[u8]) {
-        use fearless_simd::{SimdBase, SimdInto, u8x16};
-
-        let tables = &NIBBLES[coefficient as usize];
-        let low_table: uint8x16_t = u8x16::from_slice(neon, &tables[0]).into();
-        let high_table: uint8x16_t = u8x16::from_slice(neon, &tables[1]).into();
-        let mut out_chunks = out.chunks_exact_mut(16);
-        let mut symbol_chunks = symbol.chunks_exact(16);
-        for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
-            let output: uint8x16_t = u8x16::from_slice(neon, o).into();
-            let input: uint8x16_t = u8x16::from_slice(neon, s).into();
-            let low = vandq_u8(input, vdupq_n_u8(0x0f));
-            let high = vshrq_n_u8::<4>(input);
-            let product = veorq_u8(vqtbl1q_u8(low_table, low), vqtbl1q_u8(high_table, high));
-            let result: u8x16<_> = veorq_u8(output, product).simd_into(neon);
-            result.store_slice(o);
-        }
-        mul_add_scalar(
-            out_chunks.into_remainder(),
-            coefficient,
-            symbol_chunks.remainder(),
-        );
-    }
-);
+    mul_add_scalar(
+        out_chunks.into_remainder(),
+        coefficient,
+        symbol_chunks.remainder(),
+    );
+}
 
 #[cfg(test)]
 mod tests {

@@ -139,7 +139,7 @@ authenticates received content. See ADR-0037.
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
 | `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
-| `VOT_DATAGRAM_FEC` | unset | Set to `1` at both ends to force the experimental datagram FEC path, or `auto` to negotiate it but code only after measured corrected packet loss reaches 5%; the reliable path carries the rest |
+| `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only after measured corrected packet loss reaches 5%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
 | `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, total milliseconds, milliseconds to first verified payload, and what the datagram FEC path offered, decoded, abandoned, and refused |

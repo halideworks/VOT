@@ -265,10 +265,11 @@ credit and sets absolute maxima for unretired bytes, active generations, open
 coding epochs, and decode work. Zero credit stops new generations. Receiver overload cannot
 increase parity without bound, and reliable repair remains available.
 
-FEC, VCRC, public multi-rail, custom congestion control, and Multipath QUIC are
-negotiated and disabled by default. VCRC cannot authorize parity or hedges after
-risk-budget exhaustion. Experimental actions remain inside tenant, job,
-receiver, and congestion-domain limits.
+FEC is negotiated by default, but local path-loss policy keeps coding disabled
+on clean paths. VCRC, public multi-rail, custom congestion control, and
+Multipath QUIC are negotiated and disabled by default. VCRC cannot authorize
+parity or hedges after risk-budget exhaustion. Experimental actions remain
+inside tenant, job, receiver, and congestion-domain limits.
 
 ## 13. Carrier fallback and path changes
 

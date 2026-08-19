@@ -1,9 +1,10 @@
 # VOT Datagram FEC Erasure Code v0
 
-Status: normative for the experimental `DATAGRAM_FEC` extension. Disabled by
-default. Sections 1 through 8 define the erasure code (ADR-0039). Sections 9
-through 12 define how symbols travel, the five `DATAGRAM_FEC` frames, credit,
-and the drop and error rules (ADR-0040).
+Status: normative for the experimental `DATAGRAM_FEC` extension. Offered by
+default; local policy decides whether measured path loss justifies coding.
+Sections 1 through 8 define the erasure code (ADR-0039). Sections 9 through 12
+define how symbols travel, the five `DATAGRAM_FEC` frames, credit, and the drop
+and error rules (ADR-0040).
 
 ## 1. Field
 

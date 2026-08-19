@@ -1336,20 +1336,17 @@ mod tests {
     }
 
     #[test]
-    fn the_datagram_fec_offer_is_off_unless_asked_for() {
-        assert!(extensions_from(None).unwrap().is_empty());
+    fn datagram_fec_defaults_to_automatic_and_keeps_explicit_controls() {
+        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        assert_eq!(extensions_from(None).unwrap(), fec);
         for off in ["0", "off", "false", " OFF "] {
             assert!(extensions_from(Some(off)).unwrap().is_empty(), "{off}");
         }
         for on in ["1", "on", "true", " True\n", "auto"] {
-            assert_eq!(
-                extensions_from(Some(on)).unwrap(),
-                std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]),
-                "{on}"
-            );
+            assert_eq!(extensions_from(Some(on)).unwrap(), fec, "{on}");
         }
         assert!(automatic_fec(Some(" AUTO\n")));
-        assert!(!automatic_fec(None));
+        assert!(automatic_fec(None));
         assert!(!automatic_fec(Some("on")));
         assert!(extensions_from(Some("maybe")).is_err());
         assert!(

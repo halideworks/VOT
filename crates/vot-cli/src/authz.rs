@@ -257,26 +257,33 @@ pub fn now_seconds() -> Result<u64, Error> {
 pub struct Stance<'a> {
     pub(crate) authentication: vot_session::Authentication,
     pub(crate) requirement: Option<&'a Requirement>,
-    /// The extensions this serve offers a session; empty by default, since
-    /// every extension is experimental and disabled until asked for.
+    /// The extensions this serve offers a session.
     pub(crate) extensions: std::collections::BTreeSet<u64>,
+    pub(crate) use_default_extensions: bool,
+}
+
+pub(crate) fn default_extensions() -> std::collections::BTreeSet<u64> {
+    std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
 }
 
 impl Stance<'_> {
-    /// A serve that requires nothing, which is the default.
+    /// A serve that requires nothing and offers the default extensions.
     #[must_use]
     pub const fn open(nonce: [u8; 32]) -> Self {
         Self {
             authentication: vot_session::Authentication::NotRequired { nonce },
             requirement: None,
             extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 
-    /// The same stance, offering `extensions`.
+    /// The same stance, offering exactly `extensions`; an empty set disables
+    /// every optional extension.
     #[must_use]
     pub fn offering(mut self, extensions: std::collections::BTreeSet<u64>) -> Self {
         self.extensions = extensions;
+        self.use_default_extensions = false;
         self
     }
 }
@@ -291,6 +298,7 @@ impl<'a> Stance<'a> {
             },
             requirement: Some(requirement),
             extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 }
@@ -304,6 +312,7 @@ impl From<vot_session::Authentication> for Stance<'_> {
             authentication,
             requirement: None,
             extensions: std::collections::BTreeSet::new(),
+            use_default_extensions: true,
         }
     }
 }
@@ -404,6 +413,19 @@ mod tests {
         )
         .expect("a token");
         Holder::new(token, holder_key.clone()).expect("a holder")
+    }
+
+    #[test]
+    fn every_public_stance_defaults_to_fec_and_can_explicitly_disable_it() {
+        assert!(Stance::open([1; 32]).use_default_extensions);
+        assert!(Stance::required(&requirement(&keypair(1)), [2; 32]).use_default_extensions);
+        assert!(
+            Stance::from(vot_session::Authentication::NotRequired { nonce: [3; 32] })
+                .use_default_extensions
+        );
+        let off = Stance::open([4; 32]).offering(std::collections::BTreeSet::new());
+        assert!(!off.use_default_extensions);
+        assert!(off.extensions.is_empty());
     }
 
     #[test]

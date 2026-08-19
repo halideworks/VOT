@@ -47,6 +47,12 @@ pub(crate) struct Cover {
     pub(crate) length: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OpenEpoch {
+    cover: Cover,
+    plan: EpochPlan,
+}
+
 impl Cover {
     pub(crate) const fn of(open: &CodingEpochOpen) -> Self {
         Self {
@@ -138,7 +144,7 @@ impl std::ops::Add for FecCounts {
 #[derive(Debug, Default)]
 pub(crate) struct Intake {
     receiver: Receiver,
-    epochs: BTreeMap<u32, Cover>,
+    epochs: BTreeMap<u32, OpenEpoch>,
     orphans: VecDeque<Orphan>,
     orphan_bytes: usize,
     owed: VecDeque<Owed>,
@@ -202,7 +208,13 @@ impl Intake {
         match self.receiver.open(plan) {
             Ok(Open::Opened) => {
                 self.counts.offered += generations;
-                self.epochs.insert(open.epoch, Cover::of(open));
+                self.epochs.insert(
+                    open.epoch,
+                    OpenEpoch {
+                        cover: Cover::of(open),
+                        plan,
+                    },
+                );
                 Ok(())
             }
             Ok(Open::Repeated) => Ok(()),
@@ -223,8 +235,8 @@ impl Intake {
     /// bundle, if it ever comes, is answered by the reliable path.
     pub(crate) fn close(&mut self, close: CodingEpochClose) {
         self.receiver.close(close.epoch);
-        if let Some(cover) = self.epochs.remove(&close.epoch) {
-            let _ = self.take_orphans(cover);
+        if let Some(epoch) = self.epochs.remove(&close.epoch) {
+            let _ = self.take_orphans(epoch.cover);
         }
     }
 
@@ -233,33 +245,22 @@ impl Intake {
     /// here yet is held as an orphan.
     pub(crate) fn symbol(&mut self, datagram: &[u8]) -> Option<Joined> {
         let header = peek_header(datagram)?;
-        let cover = *self.epochs.get(&header.epoch)?;
-        // Asked before the symbol is taken, because it is the only way to
-        // tell a generation's first symbol from a later one for every
-        // outcome. `Symbol::Stored` reports it, but a generation holding a
-        // single source symbol decodes on the symbol that opens it and is
-        // never stored, and the tail generation of an epoch is often exactly
-        // that.
-        let opens_generation = self
-            .receiver
-            .report(header.epoch, header.generation)
-            .is_none();
+        let epoch = *self.epochs.get(&header.epoch)?;
         let outcome = self.receiver.symbol(
             header.epoch,
             header.generation,
             header.esi,
             &datagram[SYMBOL_HEADER_LEN..],
         );
-        // A drop took nothing, so it carried nothing. Everything else did.
-        if opens_generation && !matches!(outcome, Symbol::Dropped(_)) {
-            self.counts.coded += 1;
-        }
         match outcome {
             Symbol::Decoded(Decoded {
                 generation,
                 offset,
                 bytes,
             }) => {
+                if epoch.plan.sent_source_count(generation) == 1 {
+                    self.counts.coded += 1;
+                }
                 self.counts.decoded += 1;
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
@@ -267,19 +268,22 @@ impl Intake {
                     outcome: GenOutcome::Decoded,
                 }));
                 Some(Joined {
-                    cover,
+                    cover: epoch.cover,
                     generation,
                     plaintext_offset: offset,
                     bytes,
                 })
             }
             Symbol::Abandoned { generation, state } => {
+                if epoch.plan.sent_source_count(generation) == 1 {
+                    self.counts.coded += 1;
+                }
                 self.counts.abandoned += 1;
                 // Before the `GEN_DONE`, because the done is terminal for the
                 // generation and no state is accepted after it. What this one
                 // was still missing when it was given up on is the only loss
                 // sample the sender gets for it.
-                self.owe_state(state_of(header.epoch, generation, &state));
+                self.owe_state(state_of(header.epoch, generation, state));
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: header.epoch,
                     generation,
@@ -291,9 +295,13 @@ impl Intake {
                 // Only the symbol that opened the generation: one report says
                 // this end is working on it, and a report per symbol would put
                 // a control frame behind every datagram.
-                if first && let Some(state) = self.receiver.report(header.epoch, header.generation)
-                {
-                    self.owe_state(state_of(header.epoch, header.generation, &state));
+                if first {
+                    self.counts.coded += 1;
+                    if self.owed_states < MAX_OWED_STATES
+                        && let Some(state) = self.receiver.report(header.epoch, header.generation)
+                    {
+                        self.owe_state(state_of(header.epoch, header.generation, state));
+                    }
                 }
                 None
             }
@@ -421,13 +429,13 @@ pub(crate) fn record_of(bundle_id: [u8; 16], joined: Joined) -> DataRecord {
 }
 
 /// One `GEN_STATE` frame from what the receiver reported.
-fn state_of(epoch: u32, generation: u32, report: &Report) -> GenState {
+fn state_of(epoch: u32, generation: u32, report: Report) -> GenState {
     GenState {
         epoch,
         generation,
         sequence: report.sequence,
         received: report.received,
-        missing_sources: report.missing_sources.clone(),
+        missing_sources: report.missing_sources,
     }
 }
 
@@ -657,6 +665,11 @@ mod tests {
         let (esi, symbol) = &symbols[1];
         assert!(intake.symbol(&datagram(3, 0, *esi, symbol)).is_none());
         assert_eq!(intake.take_owed(), None, "only the symbol that opened it");
+        assert_eq!(
+            intake.receiver.report(3, 0).unwrap().sequence,
+            2,
+            "checking later symbols did not mint discarded reports"
+        );
     }
 
     #[test]
@@ -684,6 +697,15 @@ mod tests {
             intake.owed.len(),
             MAX_OWED_STATES,
             "the advisory queue stops growing"
+        );
+        assert_eq!(
+            intake
+                .receiver
+                .report(1, u32::try_from(MAX_OWED_STATES).unwrap())
+                .unwrap()
+                .sequence,
+            1,
+            "overflow generations did not mint discarded reports"
         );
         assert!(
             intake

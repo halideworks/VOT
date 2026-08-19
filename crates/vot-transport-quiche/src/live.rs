@@ -3866,7 +3866,7 @@ mod tests {
         let mut sent = 0_usize;
         let mut received = 0_usize;
         let mut carried = 0_u64;
-        let deadline = started + Duration::from_secs(120);
+        let deadline = started + Duration::from_mins(2);
         while received < target && Instant::now() < deadline {
             while sent < target {
                 match client.send_reliable_shared(StreamId(0), Payload::clone(&shared)) {

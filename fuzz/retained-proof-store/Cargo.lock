@@ -212,6 +212,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fearless_simd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,6 +484,9 @@ version = "0.0.1"
 [[package]]
 name = "vot-fec"
 version = "0.0.1"
+dependencies = [
+ "fearless_simd",
+]
 
 [[package]]
 name = "vot-fuzz-mutator"

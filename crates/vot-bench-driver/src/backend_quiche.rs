@@ -100,7 +100,7 @@ fn datagram_bytes_from_env() -> Result<Option<usize>, Error> {
 
 /// Handshake timeout for two-machine runs. Longer than loopback because a
 /// human starts each half.
-const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+const ROLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Binds a listener without waiting for handshake. All rails bind before
 /// any connect starts to avoid Initial loss to closed ports.

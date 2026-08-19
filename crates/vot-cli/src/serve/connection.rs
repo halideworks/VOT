@@ -214,7 +214,7 @@ impl Outbound {
         session: &mut Session<A>,
     ) -> Result<(), vot_session::Error> {
         match self {
-            Self::Control(frame) => session.send_control(frame),
+            Self::Control(frame) => session.send_control_shared(frame.clone()),
             Self::Record(record) => session.send_reliable_shared(RECORD_LANE, record.clone()),
             Self::Datagram(symbol) => session.send_datagram(0, symbol),
         }

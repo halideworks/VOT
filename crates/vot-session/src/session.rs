@@ -377,6 +377,18 @@ impl<A: TransportAdapter> Session<A> {
         self.adapter.send_control(frame).map_err(transport_error)
     }
 
+    /// Submits an already shared application control frame without another copy.
+    ///
+    /// # Errors
+    /// Refuses before `Ready`, and propagates a backend refusal.
+    pub fn send_control_shared(&mut self, frame: Payload) -> Result<(), Error> {
+        self.require_sendable()?;
+        self.check_outbound(&frame, Lane::Control)?;
+        self.adapter
+            .send_control_shared(frame)
+            .map_err(transport_error)
+    }
+
     /// Submits an application record on a reliable lane.
     ///
     /// # Errors

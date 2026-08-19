@@ -1,5 +1,27 @@
 //! GF(2^8) with the 0x11D polynomial and generator 2 (`spec/fec.md` section 1).
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+use std::sync::LazyLock;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+use fearless_simd::Level;
+
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vqtbl1q_u8, vshrq_n_u8};
+#[cfg(target_arch = "x86")]
+use core::arch::x86::{
+    __m256i, _mm256_and_si256, _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi16,
+    _mm256_xor_si256,
+};
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::{
+    __m256i, _mm256_and_si256, _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi16,
+    _mm256_xor_si256,
+};
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+static SIMD_LEVEL: LazyLock<Level> = LazyLock::new(Level::new);
+
 const POLYNOMIAL: u16 = 0x11D;
 
 /// `EXP[i] = 2^i` for `i` in `0..255`, then repeated so a sum of two logs
@@ -76,6 +98,25 @@ const fn product_tables() -> [[u8; 256]; 256] {
 
 static PRODUCTS: [[u8; 256]; 256] = product_tables();
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+const fn nibble_tables() -> [[[u8; 16]; 2]; 256] {
+    let mut tables = [[[0_u8; 16]; 2]; 256];
+    let mut coefficient = 0;
+    while coefficient < 256 {
+        let mut nibble = 0;
+        while nibble < 16 {
+            tables[coefficient][0][nibble] = PRODUCTS[coefficient][nibble];
+            tables[coefficient][1][nibble] = PRODUCTS[coefficient][nibble << 4];
+            nibble += 1;
+        }
+        coefficient += 1;
+    }
+    tables
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+static NIBBLES: [[[u8; 16]; 2]; 256] = nibble_tables();
+
 fn products_of(coefficient: u8) -> &'static [u8; 256] {
     &PRODUCTS[coefficient as usize]
 }
@@ -86,12 +127,23 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
     if coefficient == 0 {
         return;
     }
-    if coefficient == 1 {
-        for (o, s) in out.iter_mut().zip(symbol) {
-            *o ^= *s;
-        }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if let Some(avx2) = SIMD_LEVEL.as_avx2() {
+        mul_add_avx2(avx2, out, coefficient, symbol);
         return;
     }
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(neon) = SIMD_LEVEL.as_neon() {
+        mul_add_neon(neon, out, coefficient, symbol);
+        return;
+    }
+
+    mul_add_scalar(out, coefficient, symbol);
+}
+
+fn mul_add_scalar(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
     let products = products_of(coefficient);
     let mut out_chunks = out.chunks_exact_mut(8);
     let mut symbol_chunks = symbol.chunks_exact(8);
@@ -113,6 +165,66 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
         *o ^= products[*s as usize];
     }
 }
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fearless_simd::kernel!(
+    #[inline]
+    fn mul_add_avx2(avx2: Avx2, out: &mut [u8], coefficient: u8, symbol: &[u8]) {
+        use fearless_simd::{SimdBase, SimdInto, u8x16, u8x32};
+
+        let tables = &NIBBLES[coefficient as usize];
+        let low_table: __m256i = u8x32::block_splat(u8x16::from_slice(avx2, &tables[0])).into();
+        let high_table: __m256i = u8x32::block_splat(u8x16::from_slice(avx2, &tables[1])).into();
+        let mask = _mm256_set1_epi8(0x0f);
+        let mut out_chunks = out.chunks_exact_mut(32);
+        let mut symbol_chunks = symbol.chunks_exact(32);
+        for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
+            let output: __m256i = u8x32::from_slice(avx2, o).into();
+            let input: __m256i = u8x32::from_slice(avx2, s).into();
+            let low = _mm256_and_si256(input, mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16::<4>(input), mask);
+            let product = _mm256_xor_si256(
+                _mm256_shuffle_epi8(low_table, low),
+                _mm256_shuffle_epi8(high_table, high),
+            );
+            let result: u8x32<_> = _mm256_xor_si256(output, product).simd_into(avx2);
+            result.store_slice(o);
+        }
+        mul_add_scalar(
+            out_chunks.into_remainder(),
+            coefficient,
+            symbol_chunks.remainder(),
+        );
+    }
+);
+
+#[cfg(target_arch = "aarch64")]
+fearless_simd::kernel!(
+    #[inline]
+    fn mul_add_neon(neon: Neon, out: &mut [u8], coefficient: u8, symbol: &[u8]) {
+        use fearless_simd::{SimdBase, SimdInto, u8x16};
+
+        let tables = &NIBBLES[coefficient as usize];
+        let low_table: uint8x16_t = u8x16::from_slice(neon, &tables[0]).into();
+        let high_table: uint8x16_t = u8x16::from_slice(neon, &tables[1]).into();
+        let mut out_chunks = out.chunks_exact_mut(16);
+        let mut symbol_chunks = symbol.chunks_exact(16);
+        for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
+            let output: uint8x16_t = u8x16::from_slice(neon, o).into();
+            let input: uint8x16_t = u8x16::from_slice(neon, s).into();
+            let low = vandq_u8(input, vdupq_n_u8(0x0f));
+            let high = vshrq_n_u8::<4>(input);
+            let product = veorq_u8(vqtbl1q_u8(low_table, low), vqtbl1q_u8(high_table, high));
+            let result: u8x16<_> = veorq_u8(output, product).simd_into(neon);
+            result.store_slice(o);
+        }
+        mul_add_scalar(
+            out_chunks.into_remainder(),
+            coefficient,
+            symbol_chunks.remainder(),
+        );
+    }
+);
 
 #[cfg(test)]
 mod tests {
@@ -175,15 +287,24 @@ mod tests {
 
     #[test]
     fn mul_add_matches_the_scalar_kernel() {
-        let symbol: Vec<u8> = (0..=255).collect();
-        for coefficient in [0_u8, 1, 2, 0x1D, 0x80, 0xFF] {
-            let mut out = vec![0xA5_u8; 256];
-            mul_add(&mut out, coefficient, &symbol);
-            for (i, byte) in out.iter().enumerate() {
+        for length in [0, 1, 15, 16, 31, 32, 33, 255, 256, 1_023, 1_024, 1_025] {
+            let symbol: Vec<u8> = (0..length)
+                .map(|i| u8::try_from(i % 251).expect("under 251"))
+                .collect();
+            for coefficient in 0..=u8::MAX {
+                let expected: Vec<u8> = symbol
+                    .iter()
+                    .map(|value| 0xA5 ^ mul(coefficient, *value))
+                    .collect();
+                let mut scalar = vec![0xA5_u8; length];
+                mul_add_scalar(&mut scalar, coefficient, &symbol);
+                assert_eq!(scalar, expected, "scalar {coefficient} at length {length}");
+
+                let mut dispatched = vec![0xA5_u8; length];
+                mul_add(&mut dispatched, coefficient, &symbol);
                 assert_eq!(
-                    *byte,
-                    0xA5 ^ mul(coefficient, symbol[i]),
-                    "{coefficient} at {i}"
+                    dispatched, expected,
+                    "dispatched {coefficient} at length {length}"
                 );
             }
         }
@@ -211,7 +332,7 @@ mod cost {
             .map(|i| u8::try_from(i % 251).expect("under 251"))
             .collect();
         let mut out = vec![0_u8; symbol.len()];
-        let rounds: u32 = 400_000;
+        let rounds: u32 = 4_000_000;
         let began = std::time::Instant::now();
         for round in 0..rounds {
             let coefficient = u8::try_from(round % 254).expect("under 254") + 2;

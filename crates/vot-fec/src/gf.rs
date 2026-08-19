@@ -93,7 +93,23 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
         return;
     }
     let products = products_of(coefficient);
-    for (o, s) in out.iter_mut().zip(symbol) {
+    let mut out_chunks = out.chunks_exact_mut(8);
+    let mut symbol_chunks = symbol.chunks_exact(8);
+    for (o, s) in out_chunks.by_ref().zip(symbol_chunks.by_ref()) {
+        o[0] ^= products[s[0] as usize];
+        o[1] ^= products[s[1] as usize];
+        o[2] ^= products[s[2] as usize];
+        o[3] ^= products[s[3] as usize];
+        o[4] ^= products[s[4] as usize];
+        o[5] ^= products[s[5] as usize];
+        o[6] ^= products[s[6] as usize];
+        o[7] ^= products[s[7] as usize];
+    }
+    for (o, s) in out_chunks
+        .into_remainder()
+        .iter_mut()
+        .zip(symbol_chunks.remainder())
+    {
         *o ^= products[*s as usize];
     }
 }

@@ -127,6 +127,12 @@ pub(crate) fn mul_add(out: &mut [u8], coefficient: u8, symbol: &[u8]) {
     if coefficient == 0 {
         return;
     }
+    if coefficient == 1 {
+        for (o, s) in out.iter_mut().zip(symbol) {
+            *o ^= *s;
+        }
+        return;
+    }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if let Some(avx2) = SIMD_LEVEL.as_avx2() {
@@ -289,7 +295,7 @@ mod tests {
     fn mul_add_matches_the_scalar_kernel() {
         for length in [0, 1, 15, 16, 31, 32, 33, 255, 256, 1_023, 1_024, 1_025] {
             let symbol: Vec<u8> = (0..length)
-                .map(|i| u8::try_from(i % 251).expect("under 251"))
+                .map(|i| u8::try_from(i % 256).expect("under 256"))
                 .collect();
             for coefficient in 0..=u8::MAX {
                 let expected: Vec<u8> = symbol
@@ -333,6 +339,18 @@ mod cost {
             .collect();
         let mut out = vec![0_u8; symbol.len()];
         let rounds: u32 = 4_000_000;
+
+        let began = std::time::Instant::now();
+        for _ in 0..rounds {
+            mul_add(&mut out, 1, &symbol);
+        }
+        let spent = began.elapsed();
+        eprintln!(
+            "mul_add xor: {rounds} calls of {LENGTH} bytes in {spent:?}, {:.2} GB/s, sink={}",
+            (f64::from(rounds) * f64::from(LENGTH)) / spent.as_secs_f64() / 1e9,
+            out[0]
+        );
+
         let began = std::time::Instant::now();
         for round in 0..rounds {
             let coefficient = u8::try_from(round % 254).expect("under 254") + 2;

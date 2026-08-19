@@ -29,6 +29,7 @@ ALLOWED_PACKAGES = frozenset(
         "ed25519",
         "ed25519-dalek",
         "fiat-crypto",
+        "fearless_simd",
         "generic-array",
         "hybrid-array",
         "libc",

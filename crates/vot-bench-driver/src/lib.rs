@@ -324,7 +324,7 @@ impl ObjectSource {
 
     /// The source advanced to `byte_offset`. Requires word alignment.
     fn at(seed: u64, byte_offset: u64) -> Result<Self, Error> {
-        if byte_offset % WORD_BYTES as u64 != 0 {
+        if !byte_offset.is_multiple_of(WORD_BYTES as u64) {
             return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
         }
         let mut source = Self::new(seed);
@@ -394,7 +394,10 @@ const MAX_RANGED_RECORD_BYTES: usize = 3 * 65_536;
 /// ranges verify in whole groups.
 fn ranged_record_bytes(config: &Config) -> Result<usize, Error> {
     let bytes = config.record_bytes;
-    if bytes == 0 || bytes % vot_verifier::GROUP_SIZE != 0 || bytes > MAX_RANGED_RECORD_BYTES {
+    if bytes == 0
+        || !bytes.is_multiple_of(vot_verifier::GROUP_SIZE)
+        || bytes > MAX_RANGED_RECORD_BYTES
+    {
         return Err(Error::Value("VOT_BENCH_RECORD_BYTES"));
     }
     Ok(bytes)
@@ -3153,7 +3156,9 @@ mod tests {
     fn the_cpu_reading_advances_as_the_process_spends_it() {
         // The counter advances in 10ms ticks; spend CPU until it moves.
         let Some((before, _)) = super::cpu_times_ns() else {
-            assert!(!cfg!(target_os = "linux"), "linux exposes this");
+            #[cfg(target_os = "linux")]
+            panic!("linux exposes this");
+            #[cfg(not(target_os = "linux"))]
             return;
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

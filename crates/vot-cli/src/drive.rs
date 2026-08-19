@@ -151,11 +151,11 @@ pub(crate) fn drive_until_within<E: Engine>(
         // spend a half minute of budget in about a second.
         let waited = engine.wait(wait);
         budget = budget.saturating_sub(waited);
-        if spinning > SPINNING_BEFORE_PACING {
-            if let Some(rest) = wait.checked_sub(waited) {
-                std::thread::sleep(rest);
-                budget = budget.saturating_sub(rest);
-            }
+        if spinning > SPINNING_BEFORE_PACING
+            && let Some(rest) = wait.checked_sub(waited)
+        {
+            std::thread::sleep(rest);
+            budget = budget.saturating_sub(rest);
         }
     }
 }

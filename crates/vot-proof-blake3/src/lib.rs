@@ -485,7 +485,8 @@ impl SealedGroupCvs {
     }
 
     fn node_cv(&self, node: Node) -> Result<[u8; 32], Error> {
-        if node.count != 0 && node.count.is_power_of_two() && node.start % node.count == 0 {
+        if node.count != 0 && node.count.is_power_of_two() && node.start.is_multiple_of(node.count)
+        {
             let level_index = node.count.trailing_zeros() as usize;
             if level_index >= self.level_count {
                 return Err(Error::Storage(StoreError::Corrupt));
@@ -613,14 +614,16 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if covered_offset % GROUP_SIZE != 0 || data.is_empty() {
+    if !covered_offset.is_multiple_of(GROUP_SIZE) || data.is_empty() {
         return Err(Error::OutOfBounds);
     }
     let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
     let covered_end = covered_offset
         .checked_add(data_len)
         .ok_or(Error::LengthOverflow)?;
-    if covered_end > object_len || (covered_end < object_len && covered_end % GROUP_SIZE != 0) {
+    if covered_end > object_len
+        || (covered_end < object_len && !covered_end.is_multiple_of(GROUP_SIZE))
+    {
         return Err(Error::OutOfBounds);
     }
     let first = covered_offset / GROUP_SIZE;
@@ -724,7 +727,7 @@ fn encode_all(node: Node, data: &[u8], output: &mut Vec<u8>) {
 /// test are indistinguishable through a proof: reading a level and merging
 /// the same subtree give the same bytes, at very different cost.
 const fn retained_at(node: Node) -> Option<(usize, u64)> {
-    if node.count == 0 || !node.count.is_power_of_two() || node.start % node.count != 0 {
+    if node.count == 0 || !node.count.is_power_of_two() || !node.start.is_multiple_of(node.count) {
         return None;
     }
     Some((
@@ -739,13 +742,12 @@ fn node_cv_retained(node: Node, cvs: &[[u8; 32]], levels: &[Vec<[u8; 32]>]) -> [
     if node.count == 1 {
         return cvs[node.start as usize];
     }
-    if let Some((level, index)) = retained_at(node) {
-        if let Some(cv) = levels
+    if let Some((level, index)) = retained_at(node)
+        && let Some(cv) = levels
             .get(level)
             .and_then(|row| usize::try_from(index).ok().and_then(|index| row.get(index)))
-        {
-            return *cv;
-        }
+    {
+        return *cv;
     }
     let (left, right) = node.split();
     merge_subtrees_non_root(

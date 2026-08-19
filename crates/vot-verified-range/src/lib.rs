@@ -234,10 +234,10 @@ fn check_range_geometry(object_length: u64, covered_offset: u64, bytes: u64) -> 
         return Err(Error::RecordTooLarge);
     }
     let covered_end = checked_offset(covered_offset, bytes)?;
-    if covered_offset % RANGE_UNIT_BYTES != 0 || covered_end > object_length {
+    if !covered_offset.is_multiple_of(RANGE_UNIT_BYTES) || covered_end > object_length {
         return Err(Error::LengthExceeded);
     }
-    if covered_end < object_length && bytes % RANGE_UNIT_BYTES != 0 {
+    if covered_end < object_length && !bytes.is_multiple_of(RANGE_UNIT_BYTES) {
         return Err(Error::LengthExceeded);
     }
     Ok(covered_end)

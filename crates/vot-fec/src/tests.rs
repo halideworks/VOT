@@ -202,7 +202,7 @@ fn the_field_matches_the_vectors() {
     let field = vectors.get("field");
     assert_eq!(field.get("polynomial").u64(), 0x11D);
     assert_eq!(field.get("generator").u64(), 2);
-    assert!(field.get("exp_first_16").array().len() == 16);
+    assert_eq!(field.get("exp_first_16").array().len(), 16);
     assert!(field.get("products").array().len() >= 6);
     assert!(field.get("inverses").array().len() >= 6);
     let mut power = 1_u8;

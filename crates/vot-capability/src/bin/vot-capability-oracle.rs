@@ -177,7 +177,7 @@ fn name(error: &Error) -> &'static str {
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     (0..input.len())

@@ -82,15 +82,15 @@ impl CarefulResumeCache {
         current_endpoint: RemoteEndpoint,
         input: Reconnaissance,
     ) -> Result<ResumePermit, PathReject> {
-        if let Some(saved) = self.saved.get_mut(&saved_endpoint) {
-            if saved.owner.is_some() {
-                saved.discard_on_release |= saved_endpoint != current_endpoint
-                    || input.local_path_changed
-                    || input.congestion_detected
-                    || input.now >= saved.observation.expires_at
-                    || input.configuration_epoch != saved.observation.configuration_epoch;
-                return Err(PathReject::AlreadyInUse);
-            }
+        if let Some(saved) = self.saved.get_mut(&saved_endpoint)
+            && saved.owner.is_some()
+        {
+            saved.discard_on_release |= saved_endpoint != current_endpoint
+                || input.local_path_changed
+                || input.congestion_detected
+                || input.now >= saved.observation.expires_at
+                || input.configuration_epoch != saved.observation.configuration_epoch;
+            return Err(PathReject::AlreadyInUse);
         }
         if saved_endpoint != current_endpoint || input.local_path_changed {
             self.saved.remove(&saved_endpoint);

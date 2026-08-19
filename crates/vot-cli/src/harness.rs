@@ -262,7 +262,9 @@ impl TransportAdapter for Duplex {
         // Delivered unless the pair was told to lose every nth: what an
         // unreliable path does, without a clock.
         self.datagrams_sent += 1;
-        if self.drop_datagram_every != 0 && self.datagrams_sent % self.drop_datagram_every == 0 {
+        if self.drop_datagram_every != 0
+            && self.datagrams_sent.is_multiple_of(self.drop_datagram_every)
+        {
             return Ok(());
         }
         self.outbox.push(Event::Datagram(shared_payload(payload)));

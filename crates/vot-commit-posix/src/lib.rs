@@ -934,16 +934,15 @@ mod tests {
         let staging = directory.join("stage");
         let journal = directory.join("journal");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
-        let error = match PosixCommit::create(
+        let Err(error) = PosixCommit::create(
             Profile::Fast,
             [4; 16],
             staging.clone(),
             directory.join("object"),
             &journal,
             NoFaults,
-        ) {
-            Ok(_) => panic!("unsafe parent admitted"),
-            Err(error) => error,
+        ) else {
+            panic!("unsafe parent admitted");
         };
         assert!(matches!(
             error,

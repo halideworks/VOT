@@ -528,14 +528,16 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if covered_offset % PIECE_SIZE != 0 || data.is_empty() {
+    if !covered_offset.is_multiple_of(PIECE_SIZE) || data.is_empty() {
         return Err(Error::OutOfBounds);
     }
     let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
     let covered_end = covered_offset
         .checked_add(data_len)
         .ok_or(Error::LengthOverflow)?;
-    if covered_end > object_len || (covered_end < object_len && covered_end % PIECE_SIZE != 0) {
+    if covered_end > object_len
+        || (covered_end < object_len && !covered_end.is_multiple_of(PIECE_SIZE))
+    {
         return Err(Error::OutOfBounds);
     }
     let piece_count = object_len.div_ceil(PIECE_SIZE);

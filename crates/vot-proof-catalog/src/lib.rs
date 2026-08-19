@@ -43,7 +43,8 @@ pub(crate) fn geometry(object_length: u64) -> Result<(u64, u64), Error> {
     if object_length > MAX_OBJECT_LENGTH {
         return Err(Error::MalformedCatalog);
     }
-    let record_count = object_length / RANGE_LENGTH + u64::from(object_length % RANGE_LENGTH != 0);
+    let record_count =
+        object_length / RANGE_LENGTH + u64::from(!object_length.is_multiple_of(RANGE_LENGTH));
     let index_length = record_count
         .checked_mul(INDEX_ENTRY_LENGTH as u64)
         .ok_or(Error::MalformedCatalog)?;

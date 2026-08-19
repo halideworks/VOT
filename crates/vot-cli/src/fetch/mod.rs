@@ -166,12 +166,10 @@ mod tests {
                     break;
                 }
             }
-            if corrupted {
-                if let Some((_, bytes)) = serving.driver().records.first_mut() {
-                    let last = bytes.len() - 1;
-                    bytes[last] ^= 1;
-                    corrupted = false;
-                }
+            if corrupted && let Some((_, bytes)) = serving.driver().records.first_mut() {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                corrupted = false;
             }
             pump(
                 serving.driver(),

@@ -129,7 +129,7 @@ pub(crate) const RAW_KEY_PREFIX: &str = "raw:";
 pub(crate) const MAX_KEY_SOURCE_BYTES: usize = SECRET_KEY_PREFIX.len() + 2 * MAX_HMAC_KEY_BYTES + 1;
 
 pub fn decode_key(value: &str) -> Result<Vec<u8>, Error> {
-    if value.len() % 2 != 0 || value.len() > 2 * MAX_HMAC_KEY_BYTES {
+    if !value.len().is_multiple_of(2) || value.len() > 2 * MAX_HMAC_KEY_BYTES {
         return Err(Error::InvalidArguments);
     }
     let bytes = value.as_bytes();

@@ -94,10 +94,10 @@ impl PreparedFile {
 
 impl Drop for PreparedFile {
     fn drop(&mut self) {
-        if self.cleanup {
-            if let Some(temporary) = &self.temporary {
-                let _ = fs::remove_file(temporary);
-            }
+        if self.cleanup
+            && let Some(temporary) = &self.temporary
+        {
+            let _ = fs::remove_file(temporary);
         }
     }
 }

@@ -241,7 +241,9 @@ impl SimulatorAdapter {
                     .reliable_delivered
                     .checked_add(1)
                     .ok_or(TransportError::ArithmeticOverflow)?;
-                repeat = self.reliable_delivered % self.impairment.duplicate_every == 0;
+                repeat = self
+                    .reliable_delivered
+                    .is_multiple_of(self.impairment.duplicate_every);
             }
             if repeat {
                 duplicated.push(event.clone());
@@ -289,7 +291,9 @@ impl SimulatorAdapter {
                         state: vot_transport_api::DatagramSendState::Queued,
                     });
                     let lost = self.impairment.drop_datagram_every != 0
-                        && self.datagrams_sent % self.impairment.drop_datagram_every == 0;
+                        && self
+                            .datagrams_sent
+                            .is_multiple_of(self.impairment.drop_datagram_every);
                     delivered.push(TransportEvent::DatagramState {
                         context,
                         state: if lost {

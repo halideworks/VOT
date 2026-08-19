@@ -121,7 +121,7 @@ const fn bit(group: usize) -> u64 {
 /// The groups a cover of `length` bytes at `offset` spans, or `None` where
 /// the cover is not group-aligned or does not fit a `usize`.
 fn spanned_groups(offset: u64, length: usize) -> Option<(usize, usize)> {
-    if offset % GROUP_SIZE as u64 != 0 {
+    if !offset.is_multiple_of(GROUP_SIZE as u64) {
         return None;
     }
     let first = usize::try_from(offset / GROUP_SIZE as u64).ok()?;

@@ -345,7 +345,7 @@ impl MerkleAccumulator {
         let width = 1_u64
             .checked_shl(u32::try_from(level).map_err(|_| VerifyError::LengthOverflow)?)
             .ok_or(VerifyError::LengthOverflow)?;
-        if self.count % width != 0 {
+        if !self.count.is_multiple_of(width) {
             return Err(VerifyError::LengthOverflow);
         }
         while self.count

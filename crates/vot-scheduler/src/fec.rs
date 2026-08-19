@@ -291,10 +291,9 @@ impl Intake {
                 // Only the symbol that opened the generation: one report says
                 // this end is working on it, and a report per symbol would put
                 // a control frame behind every datagram.
-                if first {
-                    if let Some(state) = self.receiver.report(header.epoch, header.generation) {
-                        self.owe_state(state_of(header.epoch, header.generation, &state));
-                    }
+                if first && let Some(state) = self.receiver.report(header.epoch, header.generation)
+                {
+                    self.owe_state(state_of(header.epoch, header.generation, &state));
                 }
                 None
             }

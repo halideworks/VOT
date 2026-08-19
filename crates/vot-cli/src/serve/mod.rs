@@ -494,48 +494,88 @@ mod tests {
         }
     }
 
+    fn path_sample(lost: u64, spurious: u64, sent: u64) -> vot_transport_api::PathStats {
+        vot_transport_api::PathStats {
+            lost_packets: Some(lost),
+            spurious_lost_packets: Some(spurious),
+            packets_sent: Some(sent),
+            ..vot_transport_api::PathStats::default()
+        }
+    }
+
     #[test]
-    fn repair_count_tracks_real_loss_after_startup() {
+    fn repair_count_tracks_recent_real_loss_after_startup() {
         let repair = |lost, spurious, sent| {
-            server::fec_repair_symbols(Some(vot_transport_api::PathStats {
-                lost_packets: Some(lost),
-                spurious_lost_packets: Some(spurious),
-                packets_sent: Some(sent),
-                ..vot_transport_api::PathStats::default()
-            }))
+            let mut policy = connection::FecPolicy::default();
+            policy.observe(Some(path_sample(0, 0, 0)));
+            policy.observe(Some(path_sample(lost, spurious, sent)));
+            policy.repair_symbols()
         };
-        assert_eq!(server::fec_repair_symbols(None), 8);
+        let mut startup = connection::FecPolicy::default();
+        startup.observe(None);
+        startup.observe(Some(vot_transport_api::PathStats::default()));
+        assert_eq!(startup.repair_symbols(), 8);
+        assert_eq!(repair(0, 0, 8191), 8);
+        assert_eq!(repair(0, 0, 8192), 1);
+        assert_eq!(repair(40, 0, 8192), 2);
+        assert_eq!(repair(164, 0, 8192), 3);
+        assert_eq!(repair(410, 0, 8192), 5);
         assert_eq!(
-            server::fec_repair_symbols(Some(vot_transport_api::PathStats::default())),
-            8
+            repair(410, 409, 8192),
+            2,
+            "spurious losses do not buy repair"
         );
-        assert_eq!(repair(0, 0, 1023), 8);
-        assert_eq!(repair(0, 0, 1024), 1);
-        assert_eq!(repair(9, 0, 2000), 2);
-        assert_eq!(repair(10, 0, 2000), 2);
-        assert_eq!(repair(29, 0, 2000), 2);
-        assert_eq!(repair(30, 0, 2000), 2);
-        assert_eq!(repair(49, 0, 2000), 3);
-        assert_eq!(repair(50, 0, 2000), 3);
-        assert_eq!(repair(100, 0, 2000), 5);
-        assert_eq!(repair(50, 49, 2000), 2, "spurious losses do not buy repair");
     }
 
     #[test]
     fn automatic_fec_waits_for_a_real_five_percent_loss_sample() {
         let worthwhile = |lost, spurious, sent| {
-            server::fec_worthwhile(Some(vot_transport_api::PathStats {
-                lost_packets: Some(lost),
-                spurious_lost_packets: Some(spurious),
-                packets_sent: Some(sent),
-                ..vot_transport_api::PathStats::default()
-            }))
+            let mut policy = connection::FecPolicy::default();
+            policy.observe(Some(path_sample(0, 0, 0)));
+            policy.observe(Some(path_sample(lost, spurious, sent)));
+            policy.coding()
         };
-        assert!(!server::fec_worthwhile(None));
-        assert!(!worthwhile(100, 0, 1023));
-        assert!(!worthwhile(99, 0, 2000));
-        assert!(worthwhile(100, 0, 2000));
-        assert!(!worthwhile(100, 1, 2000));
+        assert!(!worthwhile(410, 0, 8191));
+        assert!(!worthwhile(409, 0, 8192));
+        assert!(worthwhile(410, 0, 8192));
+        assert!(!worthwhile(410, 1, 8192));
+    }
+
+    #[test]
+    fn automatic_fec_follows_recent_loss_with_hysteresis() {
+        let mut policy = connection::FecPolicy::default();
+        for (lost, sent, coding) in [
+            (0, 0, false),
+            (410, 8192, true),
+            (738, 16_384, true),
+            (984, 24_576, true),
+            (1229, 32_768, false),
+            (1557, 40_960, false),
+            (1967, 49_152, true),
+        ] {
+            policy.observe(Some(path_sample(lost, 0, sent)));
+            assert_eq!(policy.coding(), coding, "at {lost} losses of {sent}");
+        }
+        policy.observe(None);
+        assert!(policy.coding(), "missing telemetry keeps the last verdict");
+
+        policy.observe(Some(path_sample(1967, 0, 57_344)));
+        assert!(!policy.coding(), "a recent clean window disables coding");
+        assert_eq!(policy.repair_symbols(), 1, "repair follows that window");
+    }
+
+    #[test]
+    fn a_path_counter_reset_starts_a_new_fec_sample() {
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(400, 0, 4096)));
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(0, 0, 8192)));
+        assert!(!policy.coding());
+        assert_eq!(policy.repair_symbols(), 1);
+        policy.observe(Some(path_sample(410, 0, 16_384)));
+        assert!(policy.coding());
+        assert_eq!(policy.repair_symbols(), 5);
     }
 
     #[test]
@@ -546,16 +586,14 @@ mod tests {
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
         server.service(&mut session, &mut connection).unwrap();
         session.driver().control.clear();
 
-        for (request_id, offset, lost, coded) in [(1, 0, 0, false), (2, 65_536, 100, true)] {
-            session.driver().path_stats = Some(vot_transport_api::PathStats {
-                lost_packets: Some(lost),
-                spurious_lost_packets: Some(0),
-                packets_sent: Some(2000),
-                ..vot_transport_api::PathStats::default()
-            });
+        for (request_id, offset, lost, sent, coded) in
+            [(1, 0, 0, 8192, false), (2, 65_536, 410, 16_384, true)]
+        {
+            session.driver().path_stats = Some(path_sample(lost, 0, sent));
             session
                 .driver()
                 .events
@@ -581,16 +619,14 @@ mod tests {
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
         server.service(&mut session, &mut connection).unwrap();
         session.driver().control.clear();
 
-        for (request_id, offset, lost, expected_repair) in [(1, 0, 0, 1), (2, 65_536, 60, 3)] {
-            session.driver().path_stats = Some(vot_transport_api::PathStats {
-                lost_packets: Some(lost),
-                spurious_lost_packets: Some(0),
-                packets_sent: Some(2000),
-                ..vot_transport_api::PathStats::default()
-            });
+        for (request_id, offset, lost, sent, expected_repair) in
+            [(1, 0, 0, 8192, 1), (2, 65_536, 246, 16_384, 3)]
+        {
+            session.driver().path_stats = Some(path_sample(lost, 0, sent));
             session
                 .driver()
                 .events

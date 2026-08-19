@@ -4,6 +4,7 @@ use super::{
     Error, ErrorKind, Fault, Payload, RECORD_LANE, Session, TransportAdapter, VecDeque, error_code,
     is_backpressure,
 };
+use vot_transport_api::PathStats;
 
 /// Outbound budget. Bounds the queue against a peer pipelining faster than it drains.
 pub(crate) const OUTBOUND_BUDGET_BYTES: u64 = 2 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
@@ -11,6 +12,101 @@ pub(crate) const OUTBOUND_BUDGET_BYTES: u64 = 2 * vot_scheduler::MAX_PROOF_RANGE
 /// Request identities remembered for replay detection. An exact duplicate is
 /// re-answered; a duplicate identifier with different content is a protocol error.
 pub(crate) const REMEMBERED_REQUESTS: usize = 64;
+
+/// Packets in one loss decision. Smaller observations are accumulated so
+/// service-loop cadence cannot turn a handful of drops into a path verdict.
+const FEC_SAMPLE_PACKETS: u64 = 8192;
+
+#[derive(Clone, Copy, Debug)]
+struct PathCounters {
+    lost: u64,
+    spurious: u64,
+    sent: u64,
+}
+
+/// Recent path loss, activation hysteresis, and the repair count it supports.
+#[derive(Debug)]
+pub(crate) struct FecPolicy {
+    previous: Option<PathCounters>,
+    sample_lost: u64,
+    sample_sent: u64,
+    coding: bool,
+    repair_symbols: usize,
+}
+
+impl Default for FecPolicy {
+    fn default() -> Self {
+        Self {
+            previous: None,
+            sample_lost: 0,
+            sample_sent: 0,
+            coding: false,
+            repair_symbols: super::server::FEC_REPAIR_SYMBOLS,
+        }
+    }
+}
+
+impl FecPolicy {
+    /// Adds the packets since the preceding carrier sample. Counter resets
+    /// start a new baseline; missing telemetry leaves the last decision intact.
+    pub(crate) fn observe(&mut self, stats: Option<PathStats>) {
+        let Some(PathStats {
+            lost_packets: Some(lost),
+            spurious_lost_packets: Some(spurious),
+            packets_sent: Some(sent),
+            ..
+        }) = stats
+        else {
+            return;
+        };
+        let counters = PathCounters {
+            lost,
+            spurious,
+            sent,
+        };
+        let Some(previous) = self.previous.replace(counters) else {
+            return;
+        };
+        let (Some(lost), Some(spurious), Some(sent)) = (
+            counters.lost.checked_sub(previous.lost),
+            counters.spurious.checked_sub(previous.spurious),
+            counters.sent.checked_sub(previous.sent),
+        ) else {
+            self.sample_lost = 0;
+            self.sample_sent = 0;
+            return;
+        };
+        self.sample_lost = self
+            .sample_lost
+            .saturating_add(lost.saturating_sub(spurious));
+        self.sample_sent = self.sample_sent.saturating_add(sent);
+        if self.sample_sent < FEC_SAMPLE_PACKETS {
+            return;
+        }
+
+        let lost = u128::from(self.sample_lost);
+        let sent = u128::from(self.sample_sent);
+        let received = sent.saturating_sub(lost).max(1);
+        self.repair_symbols = usize::try_from((lost * 64).div_ceil(received) + 1)
+            .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
+            .clamp(1, super::server::FEC_REPAIR_SYMBOLS);
+        self.coding = if self.coding {
+            lost * 100 >= sent * 3
+        } else {
+            lost * 20 >= sent
+        };
+        self.sample_lost = 0;
+        self.sample_sent = 0;
+    }
+
+    pub(crate) const fn coding(&self) -> bool {
+        self.coding
+    }
+
+    pub(crate) const fn repair_symbols(&self) -> usize {
+        self.repair_symbols
+    }
+}
 
 /// Per-session serving state, fresh for every accepted carrier.
 pub struct ServeConnection {
@@ -36,6 +132,8 @@ pub struct ServeConnection {
     pub(crate) fec_negotiated: bool,
     /// Whether this path currently justifies coding new range answers.
     pub(crate) fec_coding: bool,
+    /// Recent carrier loss and the FEC decision derived from it.
+    pub(crate) fec_policy: FecPolicy,
 }
 
 impl Default for ServeConnection {
@@ -53,6 +151,7 @@ impl Default for ServeConnection {
             fec: FecSender::default(),
             fec_negotiated: false,
             fec_coding: true,
+            fec_policy: FecPolicy::default(),
         }
     }
 }

@@ -567,7 +567,7 @@ impl PreparedObject {
     /// Whether aligned readback bytes match the retained preparation material.
     #[must_use]
     pub fn holds(&self, covered_offset: u64, bytes: &[u8]) -> bool {
-        if bytes.is_empty() || covered_offset % GROUP_SIZE as u64 != 0 {
+        if bytes.is_empty() || !covered_offset.is_multiple_of(GROUP_SIZE as u64) {
             return false;
         }
         let Ok(length) = u64::try_from(bytes.len()) else {

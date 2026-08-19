@@ -16,7 +16,7 @@ pub(crate) const fn cover_is_exact(
 }
 
 pub(crate) const fn proof_length_is_valid(length: u64) -> bool {
-    length <= MAX_PROOF_LENGTH && length % 32 == 0
+    length <= MAX_PROOF_LENGTH && length.is_multiple_of(32)
 }
 
 pub(crate) fn next_proof_blob_length(current: u64, added: u64) -> Result<u64, Error> {

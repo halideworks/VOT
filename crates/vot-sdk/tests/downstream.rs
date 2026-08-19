@@ -222,9 +222,8 @@ fn receipt_vector_verifies_through_the_public_facade() {
 
 #[test]
 fn representative_limits_and_failures_have_stable_codes() {
-    let error = match InMemoryObjectBuilder::new(Suite::Sha256Bep52, Some(2), 1) {
-        Ok(_) => panic!("declared length exceeds the explicit limit"),
-        Err(error) => error,
+    let Err(error) = InMemoryObjectBuilder::new(Suite::Sha256Bep52, Some(2), 1) else {
+        panic!("declared length exceeds the explicit limit");
     };
     assert_eq!(error.code(), ErrorCode::LimitExceeded);
 

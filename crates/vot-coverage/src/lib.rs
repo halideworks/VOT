@@ -68,11 +68,10 @@ impl Booking<'_> {
         let mut end = self.covered_end;
         if let Some((&earlier_start, &earlier_end)) =
             coverage.extents.range(..self.covered_offset).next_back()
+            && earlier_end == self.covered_offset
         {
-            if earlier_end == self.covered_offset {
-                coverage.extents.remove(&earlier_start);
-                start = earlier_start;
-            }
+            coverage.extents.remove(&earlier_start);
+            start = earlier_start;
         }
         if let Some(later_end) = coverage.extents.remove(&self.covered_end) {
             end = later_end;

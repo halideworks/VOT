@@ -47,11 +47,11 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Build retained proof-store fuzz driver
         run: >-
-          cargo +1.88.0 build
+          cargo +1.97.1 build
           --manifest-path fuzz/retained-proof-store/Cargo.toml --locked
 
       - name: Run bounded retained proof-store fuzz smoke test

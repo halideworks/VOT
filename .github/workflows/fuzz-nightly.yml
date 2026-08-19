@@ -18,14 +18,14 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Build standalone fuzz drivers
         run: |
-          cargo +1.88.0 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
-          cargo +1.88.0 build --manifest-path fuzz/manifest/Cargo.toml --locked
-          cargo +1.88.0 build --manifest-path fuzz/static-proof-catalog/Cargo.toml --locked
-          cargo +1.88.0 build --manifest-path fuzz/retained-proof-store/Cargo.toml --locked
+          cargo +1.97.1 build --manifest-path fuzz/frame_codec/Cargo.toml --locked
+          cargo +1.97.1 build --manifest-path fuzz/manifest/Cargo.toml --locked
+          cargo +1.97.1 build --manifest-path fuzz/static-proof-catalog/Cargo.toml --locked
+          cargo +1.97.1 build --manifest-path fuzz/retained-proof-store/Cargo.toml --locked
 
       - name: Run extended bounded fuzz smoke tests
         run: |

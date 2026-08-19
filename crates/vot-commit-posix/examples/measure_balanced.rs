@@ -77,7 +77,7 @@ fn main() {
     for iteration in 0..iterations {
         let baseline_dir = run_directory(&root, "baseline", iteration);
         let balanced_dir = run_directory(&root, "balanced", iteration);
-        if iteration % 2 == 0 {
+        if iteration.is_multiple_of(2) {
             baseline_samples.push(baseline(&baseline_dir, &bytes));
             balanced_samples.push(balanced(
                 &balanced_dir,

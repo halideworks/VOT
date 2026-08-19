@@ -72,15 +72,15 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Test native storage adapters
-        run: cargo +1.88.0 test -p vot-proof-store-file -p vot-sdk-file --locked
+        run: cargo +1.97.1 test -p vot-proof-store-file -p vot-sdk-file --locked
 
       - name: Test strict unsupported path
         if: runner.os == 'macOS'
-        run: cargo +1.88.0 test -p vot-commit-strict --locked
+        run: cargo +1.97.1 test -p vot-commit-strict --locked
 
       - name: Test Windows platform file handles
         if: runner.os == 'Windows'
-        run: cargo +1.88.0 test -p vot-platform-fs --locked
+        run: cargo +1.97.1 test -p vot-platform-fs --locked

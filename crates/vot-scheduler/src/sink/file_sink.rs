@@ -206,9 +206,8 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("staging");
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let error = match FileSink::create_new(&path, 1) {
-            Ok(_) => panic!("unsafe parent admitted"),
-            Err(error) => error,
+        let Err(error) = FileSink::create_new(&path, 1) else {
+            panic!("unsafe parent admitted");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!path.exists());

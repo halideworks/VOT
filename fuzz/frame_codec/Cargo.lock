@@ -213,9 +213,9 @@ dependencies = [
 
 [[package]]
 name = "fearless_simd"
-version = "0.5.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a847f35d37ef14f89ccd8028d7d98a43a59d3c9bfae690ca7a8a95a5937ff9b5"
+checksum = "f4beca3cb2444e3304ac30843cc091f44ed58932353cd492ce740067bfce6b12"
 
 [[package]]
 name = "fiat-crypto"

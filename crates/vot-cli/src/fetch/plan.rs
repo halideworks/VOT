@@ -296,11 +296,10 @@ impl FetchPlan {
                 .range(..=offset)
                 .next_back()
                 .map(|(at, length)| (*at, *length))
+                && at.saturating_add(length) > offset
             {
-                if at.saturating_add(length) > offset {
-                    offset = at.saturating_add(length);
-                    continue;
-                }
+                offset = at.saturating_add(length);
+                continue;
             }
             let Some((offset, mut length)) = range_span(offset, object.length) else {
                 return Ok(None);

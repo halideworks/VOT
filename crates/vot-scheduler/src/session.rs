@@ -2569,7 +2569,7 @@ mod tests {
             .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
         for generation in 0..2 {
             for (i, datagram) in symbols_of(&plan, generation, &records).iter().enumerate() {
-                if i % 17 == 0 {
+                if i.is_multiple_of(17) {
                     continue;
                 }
                 push_datagram(&mut driver, datagram);

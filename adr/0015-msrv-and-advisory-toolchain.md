@@ -28,5 +28,5 @@ security policy and dependency resolution.
 ## Consequences
 
 Rust 1.85 is no longer a supported build toolchain. Historical mutation and
-benchmark evidence produced under 1.85 remains valid as historical evidence,
-but new CI evidence uses the declared 1.88 MSRV.
+benchmark evidence remains valid. The workspace minimum moved to Rust 1.97 on
+2026-08-19 because stable Rust releases do not receive security backports.

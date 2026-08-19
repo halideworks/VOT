@@ -762,7 +762,10 @@ mod tests {
             .skip(1)
             .step_by(2)
             .map(|value| {
-                assert!(value.len() % 2 == 0, "{name} holds an odd hex string");
+                assert!(
+                    value.len().is_multiple_of(2),
+                    "{name} holds an odd hex string"
+                );
                 value
                     .as_bytes()
                     .chunks_exact(2)

@@ -75,7 +75,10 @@ impl CatalogHeader {
         }
         let relative = read_u64(bytes, 0);
         let proof_length = u64::from(read_u32(bytes, 8));
-        if read_u32(bytes, 12) != 0 || proof_length > MAX_PROOF_LENGTH || proof_length % 32 != 0 {
+        if read_u32(bytes, 12) != 0
+            || proof_length > MAX_PROOF_LENGTH
+            || !proof_length.is_multiple_of(32)
+        {
             return Err(Error::MalformedCatalog);
         }
         let relative_end = relative

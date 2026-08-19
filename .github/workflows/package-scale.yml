@@ -32,12 +32,12 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Run bounded-memory package scale evidence
         env:
           VOT_TEST_TEMP: ${{ runner.temp }}/vot-package-scale
         run: >-
-          cargo +1.88.0 test -p vot-package --test package_builder_scale
+          cargo +1.97.1 test -p vot-package --test package_builder_scale
           --locked -- --ignored --exact
           million_entry_package_stays_below_allocation_cap --nocapture

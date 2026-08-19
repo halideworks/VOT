@@ -767,12 +767,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                         .saturating_add(bundle.covered_length);
                     // Booked into shared coverage, which completes the object.
                     // The subject check drops stragglers.
-                    if let Some(mut plan) = self.locked_plan() {
-                        if plan.objects.get(plan.current).map(subject_of)
+                    if let Some(mut plan) = self.locked_plan()
+                        && plan.objects.get(plan.current).map(subject_of)
                             == Some(proved.completed.subject())
-                        {
-                            plan.cover(bundle.covered_offset, bundle.covered_length);
-                        }
+                    {
+                        plan.cover(bundle.covered_offset, bundle.covered_length);
                     }
                 }
                 Err(error) => {
@@ -878,10 +877,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             }
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
-        if let Some(pin) = self.pin {
-            if pin != descriptor.package.root {
-                return Err(Fault::Pin);
-            }
+        if let Some(pin) = self.pin
+            && pin != descriptor.package.root
+        {
+            return Err(Fault::Pin);
         }
         if descriptor.package.suite != 1 {
             // The package root is blake3 over the entry sequence; any other
@@ -937,22 +936,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let manifest_id = descriptor.manifest_id;
         if let Some((first_page, page_count)) =
             self.manifest.spans.get(self.manifest.next_span).copied()
+            && self.manifest.pages_received == first_page
         {
-            if self.manifest.pages_received == first_page {
-                let request_id =
-                    Self::request_identifier(&mut self.rail.next_request).map_err(Fault::Local)?;
-                Self::queue_request(
-                    &mut self.rail.pending,
-                    &TypedFrame::ManifestRequest(ManifestRequest {
-                        request_id,
-                        manifest_id,
-                        first_page,
-                        page_count,
-                    }),
-                )
-                .map_err(Fault::Local)?;
-                self.manifest.next_span += 1;
-            }
+            let request_id =
+                Self::request_identifier(&mut self.rail.next_request).map_err(Fault::Local)?;
+            Self::queue_request(
+                &mut self.rail.pending,
+                &TypedFrame::ManifestRequest(ManifestRequest {
+                    request_id,
+                    manifest_id,
+                    first_page,
+                    page_count,
+                }),
+            )
+            .map_err(Fault::Local)?;
+            self.manifest.next_span += 1;
         }
         Ok(())
     }
@@ -1109,13 +1107,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // Forget partial accounts for objects the plan left behind, so
             // the receiver is bounded by what is current, not everything
             // this rail touched.
-            if let Some((index, subject)) = self.rail.admitted {
-                if index != plan.current {
-                    if !self.receiver.is_verified(subject) {
-                        self.receiver.abandon(subject);
-                    }
-                    self.rail.admitted = None;
+            if let Some((index, subject)) = self.rail.admitted
+                && index != plan.current
+            {
+                if !self.receiver.is_verified(subject) {
+                    self.receiver.abandon(subject);
                 }
+                self.rail.admitted = None;
             }
             if let Some(sink) = plan.active.clone() {
                 let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
@@ -1142,12 +1140,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 if synced.is_ok() {
                     // The whole object is now durable; a resume never asks
                     // for it again.
-                    if let Some(store) = &store {
-                        if let Ok(mut store) = store.lock() {
-                            let mut units = UnitRanges::new();
-                            units.extend_units(0..total_units_of(length));
-                            let _ = store.checkpoint_units(subject, total_units_of(length), &units);
-                        }
+                    if let Some(store) = &store
+                        && let Ok(mut store) = store.lock()
+                    {
+                        let mut units = UnitRanges::new();
+                        units.extend_units(0..total_units_of(length));
+                        let _ = store.checkpoint_units(subject, total_units_of(length), &units);
                     }
                 }
                 let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
@@ -1218,10 +1216,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // or a later resume would trust bytes nobody placed.
                 let at = plan.current;
                 if !plan.objects[at].resumed.is_empty() {
-                    if let Some(store) = &plan.store {
-                        if let Ok(mut store) = store.lock() {
-                            store.reset(subject).map_err(resume_failure)?;
-                        }
+                    if let Some(store) = &plan.store
+                        && let Ok(mut store) = store.lock()
+                    {
+                        store.reset(subject).map_err(resume_failure)?;
                     }
                     plan.objects[at].resumed.clear();
                 }

@@ -231,6 +231,12 @@ mod tests {
     use vot_scheduler::ReliableReceiver;
     use vot_transport_api::SubjectId;
 
+    fn forced_fec_server(bundle: &std::path::Path) -> BundleServer {
+        let mut server = BundleServer::open(bundle).unwrap();
+        server.automatic_fec = false;
+        server
+    }
+
     /// A ready server session with handshake replies cleared.
     pub(crate) fn ready_session() -> Session<Loopback> {
         ready_session_with(Settings::default())
@@ -594,8 +600,11 @@ mod tests {
     #[test]
     fn automatic_fec_keeps_clean_ranges_reliable_then_codes_lossy_ranges() {
         let (bundle, _) = built_bundle("automatic-fec", &[("two-groups.bin", patterned(131_072))]);
-        let mut server = BundleServer::open(&bundle).unwrap();
-        server.automatic_fec = true;
+        let server = BundleServer::open(&bundle).unwrap();
+        assert!(
+            server.automatic_fec,
+            "the public server defaults to automatic FEC"
+        );
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -628,7 +637,7 @@ mod tests {
     #[test]
     fn each_service_pass_uses_its_path_sample_for_new_epochs() {
         let (bundle, _) = built_bundle("adaptive-fec", &[("two-groups.bin", patterned(131_072))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -697,7 +706,7 @@ mod tests {
     #[test]
     pub(crate) fn a_negotiated_credited_session_is_answered_over_the_datagram_path() {
         let (bundle, _) = built_bundle("coded", &[("big.bin", patterned(300_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -799,7 +808,7 @@ mod tests {
     #[test]
     pub(crate) fn an_abandoned_or_refused_generation_is_resent_reliably() {
         let (bundle, _) = built_bundle("resend", &[("big.bin", patterned(200_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -927,7 +936,7 @@ mod tests {
         // and an epoch holding one generation that cannot decode keeps its
         // slot to the end of the run.
         let (bundle, _) = built_bundle("quiet", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1056,7 +1065,7 @@ mod tests {
         // decoded then held its bundle part-built until the fetch ran out of
         // admission.
         let (bundle, _) = built_bundle("busy", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1113,7 +1122,7 @@ mod tests {
         // carrier that takes nothing leaves the epoch unretirable however
         // long the receiver stays silent.
         let (bundle, _) = built_bundle("held", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1182,7 +1191,7 @@ mod tests {
         // The other half: silence about an epoch this end has not finished
         // sending says nothing about the receiver, however long it lasts.
         let (bundle, _) = built_bundle("unsent", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1233,7 +1242,7 @@ mod tests {
         // each its own bundle, proof, and epoch, the request partitioned
         // between them.
         let (bundle, _) = built_bundle("pieces", &[("big.bin", patterned(1_500_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1363,7 +1372,7 @@ mod tests {
     #[test]
     pub(crate) fn a_repeated_abandon_resends_once() {
         let (bundle, _) = built_bundle("once", &[("big.bin", patterned(200_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1419,7 +1428,7 @@ mod tests {
     #[test]
     pub(crate) fn without_credit_or_generation_room_the_answer_rides_reliably() {
         let (bundle, _) = built_bundle("plain", &[("big.bin", patterned(200_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         // Negotiated, but the peer never extended credit: the reliable answer.
         let mut session = ready_session_fec(frames::DatagramCredit {
@@ -1539,7 +1548,7 @@ mod tests {
     #[test]
     pub(crate) fn a_range_starting_on_a_later_group_is_coded_from_that_group() {
         let (bundle, _) = built_bundle("later", &[("big.bin", patterned(200_000))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();
@@ -1992,7 +2001,7 @@ mod tests {
     #[test]
     fn a_deferred_request_does_not_stop_a_silent_epoch_clock() {
         let (bundle, _) = built_bundle("deferred-quiet", &[("a.bin", patterned(65_536))]);
-        let server = BundleServer::open(&bundle).unwrap();
+        let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
         let mut session = ready_session_fec(ample_credit());
         let mut connection = ServeConnection::new();

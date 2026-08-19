@@ -658,7 +658,8 @@ mod tests {
         let serving_bundle = bundle.to_path_buf();
         let serving_offer = fec.clone();
         let serving_thread = std::thread::spawn(move || {
-            let server = BundleServer::open(&serving_bundle)?;
+            let mut server = BundleServer::open(&serving_bundle)?;
+            server.automatic_fec = false;
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
                 let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
@@ -708,23 +709,28 @@ mod tests {
         let (client, mut serving) = crate::harness::duplex_pair();
         serving.drop_datagram_every = 9;
         let serving_bundle = bundle.to_path_buf();
-        let serving_offer = fec.clone();
         let serving_thread = std::thread::spawn(move || {
-            let server = BundleServer::open(&serving_bundle)?;
+            let mut server = BundleServer::open(&serving_bundle)?;
+            assert!(
+                server.automatic_fec,
+                "the public server defaults to automatic FEC"
+            );
+            // This test pins the coded path rather than the automatic policy,
+            // whose changing path samples are covered in the serve tests.
+            server.automatic_fec = false;
             let mut answered = Some(serving);
             crate::drive::serve_sessions(Some(1), || {
                 let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
                 crate::drive::ServeSession::begin(
                     &server,
                     carrier,
-                    crate::authz::Stance::open([7; 32]).offering(serving_offer.clone()),
+                    crate::authz::Stance::open([7; 32]),
                 )
             })
         });
         let output = temporary("in-process-fec-fetched");
-        let mut fetcher =
-            BundleFetcher::begin_with(client, &output, Some(built.root), None, fec.clone())
-                .expect("a fetch offering the extension");
+        let mut fetcher = BundleFetcher::begin(client, &output, Some(built.root))
+            .expect("a fetch offering the default extensions");
         assert_eq!(fetcher.extensions(), fec);
         assert_eq!(
             fetcher.fec_counts(),
@@ -754,7 +760,7 @@ mod tests {
             .join()
             .expect("the serving thread")
             .expect("served");
-        // A fetch offering nothing decodes nothing.
+        // A fetch can explicitly offer nothing and decodes nothing.
         let (client, serving) = crate::harness::duplex_pair();
         let serving_bundle = bundle.to_path_buf();
         let serving_thread = std::thread::spawn(move || {
@@ -770,7 +776,9 @@ mod tests {
             })
         });
         let output = temporary("in-process-plain-fetched");
-        let mut plain = BundleFetcher::begin(client, &output, Some(built.root)).unwrap();
+        let mut plain =
+            BundleFetcher::begin_offering(client, &output, Some(built.root), BTreeSet::new())
+                .unwrap();
         assert!(plain.extensions().is_empty());
         assert_eq!(
             crate::drive::drive(&mut plain).expect("a driven fetch"),

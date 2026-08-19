@@ -260,7 +260,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// and durable ranges are skipped. A destination without a store is
     /// refused.
     pub fn begin(adapter: A, bundle: &Path, pin: Option<[u8; 32]>) -> Result<Self, Error> {
-        Self::begin_with(adapter, bundle, pin, None, BTreeSet::new())
+        Self::begin_offering(adapter, bundle, pin, crate::authz::default_extensions())
+    }
+
+    /// [`Self::begin`] offering exactly `extensions`; an empty set disables
+    /// every optional extension.
+    ///
+    /// # Errors
+    /// As [`Self::begin`].
+    pub fn begin_offering(
+        adapter: A,
+        bundle: &Path,
+        pin: Option<[u8; 32]>,
+        extensions: BTreeSet<u64>,
+    ) -> Result<Self, Error> {
+        Self::begin_with(adapter, bundle, pin, None, extensions)
     }
 
     /// [`Self::begin`] holding a capability to present.

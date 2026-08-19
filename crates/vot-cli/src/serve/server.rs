@@ -92,7 +92,7 @@ impl BundleServer {
             manifest_directory,
             announcement,
             objects,
-            automatic_fec: false,
+            automatic_fec: true,
         })
     }
 

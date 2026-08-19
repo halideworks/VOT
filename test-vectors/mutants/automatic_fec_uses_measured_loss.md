@@ -16,6 +16,8 @@ answers one range with zero loss and a second at 5% on the same negotiated,
 credited session, asserting that only the second emits datagrams.
 `repair_count_tracks_recent_real_loss_after_startup` pins the repair calculation at
 its boundaries and after subtracting spurious loss.
+`automatic_fec_accumulates_subwindow_counter_deltas` pins accumulation across
+several carrier samples before a decision.
 `automatic_fec_follows_recent_loss_with_hysteresis` exercises both sides of
 the hysteresis band and proves a clean recent window overrides lossy history.
 `a_path_counter_reset_starts_a_new_fec_sample` proves pre-reset packets cannot
@@ -80,5 +82,15 @@ thread 'serve::tests::a_path_counter_reset_starts_a_new_fec_sample' panicked at 
 assertion `left == right` failed
   left: 5
  right: 1
+test result: FAILED. 0 passed; 1 failed
+```
+
+Mutant 6: replace sub-window delta accumulation with assignment.
+
+Observed failure:
+
+```text
+thread 'serve::tests::automatic_fec_accumulates_subwindow_counter_deltas' panicked at crates/vot-cli/src/serve/mod.rs:553:9:
+assertion failed: policy.coding()
 test result: FAILED. 0 passed; 1 failed
 ```

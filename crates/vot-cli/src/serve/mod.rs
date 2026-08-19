@@ -542,6 +542,19 @@ mod tests {
     }
 
     #[test]
+    fn automatic_fec_accumulates_subwindow_counter_deltas() {
+        let mut policy = connection::FecPolicy::default();
+        for sent in [0, 2048, 4096, 6144] {
+            policy.observe(Some(path_sample(u64::from(sent > 0) * 410, 0, sent)));
+            assert!(!policy.coding());
+            assert_eq!(policy.repair_symbols(), 8);
+        }
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding());
+        assert_eq!(policy.repair_symbols(), 5);
+    }
+
+    #[test]
     fn automatic_fec_follows_recent_loss_with_hysteresis() {
         let mut policy = connection::FecPolicy::default();
         for (lost, sent, coding) in [

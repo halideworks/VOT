@@ -119,7 +119,7 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
     if let TypedFrame::DataRecord(value) = frame {
         validate_data_record(value)?;
         let payload_len = data_record_payload_len(value);
-        output.reserve(payload_len + 9);
+        output.reserve(payload_len.saturating_add(9));
         encode_varint(frame_type::DATA_RECORD, output)?;
         encode_varint(payload_len as u64, output)?;
         encode_validated_data_record(value, output);

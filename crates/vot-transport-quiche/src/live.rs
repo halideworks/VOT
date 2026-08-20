@@ -783,10 +783,11 @@ impl Transport {
 }
 
 impl Drop for Transport {
-    /// Stops the driver, which can wait on the peer.
+    /// Stops the driver.
     ///
-    /// The close must reach the peer for the connection to drain, so dropping
-    /// an endpoint whose peer has vanished waits out the idle timeout.
+    /// The driver flushes the close onto the wire and exits without waiting
+    /// out the draining period, so this returns within a pass or two even
+    /// when the peer has vanished.
     fn drop(&mut self) {
         // The driver owns the socket, so it must stop before this returns or
         // the port outlives the endpoint. The command channel is disconnected
@@ -1182,6 +1183,17 @@ fn run(
         }
 
         if conn.is_closed() {
+            break 'drive Ok(());
+        }
+        // A close this end asked for is on the wire once the send above
+        // flushed it. The draining period that remains exists so a peer's
+        // retransmissions can be answered, and the peer answers a close
+        // with its own; waiting it out costs whole round-trip times per
+        // connection and settles nothing the application has not already,
+        // since an owner only drops its carrier after its protocol is done.
+        // A peer-initiated close is not this end's to cut short and takes
+        // the full path above.
+        if closing && conn.is_draining() {
             break 'drive Ok(());
         }
 

@@ -91,6 +91,12 @@ impl ObjectCoverage {
         self.inner.covered_bytes()
     }
 
+    /// Bytes covered contiguously from offset zero; the safe resume point.
+    #[must_use]
+    pub fn contiguous_prefix(&self) -> u64 {
+        self.inner.contiguous_prefix()
+    }
+
     #[must_use]
     pub fn fragment_count(&self) -> usize {
         self.inner.fragment_count()

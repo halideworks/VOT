@@ -172,6 +172,16 @@ impl Coverage {
         self.bytes
     }
 
+    /// Bytes covered contiguously from offset zero.
+    ///
+    /// Resume decisions need this, not [`Self::covered_bytes`]: ranges commit
+    /// out of order, so the covered-byte count can include extents beyond a
+    /// hole, and restarting a transfer from that count would skip the hole.
+    #[must_use]
+    pub fn contiguous_prefix(&self) -> u64 {
+        self.extents.get(&0).copied().unwrap_or(0)
+    }
+
     /// Whether the covered-byte count exactly equals `length`.
     #[must_use]
     pub const fn is_complete(&self, length: u64) -> bool {
@@ -239,6 +249,20 @@ mod tests {
         assert!(!coverage.is_complete(29));
         assert!(matches!(coverage.check(5, 10), Ok(Check::Replay)));
         assert_eq!(coverage.covered_bytes(), 30);
+    }
+
+    #[test]
+    fn contiguous_prefix_stops_at_the_first_hole() {
+        let mut coverage = Coverage::new();
+        assert_eq!(coverage.contiguous_prefix(), 0);
+        commit(&mut coverage, 4, 2);
+        assert_eq!(coverage.covered_bytes(), 2);
+        assert_eq!(coverage.contiguous_prefix(), 0);
+        commit(&mut coverage, 0, 2);
+        assert_eq!(coverage.contiguous_prefix(), 2);
+        commit(&mut coverage, 2, 2);
+        assert_eq!(coverage.contiguous_prefix(), 6);
+        assert_eq!(coverage.covered_bytes(), 6);
     }
 
     #[test]

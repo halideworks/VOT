@@ -783,10 +783,11 @@ impl Transport {
 }
 
 impl Drop for Transport {
-    /// Stops the driver, which can wait on the peer.
+    /// Stops the driver.
     ///
-    /// The close must reach the peer for the connection to drain, so dropping
-    /// an endpoint whose peer has vanished waits out the idle timeout.
+    /// The driver flushes the close onto the wire and exits without waiting
+    /// out the draining period, so this returns within a pass or two even
+    /// when the peer has vanished.
     fn drop(&mut self) {
         // The driver owns the socket, so it must stop before this returns or
         // the port outlives the endpoint. The command channel is disconnected
@@ -1182,6 +1183,20 @@ fn run(
         }
 
         if conn.is_closed() {
+            break 'drive Ok(());
+        }
+        // A close this end sent is on the wire once the send above flushed
+        // it: quiche arms the draining timer as it packs the frame, and
+        // every path out of the send flushes its burst first. The draining
+        // period that remains would answer nothing, since this quiche drops
+        // straight to draining rather than answering retransmissions, so
+        // waiting it out costs whole round-trip times per connection and
+        // settles nothing. `local_error` rather than the request flag,
+        // because it is set exactly when this end's close was packed: a
+        // peer-initiated close leaves it empty and takes the full path
+        // above, and a fault-path close this end sent without a caller's
+        // request leaves just as promptly.
+        if conn.local_error().is_some() && conn.is_draining() {
             break 'drive Ok(());
         }
 

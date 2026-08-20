@@ -5,3 +5,4 @@ struct vot_sdk_file::Acceptance
 struct vot_sdk_file::Error
 struct vot_sdk_file::NativeFile
 struct vot_sdk_file::Progress
+struct vot_sdk_file::PublishObservation

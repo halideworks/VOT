@@ -120,6 +120,15 @@ pub struct Acceptance {
     pub progress: Progress,
 }
 
+/// Provider-level observation captured by a successful publish, for callers
+/// that issue receipts about the publication. Unix only today: the Windows
+/// path does not surface an incarnation or sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublishObservation {
+    pub incarnation: [u8; 16],
+    pub sequence: u64,
+}
+
 #[cfg(unix)]
 struct Backend {
     commit: vot_commit_posix::PosixCommit<vot_commit_posix::NoFaults>,
@@ -144,6 +153,7 @@ pub struct NativeFile {
     sealed: bool,
     preserve_recovery: bool,
     published: bool,
+    observation: Option<PublishObservation>,
     #[cfg(unix)]
     profile: CommitProfile,
     #[cfg(test)]
@@ -182,6 +192,7 @@ impl NativeFile {
             sealed: false,
             preserve_recovery: false,
             published: false,
+            observation: None,
             #[cfg(unix)]
             profile,
             #[cfg(test)]
@@ -203,6 +214,13 @@ impl NativeFile {
     #[must_use]
     pub const fn recovery_required(&self) -> bool {
         self.preserve_recovery
+    }
+
+    /// The provider observation from the last successful [`Self::publish`],
+    /// or `None` before publication and on platforms without one.
+    #[must_use]
+    pub const fn publish_observation(&self) -> Option<PublishObservation> {
+        self.observation
     }
 
     /// Writes one authenticated range and commits its coverage only after the
@@ -298,7 +316,14 @@ impl NativeFile {
         };
         self.preserve_recovery =
             backend.commit.state() == vot_commit_model::State::RecoveryRequired;
-        result.map(|_| ()).map_err(map_posix)
+        result
+            .map(|receipt| {
+                self.observation = Some(PublishObservation {
+                    incarnation: receipt.incarnation,
+                    sequence: receipt.sequence,
+                });
+            })
+            .map_err(map_posix)
     }
 
     #[cfg(windows)]
@@ -677,6 +702,35 @@ mod tests {
         let staging = file.staging.clone();
         assert_eq!(file.cancel().unwrap_err().kind(), ErrorKind::StateConflict);
         assert!(staging.exists(), "recovery state was discarded by Drop");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_captures_a_provider_observation() {
+        let directory = directory("observation");
+        let bytes = b"observed bytes";
+        let prepared = object(bytes);
+        let proof = prepared.prove(0, 1).unwrap();
+        let verified = vot_sdk::verify::verify_range(
+            prepared.object_id(),
+            proof.covered_offset(),
+            bytes,
+            proof.proof(),
+        )
+        .unwrap();
+        let mut file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        assert_eq!(file.publish_observation(), None);
+        file.accept(&verified).unwrap();
+        file.publish().unwrap();
+        let observation = file.publish_observation().expect("published observation");
+        assert!(observation.sequence >= 1);
+        assert_ne!(observation.incarnation, [0; 16]);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -250,34 +250,37 @@ where
     if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
         return Err(Error::InvalidArguments);
     }
-    if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
-        return Ok(Fetched {
-            package: fetched(&primary, status)?,
-            moved: primary.moved_bytes(),
-            first_moved: primary.first_moved(),
-            fec: primary.fec_counts(),
-        });
-    }
-    let Some(plan) = primary.shared_plan() else {
-        return Err(Error::InvalidBundle);
-    };
     let bundle = primary.bundle().to_owned();
     let provers = primary.proving_threads();
     // Every rail opens its own session and answers its own challenge, under
     // the token the primary was given.
     let holder = primary.holder();
     let extensions = primary.extensions();
+    // Rails wait here for the plan, or for None when the primary ends
+    // without one. Every path out of the manifest phase below sets it, or a
+    // waiting rail would never wake.
+    let plan_gate: std::sync::OnceLock<Option<crate::fetch::SharedPlan>> =
+        std::sync::OnceLock::new();
     std::thread::scope(|scope| {
         let mut spawned = Vec::new();
         for _ in 1..rails {
-            let plan = crate::fetch::SharedPlan::clone(&plan);
             let connect = &connect;
             let bundle = bundle.clone();
             let holder = holder.clone();
             let extensions = extensions.clone();
+            let gate = &plan_gate;
             spawned.push(scope.spawn(move || {
                 let outcome = (|| {
+                    // Connect before waiting for the plan: at any real
+                    // round-trip time the manifest phase is where the
+                    // transfer's serial time goes, and this handshake rides
+                    // under it instead of after it.
                     let carrier = connect()?;
+                    let Some(plan) = gate.wait().as_ref() else {
+                        // The primary finished or failed without a plan;
+                        // there is nothing to join and nothing to abandon.
+                        return Ok(None);
+                    };
                     let mut rail = crate::BundleFetcher::join(
                         carrier,
                         &bundle,
@@ -287,14 +290,36 @@ where
                     )?;
                     rail.set_proving_threads(provers)?;
                     fetch_verdict(drive(&mut rail)?)?;
-                    Ok((rail.fec_counts(), rail.first_moved()))
+                    Ok(Some((rail.fec_counts(), rail.first_moved())))
                 })();
-                if outcome.is_err() {
-                    crate::fetch::abandon_plan(&plan);
+                if outcome.is_err()
+                    && let Some(plan) = gate.wait().as_ref()
+                {
+                    crate::fetch::abandon_plan(plan);
                 }
                 outcome
             }));
         }
+        // The manifest phase: the primary alone, up to the shared plan.
+        let early = drive_until(&mut primary, |fetcher| fetcher.package().is_some());
+        let plan = match &early {
+            Ok(None) => primary.shared_plan(),
+            Ok(Some(_)) | Err(_) => None,
+        };
+        let _ = plan_gate.set(plan.clone());
+        if let Some(status) = early? {
+            // Settled before the plan existed: the whole fetch is the
+            // primary's, and the rails connected for nothing.
+            return Ok(Fetched {
+                package: fetched(&primary, status)?,
+                moved: primary.moved_bytes(),
+                first_moved: primary.first_moved(),
+                fec: primary.fec_counts(),
+            });
+        }
+        let Some(plan) = plan else {
+            return Err(Error::InvalidBundle);
+        };
         let outcome = drive(&mut primary).and_then(|status| fetched(&primary, status));
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
@@ -304,10 +329,11 @@ where
         let mut rail_failure = None;
         for rail in spawned {
             match rail.join().expect("a rail thread never panics") {
-                Ok((counts, first)) => {
+                Ok(Some((counts, first))) => {
                     fec = fec + counts;
                     first_moved = earliest_observation(first_moved, first);
                 }
+                Ok(None) => {}
                 Err(error) => rail_failure = Some(named_failure(rail_failure, error)),
             }
         }

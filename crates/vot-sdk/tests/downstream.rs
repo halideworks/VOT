@@ -81,6 +81,7 @@ fn coverage_accepts_only_authenticated_ranges_for_one_identity() {
     let mut accepted = coverage::ObjectCoverage::new(&object);
     assert_eq!(accepted.object_id(), &object);
     assert_eq!(accepted.covered_bytes(), 0);
+    assert_eq!(accepted.contiguous_prefix(), 0);
     assert_eq!(accepted.fragment_count(), 0);
     assert!(!accepted.is_complete());
     assert_eq!(
@@ -88,6 +89,7 @@ fn coverage_accepts_only_authenticated_ranges_for_one_identity() {
         coverage::CoverageUpdate::Accepted
     );
     assert_eq!(accepted.covered_bytes(), 65_536);
+    assert_eq!(accepted.contiguous_prefix(), 65_536);
     assert_eq!(accepted.fragment_count(), 1);
     assert_eq!(
         accepted.accept(&first).expect("authenticated replay"),

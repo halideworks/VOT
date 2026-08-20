@@ -105,6 +105,10 @@ pub enum RangeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Progress {
     pub covered_bytes: u64,
+    /// Bytes covered contiguously from offset zero. Ranges arrive out of
+    /// order, so this is the only safe offset to resume an upload from;
+    /// `covered_bytes` may count extents beyond a hole.
+    pub prefix_bytes: u64,
     pub total_bytes: u64,
     pub fragments: usize,
 }
@@ -189,6 +193,7 @@ impl NativeFile {
     pub fn progress(&self) -> Progress {
         Progress {
             covered_bytes: self.coverage.covered_bytes(),
+            prefix_bytes: self.coverage.contiguous_prefix(),
             total_bytes: self.object.length,
             fragments: self.coverage.fragment_count(),
         }
@@ -672,6 +677,42 @@ mod tests {
         let staging = file.staging.clone();
         assert_eq!(file.cancel().unwrap_err().kind(), ErrorKind::StateConflict);
         assert!(staging.exists(), "recovery state was discarded by Drop");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn progress_prefix_stops_at_a_hole_left_by_out_of_order_ranges() {
+        let directory = directory("prefix");
+        let data = vec![0x5a; 131_072];
+        let prepared = object(&data);
+        let mut file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        let second_proof = prepared.prove(65_536, 1).unwrap();
+        let second = vot_sdk::verify::verify_range(
+            prepared.object_id(),
+            second_proof.covered_offset(),
+            &data[65_536..],
+            second_proof.proof(),
+        )
+        .unwrap();
+        let progress = file.accept(&second).unwrap().progress;
+        assert_eq!(progress.covered_bytes, 65_536);
+        assert_eq!(progress.prefix_bytes, 0);
+        let first_proof = prepared.prove(0, 1).unwrap();
+        let first = vot_sdk::verify::verify_range(
+            prepared.object_id(),
+            first_proof.covered_offset(),
+            &data[..65_536],
+            first_proof.proof(),
+        )
+        .unwrap();
+        let progress = file.accept(&first).unwrap().progress;
+        assert_eq!(progress.covered_bytes, 131_072);
+        assert_eq!(progress.prefix_bytes, 131_072);
         fs::remove_dir_all(directory).unwrap();
     }
 

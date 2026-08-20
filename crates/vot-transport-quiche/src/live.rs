@@ -332,6 +332,12 @@ pub struct Config {
     pub max_datagram_bytes: usize,
     /// The congestion controller this endpoint runs.
     pub congestion: CongestionControl,
+    /// Initial congestion window in packets, or the controller's default.
+    ///
+    /// The sender's window governs a transfer, so this matters on the
+    /// serving end. An operator who knows the path seeds it to skip most of
+    /// slow start; the controller still collapses it on loss.
+    pub initial_congestion_window_packets: Option<usize>,
     /// A lead byte whose datagrams are not this transport's, handed to
     /// the listener's side channel instead of routed.
     ///
@@ -380,6 +386,7 @@ impl Config {
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
+            initial_congestion_window_packets: None,
             side_channel_lead: None,
         }
     }
@@ -396,6 +403,7 @@ impl Config {
             accept_timeout_ms: ACCEPT_TIMEOUT_MS,
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
+            initial_congestion_window_packets: None,
             side_channel_lead: None,
         }
     }
@@ -423,6 +431,9 @@ impl Config {
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         config.verify_peer(self.verify_peer);
+        if let Some(packets) = self.initial_congestion_window_packets {
+            config.set_initial_congestion_window_packets(packets);
+        }
         config.set_max_idle_timeout(self.idle_timeout_ms);
         if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
             return Err(Error::InvalidConfiguration);

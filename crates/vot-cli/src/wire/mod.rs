@@ -1531,6 +1531,19 @@ mod tests {
     }
 
     #[test]
+    fn an_initial_window_is_bounded_packets() {
+        assert_eq!(initial_cwnd_from(None).unwrap(), None);
+        assert_eq!(initial_cwnd_from(Some("1024")).unwrap(), Some(1024));
+        assert_eq!(initial_cwnd_from(Some(" 44739\n")).unwrap(), Some(44_739));
+        assert!(initial_cwnd_from(Some("9")).is_err(), "below the default");
+        assert!(
+            initial_cwnd_from(Some("44740")).is_err(),
+            "past the burst bound"
+        );
+        assert!(initial_cwnd_from(Some("wide")).is_err());
+    }
+
+    #[test]
     fn an_identity_pin_is_exactly_its_hex() {
         assert_eq!(identity_from(None).unwrap(), None);
         let hex = "7503bcc1b8fe0bfe100a9d32204f17133de6a6069db7ff27770f9589f142a988";

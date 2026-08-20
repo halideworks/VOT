@@ -2,10 +2,11 @@
 
 use super::{
     BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
-    FETCH_RAILS, FETCH_SERVE_IDENTITY, FETCH_STATS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT,
-    PackageSummary, Path, RELAY, SocketAddr, Transport, apply_datagram_bytes, carrier_failure,
-    congestion_from, extensions_from, holder_from, identity_from, limits, local_for, punch,
-    rails_from, rendezvous_from, stats_wanted, take_slot,
+    FETCH_RAILS, FETCH_SERVE_IDENTITY, FETCH_STATS, INITIAL_CWND, PROGRESS_QUANTUM_BYTES,
+    PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr, Transport, apply_datagram_bytes,
+    carrier_failure, congestion_from, extensions_from, holder_from, identity_from,
+    initial_cwnd_from, limits, local_for, punch, rails_from, rendezvous_from, stats_wanted,
+    take_slot,
 };
 
 /// How long a pinned fetch waits for the handshake to deliver the serve's
@@ -81,6 +82,8 @@ pub(crate) fn client_config() -> Result<Config, Error> {
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
+    config.initial_congestion_window_packets =
+        initial_cwnd_from(std::env::var(INITIAL_CWND).ok().as_deref())?;
     Ok(config)
 }
 

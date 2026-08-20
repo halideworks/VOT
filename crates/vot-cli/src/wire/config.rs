@@ -62,6 +62,29 @@ fn positive(value: &str) -> Result<u64, Error> {
 /// The environment variable that picks the congestion controller.
 pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
 
+/// The environment variable that seeds the initial congestion window, in
+/// packets. The sender's window governs a transfer, so it matters on the
+/// serve; at any real round-trip time slow start from the default ten
+/// packets is most of a small transfer's wall clock, and an operator who
+/// knows the path skips it. The controller still collapses the window on
+/// loss, so a wrong value costs one round of loss, not correctness.
+pub(crate) const INITIAL_CWND: &str = "VOT_INITIAL_CWND";
+
+/// The most packets [`INITIAL_CWND`] accepts: 64 MB of 1500-byte packets,
+/// past any bandwidth-delay product this moves well on.
+const MAX_INITIAL_CWND: usize = 44_739;
+
+/// The window [`INITIAL_CWND`] names, or nothing when unset.
+///
+/// # Errors
+/// Rejects a value that is not a number or is outside 10 to
+/// [`MAX_INITIAL_CWND`] packets: below the default it is a lie about the
+/// path, and unbounded it is a burst the first loss pays for.
+pub(crate) fn initial_cwnd_from(pin: Option<&str>) -> Result<Option<usize>, Error> {
+    pin.map(|value| bounded(value, 10..=MAX_INITIAL_CWND))
+        .transpose()
+}
+
 /// The environment variable that pins the serve's identity: the 64 hex
 /// characters of the blake3 digest of its certificate in DER, as the serve
 /// prints at startup. Unset accepts any serve; the package root still holds

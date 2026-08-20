@@ -598,6 +598,44 @@ mod tests {
     }
 
     #[test]
+    fn quiet_grace_follows_the_paths_round_trip() {
+        for (rtt_us, expected_ms) in [
+            (None, 500),
+            (Some(1_000), 500),
+            (Some(125_000), 500),
+            (Some(200_000), 800),
+            (Some(216_000), 864),
+            (Some(1_000_000), 2_000),
+        ] {
+            assert_eq!(
+                server::quiet_grace(rtt_us),
+                std::time::Duration::from_millis(expected_ms),
+                "at {rtt_us:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_service_pass_derives_the_quiet_grace_from_path_rtt() {
+        let (bundle, _) = built_bundle("quiet-grace", &[("one.bin", patterned(65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(vot_transport_api::PathStats {
+            smoothed_rtt_us: Some(200_000),
+            ..vot_transport_api::PathStats::default()
+        });
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            connection.quiet_grace,
+            std::time::Duration::from_millis(800)
+        );
+        session.driver().path_stats = None;
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.quiet_grace, server::EPOCH_QUIET_GRACE);
+    }
+
+    #[test]
     fn automatic_fec_keeps_clean_ranges_reliable_then_codes_lossy_ranges() {
         let (bundle, _) = built_bundle("automatic-fec", &[("two-groups.bin", patterned(131_072))]);
         let server = BundleServer::open(&bundle).unwrap();
@@ -987,10 +1025,10 @@ mod tests {
         // generation as its first symbol lands therefore never reaches the
         // grace while it is still working.
         let reported = connection.fec.epochs[&0]
-            .quiet_since
+            .quiet_until
             .expect("armed by the pass that read the report");
         let silent = connection.fec.epochs[&1]
-            .quiet_since
+            .quiet_until
             .expect("armed by the first quiet pass");
         assert!(
             reported > silent,
@@ -1000,7 +1038,7 @@ mod tests {
         // A done restarts the clock the same way. This is the reset that
         // carries an epoch through its decode tail, when the states have
         // stopped and only outcomes are still arriving.
-        let before_done = connection.fec.epochs[&0].quiet_since.expect("armed above");
+        let before_done = connection.fec.epochs[&0].quiet_until.expect("armed above");
         session
             .driver()
             .events
@@ -1012,7 +1050,7 @@ mod tests {
         server.service(&mut session, &mut connection).unwrap();
         assert!(
             connection.fec.epochs[&0]
-                .quiet_since
+                .quiet_until
                 .expect("armed by the pass that read the done")
                 > before_done,
             "an outcome restarts its epoch's clock"
@@ -1022,19 +1060,25 @@ mod tests {
         // back as reliable records: 16 left of the first piece and 6 of the
         // tail, the decoded one having settled.
         session.driver().records.clear();
-        // Both clocks are armed already, so measure from the later of them:
-        // an epoch is kept right up to its grace and goes once past it, and
-        // neither half depends on how long the passes above really took.
+        // Both deadlines are armed already, so measure against the later of
+        // them: an epoch is kept right up to its deadline and goes once it
+        // arrives, and neither half depends on how long the passes above
+        // really took.
         let armed = connection
             .fec
             .epochs
             .values()
-            .filter_map(|opened| opened.quiet_since)
+            .filter_map(|opened| opened.quiet_until)
             .max()
             .expect("both are armed");
         assert!(
             server
-                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE / 2)
+                .retire_quiet_epochs(
+                    &mut connection,
+                    armed
+                        .checked_sub(server::EPOCH_QUIET_GRACE / 2)
+                        .expect("the deadline sits a whole grace past a recent instant"),
+                )
                 .is_ok()
         );
         assert_eq!(
@@ -1042,11 +1086,7 @@ mod tests {
             2,
             "inside the grace both are kept"
         );
-        assert!(
-            server
-                .retire_quiet_epochs(&mut connection, armed + server::EPOCH_QUIET_GRACE)
-                .is_ok()
-        );
+        assert!(server.retire_quiet_epochs(&mut connection, armed).is_ok());
         assert!(connection.fec.epochs.is_empty(), "both are past the grace");
         connection.drain(&mut session).unwrap();
         assert_eq!(
@@ -1210,7 +1250,7 @@ mod tests {
         let unsent = connection.outbound.taken() + 1;
         for opened in connection.fec.epochs.values_mut() {
             opened.queued_through = unsent;
-            opened.quiet_since = None;
+            opened.quiet_until = None;
         }
 
         let began = std::time::Instant::now();
@@ -1230,7 +1270,7 @@ mod tests {
                 .fec
                 .epochs
                 .values()
-                .all(|opened| opened.quiet_since.is_none()),
+                .all(|opened| opened.quiet_until.is_none()),
             "no clock is armed for an epoch this end is still sending"
         );
         crate::harness::discard(&[&bundle]);
@@ -2035,7 +2075,7 @@ mod tests {
                 .fec
                 .epochs
                 .values()
-                .all(|epoch| epoch.quiet_since.is_some())
+                .all(|epoch| epoch.quiet_until.is_some())
         );
     }
 

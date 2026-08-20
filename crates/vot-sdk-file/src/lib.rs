@@ -713,6 +713,8 @@ mod tests {
         let progress = file.accept(&first).unwrap().progress;
         assert_eq!(progress.covered_bytes, 131_072);
         assert_eq!(progress.prefix_bytes, 131_072);
+        // Windows cannot remove the staging file while its handle is open.
+        drop(file);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1558,6 +1558,11 @@ mod tests {
                 .is_err(),
             "an empty armor block is not a certificate"
         );
+        // A combined PEM that leads with the key still hashes the
+        // certificate, the way the TLS stack skips to it.
+        let mut combined = std::fs::read(&ephemeral.key).unwrap();
+        combined.extend_from_slice(&pem);
+        assert_eq!(serve::der_from_pem(&combined).unwrap(), der);
     }
 
     #[test]

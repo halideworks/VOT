@@ -2830,6 +2830,25 @@ mod tests {
     }
 
     #[test]
+    fn the_peer_certificate_is_the_serves_der() {
+        let (client, server) = pair();
+        assert!(client.connected_within(Duration::from_secs(5)));
+        let (certificate, _) = credentials();
+        let der = Process::new("openssl")
+            .args(["x509", "-in", &certificate, "-outform", "der"])
+            .output()
+            .expect("openssl runs");
+        assert!(der.status.success(), "openssl re-encoded the certificate");
+        assert_eq!(
+            client.peer_certificate(),
+            Some(der.stdout),
+            "the stashed certificate is exactly what the serve presented"
+        );
+        // The server asked for no client certificate, so it holds none.
+        assert_eq!(server.peer_certificate(), None);
+    }
+
+    #[test]
     fn an_arrival_wait_parks_through_the_accept() {
         // The wait must hold for the full accept, not return early.
         let (certificate, key) = credentials();

@@ -158,11 +158,16 @@ pub(crate) fn identity_digest(certificate: &Path) -> Result<[u8; 32], Error> {
     Ok(*blake3::hash(&der_from_pem(&pem)?).as_bytes())
 }
 
-/// The DER inside the first armor block of `pem`.
+/// The DER inside the first CERTIFICATE armor block of `pem`.
+///
+/// Only CERTIFICATE blocks count, because that is what the TLS stack loads:
+/// `load_cert_chain_from_pem_file` skips keys, parameters, and bag
+/// attributes to find the first certificate, and a combined PEM that leads
+/// with any of those must still hash the certificate the handshake sends.
 ///
 /// # Errors
-/// Rejects bytes with no armor block or a body that is not base64, which is
-/// a file that is not a PEM certificate.
+/// Rejects bytes with no CERTIFICATE block or a body that is not base64,
+/// which is a file the serve could not present a certificate from.
 pub(crate) fn der_from_pem(pem: &[u8]) -> Result<Vec<u8>, Error> {
     use base64::Engine as _;
     let text = std::str::from_utf8(pem).map_err(|_| Error::InvalidArguments)?;
@@ -170,11 +175,12 @@ pub(crate) fn der_from_pem(pem: &[u8]) -> Result<Vec<u8>, Error> {
     let mut inside = false;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with("-----BEGIN ") {
+        if line == "-----BEGIN CERTIFICATE-----" {
             inside = true;
-        } else if line.starts_with("-----END ") {
-            break;
         } else if inside {
+            if line == "-----END CERTIFICATE-----" {
+                break;
+            }
             body.push_str(line);
         }
     }

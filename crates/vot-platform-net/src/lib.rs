@@ -188,7 +188,17 @@ fn size_buffers_unix(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) ->
 
     let fd = socket.as_raw_fd();
     set(fd, libc::SO_RCVBUF, receive_bytes)?;
-    set(fd, libc::SO_SNDBUF, send_bytes)
+    set(fd, libc::SO_SNDBUF, send_bytes)?;
+    // Then the forced variants, which CAP_NET_ADMIN allows past the
+    // kernel's rmem_max and wmem_max caps. Without that privilege the
+    // kernel refuses them and the clamped values above stand, which is
+    // why these two results are not consulted.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = set(fd, libc::SO_RCVBUFFORCE, receive_bytes);
+        let _ = set(fd, libc::SO_SNDBUFFORCE, send_bytes);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

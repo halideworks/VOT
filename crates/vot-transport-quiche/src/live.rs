@@ -48,9 +48,17 @@ pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 
 /// What the socket asks the kernel to hold in each direction.
 ///
-/// Send is half receive because the pump paces its own bursts out.
-const RECEIVE_BUFFER_BYTES: u32 = 4_194_304;
-const SEND_BUFFER_BYTES: u32 = 2_097_152;
+/// Sized near the bandwidth-delay product of the paths this serves: a
+/// gigabit and a fifth of a second is 26 MB in flight, and a seeded
+/// congestion window puts thousands of packets on the wire in one round
+/// trip where the previous 4 MB request held under 3,000 of them; a
+/// counter capture on an emulated 200 ms path showed 1,860 of one seeded
+/// 16 MB fetch's packets dropping at the receive buffer. The kernel
+/// grants this in full under `CAP_NET_ADMIN` and clamps it to its own caps
+/// otherwise. Send is half receive because the pump paces its own bursts
+/// out.
+const RECEIVE_BUFFER_BYTES: u32 = 16_777_216;
+const SEND_BUFFER_BYTES: u32 = 8_388_608;
 
 /// Largest UDP payload: IPv4's 65535-byte total length minus its own and
 /// UDP's headers. Not worth a family-dependent ceiling for IPv6's extra 20

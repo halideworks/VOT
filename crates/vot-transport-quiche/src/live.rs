@@ -1185,15 +1185,18 @@ fn run(
         if conn.is_closed() {
             break 'drive Ok(());
         }
-        // A close this end asked for is on the wire once the send above
-        // flushed it. The draining period that remains exists so a peer's
-        // retransmissions can be answered, and the peer answers a close
-        // with its own; waiting it out costs whole round-trip times per
-        // connection and settles nothing the application has not already,
-        // since an owner only drops its carrier after its protocol is done.
-        // A peer-initiated close is not this end's to cut short and takes
-        // the full path above.
-        if closing && conn.is_draining() {
+        // A close this end sent is on the wire once the send above flushed
+        // it: quiche arms the draining timer as it packs the frame, and
+        // every path out of the send flushes its burst first. The draining
+        // period that remains would answer nothing, since this quiche drops
+        // straight to draining rather than answering retransmissions, so
+        // waiting it out costs whole round-trip times per connection and
+        // settles nothing. `local_error` rather than the request flag,
+        // because it is set exactly when this end's close was packed: a
+        // peer-initiated close leaves it empty and takes the full path
+        // above, and a fault-path close this end sent without a caller's
+        // request leaves just as promptly.
+        if conn.local_error().is_some() && conn.is_draining() {
             break 'drive Ok(());
         }
 

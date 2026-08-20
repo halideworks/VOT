@@ -235,6 +235,7 @@ impl BundleServer {
             return Ok(());
         }
         let taken = connection.outbound.taken();
+        let grace = connection.quiet_grace;
         let mut spent = Vec::new();
         for (epoch, opened) in &mut connection.fec.epochs {
             if taken < opened.queued_through {
@@ -242,8 +243,8 @@ impl BundleServer {
                 // about the epoch says nothing about the receiver yet.
                 continue;
             }
-            let since = *opened.quiet_since.get_or_insert(now);
-            if now.saturating_duration_since(since) >= connection.quiet_grace {
+            let deadline = *opened.quiet_until.get_or_insert(now + grace);
+            if now >= deadline {
                 spent.push(*epoch);
             }
         }
@@ -332,7 +333,7 @@ impl BundleServer {
                 // The receiver is working on this epoch, which is what the
                 // close budget measures the absence of.
                 if let Some(opened) = connection.fec.epochs.get_mut(&state.epoch) {
-                    opened.quiet_since = None;
+                    opened.quiet_until = None;
                 }
                 connection
                     .fec
@@ -400,7 +401,7 @@ impl BundleServer {
                     .epochs
                     .get_mut(&done.epoch)
                     .expect("cloned above");
-                epoch.quiet_since = None;
+                epoch.quiet_until = None;
                 epoch.live.remove(&done.generation);
                 if epoch.live.is_empty() {
                     connection.fec.sender.close(done.epoch);
@@ -771,7 +772,7 @@ impl BundleServer {
                     plan,
                     live,
                     queued_through,
-                    quiet_since: None,
+                    quiet_until: None,
                 },
             );
         }
@@ -828,22 +829,20 @@ pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
 /// set well above both for the paths this serves.
 pub(crate) const EPOCH_QUIET_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The shortest grace a measured path gets. Covers the receiver's decode and
-/// scheduling gaps on paths whose round trip alone would set microseconds.
-pub(crate) const MIN_QUIET_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
-
 /// The longest grace a measured path gets: past this a stalled epoch is
 /// holding one of the few slots for whole seconds.
 pub(crate) const MAX_QUIET_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The silence budget for a path: four smoothed round trips, held between
-/// [`MIN_QUIET_GRACE`] and [`MAX_QUIET_GRACE`]. Four is the margin the fixed
-/// 500 ms was measured to give at 216 ms; a path reporting no round trip
-/// keeps that fixed default.
+/// The silence budget for a path: four smoothed round trips, never below
+/// [`EPOCH_QUIET_GRACE`] and never above [`MAX_QUIET_GRACE`]. The extension
+/// only ever lengthens the budget, because a healthy receiver's silence on a
+/// fast path is bounded by its decode and scheduling, not its round trip,
+/// and retiring early was measured turning a 0.8 s coded fetch into 13 s of
+/// reliable resends. A path reporting no round trip keeps the fixed default.
 pub(crate) fn quiet_grace(smoothed_rtt_us: Option<u64>) -> std::time::Duration {
     smoothed_rtt_us.map_or(EPOCH_QUIET_GRACE, |rtt| {
         std::time::Duration::from_micros(rtt.saturating_mul(4))
-            .clamp(MIN_QUIET_GRACE, MAX_QUIET_GRACE)
+            .clamp(EPOCH_QUIET_GRACE, MAX_QUIET_GRACE)
     })
 }
 /// The most a coded piece covers: one generation per record, and a bundle

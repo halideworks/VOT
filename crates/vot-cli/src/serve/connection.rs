@@ -174,10 +174,12 @@ pub(crate) struct OpenedEpoch {
     /// makes silence about the epoch mean the receiver is not answering
     /// rather than that this end has not handed them over yet.
     pub(crate) queued_through: u64,
-    /// When this epoch was first seen with its symbols all on the carrier
-    /// and nothing heard about it since. Cleared by anything the receiver
-    /// says about it, so it measures one epoch's own silence.
-    pub(crate) quiet_since: Option<std::time::Instant>,
+    /// When this epoch's silence budget runs out, fixed from the grace in
+    /// force when it was first seen with its symbols all on the carrier and
+    /// nothing heard about it. Cleared by anything the receiver says about
+    /// it, so it measures one epoch's own silence, and a later change in the
+    /// path's grace never shortens a budget already partly spent.
+    pub(crate) quiet_until: Option<std::time::Instant>,
 }
 
 /// The sender side of datagram FEC for one connection.

@@ -12,11 +12,6 @@ use super::{
 /// certificate before giving the carrier up.
 const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The pin `VOT_FETCH_SERVE_IDENTITY` names, read where a carrier opens.
-fn identity_pin() -> Result<Option<[u8; 32]>, Error> {
-    identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())
-}
-
 /// Refuses a carrier whose serve is not the pinned identity.
 ///
 /// The pump completes the handshake without the session driving, and the
@@ -66,7 +61,7 @@ pub(crate) fn fetch_railed(
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
-    let identity = identity_pin()?;
+    let identity = identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?;
     let connect = || {
         let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
             .map_err(carrier_failure)?;
@@ -247,7 +242,7 @@ pub(crate) fn fetch_via_rendezvous_railed(
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
-    let identity = identity_pin()?;
+    let identity = identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?;
     let key = crate::rendezvous::key_of(&root);
     let open = |service: SocketAddr| -> Result<(Transport, SocketAddr), Error> {
         let punched = punch(key, service)?;
@@ -296,7 +291,10 @@ pub(crate) fn relay_route(
         if carrier.connected_within(PUNCH_WAIT) {
             // The relay forwards datagrams; the handshake, and so the
             // certificate this checks, is the serve's own.
-            verify_serve_identity(&carrier, identity_pin()?)?;
+            verify_serve_identity(
+                &carrier,
+                identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?,
+            )?;
             eprintln!("route {slot} relayed");
             return Ok(Some(carrier));
         }

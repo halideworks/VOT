@@ -23,11 +23,14 @@ serve and fetch move a bundle over the wire; fetch writes a bundle directory
 that receive consumes unchanged, and pull is the two in one invocation.
 They need a build with the wire feature and report so without one.
 
-The channel is NOT authenticated. The server presents a throwaway certificate
-and the client does not verify it, so anyone in the middle can see what you
-fetch and can refuse to serve it. What they cannot do is give you different
-bytes: every range proves to its object's root, every root is named by the
-manifest, and the manifest proves to the seal.
+The server's identity is not verified unless you pin it. The server presents
+a throwaway certificate by default, so anyone in the middle can see which
+root you ask for and can refuse to serve it. What they cannot do is give you
+different bytes: every range proves to its object's root, every root is named
+by the manifest, and the manifest proves to the seal. To also refuse an
+imposter before asking, set VOT_FETCH_SERVE_IDENTITY to the identity line
+serve prints; the fetch then drops any connection whose certificate digest
+differs, before it sends anything.
 
 That holds only for the package you named. A fetch at an address takes a
 PACKAGE_ROOT, the 64 hex characters send printed, and refuses without one;
@@ -298,18 +301,28 @@ fn serve(
     let address = address
         .parse()
         .map_err(|_| vot_cli::Error::InvalidArguments)?;
-    let package =
-        vot_cli::serve_bundle(Path::new(bundle), address, credentials, None, |at, root| {
+    let package = vot_cli::serve_bundle(
+        Path::new(bundle),
+        address,
+        credentials,
+        None,
+        |at, root, identity| {
             println!("listening {at}");
-            // The whole command, because a fetch has to name the root and this
-            // is the only place it is printed while the serve is still up. A
-            // reader who has to go and find it is a reader who fetches unpinned.
+            // The whole command, because a fetch has to name the root and
+            // this is the only place it is printed while the serve is
+            // still up. A reader who has to go and find it is a reader
+            // who fetches unpinned.
             println!(
                 "fetch it with: vot fetch {} BUNDLE_DIR {}",
                 reachable(at),
                 root_hex(&root)
             );
-        })?;
+            println!(
+                "identity {} (pin with VOT_FETCH_SERVE_IDENTITY)",
+                root_hex(&identity)
+            );
+        },
+    )?;
     println!(
         "{} {} SERVED",
         root_hex(&package.root),

@@ -97,6 +97,10 @@ pub enum Error {
     ///
     /// Carries no exporter material, so reporting it cannot disclose the binding.
     ChannelBindingUnavailable,
+    /// A pinned fetch reached a serve whose certificate is not the pinned
+    /// identity. The bytes were never at risk, which the package root holds;
+    /// the pin asked to also know who was answering, and this peer was not it.
+    ServeIdentityMismatch,
     /// The peer ended the session under a registered code.
     PeerClosed(u16),
     /// No serve registered for this rendezvous key.
@@ -563,7 +567,13 @@ mod tests {
         let address = "127.0.0.1:1".parse().unwrap();
         let bundle = temporary("unsupported");
         assert!(matches!(
-            serve_bundle(&bundle, address, &Credentials::Ephemeral, None, |_, _| {}),
+            serve_bundle(
+                &bundle,
+                address,
+                &Credentials::Ephemeral,
+                None,
+                |_, _, _| {}
+            ),
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(

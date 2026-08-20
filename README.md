@@ -144,6 +144,7 @@ authenticates received content. See ADR-0037.
 | `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
 | `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, total milliseconds, milliseconds to first verified payload, and what the datagram FEC path offered, decoded, abandoned, and refused |
 | `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
+| `VOT_FETCH_SERVE_IDENTITY` | unset | Pins the serve's identity: the 64 hex characters of the certificate digest `vot serve` prints. The fetch drops any connection whose certificate differs, before it sends anything |
 | `VOT_SERVE_ISSUER` | unset | Issuer public key a serve accepts capabilities from, as a `KEY_SOURCE`. With the two below, the serve requires one |
 | `VOT_SERVE_ISSUER_NAME` | unset | The issuer name that key signs under |
 | `VOT_SERVE_AUDIENCE` | unset | The deployment a capability must name |

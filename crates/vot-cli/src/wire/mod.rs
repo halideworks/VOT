@@ -1095,7 +1095,7 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
                 &Credentials::Ephemeral,
                 Some(2),
-                |at, _| {
+                |at, _, _| {
                     let _ = listening.send(at);
                 },
             )
@@ -1445,7 +1445,7 @@ mod tests {
                 "127.0.0.1:0".parse().unwrap(),
                 &Credentials::Ephemeral,
                 Some(1),
-                |at, root| {
+                |at, root, _| {
                     let _ = listening.send((at, root));
                 },
             )
@@ -1485,6 +1485,87 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_identity_admits_its_serve_and_refuses_another() {
+        let source = crate::tests::temporary("identity-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.bin"), vec![5_u8; 4096]).unwrap();
+        let bundle = crate::tests::temporary("identity-bundle");
+        crate::build_bundle(&source, &bundle).unwrap();
+
+        let (listening, address) = mpsc::channel();
+        let serving = std::thread::spawn(move || {
+            serve_bundle(
+                &bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(1),
+                |at, _, identity| {
+                    let _ = listening.send((at, identity));
+                },
+            )
+        });
+        let (at, identity) = address.recv().expect("the server reported its address");
+
+        let config = client_config().unwrap();
+        let carrier =
+            Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config).unwrap();
+        assert!(
+            verify_serve_identity(&carrier, None).is_ok(),
+            "no pin admits any serve"
+        );
+        assert!(
+            verify_serve_identity(&carrier, Some(identity)).is_ok(),
+            "the announced identity is the certificate the handshake presented"
+        );
+        let mut wrong = identity;
+        wrong[0] ^= 1;
+        assert!(
+            matches!(
+                verify_serve_identity(&carrier, Some(wrong)),
+                Err(Error::ServeIdentityMismatch)
+            ),
+            "any other pin refuses the carrier"
+        );
+        drop(carrier);
+        let _ = serving.join().expect("the serving thread");
+    }
+
+    #[test]
+    fn an_identity_pin_is_exactly_its_hex() {
+        assert_eq!(identity_from(None).unwrap(), None);
+        let hex = "7503bcc1b8fe0bfe100a9d32204f17133de6a6069db7ff27770f9589f142a988";
+        assert_eq!(
+            identity_from(Some(hex)).unwrap().unwrap()[0],
+            0x75,
+            "the pin is the digest the hex spells"
+        );
+        assert!(identity_from(Some(&hex[..63])).is_err());
+        assert!(identity_from(Some("zz")).is_err());
+    }
+
+    #[test]
+    fn the_identity_digest_is_the_certificates_der() {
+        let ephemeral = Ephemeral::generate().unwrap();
+        let pem = std::fs::read(&ephemeral.certificate).unwrap();
+        let der = serve::der_from_pem(&pem).unwrap();
+        assert_eq!(
+            serve::identity_digest(&ephemeral.certificate).unwrap(),
+            *blake3::hash(&der).as_bytes()
+        );
+        assert!(serve::der_from_pem(b"not a pem").is_err());
+        assert!(
+            serve::der_from_pem(b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n")
+                .is_err(),
+            "an empty armor block is not a certificate"
+        );
+        // A combined PEM that leads with the key still hashes the
+        // certificate, the way the TLS stack skips to it.
+        let mut combined = std::fs::read(&ephemeral.key).unwrap();
+        combined.extend_from_slice(&pem);
+        assert_eq!(serve::der_from_pem(&combined).unwrap(), der);
+    }
+
+    #[test]
     fn a_bundle_crosses_a_quic_socket_over_the_datagram_path() {
         // Both ends offer DATAGRAM_FEC, so every group-aligned answer rides
         // as coded symbols and the fetch decodes them; the reliable path
@@ -1507,7 +1588,7 @@ mod tests {
                 Some(1),
                 &serving_offer,
                 false,
-                |at, root| {
+                |at, root, _| {
                     let _ = listening.send((at, root));
                 },
             )

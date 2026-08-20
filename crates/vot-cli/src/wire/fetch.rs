@@ -2,10 +2,39 @@
 
 use super::{
     BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
-    FETCH_RAILS, FETCH_STATS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY,
-    SocketAddr, Transport, apply_datagram_bytes, carrier_failure, congestion_from, extensions_from,
-    holder_from, limits, local_for, punch, rails_from, rendezvous_from, stats_wanted, take_slot,
+    FETCH_RAILS, FETCH_SERVE_IDENTITY, FETCH_STATS, PROGRESS_QUANTUM_BYTES, PUNCH_WAIT,
+    PackageSummary, Path, RELAY, SocketAddr, Transport, apply_datagram_bytes, carrier_failure,
+    congestion_from, extensions_from, holder_from, identity_from, limits, local_for, punch,
+    rails_from, rendezvous_from, stats_wanted, take_slot,
 };
+
+/// How long a pinned fetch waits for the handshake to deliver the serve's
+/// certificate before giving the carrier up.
+const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Refuses a carrier whose serve is not the pinned identity.
+///
+/// The pump completes the handshake without the session driving, and the
+/// session has sent nothing yet, so a wrong serve learns nothing but that a
+/// connection came and went. `connected_within` peeks, so the lifecycle
+/// event it reads is still there for the session to drain.
+pub(crate) fn verify_serve_identity(
+    carrier: &Transport,
+    pin: Option<[u8; 32]>,
+) -> Result<(), Error> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+    if !carrier.connected_within(IDENTITY_WAIT) {
+        return Err(Error::CarrierUnavailable);
+    }
+    match carrier.peer_certificate() {
+        Some(der) if *blake3::hash(&der).as_bytes() == pin => Ok(()),
+        // A missing certificate on an established connection is refused the
+        // way a wrong one is: the pin asked for proof this end cannot check.
+        _ => Err(Error::ServeIdentityMismatch),
+    }
+}
 
 /// Fetches a bundle from `address` into `bundle`.
 ///
@@ -32,9 +61,12 @@ pub(crate) fn fetch_railed(
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
+    let identity = identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?;
     let connect = || {
-        Transport::connect(local_for(address)?, address, Some("localhost"), &config)
-            .map_err(carrier_failure)
+        let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
+            .map_err(carrier_failure)?;
+        verify_serve_identity(&carrier, identity)?;
+        Ok(carrier)
     };
     fetch_with(connect, bundle, pin, rails)
 }
@@ -42,9 +74,10 @@ pub(crate) fn fetch_railed(
 /// The configuration every fetch rail is opened with.
 pub(crate) fn client_config() -> Result<Config, Error> {
     let mut config = Config::client(limits()?);
-    // The channel is unauthenticated. What catches a forged server is the
-    // package root this fetch pinned, which every range proves to, and a
-    // capability decides who may fetch rather than who is serving.
+    // No certificate chain to verify against: what catches a forged server
+    // is the package root this fetch pinned, which every range proves to,
+    // plus the serve identity when `VOT_FETCH_SERVE_IDENTITY` pins one,
+    // checked in `verify_serve_identity` before the session says anything.
     config.verify_peer = false;
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
@@ -209,6 +242,7 @@ pub(crate) fn fetch_via_rendezvous_railed(
     rails: usize,
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
+    let identity = identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?;
     let key = crate::rendezvous::key_of(&root);
     let open = |service: SocketAddr| -> Result<(Transport, SocketAddr), Error> {
         let punched = punch(key, service)?;
@@ -216,6 +250,7 @@ pub(crate) fn fetch_via_rendezvous_railed(
         let carrier = Transport::connect_on(punched.socket, serve, Some("localhost"), &config)
             .map_err(carrier_failure)?;
         if carrier.connected_within(PUNCH_WAIT) {
+            verify_serve_identity(&carrier, identity)?;
             Ok((carrier, serve))
         } else {
             Err(Error::RendezvousUnpunched)
@@ -254,6 +289,12 @@ pub(crate) fn relay_route(
         let carrier = Transport::connect_on(taken.socket, slot, Some("localhost"), config)
             .map_err(carrier_failure)?;
         if carrier.connected_within(PUNCH_WAIT) {
+            // The relay forwards datagrams; the handshake, and so the
+            // certificate this checks, is the serve's own.
+            verify_serve_identity(
+                &carrier,
+                identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?,
+            )?;
             eprintln!("route {slot} relayed");
             return Ok(Some(carrier));
         }

@@ -2574,6 +2574,7 @@ version = "0.0.1"
 name = "vot-cli"
 version = "0.0.1"
 dependencies = [
+ "base64 0.23.1",
  "blake3",
  "ed25519-dalek",
  "getrandom 0.4.3",

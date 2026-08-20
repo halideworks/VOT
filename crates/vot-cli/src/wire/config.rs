@@ -62,6 +62,22 @@ fn positive(value: &str) -> Result<u64, Error> {
 /// The environment variable that picks the congestion controller.
 pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
 
+/// The environment variable that pins the serve's identity: the 64 hex
+/// characters of the blake3 digest of its certificate in DER, as the serve
+/// prints at startup. Unset accepts any serve; the package root still holds
+/// whoever answers to the right bytes.
+pub(crate) const FETCH_SERVE_IDENTITY: &str = "VOT_FETCH_SERVE_IDENTITY";
+
+/// The pin [`FETCH_SERVE_IDENTITY`] names, or nothing when unset.
+///
+/// # Errors
+/// Rejects a value that is not 64 hex characters.
+pub(crate) fn identity_from(pin: Option<&str>) -> Result<Option<[u8; 32]>, Error> {
+    pin.map(str::trim)
+        .map(crate::parse_package_root)
+        .transpose()
+}
+
 /// The environment variable that controls the experimental datagram FEC
 /// extension. Automatic unless explicitly disabled.
 pub(crate) const DATAGRAM_FEC: &str = "VOT_DATAGRAM_FEC";

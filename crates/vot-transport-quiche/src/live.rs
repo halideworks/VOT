@@ -578,6 +578,7 @@ impl Transport {
         config: &Config,
         role: Role,
     ) -> Result<Self, Error> {
+        size_socket_buffers(&socket);
         // Discovery's probes must be dropped where the path narrows, never
         // fragmented and reassembled: a reassembled probe reads as success and
         // locks the connection above the path for good.
@@ -1429,6 +1430,7 @@ impl Listener {
     /// Reports a socket, credential, or configuration failure.
     pub fn bind(address: SocketAddr, config: &Config) -> Result<Self, Error> {
         let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
+        size_socket_buffers(&socket);
         vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
         let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
         enable_receive_offload(&socket);
@@ -1852,6 +1854,36 @@ fn enable_receive_offload(socket: &UdpSocket) {
 
 #[cfg(not(target_os = "linux"))]
 fn enable_receive_offload(_socket: &UdpSocket) {}
+
+/// Bytes asked of the kernel for each socket buffer, both directions.
+///
+/// Sized near the bandwidth-delay product of the paths this serves: a
+/// gigabit and a fifth of a second is 26 MB in flight, and a seeded window
+/// puts thousands of packets on the wire in one round trip where the
+/// default buffer holds about 145 of them, so the burst's tail drops at
+/// the socket and is repaired over the following round trips.
+const SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Asks the kernel for deep socket buffers, in both directions.
+///
+/// The forced variant first, which `CAP_NET_ADMIN` over the socket's
+/// network namespace allows past the caps; without that privilege the
+/// plain request applies, and the kernel clamps it to its own caps
+/// (`net.core.rmem_max` and `wmem_max`). Effective exactly as far as the
+/// host allows and harmless past that, which is why nothing is checked.
+#[cfg(target_os = "linux")]
+fn size_socket_buffers(socket: &UdpSocket) {
+    use nix::sys::socket::{setsockopt, sockopt};
+    if setsockopt(socket, sockopt::RcvBufForce, &SOCKET_BUFFER_BYTES).is_err() {
+        let _ = setsockopt(socket, sockopt::RcvBuf, &SOCKET_BUFFER_BYTES);
+    }
+    if setsockopt(socket, sockopt::SndBufForce, &SOCKET_BUFFER_BYTES).is_err() {
+        let _ = setsockopt(socket, sockopt::SndBuf, &SOCKET_BUFFER_BYTES);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn size_socket_buffers(_socket: &UdpSocket) {}
 
 /// One read: the bytes, the sender, and the segment size when the kernel
 /// coalesced several datagrams into this buffer.

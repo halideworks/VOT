@@ -472,6 +472,9 @@ pub struct Transport {
     commands: mpsc::SyncSender<Command>,
     inbound: Arc<Mutex<Inbound>>,
     channel_binding: Arc<Mutex<Option<ChannelBinding>>>,
+    /// The peer's leaf certificate in DER, kept from the handshake so a
+    /// caller can pin who it is talking to before it says anything.
+    peer_certificate: Arc<Mutex<Option<Vec<u8>>>>,
     /// The most recent path sample the driver read. Copied into the adapter
     /// before events are drained, so the disconnect that clears it is seen after
     /// the sample it belongs to rather than before.
@@ -583,11 +586,13 @@ impl Transport {
         let (commands, receiver) = mpsc::sync_channel(vot_transport_queue::DEFAULT_COUNT_LIMIT);
         let path = Arc::new(Mutex::new(None));
         let channel_binding = Arc::new(Mutex::new(None));
+        let peer_certificate = Arc::new(Mutex::new(None));
         let driver_inbound = Arc::clone(&inbound);
         let driver_close = Arc::clone(&close);
         let driver_control = Arc::clone(&control_limit);
         let driver_path = Arc::clone(&path);
         let driver_binding = Arc::clone(&channel_binding);
+        let driver_certificate = Arc::clone(&peer_certificate);
         let connection = ConnectionId(u64::from(local.port()));
         let datagram_bytes = config.max_datagram_bytes;
         let accept_timeout_ms = config.accept_timeout_ms;
@@ -610,6 +615,7 @@ impl Transport {
                     &driver_control,
                     &driver_path,
                     &driver_binding,
+                    &driver_certificate,
                     connection.0,
                     datagram_bytes,
                     accept_timeout_ms,
@@ -630,6 +636,7 @@ impl Transport {
             commands,
             inbound,
             channel_binding,
+            peer_certificate,
             path,
             close,
             held: None,
@@ -637,6 +644,14 @@ impl Transport {
             connection,
             driver: Some(driver),
         })
+    }
+
+    /// The peer's leaf certificate in DER, or nothing before the handshake
+    /// has delivered it. A client that pins a serve identity compares this
+    /// against the pin before it sends anything.
+    #[must_use]
+    pub fn peer_certificate(&self) -> Option<Vec<u8>> {
+        self.peer_certificate.lock().ok()?.clone()
     }
 
     /// The address this endpoint is bound to.
@@ -962,6 +977,7 @@ fn drive(
     control_limit: &Arc<AtomicUsize>,
     path: &Arc<Mutex<Option<PathStats>>>,
     channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
+    peer_certificate: &Arc<Mutex<Option<Vec<u8>>>>,
     connection: u64,
     datagram_bytes: usize,
     accept_timeout_ms: u64,
@@ -1008,6 +1024,7 @@ fn drive(
         control_limit,
         path,
         channel_binding,
+        peer_certificate,
         connection,
         datagram_bytes,
         buffer,
@@ -1058,6 +1075,7 @@ fn run(
     control_limit: &Arc<AtomicUsize>,
     path: &Arc<Mutex<Option<PathStats>>>,
     channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
+    peer_certificate: &Arc<Mutex<Option<Vec<u8>>>>,
     connection: u64,
     datagram_bytes: usize,
     mut buffer: Vec<u8>,
@@ -1130,6 +1148,11 @@ fn run(
             };
             *binding = Some(ChannelBinding::from_bytes(bytes));
             drop(binding);
+            // Before the Connected event, so a caller woken by it never sees
+            // an established connection with no certificate to check.
+            if let (Some(der), Ok(mut held)) = (conn.peer_cert(), peer_certificate.lock()) {
+                *held = Some(der.to_vec());
+            }
             announced = true;
             if let Ok(mut queue) = inbound.lock() {
                 queue.push_unlosable(NativeEvent::Connected(connection));
@@ -1643,6 +1666,7 @@ fn accept_routed(
     let (router_side, packets) = mpsc::sync_channel(ROUTED_READS);
     let path = Arc::new(Mutex::new(None));
     let channel_binding = Arc::new(Mutex::new(None));
+    let peer_certificate = Arc::new(Mutex::new(None));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
@@ -1653,6 +1677,7 @@ fn accept_routed(
     let pump_control = Arc::clone(&control_limit);
     let pump_path = Arc::clone(&path);
     let pump_binding = Arc::clone(&channel_binding);
+    let pump_certificate = Arc::clone(&peer_certificate);
     let pump_done = Arc::clone(&done);
     let driver = std::thread::Builder::new()
         .name(format!("vot-quiche-{}-{index}", local.port()))
@@ -1671,6 +1696,7 @@ fn accept_routed(
                 &pump_control,
                 &pump_path,
                 &pump_binding,
+                &pump_certificate,
                 connection.0,
                 datagram_bytes,
                 buffer,
@@ -1695,6 +1721,7 @@ fn accept_routed(
             commands,
             inbound,
             channel_binding,
+            peer_certificate,
             path,
             close,
             held: None,

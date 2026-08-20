@@ -37,7 +37,10 @@ pub(crate) fn serve_stance(
 /// Serves `bundle` on `address` until stopped or `sessions` are answered.
 ///
 /// The bundle is opened and proved once upfront. All sessions share one
-/// socket; `listening` reports the bound address once.
+/// socket; `listening` reports the bound address, the package root, and the
+/// serve's identity once. The identity is the blake3 digest of the
+/// certificate this serve presents, which a fetch pins with
+/// `VOT_FETCH_SERVE_IDENTITY`.
 ///
 /// # Errors
 /// Surfaces a bundle that will not open, a socket that will not bind, and
@@ -47,7 +50,7 @@ pub fn serve_bundle(
     address: SocketAddr,
     credentials: &Credentials,
     sessions: Option<u32>,
-    listening: impl FnMut(SocketAddr, [u8; 32]),
+    listening: impl FnMut(SocketAddr, [u8; 32], [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let pin = std::env::var(DATAGRAM_FEC).ok();
     let extensions = extensions_from(pin.as_deref())?;
@@ -70,7 +73,7 @@ pub(crate) fn serve_bundle_offering(
     sessions: Option<u32>,
     extensions: &std::collections::BTreeSet<u64>,
     automatic_fec: bool,
-    mut listening: impl FnMut(SocketAddr, [u8; 32]),
+    mut listening: impl FnMut(SocketAddr, [u8; 32], [u8; 32]),
 ) -> Result<PackageSummary, Error> {
     let mut server = BundleServer::open(bundle)?;
     server.set_automatic_fec(automatic_fec);
@@ -110,11 +113,12 @@ pub(crate) fn serve_bundle_offering(
     let services = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;
     config.side_channel_lead = side_channel_lead(&services);
 
+    let identity = identity_digest(&certificate)?;
     // The loop and its failure policy are in `drive`.
     let mut listener = Listener::bind(address, &config).map_err(carrier_failure)?;
-    // The root goes with the address because a fetch needs both, and the
-    // only place they are known together is here.
-    listening(listener.local_address(), server.package().root);
+    // The root and identity go with the address because a fetch needs all
+    // three, and the only place they are known together is here.
+    listening(listener.local_address(), server.package().root, identity);
     let registration = start_registration(
         &services,
         listener.take_side_channel(),
@@ -144,4 +148,40 @@ pub(crate) const fn side_channel_lead(services: &[SocketAddr]) -> Option<u8> {
     } else {
         Some(crate::rendezvous::MAGIC)
     }
+}
+
+/// The serve's identity: the blake3 digest of the leaf certificate in the
+/// PEM at `certificate`, hashed over the DER the handshake presents, so it
+/// equals what a fetch computes from the peer certificate it received.
+pub(crate) fn identity_digest(certificate: &Path) -> Result<[u8; 32], Error> {
+    let pem = std::fs::read(certificate)?;
+    Ok(*blake3::hash(&der_from_pem(&pem)?).as_bytes())
+}
+
+/// The DER inside the first armor block of `pem`.
+///
+/// # Errors
+/// Rejects bytes with no armor block or a body that is not base64, which is
+/// a file that is not a PEM certificate.
+pub(crate) fn der_from_pem(pem: &[u8]) -> Result<Vec<u8>, Error> {
+    use base64::Engine as _;
+    let text = std::str::from_utf8(pem).map_err(|_| Error::InvalidArguments)?;
+    let mut body = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN ") {
+            inside = true;
+        } else if line.starts_with("-----END ") {
+            break;
+        } else if inside {
+            body.push_str(line);
+        }
+    }
+    if body.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| Error::InvalidArguments)
 }

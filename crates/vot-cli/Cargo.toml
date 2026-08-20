@@ -11,7 +11,7 @@ default = []
 # The socket-owning carrier. Off, the crate builds in seconds and the wire
 # commands report the feature they need; on, the binary carries a QUIC
 # endpoint, and quiche builds BoringSSL through bindgen and cmake to provide it.
-wire = ["dep:vot-transport-quiche", "vot-transport-quiche/live", "dep:rcgen"]
+wire = ["dep:vot-transport-quiche", "vot-transport-quiche/live", "dep:rcgen", "dep:base64"]
 
 [dependencies]
 blake3.workspace = true
@@ -31,6 +31,8 @@ vot-session = { path = "../vot-session" }
 vot-transport-api = { path = "../vot-transport-api" }
 vot-verifier = { path = "../vot-verifier" }
 vot-transport-quiche = { path = "../vot-transport-quiche", optional = true }
+# Decodes the PEM armor around a serve certificate to hash the DER it sends.
+base64 = { workspace = true, optional = true }
 # A throwaway server certificate, because TLS 1.3 has no anonymous mode.
 # aws_lc_rs is the backend rustls already selects workspace-wide, so this
 # is not a second crypto library.

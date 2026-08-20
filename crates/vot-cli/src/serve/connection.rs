@@ -134,6 +134,9 @@ pub struct ServeConnection {
     pub(crate) fec_coding: bool,
     /// Recent carrier loss and the FEC decision derived from it.
     pub(crate) fec_policy: FecPolicy,
+    /// Per-epoch silence budget, derived from the path's smoothed round trip
+    /// each service pass; the fixed default until the carrier reports one.
+    pub(crate) quiet_grace: std::time::Duration,
 }
 
 impl Default for ServeConnection {
@@ -152,6 +155,7 @@ impl Default for ServeConnection {
             fec_negotiated: false,
             fec_coding: true,
             fec_policy: FecPolicy::default(),
+            quiet_grace: super::server::EPOCH_QUIET_GRACE,
         }
     }
 }

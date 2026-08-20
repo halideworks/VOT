@@ -120,6 +120,7 @@ impl BundleServer {
         }
         connection.drain(session)?;
         let path = session.adapter().path_stats();
+        connection.quiet_grace = quiet_grace(path.and_then(|stats| stats.smoothed_rtt_us));
         connection.fec_policy.observe(path);
         let repair_symbols = connection.fec_policy.repair_symbols();
         connection.fec_coding = !self.automatic_fec || connection.fec_policy.coding();
@@ -197,7 +198,7 @@ impl BundleServer {
     /// it decoded or gave up on. Waiting for that outcome forever is what
     /// leaves the fetch with a record that never comes, so an epoch whose
     /// symbols are all on the carrier and which has drawn nothing from the
-    /// receiver for [`EPOCH_QUIET_GRACE`] is repaired reliably and closed,
+    /// receiver for the connection's [`quiet_grace`] is repaired reliably and closed,
     /// which is what `spec/fec.md` section 11 already says a close means:
     /// every generation under it with no `GEN_DONE` retires as abandoned.
     ///
@@ -242,7 +243,7 @@ impl BundleServer {
                 continue;
             }
             let since = *opened.quiet_since.get_or_insert(now);
-            if now.saturating_duration_since(since) >= EPOCH_QUIET_GRACE {
+            if now.saturating_duration_since(since) >= connection.quiet_grace {
                 spent.push(*epoch);
             }
         }
@@ -826,6 +827,25 @@ pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
 /// grace has to clear is a round trip and the receiver's decode, so it is
 /// set well above both for the paths this serves.
 pub(crate) const EPOCH_QUIET_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The shortest grace a measured path gets. Covers the receiver's decode and
+/// scheduling gaps on paths whose round trip alone would set microseconds.
+pub(crate) const MIN_QUIET_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The longest grace a measured path gets: past this a stalled epoch is
+/// holding one of the few slots for whole seconds.
+pub(crate) const MAX_QUIET_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The silence budget for a path: four smoothed round trips, held between
+/// [`MIN_QUIET_GRACE`] and [`MAX_QUIET_GRACE`]. Four is the margin the fixed
+/// 500 ms was measured to give at 216 ms; a path reporting no round trip
+/// keeps that fixed default.
+pub(crate) fn quiet_grace(smoothed_rtt_us: Option<u64>) -> std::time::Duration {
+    smoothed_rtt_us.map_or(EPOCH_QUIET_GRACE, |rtt| {
+        std::time::Duration::from_micros(rtt.saturating_mul(4))
+            .clamp(MIN_QUIET_GRACE, MAX_QUIET_GRACE)
+    })
+}
 /// The most a coded piece covers: one generation per record, and a bundle
 /// declares at most `MAX_DATA_RECORDS_PER_BUNDLE` of them.
 pub(crate) const FEC_PIECE_BYTES: u64 =

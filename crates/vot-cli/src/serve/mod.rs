@@ -598,6 +598,43 @@ mod tests {
     }
 
     #[test]
+    fn quiet_grace_follows_the_paths_round_trip() {
+        for (rtt_us, expected_ms) in [
+            (None, 500),
+            (Some(1_000), 25),
+            (Some(50_000), 200),
+            (Some(216_000), 864),
+            (Some(1_000_000), 2_000),
+        ] {
+            assert_eq!(
+                server::quiet_grace(rtt_us),
+                std::time::Duration::from_millis(expected_ms),
+                "at {rtt_us:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_service_pass_derives_the_quiet_grace_from_path_rtt() {
+        let (bundle, _) = built_bundle("quiet-grace", &[("one.bin", patterned(65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(vot_transport_api::PathStats {
+            smoothed_rtt_us: Some(50_000),
+            ..vot_transport_api::PathStats::default()
+        });
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            connection.quiet_grace,
+            std::time::Duration::from_millis(200)
+        );
+        session.driver().path_stats = None;
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.quiet_grace, server::EPOCH_QUIET_GRACE);
+    }
+
+    #[test]
     fn automatic_fec_keeps_clean_ranges_reliable_then_codes_lossy_ranges() {
         let (bundle, _) = built_bundle("automatic-fec", &[("two-groups.bin", patterned(131_072))]);
         let server = BundleServer::open(&bundle).unwrap();

@@ -66,20 +66,25 @@ pub(crate) const CONGESTION: &str = "VOT_CONGESTION";
 /// packets. The sender's window governs a transfer, so it matters on the
 /// serve; at any real round-trip time slow start from the default ten
 /// packets is most of a small transfer's wall clock, and an operator who
-/// knows the path skips it. The controller still collapses the window on
-/// loss, so a wrong value costs one round of loss, not correctness.
+/// knows the path skips it. Under the default bbr2 controller the seed is
+/// a floor for the connection's life, not a starting point loss undoes, so
+/// it is an assertion about the path: set it only where the path is known
+/// to carry it.
 pub(crate) const INITIAL_CWND: &str = "VOT_INITIAL_CWND";
 
-/// The most packets [`INITIAL_CWND`] accepts: 64 MB of 1500-byte packets,
-/// past any bandwidth-delay product this moves well on.
-const MAX_INITIAL_CWND: usize = 44_739;
+/// The most packets [`INITIAL_CWND`] accepts. Connection-start flow
+/// control admits about this many full datagrams under the advertised
+/// initial data window, so a larger seed is inert there and, past the
+/// carrier's own 20,000-packet ceiling, pins the window outside
+/// congestion control's reach entirely.
+const MAX_INITIAL_CWND: usize = 7_100;
 
 /// The window [`INITIAL_CWND`] names, or nothing when unset.
 ///
 /// # Errors
 /// Rejects a value that is not a number or is outside 10 to
 /// [`MAX_INITIAL_CWND`] packets: below the default it is a lie about the
-/// path, and unbounded it is a burst the first loss pays for.
+/// path, and past the bound it is a window nothing can admit or govern.
 pub(crate) fn initial_cwnd_from(pin: Option<&str>) -> Result<Option<usize>, Error> {
     pin.map(|value| bounded(value, 10..=MAX_INITIAL_CWND))
         .transpose()

@@ -336,7 +336,10 @@ pub struct Config {
     ///
     /// The sender's window governs a transfer, so this matters on the
     /// serving end. An operator who knows the path seeds it to skip most of
-    /// slow start; the controller still collapses it on loss.
+    /// slow start. Under Bbr2 the seed becomes the window's floor for the
+    /// connection's life, and a seed past the recovery ceiling of 20,000
+    /// packets pins the window outside congestion control entirely, so a
+    /// caller bounds what it accepts well below that.
     pub initial_congestion_window_packets: Option<usize>,
     /// A lead byte whose datagrams are not this transport's, handed to
     /// the listener's side channel instead of routed.

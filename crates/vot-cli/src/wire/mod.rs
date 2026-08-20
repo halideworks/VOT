@@ -1534,11 +1534,11 @@ mod tests {
     fn an_initial_window_is_bounded_packets() {
         assert_eq!(initial_cwnd_from(None).unwrap(), None);
         assert_eq!(initial_cwnd_from(Some("1024")).unwrap(), Some(1024));
-        assert_eq!(initial_cwnd_from(Some(" 44739\n")).unwrap(), Some(44_739));
+        assert_eq!(initial_cwnd_from(Some(" 7100\n")).unwrap(), Some(7_100));
         assert!(initial_cwnd_from(Some("9")).is_err(), "below the default");
         assert!(
-            initial_cwnd_from(Some("44740")).is_err(),
-            "past the burst bound"
+            initial_cwnd_from(Some("7101")).is_err(),
+            "past what start-of-connection flow control admits"
         );
         assert!(initial_cwnd_from(Some("wide")).is_err());
     }

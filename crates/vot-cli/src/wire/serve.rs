@@ -1,10 +1,10 @@
 //! The serve command over a live socket.
 
 use super::{
-    BundleServer, CONGESTION, Config, Credentials, DATAGRAM_FEC, Ephemeral, Error, Listener,
-    PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME,
+    BundleServer, CONGESTION, Config, Credentials, DATAGRAM_FEC, Ephemeral, Error, INITIAL_CWND,
+    Listener, PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME,
     ServeSession, SocketAddr, apply_datagram_bytes, automatic_fec, carrier_failure,
-    congestion_from, extensions_from, limits, rendezvous_from, requirement_from,
+    congestion_from, extensions_from, initial_cwnd_from, limits, rendezvous_from, requirement_from,
     start_registration,
 };
 
@@ -108,6 +108,8 @@ pub(crate) fn serve_bundle_offering(
     }
     apply_datagram_bytes(&mut config)?;
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
+    config.initial_congestion_window_packets =
+        initial_cwnd_from(std::env::var(INITIAL_CWND).ok().as_deref())?;
     // Configure rendezvous routing before bind so the listener can
     // filter side-channel datagrams.
     let services = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;

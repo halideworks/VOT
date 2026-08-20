@@ -64,6 +64,7 @@ the same function. The reasons fall into five classes:
 | `replace > with < in flush_burst` | optional by design | as above |
 | `replace > with >= in flush_burst` | optional by design | as above |
 | `replace && with \|\| in flush_burst` | optional by design | attempts the offload where it was not asked for; the fallback carries the burst, and the slower shape hangs a loaded run, which the timeout records |
+| `replace && with \|\| in run` | equivalent behavior | the early exit on a locally requested, flushed close; the flip also exits on a peer-initiated close, which skips only that side's drain wait, a wall-clock saving no loopback test can tell from the intended one |
 | `replace != with == in send_all` | burst geometry | destination comparison; every test speaks to one peer, so no burst ever splits by address |
 | `replace + with - in send_all` | burst geometry | the moved-packet arithmetic behind the destination split, unreachable with one peer |
 | `replace + with * in send_all` | burst geometry | as above |

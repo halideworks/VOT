@@ -1,6 +1,6 @@
 //! Scheduler adapters for pure bundle and range verification.
 
-use super::{Error, SubjectId, Suite};
+use super::{Error, MAX_PROOF_RANGE_BYTES, SubjectId, Suite};
 use vot_codec::frames::{DataRecord, ObjectId, ProofBundle};
 
 pub(super) fn validate_typed_bundle<'records>(
@@ -24,6 +24,9 @@ pub(super) fn check_range_proof<'data>(
     data: &'data [u8],
     proof: &[u8],
 ) -> Result<vot_verified_range::VerifiedSlice<'data>, Error> {
+    if u64::try_from(data.len()).map_err(|_| Error::LengthExceeded)? > MAX_PROOF_RANGE_BYTES {
+        return Err(Error::RecordTooLarge);
+    }
     vot_verified_range::verify_range(object_id(subject)?, covered_offset, data, proof)
         .map_err(map_error)
 }

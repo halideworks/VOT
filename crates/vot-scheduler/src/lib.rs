@@ -13,7 +13,8 @@ pub mod session;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, Suite};
 
 /// Max bytes one proof-bearing range may cover. Also sizes receiver staging.
-pub const MAX_PROOF_RANGE_BYTES: u64 = vot_verified_range::MAX_PROOF_RANGE_BYTES;
+pub const MAX_PROOF_RANGE_BYTES: u64 = vot_codec::frames::MAX_REQUESTED_RANGE + RANGE_UNIT_BYTES;
+const _: () = assert!(MAX_PROOF_RANGE_BYTES == 4_259_840);
 /// Range granularity a proof covers, from spec/proofs.md.
 pub const RANGE_UNIT_BYTES: u64 = vot_verified_range::RANGE_UNIT_BYTES;
 

@@ -9,8 +9,9 @@ use vot_verifier::Suite;
 
 /// Range granularity covered by both frozen proof suites.
 pub const RANGE_UNIT_BYTES: u64 = 65_536;
-/// Maximum bytes carried by one proof-bearing range.
-pub const MAX_PROOF_RANGE_BYTES: u64 = 4_259_840;
+/// Maximum covered bytes for an 8 MiB request plus one unaligned edge group.
+pub const MAX_PROOF_RANGE_BYTES: u64 = 8 * 1024 * 1024 + RANGE_UNIT_BYTES;
+const _: () = assert!(MAX_PROOF_RANGE_BYTES == 8_454_144);
 
 /// A pure bundle or range verification failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -494,6 +495,21 @@ mod tests {
             Ok(RANGE_UNIT_BYTES)
         );
         assert_eq!(check_range_geometry(1, 0, 1), Ok(1));
+    }
+
+    #[test]
+    fn eight_mib_blake3_range_verifies() {
+        let bytes = vec![0x3c; 8 * 1024 * 1024];
+        let root = vot_proof_blake3::root(&bytes);
+        let proof = vot_proof_blake3::prove(&bytes, 0, bytes.len() as u64).unwrap();
+        let object = ObjectId {
+            suite: Suite::Blake3Bao64.identifier(),
+            root,
+            length: bytes.len() as u64,
+        };
+
+        let verified = verify_range(object, 0, &bytes, &proof.proof).unwrap();
+        assert_eq!(verified.data(), bytes);
     }
 
     #[test]

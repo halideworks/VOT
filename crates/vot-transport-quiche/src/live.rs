@@ -1862,7 +1862,7 @@ fn enable_receive_offload(_socket: &UdpSocket) {}
 /// puts thousands of packets on the wire in one round trip where the
 /// default buffer holds about 145 of them, so the burst's tail drops at
 /// the socket and is repaired over the following round trips.
-const SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const SOCKET_BUFFER_BYTES: usize = 16_777_216;
 
 /// Asks the kernel for deep socket buffers, in both directions.
 ///

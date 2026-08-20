@@ -57,6 +57,7 @@ the same function. The reasons fall into five classes:
 | `replace receive_space -> Vec<u8> with vec![1]` | not compiled here | non-Linux twin |
 | `replace send_segmented -> Result<(), Error> with Ok(())` | not compiled here | one row for two twins: the non-Linux stub never compiles, and the Linux body's mutant hangs the suite, which the timeout records as this same name |
 | `replace enable_receive_offload with ()` | optional by design | a kernel without coalescing leaves each datagram its own read, and the feed path handles both shapes |
+| `replace size_socket_buffers with ()` | optional by design | a deep buffer is a burst-loss saving the kernel clamps to its caps anyway; on a default host the request and its absence are indistinguishable, and only a raised-cap throughput run measures it |
 | `replace offload_available -> bool with true` | optional by design | claiming offload where the probe would refuse it falls back per burst |
 | `replace offload_available -> bool with false` | optional by design | denying offload takes the per-packet fallback, correct and slower |
 | `replace drain_arrivals -> Result<(), Error> with Ok(())` | optional by design | without the drain every pass reads once, the lockstep shape the drain exists to amortise; delivery holds and only throughput falls |

@@ -641,13 +641,13 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_that_loses_more_than_its_repair_count_arrives_reliably() {
+    fn a_generation_past_its_repair_decodes_from_a_targeted_resend() {
         // Every eighth datagram goes. Interleaving spreads most losses
         // across the cover, but one generation still loses past its repair
-        // symbols. The forced profile transmits the spec's whole repair
-        // count, so this epoch holds no reserve and the quiet deadline
-        // goes straight to the reliable backstop; the symbol-repair rung
-        // needs a sized transmit, which the serve ladder test drives.
+        // symbols. The repair round's fresh state names exactly what it is
+        // missing, and the serve's targeted repair resends those sources
+        // within a round trip (ADR-0042 decision 4), so the generation
+        // decodes without touching the reliable path or the quiet grace.
         let (bundle, built) = built_bundle("fec-past-repair", &[("big.bin", patterned(300_000))]);
         let fec = BTreeSet::from([
             vot_codec::extension_id::DATAGRAM_FEC,
@@ -680,11 +680,11 @@ mod tests {
         );
         assert_eq!(fetcher.package().expect("a package"), built);
         // 300000 bytes are five generations. Four decode from the
-        // interleaved symbols and the one over its repair budget arrives
-        // reliably at the quiet deadline. The sim's loss is periodic
-        // rather than sampled, so this count is the same on every run.
+        // interleaved symbols and the fifth from the targeted resend. The
+        // sim's loss is periodic rather than sampled, so this count is the
+        // same on every run.
         let counts = fetcher.fec_counts();
-        assert_eq!(counts.decoded, 4, "one generation needed the fallback");
+        assert_eq!(counts.decoded, 5, "the targeted resend completed the fifth");
         assert_eq!(counts.offered, 5, "every generation was offered coded");
         assert_eq!(
             counts.abandoned, 0,

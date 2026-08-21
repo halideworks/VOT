@@ -100,9 +100,20 @@ const DATAGRAM_OUTBOX_LEN: usize = 2_048;
 const DATAGRAM_OUTBOX_BYTES: usize = 1 << 20;
 
 /// Received datagram bytes the driver holds for a caller that has not drained
-/// them, on top of the shared budget. A quarter of that budget, so the stream
-/// reader's headroom precondition always survives a datagram flood.
-const MAX_DATAGRAM_INBOUND_BYTES: usize = MAX_ASSEMBLY_BYTES / 4;
+/// them, in their own account beside the shared budget so a flood of them
+/// cannot starve the stream reader's headroom.
+///
+/// Sized to what the wire's own datagram credit invites: the receiver
+/// advertises its staging capacity (about 17 MB) as `max_unretired_bytes`,
+/// and a conforming sender may have that many generation bytes of symbols
+/// in flight, which with the repair overhead is about 22 MB. The old
+/// quarter-of-assembly cap (4 MB) sat far under that invitation, and the
+/// pump silently dropped the difference whenever the session thread fell a
+/// burst behind: 8-10% of a coded transfer's symbols on a clean path,
+/// bimodally, measured on the netem rig. A bound the credit can outspend
+/// is the PR 301 class again, one layer up.
+const MAX_DATAGRAM_INBOUND_BYTES: usize = 32 * 1024 * 1024;
+const _: () = assert!(MAX_DATAGRAM_INBOUND_BYTES == 33_554_432);
 
 /// Received datagrams the driver holds for a caller that has not drained them.
 ///
@@ -163,7 +174,7 @@ struct Inbound {
     events: VecDeque<NativeEvent>,
     bytes: usize,
     assembling: usize,
-    /// Received datagram bytes among `bytes`, capped on their own.
+    /// Received datagram bytes, in their own account beside `bytes`.
     datagram_bytes: usize,
     /// Datagrams among `events`, counted on their own so a burst of them does
     /// not meet a bound that exists for the records beside them.
@@ -191,15 +202,15 @@ impl Inbound {
         }
     }
 
-    /// Queues one event, or gives it back when either bound is met. A
-    /// datagram is also bounded by its own count and byte caps.
+    /// Queues one event, or gives it back when its class's bound is met.
+    /// Datagrams live entirely in their own account: their bytes never
+    /// charge the assembly budget, so a symbol flood cannot stall the
+    /// stream reader, and the stream cannot shrink the room the datagram
+    /// credit invited.
     fn push(&mut self, event: NativeEvent) -> Result<(), NativeEvent> {
         let payload = native_payload_len(&event);
-        let Some(next) = self.charged().checked_add(payload) else {
-            return Err(event);
-        };
         let datagram = matches!(event, NativeEvent::Datagram(_));
-        if self.counted_out(datagram) || next > MAX_ASSEMBLY_BYTES {
+        if self.counted_out(datagram) {
             return Err(event);
         }
         if datagram {
@@ -208,9 +219,16 @@ impl Inbound {
             }
             self.datagram_bytes += payload;
             self.datagram_events += 1;
+        } else {
+            let Some(next) = self.charged().checked_add(payload) else {
+                return Err(event);
+            };
+            if next > MAX_ASSEMBLY_BYTES {
+                return Err(event);
+            }
+            self.bytes += payload;
         }
         self.events.push_back(event);
-        self.bytes += payload;
         self.arrived.raise();
         Ok(())
     }
@@ -228,10 +246,11 @@ impl Inbound {
     fn pop(&mut self) -> Option<NativeEvent> {
         let event = self.events.pop_front()?;
         let payload = native_payload_len(&event);
-        self.bytes = self.bytes.saturating_sub(payload);
         if matches!(event, NativeEvent::Datagram(_)) {
             self.datagram_bytes = self.datagram_bytes.saturating_sub(payload);
             self.datagram_events = self.datagram_events.saturating_sub(1);
+        } else {
+            self.bytes = self.bytes.saturating_sub(payload);
         }
         Some(event)
     }
@@ -4417,9 +4436,9 @@ mod tests {
         let _ = inbound.pop();
         assert_eq!(inbound.bytes, 0, "a popped event kept its charge");
 
-        // Datagrams have a cap of their own: a flood stops at a quarter of
-        // the budget while a stream event still fits, and popping one gives
-        // its bytes back to both counts.
+        // Datagrams live entirely in their own account: a flood stops at
+        // their cap, never charges the assembly budget, and popping one
+        // refunds only its own account.
         let mut inbound = Inbound::default();
         let datagram = || NativeEvent::Datagram(vec![1_u8; MAX_DATAGRAM_INBOUND_BYTES / 4].into());
         for _ in 0..4 {
@@ -4427,6 +4446,11 @@ mod tests {
         }
         assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES);
         assert!(inbound.push(datagram()).is_err(), "a fifth is past the cap");
+        assert_eq!(
+            inbound.charged(),
+            0,
+            "a symbol flood charges the assembly budget nothing"
+        );
         assert!(
             inbound
                 .push(NativeEvent::Reliable {
@@ -4437,9 +4461,13 @@ mod tests {
                 .is_ok(),
             "the reliable path is untouched by the flood"
         );
-        assert_eq!(inbound.bytes, MAX_DATAGRAM_INBOUND_BYTES + 1024);
+        assert_eq!(inbound.bytes, 1024);
         let _ = inbound.pop();
         assert_eq!(inbound.datagram_bytes, MAX_DATAGRAM_INBOUND_BYTES * 3 / 4);
+        assert_eq!(
+            inbound.bytes, 1024,
+            "a popped datagram refunds only its own"
+        );
         assert!(inbound.push(datagram()).is_ok(), "room again");
     }
 

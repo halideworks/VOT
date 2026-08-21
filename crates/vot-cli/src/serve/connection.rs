@@ -204,6 +204,14 @@ pub(crate) struct OpenedEpoch {
     /// Whether this epoch already spent its one symbol-repair rung. The
     /// second quiet deadline falls through to the reliable resend.
     pub(crate) symbol_repaired: bool,
+    /// Generations already answered a targeted repair for, once each.
+    pub(crate) repaired: std::collections::BTreeSet<u32>,
+    /// The outbound mark this epoch's own symbol passes sit behind: the
+    /// first pass, and the ladder's reserve rung. Written only by those,
+    /// never by a targeted repair, so one repair's queued bytes cannot
+    /// gate the sibling states that arrive in the same dispatch pass out
+    /// of theirs.
+    pub(crate) symbols_queued_through: u64,
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,

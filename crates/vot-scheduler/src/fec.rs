@@ -42,6 +42,15 @@ pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 130;
 /// each time. Credit and done frames are never dropped, because the
 /// sender's own state machine waits on them.
 pub(crate) const MAX_OWED_STATES: usize = 256;
+
+/// Bytes of pre-open symbols held per session. Sized above the seeded
+/// window's whole first flight, which is what the measured race puts on
+/// the wire before any open lands: at 12 MB the startup burst still
+/// evicted 585-5,782 symbols a run, and every eviction is a decode the
+/// epoch may fail. Past it the oldest goes and is finally counted as the
+/// drop it becomes.
+pub(crate) const MAX_PREOPEN_BYTES: usize = 24 * 1024 * 1024;
+const _: () = assert!(MAX_PREOPEN_BYTES == 25_165_824);
 pub(crate) const MAX_ORPHAN_BYTES: usize = MAX_ORPHAN_GENERATIONS * 65_536;
 
 /// The bundle a decoded generation belongs to: the object root and the exact
@@ -57,6 +66,10 @@ pub(crate) struct Cover {
 struct OpenEpoch {
     cover: Cover,
     plan: EpochPlan,
+    /// Whether the short generations were re-stated when the repair round
+    /// reached this end. Once: one fresh state per short generation is the
+    /// sample the sender's targeted repair answers (ADR-0042 decision 4).
+    restated: bool,
 }
 
 impl Cover {
@@ -166,6 +179,18 @@ impl std::ops::Add for FecCounts {
 pub(crate) struct Intake {
     receiver: Receiver,
     epochs: BTreeMap<u32, OpenEpoch>,
+    /// Symbols that arrived before their epoch's open, in arrival order.
+    /// Datagrams overtake the control stream, and under loss the open
+    /// recovers a round trip behind them, so at 5% loss a receiver that
+    /// dropped these refused 35-40% of everything the sender put on the
+    /// wire: whole covers' worth, measured on the netem rig. Held until
+    /// the open arrives and replayed through the ordinary symbol path.
+    preopen: VecDeque<(u32, Vec<u8>)>,
+    preopen_bytes: usize,
+    /// The highest epoch this end has closed or refused. Sender epoch
+    /// identifiers only rise, so a symbol at or under this is dead on
+    /// arrival and never held.
+    highest_settled: Option<u32>,
     orphans: VecDeque<Orphan>,
     orphan_bytes: usize,
     owed: VecDeque<Owed>,
@@ -220,8 +245,10 @@ impl Intake {
     }
 
     /// `CODING_EPOCH_OPEN`. `Err(())` is the conflict the spec closes the
-    /// session over.
-    pub(crate) fn open(&mut self, open: &CodingEpochOpen) -> Result<(), ()> {
+    /// session over. An accepted open replays the symbols held for it,
+    /// and the joins those completed are the caller's to place, exactly
+    /// as if [`Intake::symbol`] had returned each.
+    pub(crate) fn open(&mut self, open: &CodingEpochOpen) -> Result<Vec<Joined>, ()> {
         let Ok(plan) = EpochPlan::new(open.epoch, open.offset, open.length, open.geometry) else {
             return Err(());
         };
@@ -234,28 +261,70 @@ impl Intake {
                     OpenEpoch {
                         cover: Cover::of(open),
                         plan,
+                        restated: false,
                     },
                 );
-                Ok(())
+                let held = self.take_preopen(open.epoch);
+                let mut joined = Vec::new();
+                for datagram in held {
+                    if let Some(join) = self.symbol(&datagram) {
+                        joined.push(join);
+                    }
+                }
+                Ok(joined)
             }
-            Ok(Open::Repeated) => Ok(()),
+            Ok(Open::Repeated) => Ok(Vec::new()),
             Ok(Open::Refused) => {
                 self.counts.refused += 1;
+                self.settle_epoch(open.epoch);
                 self.owed.push_back(Owed::Done(GenDone {
                     epoch: open.epoch,
                     generation: 0,
                     outcome: GenOutcome::Refused,
                 }));
-                Ok(())
+                Ok(Vec::new())
             }
             Err(_) => Err(()),
         }
+    }
+
+    /// Marks an epoch settled and drops everything held at or under it:
+    /// identifiers only rise, so no epoch at or under the mark ever opens
+    /// again and its symbols are dead where they sit.
+    fn settle_epoch(&mut self, epoch: u32) {
+        self.highest_settled = Some(self.highest_settled.map_or(epoch, |held| held.max(epoch)));
+        let before = self.preopen.len();
+        self.preopen.retain(|(held, datagram)| {
+            if *held <= epoch {
+                self.preopen_bytes -= datagram.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.counts.symbol_drops += (before - self.preopen.len()) as u64;
+    }
+
+    /// Takes every held pre-open symbol for `epoch`, releasing its bytes.
+    fn take_preopen(&mut self, epoch: u32) -> Vec<Vec<u8>> {
+        let mut taken = Vec::new();
+        self.preopen.retain(|(held, datagram)| {
+            if *held == epoch {
+                taken.push(datagram.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.preopen_bytes -= taken.iter().map(Vec::len).sum::<usize>();
+        taken
     }
 
     /// `CODING_EPOCH_CLOSE`. Orphans of the closed epoch go with it: their
     /// bundle, if it ever comes, is answered by the reliable path.
     pub(crate) fn close(&mut self, close: CodingEpochClose) {
         self.receiver.close(close.epoch);
+        self.settle_epoch(close.epoch);
         if let Some(epoch) = self.epochs.remove(&close.epoch) {
             let _ = self.take_orphans(epoch.cover);
         }
@@ -267,9 +336,26 @@ impl Intake {
     pub(crate) fn symbol(&mut self, datagram: &[u8]) -> Option<Joined> {
         let header = peek_header(datagram)?;
         let Some(epoch) = self.epochs.get(&header.epoch).copied() else {
-            // An epoch this end does not hold: dropped per section 12, and
-            // the ledger counts it as a systematic refusal.
-            self.counts.symbol_drops += 1;
+            // An epoch this end does not hold yet. One already settled is
+            // dead and dropped per section 12; one still to open gets its
+            // symbols held for the replay, because dropping them here was
+            // measured refusing 35-40% of a lossy transfer's symbols. A
+            // drop is counted only when a symbol finally dies: settled on
+            // arrival, purged at the settle, or evicted by the budget.
+            if self
+                .highest_settled
+                .is_some_and(|settled| header.epoch <= settled)
+            {
+                self.counts.symbol_drops += 1;
+                return None;
+            }
+            while self.preopen_bytes + datagram.len() > MAX_PREOPEN_BYTES {
+                let (_, oldest) = self.preopen.pop_front()?;
+                self.preopen_bytes -= oldest.len();
+                self.counts.symbol_drops += 1;
+            }
+            self.preopen_bytes += datagram.len();
+            self.preopen.push_back((header.epoch, datagram.to_vec()));
             return None;
         };
         let outcome = self.receiver.symbol(
@@ -278,6 +364,14 @@ impl Intake {
             header.esi,
             &datagram[SYMBOL_HEADER_LEN..],
         );
+        // The first repair-round symbol says every source round is behind
+        // it, so a generation still short holds a real hole, not one in
+        // flight. One fresh state per short generation is the sample the
+        // sender's targeted repair answers within a round trip, instead of
+        // the quiet grace the reliable backstop costs (ADR-0042).
+        if usize::from(header.esi) >= epoch.plan.geometry().source_count() {
+            self.restate_short(header.epoch, epoch.plan);
+        }
         match outcome {
             Symbol::Decoded(Decoded {
                 generation,
@@ -343,6 +437,28 @@ impl Intake {
                 None
             }
             Symbol::Dropped(_) => None,
+        }
+    }
+
+    /// One fresh `GEN_STATE` for every still-live generation of an epoch,
+    /// once, when the repair round reaches this end. A live generation at
+    /// that point is short of `k`, and what it lists missing was truly
+    /// lost rather than in flight.
+    fn restate_short(&mut self, epoch: u32, plan: EpochPlan) {
+        let Some(held) = self.epochs.get_mut(&epoch) else {
+            return;
+        };
+        if held.restated {
+            return;
+        }
+        held.restated = true;
+        for generation in 0..u32::try_from(plan.generation_count()).unwrap_or(u32::MAX) {
+            if self.owed_states >= MAX_OWED_STATES {
+                break;
+            }
+            if let Some(report) = self.receiver.report(epoch, generation) {
+                self.owe_state(state_of(epoch, generation, report));
+            }
         }
     }
 
@@ -1023,20 +1139,180 @@ mod tests {
         // Two bytes of staging: one live two-byte generation of credit.
         intake.extend_credit(2, MAX_OPEN_EPOCHS);
         let _ = intake.take_owed();
-        // An epoch this end does not hold.
+        // An epoch this end does not hold yet: held, not dropped.
         assert!(intake.symbol(&datagram(9, 0, 0, &[0])).is_none());
-        assert_eq!(intake.counts().symbol_drops, 1);
+        assert_eq!(intake.counts().symbol_drops, 0, "held for the open");
         // k = 2, L = 1, length 4: two generations of two bytes. The first
         // symbol is stored; the second generation is past the credit.
         intake.open(&open_of(1, 0, 4, 2, 1, 1)).unwrap();
         assert!(intake.symbol(&datagram(1, 0, 0, &[7])).is_none());
         assert!(intake.symbol(&datagram(1, 1, 0, &[7])).is_none());
         let counts = intake.counts();
-        assert_eq!(
-            counts.symbol_drops, 2,
-            "the unknown epoch and the refused generation"
-        );
+        assert_eq!(counts.symbol_drops, 1, "the refused generation");
         assert_eq!(counts.symbols, 1, "the stored symbol was accepted");
+        // Closing epoch 9's range never happens; closing an epoch ABOVE it
+        // marks everything at or under settled, and the held symbol dies
+        // as the drop it always was.
+        intake.close(CodingEpochClose { epoch: 9 });
+        assert_eq!(
+            intake.counts().symbol_drops,
+            2,
+            "the settle purged the held symbol"
+        );
+        // At or under the settled mark, dead on arrival.
+        assert!(intake.symbol(&datagram(8, 0, 0, &[0])).is_none());
+        assert_eq!(intake.counts().symbol_drops, 3);
+    }
+
+    #[test]
+    fn symbols_that_beat_their_open_replay_and_join_when_it_arrives() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // k = 1, L = 2: a generation decodes on its one source symbol, so
+        // a replayed symbol completes it at the open.
+        let plan = EpochPlan::new(4, 0, 4, Geometry::new(1, 1, 2).unwrap()).unwrap();
+        for (esi, symbol) in vot_fec::encode_generation(&plan, 0, &[5, 6]).unwrap() {
+            assert!(
+                intake.symbol(&datagram(4, 0, esi, &symbol)).is_none(),
+                "held: the epoch is not open yet"
+            );
+        }
+        assert_eq!(intake.counts().symbols, 0, "nothing accepted yet");
+        let joined = intake.open(&open_of(4, 0, 4, 1, 1, 2)).unwrap();
+        assert_eq!(joined.len(), 1, "the replay completed the generation");
+        assert_eq!(joined[0].generation, 0);
+        assert_eq!(joined[0].bytes, vec![5, 6]);
+        assert!(intake.counts().symbols >= 1);
+        assert_eq!(intake.counts().symbol_drops, 0, "nothing died");
+    }
+
+    #[test]
+    fn the_preopen_hold_is_bounded_by_bytes_and_evicts_the_oldest() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // Each held datagram is header plus one symbol; fill past the
+        // budget and the oldest goes, counted as the drop it became.
+        let symbol = vec![0_u8; 1024];
+        let each = SYMBOL_HEADER_LEN + symbol.len();
+        let fits = MAX_PREOPEN_BYTES / each;
+        for at in 0..=u32::try_from(fits).unwrap() {
+            assert!(intake.symbol(&datagram(7, at, 1, &symbol)).is_none());
+        }
+        assert_eq!(
+            intake.counts().symbol_drops,
+            1,
+            "one over the budget evicted exactly one"
+        );
+    }
+
+    #[test]
+    fn the_repair_round_restates_every_short_generation_once() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // k = 2, L = 1, r = 1, length 6: three generations of two bytes.
+        // Generations 0 and 1 open with one source each and stay short;
+        // generation 2 never gets a symbol.
+        intake.open(&open_of(1, 0, 6, 2, 1, 1)).unwrap();
+        assert!(intake.symbol(&datagram(1, 0, 0, &[7])).is_none());
+        assert!(intake.symbol(&datagram(1, 1, 0, &[7])).is_none());
+        // Drain the first-symbol states.
+        while matches!(intake.owed(), Some(Owed::State(_))) {
+            let _ = intake.take_owed();
+        }
+        // The first repair-round symbol restates the live generations. It
+        // belongs to generation 0, whose second symbol completes it, so
+        // the restated set is generation 1 alone, with a fresh sequence.
+        assert!(intake.symbol(&datagram(1, 0, 2, &[9])).is_some());
+        let mut restated = Vec::new();
+        while let Some(owed) = intake.take_owed() {
+            if let Owed::State(state) = owed {
+                restated.push((state.generation, state.sequence));
+            }
+        }
+        assert_eq!(restated.len(), 1, "one live short generation");
+        assert_eq!(restated[0].0, 1);
+        assert!(restated[0].1 >= 2, "a fresh sequence, newer than the first");
+        // A second repair-round symbol restates nothing: once per epoch.
+        assert!(intake.symbol(&datagram(1, 1, 2, &[9])).is_some());
+        assert!(
+            !matches!(intake.owed(), Some(Owed::State(_))),
+            "the restate is spent"
+        );
+    }
+
+    #[test]
+    fn the_preopen_hold_admits_an_exact_fit_and_refunds_exactly() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // Fill to exactly the budget: every symbol is held, none evicted.
+        let symbol = vec![0_u8; 1024];
+        let each = SYMBOL_HEADER_LEN + symbol.len();
+        let fits = MAX_PREOPEN_BYTES / each;
+        let spare = MAX_PREOPEN_BYTES - fits * each;
+        for at in 0..u32::try_from(fits).unwrap() {
+            assert!(intake.symbol(&datagram(7, at, 1, &symbol)).is_none());
+        }
+        let tail = vec![0_u8; spare.saturating_sub(SYMBOL_HEADER_LEN)];
+        if spare > SYMBOL_HEADER_LEN {
+            assert!(intake.symbol(&datagram(7, 999_999, 1, &tail)).is_none());
+        }
+        assert_eq!(intake.preopen_bytes, MAX_PREOPEN_BYTES, "an exact fit");
+        assert_eq!(
+            intake.counts().symbol_drops,
+            0,
+            "nothing evicted at the fit"
+        );
+        // One byte past it evicts exactly one, and the refund is exact:
+        // the freed oldest leaves room the newcomer then takes.
+        assert!(intake.symbol(&datagram(7, 1_000_000, 1, &symbol)).is_none());
+        assert_eq!(intake.counts().symbol_drops, 1);
+        assert_eq!(
+            intake.preopen_bytes,
+            MAX_PREOPEN_BYTES - each + SYMBOL_HEADER_LEN + symbol.len(),
+            "the eviction refunded the oldest exactly"
+        );
+        // Settling an epoch above every held one purges them all, and the
+        // account returns to zero: a refund that drifted would not.
+        intake.close(CodingEpochClose { epoch: 1_000_001 });
+        assert_eq!(intake.preopen_bytes, 0, "the purge refunded everything");
+    }
+
+    #[test]
+    fn a_partial_settle_refunds_and_counts_exactly() {
+        let mut intake = Intake::default();
+        intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // Two symbols held for each of two epochs, distinct sizes so a
+        // drifted refund cannot balance by accident. Epoch 9's are sized
+        // for the geometry it will open with, so the replay decodes them.
+        let small = vec![1_u8; 7];
+        let large = vec![2_u8; 10];
+        assert!(intake.symbol(&datagram(5, 0, 1, &small)).is_none());
+        assert!(intake.symbol(&datagram(5, 1, 1, &small)).is_none());
+        assert!(intake.symbol(&datagram(9, 0, 1, &large)).is_none());
+        assert!(intake.symbol(&datagram(9, 1, 1, &large)).is_none());
+        let held = 2 * (SYMBOL_HEADER_LEN + small.len()) + 2 * (SYMBOL_HEADER_LEN + large.len());
+        assert_eq!(intake.preopen_bytes, held);
+        // Settling epoch 5 purges its two and only its two: the count and
+        // the refund are both exact, and epoch 9's stay held.
+        intake.close(CodingEpochClose { epoch: 5 });
+        assert_eq!(intake.counts().symbol_drops, 2, "exactly the settled two");
+        assert_eq!(
+            intake.preopen_bytes,
+            2 * (SYMBOL_HEADER_LEN + large.len()),
+            "exactly epoch 9's bytes remain"
+        );
+        // Opening epoch 9 replays what it held and refunds it exactly. At
+        // k = 1 a lone repair symbol reaches k, so both generations decode
+        // from the replay alone.
+        let joined = intake.open(&open_of(9, 0, 20, 1, 1, 10)).unwrap();
+        assert_eq!(joined.len(), 2, "both replayed generations decoded");
+        assert_eq!(intake.preopen_bytes, 0, "the replay refunded everything");
+        assert_eq!(intake.counts().symbol_drops, 2, "a replay is not a drop");
     }
 
     #[test]

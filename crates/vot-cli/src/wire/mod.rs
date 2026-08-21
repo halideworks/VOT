@@ -1531,6 +1531,66 @@ mod tests {
     }
 
     #[test]
+    fn a_second_connection_resumes_the_firsts_session() {
+        let source = crate::tests::temporary("resume-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.bin"), vec![9_u8; 4096]).unwrap();
+        let bundle = crate::tests::temporary("resume-bundle");
+        crate::build_bundle(&source, &bundle).unwrap();
+
+        let (listening, address) = mpsc::channel();
+        let serving = std::thread::spawn(move || {
+            serve_bundle(
+                &bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(2),
+                |at, _, identity| {
+                    let _ = listening.send((at, identity));
+                },
+            )
+        });
+        let (at, identity) = address.recv().expect("the server reported its address");
+
+        let config = client_config().unwrap();
+        let first =
+            Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config).unwrap();
+        assert!(first.connected_within(std::time::Duration::from_secs(5)));
+        assert!(!first.is_resumed(), "nothing to resume the first time");
+        // The ticket follows the handshake; bounded by its own count.
+        let mut ticket = None;
+        for _ in 0..500 {
+            ticket = first.session_ticket();
+            if ticket.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ticket = ticket.expect("the serve issued a ticket");
+
+        let mut resumed_config = client_config().unwrap();
+        resumed_config.session = Some(ticket);
+        let second = Transport::connect(
+            local_for(at).unwrap(),
+            at,
+            Some("localhost"),
+            &resumed_config,
+        )
+        .unwrap();
+        assert!(second.connected_within(std::time::Duration::from_secs(5)));
+        assert!(second.is_resumed(), "the ticket resumed the session");
+        // The pin still has a certificate to check: the resumed handshake
+        // sends none, and the stack answers with the session's saved one.
+        assert!(
+            verify_serve_identity(&second, Some(identity)).is_ok(),
+            "the identity pin verifies on a resumed handshake"
+        );
+        drop(first);
+        drop(second);
+        let _ = serving.join().expect("the serving thread");
+    }
+
+    #[test]
     fn an_initial_window_is_bounded_packets() {
         assert_eq!(initial_cwnd_from(None).unwrap(), None);
         assert_eq!(initial_cwnd_from(Some("1024")).unwrap(), Some(1024));

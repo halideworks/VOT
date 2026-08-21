@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -340,6 +340,13 @@ pub struct Config {
     pub max_datagram_bytes: usize,
     /// The congestion controller this endpoint runs.
     pub congestion: CongestionControl,
+    /// A TLS session a client resumes, as [`Transport::session_ticket`]
+    /// returned it from an earlier connection to the same serve.
+    ///
+    /// A resumed handshake carries no certificate, so the serve's whole
+    /// first flight fits the initial amplification allowance and the
+    /// handshake completes a round trip sooner. Servers ignore it.
+    pub session: Option<Vec<u8>>,
     /// Initial congestion window in packets, or the controller's default.
     ///
     /// The sender's window governs a transfer, so this matters on the
@@ -398,6 +405,7 @@ impl Config {
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
             initial_congestion_window_packets: None,
+            session: None,
             side_channel_lead: None,
         }
     }
@@ -415,6 +423,7 @@ impl Config {
             max_datagram_bytes: MAX_DATAGRAM_SIZE,
             congestion: CongestionControl::Cubic,
             initial_congestion_window_packets: None,
+            session: None,
             side_channel_lead: None,
         }
     }
@@ -442,6 +451,13 @@ impl Config {
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         config.verify_peer(self.verify_peer);
+        // Early data: a resuming client sends its negotiation in the first
+        // flight and the serve answers at one round trip. Servers enable it
+        // so the tickets they issue permit it; a client without a session
+        // to resume sends nothing early. VOT's early frames are replay-safe:
+        // negotiation is idempotent and a capability proof binds the channel
+        // exporter, which a replayed connection cannot reproduce.
+        config.enable_early_data();
         if let Some(packets) = self.initial_congestion_window_packets {
             config.set_initial_congestion_window_packets(packets);
         }
@@ -497,6 +513,11 @@ pub struct Transport {
     /// The peer's leaf certificate in DER, kept from the handshake so a
     /// caller can pin who it is talking to before it says anything.
     peer_certificate: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The TLS session ticket the peer issued, once it has, for a later
+    /// connection to resume with [`Config::session`].
+    session_ticket: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Whether the handshake resumed an earlier session.
+    resumed: Arc<AtomicBool>,
     /// The most recent path sample the driver read. Copied into the adapter
     /// before events are drained, so the disconnect that clears it is seen after
     /// the sample it belongs to rather than before.
@@ -609,16 +630,21 @@ impl Transport {
         let path = Arc::new(Mutex::new(None));
         let channel_binding = Arc::new(Mutex::new(None));
         let peer_certificate = Arc::new(Mutex::new(None));
+        let session_ticket = Arc::new(Mutex::new(None));
+        let resumed = Arc::new(AtomicBool::new(false));
         let driver_inbound = Arc::clone(&inbound);
         let driver_close = Arc::clone(&close);
         let driver_control = Arc::clone(&control_limit);
         let driver_path = Arc::clone(&path);
         let driver_binding = Arc::clone(&channel_binding);
         let driver_certificate = Arc::clone(&peer_certificate);
+        let driver_ticket = Arc::clone(&session_ticket);
+        let driver_resumed = Arc::clone(&resumed);
         let connection = ConnectionId(u64::from(local.port()));
         let datagram_bytes = config.max_datagram_bytes;
         let accept_timeout_ms = config.accept_timeout_ms;
 
+        let session = config.session.clone();
         let driver = std::thread::Builder::new()
             .name(format!("vot-quiche-{}", local.port()))
             .spawn(move || {
@@ -631,6 +657,7 @@ impl Transport {
                         .map(|(address, name)| (*address, name.as_deref())),
                     role,
                     &mut quiche_config,
+                    session.as_deref(),
                     &receiver,
                     &driver_inbound,
                     &driver_close,
@@ -638,6 +665,8 @@ impl Transport {
                     &driver_path,
                     &driver_binding,
                     &driver_certificate,
+                    &driver_ticket,
+                    &driver_resumed,
                     connection.0,
                     datagram_bytes,
                     accept_timeout_ms,
@@ -659,6 +688,8 @@ impl Transport {
             inbound,
             channel_binding,
             peer_certificate,
+            session_ticket,
+            resumed,
             path,
             close,
             held: None,
@@ -674,6 +705,27 @@ impl Transport {
     #[must_use]
     pub fn peer_certificate(&self) -> Option<Vec<u8>> {
         self.peer_certificate.lock().ok()?.clone()
+    }
+
+    /// The TLS session ticket the serve issued, or nothing until it
+    /// arrives, shortly after the handshake. Feed it to [`Config::session`]
+    /// to resume, which spares the resumed handshake a round trip.
+    #[must_use]
+    pub fn session_ticket(&self) -> Option<Vec<u8>> {
+        self.session_ticket.lock().ok()?.clone()
+    }
+
+    /// The slot [`Self::session_ticket`] reads, for a caller that must hand
+    /// the ticket on after this endpoint has moved.
+    #[must_use]
+    pub fn session_ticket_slot(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
+        Arc::clone(&self.session_ticket)
+    }
+
+    /// Whether the handshake resumed an earlier session.
+    #[must_use]
+    pub fn is_resumed(&self) -> bool {
+        self.resumed.load(Ordering::Relaxed)
     }
 
     /// The address this endpoint is bound to.
@@ -994,6 +1046,7 @@ fn drive(
     peer: Option<(SocketAddr, Option<&str>)>,
     role: Role,
     config: &mut quiche::Config,
+    session: Option<&[u8]>,
     commands: &mpsc::Receiver<Command>,
     inbound: &Arc<Mutex<Inbound>>,
     close: &Arc<AtomicU64>,
@@ -1001,6 +1054,8 @@ fn drive(
     path: &Arc<Mutex<Option<PathStats>>>,
     channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
     peer_certificate: &Arc<Mutex<Option<Vec<u8>>>>,
+    session_ticket: &Arc<Mutex<Option<Vec<u8>>>>,
+    resumed: &Arc<AtomicBool>,
     connection: u64,
     datagram_bytes: usize,
     accept_timeout_ms: u64,
@@ -1017,7 +1072,15 @@ fn drive(
 
     let conn = match (role, peer) {
         (Role::Client, Some((address, name))) => {
-            quiche::connect(name, &scid, local, address, config).map_err(|_| Error::Backend)?
+            let mut conn =
+                quiche::connect(name, &scid, local, address, config).map_err(|_| Error::Backend)?;
+            // Before the first send: a resumed handshake is decided at the
+            // ClientHello. A ticket the library rejects is dropped and the
+            // handshake runs full, which is what an expired one deserves.
+            if let Some(session) = session {
+                let _ = conn.set_session(session);
+            }
+            conn
         }
         (Role::Server, _) => {
             // A server has nothing to do until a client speaks, and the first
@@ -1048,6 +1111,8 @@ fn drive(
         path,
         channel_binding,
         peer_certificate,
+        session_ticket,
+        resumed,
         connection,
         datagram_bytes,
         buffer,
@@ -1099,6 +1164,8 @@ fn run(
     path: &Arc<Mutex<Option<PathStats>>>,
     channel_binding: &Arc<Mutex<Option<ChannelBinding>>>,
     peer_certificate: &Arc<Mutex<Option<Vec<u8>>>>,
+    session_ticket: &Arc<Mutex<Option<Vec<u8>>>>,
+    resumed: &Arc<AtomicBool>,
     connection: u64,
     datagram_bytes: usize,
     mut buffer: Vec<u8>,
@@ -1176,12 +1243,20 @@ fn run(
             if let (Some(der), Ok(mut held)) = (conn.peer_cert(), peer_certificate.lock()) {
                 *held = Some(der.to_vec());
             }
+            resumed.store(conn.is_resumed(), Ordering::Relaxed);
             announced = true;
             if let Ok(mut queue) = inbound.lock() {
                 queue.push_unlosable(NativeEvent::Connected(connection));
             }
         }
 
+        if announced
+            && let Ok(mut held) = session_ticket.try_lock()
+            && held.is_none()
+            && let Some(session) = conn.session()
+        {
+            *held = Some(session.to_vec());
+        }
         if conn.is_closed() {
             break 'drive Ok(());
         }
@@ -1559,6 +1634,13 @@ fn route(
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
     let mut space = receive_space();
     let mut routes: std::collections::HashMap<Vec<u8>, Route> = std::collections::HashMap::new();
+    // One TLS context for every connection this listener accepts, so the
+    // session tickets it issues resume across connections: each context
+    // draws its own ticket key, and a ticket no later context can read is
+    // a full handshake wearing a resumption's clothes.
+    let Ok(mut server_config) = config.build(Role::Server) else {
+        return;
+    };
     if socket.set_read_timeout(Some(ROUTER_TICK)).is_err() {
         return;
     }
@@ -1636,6 +1718,7 @@ fn route(
             socket,
             local,
             config,
+            &mut server_config,
             &mut buffer[..len],
             from,
             segment,
@@ -1677,12 +1760,12 @@ fn accept_routed(
     socket: &Arc<UdpSocket>,
     local: SocketAddr,
     config: &Config,
+    quiche_config: &mut quiche::Config,
     received: &mut [u8],
     from: SocketAddr,
     segment: Option<usize>,
     original: &[u8],
 ) -> Option<(Transport, Route)> {
-    let mut quiche_config = config.build(Role::Server).ok()?;
     let index = ROUTED.fetch_add(1, Ordering::Relaxed);
     let scid = scid_routed(local, index);
     let scid_key = scid.as_ref().to_vec();
@@ -1691,7 +1774,7 @@ fn accept_routed(
         // not a connection this listener will route two ways.
         return None;
     }
-    let mut conn = quiche::accept(&scid, None, local, from, &mut quiche_config).ok()?;
+    let mut conn = quiche::accept(&scid, None, local, from, quiche_config).ok()?;
     feed_received(&mut conn, local, received, from, segment);
 
     let mut adapter = QuicheAdapter::for_role(Role::Server);
@@ -1704,6 +1787,8 @@ fn accept_routed(
     let path = Arc::new(Mutex::new(None));
     let channel_binding = Arc::new(Mutex::new(None));
     let peer_certificate = Arc::new(Mutex::new(None));
+    let session_ticket = Arc::new(Mutex::new(None));
+    let resumed = Arc::new(AtomicBool::new(false));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
@@ -1715,6 +1800,8 @@ fn accept_routed(
     let pump_path = Arc::clone(&path);
     let pump_binding = Arc::clone(&channel_binding);
     let pump_certificate = Arc::clone(&peer_certificate);
+    let pump_ticket = Arc::clone(&session_ticket);
+    let pump_resumed = Arc::clone(&resumed);
     let pump_done = Arc::clone(&done);
     let driver = std::thread::Builder::new()
         .name(format!("vot-quiche-{}-{index}", local.port()))
@@ -1734,6 +1821,8 @@ fn accept_routed(
                 &pump_path,
                 &pump_binding,
                 &pump_certificate,
+                &pump_ticket,
+                &pump_resumed,
                 connection.0,
                 datagram_bytes,
                 buffer,
@@ -1759,6 +1848,8 @@ fn accept_routed(
             inbound,
             channel_binding,
             peer_certificate,
+            session_ticket,
+            resumed,
             path,
             close,
             held: None,

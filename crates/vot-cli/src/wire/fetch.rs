@@ -3,10 +3,10 @@
 use super::{
     BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
     FETCH_RAILS, FETCH_SERVE_IDENTITY, FETCH_STATS, INITIAL_CWND, PROGRESS_QUANTUM_BYTES,
-    PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr, Transport, apply_datagram_bytes,
-    carrier_failure, congestion_from, extensions_from, holder_from, identity_from,
-    initial_cwnd_from, limits, local_for, punch, rails_from, rendezvous_from, stats_wanted,
-    take_slot,
+    PUNCH_WAIT, PackageSummary, Path, RELAY, SESSION_CACHE, SocketAddr, Transport,
+    apply_datagram_bytes, carrier_failure, congestion_from, extensions_from, holder_from,
+    identity_from, initial_cwnd_from, limits, local_for, punch, rails_from, rendezvous_from,
+    stats_wanted, take_slot,
 };
 
 /// How long a pinned fetch waits for the handshake to deliver the serve's
@@ -63,13 +63,69 @@ pub(crate) fn fetch_railed(
 ) -> Result<PackageSummary, Error> {
     let config = client_config()?;
     let identity = identity_from(std::env::var(FETCH_SERVE_IDENTITY).ok().as_deref())?;
+    let cache = std::env::var(SESSION_CACHE)
+        .ok()
+        .map(std::path::PathBuf::from);
+    let mut primary_config = config.clone();
+    if let Some(directory) = &cache {
+        primary_config.session = read_ticket(directory, address);
+    }
+    let primary = Transport::connect(
+        local_for(address)?,
+        address,
+        Some("localhost"),
+        &primary_config,
+    )
+    .map_err(carrier_failure)?;
+    verify_serve_identity(&primary, identity)?;
+    // Rails resume the primary's ticket, which spares each handshake a
+    // round trip; a rail that connects before the ticket arrives runs full.
+    let ticket = primary.session_ticket_slot();
     let connect = || {
+        let mut config = config.clone();
+        config.session = ticket.lock().ok().and_then(|held| held.clone());
         let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
             .map_err(carrier_failure)?;
         verify_serve_identity(&carrier, identity)?;
         Ok(carrier)
     };
-    fetch_with(connect, bundle, pin, rails)
+    let outcome = fetch_over(primary, connect, bundle, pin, rails);
+    if let (Some(directory), Ok(_)) = (&cache, &outcome)
+        && let Ok(held) = ticket.lock()
+        && let Some(held) = held.as_ref()
+    {
+        write_ticket(directory, address, held);
+    }
+    outcome
+}
+
+/// The cached ticket for `address`, or nothing when there is none.
+fn read_ticket(directory: &std::path::Path, address: SocketAddr) -> Option<Vec<u8>> {
+    std::fs::read(directory.join(ticket_name(address))).ok()
+}
+
+/// Caches `ticket` for `address`, best effort: a cache that cannot be
+/// written costs the next fetch a round trip, not this one anything.
+fn write_ticket(directory: &std::path::Path, address: SocketAddr, ticket: &[u8]) {
+    if std::fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let path = directory.join(ticket_name(address));
+    let _ = std::fs::write(&path, ticket);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The cache file for `address`: its text with the port separator made
+/// filename-safe.
+fn ticket_name(address: SocketAddr) -> String {
+    format!(
+        "{}.ticket",
+        address.to_string().replace([':', '[', ']'], "_")
+    )
 }
 
 /// The configuration every fetch rail is opened with.

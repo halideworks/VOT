@@ -577,14 +577,18 @@ mod tests {
 
     #[test]
     fn automatic_fec_follows_recent_loss_with_hysteresis() {
+        // The verdict reads the smoothed rate, so the 3-4% dips inside a
+        // steadily lossy run keep coding on where per-window hysteresis
+        // was measured flapping it off half the time, and one clean
+        // window softens the rate rather than ending the engagement.
         let mut policy = connection::FecPolicy::default();
         for (lost, sent, coding) in [
             (0, 0, false),
             (410, 8192, true),
             (738, 16_384, true),
             (984, 24_576, true),
-            (1229, 32_768, false),
-            (1557, 40_960, false),
+            (1229, 32_768, true),
+            (1557, 40_960, true),
             (1967, 49_152, true),
         ] {
             policy.observe(Some(path_sample(lost, 0, sent)));
@@ -594,8 +598,40 @@ mod tests {
         assert!(policy.coding(), "missing telemetry keeps the last verdict");
 
         policy.observe(Some(path_sample(1967, 0, 57_344)));
-        assert!(!policy.coding(), "a recent clean window disables coding");
-        assert_eq!(policy.repair_symbols(), 2, "repair follows that window");
+        assert!(
+            policy.coding(),
+            "one clean window softens the rate, it does not end coding"
+        );
+        policy.observe(Some(path_sample(1967, 0, 65_536)));
+        assert!(
+            !policy.coding(),
+            "a sustained clean run disables coding through the smoothing"
+        );
+        assert_eq!(
+            policy.repair_symbols(),
+            7,
+            "repair follows the smoothed rate"
+        );
+    }
+
+    #[test]
+    fn a_freak_first_window_cannot_pin_a_clean_path_into_coding() {
+        // A 50% burst in the tiny first sample seeds at the ceiling, not
+        // its raw rate, so a path that is clean ever after disengages
+        // within five windows instead of thirteen.
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(128, 0, 256)));
+        assert!(policy.coding(), "a lossy first sample engages");
+        for window in 1..=4_u64 {
+            policy.observe(Some(path_sample(128, 0, 256 + window * 8192)));
+            assert!(policy.coding(), "still decaying at clean window {window}");
+        }
+        policy.observe(Some(path_sample(128, 0, 256 + 5 * 8192)));
+        assert!(
+            !policy.coding(),
+            "the fifth clean window crosses the off-hysteresis"
+        );
     }
 
     #[test]

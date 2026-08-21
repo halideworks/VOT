@@ -40,6 +40,12 @@ pub(crate) struct FecPolicy {
     repair_symbols: usize,
     /// Whether a sample has closed yet; the first closes early (ADR-0042).
     decided: bool,
+    /// Smoothed loss rate in [`RATE_ONE`]ths, an exponential average over
+    /// the closed windows. The verdict reads this rather than one window:
+    /// loss detection bunches real drops into some windows and starves
+    /// others, and per-window hysteresis was measured flapping a steadily
+    /// lossy path off half the time.
+    smoothed_loss: u64,
 }
 
 impl Default for FecPolicy {
@@ -51,9 +57,27 @@ impl Default for FecPolicy {
             coding: false,
             repair_symbols: super::server::FEC_REPAIR_SYMBOLS,
             decided: false,
+            smoothed_loss: 0,
         }
     }
 }
+
+/// The fixed-point unit the smoothed loss rate is held in. Wide enough
+/// that the engagement edge is exact at the sample sizes the windows
+/// close at: at 1/1024 a five-percent verdict over 8192 packets sat
+/// between representable values.
+const RATE_ONE: u64 = 65_536;
+
+/// The smoothing weight's denominator: each closed window moves the
+/// average a quarter of the way to its own rate. Four steady windows
+/// carry most of a change through, so a real shift in the path lands in
+/// about half a second of full-rate sending, while a single starved or
+/// bunched window moves the verdict by at most a quarter of its error.
+const RATE_SMOOTHING: u64 = 4;
+
+/// The most a first lossy window may seed the smoothed rate with: twice
+/// the five-percent engagement rate.
+const SEED_CEILING: u64 = RATE_ONE / 10;
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -81,8 +105,12 @@ impl FecPolicy {
             counters.spurious.checked_sub(previous.spurious),
             counters.sent.checked_sub(previous.sent),
         ) else {
+            // A counter reset is a new baseline: what the old counters'
+            // windows smoothed into the rate describes a path this one no
+            // longer is.
             self.sample_lost = 0;
             self.sample_sent = 0;
+            self.smoothed_loss = 0;
             return;
         };
         self.sample_lost = self
@@ -99,23 +127,41 @@ impl FecPolicy {
         }
         self.decided = true;
 
-        let lost = u128::from(self.sample_lost);
-        let sent = u128::from(self.sample_sent);
-        let received = sent.saturating_sub(lost).max(1);
+        // The window's own rate folds into the smoothed one, and every
+        // verdict below reads the smoothed rate: engagement at 5%, the
+        // off-hysteresis at 3%, and the repair count, so one bunched or
+        // starved window cannot flip what a steady path deserves.
+        let window_rate = (self.sample_lost.saturating_mul(RATE_ONE)) / self.sample_sent.max(1);
+        // Seeded whole by the first lossy window: until then there is
+        // nothing to smooth, and quartering the first real observation
+        // would hold engagement back three windows for no information.
+        self.smoothed_loss = if self.smoothed_loss == 0 {
+            // Capped: a genuinely lossy path still engages on its first
+            // sample, but the raw rate of one freak 256-packet startup
+            // burst was reviewed locking an otherwise clean path into
+            // coding for up to thirteen windows of decay; from the
+            // ceiling it is back under the off-hysteresis within five.
+            window_rate.min(SEED_CEILING)
+        } else {
+            self.smoothed_loss - self.smoothed_loss / RATE_SMOOTHING + window_rate / RATE_SMOOTHING
+        };
+
+        let rate = u128::from(self.smoothed_loss);
         // Three times the expected losses across a generation's symbols,
         // plus one: at that margin a generation losing past its repair is
         // rarer than one in ten thousand at the loss rates this engages
         // for, so covered bytes stop paying retransmission round trips
         // (ADR-0042). The floor of two keeps one unlucky drop from
         // touching the reliable path on a barely lossy sample.
-        self.repair_symbols =
-            usize::try_from((lost * 3 * vot_fec::MAX_SYMBOLS as u128).div_ceil(received) + 1)
-                .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
-                .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
+        self.repair_symbols = usize::try_from(
+            (rate * 3 * vot_fec::MAX_SYMBOLS as u128).div_ceil(u128::from(RATE_ONE)) + 1,
+        )
+        .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
+        .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
         self.coding = if self.coding {
-            lost * 100 >= sent * 3
+            self.smoothed_loss * 100 >= RATE_ONE * 3
         } else {
-            lost * 20 >= sent
+            self.smoothed_loss * 20 >= RATE_ONE
         };
         self.sample_lost = 0;
         self.sample_sent = 0;

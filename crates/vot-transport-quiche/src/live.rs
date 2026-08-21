@@ -451,13 +451,6 @@ impl Config {
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         config.verify_peer(self.verify_peer);
-        // Early data: a resuming client sends its negotiation in the first
-        // flight and the serve answers at one round trip. Servers enable it
-        // so the tickets they issue permit it; a client without a session
-        // to resume sends nothing early. VOT's early frames are replay-safe:
-        // negotiation is idempotent and a capability proof binds the channel
-        // exporter, which a replayed connection cannot reproduce.
-        config.enable_early_data();
         if let Some(packets) = self.initial_congestion_window_packets {
             config.set_initial_congestion_window_packets(packets);
         }
@@ -1756,6 +1749,10 @@ fn route(
 ///
 /// Answers the transport for the caller and the route for the router, or
 /// nothing for a packet that was not a usable Initial after all.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one accept is one piece; a parameter struct would name nothing"
+)]
 fn accept_routed(
     socket: &Arc<UdpSocket>,
     local: SocketAddr,

@@ -90,14 +90,6 @@ pub(crate) fn initial_cwnd_from(pin: Option<&str>) -> Result<Option<usize>, Erro
         .transpose()
 }
 
-/// The environment variable naming a directory where a fetch caches TLS
-/// session tickets by serve address. A repeat fetch to the same serve
-/// resumes, which spares its handshake a round trip: a resumed handshake
-/// carries no certificate, so the serve's whole first flight fits the
-/// initial amplification allowance. Unset caches nothing; rails within one
-/// fetch resume the primary's ticket either way.
-pub(crate) const SESSION_CACHE: &str = "VOT_SESSION_CACHE";
-
 /// The environment variable that pins the serve's identity: the 64 hex
 /// characters of the blake3 digest of its certificate in DER, as the serve
 /// prints at startup. Unset accepts any serve; the package root still holds

@@ -809,7 +809,7 @@ pub(super) fn answer_request(bytes: &[u8]) -> bool {
 /// 64 KiB integrity group and 64 sources of 1024 bytes. Eight repairs are the
 /// conservative startup/fallback profile; measured paths may use fewer.
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
-pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
+pub(crate) const FEC_REPAIR_SYMBOLS: usize = vot_fec::MAX_REPAIR_SYMBOLS;
 
 /// How long an epoch may draw nothing from the receiver before this end
 /// repairs its remaining generations reliably and closes it.

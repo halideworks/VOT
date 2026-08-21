@@ -17,6 +17,12 @@ pub(crate) const REMEMBERED_REQUESTS: usize = 64;
 /// service-loop cadence cannot turn a handful of drops into a path verdict.
 const FEC_SAMPLE_PACKETS: u64 = 8192;
 
+/// Packets in the first decision only. A transfer a few seconds long is
+/// mostly issued before a full sample closes, so the first verdict comes
+/// from a cover's worth of packets and the steady cadence takes over from
+/// there (ADR-0042).
+const FIRST_FEC_SAMPLE_PACKETS: u64 = 256;
+
 #[derive(Clone, Copy, Debug)]
 struct PathCounters {
     lost: u64,
@@ -32,6 +38,8 @@ pub(crate) struct FecPolicy {
     sample_sent: u64,
     coding: bool,
     repair_symbols: usize,
+    /// Whether a sample has closed yet; the first closes early (ADR-0042).
+    decided: bool,
 }
 
 impl Default for FecPolicy {
@@ -42,6 +50,7 @@ impl Default for FecPolicy {
             sample_sent: 0,
             coding: false,
             repair_symbols: super::server::FEC_REPAIR_SYMBOLS,
+            decided: false,
         }
     }
 }
@@ -80,16 +89,30 @@ impl FecPolicy {
             .sample_lost
             .saturating_add(lost.saturating_sub(spurious));
         self.sample_sent = self.sample_sent.saturating_add(sent);
-        if self.sample_sent < FEC_SAMPLE_PACKETS {
+        let threshold = if self.decided {
+            FEC_SAMPLE_PACKETS
+        } else {
+            FIRST_FEC_SAMPLE_PACKETS
+        };
+        if self.sample_sent < threshold {
             return;
         }
+        self.decided = true;
 
         let lost = u128::from(self.sample_lost);
         let sent = u128::from(self.sample_sent);
         let received = sent.saturating_sub(lost).max(1);
-        self.repair_symbols = usize::try_from((lost * 64).div_ceil(received) + 1)
-            .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
-            .clamp(1, super::server::FEC_REPAIR_SYMBOLS);
+        // Three times the expected losses across a generation's symbols,
+        // plus one: at that margin a generation losing past its repair is
+        // rarer than one in ten thousand at the loss rates this engages
+        // for, so covered bytes stop paying retransmission round trips
+        // (ADR-0042). The floor of two keeps one unlucky drop from
+        // touching the reliable path on a barely lossy sample.
+        self.repair_symbols = usize::try_from(
+            (lost * 3 * vot_fec::MAX_SYMBOLS as u128).div_ceil(received) + 1,
+        )
+        .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
+        .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
         self.coding = if self.coding {
             lost * 100 >= sent * 3
         } else {

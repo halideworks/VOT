@@ -289,6 +289,7 @@ impl BundleServer {
                         .expect("cloned just above");
                     renewed.symbol_repaired = true;
                     renewed.queued_through = connection.outbound.queued_through();
+                    renewed.symbols_queued_through = renewed.queued_through;
                     renewed.quiet_until = None;
                     continue;
                 }
@@ -306,6 +307,84 @@ impl BundleServer {
                 frames::CodingEpochClose { epoch },
             ))?);
         }
+        Ok(())
+    }
+
+    /// A fresh state naming a generation past its source rounds and short
+    /// of `k` gets its holes answered now: the listed missing sources plus
+    /// the unsent reserve, within a round trip of the receiver seeing the
+    /// repair round, instead of the quiet grace the reliable backstop
+    /// costs (ADR-0042 decision 4). Once per generation; the ladder and
+    /// the reliable resend still stand behind it.
+    ///
+    /// Gated on the epoch's symbols all being on the carrier and the
+    /// receiver holding at least half the sources, so an early state from
+    /// a generation whose symbols are still in flight repairs nothing.
+    fn answer_short_state(
+        &self,
+        state: &frames::GenState,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        // The budget bounds a burst of states the way it bounds the
+        // request loop: a whole epoch may re-state at once, and answering
+        // every one past the budget would put megabytes behind it in a
+        // single dispatch pass.
+        if connection.outbound.bytes() >= connection.budget {
+            return Ok(());
+        }
+        let Some(opened) = connection.fec.epochs.get(&state.epoch) else {
+            return Ok(());
+        };
+        let geometry = opened.plan.geometry();
+        let sources = geometry.source_count();
+        if usize::from(state.received) >= sources
+            || usize::from(state.received) < sources / 2
+            || connection.outbound.taken() < opened.symbols_queued_through
+            || opened.repaired.contains(&state.generation)
+            || !opened.plan.holds(state.generation)
+        {
+            return Ok(());
+        }
+        let opened = opened.clone();
+        let served = self
+            .objects
+            .get(&opened.root)
+            .ok_or(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH))?;
+        let (offset, length) = opened.plan.generation_span(state.generation);
+        let plaintext = served.read_covered(offset, length)?;
+        let symbols = vot_fec::encode_generation(&opened.plan, state.generation, &plaintext)
+            .map_err(|_| Error::InvalidBundle)?;
+        let reserve_from = sources + opened.transmitted_repairs;
+        for (esi, symbol) in &symbols {
+            let wanted = usize::from(*esi) >= reserve_from || state.missing_sources.contains(esi);
+            if !wanted {
+                continue;
+            }
+            let mut datagram =
+                Vec::with_capacity(vot_codec::frames::SYMBOL_HEADER_LEN + geometry.symbol_length());
+            frames::encode_symbol(
+                frames::SymbolHeader {
+                    epoch: opened.plan.epoch(),
+                    generation: state.generation,
+                    esi: *esi,
+                },
+                geometry,
+                symbol,
+                &mut datagram,
+            )
+            .map_err(|_| Error::InvalidBundle)?;
+            connection.queue_datagram(Payload::from(datagram));
+        }
+        let renewed = connection
+            .fec
+            .epochs
+            .get_mut(&state.epoch)
+            .expect("held above");
+        renewed.repaired.insert(state.generation);
+        // The retire mark moves so the quiet clock waits out these bytes
+        // too; the symbols mark deliberately does not, or one repair would
+        // gate its siblings in the same pass out of theirs.
+        renewed.queued_through = connection.outbound.queued_through();
         Ok(())
     }
 
@@ -432,7 +511,7 @@ impl BundleServer {
                 if let Some(opened) = connection.fec.epochs.get_mut(&state.epoch) {
                     opened.quiet_until = None;
                 }
-                connection
+                let newer = connection
                     .fec
                     .sender
                     .state(
@@ -445,6 +524,9 @@ impl BundleServer {
                         },
                     )
                     .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
+                if newer {
+                    self.answer_short_state(&state, connection)?;
+                }
                 Ok(())
             }
             TypedFrame::GenDone(done) => self.generation_done(&done, connection),
@@ -890,6 +972,8 @@ impl BundleServer {
                     pieces,
                     transmitted_repairs,
                     symbol_repaired: false,
+                    repaired: std::collections::BTreeSet::new(),
+                    symbols_queued_through: queued_through,
                     plan,
                     live,
                     queued_through,

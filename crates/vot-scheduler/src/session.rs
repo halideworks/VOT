@@ -860,9 +860,16 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             vot_codec::frames::decode(frame, limits).map_err(|_| Error::MalformedFecFrame)?;
         match typed {
             TypedFrame::CodingEpochOpen(open) => {
-                self.fec
+                // An accepted open replays the symbols that beat it here;
+                // each generation those completed joins exactly as if its
+                // last symbol had just arrived.
+                let joined = self
+                    .fec
                     .open(&open)
                     .map_err(|()| Error::CodingEpochConflict)?;
+                for join in joined {
+                    self.join(join)?;
+                }
             }
             TypedFrame::CodingEpochClose(close) => self.fec.close(close),
             _ => {}

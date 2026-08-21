@@ -1881,6 +1881,152 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_short_states_repairs_every_generation_it_names() {
+        // The receiver re-states every short generation in one flush, so
+        // the states arrive back to back in a single dispatch pass. Each
+        // must get its own targeted repair: the first repair queuing bytes
+        // gated all its siblings out until the symbols mark was split from
+        // the retire mark.
+        let (bundle, _) = built_bundle("burst", &[("big.bin", patterned(300_000))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        // A lossy sample sizes five transmitted repairs, leaving a reserve.
+        session.driver().path_stats = Some(path_sample(246, 0, 16_384));
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [51; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let epoch = *connection.fec.epochs.keys().next().expect("an epoch");
+        assert!(
+            connection.outbound.taken() >= connection.fec.epochs[&epoch].symbols_queued_through,
+            "the loopback carrier took the first pass"
+        );
+        session.driver().datagrams.clear();
+        // Three short generations report at once, each missing two sources
+        // and holding forty of sixty-four.
+        for generation in [0_u32, 1, 3] {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                    epoch,
+                    generation,
+                    sequence: 2,
+                    received: 40,
+                    missing_sources: vec![5, 9],
+                })));
+        }
+        server.service(&mut session, &mut connection).unwrap();
+        connection.drain(&mut session).unwrap();
+        // Every named generation got the two missing sources plus the
+        // eleven-symbol reserve, none was gated out by a sibling's bytes.
+        let mut per_generation: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for datagram in &session.driver().datagrams {
+            let generation = u32::from_be_bytes(datagram[4..8].try_into().unwrap());
+            per_generation
+                .entry(generation)
+                .or_default()
+                .push(datagram[8]);
+        }
+        assert_eq!(
+            per_generation.keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 3],
+            "every sibling was answered"
+        );
+        for (generation, esis) in &per_generation {
+            let mut expected: Vec<u8> = vec![5, 9];
+            expected.extend(64 + 5..64 + 16);
+            let mut got = esis.clone();
+            got.sort_unstable();
+            assert_eq!(
+                got, expected,
+                "generation {generation}: the missing sources and the reserve, exactly"
+            );
+        }
+        // A repeat with a newer sequence repairs nothing: once each.
+        session.driver().datagrams.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                epoch,
+                generation: 0,
+                sequence: 3,
+                received: 41,
+                missing_sources: vec![5],
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        connection.drain(&mut session).unwrap();
+        assert!(session.driver().datagrams.is_empty(), "once per generation");
+    }
+
+    #[test]
+    fn a_short_state_is_answered_only_inside_its_window() {
+        // The gate from both sides: under half the sources the symbols may
+        // still be in flight, at or past the whole count nothing is short,
+        // and a stale sequence changes nothing.
+        let (bundle, _) = built_bundle("window", &[("big.bin", patterned(200_000))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session.driver().path_stats = Some(path_sample(246, 0, 16_384));
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [52; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let epoch = *connection.fec.epochs.keys().next().expect("an epoch");
+        session.driver().datagrams.clear();
+        let mut sequence = 1;
+        let mut expect = |session: &mut Session<Loopback>,
+                          connection: &mut ServeConnection,
+                          generation: u32,
+                          received: u8,
+                          answered: bool| {
+            sequence += 1;
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::GenState(frames::GenState {
+                    epoch,
+                    generation,
+                    sequence,
+                    received,
+                    missing_sources: vec![7],
+                })));
+            server.service(session, connection).unwrap();
+            connection.drain(session).unwrap();
+            let got = !session.driver().datagrams.is_empty();
+            session.driver().datagrams.clear();
+            assert_eq!(got, answered, "generation {generation} received {received}");
+        };
+        expect(&mut session, &mut connection, 0, 31, false);
+        expect(&mut session, &mut connection, 0, 32, true);
+        expect(&mut session, &mut connection, 1, 63, true);
+        expect(&mut session, &mut connection, 2, 64, false);
+    }
+
+    #[test]
     fn a_resend_in_a_later_piece_rides_that_piece_bundle() {
         // An epoch spans two pieces; an abandoned generation of the second
         // comes back under the second bundle, indexed relative to it.

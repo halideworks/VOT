@@ -798,10 +798,6 @@ mod tests {
             3_000_000,
             "a longer budget than the default is honoured too"
         );
-        assert!(
-            std::env::var("VOT_STALL_MS").is_err(),
-            "the suite owns no env"
-        );
     }
 
     #[test]

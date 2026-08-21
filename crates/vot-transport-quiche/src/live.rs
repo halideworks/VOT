@@ -3098,6 +3098,64 @@ mod tests {
     }
 
     #[test]
+    fn a_listeners_ticket_resumes_a_second_connection() {
+        let (certificate, key) = credentials();
+        let config = Config::server(limits(), certificate, key);
+        let listener =
+            Listener::bind("127.0.0.1:0".parse().expect("an address"), &config).expect("a bind");
+        let address = listener.local_address();
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+
+        let first = Transport::connect(
+            "127.0.0.1:0".parse().expect("an address"),
+            address,
+            Some("localhost"),
+            &client_config,
+        )
+        .expect("a client");
+        let _first_serve = listener.accept().expect("the first connection");
+        assert!(first.connected_within(Duration::from_secs(5)));
+        assert!(!first.is_resumed(), "nothing to resume the first time");
+        // The ticket follows the handshake; bounded by its own count.
+        let mut ticket = None;
+        for _ in 0..500 {
+            ticket = first.session_ticket();
+            if ticket.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ticket = ticket.expect("the listener issued a ticket");
+        assert_eq!(
+            Some(&ticket),
+            first
+                .session_ticket_slot()
+                .lock()
+                .expect("the slot")
+                .as_ref(),
+            "the slot is where the ticket accessor reads"
+        );
+
+        let mut resumed_config = Config::client(limits());
+        resumed_config.verify_peer = false;
+        resumed_config.session = Some(ticket);
+        let second = Transport::connect(
+            "127.0.0.1:0".parse().expect("an address"),
+            address,
+            Some("localhost"),
+            &resumed_config,
+        )
+        .expect("a second client");
+        let _second_serve = listener.accept().expect("the second connection");
+        assert!(second.connected_within(Duration::from_secs(5)));
+        assert!(
+            second.is_resumed(),
+            "one listener context, so its tickets resume"
+        );
+    }
+
+    #[test]
     fn a_connection_on_a_given_socket_speaks_from_that_socket() {
         // A punched socket is only worth punching if the handshake leaves by
         // it: the peer's NAT was opened for that mapping and no other.

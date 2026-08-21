@@ -1641,6 +1641,63 @@ mod tests {
     }
 
     #[test]
+    fn credit_spent_generations_ride_under_their_own_piece() {
+        // One generation of credit against a two-piece cover: everything
+        // past the first generation rides reliably, each record indexed
+        // relative to its own piece's bundle.
+        let (bundle, _) = built_bundle("spent-credit", &[("big.bin", patterned(1_500_000))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(frames::DatagramCredit {
+            credit_epoch: 1,
+            max_unretired_bytes: 1 << 24,
+            max_active_generations: 1,
+            max_decode_work: 1 << 30,
+            max_open_epochs: 4,
+        });
+        let mut connection = ServeConnection::new();
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [33; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let frames = fec_frames(&mut session);
+        let [
+            TypedFrame::ProofBundle(first),
+            TypedFrame::ProofBundle(second),
+            TypedFrame::CodingEpochOpen(_),
+        ] = &frames[..]
+        else {
+            panic!("two bundles then one open, got {frames:?}");
+        };
+        let records: Vec<DataRecord> = std::mem::take(&mut session.driver().records)
+            .iter()
+            .map(|(_, bytes)| match decode_control(bytes) {
+                TypedFrame::DataRecord(record) => record,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(records.len(), 22, "all but the coded first generation");
+        for record in &records {
+            let generation = record.plaintext_offset / server::FEC_GENERATION_BYTES;
+            if generation < 17 {
+                assert_eq!(record.bundle_id, first.bundle_id);
+                assert_eq!(record.record_index, generation);
+            } else {
+                assert_eq!(record.bundle_id, second.bundle_id);
+                assert_eq!(record.record_index, generation - 17);
+            }
+        }
+    }
+
+    #[test]
     fn a_resend_in_a_later_piece_rides_that_piece_bundle() {
         // An epoch spans two pieces; an abandoned generation of the second
         // comes back under the second bundle, indexed relative to it.

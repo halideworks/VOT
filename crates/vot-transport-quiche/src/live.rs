@@ -457,7 +457,10 @@ impl Config {
         }
         config.verify_peer(self.verify_peer);
         if let Some(packets) = self.initial_congestion_window_packets {
-            config.set_initial_congestion_window_packets(packets);
+            config.set_initial_congestion_window_packets(scaled_initial_window(
+                packets,
+                self.max_datagram_bytes,
+            ));
         }
         config.set_max_idle_timeout(self.idle_timeout_ms);
         if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
@@ -500,6 +503,22 @@ impl Config {
         config.set_disable_active_migration(true);
         Ok(config)
     }
+}
+
+/// The window seed in the units the library counts.
+///
+/// The library multiplies its count by the largest UDP payload the endpoint
+/// may send, which this transport opens to the 65507-byte maximum so
+/// discovery can settle the path, and an unscaled count would seed fifty
+/// times the window it names; under Bbr2 the seed is also the window's
+/// floor, so the unscaled count was congestion control switched off, which
+/// a lossy path turned into second-long queues and a poisoned bandwidth
+/// model. The configured count therefore means packets of the QUIC minimum,
+/// and this scale keeps the seeded bytes what the caller asked whatever the
+/// payload ceiling.
+const fn scaled_initial_window(packets: usize, max_datagram_bytes: usize) -> usize {
+    let scaled = (packets * MIN_DATAGRAM_SIZE).div_ceil(max_datagram_bytes);
+    if scaled == 0 { 1 } else { scaled }
 }
 
 /// A QUIC endpoint carrying VOT, with its own driver thread.
@@ -3094,6 +3113,21 @@ mod tests {
         });
         assert_eq!(carried(&on_client1), vec![frame(b"first-answer")]);
         assert_eq!(carried(&on_client2), vec![frame(b"second-answer")]);
+    }
+
+    #[test]
+    fn the_window_seed_is_scaled_to_the_payload_ceiling() {
+        // 4096 minimum-size packets stay 4096 at the minimum payload and
+        // shrink to the same byte count at the ceiling.
+        assert_eq!(scaled_initial_window(4096, MIN_DATAGRAM_SIZE), 4096);
+        assert_eq!(
+            scaled_initial_window(4096, LARGEST_DATAGRAM_SIZE),
+            (4096 * MIN_DATAGRAM_SIZE).div_ceil(LARGEST_DATAGRAM_SIZE)
+        );
+        assert_eq!(scaled_initial_window(4096, 65_507), 76);
+        assert_eq!(scaled_initial_window(4096, 1_472), 3340);
+        // Never zero, whatever the caller asked.
+        assert_eq!(scaled_initial_window(1, LARGEST_DATAGRAM_SIZE), 1);
     }
 
     #[test]

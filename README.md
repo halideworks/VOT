@@ -137,7 +137,7 @@ authenticates received content. See ADR-0037.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
-| `VOT_INITIAL_CWND` | controller default | Initial congestion window in packets (10 to 7100). Set on the serve to skip most of slow start on a path the operator knows. Under the default bbr2 controller the value is a floor for the connection's life, so it is an assertion about the path, not a hint |
+| `VOT_INITIAL_CWND` | controller default | Initial congestion window in 1200-byte packets (10 to 7100, so up to ~8.5 MB). Set on the serve to skip most of slow start on a path the operator knows; size it near the path's bandwidth-delay product. Under the default bbr2 controller the value is a floor for the connection's life, so it is an assertion about the path, not a hint |
 | `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only after measured corrected packet loss reaches 5%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |

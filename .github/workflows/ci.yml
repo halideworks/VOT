@@ -765,6 +765,14 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BEFORE_SHA: ${{ github.event.before }}
+          # A mutant that silences the serve costs every affected wire test
+          # its full stall budget in real time before the test can fail, and
+          # enough of those stack past any per-mutant ceiling: PR 346 timed
+          # out on a different mutant each of six attempts with nothing
+          # hung. A short budget bounds the whole failure path instead;
+          # 15000 sits above the ten-second silences a starved runner really
+          # produces, which is what sank the earlier cfg(test) shrink.
+          VOT_STALL_MS: "15000"
         run: |
           scope=()
           mode="$(python3 tools/ci_mutation_scope.py \
@@ -779,13 +787,6 @@ jobs:
               ;;
           esac
           # shellcheck disable=SC2086: the shard args are word lists.
-          #
-          # 420s, not 120s: a mutant that silences the serve costs each
-          # affected wire test the fetch's full 30s stall budget in real
-          # time, so the worst legitimate mutant is the ~20s suite plus
-          # several such stalls. At 120s those runs report TIMEOUT with
-          # nothing hung, a different mutant each attempt (PR 346 measured
-          # the mechanism; one mutant exceeds 120s even on a fast machine).
           cargo +1.97.1 mutants --package vot-cli --features wire \
             --config .cargo/mutants-live.toml --timeout 420 --jobs 2 \
             ${{ matrix.args }} "${scope[@]}"

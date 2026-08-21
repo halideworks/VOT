@@ -456,13 +456,16 @@ impl Config {
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         config.verify_peer(self.verify_peer);
-        if let Some(packets) = self.initial_congestion_window_packets {
-            config.set_initial_congestion_window_packets(packets);
-        }
-        config.set_max_idle_timeout(self.idle_timeout_ms);
         if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
             return Err(Error::InvalidConfiguration);
         }
+        if let Some(packets) = self.initial_congestion_window_packets {
+            config.set_initial_congestion_window_packets(scaled_initial_window(
+                packets,
+                self.max_datagram_bytes,
+            ));
+        }
+        config.set_max_idle_timeout(self.idle_timeout_ms);
         config.set_max_recv_udp_payload_size(self.max_datagram_bytes);
         config.set_max_send_udp_payload_size(self.max_datagram_bytes);
         // The configured datagram is a ceiling, not a path claim. Without
@@ -500,6 +503,25 @@ impl Config {
         config.set_disable_active_migration(true);
         Ok(config)
     }
+}
+
+/// The window seed in the units the library counts.
+///
+/// The library multiplies its count by the endpoint's largest UDP payload,
+/// which this transport opens to the 65507-byte maximum so discovery can
+/// settle the path, and ratio-rescales the window and its floor as the
+/// path's real datagram size settles. An unscaled count therefore seeded
+/// fifty times its bytes exactly while the payload was still the ceiling,
+/// and under Bbr2 that transient is also the window's floor: congestion
+/// control off during the very flights that decide the model, which a
+/// lossy path turned into second-long queues and a 61 s fetch. The
+/// configured count means packets of the QUIC minimum; scaled, the seed's
+/// bytes are what the caller asked during the pre-settle transient where a
+/// seed acts, and the floor the rescaling carries forward decays to
+/// harmless rather than standing at fifty times the intent.
+const fn scaled_initial_window(packets: usize, max_datagram_bytes: usize) -> usize {
+    let scaled = (packets * MIN_DATAGRAM_SIZE).div_ceil(max_datagram_bytes);
+    if scaled == 0 { 1 } else { scaled }
 }
 
 /// A QUIC endpoint carrying VOT, with its own driver thread.
@@ -3094,6 +3116,21 @@ mod tests {
         });
         assert_eq!(carried(&on_client1), vec![frame(b"first-answer")]);
         assert_eq!(carried(&on_client2), vec![frame(b"second-answer")]);
+    }
+
+    #[test]
+    fn the_window_seed_is_scaled_to_the_payload_ceiling() {
+        // 4096 minimum-size packets stay 4096 at the minimum payload and
+        // shrink to the same byte count at the ceiling.
+        assert_eq!(scaled_initial_window(4096, MIN_DATAGRAM_SIZE), 4096);
+        assert_eq!(
+            scaled_initial_window(4096, LARGEST_DATAGRAM_SIZE),
+            (4096 * MIN_DATAGRAM_SIZE).div_ceil(LARGEST_DATAGRAM_SIZE)
+        );
+        assert_eq!(scaled_initial_window(4096, 65_507), 76);
+        assert_eq!(scaled_initial_window(4096, 1_472), 3340);
+        // Never zero, whatever the caller asked.
+        assert_eq!(scaled_initial_window(1, LARGEST_DATAGRAM_SIZE), 1);
     }
 
     #[test]

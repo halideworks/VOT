@@ -1194,6 +1194,7 @@ fn run(
     let mut pending_datagram_state = None;
     let mut queued = Queued::default();
     let mut closing = false;
+    let mut closing_passes: u32 = 0;
     let mut announced = false;
     let mut sending = Sending::new(datagram_bytes, offload);
     let mut read_timeout = match intake {
@@ -1224,6 +1225,21 @@ fn run(
         note_close_request(&mut conn, close, &mut closing);
         if orphaned {
             note_orphaned(&mut conn, &mut closing);
+        }
+        // A counted bound on the whole close path, in the loop's own body. A
+        // requested close normally reaches the drain gate below within a
+        // pass or two, but a connection wedged mid-recovery keeps producing
+        // ack-eliciting packets, each of which resets QUIC's idle timer, so
+        // nothing else ever ends it: a fetch suite run was caught spinning
+        // in quiche's frame packing for half an hour while its owner sat in
+        // [`Transport::drop`]'s join. The close was flushed best-effort
+        // passes ago by then; the peer has its own idle timeout, and this
+        // end's owner gets its thread back.
+        if closing {
+            closing_passes = closing_passes.saturating_add(1);
+            if close_overstayed(closing_passes) {
+                break 'drive Ok(());
+            }
         }
         for stream in streams.values_mut() {
             write_outbox(&mut conn, stream, &mut queued);
@@ -2204,6 +2220,38 @@ impl Sending {
     }
 }
 
+/// Passes a closing connection may make before the driver leaves without
+/// the drain gate.
+///
+/// The normal close exits the loop within a pass or two of the request, so
+/// this binds only the wedged case. Sized so the healthy-but-slow case
+/// still drains first: at the loop's 200 microsecond wait floor the budget
+/// spans at least several hundred milliseconds, which is orders past the
+/// passes a flushed close needs, and a spinning connection burns it in
+/// well under a second of CPU.
+const CLOSING_PASS_BUDGET: u32 = 4_096;
+
+/// Whether a closing connection has outstayed its pass budget. Pure, so the
+/// edge is pinned from both sides by a table test.
+const fn close_overstayed(closing_passes: u32) -> bool {
+    closing_passes > CLOSING_PASS_BUDGET
+}
+
+/// Packets one [`send_all`] call may draw from the connection before the
+/// pass ends regardless.
+///
+/// A whole congestion window of full packets is far below this, so a
+/// healthy pass never sees it; only a stream the connection feeds without
+/// end does, and that pass has to end for the driver to read its close
+/// request at all.
+const SEND_PACKET_BUDGET: u32 = 16_384;
+
+/// Whether one send pass has drawn its whole packet budget. Pure, so the
+/// edge is pinned from both sides by a table test.
+const fn send_exhausted(packets: u32) -> bool {
+    packets > SEND_PACKET_BUDGET
+}
+
 /// Takes the caller's close request to the connection, once.
 fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
     if *closing {
@@ -2230,6 +2278,7 @@ fn send_all(
     let mut segment = 0_usize;
     let mut destination = None;
     let mut deadline = None;
+    let mut packets: u32 = 0;
     loop {
         // The opening slot is the ceiling so a discovery probe fits; later
         // packets are capped under it, so the burst is a run of equal slots and
@@ -2242,6 +2291,17 @@ fn send_all(
             destination = None;
             continue;
         };
+        // A pass's own bound on the stream, counted in this loop's body. A
+        // healthy connection ends the pass itself at Done or its pacer, but
+        // a wedged one was caught feeding this loop for half an hour inside
+        // one call, and the driver's own close budget can only fire between
+        // passes. What was not sent by here waits for the next pass, which
+        // first reads commands and the close request.
+        packets = packets.saturating_add(1);
+        if send_exhausted(packets) {
+            flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+            return Ok(deadline);
+        }
         match conn.send(room) {
             Ok((written, info)) => {
                 // A different destination cannot share a burst.
@@ -2885,6 +2945,39 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn a_closing_connection_overstays_only_past_its_whole_budget() {
+        // The edge from both sides: at the budget the driver keeps trying
+        // the drain gate, one pass past it the driver leaves. Zero is the
+        // counter's start, never overstayed.
+        assert!(!close_overstayed(0));
+        assert!(!close_overstayed(1));
+        assert!(!close_overstayed(CLOSING_PASS_BUDGET));
+        assert!(close_overstayed(CLOSING_PASS_BUDGET + 1));
+        assert!(close_overstayed(u32::MAX));
+        // The budget's worst case stays test-sized: a spinning connection
+        // burns it in under a second, and a waiting one in a few of them.
+        const {
+            assert!(CLOSING_PASS_BUDGET <= 8_192);
+        }
+    }
+
+    #[test]
+    fn a_send_pass_ends_at_its_whole_packet_budget() {
+        assert!(!send_exhausted(0));
+        assert!(!send_exhausted(1));
+        assert!(!send_exhausted(SEND_PACKET_BUDGET));
+        assert!(send_exhausted(SEND_PACKET_BUDGET + 1));
+        assert!(send_exhausted(u32::MAX));
+        // Far above a congestion window of full packets, so a healthy pass
+        // never meets it, and small enough that a runaway pass ends within
+        // test-sized time.
+        const {
+            assert!(SEND_PACKET_BUDGET >= 8_192);
+            assert!(SEND_PACKET_BUDGET <= 65_536);
+        }
+    }
 
     #[test]
     fn a_changed_read_timeout_is_installed_and_cached() {

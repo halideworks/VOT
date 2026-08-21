@@ -787,8 +787,12 @@ jobs:
               ;;
           esac
           # shellcheck disable=SC2086: the shard args are word lists.
+          #
+          # The ceiling covers contention, not hangs: two mutants' suites
+          # share four cores, and the worst stall-heavy mutant measured 68s
+          # on two dedicated cores with the budget override in force.
           cargo +1.97.1 mutants --package vot-cli --features wire \
-            --config .cargo/mutants-live.toml --timeout 420 --jobs 2 \
+            --config .cargo/mutants-live.toml --timeout 900 --jobs 2 \
             ${{ matrix.args }} "${scope[@]}"
 
   mutation:

@@ -532,12 +532,12 @@ mod tests {
         let mut startup = connection::FecPolicy::default();
         startup.observe(None);
         startup.observe(Some(vot_transport_api::PathStats::default()));
-        assert_eq!(startup.repair_symbols(), 8);
-        assert_eq!(repair(0, 0, 8191), 8);
-        assert_eq!(repair(0, 0, 8192), 1);
-        assert_eq!(repair(40, 0, 8192), 2);
-        assert_eq!(repair(164, 0, 8192), 3);
-        assert_eq!(repair(410, 0, 8192), 5);
+        assert_eq!(startup.repair_symbols(), 16);
+        assert_eq!(repair(0, 0, 8192), 2, "a clean sample keeps the floor");
+        assert_eq!(repair(40, 0, 8192), 3);
+        assert_eq!(repair(164, 0, 8192), 6);
+        assert_eq!(repair(410, 0, 8192), 14);
+        assert_eq!(repair(984, 0, 8192), 16, "the spec's ceiling binds");
         assert_eq!(
             repair(410, 409, 8192),
             2,
@@ -546,30 +546,33 @@ mod tests {
     }
 
     #[test]
-    fn automatic_fec_waits_for_a_real_five_percent_loss_sample() {
+    fn automatic_fec_decides_first_from_a_covers_worth_of_packets() {
+        // The first verdict closes at 256 packets so a short transfer is
+        // covered rather than mostly issued before a full window closes
+        // (ADR-0042); the five percent bar is unchanged.
         let worthwhile = |lost, spurious, sent| {
             let mut policy = connection::FecPolicy::default();
             policy.observe(Some(path_sample(0, 0, 0)));
             policy.observe(Some(path_sample(lost, spurious, sent)));
             policy.coding()
         };
-        assert!(!worthwhile(410, 0, 8191));
-        assert!(!worthwhile(409, 0, 8192));
-        assert!(worthwhile(410, 0, 8192));
-        assert!(!worthwhile(410, 1, 8192));
+        assert!(!worthwhile(13, 0, 255), "below the first sample");
+        assert!(!worthwhile(12, 0, 256), "under five percent");
+        assert!(worthwhile(13, 0, 256));
+        assert!(!worthwhile(13, 1, 256), "spurious losses do not count");
     }
 
     #[test]
     fn automatic_fec_accumulates_subwindow_counter_deltas() {
         let mut policy = connection::FecPolicy::default();
-        for sent in [0, 2048, 4096, 6144] {
-            policy.observe(Some(path_sample(u64::from(sent > 0) * 410, 0, sent)));
+        for sent in [0, 64, 128, 192] {
+            policy.observe(Some(path_sample(u64::from(sent > 0) * 13, 0, sent)));
             assert!(!policy.coding());
-            assert_eq!(policy.repair_symbols(), 8);
+            assert_eq!(policy.repair_symbols(), 16);
         }
-        policy.observe(Some(path_sample(410, 0, 8192)));
+        policy.observe(Some(path_sample(13, 0, 256)));
         assert!(policy.coding());
-        assert_eq!(policy.repair_symbols(), 5);
+        assert_eq!(policy.repair_symbols(), 14);
     }
 
     #[test]
@@ -592,7 +595,7 @@ mod tests {
 
         policy.observe(Some(path_sample(1967, 0, 57_344)));
         assert!(!policy.coding(), "a recent clean window disables coding");
-        assert_eq!(policy.repair_symbols(), 1, "repair follows that window");
+        assert_eq!(policy.repair_symbols(), 2, "repair follows that window");
     }
 
     #[test]
@@ -603,10 +606,10 @@ mod tests {
         policy.observe(Some(path_sample(0, 0, 0)));
         policy.observe(Some(path_sample(0, 0, 8192)));
         assert!(!policy.coding());
-        assert_eq!(policy.repair_symbols(), 1);
+        assert_eq!(policy.repair_symbols(), 2);
         policy.observe(Some(path_sample(410, 0, 16_384)));
         assert!(policy.coding());
-        assert_eq!(policy.repair_symbols(), 5);
+        assert_eq!(policy.repair_symbols(), 14);
     }
 
     #[test]
@@ -696,7 +699,7 @@ mod tests {
         session.driver().control.clear();
 
         for (request_id, offset, lost, sent, expected_repair) in
-            [(1, 0, 0, 8192, 1), (2, 65_536, 246, 16_384, 3)]
+            [(1, 0, 0, 8192, 2), (2, 65_536, 246, 16_384, 9)]
         {
             session.driver().path_stats = Some(path_sample(lost, 0, sent));
             session

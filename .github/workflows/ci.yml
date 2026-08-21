@@ -779,8 +779,15 @@ jobs:
               ;;
           esac
           # shellcheck disable=SC2086: the shard args are word lists.
+          #
+          # 420s, not 120s: a mutant that silences the serve costs each
+          # affected wire test the fetch's full 30s stall budget in real
+          # time, so the worst legitimate mutant is the ~20s suite plus
+          # several such stalls. At 120s those runs report TIMEOUT with
+          # nothing hung, a different mutant each attempt (PR 346 measured
+          # the mechanism; one mutant exceeds 120s even on a fast machine).
           cargo +1.97.1 mutants --package vot-cli --features wire \
-            --config .cargo/mutants-live.toml --timeout 120 --jobs 2 \
+            --config .cargo/mutants-live.toml --timeout 420 --jobs 2 \
             ${{ matrix.args }} "${scope[@]}"
 
   mutation:

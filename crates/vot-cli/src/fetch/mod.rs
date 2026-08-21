@@ -642,13 +642,12 @@ mod tests {
 
     #[test]
     fn a_generation_that_loses_more_than_its_repair_count_arrives_reliably() {
-        // Every eighth datagram goes. Interleaving spreads most losses across
-        // the piece, but one generation still loses more than its eight repair
-        // symbols. Such a generation decodes never and reports nothing, because
-        // the receiver owes a GEN_DONE only for one it decoded or gave up on.
-        // Before the serve closed a quiet epoch this hung until the fetch
-        // spent its whole stall budget; the object now arrives over the
-        // reliable path instead.
+        // Every eighth datagram goes. Interleaving spreads most losses
+        // across the cover, but one generation still loses past its repair
+        // symbols. The forced profile transmits the spec's whole repair
+        // count, so this epoch holds no reserve and the quiet deadline
+        // goes straight to the reliable backstop; the symbol-repair rung
+        // needs a sized transmit, which the serve ladder test drives.
         let (bundle, built) = built_bundle("fec-past-repair", &[("big.bin", patterned(300_000))]);
         let fec = BTreeSet::from([
             vot_codec::extension_id::DATAGRAM_FEC,
@@ -680,10 +679,10 @@ mod tests {
             FetchStatus::Complete
         );
         assert_eq!(fetcher.package().expect("a package"), built);
-        // 300000 bytes are five generations. Four decode from the interleaved
-        // symbols and the one over its repair budget arrives reliably. The
-        // sim's loss is periodic rather than sampled, so this count is the
-        // same on every run.
+        // 300000 bytes are five generations. Four decode from the
+        // interleaved symbols and the one over its repair budget arrives
+        // reliably at the quiet deadline. The sim's loss is periodic
+        // rather than sampled, so this count is the same on every run.
         let counts = fetcher.fec_counts();
         assert_eq!(counts.decoded, 4, "one generation needed the fallback");
         assert_eq!(counts.offered, 5, "every generation was offered coded");

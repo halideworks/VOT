@@ -256,6 +256,43 @@ impl BundleServer {
             if connection.outbound.bytes() >= connection.budget {
                 break;
             }
+            // The first quiet deadline is answered with symbols, not round
+            // trips (ADR-0042): the reserve repair ESIs the first pass held
+            // back, plus the sources the receiver's newest state reported
+            // missing. The clock re-arms once; a second silence means the
+            // symbols did not land either, and the generations come back as
+            // the reliable records they would have been.
+            let ladder = connection
+                .fec
+                .epochs
+                .get(&epoch)
+                .expect("named by the pass above");
+            if !ladder.symbol_repaired {
+                // The rung needs both halves: symbols this end held back,
+                // and the receiver's word that it holds partial state to
+                // top up. A generation no state was ever accepted for may
+                // hold nothing at all, and reserve symbols alone cannot
+                // decode it; spending the rung there only doubles the
+                // retirement latency the grace exists to bound.
+                let repairable = ladder.reserve_repairs() > 0
+                    && ladder
+                        .live
+                        .iter()
+                        .any(|generation| connection.fec.sender.state_accepted(epoch, *generation));
+                if repairable {
+                    let opened = ladder.clone();
+                    self.repair_epoch_symbols(&opened, connection)?;
+                    let renewed = connection
+                        .fec
+                        .epochs
+                        .get_mut(&epoch)
+                        .expect("cloned just above");
+                    renewed.symbol_repaired = true;
+                    renewed.queued_through = connection.outbound.queued_through();
+                    renewed.quiet_until = None;
+                    continue;
+                }
+            }
             let opened = connection
                 .fec
                 .epochs
@@ -268,6 +305,65 @@ impl BundleServer {
             connection.queue_control(encoded(&TypedFrame::CodingEpochClose(
                 frames::CodingEpochClose { epoch },
             ))?);
+        }
+        Ok(())
+    }
+
+    /// The epoch's symbol repair: the reserve repair ESIs the first pass
+    /// held back, for every live generation, re-encoded from the object
+    /// rather than stored, the way [`Self::resend_generation`] re-reads
+    /// it. Reserve only: the receiver's one state per generation is the
+    /// first symbol's snapshot, so its missing list names nearly every
+    /// source and resending them would ship the whole generation again.
+    ///
+    /// Interleaved ESI-major across the generations, the way the first
+    /// pass spreads its symbols, so a dropped segmentation burst costs a
+    /// few symbols from each generation rather than one generation's
+    /// whole repair.
+    fn repair_epoch_symbols(
+        &self,
+        opened: &OpenedEpoch,
+        connection: &mut ServeConnection,
+    ) -> Result<(), Fault> {
+        let served = self
+            .objects
+            .get(&opened.root)
+            .ok_or(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH))?;
+        let geometry = opened.plan.geometry();
+        let reserve_from = geometry.source_count() + opened.transmitted_repairs;
+        let mut reserves = Vec::new();
+        for generation in &opened.live {
+            if !opened.plan.holds(*generation) {
+                continue;
+            }
+            let (offset, length) = opened.plan.generation_span(*generation);
+            let plaintext = served.read_covered(offset, length)?;
+            let mut symbols = vot_fec::encode_generation(&opened.plan, *generation, &plaintext)
+                .map_err(|_| Error::InvalidBundle)?;
+            symbols.retain(|(esi, _)| usize::from(*esi) >= reserve_from);
+            reserves.push((*generation, symbols));
+        }
+        for slot in 0..geometry.symbol_count().saturating_sub(reserve_from) {
+            for (generation, symbols) in &reserves {
+                let Some((esi, symbol)) = symbols.get(slot) else {
+                    continue;
+                };
+                let mut datagram = Vec::with_capacity(
+                    vot_codec::frames::SYMBOL_HEADER_LEN + geometry.symbol_length(),
+                );
+                frames::encode_symbol(
+                    frames::SymbolHeader {
+                        epoch: opened.plan.epoch(),
+                        generation: *generation,
+                        esi: *esi,
+                    },
+                    geometry,
+                    symbol,
+                    &mut datagram,
+                )
+                .map_err(|_| Error::InvalidBundle)?;
+                connection.queue_datagram(Payload::from(datagram));
+            }
         }
         Ok(())
     }
@@ -659,11 +755,17 @@ impl BundleServer {
             .sender
             .next_epoch()
             .ok_or(Error::InvalidBundle)?;
+        // The geometry declares the spec's whole repair count; the policy's
+        // size is how many of those ESIs the first pass transmits. The gap
+        // is the reserve a symbol repair draws from without reopening
+        // (ADR-0042): symbols are sender-chosen, so an ESI never sent is
+        // simply sent later.
+        let transmitted_repairs = repair_symbols.min(FEC_REPAIR_SYMBOLS);
         let plan = vot_fec::EpochPlan::new(
             epoch,
             covered_offset,
             covered_length,
-            fec_geometry(repair_symbols),
+            fec_geometry(FEC_REPAIR_SYMBOLS),
         )
         .map_err(|_| Error::InvalidBundle)?;
         let generations = plan.generation_count();
@@ -749,6 +851,10 @@ impl BundleServer {
                     let start = esi * geometry.symbol_length();
                     &generation.source[start..start + geometry.symbol_length()]
                 } else {
+                    if esi >= geometry.source_count() + transmitted_repairs {
+                        // The reserve: declared, encoded, held for repair.
+                        continue;
+                    }
                     &generation.repair[esi - geometry.source_count()]
                 };
                 let mut datagram = Vec::with_capacity(
@@ -782,6 +888,8 @@ impl BundleServer {
                 OpenedEpoch {
                     root: object.root,
                     pieces,
+                    transmitted_repairs,
+                    symbol_repaired: false,
                     plan,
                     live,
                     queued_through,

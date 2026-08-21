@@ -197,6 +197,13 @@ pub(crate) struct OpenedEpoch {
     /// generation's record rides under the last piece at or before it,
     /// indexed relative to that piece.
     pub(crate) pieces: Vec<(u32, [u8; 16])>,
+    /// Repair symbols the first pass transmitted per generation. The
+    /// geometry declares the spec's whole repair count, so the ESIs past
+    /// this are the reserve a symbol repair draws from (ADR-0042).
+    pub(crate) transmitted_repairs: usize,
+    /// Whether this epoch already spent its one symbol-repair rung. The
+    /// second quiet deadline falls through to the reliable resend.
+    pub(crate) symbol_repaired: bool,
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,
@@ -211,6 +218,16 @@ pub(crate) struct OpenedEpoch {
     /// it, so it measures one epoch's own silence, and a later change in the
     /// path's grace never shortens a budget already partly spent.
     pub(crate) quiet_until: Option<std::time::Instant>,
+}
+
+impl OpenedEpoch {
+    /// Repair ESIs the first pass held back for a symbol repair.
+    pub(crate) fn reserve_repairs(&self) -> usize {
+        self.plan
+            .geometry()
+            .repair_count()
+            .saturating_sub(self.transmitted_repairs)
+    }
 }
 
 /// The sender side of datagram FEC for one connection.

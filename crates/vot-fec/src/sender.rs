@@ -233,6 +233,18 @@ impl Sender {
         Ok(true)
     }
 
+    /// Whether any `GEN_STATE` was ever accepted for a live generation:
+    /// the receiver's word that it holds partial state worth topping up
+    /// with reserve symbols rather than a reliable record (ADR-0042).
+    #[must_use]
+    pub fn state_accepted(&self, epoch: u32, generation: u32) -> bool {
+        let Some(known) = self.epochs.get(&epoch) else {
+            return false;
+        };
+        known.generations.get(&generation) == Some(&None)
+            && known.sequences.contains_key(&generation)
+    }
+
     /// `GEN_DONE` from the receiver for one generation. Retires it.
     /// `Ok(true)` when it was live; `Ok(false)` for an exact repeat, a
     /// generation never begun, or an epoch this end does not have open.

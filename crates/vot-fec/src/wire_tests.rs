@@ -496,6 +496,7 @@ fn a_sender_tracks_what_credit_lets_it_open_and_begin() {
 /// A newer state is accepted once, done retires once, and payloads outside
 /// the epoch's constraints are errors rather than ignores.
 fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
+    assert!(!sender.state_accepted(1, 0), "no state accepted yet");
     assert_eq!(
         sender.state(1, 0, seq(0)),
         Ok(true),
@@ -515,7 +516,14 @@ fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
         Ok(true),
         "received may reach k + r"
     );
+    assert!(sender.state_accepted(1, 0), "a state was accepted");
+    assert!(!sender.state_accepted(1, 1), "not begun");
+    assert!(!sender.state_accepted(2, 0), "unknown epoch");
     assert_eq!(sender.state(1, 0, seq(2)), Ok(false));
+    assert!(
+        sender.state_accepted(1, 0),
+        "a stale sequence changes nothing"
+    );
     assert_eq!(sender.state(1, 1, seq(1)), Ok(false), "not begun");
     assert_eq!(sender.state(2, 0, seq(1)), Ok(false), "unknown epoch");
     assert_eq!(
@@ -579,6 +587,10 @@ fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
 /// Retire on refusal or close, and never reuse an identifier.
 fn close_rules(sender: &mut Sender, plan1: EpochPlan) {
     assert_eq!(sender.outcome(1, 0), Some(Some(Done::Decoded)));
+    assert!(
+        !sender.state_accepted(1, 0),
+        "a done generation accepts no further state"
+    );
     assert_eq!(sender.active_generations(), 0);
     assert_eq!(sender.unretired_bytes(), 0);
     assert!(sender.may_begin(1));

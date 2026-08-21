@@ -2237,6 +2237,21 @@ const fn close_overstayed(closing_passes: u32) -> bool {
     closing_passes > CLOSING_PASS_BUDGET
 }
 
+/// Packets one [`send_all`] call may draw from the connection before the
+/// pass ends regardless.
+///
+/// A whole congestion window of full packets is far below this, so a
+/// healthy pass never sees it; only a stream the connection feeds without
+/// end does, and that pass has to end for the driver to read its close
+/// request at all.
+const SEND_PACKET_BUDGET: u32 = 16_384;
+
+/// Whether one send pass has drawn its whole packet budget. Pure, so the
+/// edge is pinned from both sides by a table test.
+const fn send_exhausted(packets: u32) -> bool {
+    packets > SEND_PACKET_BUDGET
+}
+
 /// Takes the caller's close request to the connection, once.
 fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
     if *closing {
@@ -2263,6 +2278,7 @@ fn send_all(
     let mut segment = 0_usize;
     let mut destination = None;
     let mut deadline = None;
+    let mut packets: u32 = 0;
     loop {
         // The opening slot is the ceiling so a discovery probe fits; later
         // packets are capped under it, so the burst is a run of equal slots and
@@ -2275,6 +2291,17 @@ fn send_all(
             destination = None;
             continue;
         };
+        // A pass's own bound on the stream, counted in this loop's body. A
+        // healthy connection ends the pass itself at Done or its pacer, but
+        // a wedged one was caught feeding this loop for half an hour inside
+        // one call, and the driver's own close budget can only fire between
+        // passes. What was not sent by here waits for the next pass, which
+        // first reads commands and the close request.
+        packets = packets.saturating_add(1);
+        if send_exhausted(packets) {
+            flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+            return Ok(deadline);
+        }
         match conn.send(room) {
             Ok((written, info)) => {
                 // A different destination cannot share a burst.
@@ -2933,6 +2960,22 @@ mod tests {
         // burns it in under a second, and a waiting one in a few of them.
         const {
             assert!(CLOSING_PASS_BUDGET <= 8_192);
+        }
+    }
+
+    #[test]
+    fn a_send_pass_ends_at_its_whole_packet_budget() {
+        assert!(!send_exhausted(0));
+        assert!(!send_exhausted(1));
+        assert!(!send_exhausted(SEND_PACKET_BUDGET));
+        assert!(send_exhausted(SEND_PACKET_BUDGET + 1));
+        assert!(send_exhausted(u32::MAX));
+        // Far above a congestion window of full packets, so a healthy pass
+        // never meets it, and small enough that a runaway pass ends within
+        // test-sized time.
+        const {
+            assert!(SEND_PACKET_BUDGET >= 8_192);
+            assert!(SEND_PACKET_BUDGET <= 65_536);
         }
     }
 

@@ -1337,7 +1337,10 @@ mod tests {
 
     #[test]
     fn datagram_fec_defaults_to_automatic_and_keeps_explicit_controls() {
-        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let fec = std::collections::BTreeSet::from([
+            vot_codec::extension_id::DATAGRAM_FEC,
+            vot_codec::extension_id::FEC_COVER_EPOCHS,
+        ]);
         assert_eq!(extensions_from(None).unwrap(), fec);
         for off in ["0", "off", "false", " OFF "] {
             assert!(extensions_from(Some(off)).unwrap().is_empty(), "{off}");
@@ -1383,10 +1386,13 @@ mod tests {
                     decoded: 65_500,
                     abandoned: 36,
                     refused: 2,
+                    symbols: 4_194_304,
+                    symbol_drops: 17,
                 },
             ),
             "fetch stats bytes=4294967296 ms=8500 first_ms=321 fec_offered=65536 \
-             fec_coded=65530 fec_decoded=65500 fec_abandoned=36 fec_refused=2"
+             fec_coded=65530 fec_decoded=65500 fec_abandoned=36 fec_refused=2 \
+             fec_symbols=4194304 fec_symbol_drops=17"
         );
         assert_eq!(
             fetch::stats_line(
@@ -1396,7 +1402,7 @@ mod tests {
                 vot_scheduler::FecCounts::default(),
             ),
             "fetch stats bytes=0 ms=0 first_ms=none fec_offered=0 fec_coded=0 fec_decoded=0 \
-             fec_abandoned=0 fec_refused=0"
+             fec_abandoned=0 fec_refused=0 fec_symbols=0 fec_symbol_drops=0"
         );
         // Sub-millisecond is reported as what it is rather than rounded up:
         // a run this short is not a measurement, and saying 1 would hide it.
@@ -1408,7 +1414,7 @@ mod tests {
                 vot_scheduler::FecCounts::default(),
             ),
             "fetch stats bytes=7 ms=0 first_ms=0 fec_offered=0 fec_coded=0 fec_decoded=0 \
-             fec_abandoned=0 fec_refused=0"
+             fec_abandoned=0 fec_refused=0 fec_symbols=0 fec_symbol_drops=0"
         );
     }
 
@@ -1649,7 +1655,10 @@ mod tests {
         std::fs::write(source.join("data.bin"), vec![0x3c_u8; 1_500_000]).unwrap();
         let bundle = crate::tests::temporary("fec-wire-bundle");
         let built = crate::build_bundle(&source, &bundle).unwrap();
-        let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let fec = std::collections::BTreeSet::from([
+            vot_codec::extension_id::DATAGRAM_FEC,
+            vot_codec::extension_id::FEC_COVER_EPOCHS,
+        ]);
 
         let (listening, address) = mpsc::channel();
         let serving_offer = fec.clone();

@@ -61,11 +61,12 @@ const _: () = assert!(
 /// of whatever depth its reliable pipeline runs at.
 ///
 /// An epoch lives at least a round trip, so the share of requests that find
-/// a free slot falls as latency rises and the rest are answered reliably:
-/// measured on an emulated 30 ms path, eight slots carried 81% of the
-/// generations they offered, ten carried 84% and fifteen carried 89%. Raising
-/// this is a memory decision rather than a free one, because the depth below
-/// holds two bundles a slot and the byte budget affords about twenty pieces.
+/// a free slot falls as latency rises and the rest are answered reliably.
+/// Under ADR-0042 a slot holds a whole requested cover rather than one
+/// piece, so eight slots hold about 34 MB in flight, deeper than the request
+/// pipeline that feeds them. The slot-count sweep measured under per-piece
+/// epochs does not carry over; this count is re-measured under cover-sized
+/// epochs before it moves.
 pub const MAX_CODING_EPOCHS: usize = 8;
 
 /// What a sender may have outstanding on the coded path: what the reliable
@@ -217,14 +218,16 @@ impl PendingBundles {
         self.entries.get(id)
     }
 
-    /// The bundle whose proof covers exactly `cover`, if one is held.
-    fn bundle_covering(&self, cover: Cover) -> Option<[u8; 16]> {
+    /// The bundle whose covered range contains `offset` for `root`, if one
+    /// is held, with its covered offset. An epoch spans several piece
+    /// bundles, so a decoded generation joins by containment.
+    fn bundle_containing(&self, root: [u8; 32], offset: u64) -> Option<([u8; 16], u64)> {
         self.entries.iter().find_map(|(id, pending)| {
             let bundle = pending.bundle.as_ref()?;
-            (bundle.object.root == cover.root
-                && bundle.covered_offset == cover.offset
-                && bundle.covered_length == cover.length)
-                .then_some(*id)
+            (bundle.object.root == root
+                && offset >= bundle.covered_offset
+                && offset - bundle.covered_offset < bundle.covered_length)
+                .then_some((*id, bundle.covered_offset))
         })
     }
 
@@ -234,21 +237,19 @@ impl PendingBundles {
 
     /// Coding epochs this end can promise room for.
     ///
-    /// An open epoch pins one pending bundle from its `CODING_EPOCH_OPEN`
-    /// until the last of its generations lands, so a credit inviting more
-    /// epochs than this admits bundles is one the sender spends and this end
-    /// then refuses, ending the fetch.
+    /// An open epoch spans one requested cover, and its `PROOF_BUNDLE`s pin
+    /// up to [`PIECES_PER_COVER`] pending bundles from its
+    /// `CODING_EPOCH_OPEN` until the last of its generations lands, so a
+    /// credit inviting more epochs than the depth holds in whole covers is
+    /// one the sender spends and this end then refuses, ending the fetch.
     ///
-    /// The reserve is a whole cover's worth of pieces rather than one slot.
-    /// Coding is what splits a cover into pieces at all: answered reliably a
-    /// cover is one bundle, and answered coded it is up to
-    /// [`PIECES_PER_COVER`] of them, the ones past this end's epochs
-    /// included, because those ride reliably as pieces of their own. A depth
-    /// under that cannot hold one coded cover in any arrangement, so it
-    /// promises nothing and the sender answers whole covers reliably, which
-    /// is the one shape that always fits.
+    /// The reserve is one further cover's worth of pieces. A depth under
+    /// that cannot hold one coded cover in any arrangement, so it promises
+    /// nothing and the sender answers whole covers reliably, which is the
+    /// one shape that always fits.
     fn epoch_capacity(&self) -> u64 {
-        u64::try_from(self.bundle_limit.saturating_sub(PIECES_PER_COVER)).unwrap_or(u64::MAX)
+        u64::try_from(self.bundle_limit.saturating_sub(PIECES_PER_COVER) / PIECES_PER_COVER)
+            .unwrap_or(u64::MAX)
     }
 
     /// Bytes the orphan budget has left, in whole quanta.
@@ -869,14 +870,17 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.send_owed()
     }
 
-    /// A decoded generation joins the bundle for its exact covered range as
-    /// one record, or waits for that bundle.
+    /// A decoded generation joins the bundle whose covered range contains
+    /// it as one record, or waits for that bundle.
     fn join(&mut self, joined: Joined) -> Result<(), Error> {
-        let Some(id) = self.pending.bundle_covering(joined.cover) else {
+        let Some((id, covered_offset)) = self
+            .pending
+            .bundle_containing(joined.cover.root, joined.plaintext_offset)
+        else {
             self.fec.hold_orphan(joined);
             return Ok(());
         };
-        self.hold_record(fec::record_of(id, joined))
+        self.hold_record(fec::record_of(id, covered_offset, joined))
     }
 
     /// Puts what the intake owes the sender on the control stream. A refusal
@@ -974,7 +978,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.deliver(id)?;
         // Generations that arrived before their bundle join it now.
         for joined in self.fec.take_orphans(cover) {
-            self.hold_record(fec::record_of(id, joined))?;
+            self.hold_record(fec::record_of(id, cover.offset, joined))?;
         }
         Ok(())
     }
@@ -2384,6 +2388,10 @@ mod tests {
     /// A ready session over a loopback with `DATAGRAM_FEC` negotiated on both
     /// ends, so the intake arms on the first poll.
     fn ready_fec() -> SessionReceiver<Loopback> {
+        ready_fec_with_depth(PIECES_PER_COVER * (MAX_CODING_EPOCHS + 1))
+    }
+
+    fn ready_fec_with_depth(depth: usize) -> SessionReceiver<Loopback> {
         let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
         let mut session = Session::server(
             Loopback::default(),
@@ -2412,10 +2420,9 @@ mod tests {
             session,
             ReliableReceiver::new(1 << 20, 1 << 16, 1 << 16).unwrap(),
         );
-        // A depth that admits a coded cover, which is what a caller enabling
+        // A depth that admits coded covers, which is what a caller enabling
         // this extension has to set: at the default an epoch would cost more
         // bundles than there are and `epoch_capacity` invites none.
-        let depth = PIECES_PER_COVER + MAX_CODING_EPOCHS;
         receiver
             .set_pending_limits(depth, depth * MAX_PENDING_BUNDLE_BYTES)
             .unwrap();
@@ -2548,6 +2555,111 @@ mod tests {
     }
 
     #[test]
+    fn the_invited_epochs_are_counted_in_whole_covers() {
+        // An epoch spans a requested cover and pins its pieces, so the
+        // invitation counts the depth in whole covers past the one-cover
+        // reserve, capped at MAX_CODING_EPOCHS.
+        for (depth, invited) in [
+            (PIECES_PER_COVER, 0),
+            (2 * PIECES_PER_COVER, 1),
+            (3 * PIECES_PER_COVER - 1, 1),
+            (
+                PIECES_PER_COVER * (MAX_CODING_EPOCHS + 2),
+                MAX_CODING_EPOCHS as u64,
+            ),
+        ] {
+            let mut driver = ready_fec_with_depth(depth);
+            assert_eq!(driver.poll().unwrap(), None);
+            let limits = vot_codec::DecodeLimits {
+                max_unknown_payload: 1 << 16,
+                max_frames: 1,
+            };
+            let sent = std::mem::take(&mut driver.session_mut().driver().sent);
+            let credit = sent
+                .iter()
+                .find_map(|frame| match vot_codec::frames::decode(frame, limits) {
+                    Ok((TypedFrame::DatagramCredit(credit), _)) => Some(credit),
+                    _ => None,
+                })
+                .expect("arming sends the first credit");
+            assert_eq!(credit.max_open_epochs, invited, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn a_generation_joins_a_bundle_covering_a_later_range() {
+        // The join is offset containment against the bundle's own covered
+        // range, which here starts past zero: an index or containment check
+        // done from the object's start instead would orphan every
+        // generation and leave the bundle pending.
+        let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x33; unit * 4];
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let proof = vot_proof_blake3::prove(&bytes, 2 * unit as u64, 2 * unit as u64).unwrap();
+        let bundle = ProofBundle {
+            request_id: [3; 16],
+            bundle_id: [4; 16],
+            object: ObjectId::try_from(subject).unwrap(),
+            requested_offset: 2 * unit as u64,
+            requested_length: 2 * unit as u64,
+            covered_offset: proof.covered_offset,
+            covered_length: proof.data.len() as u64,
+            data_record_count: 2,
+            total_plaintext_length: proof.data.len() as u64,
+            proof: proof.proof,
+        };
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let (open, plan) = epoch_of(&bundle, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        for generation in 0..2 {
+            let (offset, length) = plan.generation_span(generation);
+            let start = usize::try_from(offset).unwrap();
+            let end = start + usize::try_from(length).unwrap();
+            for (esi, symbol) in
+                vot_fec::encode_generation(&plan, generation, &bytes[start..end]).unwrap()
+            {
+                let mut datagram = Vec::new();
+                vot_codec::frames::encode_symbol(
+                    vot_codec::frames::SymbolHeader {
+                        epoch: 1,
+                        generation,
+                        esi,
+                    },
+                    plan.geometry(),
+                    &symbol,
+                    &mut datagram,
+                )
+                .unwrap();
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.fec_counts().decoded, 2);
+        assert_eq!(
+            driver.pending_bundles(),
+            0,
+            "both decoded generations joined the bundle and it delivered"
+        );
+    }
+
+    #[test]
     fn a_lossy_epoch_becomes_verified_state_through_its_bundle() {
         // The bundle arrives first, then every generation loses four
         // symbols; each decoded generation is one record of the bundle.
@@ -2588,6 +2700,10 @@ mod tests {
                 decoded: 2,
                 abandoned: 0,
                 refused: 0,
+                // Each generation decodes at its 64th accepted symbol; the
+                // rest arrive settled and are the decode's normal tail.
+                symbols: 128,
+                symbol_drops: 0,
             }
         );
         assert_eq!(driver.pending_bundles(), 0);

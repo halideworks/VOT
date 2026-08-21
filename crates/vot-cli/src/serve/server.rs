@@ -131,8 +131,9 @@ impl BundleServer {
             if let Err(fault) = self.pump_manifest(connection) {
                 return fail(fault, session, connection);
             }
-            connection.fec_negotiated =
-                session.extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC);
+            connection.fec_negotiated = session
+                .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC)
+                && session.extension_negotiated(vot_codec::extension_id::FEC_COVER_EPOCHS);
             let over_budget = connection.outbound.bytes() >= connection.budget;
             let polled = if over_budget || connection.deferred.is_empty() {
                 session.poll()
@@ -429,11 +430,12 @@ impl BundleServer {
         if !opened.plan.holds(generation) {
             return Ok(());
         }
+        let (first, piece_id) = piece_of(&opened.pieces, generation).ok_or(Error::InvalidBundle)?;
         let (offset, length) = opened.plan.generation_span(generation);
         let plaintext = served.read_covered(offset, length)?;
         connection.queue_record(encoded(&TypedFrame::DataRecord(DataRecord {
-            bundle_id: opened.bundle_id,
-            record_index: u64::from(generation),
+            bundle_id: piece_id,
+            record_index: u64::from(generation - first),
             plaintext_offset: offset,
             plaintext_length: length,
             compression: 0,
@@ -517,53 +519,15 @@ impl BundleServer {
                 connection,
             );
         }
-        // Coded, in pieces of at most `MAX_DATA_RECORDS_PER_BUNDLE`
-        // generations, each its own bundle and epoch: a bundle carries one
-        // record per generation and the wire bounds records per bundle. The
-        // request's sub-ranges partition it, and the receiver deduplicates
-        // on request and range identity, so several bundles may answer one
-        // request. A piece the peer's credit no longer admits an epoch for
-        // rides reliably.
-        // Pieces are the object's fixed FEC_PIECE_BYTES windows cut to the
-        // request, so a piece's group cover never exceeds the record bound.
-        let request_end = request.offset.saturating_add(request.length);
-        let mut sub_offset = request.offset;
-        let mut index: u16 = 0;
-        while sub_offset < request_end {
-            let piece_end = (sub_offset / FEC_PIECE_BYTES)
-                .saturating_add(1)
-                .saturating_mul(FEC_PIECE_BYTES)
-                .min(request_end);
-            if piece_end <= sub_offset {
-                return Err(Error::InvalidBundle.into());
-            }
-            let sub_length = piece_end - sub_offset;
-            let mut piece_id = bundle_id;
-            piece_id[14..].copy_from_slice(&index.to_be_bytes());
-            if connection.fec.sender.may_open() {
-                Self::answer_coded(
-                    served,
-                    request.request_id,
-                    piece_id,
-                    sub_offset,
-                    sub_length,
-                    connection,
-                    repair_symbols,
-                )?;
-            } else {
-                Self::answer_reliably(
-                    served,
-                    request.request_id,
-                    piece_id,
-                    sub_offset,
-                    sub_length,
-                    connection,
-                )?;
-            }
-            sub_offset = piece_end;
-            index = index.checked_add(1).ok_or(Error::InvalidBundle)?;
-        }
-        Ok(())
+        Self::answer_coded(
+            served,
+            request.request_id,
+            bundle_id,
+            request.offset,
+            request.length,
+            connection,
+            repair_symbols,
+        )
     }
 
     /// The reliable answer: the cover's proof and its bytes as records.
@@ -612,9 +576,16 @@ impl BundleServer {
         Ok(())
     }
 
-    /// The coded answer for one piece: the same bundle with one record per
+    /// The coded answer for one request: one epoch across the whole covered
+    /// range (ADR-0042), one proof bundle per piece with one record per
     /// generation, then the epoch open, then each generation's symbols, or
     /// its record when the peer's generation credit is spent.
+    ///
+    /// Pieces are the object's fixed `FEC_PIECE_BYTES` windows cut to the
+    /// request, so a piece's group cover never exceeds the record bound. The
+    /// windows are group-aligned, so proving expands only the two ends of
+    /// the request and the piece covers abut: their union is the epoch's
+    /// range, and every generation lies whole inside one piece.
     fn answer_coded(
         served: &ServedObject,
         request_id: [u8; 16],
@@ -624,11 +595,65 @@ impl BundleServer {
         connection: &mut ServeConnection,
         repair_symbols: usize,
     ) -> Result<(), Fault> {
-        let (covered_offset, covered_length, proof) = served
-            .layer
-            .prove(offset, length)
-            .map_err(Error::from)?
-            .into_parts();
+        let request_end = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
+        let object = served.object;
+        // Bundles go out before the epoch open, so on the ordered control
+        // stream no generation can decode ahead of the bundle it joins.
+        let mut covers: Vec<(u64, [u8; 16])> = Vec::new();
+        let mut covered_end = 0_u64;
+        let mut sub_offset = offset;
+        let mut index: u16 = 0;
+        while sub_offset < request_end {
+            let piece_end = (sub_offset / FEC_PIECE_BYTES)
+                .saturating_add(1)
+                .saturating_mul(FEC_PIECE_BYTES)
+                .min(request_end);
+            if piece_end <= sub_offset {
+                return Err(Error::InvalidBundle.into());
+            }
+            let sub_length = piece_end - sub_offset;
+            let mut piece_id = bundle_id;
+            piece_id[14..].copy_from_slice(&index.to_be_bytes());
+            let (piece_offset, piece_length, proof) = served
+                .layer
+                .prove(sub_offset, sub_length)
+                .map_err(Error::from)?
+                .into_parts();
+            debug_assert!(
+                covers.is_empty() || piece_offset == covered_end,
+                "piece covers must abut"
+            );
+            covered_end = piece_offset
+                .checked_add(piece_length)
+                .ok_or(Error::InvalidBundle)?;
+            connection.queue_control(encoded(&TypedFrame::ProofBundle(ProofBundle {
+                request_id,
+                bundle_id: piece_id,
+                object,
+                requested_offset: sub_offset,
+                requested_length: sub_length,
+                covered_offset: piece_offset,
+                covered_length: piece_length,
+                data_record_count: piece_length.div_ceil(FEC_GENERATION_BYTES),
+                total_plaintext_length: piece_length,
+                proof,
+            }))?);
+            covers.push((piece_offset, piece_id));
+            sub_offset = piece_end;
+            index = index.checked_add(1).ok_or(Error::InvalidBundle)?;
+        }
+        let covered_offset = covers.first().ok_or(Error::InvalidBundle)?.0;
+        let covered_length = covered_end
+            .checked_sub(covered_offset)
+            .ok_or(Error::InvalidBundle)?;
+        let pieces: Vec<(u32, [u8; 16])> = covers
+            .iter()
+            .map(|(at, id)| {
+                u32::try_from((at - covered_offset) / FEC_GENERATION_BYTES)
+                    .map(|first| (first, *id))
+                    .map_err(|_| Error::InvalidBundle)
+            })
+            .collect::<Result<_, _>>()?;
         let epoch = connection
             .fec
             .sender
@@ -642,21 +667,7 @@ impl BundleServer {
         )
         .map_err(|_| Error::InvalidBundle)?;
         let generations = plan.generation_count();
-        debug_assert!(generations <= vot_codec::frames::MAX_DATA_RECORDS_PER_BUNDLE as u64);
         let plaintext = served.read_covered(covered_offset, covered_length)?;
-        let object = served.object;
-        connection.queue_control(encoded(&TypedFrame::ProofBundle(ProofBundle {
-            request_id,
-            bundle_id,
-            object,
-            requested_offset: offset,
-            requested_length: length,
-            covered_offset,
-            covered_length,
-            data_record_count: generations,
-            total_plaintext_length: covered_length,
-            proof,
-        }))?);
         connection
             .fec
             .sender
@@ -711,10 +722,12 @@ impl BundleServer {
                 live.insert(generation);
             } else {
                 // Past the peer's generation credit: this one rides reliably
-                // under the same bundle.
+                // under its piece's bundle.
+                let (first, piece_id) =
+                    piece_of(&pieces, generation).ok_or(Error::InvalidBundle)?;
                 connection.queue_record(encoded(&TypedFrame::DataRecord(DataRecord {
-                    bundle_id,
-                    record_index: u64::from(generation),
+                    bundle_id: piece_id,
+                    record_index: u64::from(generation - first),
                     plaintext_offset: gen_offset,
                     plaintext_length: gen_length,
                     compression: 0,
@@ -722,7 +735,7 @@ impl BundleServer {
                 }))?);
             }
         }
-        // Spread each ESI across the piece before sending the next one. A
+        // Spread each ESI across the cover before sending the next one. A
         // dropped UDP segmentation burst then costs a few symbols from each
         // generation instead of enough adjacent symbols to defeat its repair
         // budget outright.
@@ -768,7 +781,7 @@ impl BundleServer {
                 plan.epoch(),
                 OpenedEpoch {
                     root: object.root,
-                    bundle_id,
+                    pieces,
                     plan,
                     live,
                     queued_through,
@@ -778,6 +791,16 @@ impl BundleServer {
         }
         Ok(())
     }
+}
+
+/// The piece a generation's record rides under: the last piece at or before
+/// it, as its first generation and bundle identifier.
+fn piece_of(pieces: &[(u32, [u8; 16])], generation: u32) -> Option<(u32, [u8; 16])> {
+    pieces
+        .iter()
+        .rev()
+        .find(|(first, _)| *first <= generation)
+        .copied()
 }
 
 /// Whether consuming this frame can add a new answer batch.

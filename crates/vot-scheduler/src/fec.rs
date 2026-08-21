@@ -3,12 +3,13 @@
 //! decoded generation and the proof bundle that vouches for its bytes.
 //!
 //! A serve that answers a range over the datagram path announces the same
-//! `PROOF_BUNDLE` it would have sent reliably, with `data_record_count` equal
-//! to the epoch's generation count, and opens one coding epoch whose range is
-//! exactly the bundle's covered range. Each generation this end decodes
-//! becomes one `DataRecord` of that bundle, so verification, replay, and
-//! delivery are the bundle path's, unchanged. Everything here that arrives
-//! for state this end does not hold is dropped, as section 12 says.
+//! `PROOF_BUNDLE`s it would have sent reliably, one per piece with
+//! `data_record_count` equal to the piece's generation count, and opens one
+//! coding epoch spanning the whole covered range (ADR-0042). Each generation
+//! this end decodes becomes one `DataRecord` of the bundle whose covered
+//! range contains it, so verification, replay, and delivery are the bundle
+//! path's, unchanged. Everything here that arrives for state this end does
+//! not hold is dropped, as section 12 says.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -23,7 +24,12 @@ use vot_fec::{Credit, Decoded, EpochPlan, Open, Receiver, Report, Symbol};
 /// control stream, so a few are normal; past either bound the oldest goes
 /// and the reliable path repairs it. Their FEC credit was released when they
 /// decoded, so this is the whole bound on them.
-pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 16;
+///
+/// Sized as two whole covers under cover-sized epochs: a bundle this end
+/// refused or evicted leaves every generation of its piece orphaned, and at
+/// the old bound of sixteen those dropped and rode reliably again, which is
+/// the waste the coded path exists to remove.
+pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 130;
 
 /// Most `GEN_STATE` frames held for sending at once.
 ///
@@ -36,7 +42,7 @@ pub(crate) const MAX_ORPHAN_GENERATIONS: usize = 16;
 /// each time. Credit and done frames are never dropped, because the
 /// sender's own state machine waits on them.
 pub(crate) const MAX_OWED_STATES: usize = 256;
-pub(crate) const MAX_ORPHAN_BYTES: usize = 16 * 65_536;
+pub(crate) const MAX_ORPHAN_BYTES: usize = MAX_ORPHAN_GENERATIONS * 65_536;
 
 /// The bundle a decoded generation belongs to: the object root and the exact
 /// covered range the epoch was opened over.
@@ -69,6 +75,7 @@ pub(crate) struct Orphan {
     pub(crate) cover: Cover,
     pub(crate) generation: u32,
     pub(crate) offset: u64,
+    pub(crate) generation_bytes: u64,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -87,6 +94,9 @@ pub(crate) struct Joined {
     pub(crate) generation: u32,
     /// The record's absolute object offset, as `DataRecord` carries it.
     pub(crate) plaintext_offset: u64,
+    /// The epoch's generation stride, which names the record's slot in the
+    /// bundle its offset falls in.
+    pub(crate) generation_bytes: u64,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -124,6 +134,15 @@ pub struct FecCounts {
     pub abandoned: u64,
     /// Coding epochs refused, whose generation count this end never learned.
     pub refused: u64,
+    /// Symbol datagrams this end accepted into a live generation, the
+    /// receiver's end of the delivery ledger: what the sender encoded minus
+    /// this minus the path's own loss is what dropped in between.
+    pub symbols: u64,
+    /// Symbol datagrams refused at this end for a systematic reason: an
+    /// epoch this end does not hold, or a symbol past the extended credit.
+    /// Late symbols for a settled generation are not counted; they are the
+    /// normal tail of a decode.
+    pub symbol_drops: u64,
 }
 
 impl std::ops::Add for FecCounts {
@@ -137,6 +156,8 @@ impl std::ops::Add for FecCounts {
             decoded: self.decoded.saturating_add(other.decoded),
             abandoned: self.abandoned.saturating_add(other.abandoned),
             refused: self.refused.saturating_add(other.refused),
+            symbols: self.symbols.saturating_add(other.symbols),
+            symbol_drops: self.symbol_drops.saturating_add(other.symbol_drops),
         }
     }
 }
@@ -245,7 +266,12 @@ impl Intake {
     /// here yet is held as an orphan.
     pub(crate) fn symbol(&mut self, datagram: &[u8]) -> Option<Joined> {
         let header = peek_header(datagram)?;
-        let epoch = *self.epochs.get(&header.epoch)?;
+        let Some(epoch) = self.epochs.get(&header.epoch).copied() else {
+            // An epoch this end does not hold: dropped per section 12, and
+            // the ledger counts it as a systematic refusal.
+            self.counts.symbol_drops += 1;
+            return None;
+        };
         let outcome = self.receiver.symbol(
             header.epoch,
             header.generation,
@@ -258,6 +284,7 @@ impl Intake {
                 offset,
                 bytes,
             }) => {
+                self.counts.symbols += 1;
                 if epoch.plan.sent_source_count(generation) == 1 {
                     self.counts.coded += 1;
                 }
@@ -271,10 +298,12 @@ impl Intake {
                     cover: epoch.cover,
                     generation,
                     plaintext_offset: offset,
+                    generation_bytes: epoch.plan.generation_bytes(),
                     bytes,
                 })
             }
             Symbol::Abandoned { generation, state } => {
+                self.counts.symbols += 1;
                 if epoch.plan.sent_source_count(generation) == 1 {
                     self.counts.coded += 1;
                 }
@@ -292,6 +321,7 @@ impl Intake {
                 None
             }
             Symbol::Stored { first } => {
+                self.counts.symbols += 1;
                 // Only the symbol that opened the generation: one report says
                 // this end is working on it, and a report per symbol would put
                 // a control frame behind every datagram.
@@ -303,6 +333,13 @@ impl Intake {
                         self.owe_state(state_of(header.epoch, header.generation, state));
                     }
                 }
+                None
+            }
+            // Credit refusals are the systematic drop sites the ledger
+            // exists to find; a late symbol for a settled generation is the
+            // normal tail of a decode.
+            Symbol::Dropped(vot_fec::Drop::NoCredit | vot_fec::Drop::PastCredit) => {
+                self.counts.symbol_drops += 1;
                 None
             }
             Symbol::Dropped(_) => None,
@@ -328,19 +365,26 @@ impl Intake {
             cover: joined.cover,
             generation: joined.generation,
             offset: joined.plaintext_offset,
+            generation_bytes: joined.generation_bytes,
             bytes: joined.bytes,
         });
     }
 
-    /// Takes every held generation for a bundle that has just arrived.
+    /// Takes every held generation a just-arrived bundle's covered range
+    /// contains. An epoch spans several piece bundles, so containment is
+    /// the join, not equality.
     pub(crate) fn take_orphans(&mut self, cover: Cover) -> Vec<Joined> {
         let mut taken = Vec::new();
         self.orphans.retain(|orphan| {
-            if orphan.cover == cover {
+            if orphan.cover.root == cover.root
+                && orphan.offset >= cover.offset
+                && orphan.offset - cover.offset < cover.length
+            {
                 taken.push(Joined {
                     cover,
                     generation: orphan.generation,
                     plaintext_offset: orphan.offset,
+                    generation_bytes: orphan.generation_bytes,
                     bytes: orphan.bytes.clone(),
                 });
                 false
@@ -416,11 +460,15 @@ fn peek_header(datagram: &[u8]) -> Option<SymbolHeader> {
     })
 }
 
-/// The record a decoded generation becomes for its bundle.
-pub(crate) fn record_of(bundle_id: [u8; 16], joined: Joined) -> DataRecord {
+/// The record a decoded generation becomes for its bundle. The index is
+/// relative to the bundle's covered range: an epoch's generations span
+/// several piece bundles, and generations are whole 64 KiB groups, so the
+/// offset names the slot exactly.
+pub(crate) fn record_of(bundle_id: [u8; 16], covered_offset: u64, joined: Joined) -> DataRecord {
     DataRecord {
         bundle_id,
-        record_index: u64::from(joined.generation),
+        record_index: joined.plaintext_offset.saturating_sub(covered_offset)
+            / joined.generation_bytes.max(1),
         plaintext_offset: joined.plaintext_offset,
         plaintext_length: joined.bytes.len() as u64,
         compression: 0,
@@ -566,6 +614,8 @@ mod tests {
                 decoded: 0,
                 abandoned: 0,
                 refused: 1,
+                symbols: 0,
+                symbol_drops: 0,
             }
         );
         // One byte of staging is a decode budget of sixteen, against an epoch
@@ -614,6 +664,8 @@ mod tests {
                 decoded: 16,
                 abandoned: 16,
                 refused: 1,
+                symbols: 32,
+                symbol_drops: 0,
             }
         );
     }
@@ -775,6 +827,8 @@ mod tests {
             decoded: 4,
             abandoned: 8,
             refused: 16,
+            symbols: 1024,
+            symbol_drops: 4096,
         };
         let right = FecCounts {
             offered: 32,
@@ -782,6 +836,8 @@ mod tests {
             decoded: 128,
             abandoned: 256,
             refused: 512,
+            symbols: 2048,
+            symbol_drops: 8192,
         };
         assert_eq!(
             left + right,
@@ -791,6 +847,8 @@ mod tests {
                 decoded: 132,
                 abandoned: 264,
                 refused: 528,
+                symbols: 3072,
+                symbol_drops: 12288,
             }
         );
         assert_eq!(left + FecCounts::default(), left);
@@ -802,6 +860,8 @@ mod tests {
             decoded: u64::MAX,
             abandoned: u64::MAX,
             refused: u64::MAX,
+            symbols: u64::MAX,
+            symbol_drops: u64::MAX,
         };
         assert_eq!(full + right, full);
     }
@@ -924,7 +984,7 @@ mod tests {
                 });
                 assert_eq!(taken.len(), 1);
                 assert_eq!(taken[0].plaintext_offset, 3 * 65_536 + 8);
-                let record = record_of([9; 16], taken[0].clone());
+                let record = record_of([9; 16], 3 * 65_536, taken[0].clone());
                 assert_eq!(record.record_index, 1);
                 assert_eq!(record.plaintext_offset, 3 * 65_536 + 8);
                 assert_eq!(record.plaintext_length, 8);
@@ -958,6 +1018,74 @@ mod tests {
     }
 
     #[test]
+    fn refused_symbols_are_counted_as_ledger_drops() {
+        let mut intake = Intake::default();
+        // Two bytes of staging: one live two-byte generation of credit.
+        intake.extend_credit(2, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // An epoch this end does not hold.
+        assert!(intake.symbol(&datagram(9, 0, 0, &[0])).is_none());
+        assert_eq!(intake.counts().symbol_drops, 1);
+        // k = 2, L = 1, length 4: two generations of two bytes. The first
+        // symbol is stored; the second generation is past the credit.
+        intake.open(&open_of(1, 0, 4, 2, 1, 1)).unwrap();
+        assert!(intake.symbol(&datagram(1, 0, 0, &[7])).is_none());
+        assert!(intake.symbol(&datagram(1, 1, 0, &[7])).is_none());
+        let counts = intake.counts();
+        assert_eq!(
+            counts.symbol_drops, 2,
+            "the unknown epoch and the refused generation"
+        );
+        assert_eq!(counts.symbols, 1, "the stored symbol was accepted");
+    }
+
+    #[test]
+    fn an_orphan_is_taken_by_the_bundle_whose_cover_contains_it() {
+        // Containment is half-open: a cover ending at the orphan's offset
+        // does not take it, the one containing it does.
+        let mut intake = Intake::default();
+        intake.hold_orphan(Joined {
+            cover: Cover {
+                root: [1; 32],
+                offset: 0,
+                length: 2,
+            },
+            generation: 99,
+            plaintext_offset: 1,
+            generation_bytes: 1,
+            bytes: vec![9],
+        });
+        assert!(
+            intake
+                .take_orphans(Cover {
+                    root: [1; 32],
+                    offset: 0,
+                    length: 1,
+                })
+                .is_empty(),
+            "a cover ending at the offset does not contain it"
+        );
+        assert!(
+            intake
+                .take_orphans(Cover {
+                    root: [2; 32],
+                    offset: 1,
+                    length: 1,
+                })
+                .is_empty(),
+            "another object's cover does not contain it"
+        );
+        let taken = intake.take_orphans(Cover {
+            root: [1; 32],
+            offset: 1,
+            length: 1,
+        });
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].generation, 99);
+        assert_eq!(intake.orphan_bytes, 0);
+    }
+
+    #[test]
     fn orphans_are_bounded_by_count_and_bytes_and_leave_with_their_epoch() {
         let mut intake = Intake::default();
         intake.extend_credit(1 << 20, MAX_OPEN_EPOCHS);
@@ -972,6 +1100,7 @@ mod tests {
                 },
                 generation: i,
                 plaintext_offset: 0,
+                generation_bytes: 1,
                 bytes: vec![0],
             });
         }
@@ -992,6 +1121,7 @@ mod tests {
             },
             generation,
             plaintext_offset: 0,
+            generation_bytes: 1,
             bytes: vec![0; MAX_ORPHAN_BYTES / 2],
         };
         intake.hold_orphan(big(0));
@@ -1018,6 +1148,7 @@ mod tests {
             },
             generation: 5,
             plaintext_offset: 0,
+            generation_bytes: 1,
             bytes: vec![0; MAX_ORPHAN_BYTES],
         });
         assert_eq!(intake.orphan_bytes, MAX_ORPHAN_BYTES);
@@ -1034,6 +1165,7 @@ mod tests {
             },
             generation: 0,
             plaintext_offset: 0,
+            generation_bytes: 1,
             bytes: vec![0; MAX_ORPHAN_BYTES + 1],
         });
         assert_eq!(intake.orphan_bytes, 0);
@@ -1043,6 +1175,7 @@ mod tests {
             cover: Cover::of(&open_of(3, 0, 4, 1, 1, 4)),
             generation: 0,
             plaintext_offset: 0,
+            generation_bytes: 1,
             bytes: vec![0; 4],
         });
         assert_eq!(intake.orphan_bytes, 4);

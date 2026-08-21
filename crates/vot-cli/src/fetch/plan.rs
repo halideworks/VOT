@@ -43,7 +43,7 @@ const PIECES_PER_COVER: usize = 5;
 /// what the two pipelines actually hold rather than for this count of
 /// worst-case bundles.
 pub(crate) const PENDING_BUNDLE_DEPTH: usize =
-    RELIABLE_BUNDLE_DEPTH + 2 * vot_scheduler::session::MAX_CODING_EPOCHS;
+    RELIABLE_BUNDLE_DEPTH + 2 * vot_scheduler::session::MAX_CODING_EPOCHS * PIECES_PER_COVER;
 
 /// Bundles the reliable pipeline alone can hold: every outstanding cover, in
 /// every piece it may be answered in.
@@ -57,16 +57,16 @@ const _: () = assert!(
         == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
 );
 const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
-// An open epoch pins a bundle for its whole life, so the depth has to hold
-// the epochs on top of the reliable pipeline rather than carve them out of
-// it. At the depth alone a fetch at fifteen epochs died of
-// `PendingBundlesExhausted` under loss with the byte budget barely touched.
+// An open epoch spans a whole requested cover (ADR-0042) and pins that
+// cover's piece bundles for its whole life, so the depth has to hold the
+// epochs' pieces on top of the reliable pipeline rather than carve them out
+// of it.
 //
-// Two bundles a slot, not one: retiring an epoch frees its slot the moment
+// Two covers a slot, not one: retiring an epoch frees its slot the moment
 // the repair records are queued, so the next request opens a fresh epoch and
-// a fresh bundle while the retired one is still incomplete at the receiver,
+// fresh bundles while the retired one is still incomplete at the receiver,
 // a transit behind. One slot can hold both for that transit.
-const _: () = assert!(PENDING_BUNDLE_DEPTH == 36);
+const _: () = assert!(PENDING_BUNDLE_DEPTH == 100);
 
 /// Bytes a fetch may hold across part-built bundles.
 ///
@@ -74,31 +74,28 @@ const _: () = assert!(PENDING_BUNDLE_DEPTH == 36);
 /// they may hold, and it is this that bounds the memory a peer can pin.
 /// Sized as the two pipelines at once rather than as `PENDING_BUNDLE_DEPTH`
 /// worst-case bundles: the reliable pipeline holds at most its own depth of
-/// full-sized bundles, and the coded pipeline holds pieces, which are a
-/// fixed `FEC_PIECE_BYTES` each and about a quarter of the record bound. The
-/// difference is not academic, since a peer that announces bundles and never
-/// completes them holds this much until the session ends: at the depth times
-/// the record bound it would be about 87 MB a rail, and four rails is the
-/// default.
+/// full-sized bundles, and the coded pipeline holds two covers a slot,
+/// which are at most `MAX_PROOF_RANGE_BYTES` each. A peer that announces
+/// bundles and never completes them holds this much until the session ends.
 pub(crate) const PENDING_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
     * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
-    + RELIABLE_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+    + 2 * vot_scheduler::session::MAX_CODING_EPOCHS * COVER_BYTES_USIZE;
 
-/// Orphan records are the same pieces before their proof, so they are
+/// Orphan records are the same covers before their proof, so they are
 /// bounded the same way, against the record bound a bundle without its proof
 /// carries.
 pub(crate) const ORPHAN_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
     * vot_scheduler::session::MAX_ORPHAN_BUNDLE_BYTES
-    + RELIABLE_BUNDLE_DEPTH * FEC_PIECE_BYTES_USIZE;
+    + 2 * vot_scheduler::session::MAX_CODING_EPOCHS * COVER_BYTES_USIZE;
 
 // Spelled out, so a slip in either sum is a build failure rather than a
 // budget that silently refuses a conforming transfer or admits far more than
 // it meant to.
-const _: () = assert!(PENDING_BUNDLE_BYTES == 44_302_336);
-const _: () = assert!(ORPHAN_BUNDLE_BYTES == 40_108_032);
+const _: () = assert!(PENDING_BUNDLE_BYTES == 90_177_536);
+const _: () = assert!(ORPHAN_BUNDLE_BYTES == 85_983_232);
 
-const FEC_PIECE_BYTES_USIZE: usize = 1_114_112;
-const _: () = assert!(FEC_PIECE_BYTES_USIZE as u64 == crate::serve::server::FEC_PIECE_BYTES);
+const COVER_BYTES_USIZE: usize = 4_259_840;
+const _: () = assert!(COVER_BYTES_USIZE as u64 == vot_scheduler::MAX_PROOF_RANGE_BYTES);
 
 /// Bundles that may hold records which arrived before their proof.
 ///
@@ -115,7 +112,7 @@ pub(crate) const ORPHAN_BUNDLE_DEPTH: usize = ORPHAN_BUNDLE_BYTES / FEC_GENERATI
 const FEC_GENERATION_BYTES_USIZE: usize = 65_536;
 const _: () =
     assert!(FEC_GENERATION_BYTES_USIZE as u64 == crate::serve::server::FEC_GENERATION_BYTES);
-const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 612);
+const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_312);
 
 /// Bytes this fetch may have asked for and not yet placed.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;

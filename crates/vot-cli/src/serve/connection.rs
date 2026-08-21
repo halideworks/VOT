@@ -128,7 +128,11 @@ pub struct ServeConnection {
     /// The datagram FEC sending state: what the peer's credit lets this end
     /// open and send. Used only while `fec_negotiated`.
     pub(crate) fec: FecSender,
-    /// Whether the session negotiated `DATAGRAM_FEC`, refreshed each pass.
+    /// Whether the session negotiated both `DATAGRAM_FEC` and
+    /// `FEC_COVER_EPOCHS`, refreshed each pass. The second declares a
+    /// receiver that joins an epoch's generations to bundles by offset,
+    /// which the cover-sized epochs this serve opens require, so a peer
+    /// offering only the first is answered reliably.
     pub(crate) fec_negotiated: bool,
     /// Whether this path currently justifies coding new range answers.
     pub(crate) fec_coding: bool,
@@ -160,12 +164,17 @@ impl Default for ServeConnection {
     }
 }
 
-/// One epoch this serve opened for one bundle: what to re-send reliably when
-/// the receiver reports a generation abandoned or the epoch refused.
+/// One epoch this serve opened across one requested cover: what to re-send
+/// reliably when the receiver reports a generation abandoned or the epoch
+/// refused.
 #[derive(Clone, Debug)]
 pub(crate) struct OpenedEpoch {
     pub(crate) root: [u8; 32],
-    pub(crate) bundle_id: [u8; 16],
+    /// The piece bundles the epoch's generations belong to, ascending:
+    /// each piece's first generation and its bundle identifier. A
+    /// generation's record rides under the last piece at or before it,
+    /// indexed relative to that piece.
+    pub(crate) pieces: Vec<(u32, [u8; 16])>,
     pub(crate) plan: vot_fec::EpochPlan,
     /// Generations still owed an outcome; the epoch closes when empty.
     pub(crate) live: std::collections::BTreeSet<u32>,

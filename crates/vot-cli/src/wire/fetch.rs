@@ -196,13 +196,15 @@ pub(crate) fn stats_line(
     let first = first.map_or_else(|| "none".to_owned(), |time| time.as_millis().to_string());
     format!(
         "fetch stats bytes={bytes} ms={} first_ms={first} fec_offered={} fec_coded={} fec_decoded={} \
-         fec_abandoned={} fec_refused={}",
+         fec_abandoned={} fec_refused={} fec_symbols={} fec_symbol_drops={}",
         elapsed.as_millis(),
         fec.offered,
         fec.coded,
         fec.decoded,
         fec.abandoned,
-        fec.refused
+        fec.refused,
+        fec.symbols,
+        fec.symbol_drops
     )
 }
 

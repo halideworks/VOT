@@ -268,19 +268,20 @@ impl BundleServer {
                 .get(&epoch)
                 .expect("named by the pass above");
             if !ladder.symbol_repaired {
+                // The rung needs both halves: symbols this end held back,
+                // and the receiver's word that it holds partial state to
+                // top up. A generation no state was ever accepted for may
+                // hold nothing at all, and reserve symbols alone cannot
+                // decode it; spending the rung there only doubles the
+                // retirement latency the grace exists to bound.
                 let repairable = ladder.reserve_repairs() > 0
-                    || ladder.live.iter().any(|generation| {
-                        connection
-                            .fec
-                            .sender
-                            .reported_missing(epoch, *generation)
-                            .is_some_and(|missing| !missing.is_empty())
-                    });
+                    && ladder
+                        .live
+                        .iter()
+                        .any(|generation| connection.fec.sender.state_accepted(epoch, *generation));
                 if repairable {
                     let opened = ladder.clone();
-                    for generation in &opened.live {
-                        self.repair_generation_symbols(&opened, *generation, connection)?;
-                    }
+                    self.repair_epoch_symbols(&opened, connection)?;
                     let renewed = connection
                         .fec
                         .epochs
@@ -308,54 +309,61 @@ impl BundleServer {
         Ok(())
     }
 
-    /// One generation's symbol repair: the reserve repair ESIs the first
-    /// pass held back, plus the sources the receiver's newest state
-    /// reported missing. Re-encoded from the object rather than stored,
-    /// the way [`Self::resend_generation`] re-reads it.
-    fn repair_generation_symbols(
+    /// The epoch's symbol repair: the reserve repair ESIs the first pass
+    /// held back, for every live generation, re-encoded from the object
+    /// rather than stored, the way [`Self::resend_generation`] re-reads
+    /// it. Reserve only: the receiver's one state per generation is the
+    /// first symbol's snapshot, so its missing list names nearly every
+    /// source and resending them would ship the whole generation again.
+    ///
+    /// Interleaved ESI-major across the generations, the way the first
+    /// pass spreads its symbols, so a dropped segmentation burst costs a
+    /// few symbols from each generation rather than one generation's
+    /// whole repair.
+    fn repair_epoch_symbols(
         &self,
         opened: &OpenedEpoch,
-        generation: u32,
         connection: &mut ServeConnection,
     ) -> Result<(), Fault> {
         let served = self
             .objects
             .get(&opened.root)
             .ok_or(Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH))?;
-        if !opened.plan.holds(generation) {
-            return Ok(());
-        }
-        let (offset, length) = opened.plan.generation_span(generation);
-        let plaintext = served.read_covered(offset, length)?;
-        let symbols = vot_fec::encode_generation(&opened.plan, generation, &plaintext)
-            .map_err(|_| Error::InvalidBundle)?;
         let geometry = opened.plan.geometry();
         let reserve_from = geometry.source_count() + opened.transmitted_repairs;
-        let missing = connection
-            .fec
-            .sender
-            .reported_missing(opened.plan.epoch(), generation)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default();
-        for (esi, symbol) in &symbols {
-            let wanted = usize::from(*esi) >= reserve_from || missing.contains(esi);
-            if !wanted {
+        let mut reserves = Vec::new();
+        for generation in &opened.live {
+            if !opened.plan.holds(*generation) {
                 continue;
             }
-            let mut datagram =
-                Vec::with_capacity(vot_codec::frames::SYMBOL_HEADER_LEN + geometry.symbol_length());
-            frames::encode_symbol(
-                frames::SymbolHeader {
-                    epoch: opened.plan.epoch(),
-                    generation,
-                    esi: *esi,
-                },
-                geometry,
-                symbol,
-                &mut datagram,
-            )
-            .map_err(|_| Error::InvalidBundle)?;
-            connection.queue_datagram(Payload::from(datagram));
+            let (offset, length) = opened.plan.generation_span(*generation);
+            let plaintext = served.read_covered(offset, length)?;
+            let mut symbols = vot_fec::encode_generation(&opened.plan, *generation, &plaintext)
+                .map_err(|_| Error::InvalidBundle)?;
+            symbols.retain(|(esi, _)| usize::from(*esi) >= reserve_from);
+            reserves.push((*generation, symbols));
+        }
+        for slot in 0..geometry.symbol_count().saturating_sub(reserve_from) {
+            for (generation, symbols) in &reserves {
+                let Some((esi, symbol)) = symbols.get(slot) else {
+                    continue;
+                };
+                let mut datagram = Vec::with_capacity(
+                    vot_codec::frames::SYMBOL_HEADER_LEN + geometry.symbol_length(),
+                );
+                frames::encode_symbol(
+                    frames::SymbolHeader {
+                        epoch: opened.plan.epoch(),
+                        generation: *generation,
+                        esi: *esi,
+                    },
+                    geometry,
+                    symbol,
+                    &mut datagram,
+                )
+                .map_err(|_| Error::InvalidBundle)?;
+                connection.queue_datagram(Payload::from(datagram));
+            }
         }
         Ok(())
     }

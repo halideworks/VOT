@@ -496,7 +496,7 @@ fn a_sender_tracks_what_credit_lets_it_open_and_begin() {
 /// A newer state is accepted once, done retires once, and payloads outside
 /// the epoch's constraints are errors rather than ignores.
 fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
-    assert_eq!(sender.reported_missing(1, 0), None, "no state accepted yet");
+    assert!(!sender.state_accepted(1, 0), "no state accepted yet");
     assert_eq!(
         sender.state(1, 0, seq(0)),
         Ok(true),
@@ -516,17 +516,12 @@ fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
         Ok(true),
         "received may reach k + r"
     );
-    assert_eq!(
-        sender.reported_missing(1, 0),
-        Some(&[0_u8, 3][..]),
-        "the newest accepted state's missing sources, exactly"
-    );
-    assert_eq!(sender.reported_missing(1, 1), None, "not begun");
-    assert_eq!(sender.reported_missing(2, 0), None, "unknown epoch");
+    assert!(sender.state_accepted(1, 0), "a state was accepted");
+    assert!(!sender.state_accepted(1, 1), "not begun");
+    assert!(!sender.state_accepted(2, 0), "unknown epoch");
     assert_eq!(sender.state(1, 0, seq(2)), Ok(false));
-    assert_eq!(
-        sender.reported_missing(1, 0),
-        Some(&[0_u8, 3][..]),
+    assert!(
+        sender.state_accepted(1, 0),
         "a stale sequence changes nothing"
     );
     assert_eq!(sender.state(1, 1, seq(1)), Ok(false), "not begun");
@@ -592,10 +587,9 @@ fn feedback_rules(sender: &mut Sender, plan1: EpochPlan) {
 /// Retire on refusal or close, and never reuse an identifier.
 fn close_rules(sender: &mut Sender, plan1: EpochPlan) {
     assert_eq!(sender.outcome(1, 0), Some(Some(Done::Decoded)));
-    assert_eq!(
-        sender.reported_missing(1, 0),
-        None,
-        "a done generation reports no missing sources"
+    assert!(
+        !sender.state_accepted(1, 0),
+        "a done generation accepts no further state"
     );
     assert_eq!(sender.active_generations(), 0);
     assert_eq!(sender.unretired_bytes(), 0);

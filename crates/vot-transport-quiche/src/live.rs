@@ -456,6 +456,9 @@ impl Config {
                 .map_err(|_| Error::InvalidConfiguration)?;
         }
         config.verify_peer(self.verify_peer);
+        if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
+            return Err(Error::InvalidConfiguration);
+        }
         if let Some(packets) = self.initial_congestion_window_packets {
             config.set_initial_congestion_window_packets(scaled_initial_window(
                 packets,
@@ -463,9 +466,6 @@ impl Config {
             ));
         }
         config.set_max_idle_timeout(self.idle_timeout_ms);
-        if !(MIN_DATAGRAM_SIZE..=LARGEST_DATAGRAM_SIZE).contains(&self.max_datagram_bytes) {
-            return Err(Error::InvalidConfiguration);
-        }
         config.set_max_recv_udp_payload_size(self.max_datagram_bytes);
         config.set_max_send_udp_payload_size(self.max_datagram_bytes);
         // The configured datagram is a ceiling, not a path claim. Without
@@ -507,15 +507,18 @@ impl Config {
 
 /// The window seed in the units the library counts.
 ///
-/// The library multiplies its count by the largest UDP payload the endpoint
-/// may send, which this transport opens to the 65507-byte maximum so
-/// discovery can settle the path, and an unscaled count would seed fifty
-/// times the window it names; under Bbr2 the seed is also the window's
-/// floor, so the unscaled count was congestion control switched off, which
-/// a lossy path turned into second-long queues and a poisoned bandwidth
-/// model. The configured count therefore means packets of the QUIC minimum,
-/// and this scale keeps the seeded bytes what the caller asked whatever the
-/// payload ceiling.
+/// The library multiplies its count by the endpoint's largest UDP payload,
+/// which this transport opens to the 65507-byte maximum so discovery can
+/// settle the path, and ratio-rescales the window and its floor as the
+/// path's real datagram size settles. An unscaled count therefore seeded
+/// fifty times its bytes exactly while the payload was still the ceiling,
+/// and under Bbr2 that transient is also the window's floor: congestion
+/// control off during the very flights that decide the model, which a
+/// lossy path turned into second-long queues and a 61 s fetch. The
+/// configured count means packets of the QUIC minimum; scaled, the seed's
+/// bytes are what the caller asked during the pre-settle transient where a
+/// seed acts, and the floor the rescaling carries forward decays to
+/// harmless rather than standing at fifty times the intent.
 const fn scaled_initial_window(packets: usize, max_datagram_bytes: usize) -> usize {
     let scaled = (packets * MIN_DATAGRAM_SIZE).div_ceil(max_datagram_bytes);
     if scaled == 0 { 1 } else { scaled }

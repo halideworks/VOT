@@ -650,7 +650,10 @@ mod tests {
         // spent its whole stall budget; the object now arrives over the
         // reliable path instead.
         let (bundle, built) = built_bundle("fec-past-repair", &[("big.bin", patterned(300_000))]);
-        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let fec = BTreeSet::from([
+            vot_codec::extension_id::DATAGRAM_FEC,
+            vot_codec::extension_id::FEC_COVER_EPOCHS,
+        ]);
         let (client, mut serving) = crate::harness::duplex_pair();
         serving.drop_datagram_every = 8;
         let serving_bundle = bundle.to_path_buf();
@@ -698,14 +701,18 @@ mod tests {
     #[test]
     pub(crate) fn a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it() {
         // Both ends offer DATAGRAM_FEC over an in-process pair that loses
-        // every ninth datagram: exactly eight of a full generation's 72, the
-        // repair count, so every generation decodes with nothing to spare
+        // every twelfth datagram: about six of a full generation's 72, and
+        // the short last generation's skipped sources shift the pattern by
+        // at most one, so every generation stays within its eight repairs
         // and the fetch completes with the object having travelled as
         // symbols.
         let (bundle, built) = built_bundle("in-process-fec", &[("big.bin", patterned(1_500_000))]);
-        let fec = BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
+        let fec = BTreeSet::from([
+            vot_codec::extension_id::DATAGRAM_FEC,
+            vot_codec::extension_id::FEC_COVER_EPOCHS,
+        ]);
         let (client, mut serving) = crate::harness::duplex_pair();
-        serving.drop_datagram_every = 9;
+        serving.drop_datagram_every = 12;
         let serving_bundle = bundle.to_path_buf();
         let serving_thread = std::thread::spawn(move || {
             let mut server = BundleServer::open(&serving_bundle)?;
@@ -741,8 +748,8 @@ mod tests {
         );
         assert_eq!(fetcher.package().expect("a package"), built);
         let counts = fetcher.fec_counts();
-        assert!(
-            counts.decoded >= 20,
+        assert_eq!(
+            counts.decoded, 23,
             "the object's 23 generations came as symbols: {counts:?}"
         );
         // Every generation an epoch opened is accounted for, and this loss

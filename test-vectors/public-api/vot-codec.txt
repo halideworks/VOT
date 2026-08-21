@@ -40,6 +40,7 @@ constant vot_codec::error_code::UNSUPPORTED_VERSION
 constant vot_codec::extension_id::CORE_RELIABLE
 constant vot_codec::extension_id::CUSTOM_CONGESTION_CONTROL
 constant vot_codec::extension_id::DATAGRAM_FEC
+constant vot_codec::extension_id::FEC_COVER_EPOCHS
 constant vot_codec::extension_id::MULTIPATH_QUIC
 constant vot_codec::extension_id::PUBLIC_MULTI_RAIL
 constant vot_codec::extension_id::VCRC

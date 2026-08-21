@@ -389,6 +389,12 @@
       "name": "MULTIPATH_QUIC",
       "status": "experimental",
       "default": "disabled"
+    },
+    {
+      "value": "0x07",
+      "name": "FEC_COVER_EPOCHS",
+      "status": "experimental",
+      "default": "enabled"
     }
   ],
   "suites": [

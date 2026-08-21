@@ -53,6 +53,7 @@ pub mod extension_id {
     pub const PUBLIC_MULTI_RAIL: u64 = 0x04;
     pub const CUSTOM_CONGESTION_CONTROL: u64 = 0x05;
     pub const MULTIPATH_QUIC: u64 = 0x06;
+    pub const FEC_COVER_EPOCHS: u64 = 0x07;
 }
 
 pub mod error_code {

@@ -123,6 +123,7 @@ pub(crate) fn extensions_from(pin: Option<&str>) -> Result<std::collections::BTr
         Some("0" | "off" | "false") => Ok(std::collections::BTreeSet::new()),
         None | Some("1" | "on" | "true" | "auto") => Ok(std::collections::BTreeSet::from([
             vot_codec::extension_id::DATAGRAM_FEC,
+            vot_codec::extension_id::FEC_COVER_EPOCHS,
         ])),
         Some(_) => Err(Error::InvalidArguments),
     }

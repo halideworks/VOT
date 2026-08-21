@@ -153,6 +153,13 @@ a decoded generation yields are verified by the same range proof a reliable
 `DATA_RECORD` for that group would carry. Proofs travel on the reliable path
 as before; the datagram path carries bytes only.
 
+An epoch's range need not equal one bundle's covered range. The experimental
+`FEC_COVER_EPOCHS` extension declares a receiver that maps an epoch's
+generations onto the proof bundles whose covered ranges contain them, so a
+sender may open one epoch across a whole requested cover (ADR-0042). A
+sender MUST NOT open an epoch spanning more than one bundle's covered range
+unless `FEC_COVER_EPOCHS` was negotiated.
+
 ## 10. Symbol datagrams
 
 A symbol is one QUIC datagram (or the equivalent unreliable unit of another

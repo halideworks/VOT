@@ -263,7 +263,10 @@ pub struct Stance<'a> {
 }
 
 pub(crate) fn default_extensions() -> std::collections::BTreeSet<u64> {
-    std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC])
+    std::collections::BTreeSet::from([
+        vot_codec::extension_id::DATAGRAM_FEC,
+        vot_codec::extension_id::FEC_COVER_EPOCHS,
+    ])
 }
 
 impl Stance<'_> {

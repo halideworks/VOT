@@ -99,6 +99,7 @@ thing it configures.
 | `0x04` | `PUBLIC_MULTI_RAIL` | experimental | disabled |
 | `0x05` | `CUSTOM_CONGESTION_CONTROL` | experimental | disabled |
 | `0x06` | `MULTIPATH_QUIC` | experimental | disabled |
+| `0x07` | `FEC_COVER_EPOCHS` | experimental | enabled |
 
 Advertising an extension does not authorize its use. Both endpoints must
 negotiate it and local policy must enable it.

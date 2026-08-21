@@ -829,10 +829,11 @@ pub(super) fn answer_request(bytes: &[u8]) -> bool {
 }
 
 /// The shipped FEC profile (spec/fec.md section 9): one generation is one
-/// 64 KiB integrity group and 64 sources of 1024 bytes. Eight repairs are the
-/// conservative startup/fallback profile; measured paths may use fewer.
+/// 64 KiB integrity group and 64 sources of 1024 bytes. The spec's whole
+/// repair ceiling is the startup/fallback profile; a measured path sizes
+/// under it at three times its loss (ADR-0042).
 pub(crate) const FEC_GENERATION_BYTES: u64 = 65_536;
-pub(crate) const FEC_REPAIR_SYMBOLS: usize = 8;
+pub(crate) const FEC_REPAIR_SYMBOLS: usize = vot_fec::MAX_REPAIR_SYMBOLS;
 
 /// How long an epoch may draw nothing from the receiver before this end
 /// repairs its remaining generations reliably and closes it.

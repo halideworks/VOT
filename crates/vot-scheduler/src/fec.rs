@@ -1018,6 +1018,28 @@ mod tests {
     }
 
     #[test]
+    fn refused_symbols_are_counted_as_ledger_drops() {
+        let mut intake = Intake::default();
+        // Two bytes of staging: one live two-byte generation of credit.
+        intake.extend_credit(2, MAX_OPEN_EPOCHS);
+        let _ = intake.take_owed();
+        // An epoch this end does not hold.
+        assert!(intake.symbol(&datagram(9, 0, 0, &[0])).is_none());
+        assert_eq!(intake.counts().symbol_drops, 1);
+        // k = 2, L = 1, length 4: two generations of two bytes. The first
+        // symbol is stored; the second generation is past the credit.
+        intake.open(&open_of(1, 0, 4, 2, 1, 1)).unwrap();
+        assert!(intake.symbol(&datagram(1, 0, 0, &[7])).is_none());
+        assert!(intake.symbol(&datagram(1, 1, 0, &[7])).is_none());
+        let counts = intake.counts();
+        assert_eq!(
+            counts.symbol_drops, 2,
+            "the unknown epoch and the refused generation"
+        );
+        assert_eq!(counts.symbols, 1, "the stored symbol was accepted");
+    }
+
+    #[test]
     fn an_orphan_is_taken_by_the_bundle_whose_cover_contains_it() {
         // Containment is half-open: a cover ending at the orphan's offset
         // does not take it, the one containing it does.

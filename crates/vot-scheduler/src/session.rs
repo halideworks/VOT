@@ -2587,6 +2587,79 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_joins_a_bundle_covering_a_later_range() {
+        // The join is offset containment against the bundle's own covered
+        // range, which here starts past zero: an index or containment check
+        // done from the object's start instead would orphan every
+        // generation and leave the bundle pending.
+        let unit = usize::try_from(crate::RANGE_UNIT_BYTES).unwrap();
+        let bytes = vec![0x33; unit * 4];
+        let subject = SubjectId::new(
+            1,
+            vot_verifier::root(Suite::Blake3Bao64, &bytes).unwrap(),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let proof = vot_proof_blake3::prove(&bytes, 2 * unit as u64, 2 * unit as u64).unwrap();
+        let bundle = ProofBundle {
+            request_id: [3; 16],
+            bundle_id: [4; 16],
+            object: ObjectId::try_from(subject).unwrap(),
+            requested_offset: 2 * unit as u64,
+            requested_length: 2 * unit as u64,
+            covered_offset: proof.covered_offset,
+            covered_length: proof.data.len() as u64,
+            data_record_count: 2,
+            total_plaintext_length: proof.data.len() as u64,
+            proof: proof.proof,
+        };
+        let mut driver = ready_fec();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        let (open, plan) = epoch_of(&bundle, 1);
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle.clone()))));
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(Payload::from(
+                wire(&TypedFrame::CodingEpochOpen(open)).as_slice(),
+            )));
+        for generation in 0..2 {
+            let (offset, length) = plan.generation_span(generation);
+            let start = usize::try_from(offset).unwrap();
+            let end = start + usize::try_from(length).unwrap();
+            for (esi, symbol) in
+                vot_fec::encode_generation(&plan, generation, &bytes[start..end]).unwrap()
+            {
+                let mut datagram = Vec::new();
+                vot_codec::frames::encode_symbol(
+                    vot_codec::frames::SymbolHeader {
+                        epoch: 1,
+                        generation,
+                        esi,
+                    },
+                    plan.geometry(),
+                    &symbol,
+                    &mut datagram,
+                )
+                .unwrap();
+                push_datagram(&mut driver, &datagram);
+            }
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(driver.fec_counts().decoded, 2);
+        assert_eq!(
+            driver.pending_bundles(),
+            0,
+            "both decoded generations joined the bundle and it delivered"
+        );
+    }
+
+    #[test]
     fn a_lossy_epoch_becomes_verified_state_through_its_bundle() {
         // The bundle arrives first, then every generation loses four
         // symbols; each decoded generation is one record of the bundle.

@@ -26,6 +26,34 @@ const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 const STALLED_WAIT_MS: u64 = 30_000;
 const STALLED_WAIT: Duration = Duration::from_millis(STALLED_WAIT_MS);
 
+/// The stall budget in force: `VOT_STALL_MS` when set, [`STALLED_WAIT`]
+/// otherwise, read once per process.
+///
+/// The override exists because a suite full of deliberately broken serves,
+/// which is what a mutation run is, pays this budget on every failure path:
+/// a fetch facing a silenced serve burns the whole budget before erring, and
+/// enough such tests stack past any per-mutant ceiling. CI's mutation jobs
+/// set 15 seconds, above the ten-second silences a starved runner really
+/// produces; anything at or below those silences flakes, which is why the
+/// floor is enforced rather than documented.
+fn stalled_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| stalled_wait_from(std::env::var("VOT_STALL_MS").ok().as_deref()))
+}
+
+/// The lowest override honoured: at or under the silences a starved but
+/// healthy runner was measured producing, a budget reads load as a stall.
+const STALL_FLOOR_MS: u64 = 11_000;
+
+/// [`stalled_wait`]'s value from the environment, the default for a value
+/// that is absent, unreadable, or under the floor a loaded runner needs.
+fn stalled_wait_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= STALL_FLOOR_MS)
+        .map_or(STALLED_WAIT, Duration::from_millis)
+}
+
 /// No-progress passes before the loop paces itself.
 ///
 /// A wait returns at once when an event is already queued, so a session that
@@ -99,7 +127,7 @@ pub fn drive_until<E: Engine>(
     engine: &mut E,
     done: impl FnMut(&E) -> bool,
 ) -> Result<Option<E::Status>, Error> {
-    drive_until_within(engine, done, STALLED_WAIT)
+    drive_until_within(engine, done, stalled_wait())
 }
 
 /// [`drive_until`] under a stall budget of the caller's choosing.
@@ -452,7 +480,7 @@ where
     A: TransportAdapter + Send,
     F: FnMut() -> Result<ServeSession<'server, A>, Error>,
 {
-    serve_sessions_within(sessions, STALLED_WAIT, next)
+    serve_sessions_within(sessions, stalled_wait(), next)
 }
 
 /// [`serve_sessions`] driving each session under `stall_budget`.
@@ -750,6 +778,27 @@ mod tests {
     const TEST_STALL: Duration = Duration::from_millis(TEST_STALL_MS);
     const IDLE_PASSES: u64 = TEST_STALL_MS / IDLE_BOUND_MS;
     const BUSY_PASSES: u64 = TEST_STALL_MS / BUSY_BOUND_MS;
+
+    #[test]
+    fn the_stall_budget_override_is_bounded_below() {
+        assert_eq!(stalled_wait_from(None), STALLED_WAIT);
+        assert_eq!(stalled_wait_from(Some("nonsense")), STALLED_WAIT);
+        assert_eq!(stalled_wait_from(Some("")), STALLED_WAIT);
+        // The floor from both sides: the measured starved-runner silence is
+        // ten seconds, and a budget at or under it reads load as a stall.
+        assert_eq!(
+            stalled_wait_from(Some("10999")),
+            STALLED_WAIT,
+            "under the floor the override is refused"
+        );
+        assert_eq!(stalled_wait_from(Some("11000")), Duration::from_secs(11));
+        assert_eq!(stalled_wait_from(Some(" 15000\n")), Duration::from_secs(15));
+        assert_eq!(
+            stalled_wait_from(Some("3000000")).as_millis(),
+            3_000_000,
+            "a longer budget than the default is honoured too"
+        );
+    }
 
     #[test]
     fn every_terminal_status_names_its_error() {

@@ -341,11 +341,16 @@ pub struct Config {
     /// The congestion controller this endpoint runs.
     pub congestion: CongestionControl,
     /// A TLS session a client resumes, as [`Transport::session_ticket`]
-    /// returned it from an earlier connection to the same serve.
+    /// returned it from an earlier connection to the same serve. Servers
+    /// ignore it. What resumption spares is the certificate flight, not a
+    /// round trip: this build sends nothing early.
     ///
-    /// A resumed handshake carries no certificate, so the serve's whole
-    /// first flight fits the initial amplification allowance and the
-    /// handshake completes a round trip sooner. Servers ignore it.
+    /// The blob is trust: a resumed handshake authenticates the serve with
+    /// the pre-shared key inside it rather than a certificate, and the peer
+    /// certificate it reports afterwards is whatever the blob carried, so a
+    /// hostile blob defeats an identity pin. It must come from this
+    /// process, or storage in the same trust domain as the pin, and never
+    /// off the network.
     pub session: Option<Vec<u8>>,
     /// Initial congestion window in packets, or the controller's default.
     ///
@@ -706,13 +711,6 @@ impl Transport {
     #[must_use]
     pub fn session_ticket(&self) -> Option<Vec<u8>> {
         self.session_ticket.lock().ok()?.clone()
-    }
-
-    /// The slot [`Self::session_ticket`] reads, for a caller that must hand
-    /// the ticket on after this endpoint has moved.
-    #[must_use]
-    pub fn session_ticket_slot(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
-        Arc::clone(&self.session_ticket)
     }
 
     /// Whether the handshake resumed an earlier session.
@@ -1524,8 +1522,9 @@ impl Listener {
         let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
         enable_receive_offload(&socket);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
-        // Built here once to surface a bad configuration at the bind, and
-        // rebuilt per connection because a `quiche::Config` serves one.
+        // Built here to surface a bad configuration at the bind rather
+        // than as a silently dead router; the router builds the one it
+        // shares across every accept.
         let _ = config.build(Role::Server)?;
         let socket = Arc::new(socket);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3127,16 +3126,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let ticket = ticket.expect("the listener issued a ticket");
-        assert_eq!(
-            Some(&ticket),
-            first
-                .session_ticket_slot()
-                .lock()
-                .expect("the slot")
-                .as_ref(),
-            "the slot is where the ticket accessor reads"
-        );
-
         let mut resumed_config = Config::client(limits());
         resumed_config.verify_peer = false;
         resumed_config.session = Some(ticket);

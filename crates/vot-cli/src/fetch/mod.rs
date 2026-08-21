@@ -641,14 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_that_loses_more_than_its_repair_count_arrives_reliably() {
-        // Every eighth datagram goes. Interleaving spreads most losses across
-        // the piece, but one generation still loses more than its eight repair
-        // symbols. Such a generation decodes never and reports nothing, because
-        // the receiver owes a GEN_DONE only for one it decoded or gave up on.
-        // Before the serve closed a quiet epoch this hung until the fetch
-        // spent its whole stall budget; the object now arrives over the
-        // reliable path instead.
+    fn a_generation_past_its_transmitted_repair_decodes_from_the_reserve() {
+        // Every eighth datagram goes. Interleaving spreads most losses
+        // across the cover, but one generation still loses past the repair
+        // symbols the first pass transmitted. Such a generation decodes
+        // never from that pass and reports nothing terminal, so the serve's
+        // first quiet deadline answers with the reserve repair ESIs and the
+        // reported missing sources instead of round trips (ADR-0042);
+        // reliable resend remains the second deadline's backstop.
         let (bundle, built) = built_bundle("fec-past-repair", &[("big.bin", patterned(300_000))]);
         let fec = BTreeSet::from([
             vot_codec::extension_id::DATAGRAM_FEC,
@@ -680,12 +680,14 @@ mod tests {
             FetchStatus::Complete
         );
         assert_eq!(fetcher.package().expect("a package"), built);
-        // 300000 bytes are five generations. Four decode from the interleaved
-        // symbols and the one over its repair budget arrives reliably. The
-        // sim's loss is periodic rather than sampled, so this count is the
-        // same on every run.
+        // 300000 bytes are five generations. Four decode from the
+        // interleaved symbols; the one over its transmitted repair budget
+        // decodes after the quiet deadline's symbol repair sends the
+        // reserve ESIs (ADR-0042), so the reliable path carries nothing.
+        // The sim's loss is periodic rather than sampled, so this count is
+        // the same on every run.
         let counts = fetcher.fec_counts();
-        assert_eq!(counts.decoded, 4, "one generation needed the fallback");
+        assert_eq!(counts.decoded, 5, "the symbol repair completed the fifth");
         assert_eq!(counts.offered, 5, "every generation was offered coded");
         assert_eq!(
             counts.abandoned, 0,

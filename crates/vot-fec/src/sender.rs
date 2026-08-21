@@ -84,8 +84,10 @@ struct Epoch {
     plan: EpochPlan,
     /// Generations this end has begun sending, with the outcome once known.
     generations: BTreeMap<u32, Option<Done>>,
-    /// The highest `GEN_STATE` sequence accepted per generation.
-    sequences: BTreeMap<u32, u64>,
+    /// The highest `GEN_STATE` sequence accepted per generation, with the
+    /// missing sources that state reported (ADR-0042: the sample a symbol
+    /// repair retransmits from).
+    sequences: BTreeMap<u32, (u64, Vec<u8>)>,
 }
 
 /// The sender's whole FEC state for one session.
@@ -225,12 +227,29 @@ impl Sender {
         if known
             .sequences
             .get(&generation)
-            .is_some_and(|held| state.sequence <= *held)
+            .is_some_and(|(held, _)| state.sequence <= *held)
         {
             return Ok(false);
         }
-        known.sequences.insert(generation, state.sequence);
+        known
+            .sequences
+            .insert(generation, (state.sequence, state.missing_sources.to_vec()));
         Ok(true)
+    }
+
+    /// The missing sources the newest accepted `GEN_STATE` reported for a
+    /// live generation, or nothing when no state was accepted or the
+    /// generation is done. What a symbol repair retransmits (ADR-0042).
+    #[must_use]
+    pub fn reported_missing(&self, epoch: u32, generation: u32) -> Option<&[u8]> {
+        let known = self.epochs.get(&epoch)?;
+        if known.generations.get(&generation) != Some(&None) {
+            return None;
+        }
+        known
+            .sequences
+            .get(&generation)
+            .map(|(_, missing)| missing.as_slice())
     }
 
     /// `GEN_DONE` from the receiver for one generation. Retires it.

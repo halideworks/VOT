@@ -716,7 +716,10 @@ mod tests {
             let TypedFrame::CodingEpochOpen(open) = &frames[1] else {
                 panic!("proof then coding epoch open, got {frames:?}");
             };
-            assert_eq!(open.geometry.repair_count(), expected_repair);
+            // The geometry always declares the spec's whole repair count;
+            // the sample sizes what the first pass transmits, and the gap
+            // is the reserve (ADR-0042).
+            assert_eq!(open.geometry.repair_count(), server::FEC_REPAIR_SYMBOLS);
             assert_eq!(session.driver().datagrams.len(), 64 + expected_repair);
             assert_eq!(
                 decoded_generations(&mut session, open, ample_receiver_credit()).len(),
@@ -1121,6 +1124,88 @@ mod tests {
             "every live generation of both came back reliably"
         );
         crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn the_first_quiet_deadline_answers_with_the_reserve_and_the_second_retires() {
+        // A lossy sample sizes the transmitted repairs under the declared
+        // count, so the epoch holds a reserve. The first quiet deadline
+        // sends it as symbols and re-arms the clock; only the second
+        // deadline retires the generations reliably (ADR-0042).
+        let (bundle, _) = built_bundle("ladder", &[("big.bin", patterned(200_000))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
+        server.service(&mut session, &mut connection).unwrap();
+        session.driver().control.clear();
+        // 246 of 16384 sizes five transmitted repairs against sixteen
+        // declared, leaving an eleven-symbol reserve.
+        session.driver().path_stats = Some(path_sample(246, 0, 16_384));
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [41; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let opened = connection.fec.epochs.values().next().expect("an epoch");
+        assert_eq!(opened.transmitted_repairs, 5);
+        assert!(!opened.symbol_repaired);
+        let live = opened.live.len();
+        assert_eq!(live, 4, "200000 bytes are four generations");
+        session.driver().datagrams.clear();
+        session.driver().records.clear();
+
+        // First deadline: reserve symbols out, epoch still open, re-armed.
+        let began = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, began).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, began + server::MAX_QUIET_GRACE)
+                .is_ok()
+        );
+        connection.drain(&mut session).unwrap();
+        assert_eq!(
+            session.driver().datagrams.len(),
+            live * (server::FEC_REPAIR_SYMBOLS - 5),
+            "the reserve ESIs of every live generation"
+        );
+        for datagram in &session.driver().datagrams {
+            let esi = datagram[8];
+            assert!(
+                usize::from(esi) >= 64 + 5,
+                "a reserve symbol, not a repeat of the first pass: esi {esi}"
+            );
+        }
+        assert!(
+            session.driver().records.is_empty(),
+            "no reliable records yet"
+        );
+        let renewed = connection.fec.epochs.values().next().expect("still open");
+        assert!(renewed.symbol_repaired);
+        assert!(
+            renewed.quiet_until.is_none(),
+            "the clock re-arms from the next quiet pass"
+        );
+        session.driver().datagrams.clear();
+
+        // Second deadline: the reliable backstop, exactly as before.
+        let again = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, again).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, again + server::MAX_QUIET_GRACE)
+                .is_ok()
+        );
+        connection.drain(&mut session).unwrap();
+        assert!(connection.fec.epochs.is_empty(), "retired at the second");
+        assert_eq!(session.driver().records.len(), live);
+        assert!(session.driver().datagrams.is_empty(), "the rung was spent");
     }
 
     #[test]

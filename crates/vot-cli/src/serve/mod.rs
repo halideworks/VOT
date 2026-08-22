@@ -818,6 +818,39 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_does_not_inherit_how_badly_the_last_one_failed() {
+        // The smoothed rate is above the bar by construction whenever it
+        // disengages, and it only decays a quarter a sample, so a run that
+        // climbed well past the bar before failing would spend the retry's
+        // first clean sample crossing it again.
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        let mut lossy = |policy: &mut connection::FecPolicy, windows: u64| {
+            for _ in 0..windows {
+                sent += 8192;
+                policy.observe(Some(path_sample(sent / 20, 0, sent)));
+            }
+        };
+        lossy(&mut policy, 2);
+        assert!(policy.coding(), "a lossy path engages");
+
+        // Climb well past the bar before the verdict: two half-failing
+        // samples and then a whole one.
+        decode_sample(&mut policy, HALF_SAMPLE);
+        decode_sample(&mut policy, HALF_SAMPLE);
+        decode_sample(&mut policy, connection::FEC_DECODE_SAMPLE);
+        assert!(!policy.coding(), "sustained failure ends coding");
+
+        lossy(&mut policy, 5);
+        assert!(policy.coding(), "the hold is spent and the path is lossy");
+        decode_sample(&mut policy, 0);
+        assert!(
+            policy.coding(),
+            "the retry decoded everything and is not judged on the last attempt"
+        );
+    }
+
+    #[test]
     fn a_few_failures_a_sample_never_end_coding() {
         // A steady trickle inside the repair budget: the smoothed rate
         // settles under the share and stays there however long it runs.

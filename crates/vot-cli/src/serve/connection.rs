@@ -196,6 +196,7 @@ impl FecPolicy {
             self.sample_lost = 0;
             self.sample_sent = 0;
             self.smoothed_loss = 0;
+            self.smoothed_failure = 0;
             return;
         };
         self.sample_lost = self
@@ -264,8 +265,15 @@ impl FecPolicy {
             // An engagement is judged on its own outcomes. What is still
             // resolving from the last one arrives for generations coded
             // before it ended, and describes a path this may no longer be.
+            // The smoothed rate goes with them: it only ever decays a
+            // quarter a sample and it is above the bar by construction at
+            // a disengage, so carrying it would spend the retry's first
+            // clean sample crossing the bar again, however well the
+            // retried path decodes. What bounds the retries is the hold
+            // and its doubling, not this.
             self.resolved_sample = 0;
             self.failed_sample = 0;
+            self.smoothed_failure = 0;
         }
         self.coding = engaged;
         self.sample_lost = 0;

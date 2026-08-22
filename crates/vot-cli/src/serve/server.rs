@@ -580,6 +580,11 @@ impl BundleServer {
                     .sender
                     .done(done.epoch, done.generation, verdict)
                     .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
+                if first && verdict == vot_fec::Done::Decoded {
+                    // The other half of what the decode policy weighs, off
+                    // the same stream of reports as the failures below.
+                    connection.fec_policy.note_decoded();
+                }
                 // A repeat is idempotent (spec/fec.md section 11): the record
                 // went out on the first.
                 if first && verdict == vot_fec::Done::Abandoned {
@@ -920,7 +925,6 @@ impl BundleServer {
                     repair,
                 });
                 live.insert(generation);
-                connection.fec_policy.note_coded();
             } else {
                 // Past the peer's generation credit: this one rides reliably
                 // under its piece's bundle.

@@ -616,14 +616,25 @@ mod tests {
         );
     }
 
-    /// Codes `coded` generations past the policy, `failed` of which the
-    /// receiver could not decode.
-    fn code_generations(policy: &mut connection::FecPolicy, coded: u64, failed: u64) {
-        for index in 0..coded {
+    /// One whole decode sample, `failed` of it generations the receiver
+    /// could not decode.
+    fn decode_sample(policy: &mut connection::FecPolicy, failed: u64) {
+        code_generations(policy, connection::FEC_DECODE_SAMPLE, failed);
+    }
+
+    /// Half a sample of failures, which is the shape the shaped
+    /// bottleneck's reports arrive in.
+    const HALF_SAMPLE: u64 = connection::FEC_DECODE_SAMPLE / 2;
+
+    /// Resolves `resolved` coded generations past the policy, `failed` of
+    /// which the receiver could not decode.
+    fn code_generations(policy: &mut connection::FecPolicy, resolved: u64, failed: u64) {
+        for index in 0..resolved {
             if index < failed {
                 policy.note_repaired();
+            } else {
+                policy.note_decoded();
             }
-            policy.note_coded();
         }
     }
 
@@ -640,10 +651,10 @@ mod tests {
 
         // Half of every sample failing is the shaped bottleneck's own
         // measurement. Smoothed, it takes three samples to be believed.
-        code_generations(&mut policy, 128, 64);
-        code_generations(&mut policy, 128, 64);
+        decode_sample(&mut policy, HALF_SAMPLE);
+        decode_sample(&mut policy, HALF_SAMPLE);
         assert!(policy.coding(), "two samples are not yet a verdict");
-        code_generations(&mut policy, 128, 64);
+        decode_sample(&mut policy, HALF_SAMPLE);
         assert!(!policy.coding(), "sustained failure ends coding");
 
         // The loss is still there, and it is exactly what must not
@@ -685,7 +696,7 @@ mod tests {
         for (failure, expected_hold) in [(1_u32, 4_u64), (2, 8), (3, 16), (4, 32)] {
             // Every generation failing: one sample is a verdict on its own
             // at that rate, so each retry costs exactly one sample.
-            code_generations(&mut policy, 128, 128);
+            decode_sample(&mut policy, connection::FEC_DECODE_SAMPLE);
             assert!(!policy.coding(), "failure {failure} ends coding");
             // Held through exactly the windows this failure earned, then
             // judged on loss again by the next one.
@@ -718,9 +729,9 @@ mod tests {
         assert!(policy.coding());
 
         for lump in 1..=8 {
-            code_generations(&mut policy, 128, 64);
+            decode_sample(&mut policy, HALF_SAMPLE);
             for _ in 0..8 {
-                code_generations(&mut policy, 128, 0);
+                decode_sample(&mut policy, 0);
             }
             assert!(
                 policy.coding(),
@@ -732,9 +743,9 @@ mod tests {
     #[test]
     fn a_retry_is_judged_on_the_path_it_retries() {
         // The reports of an epoch coded before the verdict keep arriving
-        // all through the hold, and nothing is coding to put underneath
-        // them. Counted, they would land whole on the first sample after
-        // the hold and end the retry on the losing path's evidence.
+        // all through the hold. They resolve into their own sample, which
+        // is the previous attempt's tail and must not lengthen its hold,
+        // and they must not decide the retry either.
         let mut policy = connection::FecPolicy::default();
         let mut sent = 0_u64;
         let mut lossy = |policy: &mut connection::FecPolicy, windows: u64| {
@@ -745,12 +756,12 @@ mod tests {
         };
         lossy(&mut policy, 2);
         assert!(policy.coding(), "a lossy path engages");
-        code_generations(&mut policy, 128, 128);
+        decode_sample(&mut policy, connection::FEC_DECODE_SAMPLE);
         assert!(!policy.coding(), "a sample that wholly failed ends coding");
 
         // The tail of what was already in flight, arriving with nothing
         // coding behind it.
-        for _ in 0..64 {
+        for _ in 0..HALF_SAMPLE {
             policy.note_repaired();
         }
         lossy(&mut policy, 5);
@@ -758,7 +769,7 @@ mod tests {
 
         // The retried path decodes everything it is given, and that is
         // what decides it.
-        code_generations(&mut policy, 128, 0);
+        decode_sample(&mut policy, 0);
         assert!(policy.coding(), "a clean retry survives its first sample");
     }
 
@@ -772,7 +783,7 @@ mod tests {
         assert!(policy.coding());
 
         for sample in 1..=64 {
-            code_generations(&mut policy, 128, 16);
+            decode_sample(&mut policy, connection::FEC_DECODE_SAMPLE / 8);
             assert!(policy.coding(), "an eighth failing at sample {sample}");
         }
     }

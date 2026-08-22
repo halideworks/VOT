@@ -138,3 +138,49 @@ today's floor is 2.2x.
   caps under the deeper epochs, held by the existing wire tests.
 - The 4 GiB and 12 GiB coded cells that previously failed or stalled
   complete at both 8 and whatever slot count the re-measure selects.
+
+## Measured outcome (2026-08-22)
+
+The four decisions merged as PRs 346, 351, 352, and 353-355; the
+verification then found and removed two delivery defects under the
+decisions rather than in them: quiche's 1,024-slot inbound datagram
+queue silently discarding symbols below every counter this stack owns
+(PR 356 sizes it to the credit's event bound), and the targeted-repair
+gate omitting this ADR's own "from what remains in flight" term, so it
+answered nearly every generation while the over-lost ones starved on
+the outbound budget (PR 357). PR 358 moved the engagement thresholds to
+4%/2.5%, a margin under the loss rates the policy serves, after the 5%
+threshold on a 5% path measured as a per-window coin flip.
+
+Against the verification list, on the netem rig at 200 ms:
+
+- Generation failure, credit conformance, and the clean automatic arm
+  all hold: decode is 100% of coded, abandoned and refused are zero,
+  receiver symbol drops are zero in every post-fix run, and the clean
+  arm offers nothing and sits at reliable's wall.
+- The 4 GiB coded cells that previously failed complete: at 5% loss,
+  forced 18.75 s and defaults 19.54 s, full byte count, zero abandoned.
+  The defaults arm offers 91% of generations at that size.
+- Coded settlement at 256 MB: p50 303 ms against reliable-clean's 417,
+  so a forced-coded clean transfer now completes faster than reliable
+  (2.11-2.18 s against 2.21). The p99 under loss was last attributed
+  while the drop defects stood; the coded arm's 5% data phase is not
+  fully explained post-fix.
+- The 90% automatic share holds at 4 GiB but not at 256 MB, and the
+  reason is structural, not a tuning miss: issuance outruns the
+  verdict, so most covers of a short transfer are answered before any
+  sample can close. Deepening the request window makes this worse, not
+  better (a parked W=8 branch front-loads issuance further and the
+  codable tail shrinks; its 12-20% win exists only under forced
+  coding).
+
+Wall at 5% loss, 256 MB, defaults: median 1.9x of clean, best runs
+1.6x, against this ADR's 1.2x. The remaining gap is not in the coded
+path: it is the serial prefix under loss, whose first byte ran
+1.5-6.7 s against 1.03 clean in the closing sweep with walls tracking
+it nearly one for one. The lever there is prefix loss-robustness, not
+prefix length: duplication of early packets removed the multi-second
+first-byte tail in a probe, and the levers that shorten the prefix
+(0-RTT sequencing, manifest in the announcement) shorten both arms and
+barely move the ratio. That work changes the wire and needs its own
+ADR; no lever inside this one's scope reaches 1.2x.

@@ -24,8 +24,8 @@ pub(crate) const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::G
 
 // The limit clears the credit by a group; at or under it would refuse a
 // conforming answer.
-const _: () = assert!(FETCH_CREDIT_BYTES == 17_039_360);
-const _: () = assert!(FETCH_STAGING_BYTES == 17_104_896);
+const _: () = assert!(FETCH_CREDIT_BYTES == 34_078_720);
+const _: () = assert!(FETCH_STAGING_BYTES == 34_144_256);
 
 /// The stance a fetch takes on a challenge it has not seen yet.
 ///

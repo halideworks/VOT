@@ -20,7 +20,14 @@ pub(crate) fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)
 /// The bound is on the wire, not the queue: a pass costs microseconds and
 /// an answer costs a round trip, so bounding the queue lets an object of
 /// any size be asked for in full before the first cover lands.
-pub(crate) const OUTSTANDING_COVERS: usize = 4;
+///
+/// Eight matches the coding epoch slots, so an engaged path can hold a
+/// coded answer per outstanding cover. At four, the staging credit this
+/// scales (about 17 MB, 261 generations) sat under the ~305 generations
+/// a 200 ms path holds un-retired at its operating rate, so a quarter of
+/// every engaged transfer's generations were refused coding by the
+/// sender's own credit and rode reliably into recovery rounds.
+pub(crate) const OUTSTANDING_COVERS: usize = 8;
 
 /// Bundles one cover can be answered in.
 ///
@@ -56,7 +63,7 @@ const _: () = assert!(
     PIECES_PER_COVER as u64
         == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
 );
-const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
+const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 40);
 // An open epoch spans a whole requested cover (ADR-0042) and pins that
 // cover's piece bundles for its whole life, so the depth has to hold the
 // epochs' pieces on top of the reliable pipeline rather than carve them out
@@ -66,7 +73,7 @@ const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
 // the repair records are queued, so the next request opens a fresh epoch and
 // fresh bundles while the retired one is still incomplete at the receiver,
 // a transit behind. One slot can hold both for that transit.
-const _: () = assert!(PENDING_BUNDLE_DEPTH == 100);
+const _: () = assert!(PENDING_BUNDLE_DEPTH == 120);
 
 /// Bytes a fetch may hold across part-built bundles.
 ///
@@ -91,8 +98,8 @@ pub(crate) const ORPHAN_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
 // Spelled out, so a slip in either sum is a build failure rather than a
 // budget that silently refuses a conforming transfer or admits far more than
 // it meant to.
-const _: () = assert!(PENDING_BUNDLE_BYTES == 90_177_536);
-const _: () = assert!(ORPHAN_BUNDLE_BYTES == 85_983_232);
+const _: () = assert!(PENDING_BUNDLE_BYTES == 112_197_632);
+const _: () = assert!(ORPHAN_BUNDLE_BYTES == 103_809_024);
 
 const COVER_BYTES_USIZE: usize = 4_259_840;
 const _: () = assert!(COVER_BYTES_USIZE as u64 == vot_scheduler::MAX_PROOF_RANGE_BYTES);
@@ -112,7 +119,7 @@ pub(crate) const ORPHAN_BUNDLE_DEPTH: usize = ORPHAN_BUNDLE_BYTES / FEC_GENERATI
 const FEC_GENERATION_BYTES_USIZE: usize = 65_536;
 const _: () =
     assert!(FEC_GENERATION_BYTES_USIZE as u64 == crate::serve::server::FEC_GENERATION_BYTES);
-const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_312);
+const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_584);
 
 /// Bytes this fetch may have asked for and not yet placed.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;

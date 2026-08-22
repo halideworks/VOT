@@ -1,0 +1,125 @@
+# ADR-0043: Startup prefix datagram duplication
+
+- Status: Proposed
+- Date: 2026-08-22
+- Decision owners: A00 architecture; A10 transport
+- Applies to: the quiche pump's outbound path
+  (`crates/vot-transport-quiche/src/live.rs`); no wire frame, spec
+  section, or negotiation state changes
+
+## Context
+
+A fetch pays a serial prefix of about five round trips before its first
+record: the TLS handshake (the server's first flight is amplification-shaped
+to one datagram until the client's next packet arrives), one VOT negotiation
+round trip with the announcement pushed alongside it (ADR-0041), the serial
+manifest page round trips (`request_pages` issues one span and waits for
+it), and the first `RANGE_REQUEST` with its proof. Every packet in the
+prefix is small and serial, so a loss there costs a full recovery round
+trip at best and a cold PTO at worst, and little else is in flight to keep
+the loss detector's ack clock ticking; PR 355's ping cadence bounds the
+detection delay but cannot remove the recovery round itself.
+
+Measured on the netem rig (256 MB, 200 ms, 5% loss both ways, seeded
+window): first byte runs 1.5-6.7 s against 1.03 s clean, and the walls
+track first byte nearly one for one at this size; the certification sweep
+put the medians at 1588 ms lossy against 1052 clean. The data phase's own
+~1.8x under loss belongs to ADR-0042 and its named policy residuals. The
+prefix is the part no coding reaches, because the FEC extension protects
+only bulk range answers.
+
+A probe answered the mechanism question. Duplicating every outbound
+datagram at the socket while a connection's sent count was under 200, both
+ends, removed the 2.3-3.5 s first-byte outliers at 5% entirely and left
+the median near 1.5 s. Two facts follow. The first-byte tail is
+retransmission timing on a serial flight, and duplication removes it. The
+residual median is one recovery round entangled with the first data
+flight, which engagement timing owns (the real-path forced-coded arm's
+first bytes sit at ~0.6 s on a lossy 100 ms path), so it is out of this
+ADR's scope. The probe is not shippable as it stands: it duplicated below
+quiche, so the server's copies were invisible to quiche's pre-validation
+anti-amplification accounting, the three-times-received-byte rule that
+spec/security.md section 7 requires.
+
+The mechanics allow a small change. Every QUIC datagram either role sends
+leaves through one function, `flush_burst` in
+`crates/vot-transport-quiche/src/live.rs`, because the client and server
+share the same pump loop (`run`). The only sends that bypass it are
+stateless version negotiation and the non-QUIC side channel.
+
+## Decision
+
+While a connection is in its startup phase, the pump transmits every
+outbound QUIC datagram twice.
+
+1. **Duplication happens at `flush_burst`,** as a second transmission of
+   the already-encrypted datagram. A QUIC receiver discards duplicate
+   packet numbers natively, so the copy is pure loss insurance; nothing
+   above the pump changes and no spec text moves.
+
+2. **The phase is a datagram count, not a clock.** Duplication applies
+   while the connection's total sent-datagram count is below a bound,
+   default 200, which is the probe's measured shape, overridable as
+   `VOT_PREFIX_DUP` with zero disabling it. The count spans the handshake,
+   negotiation, announcement, manifest pages, and the leading edge of the
+   first data flight on both roles. The cost ceiling is ~200 extra
+   datagrams of at most 1200 bytes, ~240 KB per connection, paid once.
+
+3. **The server duplicates only after the handshake is established.**
+   Before address validation completes the server sends exactly what
+   quiche accounts, so the three-times rule stands untouched; from
+   `is_established` onward the limit no longer applies and the copies are
+   legal. The client duplicates from its first flight, where no
+   amplification rule exists.
+
+The target, which the netem rig holds this to: at 5% loss the first-byte
+tail collapses to the clean shape, p99 first byte within 2x of clean and
+no run above 3 s, with the p50 explicitly out of scope as the entangled
+recovery round named above. Clean-path walls stay within noise.
+
+## Consequences
+
+- Every connection, clean paths included, pays the ~240 KB once. It is
+  invisible next to a seeded window and buys the tail on paths whose loss
+  is not yet measurable, which is exactly when the prefix runs.
+- The server's own handshake flight remains unprotected, because the
+  amplification shape is the point of that rule. The client's copies
+  protect the client half of the handshake; the server's copies protect
+  the negotiation reply, announcement, and manifest pages. If part of the
+  probe's tail win was server handshake loss, the legal shape gives some
+  of it back; the verification list settles that empirically rather than
+  by assertion.
+- On the GSO path (`send_segmented`) the copy is a second flush of the
+  same burst, so segmentation offload is retained for both transmissions.
+- The knob is a calibration point, not a config surface: one integer with
+  a measured default, in the same style as `VOT_INITIAL_CWND`.
+
+## Rejected alternatives
+
+- **0-RTT frame sequencing on session resumption:** PR 344 already gives
+  ticket resumption and it measured wall-neutral, because the resumed
+  handshake pays the same round trips; this build deliberately sends no
+  early data (spec/wire.md section 4's replay rules). Shortening the
+  prefix cuts both arms and barely moves the lossy ratio, which is the
+  number this ADR exists to move.
+- **Manifest page in the announcement:** saves one round trip on both
+  arms, ratio near unchanged, and collides with spec/security.md
+  section 7's ban on pre-authentication manifest pages, so it prices an
+  authentication redesign against a ratio-neutral round trip.
+- **Eager rail connection:** measured 31% worse (branch `rail-overlap`).
+- **Deeper request pipeline:** re-tested after the window-seed fix, still
+  worse.
+- **Duplicating bulk data:** rejected in ADR-0042 and stays rejected; this
+  ADR's scope is the counted startup prefix only.
+
+## Required verification
+
+- The multi-second first-byte outliers at 5% loss are gone: nine runs an
+  arm minimum, 256 MB at 200 ms, p99 first byte within 2x of clean and no
+  run above 3 s.
+- Clean cells unchanged: 16 MB seeded and 256 MB walls within noise of
+  main, both arms.
+- Amplification conformance: a wire test holds the server's
+  pre-establishment sent-byte count identical with the feature on and off.
+- `VOT_PREFIX_DUP=0` reproduces main's send behavior exactly, held by the
+  same test.

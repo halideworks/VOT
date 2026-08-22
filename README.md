@@ -138,6 +138,7 @@ authenticates received content. See ADR-0037.
 | --- | --- | --- |
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
 | `VOT_INITIAL_CWND` | controller default | Initial congestion window in 1200-byte packets (10 to 7100, so up to ~8.5 MB of first-flight window). Set on the serve to skip most of slow start on a path the operator knows; size it near the path's bandwidth-delay product. The seed acts while the connection starts up and decays as the path's datagram size settles, so a generous value costs a burst, not the connection |
+| `VOT_PREFIX_DUP` | 200 | Datagrams each end sends twice at the start of a connection, up to 4096, where `0` sends each once. The serial prefix is sparse, so a loss in it waits on a recovery round trip nothing else can shorten; the copies cost about 240 KB once per connection and removed the multi-second first-byte tail at 5% loss |
 | `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only after measured corrected packet loss reaches 5%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |

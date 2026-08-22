@@ -730,6 +730,39 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_is_judged_on_the_path_it_retries() {
+        // The reports of an epoch coded before the verdict keep arriving
+        // all through the hold, and nothing is coding to put underneath
+        // them. Counted, they would land whole on the first sample after
+        // the hold and end the retry on the losing path's evidence.
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        let mut lossy = |policy: &mut connection::FecPolicy, windows: u64| {
+            for _ in 0..windows {
+                sent += 8192;
+                policy.observe(Some(path_sample(sent / 20, 0, sent)));
+            }
+        };
+        lossy(&mut policy, 2);
+        assert!(policy.coding(), "a lossy path engages");
+        code_generations(&mut policy, 128, 128);
+        assert!(!policy.coding(), "a sample that wholly failed ends coding");
+
+        // The tail of what was already in flight, arriving with nothing
+        // coding behind it.
+        for _ in 0..64 {
+            policy.note_repaired();
+        }
+        lossy(&mut policy, 5);
+        assert!(policy.coding(), "the hold is spent and the path is lossy");
+
+        // The retried path decodes everything it is given, and that is
+        // what decides it.
+        code_generations(&mut policy, 128, 0);
+        assert!(policy.coding(), "a clean retry survives its first sample");
+    }
+
+    #[test]
     fn a_few_failures_a_sample_never_end_coding() {
         // A steady trickle inside the repair budget: the smoothed rate
         // settles under the share and stays there however long it runs.

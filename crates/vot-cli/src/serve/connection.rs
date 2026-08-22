@@ -294,7 +294,18 @@ impl FecPolicy {
 
     /// Counts a coded generation the receiver could not decode from
     /// symbols, which this end is repairing reliably instead.
+    ///
+    /// Ignored while coding is off. The reports of an epoch coded before
+    /// the verdict keep arriving through the hold that follows it, and
+    /// nothing is coding to put underneath them: they would land whole on
+    /// the first sample after the hold, whose own generations have not
+    /// failed at all, and end the retry on the losing path's evidence
+    /// rather than the retried one's. Their information is already spent,
+    /// since it is what disengaged coding in the first place.
     pub(crate) fn note_repaired(&mut self) {
+        if !self.coding {
+            return;
+        }
         self.failed_sample = self.failed_sample.saturating_add(1);
     }
 

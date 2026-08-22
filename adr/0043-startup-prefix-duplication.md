@@ -1,6 +1,6 @@
 # ADR-0043: Startup prefix datagram duplication
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-22
 - Decision owners: A00 architecture; A10 transport
 - Applies to: the quiche pump's outbound path

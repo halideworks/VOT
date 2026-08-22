@@ -35,7 +35,7 @@ the median near 1.5 s. Two facts follow. The first-byte tail is
 retransmission timing on a serial flight, and duplication removes it. The
 residual median is one recovery round entangled with the first data
 flight, which engagement timing owns (the real-path forced-coded arm's
-first bytes sit at ~0.6 s on a lossy 100 ms path), so it is out of this
+first bytes sit at 0.6-0.8 s on a lossy 100 ms path), so it is out of this
 ADR's scope. The probe is not shippable as it stands: it duplicated below
 quiche, so the server's copies were invisible to quiche's pre-validation
 anti-amplification accounting, the three-times-received-byte rule that
@@ -60,9 +60,9 @@ outbound QUIC datagram twice.
 2. **The phase is a datagram count, not a clock.** Duplication applies
    while the connection's total sent-datagram count is below a bound,
    default 200, which is the probe's measured shape, overridable as
-   `VOT_PREFIX_DUP` with zero disabling it. The count spans the handshake,
-   negotiation, announcement, manifest pages, and the leading edge of the
-   first data flight on both roles. The cost ceiling is ~200 extra
+   `VOT_PREFIX_DUP` with zero disabling it. The count spans the client's
+   handshake and, on both roles, the negotiation, announcement, manifest
+   pages, and the leading edge of the first data flight. The cost ceiling is ~200 extra
    datagrams of at most 1200 bytes, ~240 KB per connection, paid once.
 
 3. **The server duplicates only after the handshake is established.**

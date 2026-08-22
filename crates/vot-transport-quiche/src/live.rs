@@ -1226,7 +1226,26 @@ fn run(
         Intake::Routed(_) => None,
     };
 
+    let mut ramp_pings: u32 = 0;
+    let mut last_ping = Instant::now();
     let outcome = 'drive: loop {
+        // The ramp's serial prefix is a handful of sparse flights, and a
+        // lost packet in a sparse flight has no later packets to reveal
+        // the gap: recovery falls to probe timers, 300-900 ms against the
+        // round trip a gap detection costs. A short ping cadence through
+        // the ramp keeps the ack clock ticking on both ends; measured at
+        // 5% loss and 200 ms it took the first byte's median from 2.56 s
+        // to 1.49 s and the worst wall from 11.1 s to 5.6 s. The budget
+        // bounds it: about a second of cadence, then silence.
+        // Armed only once the handshake completes: before establishment
+        // send_ack_eliciting is a documented no-op, and a counted budget
+        // that ticks through a slow lossy handshake would be spent on
+        // nothing exactly where the ramp needs it (review's catch).
+        if announced && ramp_ping_due(ramp_pings) && last_ping.elapsed() >= RAMP_PING_INTERVAL {
+            let _ = conn.send_ack_eliciting();
+            ramp_pings += 1;
+            last_ping = Instant::now();
+        }
         queued.debug_assert_matches(&streams);
         let orphaned = take_submissions(
             &mut conn,
@@ -1293,6 +1312,8 @@ fn run(
             }
             resumed.store(conn.is_resumed(), Ordering::Relaxed);
             announced = true;
+            // The ramp cadence's clock starts here, with the whole budget.
+            last_ping = Instant::now();
             if let Ok(mut queue) = inbound.lock() {
                 queue.push_unlosable(NativeEvent::Connected(connection));
             }
@@ -2271,6 +2292,27 @@ const fn send_exhausted(packets: u32) -> bool {
     packets > SEND_PACKET_BUDGET
 }
 
+/// How often the ramp cadence elicits an ack.
+const RAMP_PING_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Pings the ramp cadence sends before falling silent, counted rather
+/// than clocked so the bound lives in the loop's own body: at the
+/// interval above this spans the serial prefix of any path this serves,
+/// and a connection that outlives it has two-way traffic keeping the ack
+/// clock alive on its own.
+///
+/// The cadence arms at establishment, where `send_ack_eliciting` starts
+/// doing anything. If early data is ever enabled, the arming gate needs
+/// `is_in_early_data` beside `is_established`, or the cadence stays dark
+/// through the whole 0-RTT window.
+const RAMP_PING_BUDGET: u32 = 48;
+
+/// Whether the ramp cadence still owes pings. Pure, so the edge is
+/// pinned from both sides by a table test.
+const fn ramp_ping_due(ramp_pings: u32) -> bool {
+    ramp_pings < RAMP_PING_BUDGET
+}
+
 /// Takes the caller's close request to the connection, once.
 fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
     if *closing {
@@ -2964,6 +3006,20 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn the_ramp_cadence_falls_silent_at_its_whole_budget() {
+        assert!(ramp_ping_due(0));
+        assert!(ramp_ping_due(RAMP_PING_BUDGET - 1));
+        assert!(!ramp_ping_due(RAMP_PING_BUDGET));
+        assert!(!ramp_ping_due(u32::MAX));
+        // About a second of cadence: enough for any serial prefix this
+        // serves, small enough that an idle connection goes quiet fast.
+        const {
+            assert!(RAMP_PING_BUDGET >= 32);
+            assert!(RAMP_PING_BUDGET <= 128);
+        }
+    }
 
     #[test]
     fn a_closing_connection_overstays_only_past_its_whole_budget() {

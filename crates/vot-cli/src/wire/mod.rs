@@ -1610,6 +1610,23 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_duplication_budget_is_bounded_datagrams() {
+        assert_eq!(prefix_dup_from(None).unwrap(), None, "unset is the default");
+        assert_eq!(
+            prefix_dup_from(Some("0")).unwrap(),
+            Some(0),
+            "zero sends each datagram once"
+        );
+        assert_eq!(prefix_dup_from(Some(" 200\n")).unwrap(), Some(200));
+        assert_eq!(prefix_dup_from(Some("4096")).unwrap(), Some(4_096));
+        assert!(
+            prefix_dup_from(Some("4097")).is_err(),
+            "past a prefix-sized answer"
+        );
+        assert!(prefix_dup_from(Some("twice")).is_err());
+    }
+
+    #[test]
     fn an_identity_pin_is_exactly_its_hex() {
         assert_eq!(identity_from(None).unwrap(), None);
         let hex = "7503bcc1b8fe0bfe100a9d32204f17133de6a6069db7ff27770f9589f142a988";

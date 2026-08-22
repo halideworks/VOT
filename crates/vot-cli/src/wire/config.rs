@@ -90,6 +90,27 @@ pub(crate) fn initial_cwnd_from(pin: Option<&str>) -> Result<Option<usize>, Erro
         .transpose()
 }
 
+/// The environment variable that sets how many datagrams each end sends
+/// twice at the start of a connection. The serial prefix is sparse, so a
+/// loss in it waits on a recovery round trip; the copies buy it back at
+/// about 240 KB once per connection. Unset takes the carrier's measured
+/// default, and zero sends each datagram once. ADR-0043.
+pub(crate) const PREFIX_DUP: &str = "VOT_PREFIX_DUP";
+
+/// The most datagrams [`PREFIX_DUP`] accepts. Past the startup prefix the
+/// copies are bulk overhead that congestion control never sees, so this
+/// bounds the knob to prefix-sized answers rather than a doubled transfer.
+const MAX_PREFIX_DUP: usize = 4_096;
+
+/// The budget [`PREFIX_DUP`] names, or nothing when unset.
+///
+/// # Errors
+/// Rejects a value that is not a number or is past [`MAX_PREFIX_DUP`].
+pub(crate) fn prefix_dup_from(pin: Option<&str>) -> Result<Option<usize>, Error> {
+    pin.map(|value| bounded(value, 0..=MAX_PREFIX_DUP))
+        .transpose()
+}
+
 /// The environment variable that pins the serve's identity: the 64 hex
 /// characters of the blake3 digest of its certificate in DER, as the serve
 /// prints at startup. Unset accepts any serve; the package root still holds

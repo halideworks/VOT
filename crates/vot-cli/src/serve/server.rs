@@ -618,6 +618,12 @@ impl BundleServer {
         if !opened.plan.holds(generation) {
             return Ok(());
         }
+        // Every way a coded generation can fail arrives here: the receiver
+        // abandoning it, the epoch refused, and the quiet retirement that
+        // covers a generation which never gathered enough symbols to
+        // report at all. So this is where the policy learns coding is not
+        // working.
+        connection.fec_policy.note_repaired();
         let (first, piece_id) = piece_of(&opened.pieces, generation).ok_or(Error::InvalidBundle)?;
         let (offset, length) = opened.plan.generation_span(generation);
         let plaintext = served.read_covered(offset, length)?;
@@ -914,6 +920,7 @@ impl BundleServer {
                     repair,
                 });
                 live.insert(generation);
+                connection.fec_policy.note_coded();
             } else {
                 // Past the peer's generation credit: this one rides reliably
                 // under its piece's bundle.

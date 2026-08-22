@@ -616,6 +616,147 @@ mod tests {
         );
     }
 
+    /// Codes `coded` generations past the policy, `failed` of which the
+    /// receiver could not decode.
+    fn code_generations(policy: &mut connection::FecPolicy, coded: u64, failed: u64) {
+        for index in 0..coded {
+            if index < failed {
+                policy.note_repaired();
+            }
+            policy.note_coded();
+        }
+    }
+
+    #[test]
+    fn coding_that_cannot_decode_disengages_and_stays_off_for_its_hold() {
+        // Loss the sender caused itself is loss coding cannot answer: the
+        // repair symbols drop in the same queue as the sources. Nothing
+        // about the path tells the two apart, so the policy reads whether
+        // the coding worked.
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding(), "a lossy path engages");
+
+        // Half of every sample failing is the shaped bottleneck's own
+        // measurement. Smoothed, it takes three samples to be believed.
+        code_generations(&mut policy, 128, 64);
+        code_generations(&mut policy, 128, 64);
+        assert!(policy.coding(), "two samples are not yet a verdict");
+        code_generations(&mut policy, 128, 64);
+        assert!(!policy.coding(), "sustained failure ends coding");
+
+        // The loss is still there, and it is exactly what must not
+        // re-engage coding while the hold runs.
+        for window in 1..=4_u64 {
+            policy.observe(Some(path_sample(
+                410 * (window + 1),
+                0,
+                8192 * (window + 1),
+            )));
+            assert!(!policy.coding(), "held off at window {window}");
+        }
+        policy.observe(Some(path_sample(2460, 0, 49_152)));
+        assert!(
+            policy.coding(),
+            "past the hold the path is judged on its loss again"
+        );
+    }
+
+    #[test]
+    fn a_path_that_keeps_failing_is_retried_less_and_less() {
+        // The signal arrives late: a generation that never gathers enough
+        // symbols owes no GEN_DONE, so this end learns the truth at the
+        // epoch's quiet retirement. A fixed hold therefore pays a fresh
+        // sample plus that lag for every retry, which measured as half the
+        // cost of not discriminating at all. Each failure doubles the next
+        // hold, to a cap that outlasts a transfer.
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        let mut lossy = |policy: &mut connection::FecPolicy, windows: u64| {
+            for _ in 0..windows {
+                sent += 8192;
+                policy.observe(Some(path_sample(sent / 20, 0, sent)));
+            }
+        };
+        lossy(&mut policy, 2);
+        assert!(policy.coding(), "a lossy path engages");
+
+        for (failure, expected_hold) in [(1_u32, 4_u64), (2, 8), (3, 16), (4, 32)] {
+            // Every generation failing: one sample is a verdict on its own
+            // at that rate, so each retry costs exactly one sample.
+            code_generations(&mut policy, 128, 128);
+            assert!(!policy.coding(), "failure {failure} ends coding");
+            // Held through exactly the windows this failure earned, then
+            // judged on loss again by the next one.
+            lossy(&mut policy, expected_hold);
+            assert!(
+                !policy.coding(),
+                "failure {failure} holds through {expected_hold} windows"
+            );
+            lossy(&mut policy, 1);
+            assert!(
+                policy.coding(),
+                "failure {failure} releases after {expected_hold}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lossy_path_keeps_coding_through_bursts_of_failures() {
+        // The case this must not break, and the one a raw per-sample
+        // verdict did break. Failures arrive in lumps, because an epoch's
+        // quiet retirement reports every generation under it at once, so a
+        // path failing 2% overall still shows whole samples at half. On a
+        // real 4 GiB transfer at 5% loss, nine of 359 raw samples crossed a
+        // quarter on their own while the fetch decoded 100% of what it
+        // coded, and acting on them cost that arm coding it should have
+        // kept.
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding());
+
+        for lump in 1..=8 {
+            code_generations(&mut policy, 128, 64);
+            for _ in 0..8 {
+                code_generations(&mut policy, 128, 0);
+            }
+            assert!(
+                policy.coding(),
+                "a lump at {lump} among decoding samples is not a verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn a_few_failures_a_sample_never_end_coding() {
+        // A steady trickle inside the repair budget: the smoothed rate
+        // settles under the share and stays there however long it runs.
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding());
+
+        for sample in 1..=64 {
+            code_generations(&mut policy, 128, 16);
+            assert!(policy.coding(), "an eighth failing at sample {sample}");
+        }
+    }
+
+    #[test]
+    fn decode_failures_alone_never_engage_coding() {
+        // The decode verdict only ever takes coding away. A path with no
+        // loss codes nothing, so it reports nothing, and a stray repair
+        // must not be readable as a reason to start.
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(0, 0, 8192)));
+        assert!(!policy.coding(), "a clean path codes nothing");
+        code_generations(&mut policy, 256, 256);
+        assert!(!policy.coding(), "and is not engaged by decode counts");
+    }
+
     #[test]
     fn a_freak_first_window_cannot_pin_a_clean_path_into_coding() {
         // A 50% burst in the tiny first sample seeds at the ceiling, not

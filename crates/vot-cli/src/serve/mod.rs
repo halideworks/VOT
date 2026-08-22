@@ -2009,9 +2009,11 @@ mod tests {
 
     #[test]
     fn a_short_state_is_answered_only_inside_its_window() {
-        // The gate from both sides: under half the sources the symbols may
+        // The gate from all sides: under half the sources the symbols may
         // still be in flight, at or past the whole count nothing is short,
-        // and a stale sequence changes nothing.
+        // and holes the five transmitted repairs still in flight can fill
+        // need nothing, so only a generation short past that margin is
+        // answered.
         let (bundle, _) = built_bundle("window", &[("big.bin", patterned(200_000))]);
         let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
@@ -2058,8 +2060,10 @@ mod tests {
         };
         expect(&mut session, &mut connection, 0, 31, false);
         expect(&mut session, &mut connection, 0, 32, true);
-        expect(&mut session, &mut connection, 1, 63, true);
-        expect(&mut session, &mut connection, 2, 64, false);
+        expect(&mut session, &mut connection, 1, 58, true);
+        expect(&mut session, &mut connection, 2, 59, false);
+        expect(&mut session, &mut connection, 3, 63, false);
+        expect(&mut session, &mut connection, 4, 64, false);
     }
 
     #[test]

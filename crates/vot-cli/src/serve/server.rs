@@ -317,9 +317,15 @@ impl BundleServer {
     /// costs (ADR-0042 decision 4). Once per generation; the ladder and
     /// the reliable resend still stand behind it.
     ///
-    /// Gated on the epoch's symbols all being on the carrier and the
-    /// receiver holding at least half the sources, so an early state from
-    /// a generation whose symbols are still in flight repairs nothing.
+    /// Gated on the epoch's symbols all being on the carrier, the
+    /// receiver holding at least half the sources, and the holes
+    /// exceeding the repair symbols the first pass already sent. The
+    /// restate rides the epoch's first repair symbol, so every
+    /// generation's own repair round is still in flight behind it: a
+    /// generation whose holes those repairs can fill needs nothing, and
+    /// answering it anyway was measured sending a targeted repair for
+    /// nearly every generation of a forced 5% transfer while the
+    /// over-lost ones bounced off the outbound budget this spends.
     fn answer_short_state(
         &self,
         state: &frames::GenState,
@@ -339,6 +345,7 @@ impl BundleServer {
         let sources = geometry.source_count();
         if usize::from(state.received) >= sources
             || usize::from(state.received) < sources / 2
+            || sources - usize::from(state.received) <= opened.transmitted_repairs
             || connection.outbound.taken() < opened.symbols_queued_through
             || opened.repaired.contains(&state.generation)
             || !opened.plan.holds(state.generation)

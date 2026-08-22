@@ -741,6 +741,48 @@ mod tests {
     }
 
     #[test]
+    fn only_a_generations_first_decoded_word_is_counted() {
+        // The decode policy's denominator. A repeat says nothing new, and
+        // an abandoned generation belongs to the numerator, counted where
+        // it is repaired.
+        assert!(server::first_decode(true, vot_fec::Done::Decoded));
+        assert!(!server::first_decode(false, vot_fec::Done::Decoded));
+        assert!(!server::first_decode(true, vot_fec::Done::Abandoned));
+        assert!(!server::first_decode(false, vot_fec::Done::Abandoned));
+    }
+
+    #[test]
+    fn a_sample_in_progress_survives_the_windows_under_it() {
+        // Loss windows close far more often than decode samples fill, and
+        // only a fresh engagement clears the sample. Clearing it on any
+        // other window would mean a verdict that never arrives, because
+        // the outcomes would never accumulate to a full sample.
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        let mut lossy = |policy: &mut connection::FecPolicy, windows: u64| {
+            for _ in 0..windows {
+                sent += 8192;
+                policy.observe(Some(path_sample(sent / 20, 0, sent)));
+            }
+        };
+        lossy(&mut policy, 2);
+        assert!(policy.coding(), "a lossy path engages");
+
+        // One sample's worth of failures, a loss window between every one
+        // of them, and the engagement alive throughout.
+        for _ in 0..connection::FEC_DECODE_SAMPLE - 1 {
+            policy.note_repaired();
+            lossy(&mut policy, 1);
+            assert!(policy.coding(), "still short of a sample");
+        }
+        policy.note_repaired();
+        assert!(
+            !policy.coding(),
+            "the sample accumulated across the windows and was judged"
+        );
+    }
+
+    #[test]
     fn a_retry_is_judged_on_the_path_it_retries() {
         // The reports of an epoch coded before the verdict keep arriving
         // all through the hold. They resolve into their own sample, which

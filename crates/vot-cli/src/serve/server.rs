@@ -580,9 +580,7 @@ impl BundleServer {
                     .sender
                     .done(done.epoch, done.generation, verdict)
                     .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
-                if first && verdict == vot_fec::Done::Decoded {
-                    // The other half of what the decode policy weighs, off
-                    // the same stream of reports as the failures below.
+                if first_decode(first, verdict) {
                     connection.fec_policy.note_decoded();
                 }
                 // A repeat is idempotent (spec/fec.md section 11): the record
@@ -1004,6 +1002,17 @@ impl BundleServer {
         }
         Ok(())
     }
+}
+
+/// Whether this `GEN_DONE` is the first word that a generation decoded,
+/// which is the decode policy's denominator.
+///
+/// A repeat says nothing new (spec/fec.md section 11), and an abandoned
+/// generation is the other half of the ratio, counted where it is
+/// repaired. Pure, so both halves of the condition are pinned by a table
+/// test rather than by whichever serve path happens to reach it.
+pub(crate) const fn first_decode(first: bool, verdict: vot_fec::Done) -> bool {
+    first && matches!(verdict, vot_fec::Done::Decoded)
 }
 
 /// The piece a generation's record rides under: the last piece at or before

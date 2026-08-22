@@ -27,6 +27,70 @@ const FEC_SAMPLE_PACKETS: u64 = 8192;
 /// sent; one such run never engaged at all.
 const FIRST_FEC_SAMPLE_PACKETS: u64 = 256;
 
+/// Generations whose fate is known in one decode sample.
+///
+/// Counted as they resolve rather than as they are coded, so both halves
+/// of the ratio come off the same stream of reports. An outcome reaches
+/// this end well after the generation was coded, by `GEN_DONE` or by the
+/// epoch's quiet retirement, and counting the coding instead put the two
+/// halves on different clocks: whichever way the mismatch was resolved it
+/// misjudged the sample that spans a change of verdict, once by charging
+/// an old attempt's failures to a fresh denominator and once by closing a
+/// sample before any of its own outcomes had arrived.
+///
+/// Small, because the whole cost of this verdict is how long it takes to
+/// reach: outcomes arrive in lumps at epoch retirement, and the smoothing
+/// below is what absorbs the noise a short sample carries. Measured on the
+/// 4 GiB shaped cell, 128 gave 63.07 s and 48 gives 61.42 against 68.22
+/// unjudged and 56.10 with coding off, and the genuinely lossy cell is
+/// unmoved between them.
+pub(crate) const FEC_DECODE_SAMPLE: u64 = 48;
+
+/// The share of coded generations that may fail before coding is judged
+/// to be making the path worse: a quarter, of the smoothed rate.
+///
+/// Measured, this separates the two cases with room on both sides. A path
+/// whose loss is exogenous decodes every coded generation it engages for,
+/// 100% across every emulated cell and a real 12 GiB transfer at 5% loss.
+/// A path whose loss is the sender's own queue overflowing decoded 39-40%
+/// of coded, because the repair symbols queue behind the sources they
+/// were sent to repair.
+///
+/// Read against the smoothed rate rather than one sample, for the reason
+/// the loss verdict is: failures do not arrive spread out. A generation
+/// that never gathers enough symbols owes no `GEN_DONE`, so its epoch's
+/// quiet retirement reports the whole epoch at once, and a sample sees
+/// either none of that or half of it. Measured on a genuinely lossy
+/// 4 GiB transfer whose overall failure rate was 1.9%, nine of 359 raw
+/// samples crossed a quarter on their own, and acting on them cost that
+/// arm coding it should have kept.
+const DECODE_FAILURE_SHARE: u64 = 4;
+
+/// Closed loss windows the first decode failure holds coding off for.
+///
+/// Coding cannot be judged while it is off, because a generation that is
+/// never coded never reports, so the off-hysteresis on the loss rate
+/// cannot be what governs re-entry: the loss that engaged coding is still
+/// there, and the verdict would flap engage, fail, disengage, re-engage
+/// for the length of the transfer. A counted hold bounds that duty cycle
+/// instead, and the first one is short so a path that has genuinely
+/// changed is retried rather than written off on one bad sample.
+const DECODE_FAILURE_HOLD_WINDOWS: u32 = 4;
+
+/// Doublings the hold may take across repeated failures on one
+/// connection.
+///
+/// A fixed hold is not enough on its own, because this end learns a
+/// generation's fate well after it coded it: the receiver owes no
+/// `GEN_DONE` for a generation that never gathered enough symbols to
+/// decode, so the whole truth arrives at the epoch's quiet retirement. A
+/// path that keeps failing therefore pays a fresh sample plus that lag
+/// for every retry, and a fixed hold buys one retry per hold for the
+/// length of the transfer. Doubling bounds the retries a connection can
+/// spend in total, and at the cap the hold outlasts any transfer, so a
+/// path that has failed five samples is left alone.
+const DECODE_FAILURE_BACKOFF_CAP: u32 = 4;
+
 #[derive(Clone, Copy, Debug)]
 struct PathCounters {
     lost: u64,
@@ -50,6 +114,18 @@ pub(crate) struct FecPolicy {
     /// others, and per-window hysteresis was measured flapping a steadily
     /// lossy path off half the time.
     smoothed_loss: u64,
+    /// Generations resolved toward the current decode decision, and how
+    /// many of them the receiver could not decode from symbols.
+    resolved_sample: u64,
+    failed_sample: u64,
+    /// The share of coded generations failing, in [`RATE_ONE`]ths,
+    /// smoothed across samples the way the loss rate is.
+    smoothed_failure: u64,
+    /// Loss windows still owed to a decode failure before coding may be
+    /// reconsidered, and how many samples have failed on this connection,
+    /// which is what lengthens the next hold.
+    hold: u32,
+    decode_failures: u32,
 }
 
 impl Default for FecPolicy {
@@ -62,6 +138,11 @@ impl Default for FecPolicy {
             repair_symbols: super::server::FEC_REPAIR_SYMBOLS,
             decided: false,
             smoothed_loss: 0,
+            resolved_sample: 0,
+            failed_sample: 0,
+            smoothed_failure: 0,
+            hold: 0,
+            decode_failures: 0,
         }
     }
 }
@@ -115,6 +196,7 @@ impl FecPolicy {
             self.sample_lost = 0;
             self.sample_sent = 0;
             self.smoothed_loss = 0;
+            self.smoothed_failure = 0;
             return;
         };
         self.sample_lost = self
@@ -167,13 +249,96 @@ impl FecPolicy {
         // onto the threshold and the verdict becomes a coin flip per
         // window, measured coding anywhere from zero to 1,536 of 4,096
         // generations across identical cells.
-        self.coding = if self.coding {
+        let engaged = if let Some(remaining) = self.hold.checked_sub(1) {
+            // A decode failure is serving out its hold. The loss that
+            // engaged coding is still on the path and would re-engage it
+            // every window, so nothing about the loss rate is consulted
+            // until the hold is spent.
+            self.hold = remaining;
+            false
+        } else if self.coding {
             self.smoothed_loss * 40 >= RATE_ONE
         } else {
             self.smoothed_loss * 25 >= RATE_ONE
         };
+        if engaged && !self.coding {
+            // An engagement is judged on its own outcomes. What is still
+            // resolving from the last one arrives for generations coded
+            // before it ended, and describes a path this may no longer be.
+            // The smoothed rate goes with them: it only ever decays a
+            // quarter a sample and it is above the bar by construction at
+            // a disengage, so carrying it would spend the retry's first
+            // clean sample crossing the bar again, however well the
+            // retried path decodes. What bounds the retries is the hold
+            // and its doubling, not this.
+            self.resolved_sample = 0;
+            self.failed_sample = 0;
+            self.smoothed_failure = 0;
+        }
+        self.coding = engaged;
         self.sample_lost = 0;
         self.sample_sent = 0;
+    }
+
+    /// Counts a coded generation the receiver decoded from symbols.
+    pub(crate) fn note_decoded(&mut self) {
+        self.note_resolved(false);
+    }
+
+    /// Counts a coded generation the receiver could not decode from
+    /// symbols, which this end is repairing reliably instead.
+    pub(crate) fn note_repaired(&mut self) {
+        self.note_resolved(true);
+    }
+
+    /// Takes one generation's outcome, and judges the sample once it is
+    /// full.
+    ///
+    /// Loss the sender caused itself is loss coding cannot answer: the
+    /// repair symbols are more packets into the same overflowing queue, so
+    /// they drop with the sources they were sent to repair and the coded
+    /// arm pays its overhead for generations that decode anyway. Measured
+    /// against a shaped bottleneck with no injected loss, the automatic
+    /// policy engaged on every run, put 41% more packets into the queue
+    /// (20,658 drops against 14,667), decoded 40% of what it coded, and
+    /// cost 6.3% of the wall at 256 MB and 14% at 4 GiB. Nothing the
+    /// sender can see about the path separates that from a lossy link:
+    /// delay does not move (RTT sat within 1.3% of its minimum in the
+    /// shaped cell, inside the range the clean and lossy cells both
+    /// occupy) and neither does the normalized loss-event count. What
+    /// separates them is whether the coding works, so that is what this
+    /// reads.
+    fn note_resolved(&mut self, failed: bool) {
+        self.resolved_sample = self.resolved_sample.saturating_add(1);
+        if failed {
+            self.failed_sample = self.failed_sample.saturating_add(1);
+        }
+        if self.resolved_sample < FEC_DECODE_SAMPLE {
+            return;
+        }
+        let sample_rate =
+            (self.failed_sample.saturating_mul(RATE_ONE)) / self.resolved_sample.max(1);
+        self.resolved_sample = 0;
+        self.failed_sample = 0;
+        // A sample that resolves while coding is off is the previous
+        // attempt's tail arriving, and it is not weighed at all: it is the
+        // evidence that ended that attempt, and an epoch's quiet
+        // retirement reports every generation still under it at once, so
+        // the tail is whole samples of near-total failure by construction.
+        // Folded, it would end the next engagement on the last one's
+        // record, however well the retried path decodes.
+        if !self.coding {
+            return;
+        }
+        self.smoothed_failure = self.smoothed_failure - self.smoothed_failure / RATE_SMOOTHING
+            + sample_rate / RATE_SMOOTHING;
+        if self.smoothed_failure.saturating_mul(DECODE_FAILURE_SHARE) < RATE_ONE {
+            return;
+        }
+        self.coding = false;
+        self.hold = DECODE_FAILURE_HOLD_WINDOWS
+            .saturating_mul(1 << self.decode_failures.min(DECODE_FAILURE_BACKOFF_CAP));
+        self.decode_failures = self.decode_failures.saturating_add(1);
     }
 
     pub(crate) const fn coding(&self) -> bool {

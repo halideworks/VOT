@@ -580,6 +580,9 @@ impl BundleServer {
                     .sender
                     .done(done.epoch, done.generation, verdict)
                     .map_err(|_| Fault::Peer(error_code::MALFORMED_FRAME))?;
+                if first_decode(first, verdict) {
+                    connection.fec_policy.note_decoded();
+                }
                 // A repeat is idempotent (spec/fec.md section 11): the record
                 // went out on the first.
                 if first && verdict == vot_fec::Done::Abandoned {
@@ -618,6 +621,12 @@ impl BundleServer {
         if !opened.plan.holds(generation) {
             return Ok(());
         }
+        // Every way a coded generation can fail arrives here: the receiver
+        // abandoning it, the epoch refused, and the quiet retirement that
+        // covers a generation which never gathered enough symbols to
+        // report at all. So this is where the policy learns coding is not
+        // working.
+        connection.fec_policy.note_repaired();
         let (first, piece_id) = piece_of(&opened.pieces, generation).ok_or(Error::InvalidBundle)?;
         let (offset, length) = opened.plan.generation_span(generation);
         let plaintext = served.read_covered(offset, length)?;
@@ -993,6 +1002,17 @@ impl BundleServer {
         }
         Ok(())
     }
+}
+
+/// Whether this `GEN_DONE` is the first word that a generation decoded,
+/// which is the decode policy's denominator.
+///
+/// A repeat says nothing new (spec/fec.md section 11), and an abandoned
+/// generation is the other half of the ratio, counted where it is
+/// repaired. Pure, so both halves of the condition are pinned by a table
+/// test rather than by whichever serve path happens to reach it.
+pub(crate) const fn first_decode(first: bool, verdict: vot_fec::Done) -> bool {
+    first && matches!(verdict, vot_fec::Done::Decoded)
 }
 
 /// The piece a generation's record rides under: the last piece at or before

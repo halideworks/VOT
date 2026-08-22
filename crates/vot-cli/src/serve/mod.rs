@@ -1949,8 +1949,8 @@ mod tests {
             "the loopback carrier took the first pass"
         );
         session.driver().datagrams.clear();
-        // Three short generations report at once, each missing two sources
-        // and holding forty of sixty-four.
+        // Three short generations report at once, each missing six sources,
+        // one past what the five transmitted repairs could fill.
         for generation in [0_u32, 1, 3] {
             session
                 .driver()
@@ -1959,13 +1959,13 @@ mod tests {
                     epoch,
                     generation,
                     sequence: 2,
-                    received: 40,
-                    missing_sources: vec![5, 9],
+                    received: 58,
+                    missing_sources: vec![5, 9, 11, 13, 17, 19],
                 })));
         }
         server.service(&mut session, &mut connection).unwrap();
         connection.drain(&mut session).unwrap();
-        // Every named generation got the two missing sources plus the
+        // Every named generation got the six missing sources plus the
         // eleven-symbol reserve, none was gated out by a sibling's bytes.
         let mut per_generation: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         for datagram in &session.driver().datagrams {
@@ -1981,7 +1981,7 @@ mod tests {
             "every sibling was answered"
         );
         for (generation, esis) in &per_generation {
-            let mut expected: Vec<u8> = vec![5, 9];
+            let mut expected: Vec<u8> = vec![5, 9, 11, 13, 17, 19];
             expected.extend(64 + 5..64 + 16);
             let mut got = esis.clone();
             got.sort_unstable();
@@ -1999,8 +1999,8 @@ mod tests {
                 epoch,
                 generation: 0,
                 sequence: 3,
-                received: 41,
-                missing_sources: vec![5],
+                received: 58,
+                missing_sources: vec![5, 9, 11, 13, 17, 19],
             })));
         server.service(&mut session, &mut connection).unwrap();
         connection.drain(&mut session).unwrap();
@@ -2011,9 +2011,10 @@ mod tests {
     fn a_short_state_is_answered_only_inside_its_window() {
         // The gate from all sides: under half the sources the symbols may
         // still be in flight, at or past the whole count nothing is short,
-        // and holes the five transmitted repairs still in flight can fill
-        // need nothing, so only a generation short past that margin is
-        // answered.
+        // and a missing list the five transmitted repairs can fill needs
+        // nothing, so only a generation missing past that margin is
+        // answered. Each state's counts are a receiver's real shape:
+        // received plus missing is the source count.
         let (bundle, _) = built_bundle("window", &[("big.bin", patterned(200_000))]);
         let server = forced_fec_server(&bundle);
         let object = server.objects.values().next().unwrap().object;
@@ -2050,7 +2051,7 @@ mod tests {
                     generation,
                     sequence,
                     received,
-                    missing_sources: vec![7],
+                    missing_sources: (0..64 - received).collect(),
                 })));
             server.service(session, connection).unwrap();
             connection.drain(session).unwrap();
@@ -2063,7 +2064,7 @@ mod tests {
         expect(&mut session, &mut connection, 1, 58, true);
         expect(&mut session, &mut connection, 2, 59, false);
         expect(&mut session, &mut connection, 3, 63, false);
-        expect(&mut session, &mut connection, 4, 64, false);
+        expect(&mut session, &mut connection, 3, 64, false);
     }
 
     #[test]

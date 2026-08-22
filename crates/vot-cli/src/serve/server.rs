@@ -318,8 +318,11 @@ impl BundleServer {
     /// the reliable resend still stand behind it.
     ///
     /// Gated on the epoch's symbols all being on the carrier, the
-    /// receiver holding at least half the sources, and the holes
-    /// exceeding the repair symbols the first pass already sent. The
+    /// receiver holding at least half the sources, and the missing
+    /// sources outnumbering the repair symbols the first pass sent.
+    /// `received` already counts repair symbols in hand, so "the
+    /// in-flight repair round cannot reach `k`" reduces exactly to that
+    /// count comparison, with nothing to subtract. The
     /// restate rides the epoch's first repair symbol, so every
     /// generation's own repair round is still in flight behind it: a
     /// generation whose holes those repairs can fill needs nothing, and
@@ -345,7 +348,7 @@ impl BundleServer {
         let sources = geometry.source_count();
         if usize::from(state.received) >= sources
             || usize::from(state.received) < sources / 2
-            || sources - usize::from(state.received) <= opened.transmitted_repairs
+            || state.missing_sources.len() <= opened.transmitted_repairs
             || connection.outbound.taken() < opened.symbols_queued_through
             || opened.repaired.contains(&state.generation)
             || !opened.plan.holds(state.generation)

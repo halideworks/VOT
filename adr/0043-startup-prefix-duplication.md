@@ -134,7 +134,7 @@ prior behavior exactly, reps interleaved.
 At 256 MB and 5% loss both ways, n=12 an arm, the duplicated arm's first
 byte ran a median of 1498 ms with a p90 of 1675 and a maximum of 1681,
 against 1688, 2942 and 7825 without. The tail is the finding: the
-undulicated arm reaches a 7.8 s first byte and a 14.3 s wall, where the
+unduplicated arm reaches a 7.8 s first byte and a 14.3 s wall, where the
 duplicated arm's worst first byte in twelve runs is 1681 ms and its
 worst wall 5.15 s. Wall medians were 3.63 s against 4.00 s. Against this
 ADR's target, p99 first byte within 2x of clean (1040 ms) and no run

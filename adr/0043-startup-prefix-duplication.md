@@ -123,3 +123,39 @@ recovery round named above. Clean-path walls stay within noise.
   pre-establishment sent-byte count identical with the feature on and off.
 - `VOT_PREFIX_DUP=0` reproduces main's send behavior exactly, held by the
   same test.
+
+## Measured outcome (2026-08-22)
+
+Merged as PR 359. Measured on the netem rig at 200 ms with MTU 1500,
+seeded 7100 both ends, one binary and two arms by environment: the
+default 200-datagram budget against `VOT_PREFIX_DUP=0`, which is the
+prior behavior exactly, reps interleaved.
+
+At 256 MB and 5% loss both ways, n=12 an arm, the duplicated arm's first
+byte ran a median of 1498 ms with a p90 of 1675 and a maximum of 1681,
+against 1688, 2942 and 7825 without. The tail is the finding: the
+undulicated arm reaches a 7.8 s first byte and a 14.3 s wall, where the
+duplicated arm's worst first byte in twelve runs is 1681 ms and its
+worst wall 5.15 s. Wall medians were 3.63 s against 4.00 s. Against this
+ADR's target, p99 first byte within 2x of clean (1040 ms) and no run
+above 3 s: met, with the whole duplicated distribution inside 1.7 s.
+
+At 16 MB and 5% loss, n=9 an arm, the same shape at the size where the
+prefix is most of the wall: wall median 2.23 s against 2.67, first byte
+median 1515 ms against 1794 and p90 1805 against 2615.
+
+Clean cells cost nothing measurable, n=5 an arm: 256 MB at 2.21 s and
+16 MB at 1.33 s in both arms, first byte 1040 ms against 1044 and 1038
+against 1043. All 62 runs completed with the full byte count and zero
+abandoned, refused, or dropped symbols.
+
+The empirical risk this ADR named is answered: the amplification-legal
+shape, which leaves the server's own handshake flight unprotected, keeps
+the probe's tail win in full. What it does not answer is the residual
+median, ~1.5 s against 1.03 clean, which this ADR placed out of scope
+and attributed to a recovery round entangled with the first data flight;
+that remains with engagement timing.
+
+One observation for the loss policy rather than the transport: the arms
+offer different coded counts (1280 against 896 in the first lossy pair)
+because a faster prefix changes when the policy's first sample closes.

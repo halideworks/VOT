@@ -83,11 +83,12 @@ const DATAGRAM_QUEUE_LEN: usize = 1_024;
 /// account admits: at 1,024 the queue held 1.2 MB under a 32 MB account,
 /// and a seeded first flight overran it between driver passes, so quiche
 /// discarded whole coding epochs below every counter this stack owns. The
-/// wire's datagram credit bounds what a conforming sender has in flight,
-/// so [`MAX_DATAGRAM_INBOUND_BYTES`] over the smallest datagram that can
-/// carry a handshake is the most the queue is ever asked to hold.
-const DATAGRAM_RECV_QUEUE_LEN: usize = MAX_DATAGRAM_INBOUND_BYTES / MIN_DATAGRAM_SIZE;
-const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 27_962);
+/// account admits at most [`MAX_DATAGRAM_INBOUND_EVENTS`] datagrams
+/// whatever their size, because its byte bound is what governs at half a
+/// kilobyte and up, so that count is the most the queue is ever asked to
+/// hold in both units.
+const DATAGRAM_RECV_QUEUE_LEN: usize = MAX_DATAGRAM_INBOUND_EVENTS;
+const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
 
 /// Datagrams the driver holds for a connection whose own queue is full.
 ///

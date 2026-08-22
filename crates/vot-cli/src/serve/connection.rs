@@ -310,15 +310,21 @@ impl FecPolicy {
         }
         let sample_rate =
             (self.failed_sample.saturating_mul(RATE_ONE)) / self.resolved_sample.max(1);
-        self.smoothed_failure = self.smoothed_failure - self.smoothed_failure / RATE_SMOOTHING
-            + sample_rate / RATE_SMOOTHING;
         self.resolved_sample = 0;
         self.failed_sample = 0;
-        // Only ever taken away, and only from an engagement there is one
-        // to take: a sample that resolves while coding is already off is
-        // the previous attempt's tail arriving, which is the evidence that
-        // ended it rather than a reason to lengthen its hold.
-        if !self.coding || self.smoothed_failure.saturating_mul(DECODE_FAILURE_SHARE) < RATE_ONE {
+        // A sample that resolves while coding is off is the previous
+        // attempt's tail arriving, and it is not weighed at all: it is the
+        // evidence that ended that attempt, and an epoch's quiet
+        // retirement reports every generation still under it at once, so
+        // the tail is whole samples of near-total failure by construction.
+        // Folded, it would end the next engagement on the last one's
+        // record, however well the retried path decodes.
+        if !self.coding {
+            return;
+        }
+        self.smoothed_failure = self.smoothed_failure - self.smoothed_failure / RATE_SMOOTHING
+            + sample_rate / RATE_SMOOTHING;
+        if self.smoothed_failure.saturating_mul(DECODE_FAILURE_SHARE) < RATE_ONE {
             return;
         }
         self.coding = false;

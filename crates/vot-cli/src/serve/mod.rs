@@ -802,8 +802,10 @@ mod tests {
         assert!(!policy.coding(), "a sample that wholly failed ends coding");
 
         // The tail of what was already in flight, arriving with nothing
-        // coding behind it.
-        for _ in 0..HALF_SAMPLE {
+        // coding behind it. Whole samples of it: an epoch's quiet
+        // retirement reports every generation still under it at once, and
+        // an epoch carries about twice a sample's worth.
+        for _ in 0..connection::FEC_DECODE_SAMPLE * 2 {
             policy.note_repaired();
         }
         lossy(&mut policy, 5);

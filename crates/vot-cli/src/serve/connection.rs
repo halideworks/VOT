@@ -20,7 +20,11 @@ const FEC_SAMPLE_PACKETS: u64 = 8192;
 /// Packets in the first decision only. A transfer a few seconds long is
 /// mostly issued before a full sample closes, so the first verdict comes
 /// from a cover's worth of packets and the steady cadence takes over from
-/// there (ADR-0042).
+/// there (ADR-0042). Closing early on a detected loss instead was
+/// measured seeding the smoothed rate at a fraction of the truth,
+/// because detection trails sending by about a round trip and the close
+/// divides a fresh loss count by every packet the seeded flight already
+/// sent; one such run never engaged at all.
 const FIRST_FEC_SAMPLE_PACKETS: u64 = 256;
 
 #[derive(Clone, Copy, Debug)]
@@ -75,8 +79,8 @@ const RATE_ONE: u64 = 65_536;
 /// bunched window moves the verdict by at most a quarter of its error.
 const RATE_SMOOTHING: u64 = 4;
 
-/// The most a first lossy window may seed the smoothed rate with: twice
-/// the five-percent engagement rate.
+/// The most a first lossy window may seed the smoothed rate with: a
+/// tenth, well past the engagement rate.
 const SEED_CEILING: u64 = RATE_ONE / 10;
 
 impl FecPolicy {
@@ -128,8 +132,8 @@ impl FecPolicy {
         self.decided = true;
 
         // The window's own rate folds into the smoothed one, and every
-        // verdict below reads the smoothed rate: engagement at 5%, the
-        // off-hysteresis at 3%, and the repair count, so one bunched or
+        // verdict below reads the smoothed rate: engagement at 4%, the
+        // off-hysteresis at 2.5%, and the repair count, so one bunched or
         // starved window cannot flip what a steady path deserves.
         let window_rate = (self.sample_lost.saturating_mul(RATE_ONE)) / self.sample_sent.max(1);
         // Seeded whole by the first lossy window: until then there is
@@ -158,10 +162,15 @@ impl FecPolicy {
         )
         .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
         .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
+        // Engagement sits a margin under the loss rates it serves, not at
+        // them: at exactly 5% the smoothed estimate of a 5% path converges
+        // onto the threshold and the verdict becomes a coin flip per
+        // window, measured coding anywhere from zero to 1,536 of 4,096
+        // generations across identical cells.
         self.coding = if self.coding {
-            self.smoothed_loss * 100 >= RATE_ONE * 3
+            self.smoothed_loss * 40 >= RATE_ONE
         } else {
-            self.smoothed_loss * 20 >= RATE_ONE
+            self.smoothed_loss * 25 >= RATE_ONE
         };
         self.sample_lost = 0;
         self.sample_sent = 0;

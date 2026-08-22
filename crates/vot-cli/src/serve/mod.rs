@@ -549,7 +549,9 @@ mod tests {
     fn automatic_fec_decides_first_from_a_covers_worth_of_packets() {
         // The first verdict closes at 256 packets so a short transfer is
         // covered rather than mostly issued before a full window closes
-        // (ADR-0042); the five percent bar is unchanged.
+        // (ADR-0042). The bar is four percent: a margin under the five
+        // percent paths it serves, where sitting exactly at them made the
+        // verdict a coin flip on the estimate's own noise.
         let worthwhile = |lost, spurious, sent| {
             let mut policy = connection::FecPolicy::default();
             policy.observe(Some(path_sample(0, 0, 0)));
@@ -557,9 +559,9 @@ mod tests {
             policy.coding()
         };
         assert!(!worthwhile(13, 0, 255), "below the first sample");
-        assert!(!worthwhile(12, 0, 256), "under five percent");
-        assert!(worthwhile(13, 0, 256));
-        assert!(!worthwhile(13, 1, 256), "spurious losses do not count");
+        assert!(!worthwhile(10, 0, 256), "under four percent");
+        assert!(worthwhile(11, 0, 256));
+        assert!(!worthwhile(11, 1, 256), "spurious losses do not count");
     }
 
     #[test]

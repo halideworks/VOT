@@ -400,6 +400,13 @@ pub struct Config {
     /// A caller sharing the socket with another protocol names the byte that
     /// tells them apart; without one every arrival is routed as QUIC.
     pub side_channel_lead: Option<u8>,
+    /// Datagrams this endpoint sends twice at the start of a connection,
+    /// or zero to send each once. ADR-0043.
+    ///
+    /// The copies buy the serial prefix against loss, where a lost packet
+    /// waits on a recovery round trip that no other traffic can shorten.
+    /// [`PREFIX_DUPLICATION_DATAGRAMS`] is the measured default.
+    pub prefix_duplication_datagrams: usize,
 }
 
 /// Which congestion controller carries the connection.
@@ -445,6 +452,7 @@ impl Config {
             initial_congestion_window_packets: None,
             session: None,
             side_channel_lead: None,
+            prefix_duplication_datagrams: PREFIX_DUPLICATION_DATAGRAMS,
         }
     }
 
@@ -463,6 +471,7 @@ impl Config {
             initial_congestion_window_packets: None,
             session: None,
             side_channel_lead: None,
+            prefix_duplication_datagrams: PREFIX_DUPLICATION_DATAGRAMS,
         }
     }
 
@@ -696,6 +705,7 @@ impl Transport {
         let connection = ConnectionId(u64::from(local.port()));
         let datagram_bytes = config.max_datagram_bytes;
         let accept_timeout_ms = config.accept_timeout_ms;
+        let prefix_duplication = config.prefix_duplication_datagrams;
 
         let session = config.session.clone();
         let driver = std::thread::Builder::new()
@@ -723,6 +733,7 @@ impl Transport {
                     connection.0,
                     datagram_bytes,
                     accept_timeout_ms,
+                    prefix_duplication,
                 );
                 if let Ok(mut binding) = driver_binding.lock() {
                     *binding = None;
@@ -1105,6 +1116,7 @@ fn drive(
     connection: u64,
     datagram_bytes: usize,
     accept_timeout_ms: u64,
+    prefix_duplication: usize,
 ) -> Result<(), Error> {
     // Heap-allocated and large enough for the largest frame a lane carries, so
     // a whole record is handed to the parser as one slice.
@@ -1161,6 +1173,7 @@ fn drive(
         resumed,
         connection,
         datagram_bytes,
+        prefix_duplication,
         buffer,
         out,
         offload,
@@ -1214,6 +1227,7 @@ fn run(
     resumed: &Arc<AtomicBool>,
     connection: u64,
     datagram_bytes: usize,
+    prefix_duplication: usize,
     mut buffer: Vec<u8>,
     mut out: Vec<u8>,
     offload: bool,
@@ -1229,7 +1243,7 @@ fn run(
     let mut closing = false;
     let mut closing_passes: u32 = 0;
     let mut announced = false;
-    let mut sending = Sending::new(datagram_bytes, offload);
+    let mut sending = Sending::new(datagram_bytes, offload, role, prefix_duplication);
     let mut read_timeout = match intake {
         Intake::Socket => {
             socket
@@ -1880,6 +1894,7 @@ fn accept_routed(
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
+    let prefix_duplication = config.prefix_duplication_datagrams;
 
     let pump_socket = Arc::clone(socket);
     let pump_inbound = Arc::clone(&inbound);
@@ -1913,6 +1928,7 @@ fn accept_routed(
                 &pump_resumed,
                 connection.0,
                 datagram_bytes,
+                prefix_duplication,
                 buffer,
                 out,
                 offload_available(),
@@ -2236,14 +2252,8 @@ fn send_and_revalidate(
     out: &mut [u8],
     sending: &mut Sending,
 ) -> Result<Option<Instant>, Error> {
-    let paced = send_all(
-        socket,
-        conn,
-        out,
-        sending.ceiling,
-        sending.gso,
-        &mut sending.refused,
-    )?;
+    sending.open_duplication(conn.is_established());
+    let paced = send_all(socket, conn, out, sending)?;
     if should_revalidate(sending.refused) {
         conn.revalidate_pmtu();
         sending.refused = 0;
@@ -2257,21 +2267,65 @@ const fn should_revalidate(refused: usize) -> bool {
 }
 
 /// What a send pass needs beyond the connection: the ceiling, whether
-/// segmentation offload is available, and the size-refusal ledger.
+/// segmentation offload is available, the size-refusal ledger, and what
+/// the startup prefix still owes a second copy of.
 struct Sending {
     ceiling: usize,
     gso: bool,
     refused: usize,
+    role: Role,
+    /// Datagrams the startup prefix still sends twice. ADR-0043.
+    duplicates: usize,
+    /// Whether this pass's bursts are duplicated, decided once against the
+    /// connection rather than per burst.
+    duplicating: bool,
 }
 
 impl Sending {
-    const fn new(ceiling: usize, gso: bool) -> Self {
+    const fn new(ceiling: usize, gso: bool, role: Role, duplicates: usize) -> Self {
         Self {
             ceiling,
             gso,
             refused: 0,
+            role,
+            duplicates,
+            duplicating: false,
         }
     }
+
+    /// Decides whether this pass duplicates, from what the connection has
+    /// reached and what the budget has left.
+    fn open_duplication(&mut self, established: bool) {
+        self.duplicating = duplication_open(self.role, established, self.duplicates);
+    }
+}
+
+/// Datagrams each end sends twice at the start of a connection.
+///
+/// The serial prefix is a handful of sparse flights (handshake,
+/// negotiation, the announcement, manifest pages, the leading edge of the
+/// first data flight), so a loss in it waits on a recovery round trip that
+/// no other traffic can shorten: at 5% loss and 200 ms first byte ran
+/// 1.5-6.7 s against 1.03 s clean, and a probe that duplicated the prefix
+/// removed the multi-second outliers outright. Counted in datagrams rather
+/// than clocked, so the bound lives in the send path's own body. ADR-0043.
+///
+/// A copy is sent beside the carrier's congestion accounting rather than
+/// through it, which is what keeps the budget small: at the QUIC minimum
+/// datagram this is about 240 KB, once, per connection.
+const PREFIX_DUPLICATION_DATAGRAMS: usize = 200;
+
+/// Whether this end may duplicate the bursts of a pass.
+///
+/// A client duplicates from its first flight, where no amplification rule
+/// binds it. A server waits for establishment: its copies are invisible to
+/// the carrier's own accounting, and until the handshake completes that
+/// accounting is the three-times-received bound an unvalidated address is
+/// owed (spec/security.md section 7). Establishment is strictly later than
+/// the address validation that lifts the bound, so the gate is the
+/// conservative side of the rule.
+const fn duplication_open(role: Role, established: bool, remaining: usize) -> bool {
+    remaining > 0 && (matches!(role, Role::Client) || established)
 }
 
 /// Passes a closing connection may make before the driver leaves without
@@ -2343,12 +2397,11 @@ fn send_all(
     socket: &UdpSocket,
     conn: &mut quiche::Connection,
     out: &mut [u8],
-    ceiling: usize,
-    gso: bool,
-    refused: &mut usize,
+    sending: &mut Sending,
 ) -> Result<Option<Instant>, Error> {
     // Packets are gathered into one buffer and handed over together so
     // segmentation offload takes the whole burst in one call.
+    let ceiling = sending.ceiling;
     let mut filled = 0_usize;
     let mut segment = 0_usize;
     let mut destination = None;
@@ -2361,7 +2414,7 @@ fn send_all(
         let slot = if filled == 0 { ceiling } else { segment };
         let Some(room) = out.get_mut(filled..filled + slot) else {
             // The buffer holds no further packet, so this burst goes now.
-            flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+            flush_burst(socket, &out[..filled], segment, destination, sending)?;
             filled = 0;
             destination = None;
             continue;
@@ -2374,14 +2427,14 @@ fn send_all(
         // first reads commands and the close request.
         packets = packets.saturating_add(1);
         if send_exhausted(packets) {
-            flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+            flush_burst(socket, &out[..filled], segment, destination, sending)?;
             return Ok(deadline);
         }
         match conn.send(room) {
             Ok((written, info)) => {
                 // A different destination cannot share a burst.
                 if destination.is_some_and(|previous| previous != info.to) {
-                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+                    flush_burst(socket, &out[..filled], segment, destination, sending)?;
                     // The packet just generated sits at `filled`, so move it to
                     // the front rather than losing or resending it.
                     out.copy_within(filled..filled + written, 0);
@@ -2398,20 +2451,20 @@ fn send_all(
                 // bounds a burst's time by the pacer's clock.
                 if info.at > Instant::now() {
                     deadline = Some(info.at);
-                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+                    flush_burst(socket, &out[..filled], segment, destination, sending)?;
                     return Ok(deadline);
                 }
                 // A packet shorter than a segment closes the burst, because
                 // the kernel cuts every segment to the same length but the
                 // last; the connection may still have more to say.
                 if written < segment {
-                    flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+                    flush_burst(socket, &out[..filled], segment, destination, sending)?;
                     filled = 0;
                     destination = None;
                 }
             }
             Err(quiche::Error::Done) => {
-                flush_burst(socket, &out[..filled], segment, destination, gso, refused)?;
+                flush_burst(socket, &out[..filled], segment, destination, sending)?;
                 // Done in a segment-sized slot only says the next packet did
                 // not fit this burst's segment: a burst opened by a lone ACK
                 // pins the segment near thirty bytes, and ending the pass
@@ -2427,7 +2480,7 @@ fn send_all(
             Err(_) => {
                 // The gathered packets are state the connection has already
                 // committed to; they go to the peer even as the driver ends.
-                let _ = flush_burst(socket, &out[..filled], segment, destination, gso, refused);
+                let _ = flush_burst(socket, &out[..filled], segment, destination, sending);
                 return Err(Error::Backend);
             }
         }
@@ -2490,18 +2543,14 @@ const fn offload_available() -> bool {
     cfg!(target_os = "linux")
 }
 
-/// Hands one burst of equally sized packets to the socket.
-///
-/// With offload the whole burst is one call; without it each packet is sent
-/// separately. A refused control message falls back rather than failing: offload
-/// is a cost saving, not a correctness requirement.
+/// Hands one burst of equally sized packets to the socket, twice while the
+/// startup prefix still owes copies.
 fn flush_burst(
     socket: &UdpSocket,
     burst: &[u8],
     segment: usize,
     destination: Option<SocketAddr>,
-    gso: bool,
-    refused: &mut usize,
+    sending: &mut Sending,
 ) -> Result<(), Error> {
     let Some(destination) = destination else {
         return Ok(());
@@ -2509,6 +2558,62 @@ fn flush_burst(
     if burst.is_empty() {
         return Ok(());
     }
+    send_burst(
+        socket,
+        burst,
+        segment,
+        destination,
+        sending.gso,
+        &mut sending.refused,
+    )?;
+    if sending.duplicating {
+        duplicate_burst(socket, burst, segment, destination, sending);
+    }
+    Ok(())
+}
+
+/// Sends as much of the burst a second time as the startup budget covers.
+///
+/// A peer discards a packet number it has already seen, so a copy costs a
+/// decryption and buys the packet against one loss. Nothing here is
+/// reported: the connection is owed the original, and a refused copy is
+/// neither the carrier's death nor a probe's answer about the path.
+fn duplicate_burst(
+    socket: &UdpSocket,
+    burst: &[u8],
+    segment: usize,
+    destination: SocketAddr,
+    sending: &mut Sending,
+) {
+    let room = sending.duplicates.saturating_mul(segment).min(burst.len());
+    let copy = &burst[..room];
+    sending.duplicates = sending
+        .duplicates
+        .saturating_sub(copy.len().div_ceil(segment));
+    let mut refused = 0;
+    let _ = send_burst(
+        socket,
+        copy,
+        segment,
+        destination,
+        sending.gso,
+        &mut refused,
+    );
+}
+
+/// Hands one burst of equally sized packets to the socket.
+///
+/// With offload the whole burst is one call; without it each packet is sent
+/// separately. A refused control message falls back rather than failing: offload
+/// is a cost saving, not a correctness requirement.
+fn send_burst(
+    socket: &UdpSocket,
+    burst: &[u8],
+    segment: usize,
+    destination: SocketAddr,
+    gso: bool,
+    refused: &mut usize,
+) -> Result<(), Error> {
     // A kernel that will not segment falls through and takes the packets one
     // at a time.
     if gso && burst.len() > segment && send_segmented(socket, burst, segment, destination).is_ok() {
@@ -3719,17 +3824,227 @@ mod tests {
         // that has nothing to do with size, on every platform.
         let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
         let burst = vec![0x53_u8; 1_200];
-        let mut refused = 0;
+        let mut sending = Sending::new(1_200, false, Role::Client, 0);
         let outcome = flush_burst(
             &sender,
             &burst,
             1_200,
             Some("0.0.0.0:0".parse().expect("an address")),
-            false,
-            &mut refused,
+            &mut sending,
         );
         assert!(outcome.is_err(), "a non-size refusal fails the burst");
-        assert_eq!(refused, 0, "and is no probe's answer");
+        assert_eq!(sending.refused, 0, "and is no probe's answer");
+    }
+
+    #[test]
+    fn only_a_client_duplicates_before_the_handshake_completes() {
+        // The whole grid. A server's copies are sent beside the carrier's
+        // anti-amplification accounting rather than through it, so an
+        // unvalidated address must never see one; a client is bound by no
+        // such rule and duplicates from its first flight. A spent budget
+        // closes both.
+        for established in [false, true] {
+            assert!(
+                duplication_open(Role::Client, established, 1),
+                "a client duplicates from its first flight, established={established}"
+            );
+            assert!(
+                !duplication_open(Role::Client, established, 0),
+                "until the budget is spent, established={established}"
+            );
+        }
+        assert!(
+            !duplication_open(Role::Server, false, PREFIX_DUPLICATION_DATAGRAMS),
+            "a server sends no copy an unvalidated address could be flooded with"
+        );
+        assert!(
+            duplication_open(Role::Server, true, 1),
+            "and duplicates once the handshake has validated the peer"
+        );
+        assert!(!duplication_open(Role::Server, true, 0), "to its budget");
+        // Enough datagrams for any serial prefix this carries, and small
+        // enough that the unaccounted bytes stay a rounding error against
+        // a seeded window.
+        const {
+            assert!(PREFIX_DUPLICATION_DATAGRAMS >= 64);
+            assert!(PREFIX_DUPLICATION_DATAGRAMS <= 1_024);
+        }
+    }
+
+    /// Datagrams waiting at `socket`, drained to its read timeout.
+    ///
+    /// Bounded by its own body: a defect that duplicates without end would
+    /// otherwise hang the suite instead of failing it.
+    fn landed(socket: &UdpSocket) -> usize {
+        let mut packet = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+        for count in 0..64 {
+            if socket.recv_from(&mut packet).is_err() {
+                return count;
+            }
+        }
+        panic!("the sender never stopped: more than 64 datagrams for one burst");
+    }
+
+    #[test]
+    fn the_startup_budget_sends_each_burst_twice_and_no_further() {
+        // The copy is the whole point of the prefix budget, and the budget
+        // is what stops it becoming a doubled connection.
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("a receiver");
+        let destination = receiver.local_addr().expect("its address");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("a bounded wait");
+        let burst = vec![0x54_u8; 3_600];
+
+        // Three packets out, three copies back, and the budget pays for
+        // each datagram rather than each burst.
+        let mut sending = Sending::new(1_200, false, Role::Client, 8);
+        sending.open_duplication(false);
+        flush_burst(&sender, &burst, 1_200, Some(destination), &mut sending)
+            .expect("the burst goes");
+        assert_eq!(landed(&receiver), 6, "each packet arrives twice");
+        assert_eq!(sending.duplicates, 5, "and three datagrams were spent");
+
+        // A budget under the burst duplicates what it covers and no more.
+        let mut sending = Sending::new(1_200, false, Role::Client, 1);
+        sending.open_duplication(false);
+        flush_burst(&sender, &burst, 1_200, Some(destination), &mut sending)
+            .expect("the burst goes");
+        assert_eq!(landed(&receiver), 4, "three packets and the one copy left");
+        assert_eq!(sending.duplicates, 0, "the budget is spent exactly");
+
+        // Spent, the burst is sent once, which is what the carrier owes.
+        flush_burst(&sender, &burst, 1_200, Some(destination), &mut sending)
+            .expect("the burst goes");
+        assert_eq!(landed(&receiver), 3, "no copy past the budget");
+    }
+
+    #[test]
+    fn a_server_flight_is_the_same_size_before_the_handshake_either_way() {
+        // ADR-0043's amplification conformance: whatever a server sends an
+        // unvalidated address, arming the prefix budget must not add a byte
+        // to it. Two servers fed the same client Initial send the same
+        // flight, so the counts are comparable.
+        let (certificate, key) = credentials();
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        let mut client_config = client_config.build(Role::Client).expect("a client config");
+        let mut server_config = Config::server(limits(), certificate, key)
+            .build(Role::Server)
+            .expect("a server config");
+
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("the server's socket");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("the client's socket");
+        let server_address = sender.local_addr().expect("its address");
+        let client_address = receiver.local_addr().expect("its address");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("a bounded wait");
+
+        // One client Initial, minted without a socket, is what both servers
+        // answer.
+        let scid = quiche::ConnectionId::from_ref(&[11; 16]);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &scid,
+            client_address,
+            server_address,
+            &mut client_config,
+        )
+        .expect("a client");
+        let mut initial = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+        let (len, _) = client
+            .send(&mut initial)
+            .expect("the client's first flight");
+        initial.truncate(len);
+
+        let mut flight = |index: u8, duplicates: usize| {
+            let identifier = [index; 16];
+            let scid = quiche::ConnectionId::from_ref(&identifier);
+            let mut server = quiche::accept(
+                &scid,
+                None,
+                server_address,
+                client_address,
+                &mut server_config,
+            )
+            .expect("a server");
+            let mut arriving = initial.clone();
+            server
+                .recv(
+                    &mut arriving,
+                    quiche::RecvInfo {
+                        from: client_address,
+                        to: server_address,
+                    },
+                )
+                .expect("the client's Initial");
+            assert!(
+                !server.is_established(),
+                "the peer's address is not validated yet"
+            );
+            let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+            let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Server, duplicates);
+            send_and_revalidate(&sender, &mut server, &mut out, &mut sending)
+                .expect("the server's answer");
+            assert_eq!(
+                sending.duplicates, duplicates,
+                "and no budget was spent on it"
+            );
+            landed(&receiver)
+        };
+
+        let armed = flight(12, PREFIX_DUPLICATION_DATAGRAMS);
+        let disarmed = flight(13, 0);
+        assert!(armed > 0, "the server answered at all");
+        assert_eq!(
+            armed, disarmed,
+            "an unvalidated address sees the same flight either way"
+        );
+    }
+
+    #[test]
+    fn a_clients_first_flight_goes_twice_and_only_to_its_budget() {
+        // The client half of the same rule, through the pass the pump runs:
+        // no handshake yet, and the copy still goes.
+        let mut config = Config::client(limits());
+        config.verify_peer = false;
+        let mut config = config.build(Role::Client).expect("a client config");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("the client's socket");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("the server's socket");
+        let destination = receiver.local_addr().expect("its address");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("a bounded wait");
+
+        let mut flight = |index: u8, duplicates: usize| {
+            let identifier = [index; 16];
+            let scid = quiche::ConnectionId::from_ref(&identifier);
+            let mut client = quiche::connect(
+                Some("localhost"),
+                &scid,
+                sender.local_addr().expect("its address"),
+                destination,
+                &mut config,
+            )
+            .expect("a client");
+            let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+            let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, duplicates);
+            send_and_revalidate(&sender, &mut client, &mut out, &mut sending)
+                .expect("the first flight");
+            (landed(&receiver), sending.duplicates)
+        };
+
+        let (armed, left) = flight(14, PREFIX_DUPLICATION_DATAGRAMS);
+        let (disarmed, _) = flight(15, 0);
+        assert_eq!(disarmed, 1, "an Initial is one datagram");
+        assert_eq!(armed, 2, "and the budget sends it twice");
+        assert_eq!(
+            left,
+            PREFIX_DUPLICATION_DATAGRAMS - 1,
+            "one datagram of the budget spent"
+        );
     }
 
     #[test]
@@ -3830,17 +4145,13 @@ mod tests {
         // fallback, whose kernel rejects an over-sized segment before
         // queuing anything and so falls through to the same loop.
         for gso in [false, true] {
-            let mut refused = 0;
-            flush_burst(
-                &sender,
-                &burst,
-                oversized,
-                Some(destination),
-                gso,
-                &mut refused,
-            )
-            .expect("a refused probe does not fail the burst");
-            assert_eq!(refused, 1, "the refusal is counted, once, gso={gso}");
+            let mut sending = Sending::new(oversized, gso, Role::Client, 0);
+            flush_burst(&sender, &burst, oversized, Some(destination), &mut sending)
+                .expect("a refused probe does not fail the burst");
+            assert_eq!(
+                sending.refused, 1,
+                "the refusal is counted, once, gso={gso}"
+            );
 
             let mut landed = vec![0_u8; oversized];
             let (bytes, _) = receiver

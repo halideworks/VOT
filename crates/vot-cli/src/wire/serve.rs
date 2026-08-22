@@ -2,10 +2,10 @@
 
 use super::{
     BundleServer, CONGESTION, Config, Credentials, DATAGRAM_FEC, Ephemeral, Error, INITIAL_CWND,
-    Listener, PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER, SERVE_ISSUER_NAME,
-    ServeSession, SocketAddr, apply_datagram_bytes, automatic_fec, carrier_failure,
-    congestion_from, extensions_from, initial_cwnd_from, limits, rendezvous_from, requirement_from,
-    start_registration,
+    Listener, PREFIX_DUP, PackageSummary, Path, RENDEZVOUS, SERVE_AUDIENCE, SERVE_ISSUER,
+    SERVE_ISSUER_NAME, ServeSession, SocketAddr, apply_datagram_bytes, automatic_fec,
+    carrier_failure, congestion_from, extensions_from, initial_cwnd_from, limits, prefix_dup_from,
+    rendezvous_from, requirement_from, start_registration,
 };
 
 /// The serve's stance for one session: what it asks of the peer, with a fresh
@@ -110,6 +110,9 @@ pub(crate) fn serve_bundle_offering(
     config.congestion = congestion_from(std::env::var(CONGESTION).ok().as_deref())?;
     config.initial_congestion_window_packets =
         initial_cwnd_from(std::env::var(INITIAL_CWND).ok().as_deref())?;
+    if let Some(datagrams) = prefix_dup_from(std::env::var(PREFIX_DUP).ok().as_deref())? {
+        config.prefix_duplication_datagrams = datagrams;
+    }
     // Configure rendezvous routing before bind so the listener can
     // filter side-channel datagrams.
     let services = rendezvous_from(std::env::var(RENDEZVOUS).ok().as_deref())?;

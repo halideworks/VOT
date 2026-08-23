@@ -178,7 +178,7 @@ pub(super) fn provers_per_rail(provers: usize, rails: usize) -> usize {
     if provers == 0 {
         0
     } else {
-        provers.div_ceil(rails.max(1))
+        (provers / rails.max(1)).max(1)
     }
 }
 

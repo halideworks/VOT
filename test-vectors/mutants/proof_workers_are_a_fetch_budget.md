@@ -4,8 +4,8 @@ Criterion: a fetch divides its proving-thread budget across its rails, while
 leaving at least one worker on every active rail.
 
 Passing evidence: `proof_workers_are_a_fetch_budget_not_a_per_rail_multiplier`
-checks one, two, four, and eight rails, an explicit larger budget, zero rails,
-and the existing zero-worker refusal.
+checks one, two, four, and eight rails, divisible and non-divisible budgets,
+zero rails, and the existing zero-worker refusal.
 
 Mutant: return `provers` unchanged instead of dividing it by the rail count,
 restoring the prior per-rail multiplier.

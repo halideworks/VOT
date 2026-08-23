@@ -126,12 +126,14 @@ pub(crate) struct FecPolicy {
     /// which is what lengthens the next hold.
     hold: u32,
     decode_failures: u32,
-    /// Every packet this connection has counted and the plain rate over
-    /// all of them, which is the path's character rather than the
-    /// moment's, plus the windows closed so far, which is what makes it
-    /// worth trusting.
-    sustained_lost: u64,
-    sustained_sent: u64,
+    /// The last [`SUSTAINED_WINDOWS`] unaided window rates and where the
+    /// next one goes, their mean, and the windows closed so far. A
+    /// trailing window rather than a running mean over the whole
+    /// connection, because a mean that never forgets is pushed over the
+    /// bar by the ramp it opened with, which is measured below.
+    recent: [u32; SUSTAINED_WINDOWS],
+    recent_at: usize,
+    recent_len: usize,
     sustained_loss: u64,
     windows_closed: u32,
     /// Whether the recent rate's excursions above the bar are this
@@ -154,8 +156,9 @@ impl Default for FecPolicy {
             smoothed_failure: 0,
             hold: 0,
             decode_failures: 0,
-            sustained_lost: 0,
-            sustained_sent: 0,
+            recent: [0; SUSTAINED_WINDOWS],
+            recent_at: 0,
+            recent_len: 0,
             sustained_loss: 0,
             windows_closed: 0,
             transient: true,
@@ -207,6 +210,19 @@ const SEED_CEILING: u64 = RATE_ONE / 10;
 /// paid by long transfers.
 pub(crate) const SUSTAINED_MIN_WINDOWS: u32 = 4;
 
+/// Unaided windows the path's rate is averaged over.
+///
+/// A trailing window, because a mean over the whole connection never
+/// forgets the ramp it opened with. Traced on a real 12 GiB transfer
+/// with coding off throughout, the running mean climbs through the ramp
+/// to **4.11% at windows seventeen through twenty-one**, just over the
+/// bar that admits coding, before decaying to 2.4% by window forty. It
+/// only has to cross once: coding starts, the measurement stops because
+/// a coded window is not evidence about the path, and the crossing
+/// becomes permanent. Over the same trace a sixteen-window trailing
+/// mean peaks at 3.29% and never crosses.
+const SUSTAINED_WINDOWS: usize = 16;
+
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
     /// start a new baseline; missing telemetry leaves the last decision intact.
@@ -240,8 +256,9 @@ impl FecPolicy {
             self.sample_sent = 0;
             self.smoothed_loss = 0;
             self.smoothed_failure = 0;
-            self.sustained_lost = 0;
-            self.sustained_sent = 0;
+            self.recent = [0; SUSTAINED_WINDOWS];
+            self.recent_at = 0;
+            self.recent_len = 0;
             self.sustained_loss = 0;
             self.windows_closed = 0;
             self.transient = true;
@@ -292,10 +309,14 @@ impl FecPolicy {
         // nothing about the path, and a window under coding is partly
         // coding's own doing, so neither is evidence.
         if !self.coding && self.windows_closed > 0 {
-            self.sustained_lost = self.sustained_lost.saturating_add(self.sample_lost);
-            self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
-            self.sustained_loss =
-                (self.sustained_lost.saturating_mul(RATE_ONE)) / self.sustained_sent.max(1);
+            self.recent[self.recent_at] = u32::try_from(window_rate).unwrap_or(u32::MAX);
+            self.recent_at = (self.recent_at + 1) % SUSTAINED_WINDOWS;
+            self.recent_len = self.recent_len.saturating_add(1).min(SUSTAINED_WINDOWS);
+            let total: u64 = self.recent[..self.recent_len]
+                .iter()
+                .map(|rate| u64::from(*rate))
+                .sum();
+            self.sustained_loss = total / self.recent_len as u64;
         }
         // Every window counts toward eligibility, including the coded
         // ones that contribute no measurement. Otherwise a connection

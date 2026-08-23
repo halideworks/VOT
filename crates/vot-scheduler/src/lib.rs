@@ -158,6 +158,16 @@ mod tests {
         }
     }
 
+    /// The records as the receiver takes them, borrowing rather than copying.
+    fn refs(
+        records: &[vot_codec::frames::DataRecord],
+    ) -> Vec<vot_codec::frames::DataRecordRef<'_>> {
+        records
+            .iter()
+            .map(vot_codec::frames::DataRecordRef::from)
+            .collect()
+    }
+
     fn assert_typed_bundle_error(
         subject: SubjectId,
         bundle: &vot_codec::frames::ProofBundle,
@@ -171,7 +181,7 @@ mod tests {
             .begin_ranges(subject, Box::new(DiscardSink))
             .unwrap();
         assert_eq!(
-            receiver.receive_typed_bundle(subject, bundle, records),
+            receiver.receive_typed_bundle(subject, bundle, &refs(records)),
             Err(expected)
         );
     }
@@ -1023,7 +1033,7 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
         receiver
-            .receive_typed_bundle(subject, &bundle, &decoded_records)
+            .receive_typed_bundle(subject, &bundle, &refs(&decoded_records))
             .unwrap();
         assert_eq!(receiver.advertised_credit(), bytes.len() as u64);
         assert_eq!(receiver.peak_staging(), staging_limit);
@@ -1055,11 +1065,11 @@ mod tests {
             .begin_ranges(subject, Box::new(DiscardSink))
             .unwrap();
         duplicate_receiver
-            .receive_typed_bundle(subject, &bundle, &decoded_records)
+            .receive_typed_bundle(subject, &bundle, &refs(&decoded_records))
             .unwrap();
         let credit_before_duplicate = duplicate_receiver.advertised_credit();
         duplicate_receiver
-            .receive_typed_bundle(subject, &bundle, &decoded_records)
+            .receive_typed_bundle(subject, &bundle, &refs(&decoded_records))
             .unwrap();
         assert_eq!(
             duplicate_receiver.advertised_credit(),
@@ -1100,7 +1110,7 @@ mod tests {
 
         let range = std::thread::scope(|scope| {
             scope
-                .spawn(|| ReliableReceiver::verify_typed_bundle(subject, &bundle, &records))
+                .spawn(|| ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&records)))
                 .join()
                 .expect("a verifier thread")
         })
@@ -1128,11 +1138,12 @@ mod tests {
         let mut bad_records = records.to_vec();
         bad_records[0].encoded[0] ^= 1;
         assert!(matches!(
-            ReliableReceiver::verify_typed_bundle(subject, &bundle, &bad_records),
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&bad_records)),
             Err(Error::ProofInvalid)
         ));
 
-        let stray = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+        let stray =
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&records)).unwrap();
         let mut closed =
             ReliableReceiver::new(staging_limit, staging_limit, staging_limit).unwrap();
         assert!(matches!(
@@ -1140,7 +1151,8 @@ mod tests {
             Err(Error::UnknownObject)
         ));
 
-        let again = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+        let again =
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&records)).unwrap();
         let credit_verified = receiver.advertised_credit();
         receiver.admit_verified_range(again).unwrap();
         assert_eq!(receiver.advertised_credit(), credit_verified);
@@ -1176,7 +1188,8 @@ mod tests {
             compression: 0,
             encoded: bytes.clone(),
         }];
-        let range = ReliableReceiver::verify_typed_bundle(subject, &bundle, &records).unwrap();
+        let range =
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&records)).unwrap();
 
         let sink = std::sync::Arc::new(MemorySink::default());
         let staging_limit = VERIFIER_RESERVATION + bytes.len() as u64;

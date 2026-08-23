@@ -232,7 +232,7 @@ impl ReliableReceiver {
     pub fn verify_typed_bundle(
         subject: SubjectId,
         bundle: &vot_codec::frames::ProofBundle,
-        records: &[vot_codec::frames::DataRecord],
+        records: &[vot_codec::frames::DataRecordRef<'_>],
     ) -> Result<VerifiedRange, Error> {
         Ok(VerifiedRange {
             inner: verify_typed_bundle(subject, bundle, records)?,
@@ -270,7 +270,7 @@ impl ReliableReceiver {
         &mut self,
         subject: SubjectId,
         bundle: &vot_codec::frames::ProofBundle,
-        records: &[vot_codec::frames::DataRecord],
+        records: &[vot_codec::frames::DataRecordRef<'_>],
     ) -> Result<(), Error> {
         let validated = validate_typed_bundle(subject, bundle, records)?;
         let covered_bytes = validated.covered_length();

@@ -330,7 +330,11 @@ mod tests {
         records: &[DataRecord],
     ) -> Vec<u8> {
         let subject = SubjectId::try_from(object).unwrap();
-        ReliableReceiver::verify_typed_bundle(subject, bundle, records).unwrap();
+        let borrowed = records
+            .iter()
+            .map(frames::DataRecordRef::from)
+            .collect::<Vec<_>>();
+        ReliableReceiver::verify_typed_bundle(subject, bundle, &borrowed).unwrap();
         let mut ordered: Vec<&DataRecord> = records.iter().collect();
         ordered.sort_by_key(|record| record.record_index);
         let mut assembled = Vec::new();

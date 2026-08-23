@@ -101,6 +101,19 @@ impl From<&DataRecord> for DataRecordHeader {
     }
 }
 
+impl From<DataRecordRef<'_>> for DataRecord {
+    fn from(value: DataRecordRef<'_>) -> Self {
+        Self {
+            bundle_id: value.bundle_id,
+            record_index: value.record_index,
+            plaintext_offset: value.plaintext_offset,
+            plaintext_length: value.plaintext_length,
+            compression: value.compression,
+            encoded: value.encoded.to_vec(),
+        }
+    }
+}
+
 impl<'data> From<&'data DataRecord> for DataRecordRef<'data> {
     fn from(value: &'data DataRecord) -> Self {
         Self {
@@ -117,6 +130,12 @@ impl<'data> From<&'data DataRecord> for DataRecordRef<'data> {
 impl DataRecord {
     pub fn validate(&self) -> Result<(), Error> {
         validate_data_record(self.into())
+    }
+}
+
+impl DataRecordRef<'_> {
+    pub fn validate(&self) -> Result<(), Error> {
+        validate_data_record(*self)
     }
 }
 
@@ -362,6 +381,10 @@ pub(super) fn encode_validated_data_record(value: DataRecordRef<'_>, output: &mu
 }
 
 pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
+    Ok(decode_data_record_ref_payload(input)?.into())
+}
+
+pub(super) fn decode_data_record_ref_payload(input: &[u8]) -> Result<DataRecordRef<'_>, Error> {
     let mut reader = Reader::new(input);
     reader.map(8)?;
     reader.key(0)?;
@@ -381,12 +404,12 @@ pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
     reader.key(6)?;
     let encoded_length = reader.uint()?;
     reader.key(7)?;
-    let encoded = reader.bytes(MAX_DATA_BYTES)?.to_vec();
+    let encoded = reader.bytes(MAX_DATA_BYTES)?;
     reader.finish()?;
     if encoded_length != encoded.len() as u64 {
         return Err(Error::InvalidValue);
     }
-    let value = DataRecord {
+    let value = DataRecordRef {
         bundle_id,
         record_index,
         plaintext_offset,
@@ -394,7 +417,7 @@ pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
         compression,
         encoded,
     };
-    validate_data_record((&value).into())?;
+    validate_data_record(value)?;
     Ok(value)
 }
 

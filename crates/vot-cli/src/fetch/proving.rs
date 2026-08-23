@@ -111,10 +111,11 @@ impl Drop for ProvingPool {
 
 /// Proves one bundle and places its bytes.
 pub(crate) fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
+    let records = work.completed.records();
     let range = ReliableReceiver::verify_typed_bundle(
         work.completed.subject(),
         work.completed.bundle(),
-        work.completed.records(),
+        &records,
     )?;
     let written = range.write_to(work.sink.as_ref())?;
     Ok(Proved {

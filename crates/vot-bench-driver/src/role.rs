@@ -272,10 +272,15 @@ fn drive_receive_rail(
                 Event::Reliable { bytes, .. } => {
                     tally.wire_bytes = tally.wire_bytes.saturating_add(bytes.len() as u64);
                     if let Some(whole) = reassembly.take(&bytes)? {
+                        let records = whole
+                            .records
+                            .iter()
+                            .map(vot_codec::frames::DataRecordRef::from)
+                            .collect::<Vec<_>>();
                         let range = SchedulerReceiver::verify_typed_bundle(
                             subject,
                             &whole.bundle,
-                            &whole.records,
+                            &records,
                         )?;
                         let admitted = range.len();
                         witnesses.hold(admitted);

@@ -5,9 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use vot_codec::frames::{DataRecord, ProofBundle, TypedFrame};
+use vot_codec::frames::{DataRecord, DataRecordHeader, DataRecordRef, ProofBundle, TypedFrame};
 use vot_session::Session;
-use vot_transport_api::{Event, SubjectId, TransportAdapter};
+use vot_transport_api::{Event, Payload, SubjectId, TransportAdapter};
 
 use crate::fec::{self, Cover, Intake, Joined};
 use crate::{Error, RangeSink, ReliableReceiver};
@@ -101,6 +101,67 @@ const _: () = assert!(ORPHAN_HEADROOM_QUANTUM == 4_194_304);
 /// Delivered bundle identities remembered so an exact replay stays idempotent.
 pub const REMEMBERED_BUNDLES: usize = 64;
 
+/// A record held as its wire bytes: the header, the payload the frame arrived
+/// in, and where the encoded bytes sit in it. Holding the payload is what
+/// keeps the record's bytes uncopied until the range is assembled.
+#[derive(Clone, Debug)]
+struct HeldRecord {
+    header: DataRecordHeader,
+    payload: Payload,
+    encoded: std::ops::Range<usize>,
+}
+
+impl HeldRecord {
+    /// Where a decoded record sits in the payload it borrows from, so the
+    /// payload can be moved into the hold without a second borrow of it.
+    fn placement(
+        payload: &Payload,
+        record: DataRecordRef<'_>,
+    ) -> (DataRecordHeader, std::ops::Range<usize>) {
+        let start = record.encoded.as_ptr() as usize - payload.as_ptr() as usize;
+        let encoded = start..start + record.encoded.len();
+        debug_assert_eq!(&payload[encoded.clone()], record.encoded);
+        (DataRecordHeader::from(record), encoded)
+    }
+
+    fn encoded(&self) -> &[u8] {
+        &self.payload[self.encoded.clone()]
+    }
+
+    fn as_ref(&self) -> DataRecordRef<'_> {
+        DataRecordRef {
+            bundle_id: self.header.bundle_id,
+            record_index: self.header.record_index,
+            plaintext_offset: self.header.plaintext_offset,
+            plaintext_length: self.header.plaintext_length,
+            compression: self.header.compression,
+            encoded: self.encoded(),
+        }
+    }
+}
+
+/// A record the coding path produced rather than received, wrapped so both
+/// paths hold one shape.
+impl From<DataRecord> for HeldRecord {
+    fn from(value: DataRecord) -> Self {
+        let header = DataRecordHeader::from(&value);
+        let encoded = 0..value.encoded.len();
+        Self {
+            header,
+            payload: Payload::from(value.encoded),
+            encoded,
+        }
+    }
+}
+
+impl PartialEq for HeldRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for HeldRecord {}
+
 /// Framing identity of one delivered record. Used for idempotent replay checks.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct DeliveredRecord {
@@ -112,13 +173,13 @@ struct DeliveredRecord {
 }
 
 impl DeliveredRecord {
-    fn of(record: &DataRecord) -> Self {
+    const fn of(header: &DataRecordHeader) -> Self {
         Self {
-            record_index: record.record_index,
-            plaintext_offset: record.plaintext_offset,
-            plaintext_length: record.plaintext_length,
-            compression: record.compression,
-            encoded_length: record.encoded.len(),
+            record_index: header.record_index,
+            plaintext_offset: header.plaintext_offset,
+            plaintext_length: header.plaintext_length,
+            compression: header.compression,
+            encoded_length: header.encoded_length,
         }
     }
 }
@@ -132,10 +193,13 @@ struct Delivered {
 }
 
 impl Delivered {
-    fn of(identity: [u8; 32], records: &[DataRecord]) -> Self {
+    fn of(identity: [u8; 32], records: &[HeldRecord]) -> Self {
         Self {
             identity,
-            records: records.iter().map(DeliveredRecord::of).collect(),
+            records: records
+                .iter()
+                .map(|held| DeliveredRecord::of(&held.header))
+                .collect(),
         }
     }
 }
@@ -146,7 +210,7 @@ struct Pending {
     bundle: Option<ProofBundle>,
     /// The hash of the frame the bundle arrived in, kept for the replay check.
     identity: Option<[u8; 32]>,
-    records: Vec<DataRecord>,
+    records: Vec<HeldRecord>,
     /// When this entry was opened, counted in entries rather than time, so
     /// the oldest orphan can be named without a clock.
     opened: u64,
@@ -376,8 +440,8 @@ impl PendingBundles {
     }
 
     /// Holds one record under whichever budget its entry occupies.
-    fn append_record(&mut self, record: DataRecord) -> Result<(), Error> {
-        let id = record.bundle_id;
+    fn append_record(&mut self, record: HeldRecord) -> Result<(), Error> {
+        let id = record.header.bundle_id;
         let orphan = self.entries.get(&id).is_none_or(Pending::is_orphan);
         let bytes = record.encoded.len();
         // An orphan budget with no room is not a failed transfer: the oldest
@@ -485,7 +549,7 @@ pub struct CompletedBundle {
     identity: [u8; 32],
     subject: SubjectId,
     bundle: ProofBundle,
-    records: Vec<DataRecord>,
+    records: Vec<HeldRecord>,
 }
 
 impl CompletedBundle {
@@ -503,8 +567,8 @@ impl CompletedBundle {
 
     /// The records the proof covers, in arrival order.
     #[must_use]
-    pub fn records(&self) -> &[DataRecord] {
-        &self.records
+    pub fn records(&self) -> Vec<DataRecordRef<'_>> {
+        self.records.iter().map(HeldRecord::as_ref).collect()
     }
 }
 
@@ -750,7 +814,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 }
                 // A lane carries payload and nothing else, which the session
                 // enforces, so every frame reaching here is a record.
-                Event::Reliable { bytes, .. } => self.accept_record(&bytes)?,
+                Event::Reliable { bytes, .. } => self.accept_record(bytes)?,
                 // The proof that describes a range is bounded by the control
                 // ceiling, not the record limit, so it arrives here rather
                 // than on the lane its records travel.
@@ -779,20 +843,21 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         Ok(None)
     }
 
-    /// Feeds one record from a lane.
-    fn accept_record(&mut self, frame: &[u8]) -> Result<(), Error> {
+    /// Feeds one record from a lane, holding the payload it arrived in so its
+    /// bytes are copied once, when the range is assembled.
+    fn accept_record(&mut self, payload: Payload) -> Result<(), Error> {
         let limits = vot_codec::DecodeLimits {
             max_unknown_payload: vot_transport_api::MAX_DATA_RECORD_BYTES,
             max_frames: 1,
         };
-        let (typed, _) =
-            vot_codec::frames::decode(frame, limits).map_err(|_| Error::ProofInvalid)?;
-        match typed {
-            TypedFrame::DataRecord(record) => self.hold_record(record),
-            // Unreachable while the session holds a lane to one type, and a
-            // silent success here would hide it if that changed.
-            _ => Err(Error::ProofInvalid),
-        }
+        let (record, _) = vot_codec::frames::decode_data_record_ref(&payload, limits)
+            .map_err(|_| Error::ProofInvalid)?;
+        let (header, encoded) = HeldRecord::placement(&payload, record);
+        self.hold_record(HeldRecord {
+            header,
+            payload,
+            encoded,
+        })
     }
 
     /// Feeds one proof from the control stream.
@@ -887,7 +952,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             self.fec.hold_orphan(joined);
             return Ok(());
         };
-        self.hold_record(fec::record_of(id, covered_offset, joined))
+        self.hold_record(fec::record_of(id, covered_offset, joined).into())
     }
 
     /// Puts what the intake owes the sender on the control stream. A refusal
@@ -985,18 +1050,18 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         self.deliver(id)?;
         // Generations that arrived before their bundle join it now.
         for joined in self.fec.take_orphans(cover) {
-            self.hold_record(fec::record_of(id, cover.offset, joined))?;
+            self.hold_record(fec::record_of(id, cover.offset, joined).into())?;
         }
         Ok(())
     }
 
-    fn hold_record(&mut self, record: DataRecord) -> Result<(), Error> {
-        let id = record.bundle_id;
+    fn hold_record(&mut self, record: HeldRecord) -> Result<(), Error> {
+        let id = record.header.bundle_id;
         if let Some((_, prior)) = self.delivered.iter().find(|(seen, _)| *seen == id) {
             // Its bundle is verified and gone, so holding this would leave an
             // entry that can never complete. An exact retry is idempotent and
             // anything else conflicts with what was verified.
-            return if prior.records.contains(&DeliveredRecord::of(&record)) {
+            return if prior.records.contains(&DeliveredRecord::of(&record.header)) {
                 Ok(())
             } else {
                 Err(Error::ProofInvalid)
@@ -1006,7 +1071,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             if let Some(held) = pending
                 .records
                 .iter()
-                .find(|held| held.record_index == record.record_index)
+                .find(|held| held.header.record_index == record.header.record_index)
             {
                 return if *held == record {
                     Ok(())
@@ -1061,8 +1126,13 @@ impl<A: TransportAdapter> SessionReceiver<A> {
         // replay arriving here is one whose identity was evicted. The receiver
         // checks its proof either way and treats a verified subject as
         // unchanged, which is what makes the bound on that memory harmless.
+        let records = pending
+            .records
+            .iter()
+            .map(HeldRecord::as_ref)
+            .collect::<Vec<_>>();
         self.receiver
-            .receive_typed_bundle(subject, &bundle, &pending.records)?;
+            .receive_typed_bundle(subject, &bundle, &records)?;
         self.after_admission(id, delivered, subject)
     }
 
@@ -1337,6 +1407,33 @@ mod tests {
     }
 
     #[test]
+    fn a_held_record_borrows_the_payload_its_frame_arrived_in() {
+        let (_, _, records) = object();
+        let frame = wire(&TypedFrame::DataRecord(records[0].clone()));
+        let payload = Payload::from(frame);
+        let limits = vot_codec::DecodeLimits {
+            max_unknown_payload: vot_transport_api::MAX_DATA_RECORD_BYTES,
+            max_frames: 1,
+        };
+        let (decoded, _) = vot_codec::frames::decode_data_record_ref(&payload, limits).unwrap();
+        let (header, encoded) = HeldRecord::placement(&payload, decoded);
+        let held = HeldRecord {
+            header,
+            payload: payload.clone(),
+            encoded,
+        };
+        assert_eq!(held.header, DataRecordHeader::from(&records[0]));
+        assert_eq!(held.encoded(), records[0].encoded);
+        assert_eq!(held.as_ref(), DataRecordRef::from(&records[0]));
+        assert_eq!(held.encoded.len(), records[0].encoded.len());
+        assert!(held.encoded.start > 0, "the envelope precedes the bytes");
+        assert!(std::ptr::eq(
+            held.encoded().as_ptr(),
+            payload[held.encoded.clone()].as_ptr()
+        ));
+    }
+
+    #[test]
     fn a_bundle_and_its_records_become_verified_state() {
         // Nothing joined a session to a receiver, so a live carrier moved
         // records and verified nothing.
@@ -1395,10 +1492,11 @@ mod tests {
 
         let completed = driver.take_completed().expect("a bundle to prove");
         assert!(driver.take_completed().is_none(), "one bundle, taken once");
+        let records = completed.records();
         let range = ReliableReceiver::verify_typed_bundle(
             completed.subject(),
             completed.bundle(),
-            completed.records(),
+            &records,
         )
         .expect("the proof holds");
         let written = range.write_to(&DiscardSink).expect("the sink takes it");
@@ -1433,10 +1531,11 @@ mod tests {
         }
         assert_eq!(driver.poll().unwrap(), None);
         let completed = driver.take_completed().expect("a bundle to prove");
+        let records = completed.records();
         let range = ReliableReceiver::verify_typed_bundle(
             completed.subject(),
             completed.bundle(),
-            completed.records(),
+            &records,
         )
         .expect("the proof holds");
         let written = range.write_to(&DiscardSink).expect("the sink takes it");
@@ -1585,7 +1684,7 @@ mod tests {
     fn a_drifted_budget_fails_the_recomputation() {
         let mut pending = PendingBundles::default();
         let (_, _, records) = object();
-        pending.append_record(records[0].clone()).unwrap();
+        pending.append_record(records[0].clone().into()).unwrap();
         // The only way the counters and the map can disagree is a bug;
         // simulate one.
         pending.orphan_bytes += 1;
@@ -1703,15 +1802,15 @@ mod tests {
         // Arriving in the opposite order to their identities, so the oldest
         // is not simply the first the map holds.
         for id in [30_u8, 20, 10] {
-            pending.append_record(record(id, 4)).unwrap();
+            pending.append_record(record(id, 4).into()).unwrap();
         }
         // The oldest is spoken to again. That does not make it younger: what
         // decides is when it opened, because what it is waiting for is a
         // proof that was answered long ago.
-        pending.append_record(record(30, 4)).unwrap();
+        pending.append_record(record(30, 4).into()).unwrap();
         assert_eq!(pending.orphan_count(), 3);
 
-        pending.append_record(record(9, 4)).unwrap();
+        pending.append_record(record(9, 4).into()).unwrap();
         assert_eq!(pending.orphan_count(), 3, "the bound is what it says");
         assert!(pending.get(&[30; 16]).is_none(), "the oldest made way");
         assert!(pending.get(&[20; 16]).is_some());
@@ -1738,12 +1837,12 @@ mod tests {
             ..PendingBundles::default()
         };
         for id in [1_u8, 2, 3, 4] {
-            pending.append_record(record(id, 100)).unwrap();
+            pending.append_record(record(id, 100).into()).unwrap();
         }
         assert_eq!(pending.orphan_bytes, 400, "the budget is full");
 
         // Three hundred bytes needs three of them gone.
-        pending.append_record(record(5, 300)).unwrap();
+        pending.append_record(record(5, 300).into()).unwrap();
         assert_eq!(pending.orphan_bytes, 400);
         assert!(pending.get(&[1; 16]).is_none());
         assert!(pending.get(&[2; 16]).is_none());
@@ -1753,7 +1852,7 @@ mod tests {
 
         // More than the budget holds at all: nothing is dropped for it.
         assert_eq!(
-            pending.append_record(record(6, 500)),
+            pending.append_record(record(6, 500).into()),
             Err(Error::PendingBundlesExhausted)
         );
         assert!(pending.get(&[4; 16]).is_some(), "a refusal empties nothing");
@@ -2214,6 +2313,28 @@ mod tests {
         push_object(&mut driver, &bundle, &records);
         assert_eq!(driver.poll().unwrap(), None);
         assert!(driver.is_verified(subject), "the retry verified");
+    }
+
+    #[test]
+    fn a_missing_or_discontinuous_record_is_refused_at_proof_time() {
+        // The bundle declares two records, so the gap only shows once every
+        // record it names has arrived and the range is assembled.
+        let (subject, bundle, records) = object();
+        let mut absent = records.clone();
+        absent[1].record_index = 2;
+        let mut driver = ready();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        push_object(&mut driver, &bundle, &absent);
+        assert_eq!(driver.poll(), Err(Error::LengthMismatch));
+        assert!(!driver.is_verified(subject));
+
+        let mut adrift = records;
+        adrift[1].plaintext_offset += crate::RANGE_UNIT_BYTES;
+        let mut driver = ready();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        push_object(&mut driver, &bundle, &adrift);
+        assert_eq!(driver.poll(), Err(Error::LengthMismatch));
+        assert!(!driver.is_verified(subject));
     }
 
     #[test]

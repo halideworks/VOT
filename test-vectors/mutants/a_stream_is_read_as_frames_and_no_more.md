@@ -73,7 +73,7 @@ survivor, and its 58 live tests pass in debug, in release, and under
 AddressSanitizer with LeakSanitizer, which is what says the extraction changed
 the carrier's behaviour in no way.
 
-The owned-frame handoff rerun selected all 64 mutants in
-`vot-transport-framing`: 56 were caught, 8 were unviable, and none survived.
-The framing suite and the 86-test live quiche suite both passed with completed
+The owned-frame handoff rerun selected all 66 mutants in
+`vot-transport-framing`: 61 were caught, 5 were unviable, and none survived.
+The framing suite and the 88-test live quiche suite both passed with completed
 reassembly buffers moved into transport payloads instead of copied into them.

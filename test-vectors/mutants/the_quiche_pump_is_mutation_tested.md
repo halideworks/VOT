@@ -21,7 +21,7 @@ no longer survives.
 
 A row names the mutant as `cargo-mutants` prints it, without the file position,
 so one row covers a mutant that exists in a compiled and an uncompiled twin of
-the same function. The reasons fall into five classes:
+the same function. The reasons fall into six classes:
 
 - **not compiled here**: the non-Linux twin of a `cfg`-gated function. The
   mutated code never builds in this job, so the suite cannot see it. The
@@ -43,6 +43,9 @@ the same function. The reasons fall into five classes:
   `write_outbox` sat here wrongly until review showed a split write hangs the
   stream under it; a small-window sans-IO pair now kills it, which is the
   fate a row in this table should hope for.
+- **timeout after failure**: a focused assertion fails immediately, but the
+  mutation also makes the serialized live cases wait out their connection
+  bounds, so the complete suite reaches cargo-mutants' timeout before it exits.
 
 | mutant | class | reason |
 | --- | --- | --- |
@@ -60,6 +63,8 @@ the same function. The reasons fall into five classes:
 | `replace offload_available -> bool with true` | optional by design | claiming offload where the probe would refuse it falls back per burst |
 | `replace offload_available -> bool with false` | optional by design | denying offload takes the per-packet fallback, correct and slower |
 | `replace drain_arrivals -> Result<(), Error> with Ok(())` | optional by design | without the drain every pass reads once, the lockstep shape the drain exists to amortise; delivery holds and only throughput falls |
+| `replace version_unsupported -> bool with true` | timeout after failure | the focused version test fails, then every supported handshake is rejected and the remaining live cases wait out their connection bounds |
+| `delete ! in version_unsupported` | timeout after failure | as above |
 | `replace > with == in send_burst` | optional by design | routes single-packet bursts through the offload or per-packet path; both carry the burst |
 | `replace > with < in send_burst` | optional by design | as above |
 | `replace > with >= in send_burst` | optional by design | as above |

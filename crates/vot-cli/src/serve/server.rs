@@ -5,7 +5,7 @@ use super::{
     MAX_CONTROL_FRAME_PAYLOAD, ManifestReader, ManifestRequest, OpenedEpoch, PackageDescriptor,
     PackageSummary, Path, PathBuf, Payload, ProofBundle, RECORD_PLAINTEXT_BYTES, RangeRequest,
     ServeConnection, ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter,
-    TypedFrame, encoded, error_code, fail, frame_type, frames,
+    TypedFrame, encoded, encoded_record, error_code, fail, frame_type, frames,
 };
 
 /// One bundle, opened and proved once, answering any number of sessions.
@@ -759,15 +759,15 @@ impl BundleServer {
         connection.queue_control(encoded(&bundle)?);
         let mut record_offset = covered_offset;
         for (index, chunk) in plaintext.chunks(RECORD_PLAINTEXT_BYTES).enumerate() {
-            let record = TypedFrame::DataRecord(DataRecord {
+            let record = frames::DataRecordRef {
                 bundle_id,
                 record_index: index as u64,
                 plaintext_offset: record_offset,
                 plaintext_length: chunk.len() as u64,
                 compression: 0,
-                encoded: chunk.to_vec(),
-            });
-            connection.queue_record(encoded(&record)?);
+                encoded: chunk,
+            };
+            connection.queue_record(encoded_record(record)?);
             record_offset = record_offset.saturating_add(chunk.len() as u64);
         }
         Ok(())

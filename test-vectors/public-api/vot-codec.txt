@@ -130,6 +130,7 @@ function vot_codec::frames::decode_session_reject_payload
 function vot_codec::frames::decode_symbol
 function vot_codec::frames::encode
 function vot_codec::frames::encode_auth_context_payload
+function vot_codec::frames::encode_data_record
 function vot_codec::frames::encode_symbol
 function vot_codec::is_critical
 function vot_codec::is_grease
@@ -162,6 +163,7 @@ struct vot_codec::frames::Capacity
 struct vot_codec::frames::CodingEpochClose
 struct vot_codec::frames::CodingEpochOpen
 struct vot_codec::frames::DataRecord
+struct vot_codec::frames::DataRecordRef
 struct vot_codec::frames::DatagramCredit
 struct vot_codec::frames::GenDone
 struct vot_codec::frames::GenState

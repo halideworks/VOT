@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use vot_codec::frames::{DataRecord, ObjectId, ProofBundle};
+use vot_codec::frames::{DataRecord, DataRecordRef, ObjectId, ProofBundle};
 use vot_verifier::Suite;
 
 /// Range granularity covered by both frozen proof suites.
@@ -29,7 +29,7 @@ pub enum Error {
 #[derive(Debug)]
 pub struct ValidatedBundle<'records> {
     bundle: &'records ProofBundle,
-    ordered: BTreeMap<u64, &'records DataRecord>,
+    ordered: BTreeMap<u64, DataRecordRef<'records>>,
 }
 
 impl ValidatedBundle<'_> {
@@ -125,6 +125,19 @@ pub fn validate_typed_bundle<'records>(
     bundle: &'records ProofBundle,
     records: &'records [DataRecord],
 ) -> Result<ValidatedBundle<'records>, Error> {
+    let borrowed = records.iter().map(DataRecordRef::from).collect::<Vec<_>>();
+    validate_typed_bundle_ref(object, bundle, &borrowed)
+}
+
+/// Checks a bundle's identity and records whose bytes stay with their caller.
+///
+/// # Errors
+/// Rejects exactly what [`validate_typed_bundle`] rejects.
+pub fn validate_typed_bundle_ref<'records>(
+    object: ObjectId,
+    bundle: &'records ProofBundle,
+    records: &[DataRecordRef<'records>],
+) -> Result<ValidatedBundle<'records>, Error> {
     bundle.validate().map_err(|_| Error::ProofInvalid)?;
     if bundle.object.suite != object.suite
         || bundle.object.root != object.root
@@ -134,7 +147,7 @@ pub fn validate_typed_bundle<'records>(
         return Err(Error::LengthMismatch);
     }
     let mut ordered = BTreeMap::new();
-    for record in records {
+    for record in records.iter().copied() {
         record.validate().map_err(|_| Error::ProofInvalid)?;
         if record.bundle_id != bundle.bundle_id {
             return Err(Error::ProofInvalid);
@@ -160,7 +173,21 @@ pub fn verify_typed_bundle(
     bundle: &ProofBundle,
     records: &[DataRecord],
 ) -> Result<VerifiedRange, Error> {
-    let data = validate_typed_bundle(object, bundle, records)?.assemble()?;
+    let borrowed = records.iter().map(DataRecordRef::from).collect::<Vec<_>>();
+    verify_typed_bundle_ref(object, bundle, &borrowed)
+}
+
+/// Validates, reassembles, and authenticates a bundle whose record bytes stay
+/// with their caller.
+///
+/// # Errors
+/// Returns exactly what [`verify_typed_bundle`] returns.
+pub fn verify_typed_bundle_ref(
+    object: ObjectId,
+    bundle: &ProofBundle,
+    records: &[DataRecordRef<'_>],
+) -> Result<VerifiedRange, Error> {
+    let data = validate_typed_bundle_ref(object, bundle, records)?.assemble()?;
     let verified = verify_range(object, bundle.covered_offset, &data, &bundle.proof)?;
     let object = verified.object();
     let covered_offset = verified.covered_offset();
@@ -205,7 +232,7 @@ pub fn verify_range<'data>(
 
 fn assemble_ordered(
     bundle: &ProofBundle,
-    ordered: &BTreeMap<u64, &DataRecord>,
+    ordered: &BTreeMap<u64, DataRecordRef<'_>>,
 ) -> Result<Vec<u8>, Error> {
     let capacity = usize::try_from(bundle.covered_length).map_err(|_| Error::LengthExceeded)?;
     let mut data = Vec::with_capacity(capacity);
@@ -216,7 +243,7 @@ fn assemble_ordered(
         if record.plaintext_offset != expected_offset {
             return Err(Error::LengthMismatch);
         }
-        data.extend_from_slice(&record.encoded);
+        data.extend_from_slice(record.encoded);
     }
     if data.len() as u64 != bundle.covered_length {
         return Err(Error::LengthMismatch);
@@ -308,6 +335,28 @@ mod tests {
             bundle,
             records,
         }
+    }
+
+    #[test]
+    fn borrowed_records_assemble_the_same_bytes_as_owned_ones() {
+        let fixture = make_fixture(Suite::Blake3Bao64);
+        let borrowed = fixture
+            .records
+            .iter()
+            .map(DataRecordRef::from)
+            .collect::<Vec<_>>();
+        let owned = validate_typed_bundle(fixture.object, &fixture.bundle, &fixture.records)
+            .unwrap()
+            .assemble()
+            .unwrap();
+        let refs = validate_typed_bundle_ref(fixture.object, &fixture.bundle, &borrowed)
+            .unwrap()
+            .assemble()
+            .unwrap();
+        assert_eq!(refs, owned);
+        assert_eq!(refs, fixture.bytes);
+        let range = verify_typed_bundle_ref(fixture.object, &fixture.bundle, &borrowed).unwrap();
+        assert_eq!(range.data(), fixture.bytes);
     }
 
     #[test]

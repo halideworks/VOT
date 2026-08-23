@@ -198,6 +198,26 @@ pub fn reserve_data_record(
     Ok(range)
 }
 
+/// Decodes one `DATA_RECORD` frame, borrowing its encoded bytes from `input`.
+///
+/// # Errors
+/// Returns [`Error::WrongFrameType`] for any other frame, and the same
+/// envelope and record failures as [`decode`].
+pub fn decode_data_record_ref(
+    input: &[u8],
+    limits: DecodeLimits,
+) -> Result<(DataRecordRef<'_>, usize), Error> {
+    let (decoded, consumed) = decode_one(input, limits)?;
+    let frame_kind = decoded.frame_type();
+    let DecodedFrame::Known { payload, .. } = decoded else {
+        return Err(Error::WrongFrameType(frame_kind));
+    };
+    if frame_kind != frame_type::DATA_RECORD {
+        return Err(Error::WrongFrameType(frame_kind));
+    }
+    Ok((decode_data_record_ref_payload(payload)?, consumed))
+}
+
 /// Decodes one typed frame without accepting an unknown application payload.
 pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize), Error> {
     let (decoded, consumed) = decode_one(input, limits)?;
@@ -1457,6 +1477,97 @@ mod tests {
         let mut wide_scope = open(1);
         wide_scope.requested_scope = vec![0; MAX_SCOPE_BYTES + 1];
         assert!(encode_session_open(&wide_scope, &mut out).is_err());
+    }
+
+    #[test]
+    fn a_borrowed_record_validates_like_the_owned_one() {
+        let mut record = DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: GROUP_BYTES,
+            plaintext_length: GROUP_BYTES,
+            compression: 0,
+            encoded: vec![0xaa; GROUP_BYTES as usize],
+        };
+        assert_eq!(DataRecordRef::from(&record).validate(), Ok(()));
+        record.plaintext_length = 0;
+        assert_eq!(
+            DataRecordRef::from(&record).validate(),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(record.validate(), Err(Error::InvalidValue));
+    }
+
+    #[test]
+    fn borrowed_data_record_decode_matches_the_owned_one() {
+        let record = DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: GROUP_BYTES,
+            plaintext_length: GROUP_BYTES,
+            compression: 0,
+            encoded: vec![0xaa; GROUP_BYTES as usize],
+        };
+        let mut encoded = Vec::new();
+        encode(&TypedFrame::DataRecord(record), &mut encoded).unwrap();
+        let (typed, owned_used) = decode(&encoded, DecodeLimits::default()).unwrap();
+        let TypedFrame::DataRecord(owned) = typed else {
+            panic!("a data record frame decoded as something else");
+        };
+        let (borrowed, used) = decode_data_record_ref(&encoded, DecodeLimits::default()).unwrap();
+        assert_eq!(borrowed, DataRecordRef::from(&owned));
+        assert_eq!(used, owned_used);
+        let start = borrowed.encoded.as_ptr() as usize - encoded.as_ptr() as usize;
+        assert_eq!(
+            &encoded[start..start + borrowed.encoded.len()],
+            borrowed.encoded
+        );
+    }
+
+    #[test]
+    fn borrowed_data_record_decode_refuses_another_frame_type() {
+        let mut encoded = Vec::new();
+        encode(
+            &TypedFrame::CodingEpochClose(CodingEpochClose { epoch: 1 }),
+            &mut encoded,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_data_record_ref(&encoded, DecodeLimits::default()),
+            Err(Error::WrongFrameType(frame_type::CODING_EPOCH_CLOSE))
+        );
+    }
+
+    #[test]
+    fn borrowed_data_record_decode_refuses_a_mismatched_encoded_length() {
+        let frame = |declared: u64| {
+            let mut payload = Vec::new();
+            vot_cbor::map(&mut payload, 8);
+            vot_cbor::uint(&mut payload, 0);
+            vot_cbor::uint(&mut payload, 0);
+            vot_cbor::uint(&mut payload, 1);
+            vot_cbor::bytes(&mut payload, &[2; 16]);
+            for (key, value) in [
+                (2u64, 0u64),
+                (3, GROUP_BYTES),
+                (4, 3),
+                (5, 0),
+                (6, declared),
+            ] {
+                vot_cbor::uint(&mut payload, key);
+                vot_cbor::uint(&mut payload, value);
+            }
+            vot_cbor::uint(&mut payload, 7);
+            vot_cbor::bytes(&mut payload, &[0xaa; 3]);
+            let mut encoded = Vec::new();
+            encode_frame(frame_type::DATA_RECORD, &payload, &mut encoded).unwrap();
+            encoded
+        };
+        assert_eq!(
+            decode_data_record_ref(&frame(4), DecodeLimits::default()),
+            Err(Error::InvalidValue)
+        );
+        assert!(decode_data_record_ref(&frame(3), DecodeLimits::default()).is_ok());
     }
 
     #[test]

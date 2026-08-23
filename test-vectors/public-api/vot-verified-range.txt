@@ -2,8 +2,10 @@ constant vot_verified_range::MAX_PROOF_RANGE_BYTES
 constant vot_verified_range::RANGE_UNIT_BYTES
 enum vot_verified_range::Error
 function vot_verified_range::validate_typed_bundle
+function vot_verified_range::validate_typed_bundle_ref
 function vot_verified_range::verify_range
 function vot_verified_range::verify_typed_bundle
+function vot_verified_range::verify_typed_bundle_ref
 struct vot_verified_range::ValidatedBundle
 struct vot_verified_range::VerifiedRange
 struct vot_verified_range::VerifiedSlice

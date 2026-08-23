@@ -125,6 +125,7 @@ function vot_codec::encode_varint
 function vot_codec::frames::begin_data_record
 function vot_codec::frames::decode
 function vot_codec::frames::decode_auth_context_payload
+function vot_codec::frames::decode_data_record_ref
 function vot_codec::frames::decode_session_accept_payload
 function vot_codec::frames::decode_session_open_payload
 function vot_codec::frames::decode_session_reject_payload

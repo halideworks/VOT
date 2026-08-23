@@ -1518,11 +1518,13 @@ fn transfer_ranged_into<C: Carrier>(
                         return Ok(());
                     };
                     drop(taken);
-                    let range = ReliableReceiver::verify_typed_bundle(
-                        subject,
-                        &whole.bundle,
-                        &whole.records,
-                    )?;
+                    let records = whole
+                        .records
+                        .iter()
+                        .map(vot_codec::frames::DataRecordRef::from)
+                        .collect::<Vec<_>>();
+                    let range =
+                        ReliableReceiver::verify_typed_bundle(subject, &whole.bundle, &records)?;
                     let held = range.len();
                     witnesses.hold(held);
                     let placed = range.write_to(sink.as_ref());

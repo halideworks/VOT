@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use vot_transport_api::Error;
+use vot_transport_api::{Error, Payload};
 
 /// Largest partial frame held on a reliable lane while waiting for the rest.
 pub const MAX_PARTIAL_FRAME: usize = vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES;
@@ -221,6 +221,7 @@ impl<B: AssemblyBudget> Framing<B> {
                     );
                 }
             }
+            self.pending.reserve_exact(bytes.len());
         }
         self.pending.extend_from_slice(bytes);
         Ok(())
@@ -257,7 +258,7 @@ impl<B: AssemblyBudget> Framing<B> {
     pub fn accept(
         &mut self,
         bytes: &[u8],
-        mut emit: impl FnMut(&[u8]) -> Result<(), FrameFault>,
+        mut emit: impl FnMut(Payload) -> Result<(), FrameFault>,
     ) -> Result<(), FrameFault> {
         let control = self.control_limit.load(Ordering::Relaxed);
         let limits = vot_codec::DecodeLimits {
@@ -307,7 +308,7 @@ impl<B: AssemblyBudget> Framing<B> {
                 // left full, this branch would repeat forever.
                 let complete = self.take_pending();
                 debug_assert!(self.pending.is_empty(), "take_pending left bytes behind");
-                emit(&complete)?;
+                emit(complete.into())?;
                 continue;
             }
 
@@ -324,7 +325,7 @@ impl<B: AssemblyBudget> Framing<B> {
                 return Ok(());
             }
             if !envelope.skipped {
-                emit(&input[..envelope.total_length])?;
+                emit(input[..envelope.total_length].into())?;
             }
             input = &input[envelope.total_length..];
         }
@@ -704,7 +705,13 @@ mod tests {
         let whole = frame(400);
         let mut fault = None;
         for piece in whole.chunks(30) {
+            let capacity = framing.pending.capacity();
             if let Err(error) = framing.accept(piece, |_| Ok(())) {
+                assert_eq!(
+                    framing.pending.capacity(),
+                    capacity,
+                    "a refused growth allocated no uncharged memory"
+                );
                 fault = Some(error);
                 break;
             }

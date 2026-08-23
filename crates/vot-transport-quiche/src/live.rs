@@ -3109,13 +3109,12 @@ fn read_streams(
             let overflow = &mut state.overflow;
             let outcome = state.framing.accept(&buffer[..len], |frame| {
                 *sequence = sequence.wrapping_add(1);
-                let shared = vot_transport_api::shared_payload(frame);
                 let event = match kind {
-                    StreamKind::Control => NativeEvent::Control(shared),
+                    StreamKind::Control => NativeEvent::Control(frame),
                     StreamKind::Reliable { lane } => NativeEvent::Reliable {
                         lane,
                         sequence: *sequence,
-                        bytes: shared,
+                        bytes: frame,
                     },
                 };
                 let Ok(mut queue) = inbound.lock() else {

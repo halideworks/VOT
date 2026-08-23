@@ -2183,7 +2183,7 @@ pub mod live {
             let mut delivered = 0;
             framing
                 .accept(&read, |frame| {
-                    assert_eq!(frame, record.as_slice());
+                    assert_eq!(frame.as_ref(), record.as_slice());
                     delivered += 1;
                     Ok(())
                 })

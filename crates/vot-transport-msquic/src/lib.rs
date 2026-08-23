@@ -2230,9 +2230,9 @@ pub mod live {
             let refused = refused.expect("the shared budget never bit");
             assert_eq!(refused, super::FrameFault::exhausted());
             assert!(
-                streams.len() * head.len() <= MAX_CALLBACK_BYTES,
+                streams.len() * record.len() <= MAX_CALLBACK_BYTES,
                 "held {} bytes across {} streams",
-                streams.len() * head.len(),
+                streams.len() * record.len(),
                 streams.len()
             );
             assert!(
@@ -2266,7 +2266,7 @@ pub mod live {
                 framing.accept(&head, |_| Ok(())).unwrap();
                 assert_eq!(
                     budget.lock().unwrap().charged(),
-                    head.len(),
+                    record.len(),
                     "the partial frame is charged while it is held"
                 );
                 drop(framing);

@@ -3098,7 +3098,10 @@ fn read_streams(
                 };
                 MAX_ASSEMBLY_BYTES.saturating_sub(queue.charged())
             };
-            let needed = vot_transport_framing::MAX_PARTIAL_FRAME
+            let partial_limit = state
+                .kind
+                .partial_frame_limit(control_limit.load(Ordering::Relaxed));
+            let needed = partial_limit
                 .saturating_add(buffer.len())
                 .saturating_sub(state.framing.reserved());
             if headroom < needed {
@@ -5767,8 +5770,10 @@ mod tests {
 
         // At the exact threshold the read proceeds: headroom for one chunk
         // plus one partial frame is enough, not a byte more.
-        inbound.lock().expect("the queue").assembling =
-            MAX_ASSEMBLY_BYTES - (vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len());
+        let threshold = StreamKind::Control
+            .partial_frame_limit(control_limit.load(Ordering::Relaxed))
+            + buffer.len();
+        inbound.lock().expect("the queue").assembling = MAX_ASSEMBLY_BYTES - threshold;
         read_streams(
             &mut server,
             &mut streams,
@@ -6006,6 +6011,89 @@ mod tests {
             inbound.lock().expect("the queue").events.len(),
             1,
             "the charged spare capacity did not unblock the tail"
+        );
+    }
+
+    #[test]
+    fn a_large_control_frame_waits_for_its_own_headroom() {
+        let (mut client, mut server) = sans_io_pair(2_000_000);
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let mut frame = Vec::new();
+        vot_codec::encode_frame(
+            vot_codec::frame_type::PACKAGE_DESCRIPTOR,
+            &vec![0x27; vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD],
+            &mut frame,
+        )
+        .expect("a maximum control frame");
+        let split = vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD / 2 - 32;
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(
+            vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD,
+        ));
+        let mut streams = BTreeMap::new();
+        let state = stream_state(
+            &mut streams,
+            CONTROL_STREAM_ID,
+            StreamKind::Control,
+            &budget,
+            &control_limit,
+        );
+        state
+            .framing
+            .accept(&frame[..split], |_| panic!("a partial frame completed"))
+            .expect("the prefix fits");
+
+        let mut sent = split;
+        while sent < frame.len() {
+            match client.stream_send(CONTROL_STREAM_ID, &frame[sent..], false) {
+                Ok(written) => sent += written,
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("a stream: {error:?}"),
+            }
+            shuttle(&mut client, local, &mut server, remote);
+            shuttle(&mut server, remote, &mut client, local);
+        }
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        let reserved = streams
+            .get(&CONTROL_STREAM_ID)
+            .expect("the control stream")
+            .framing
+            .reserved();
+        let low_headroom = 100_000;
+        inbound.lock().expect("the queue").bytes = MAX_ASSEMBLY_BYTES - reserved - low_headroom;
+
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(
+            server.local_error().is_none(),
+            "backpressure closed the connection"
+        );
+        assert!(inbound.lock().expect("the queue").events.is_empty());
+
+        inbound.lock().expect("the queue").bytes = 0;
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(server.local_error().is_none());
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            1,
+            "the control frame did not arrive after headroom returned"
         );
     }
 

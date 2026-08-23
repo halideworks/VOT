@@ -369,6 +369,12 @@ impl<B: AssemblyBudget> Framing<B> {
         self.pending.len()
     }
 
+    /// Capacity this stream has already charged to its assembly budget.
+    #[must_use]
+    pub const fn reserved(&self) -> usize {
+        self.charged
+    }
+
     /// Whether a frame is part-way through arriving, whether it is being
     /// assembled or discarded.
     #[must_use]
@@ -534,7 +540,10 @@ mod tests {
         let whole = frame(1_024);
         collect(&mut framing, &whole[..100]).expect("a partial frame");
         assert_eq!(shared.held(), 128, "only amortized storage is reserved");
-        assert!(shared.held() < whole.len(), "future payload is not precharged");
+        assert!(
+            shared.held() < whole.len(),
+            "future payload is not precharged"
+        );
         assert_eq!(framing.buffered(), 100);
 
         collect(&mut framing, &whole[100..]).expect("the rest of the frame");

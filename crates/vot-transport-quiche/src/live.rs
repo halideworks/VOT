@@ -3098,7 +3098,10 @@ fn read_streams(
                 };
                 MAX_ASSEMBLY_BYTES.saturating_sub(queue.charged())
             };
-            if headroom < vot_transport_framing::MAX_PARTIAL_FRAME.saturating_add(buffer.len()) {
+            let needed = vot_transport_framing::MAX_PARTIAL_FRAME
+                .saturating_add(buffer.len())
+                .saturating_sub(state.framing.reserved());
+            if headroom < needed {
                 break;
             }
             let Ok((len, fin)) = conn.stream_recv(id, buffer) else {
@@ -5941,6 +5944,68 @@ mod tests {
             inbound.lock().expect("the queue").events.len(),
             1,
             "the split frame never assembled"
+        );
+    }
+
+    #[test]
+    fn a_split_frame_reuses_its_reserved_headroom() {
+        let (mut client, mut server) = sans_io_pair(1_000_000);
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
+        let frame = record(&vec![0x27; vot_transport_api::MAX_DATA_RECORD_BYTES]);
+        let split = frame.len() / 2;
+        let inbound = Arc::new(Mutex::new(Inbound::default()));
+        let budget = SharedBudget(Arc::clone(&inbound));
+        let control_limit = Arc::new(AtomicUsize::new(1_000_000));
+        let mut streams = BTreeMap::new();
+        let id = stream_for_lane(0, Role::Client).expect("a lane");
+        let lane = lane_for_stream(id, Role::Server).expect("the peer lane");
+        let state = stream_state(
+            &mut streams,
+            id,
+            StreamKind::Reliable { lane },
+            &budget,
+            &control_limit,
+        );
+        state
+            .framing
+            .accept(&frame[..split], |_| panic!("a partial frame completed"))
+            .expect("the prefix fits");
+        let reserved = state.framing.reserved();
+        assert!(reserved > split, "the prefix reserved no spare capacity");
+
+        let mut sent = split;
+        while sent < frame.len() {
+            match client.stream_send(id, &frame[sent..], false) {
+                Ok(written) => sent += written,
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("a stream: {error:?}"),
+            }
+            shuttle(&mut client, local, &mut server, remote);
+            shuttle(&mut server, remote, &mut client, local);
+        }
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        let old_threshold = vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len();
+        inbound.lock().expect("the queue").bytes = MAX_ASSEMBLY_BYTES - old_threshold;
+        assert!(
+            MAX_ASSEMBLY_BYTES - inbound.lock().expect("the queue").charged() < old_threshold,
+            "the test left enough headroom for the old gate"
+        );
+
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
+        assert!(server.local_error().is_none());
+        assert_eq!(
+            inbound.lock().expect("the queue").events.len(),
+            1,
+            "the charged spare capacity did not unblock the tail"
         );
     }
 

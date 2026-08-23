@@ -117,13 +117,7 @@ impl TypedFrame {
 /// Encodes one typed frame and its bounded envelope.
 pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
     if let TypedFrame::DataRecord(value) = frame {
-        validate_data_record(value)?;
-        let payload_len = data_record_payload_len(value);
-        output.reserve(payload_len.saturating_add(9));
-        encode_varint(frame_type::DATA_RECORD, output)?;
-        encode_varint(payload_len as u64, output)?;
-        encode_validated_data_record(value, output);
-        return Ok(());
+        return encode_data_record(value.into(), output);
     }
     let mut payload = Vec::new();
     match frame {
@@ -160,6 +154,17 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
         TypedFrame::CodingEpochClose(value) => encode_coding_epoch_close(*value, &mut payload),
     }
     encode_frame(frame.frame_type(), &payload, output)?;
+    Ok(())
+}
+
+/// Encodes one borrowed data record and its bounded envelope.
+pub fn encode_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) -> Result<(), Error> {
+    validate_data_record(value)?;
+    let payload_len = data_record_payload_len(value);
+    output.reserve(payload_len.saturating_add(9));
+    encode_varint(frame_type::DATA_RECORD, output)?;
+    encode_varint(payload_len as u64, output)?;
+    encode_validated_data_record(value, output);
     Ok(())
 }
 
@@ -1466,20 +1471,28 @@ mod tests {
             encoded: vec![1, 2, 3],
         };
         let mut payload = Vec::new();
-        encode_validated_data_record(&data, &mut payload);
+        encode_validated_data_record((&data).into(), &mut payload);
         let mut expected = vec![0xaa];
         encode_frame(frame_type::DATA_RECORD, &payload, &mut expected).unwrap();
         let mut actual = vec![0xaa];
         encode(&TypedFrame::DataRecord(data.clone()), &mut actual).unwrap();
         assert_eq!(actual, expected);
+        let mut borrowed = vec![0xaa];
+        encode_data_record((&data).into(), &mut borrowed).unwrap();
+        assert_eq!(borrowed, expected);
 
         data.record_index = 17;
         let before = actual.clone();
         assert_eq!(
-            encode(&TypedFrame::DataRecord(data), &mut actual),
+            encode(&TypedFrame::DataRecord(data.clone()), &mut actual),
             Err(Error::InvalidValue)
         );
         assert_eq!(actual, before);
+        assert_eq!(
+            encode_data_record((&data).into(), &mut borrowed),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(borrowed, before);
     }
 
     #[test]
@@ -1563,7 +1576,8 @@ mod tests {
             encoded: vec![0xaa; encoded_length],
         };
         let mut maximum_encoded_length = MAX_DATA_BYTES;
-        while data_record_payload_len(&make_data(maximum_encoded_length)) > MAX_DATA_BYTES {
+        while data_record_payload_len((&make_data(maximum_encoded_length)).into()) > MAX_DATA_BYTES
+        {
             maximum_encoded_length -= 1;
         }
         let valid = make_data(maximum_encoded_length);
@@ -1571,7 +1585,7 @@ mod tests {
         assert!(encode(&TypedFrame::DataRecord(valid), &mut Vec::new()).is_ok());
 
         let invalid = make_data(maximum_encoded_length + 1);
-        assert!(data_record_payload_len(&invalid) > MAX_DATA_BYTES);
+        assert!(data_record_payload_len((&invalid).into()) > MAX_DATA_BYTES);
         assert_eq!(invalid.validate(), Err(Error::InvalidValue));
         assert_eq!(
             encode(&TypedFrame::DataRecord(invalid), &mut Vec::new()),

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use vot_codec::frames::{
-    self, DataRecord, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest, TypedFrame,
+    self, DataRecord, DataRecordRef, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest,
+    TypedFrame,
 };
 use vot_codec::{DecodeLimits, error_code, frame_type};
 use vot_object::{ObjectBuilder, PreparedObject};
@@ -95,6 +96,12 @@ pub(crate) fn is_backpressure(error: &vot_session::Error) -> bool {
 pub(crate) fn encoded(frame: &TypedFrame) -> Result<Payload, Error> {
     let mut wire = Vec::new();
     frames::encode(frame, &mut wire)?;
+    Ok(shared_payload(&wire))
+}
+
+pub(crate) fn encoded_record(record: DataRecordRef<'_>) -> Result<Payload, Error> {
+    let mut wire = Vec::new();
+    frames::encode_data_record(record, &mut wire)?;
     Ok(shared_payload(&wire))
 }
 

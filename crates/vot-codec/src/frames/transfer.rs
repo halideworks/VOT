@@ -60,9 +60,33 @@ pub struct DataRecord {
     pub encoded: Vec<u8>,
 }
 
+/// A data record whose encoded bytes remain owned by its caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataRecordRef<'data> {
+    pub bundle_id: [u8; 16],
+    pub record_index: u64,
+    pub plaintext_offset: u64,
+    pub plaintext_length: u64,
+    pub compression: u8,
+    pub encoded: &'data [u8],
+}
+
+impl<'data> From<&'data DataRecord> for DataRecordRef<'data> {
+    fn from(value: &'data DataRecord) -> Self {
+        Self {
+            bundle_id: value.bundle_id,
+            record_index: value.record_index,
+            plaintext_offset: value.plaintext_offset,
+            plaintext_length: value.plaintext_length,
+            compression: value.compression,
+            encoded: &value.encoded,
+        }
+    }
+}
+
 impl DataRecord {
     pub fn validate(&self) -> Result<(), Error> {
-        validate_data_record(self)
+        validate_data_record(self.into())
     }
 }
 
@@ -281,7 +305,7 @@ pub(super) fn proof_bundle_payload_len_with(value: &ProofBundle, proof_len: usiz
         .saturating_add(cbor_byte_string_len(proof_len))
 }
 
-pub(super) fn encode_validated_data_record(value: &DataRecord, output: &mut Vec<u8>) {
+pub(super) fn encode_validated_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) {
     vot_cbor::map(output, 8);
     vot_cbor::uint(output, 0);
     vot_cbor::uint(output, 0);
@@ -298,7 +322,7 @@ pub(super) fn encode_validated_data_record(value: &DataRecord, output: &mut Vec<
     vot_cbor::uint(output, 6);
     vot_cbor::uint(output, value.encoded.len() as u64);
     vot_cbor::uint(output, 7);
-    vot_cbor::bytes(output, &value.encoded);
+    vot_cbor::bytes(output, value.encoded);
 }
 
 pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
@@ -334,11 +358,11 @@ pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
         compression,
         encoded,
     };
-    validate_data_record(&value)?;
+    validate_data_record((&value).into())?;
     Ok(value)
 }
 
-pub(super) fn validate_data_record(value: &DataRecord) -> Result<(), Error> {
+pub(super) fn validate_data_record(value: DataRecordRef<'_>) -> Result<(), Error> {
     let encoded_length = value.encoded.len() as u64;
     if value.record_index > 16
         || value.plaintext_offset > MAX_OBJECT_LENGTH
@@ -355,7 +379,7 @@ pub(super) fn validate_data_record(value: &DataRecord) -> Result<(), Error> {
     }
 }
 
-pub(super) fn data_record_payload_len(value: &DataRecord) -> usize {
+pub(super) fn data_record_payload_len(value: DataRecordRef<'_>) -> usize {
     cbor_head_len(8)
         .saturating_add(cbor_head_len(0))
         .saturating_add(cbor_head_len(0))

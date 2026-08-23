@@ -770,17 +770,12 @@ impl BundleServer {
                 encoded_length,
             };
             let mut wire = Vec::new();
-            let encoded = frames::reserve_data_record(record, &mut wire).map_err(Error::from)?;
+            let encoded = frames::begin_data_record(record, &mut wire).map_err(Error::from)?;
             records.push((wire, encoded));
             record_offset = record_offset.saturating_add(encoded_length as u64);
             remaining -= encoded_length;
         }
-        let mut parts: Vec<&mut [u8]> = records
-            .iter_mut()
-            .map(|(wire, encoded)| &mut wire[encoded.clone()])
-            .collect();
-        served.read_covered_into(covered_offset, &mut parts)?;
-        drop(parts);
+        served.read_covered_appending(covered_offset, &mut records)?;
         connection.queue_control(encoded(&bundle)?);
         for (wire, _) in records {
             connection.queue_record(Payload::from(wire));

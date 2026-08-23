@@ -161,14 +161,14 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
 /// Encodes one borrowed data record and its bounded envelope.
 pub fn encode_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) -> Result<(), Error> {
     let encoded = value.encoded;
-    let range = reserve_data_record(value.into(), output)?;
-    output[range].copy_from_slice(encoded);
+    begin_data_record(value.into(), output)?;
+    output.extend_from_slice(encoded);
     Ok(())
 }
 
-/// Encodes a data-record envelope with a zeroed encoded-byte field and returns
-/// the field's range so a caller can fill it in place.
-pub fn reserve_data_record(
+/// Encodes a data-record envelope up to its encoded-byte field, reserves that
+/// field, and returns the range that appending its bytes will fill.
+pub fn begin_data_record(
     value: DataRecordHeader,
     output: &mut Vec<u8>,
 ) -> Result<Range<usize>, Error> {
@@ -184,8 +184,18 @@ pub fn reserve_data_record(
     encode_varint(payload_len as u64, output)?;
     encode_validated_data_record_header(value, output);
     let start = output.len();
-    output.resize(start.saturating_add(value.encoded_length), 0);
-    Ok(start..output.len())
+    Ok(start..start.saturating_add(value.encoded_length))
+}
+
+/// Encodes a data-record envelope with a zeroed encoded-byte field and returns
+/// the field's range so a caller can fill it in place.
+pub fn reserve_data_record(
+    value: DataRecordHeader,
+    output: &mut Vec<u8>,
+) -> Result<Range<usize>, Error> {
+    let range = begin_data_record(value, output)?;
+    output.resize(range.end, 0);
+    Ok(range)
 }
 
 /// Decodes one typed frame without accepting an unknown application payload.
@@ -1505,6 +1515,12 @@ mod tests {
         assert_eq!(reserved[encoded.clone()], [0, 0, 0]);
         reserved[encoded].copy_from_slice(&data.encoded);
         assert_eq!(reserved, expected);
+        let mut begun = vec![0xaa];
+        let encoded = begin_data_record((&data).into(), &mut begun).unwrap();
+        assert_eq!(begun.len(), encoded.start);
+        begun.extend_from_slice(&data.encoded);
+        assert_eq!(begun.len(), encoded.end);
+        assert_eq!(begun, expected);
 
         data.record_index = 17;
         let before = actual.clone();

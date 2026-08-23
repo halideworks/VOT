@@ -183,8 +183,7 @@ pub struct Framing<B: AssemblyBudget> {
     /// The one permit for storage reserved by `pending` against the shared
     /// budget. One per stream, however many pieces the frame arrives in.
     hold: Option<B::Hold>,
-    /// Bytes charged and reserved for the frame in `pending`. Once its
-    /// envelope is known, this is the complete frame size.
+    /// Bytes charged and reserved for the frame in `pending`.
     charged: usize,
     budget: B,
     kind: StreamKind,
@@ -208,8 +207,11 @@ impl<B: AssemblyBudget> Framing<B> {
     /// # Errors
     /// Reports a budget the peer has already spent, which is a resource limit
     /// rather than a malformed frame.
-    fn hold(&mut self, bytes: &[u8], target: usize) -> Result<(), FrameFault> {
-        debug_assert!(target >= self.pending.len() + bytes.len());
+    fn hold(&mut self, bytes: &[u8], frame_length: Option<usize>) -> Result<(), FrameFault> {
+        let required = self.pending.len() + bytes.len();
+        let geometric = required.checked_next_power_of_two().unwrap_or(required);
+        let target = frame_length.map_or(geometric, |length| geometric.min(length));
+        debug_assert!(target >= required);
         let growth = target.saturating_sub(self.charged);
         if growth != 0 {
             match &mut self.hold {
@@ -292,7 +294,7 @@ impl<B: AssemblyBudget> Framing<B> {
             if !self.pending.is_empty() {
                 let Some(envelope) = self.envelope(limits, control, None)? else {
                     // Header incomplete: take one byte and retry.
-                    self.hold(&input[..1], self.pending.len() + 1)?;
+                    self.hold(&input[..1], None)?;
                     input = &input[1..];
                     continue;
                 };
@@ -304,7 +306,7 @@ impl<B: AssemblyBudget> Framing<B> {
                     input = &input[taken..];
                     continue;
                 }
-                self.hold(&input[..taken], envelope.total_length)?;
+                self.hold(&input[..taken], Some(envelope.total_length))?;
                 input = &input[taken..];
                 if self.pending.len() < envelope.total_length {
                     return Ok(());
@@ -319,7 +321,7 @@ impl<B: AssemblyBudget> Framing<B> {
             }
 
             let Some(envelope) = self.envelope(limits, control, Some(input))? else {
-                self.hold(input, self.pending.len() + input.len())?;
+                self.hold(input, None)?;
                 return Ok(());
             };
             if input.len() < envelope.total_length {
@@ -327,7 +329,7 @@ impl<B: AssemblyBudget> Framing<B> {
                     self.discarding = envelope.total_length - input.len();
                     return Ok(());
                 }
-                self.hold(input, envelope.total_length)?;
+                self.hold(input, Some(envelope.total_length))?;
                 return Ok(());
             }
             if !envelope.skipped {
@@ -526,12 +528,13 @@ mod tests {
     }
 
     #[test]
-    fn reserved_frame_bytes_are_charged_and_returned() {
+    fn frame_storage_grows_geometrically_and_is_returned() {
         let shared = budget();
         let mut framing = Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
         let whole = frame(1_024);
         collect(&mut framing, &whole[..100]).expect("a partial frame");
-        assert_eq!(shared.held(), whole.len(), "the known frame is reserved");
+        assert_eq!(shared.held(), 128, "only amortized storage is reserved");
+        assert!(shared.held() < whole.len(), "future payload is not precharged");
         assert_eq!(framing.buffered(), 100);
 
         collect(&mut framing, &whole[100..]).expect("the rest of the frame");
@@ -539,7 +542,7 @@ mod tests {
 
         let mut reset = Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
         collect(&mut reset, &whole[..50]).expect("a partial frame");
-        assert_eq!(shared.held(), whole.len());
+        assert_eq!(shared.held(), 64);
         drop(reset);
         assert_eq!(shared.held(), 0);
     }
@@ -547,7 +550,7 @@ mod tests {
     #[test]
     fn a_peer_cannot_hold_more_than_the_budget_across_streams() {
         let whole = frame(1_024);
-        let shared = Arc::new(StandaloneBudget::new(whole.len()));
+        let shared = Arc::new(StandaloneBudget::new(128));
         let mut first = Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
         let mut second = Framing::new(StreamKind::Control, Arc::clone(&shared), control_limit());
         collect(&mut first, &whole[..100]).expect("a partial frame");
@@ -565,7 +568,7 @@ mod tests {
         first.release();
         assert_eq!(shared.held(), 0);
         assert_eq!(collect(&mut second, &whole[..100]), Ok(Vec::new()));
-        assert_eq!(shared.held(), whole.len());
+        assert_eq!(shared.held(), 128);
     }
 
     #[test]
@@ -752,8 +755,8 @@ mod tests {
     #[test]
     fn the_budget_charge_always_covers_reserved_storage() {
         // After every accept, the shared budget holds exactly what the framer
-        // reserved. Once known, that covers the complete frame. A skipped
-        // frame charges nothing at any point.
+        // reserved. Capacity grows geometrically up to the complete frame,
+        // while a skipped frame charges nothing at any point.
         let mut stream = Vec::new();
         stream.extend_from_slice(&frame(64));
         vot_codec::encode_frame(0x1f00, &vec![0x11; 900], &mut stream)

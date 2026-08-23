@@ -1056,20 +1056,31 @@ mod tests {
     fn a_coded_window_is_not_evidence_about_the_path() {
         // The whole point: what the path does while this end is adding
         // redundancy to it says as much about the redundancy as the path.
+        // Read the path's rate on a quiet stretch first, so there is a
+        // value the coded windows could move.
         let (mut policy, mut st) = engaged_policy();
-        let before = policy.unaided_loss();
-        for _ in 0..4 {
-            st.0 += 8192;
-            st.1 += 8192 * 200_000 / 1_000_000;
-            policy.observe(Some(path_sample(st.1, 0, st.0)));
-            let (pausing, ..) = policy.probe_state();
-            if pausing > 0 {
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
                 break;
             }
         }
+        let before = policy.unaided_loss();
+        assert!(before > 0, "the quiet stretch was measured");
+
+        // Now hand it coded windows at twenty percent, stopping short of
+        // the arming that would reset the reading anyway.
+        feedback_windows(&mut policy, &mut st, 24, 20_000, 200_000);
+        assert!(policy.coding(), "the path turned lossy and is coded again");
+        let coded_before = policy.unaided_loss();
+        for _ in 0..3 {
+            st.0 += 8192;
+            st.1 += 8192 * 200_000 / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+        }
         assert_eq!(
             policy.unaided_loss(),
-            before,
+            coded_before,
             "twenty percent under coding moved the path's own rate"
         );
     }
@@ -1155,7 +1166,21 @@ mod tests {
     fn a_counter_reset_clears_the_looks_state_too() {
         // A reset is a new path, and what the old one was measured to
         // need says nothing about it.
+        // A carry-on look first, so the cadence has moved off its
+        // starting value and the reset has something to undo.
         let (mut policy, mut st) = engaged_policy();
+        for _ in 0..400 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
+            let (_, _, _, interval) = policy.probe_state();
+            if interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+        let (_, _, _, interval) = policy.probe_state();
+        assert!(
+            interval > connection::PROBE_FIRST_INTERVAL,
+            "a look carried on"
+        );
         for _ in 0..600 {
             feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
             if policy.quiet_path() {

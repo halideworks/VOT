@@ -2208,10 +2208,10 @@ mod tests {
         let flushes = client.adapter().flushes;
         let control = vot_transport_api::shared_payload(&frame_of(frame_type::PING, 0));
         client.send_control_shared(control.clone()).unwrap();
-        assert!(std::sync::Arc::ptr_eq(
-            &control,
-            &client.adapter().shared_controls[0]
-        ));
+        assert_eq!(
+            control.as_ptr(),
+            client.adapter().shared_controls[0].as_ptr()
+        );
         client
             .send_reliable_shared(
                 StreamId(3),

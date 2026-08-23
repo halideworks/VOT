@@ -6,6 +6,7 @@ mod permit;
 pub use permit::{Ledger, Permit};
 
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -187,11 +188,42 @@ pub enum DatagramSendState {
 
 /// A payload whose allocation can be shared between the transport driver and
 /// application workers.
-pub type Payload = Arc<[u8]>;
+///
+/// Opaque so an owned buffer can be adopted without exposing its storage.
+/// Clone the payload to share it and use its byte-slice interfaces to read it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payload(Arc<Vec<u8>>);
+
+impl Deref for Payload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        let bytes = bytes.into_boxed_slice().into_vec();
+        Self(Arc::new(bytes))
+    }
+}
+
+impl From<&[u8]> for Payload {
+    fn from(bytes: &[u8]) -> Self {
+        Self::from(bytes.to_vec())
+    }
+}
 
 #[must_use]
 pub fn shared_payload(bytes: &[u8]) -> Payload {
-    Arc::from(bytes)
+    Payload::from(bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1066,6 +1098,22 @@ mod tests {
         let binding = ChannelBinding::from_bytes([0x27; CHANNEL_BINDING_LEN]);
         assert_eq!(binding.as_bytes(), &[0x27; CHANNEL_BINDING_LEN]);
         assert_eq!(format!("{binding:?}"), "ChannelBinding([redacted])");
+    }
+
+    #[test]
+    fn payload_adopts_owned_vec_and_shares_clones() {
+        let owned = vec![1, 2, 3];
+        let allocation = owned.as_ptr();
+        let payload = Payload::from(owned);
+        let cloned = payload.clone();
+        assert_eq!(payload.as_ptr(), allocation);
+        assert_eq!(cloned.as_ptr(), allocation);
+        assert_eq!(payload.as_ref(), [1, 2, 3]);
+
+        let mut oversized = Vec::with_capacity(1 << 20);
+        oversized.push(7);
+        let bounded = Payload::from(oversized);
+        assert_eq!(bounded.0.capacity(), bounded.len());
     }
 
     #[test]

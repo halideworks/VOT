@@ -279,11 +279,22 @@ impl FecPolicy {
         } else {
             self.smoothed_loss - self.smoothed_loss / RATE_SMOOTHING + window_rate / RATE_SMOOTHING
         };
-        self.sustained_lost = self.sustained_lost.saturating_add(self.sample_lost);
-        self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
-        self.sustained_loss =
-            (self.sustained_lost.saturating_mul(RATE_ONE)) / self.sustained_sent.max(1);
-        self.windows_closed = self.windows_closed.saturating_add(1);
+        // Only while this end is not coding. Redundancy is more packets
+        // into whatever queue is dropping them, so a rate measured under
+        // coding is partly coding's own: on a real path carrying no loss
+        // of its own, the reliable arm sustains 2.29% and the coded arm
+        // of the same transfer sustains 6.5%. Judging engagement by a
+        // number engagement inflates is a loop that holds itself shut,
+        // which is measured: a veto reading the coded rate never armed.
+        // What this holds is the rate the path shows when nothing is
+        // being added to it.
+        if !self.coding {
+            self.sustained_lost = self.sustained_lost.saturating_add(self.sample_lost);
+            self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
+            self.sustained_loss =
+                (self.sustained_lost.saturating_mul(RATE_ONE)) / self.sustained_sent.max(1);
+            self.windows_closed = self.windows_closed.saturating_add(1);
+        }
         // Two-sided, because the sustained rate of a path whose loss is
         // its own controller's sits near the bar with real variance, and
         // a single edge would flap the way per-window hysteresis flapped

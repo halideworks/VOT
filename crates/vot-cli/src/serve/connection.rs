@@ -126,6 +126,24 @@ pub(crate) struct FecPolicy {
     /// which is what lengthens the next hold.
     hold: u32,
     decode_failures: u32,
+    /// The last unaided window rates, where the next one goes, and their
+    /// mean: the path's own rate, measured only when this end is adding
+    /// nothing to it.
+    recent: [u32; PROBE_WINDOWS],
+    recent_at: usize,
+    recent_len: usize,
+    unaided_loss: u64,
+    /// The pause cadence: coded windows since the last pause, how many
+    /// to allow before the next, and how many windows of the current
+    /// pause remain.
+    coded_since_probe: u32,
+    probe_interval: u32,
+    pausing: u32,
+    /// Closed windows so far, only to skip the opening ramp.
+    windows_closed: u32,
+    /// Whether the last unaided look said this path does not need
+    /// coding.
+    quiet_path: bool,
 }
 
 impl Default for FecPolicy {
@@ -143,6 +161,15 @@ impl Default for FecPolicy {
             smoothed_failure: 0,
             hold: 0,
             decode_failures: 0,
+            recent: [0; PROBE_WINDOWS],
+            recent_at: 0,
+            recent_len: 0,
+            unaided_loss: 0,
+            coded_since_probe: 0,
+            probe_interval: PROBE_FIRST_INTERVAL,
+            pausing: 0,
+            windows_closed: 0,
+            quiet_path: false,
         }
     }
 }
@@ -163,6 +190,44 @@ const RATE_SMOOTHING: u64 = 4;
 /// The most a first lossy window may seed the smoothed rate with: a
 /// tenth, well past the engagement rate.
 const SEED_CEILING: u64 = RATE_ONE / 10;
+
+/// Unaided windows the path's own rate is averaged over.
+///
+/// A trailing window rather than a mean over the connection, because a
+/// mean that never forgets is carried over the bar by the ramp it opened
+/// with: traced on a real 12 GiB transfer with coding off throughout,
+/// the running mean climbs to 4.11% at windows seventeen through
+/// twenty-one before decaying to 2.4% by window forty.
+const PROBE_WINDOWS: usize = 16;
+
+/// Unaided windows that must be in hand before the probe will judge.
+const PROBE_MIN_WINDOWS: usize = 4;
+
+/// Coded windows before the first pause, doubling to
+/// [`PROBE_MAX_INTERVAL`] each time the pause says to carry on.
+///
+/// Every observable this end can read while coding runs is downstream of
+/// coding's own traffic: loss, delay, drops, decode outcomes, and
+/// whether decoding needed repair are all endogenous to the engagement
+/// they would judge, which is why five in-band discriminators died the
+/// same death on real paths. The only measurement that means anything is
+/// one taken with nothing added to the path, so the policy stops adding
+/// for a moment and looks. That is what a delay-targeting rate
+/// controller does continuously and is the reason it never traps itself.
+const PROBE_FIRST_INTERVAL: u32 = 8;
+
+/// The longest a settled answer goes unchecked.
+const PROBE_MAX_INTERVAL: u32 = 64;
+
+/// Windows one pause lasts.
+///
+/// The cost is arithmetic and bounded, which is what separates this from
+/// an open-ended experiment on a path where coding may be winning:
+/// pausing four windows in sixty-four leaves about 6% of a transfer
+/// uncoded, so on a path where coding wins 6% the probe costs about 0.4%
+/// of the wall, against the 30% it recovers on a path where coding is
+/// wrong.
+const PROBE_PAUSE_WINDOWS: u32 = 4;
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -197,6 +262,15 @@ impl FecPolicy {
             self.sample_sent = 0;
             self.smoothed_loss = 0;
             self.smoothed_failure = 0;
+            self.recent = [0; PROBE_WINDOWS];
+            self.recent_at = 0;
+            self.recent_len = 0;
+            self.unaided_loss = 0;
+            self.coded_since_probe = 0;
+            self.probe_interval = PROBE_FIRST_INTERVAL;
+            self.pausing = 0;
+            self.windows_closed = 0;
+            self.quiet_path = false;
             return;
         };
         self.sample_lost = self
@@ -231,6 +305,8 @@ impl FecPolicy {
         } else {
             self.smoothed_loss - self.smoothed_loss / RATE_SMOOTHING + window_rate / RATE_SMOOTHING
         };
+        self.observe_unaided(window_rate);
+        self.run_probe();
 
         let rate = u128::from(self.smoothed_loss);
         // Three times the expected losses across a generation's symbols,
@@ -261,6 +337,9 @@ impl FecPolicy {
         } else {
             self.smoothed_loss * 25 >= RATE_ONE
         };
+        // A pause is a measurement, and the last one has the final word
+        // on whether this path wants coding at all.
+        let engaged = engaged && self.pausing == 0 && !self.quiet_path;
         if engaged && !self.coding {
             // An engagement is judged on its own outcomes. What is still
             // resolving from the last one arrives for generations coded
@@ -278,6 +357,79 @@ impl FecPolicy {
         self.coding = engaged;
         self.sample_lost = 0;
         self.sample_sent = 0;
+    }
+
+    /// Takes a closed window into the unaided rate, if this end was
+    /// adding nothing to the path while it ran.
+    ///
+    /// The opening window is the amplification-shaped ramp and describes
+    /// no path, and a coded window describes coding as much as the path,
+    /// so neither is evidence.
+    fn observe_unaided(&mut self, window_rate: u64) {
+        if self.coding || self.windows_closed == 0 {
+            self.windows_closed = self.windows_closed.saturating_add(1);
+            return;
+        }
+        self.windows_closed = self.windows_closed.saturating_add(1);
+        self.recent[self.recent_at] = u32::try_from(window_rate).unwrap_or(u32::MAX);
+        self.recent_at = (self.recent_at + 1) % PROBE_WINDOWS;
+        self.recent_len = self.recent_len.saturating_add(1).min(PROBE_WINDOWS);
+        let total: u64 = self.recent[..self.recent_len]
+            .iter()
+            .map(|rate| u64::from(*rate))
+            .sum();
+        self.unaided_loss = total / self.recent_len as u64;
+    }
+
+    /// Runs the pause cadence: counts coded windows toward the next
+    /// look, spends a pause, and reads the verdict when one ends.
+    fn run_probe(&mut self) {
+        if self.pausing > 0 {
+            self.pausing -= 1;
+            if self.pausing == 0 {
+                self.quiet_path = self.judged_quiet();
+                if !self.quiet_path {
+                    // The look said carry on, so the next one is further
+                    // off; a settled answer is not worth re-asking at
+                    // the same rate.
+                    self.probe_interval = self
+                        .probe_interval
+                        .saturating_mul(2)
+                        .min(PROBE_MAX_INTERVAL);
+                }
+            }
+            return;
+        }
+        if self.quiet_path {
+            // Nothing is being added, so the evidence keeps arriving on
+            // its own and a path that turns lossy is served again
+            // without a pause to discover it.
+            if self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 25 >= RATE_ONE {
+                self.quiet_path = false;
+                self.coded_since_probe = 0;
+                self.probe_interval = PROBE_FIRST_INTERVAL;
+            }
+            return;
+        }
+        if !self.coding {
+            return;
+        }
+        self.coded_since_probe = self.coded_since_probe.saturating_add(1);
+        if self.coded_since_probe >= self.probe_interval {
+            self.coded_since_probe = 0;
+            self.pausing = PROBE_PAUSE_WINDOWS;
+            // The look is over this pause's own windows and nothing
+            // older, so the verdict cannot be carried by history from
+            // before the engagement it is judging.
+            self.recent_at = 0;
+            self.recent_len = 0;
+            self.unaided_loss = 0;
+        }
+    }
+
+    /// Whether the unaided look says this path does not need coding.
+    const fn judged_quiet(&self) -> bool {
+        self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 40 < RATE_ONE
     }
 
     /// Counts a coded generation the receiver decoded from symbols.
@@ -343,6 +495,24 @@ impl FecPolicy {
 
     pub(crate) const fn coding(&self) -> bool {
         self.coding
+    }
+
+    /// Whether the last unaided look said this path does not need
+    /// coding.
+    #[cfg(test)]
+    pub(crate) const fn quiet_path(&self) -> bool {
+        self.quiet_path
+    }
+
+    /// The path's own rate in [`RATE_ONE`]ths, from unaided windows.
+    #[cfg(test)]
+    pub(crate) const fn unaided_loss(&self) -> u64 {
+        self.unaided_loss
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn probe_state(&self) -> (u32, usize, u32) {
+        (self.pausing, self.recent_len, self.coded_since_probe)
     }
 
     pub(crate) const fn repair_symbols(&self) -> usize {

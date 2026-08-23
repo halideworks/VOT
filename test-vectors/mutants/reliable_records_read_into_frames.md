@@ -19,3 +19,10 @@ or timed out.
 Six interleaved, storage-inclusive 4 GiB loopback transfers reduced median
 sender CPU from 7.79 to 6.49 core-seconds and median wall time from 2.74 to 2.68
 seconds. Every run verified the same root and byte count.
+
+The follow-up append path selected 19 codec mutants: 5 caught, 14 unviable,
+and none missed. Its service run caught 10 of 11 mutants; the survivor exposed
+two equivalent length checks, so the redundant check was deleted. The final
+iteration caught all four changed or previously surviving mutants. Three more
+interleaved 4 GiB runs per arm reduced aggregate sender CPU from 20.55 to 19.70
+core-seconds and median wall time from 2.61 to 2.54 seconds.

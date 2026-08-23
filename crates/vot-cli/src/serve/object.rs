@@ -239,11 +239,53 @@ impl ServedObject {
         for part in parts.iter_mut() {
             file.read_exact(part).map_err(short_read)?;
         }
+        self.verify_read(&file, offset, length, parts)
+    }
+
+    /// Appends one cover into reserved record fields without initializing them
+    /// before the file read, then verifies their joined bytes.
+    pub(crate) fn read_covered_appending(
+        &self,
+        offset: u64,
+        records: &mut [(Vec<u8>, std::ops::Range<usize>)],
+    ) -> Result<(), Error> {
+        let length = records.iter().try_fold(0usize, |length, (_, range)| {
+            length.checked_add(range.len()).ok_or(Error::InvalidBundle)
+        })?;
+        let mut file = File::open(&self.path).map_err(missing_object)?;
+        file.seek(SeekFrom::Start(offset))?;
+        for (wire, range) in records.iter_mut() {
+            if wire.len() != range.start {
+                return Err(Error::InvalidBundle);
+            }
+            let expected = range.len();
+            file.by_ref()
+                .take(expected as u64)
+                .read_to_end(wire)
+                .map_err(short_read)?;
+            if wire.len() != range.end {
+                return Err(short_read(io::Error::from(io::ErrorKind::UnexpectedEof)));
+            }
+        }
+        let parts: Vec<&mut [u8]> = records
+            .iter_mut()
+            .map(|(wire, range)| &mut wire[range.clone()])
+            .collect();
+        self.verify_read(&file, offset, length, &parts)
+    }
+
+    fn verify_read(
+        &self,
+        file: &File,
+        offset: u64,
+        length: usize,
+        parts: &[&mut [u8]],
+    ) -> Result<(), Error> {
         let span = spanned_groups(offset, length);
         let checked = self.verified.as_ref().is_none_or(|verified| {
             span.is_some_and(|(first, count)| verified.holds_span(first, count))
         });
-        if checked && self.witness.reports_untouched(&Witness::of(&file)?) {
+        if checked && self.witness.reports_untouched(&Witness::of(file)?) {
             return Ok(());
         }
         if !self.holds_parts(offset, length, parts) {

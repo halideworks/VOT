@@ -1040,6 +1040,57 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_a_look_reads_against_has_an_exact_edge() {
+        assert!(connection::under_probe_bar(0));
+        assert!(connection::under_probe_bar(connection::PROBE_BAR - 1));
+        assert!(!connection::under_probe_bar(connection::PROBE_BAR));
+        assert!(!connection::under_probe_bar(u64::MAX));
+    }
+
+    #[test]
+    fn a_coded_window_is_not_evidence_about_the_path() {
+        // The whole point: what the path does while this end is adding
+        // redundancy to it says as much about the redundancy as the path.
+        let (mut policy, mut st) = engaged_policy();
+        let before = policy.unaided_loss();
+        for _ in 0..4 {
+            st.0 += 8192;
+            st.1 += 8192 * 200_000 / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+            let (pausing, ..) = policy.probe_state();
+            if pausing > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            policy.unaided_loss(),
+            before,
+            "twenty percent under coding moved the path's own rate"
+        );
+    }
+
+    #[test]
+    fn one_pause_is_one_look() {
+        // The verdict lands when the pause ends, not on each window of
+        // it: a look that carried on pushes the next one out once, from
+        // eight coded windows to sixteen, and not six times.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..400 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
+            let (pausing, _, _, interval) = policy.probe_state();
+            if pausing == 0 && interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+        let (_, _, _, interval) = policy.probe_state();
+        assert_eq!(
+            interval,
+            connection::PROBE_FIRST_INTERVAL * 2,
+            "one look doubled the interval once"
+        );
+    }
+
+    #[test]
     fn a_pause_on_a_lossy_path_resumes_coding() {
         // The other verdict. Here the loss is the path's own, so removing
         // coding does not remove it and the look says carry on.
@@ -1048,7 +1099,7 @@ mod tests {
         // steady state is what is read.
         for _ in 0..600 {
             feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
-            let (pausing, _, since) = policy.probe_state();
+            let (pausing, _, since, _) = policy.probe_state();
             if pausing == 0 && since > 0 {
                 break;
             }

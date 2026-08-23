@@ -216,7 +216,7 @@ const PROBE_MIN_WINDOWS: usize = 4;
 /// one taken with nothing added to the path, so the policy stops adding
 /// for a moment and looks. That is what a delay-targeting rate
 /// controller does continuously and is the reason it never traps itself.
-const PROBE_FIRST_INTERVAL: u32 = 8;
+pub(crate) const PROBE_FIRST_INTERVAL: u32 = 8;
 
 /// The longest a settled answer goes unchecked.
 const PROBE_MAX_INTERVAL: u32 = 64;
@@ -241,6 +241,18 @@ const PROBE_PAUSE_WINDOWS: u32 = 6;
 /// engagement flaps it may be the last look for a long time, because the
 /// count toward the next one only advances while coding.
 const PROBE_AGREEING_LOOKS: u8 = 1;
+
+/// The rate a look must read under for the path to be judged not to need
+/// coding: the engagement rate, so the question is whether this path
+/// would engage on its own merits when measured with nothing added.
+pub(crate) const PROBE_BAR: u64 = RATE_ONE / 25;
+
+/// Whether a measured rate is under the bar. Pure, so both sides of the
+/// edge are pinned by a table test rather than by whichever cell happens
+/// to straddle it.
+pub(crate) const fn under_probe_bar(rate: u64) -> bool {
+    rate < PROBE_BAR
+}
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -423,7 +435,7 @@ impl FecPolicy {
             // Nothing is being added, so the evidence keeps arriving on
             // its own and a path that turns lossy is served again
             // without a pause to discover it.
-            if self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 25 >= RATE_ONE {
+            if self.recent_len >= PROBE_MIN_WINDOWS && !under_probe_bar(self.unaided_loss) {
                 self.quiet_path = false;
                 self.quiet_looks = 0;
                 self.coded_since_probe = 0;
@@ -456,7 +468,7 @@ impl FecPolicy {
     /// enough to matter would sit on top of the five percent paths this
     /// serves and make *their* verdict the coin flip instead.
     const fn judged_quiet(&self) -> bool {
-        self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 25 < RATE_ONE
+        self.recent_len >= PROBE_MIN_WINDOWS && under_probe_bar(self.unaided_loss)
     }
 
     /// Counts a coded generation the receiver decoded from symbols.
@@ -538,8 +550,13 @@ impl FecPolicy {
     }
 
     #[cfg(test)]
-    pub(crate) const fn probe_state(&self) -> (u32, usize, u32) {
-        (self.pausing, self.recent_len, self.coded_since_probe)
+    pub(crate) const fn probe_state(&self) -> (u32, usize, u32, u32) {
+        (
+            self.pausing,
+            self.recent_len,
+            self.coded_since_probe,
+            self.probe_interval,
+        )
     }
 
     pub(crate) const fn repair_symbols(&self) -> usize {

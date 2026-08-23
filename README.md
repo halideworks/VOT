@@ -143,7 +143,7 @@ authenticates received content. See ADR-0037.
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only after measured corrected packet loss reaches 5%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
-| `VOT_FETCH_PROVERS` | unset | Proving thread count for fetch |
+| `VOT_FETCH_PROVERS` | unset | Total proving thread budget for a fetch, divided across its rails with at least one per rail |
 | `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, total milliseconds, milliseconds to first verified payload, and what the datagram FEC path offered, decoded, abandoned, and refused |
 | `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
 | `VOT_FETCH_SERVE_IDENTITY` | unset | Pins the serve's identity: the 64 hex characters of the certificate digest `vot serve` prints. The fetch drops any connection whose certificate differs, before it sends anything |

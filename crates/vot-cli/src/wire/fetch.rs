@@ -146,9 +146,12 @@ where
         )?,
         extensions,
     )?;
-    if let Ok(value) = std::env::var("VOT_FETCH_PROVERS") {
-        fetcher.set_proving_threads(value.trim().parse().map_err(|_| Error::InvalidArguments)?)?;
-    }
+    let provers = std::env::var("VOT_FETCH_PROVERS")
+        .ok()
+        .map(|value| value.trim().parse().map_err(|_| Error::InvalidArguments))
+        .transpose()?
+        .unwrap_or_else(|| fetcher.proving_threads());
+    fetcher.set_proving_threads(provers_per_rail(provers, rails))?;
     // Progress lines go to stderr so stdout stays clean for scripts.
     fetcher.report_placed(
         PROGRESS_QUANTUM_BYTES,
@@ -167,6 +170,16 @@ where
         eprintln!("{}", stats_line(outcome.moved, elapsed, first, outcome.fec));
     }
     Ok(outcome)
+}
+
+/// Splits one fetch's proof workers across its rails without leaving a rail
+/// unable to place what it receives.
+pub(super) fn provers_per_rail(provers: usize, rails: usize) -> usize {
+    if provers == 0 {
+        0
+    } else {
+        provers.div_ceil(rails.max(1))
+    }
 }
 
 /// What one fetch measured, as one line an operator or a bench harness reads:

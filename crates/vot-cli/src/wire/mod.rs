@@ -1419,6 +1419,28 @@ mod tests {
     }
 
     #[test]
+    fn proof_workers_are_a_fetch_budget_not_a_per_rail_multiplier() {
+        for (provers, rails, expected) in [
+            (4, 0, 4),
+            (4, 1, 4),
+            (4, 2, 2),
+            (4, 4, 1),
+            (4, 8, 1),
+            (5, 4, 1),
+            (9, 8, 1),
+            (17, 8, 2),
+            (32, 8, 4),
+            (0, 8, 0),
+        ] {
+            assert_eq!(
+                fetch::provers_per_rail(provers, rails),
+                expected,
+                "{provers} workers across {rails} rails"
+            );
+        }
+    }
+
+    #[test]
     fn an_ephemeral_certificate_goes_when_the_server_does() {
         let (certificate, key, directory) = {
             let written = Ephemeral::generate().expect("credentials");

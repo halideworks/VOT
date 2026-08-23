@@ -201,11 +201,10 @@ const PROBE_WINDOWS: usize = 16;
 
 /// Unaided windows that must be in hand before a look will judge.
 ///
-/// A pause always records its whole length, so this is a statement about
-/// the pause being long enough to mean anything rather than a runtime
-/// gate that can fail.
+/// A pause always records this many windows after its settling prefix, so
+/// this is a statement about the pause being long enough to mean anything
+/// rather than a runtime gate that can fail.
 const PROBE_MIN_WINDOWS: usize = 4;
-const _: () = assert!(PROBE_PAUSE_WINDOWS as usize >= PROBE_MIN_WINDOWS);
 
 /// Coded windows before the first pause, doubling to
 /// [`PROBE_MAX_INTERVAL`] each time the pause says to carry on.
@@ -223,16 +222,23 @@ pub(crate) const PROBE_FIRST_INTERVAL: u32 = 8;
 /// The longest a settled answer goes unchecked.
 const PROBE_MAX_INTERVAL: u32 = 64;
 
-/// Windows one pause lasts.
+/// Opening pause windows allowed for the coded flight to resolve.
+///
+/// At the measured 218 ms WAN RTT, one loss window closes in about 80 ms;
+/// reading those first windows attributed the coded flight's losses to the
+/// unaided path and over-sized every later generation.
+const PROBE_SETTLE_WINDOWS: u32 = 3;
+
+/// Windows one pause lasts, including the settling prefix.
 ///
 /// The cost is arithmetic and bounded, which is what separates this from
-/// an open-ended experiment on a path where coding may be winning: six
-/// windows in every seventy at the settled cadence is about 9% of a
+/// an open-ended experiment on a path where coding may be winning: seven
+/// windows in every seventy-one at the settled cadence is about 10% of a
 /// transfer uncoded, so on a path where coding wins 6% the probe costs
 /// well under a percent of the wall, against the 30% it recovers where
 /// coding is wrong. Measured, the lossy cell came out ahead of not
 /// probing at all.
-const PROBE_PAUSE_WINDOWS: u32 = 6;
+const PROBE_PAUSE_WINDOWS: u32 = 7;
 
 /// The rate a look must read under for the path to be judged not to need
 /// coding: the engagement rate, so the question is whether this path
@@ -325,7 +331,16 @@ impl FecPolicy {
         self.observe_unaided(window_rate);
         self.run_probe();
 
-        let rate = u128::from(self.smoothed_loss);
+        // Once the path has been measured without redundancy in flight,
+        // size redundancy from that measurement. Loss observed while coding
+        // includes the repair traffic itself and otherwise makes coding buy
+        // more coding. The smoothed rate remains the startup fallback.
+        let measured_loss = if self.recent_len >= PROBE_MIN_WINDOWS {
+            self.unaided_loss
+        } else {
+            self.smoothed_loss
+        };
+        let rate = u128::from(measured_loss);
         // Three times the expected losses across a generation's symbols,
         // plus one: at that margin a generation losing past its repair is
         // rarer than one in ten thousand at the loss rates this engages
@@ -383,7 +398,10 @@ impl FecPolicy {
     /// no path, and a coded window describes coding as much as the path,
     /// so neither is evidence.
     fn observe_unaided(&mut self, window_rate: u64) {
-        if self.coding || self.windows_closed == 0 {
+        if self.coding
+            || self.windows_closed == 0
+            || self.pausing > PROBE_PAUSE_WINDOWS - PROBE_SETTLE_WINDOWS
+        {
             self.windows_closed = self.windows_closed.saturating_add(1);
             return;
         }

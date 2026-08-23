@@ -82,6 +82,7 @@ not part of the identity.
 | `replace live::measured -> Option<u64> with Some(0)` | Path statistics. The values are advisory telemetry, and asserting a real round-trip time on loopback would be a flaky test bought for a mutant that cannot affect a transfer. |
 | `replace live::measured -> Option<u64> with Some(1)` | Path statistics, as above. |
 | `replace live::AcceptedTransport::sample_path -> Result<(), msquic::Status> with Ok(())` | The call is exercised; its effect is the telemetry above. |
+| `replace live::<impl std::fmt::Debug for AssemblyHold>::fmt -> std::fmt::Result with Ok(Default::default())` | Private diagnostic formatting. It changes no state and no transfer behavior; asserting an internal debug string would test spelling. |
 | `delete match arm ConnectionEvent::PeerStreamStarted{stream, ..} in live::MsQuicTransport::connect` | A client learning about a stream the server opened. A VOT server answers on the stream the client opened, so nothing in the suite makes a server open one. Reachable only by a peer this protocol does not describe. |
 | `delete match arm ConnectionEvent::ShutdownComplete{..} in live::MsQuicTransport::connect` | The client-side arm, as above. |
 | `delete match arm StreamEvent::SendComplete{client_context, ..} in live::stream_handler` | Where a send buffer is released, so deleting it leaks, which is the sanitizer's to catch rather than a functional test's. |

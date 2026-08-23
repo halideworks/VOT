@@ -801,6 +801,24 @@ mod tests {
     }
 
     #[test]
+    fn a_loss_window_does_not_clear_the_decode_sample() {
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding(), "a lossy path engages");
+
+        code_generations(
+            &mut policy,
+            connection::FEC_DECODE_SAMPLE - 1,
+            connection::FEC_DECODE_SAMPLE - 1,
+        );
+        policy.observe(Some(path_sample(820, 0, 16_384)));
+        policy.note_repaired();
+
+        assert!(!policy.coding(), "the full failing sample is judged");
+    }
+
+    #[test]
     fn a_retry_is_judged_on_the_path_it_retries() {
         // The reports of an epoch coded before the verdict keep arriving
         // all through the hold. They resolve into their own sample, which
@@ -1122,6 +1140,26 @@ mod tests {
         }
         assert!(!policy.quiet_path(), "the look found the path's own loss");
         assert!(policy.coding(), "and coding carried on");
+    }
+
+    #[test]
+    fn repair_uses_the_paths_unaided_loss_after_a_look() {
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 50_000);
+            let (pausing, _, since, interval) = policy.probe_state();
+            if pausing == 0 && since > 0 && interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+
+        assert!(policy.coding(), "five percent path loss keeps coding on");
+        assert_eq!(
+            policy.repair_symbols(),
+            13,
+            "unaided rate {} of 65536",
+            policy.unaided_loss()
+        );
     }
 
     #[test]

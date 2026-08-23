@@ -60,9 +60,9 @@ the same function. The reasons fall into five classes:
 | `replace offload_available -> bool with true` | optional by design | claiming offload where the probe would refuse it falls back per burst |
 | `replace offload_available -> bool with false` | optional by design | denying offload takes the per-packet fallback, correct and slower |
 | `replace drain_arrivals -> Result<(), Error> with Ok(())` | optional by design | without the drain every pass reads once, the lockstep shape the drain exists to amortise; delivery holds and only throughput falls |
-| `replace > with == in flush_burst` | optional by design | routes single-packet bursts through the offload or per-packet path; both carry the burst |
-| `replace > with < in flush_burst` | optional by design | as above |
-| `replace > with >= in flush_burst` | optional by design | as above |
+| `replace > with == in send_burst` | optional by design | routes single-packet bursts through the offload or per-packet path; both carry the burst |
+| `replace > with < in send_burst` | optional by design | as above |
+| `replace > with >= in send_burst` | optional by design | as above |
 | `replace && with \|\| in flush_burst` | optional by design | attempts the offload where it was not asked for; the fallback carries the burst, and the slower shape hangs a loaded run, which the timeout records |
 | `replace && with \|\| in run` | equivalent behavior | the early exit on a locally sent, flushed close; the flip also exits on a peer-initiated close, which skips only that side's drain wait, a wall-clock saving no loopback test can tell from the intended one |
 | `replace != with == in send_all` | burst geometry | destination comparison; every test speaks to one peer, so no burst ever splits by address |

@@ -1792,7 +1792,7 @@ fn route(
             });
             continue;
         }
-        if !quiche::version_is_supported(header.version) {
+        if version_unsupported(header.version) {
             // Answered rather than dropped, which is what lets a client
             // try another version.
             let mut out = [0_u8; MIN_DATAGRAM_SIZE];
@@ -1996,6 +1996,10 @@ fn scid_routed(local: SocketAddr, index: u64) -> quiche::ConnectionId<'static> {
 /// that a test whose client never comes fails rather than hangs.
 const ACCEPT_TIMEOUT_MS: u64 = 10_000;
 
+fn version_unsupported(version: u32) -> bool {
+    !quiche::version_is_supported(version)
+}
+
 /// Waits for the first packet and turns it into a connection.
 fn accept_one(
     socket: &UdpSocket,
@@ -2019,7 +2023,7 @@ fn accept_one(
         else {
             continue;
         };
-        if !quiche::version_is_supported(header.version) {
+        if version_unsupported(header.version) {
             // A version this endpoint does not speak is answered rather than
             // dropped, which is what lets a client try another.
             // Version negotiation is a short packet, and the smallest datagram
@@ -3125,6 +3129,12 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn supported_and_unknown_versions_take_opposite_paths() {
+        assert!(!version_unsupported(quiche::PROTOCOL_VERSION));
+        assert!(version_unsupported(u32::MAX));
+    }
 
     #[test]
     fn the_ramp_cadence_falls_silent_at_its_whole_budget() {

@@ -23,6 +23,55 @@ use crate::{
     lane_for_stream, stream_for_lane,
 };
 
+#[derive(Clone, Debug)]
+struct SharedBuf {
+    bytes: Payload,
+    start: usize,
+    end: usize,
+}
+
+impl AsRef<[u8]> for SharedBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[self.start..self.end]
+    }
+}
+
+impl quiche::BufSplit for SharedBuf {
+    fn split_at(&mut self, at: usize) -> Self {
+        let middle = self.start + at;
+        assert!(middle <= self.end);
+        let tail = Self {
+            bytes: self.bytes.clone(),
+            start: middle,
+            end: self.end,
+        };
+        self.end = middle;
+        tail
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SharedBufFactory;
+
+impl quiche::BufFactory for SharedBufFactory {
+    type Buf = SharedBuf;
+    type DgramBuf = Vec<u8>;
+
+    fn buf_from_slice(buf: &[u8]) -> Self::Buf {
+        SharedBuf {
+            bytes: Payload::from(buf),
+            start: 0,
+            end: buf.len(),
+        }
+    }
+
+    fn dgram_buf_from_slice(buf: &[u8]) -> Self::DgramBuf {
+        buf.to_vec()
+    }
+}
+
+type Connection = quiche::Connection<SharedBufFactory>;
+
 /// Largest UDP payload either direction when a caller names none.
 ///
 /// A ceiling, not a path claim: discovery settles under it where a tunnel or
@@ -1130,8 +1179,10 @@ fn drive(
 
     let conn = match (role, peer) {
         (Role::Client, Some((address, name))) => {
-            let mut conn =
-                quiche::connect(name, &scid, local, address, config).map_err(|_| Error::Backend)?;
+            let mut conn = quiche::connect_with_buffer_factory::<SharedBufFactory>(
+                name, &scid, local, address, config,
+            )
+            .map_err(|_| Error::Backend)?;
             // Before the first send: a resumed handshake is decided at the
             // ClientHello. A ticket the library rejects is dropped and the
             // handshake runs full, which is what an expired one deserves.
@@ -1213,7 +1264,7 @@ struct Arrived {
 fn run(
     socket: &UdpSocket,
     intake: Intake<'_>,
-    mut conn: quiche::Connection,
+    mut conn: Connection,
     local: SocketAddr,
     role: Role,
     commands: &mpsc::Receiver<Command>,
@@ -1451,7 +1502,7 @@ fn run(
             &mut buffer,
         );
         drain_datagrams(&mut conn, inbound, &mut buffer);
-        if let Some(sample) = path_sample(&conn)
+        if let Some(sample) = path_sample_from(&conn)
             && let Ok(mut slot) = path.lock()
         {
             *slot = Some(sample);
@@ -1876,7 +1927,14 @@ fn accept_routed(
         // not a connection this listener will route two ways.
         return None;
     }
-    let mut conn = quiche::accept(&scid, None, local, from, quiche_config).ok()?;
+    let mut conn = quiche::accept_with_buf_factory::<SharedBufFactory>(
+        &scid,
+        None,
+        local,
+        from,
+        quiche_config,
+    )
+    .ok()?;
     feed_received(&mut conn, local, received, from, segment);
 
     let mut adapter = QuicheAdapter::for_role(Role::Server);
@@ -2007,7 +2065,7 @@ fn accept_one(
     config: &mut quiche::Config,
     buffer: &mut [u8],
     timeout_ms: u64,
-) -> Result<Option<quiche::Connection>, Error> {
+) -> Result<Option<Connection>, Error> {
     // Zero means the caller will wait: a bound would read as a carrier that
     // died during the handshake.
     let bound = match timeout_ms {
@@ -2036,7 +2094,8 @@ fn accept_one(
         }
         let scid = scid_for(local);
         let mut conn =
-            quiche::accept(&scid, None, local, from, config).map_err(|_| Error::Backend)?;
+            quiche::accept_with_buf_factory::<SharedBufFactory>(&scid, None, local, from, config)
+                .map_err(|_| Error::Backend)?;
         let info = quiche::RecvInfo { from, to: local };
         if conn.recv(&mut buffer[..len], info).is_err() {
             continue;
@@ -2160,7 +2219,7 @@ fn address_of(storage: &nix::sys::socket::SockaddrStorage) -> Option<SocketAddr>
 /// the last allowed short. A packet the connection cannot read is a stray or
 /// another peer's; it is dropped rather than answered.
 fn feed_received(
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     local: SocketAddr,
     received: &mut [u8],
     from: SocketAddr,
@@ -2217,7 +2276,7 @@ fn is_side_channel(lead: Option<u8>, bytes: &[u8], segment: Option<usize>) -> bo
 )]
 fn drain_arrivals(
     socket: &UdpSocket,
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     local: SocketAddr,
     buffer: &mut [u8],
     space: &mut Vec<u8>,
@@ -2252,7 +2311,7 @@ fn drain_arrivals(
 /// settled PMTU; revalidation reopens discovery and resets the ledger.
 fn send_and_revalidate(
     socket: &UdpSocket,
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     out: &mut [u8],
     sending: &mut Sending,
 ) -> Result<Option<Instant>, Error> {
@@ -2386,7 +2445,7 @@ const fn ramp_ping_due(ramp_pings: u32) -> bool {
 }
 
 /// Takes the caller's close request to the connection, once.
-fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
+fn note_close_request(conn: &mut Connection, close: &Arc<AtomicU64>, closing: &mut bool) {
     if *closing {
         return;
     }
@@ -2399,7 +2458,7 @@ fn note_close_request(conn: &mut quiche::Connection, close: &Arc<AtomicU64>, clo
 
 fn send_all(
     socket: &UdpSocket,
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     out: &mut [u8],
     sending: &mut Sending,
 ) -> Result<Option<Instant>, Error> {
@@ -2669,7 +2728,7 @@ fn datagram_too_large(error: &std::io::Error) -> bool {
     reason = "one submission needs what the driver holds, and the driver holds no less"
 )]
 fn take_submissions(
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     streams: &mut BTreeMap<u64, StreamState>,
     datagrams: &mut VecDeque<(Payload, u64)>,
     budget: &SharedBudget,
@@ -2720,7 +2779,7 @@ fn take_submissions(
 /// The stored-close path runs first, so a code the caller stored is already the
 /// connection's. This handles an owner that vanished without one. Two paths
 /// ensure no single failure strands the drop's join on an idle timeout.
-fn note_orphaned(conn: &mut quiche::Connection, closing: &mut bool) {
+fn note_orphaned(conn: &mut Connection, closing: &mut bool) {
     if *closing {
         return;
     }
@@ -2737,7 +2796,7 @@ fn note_orphaned(conn: &mut quiche::Connection, closing: &mut bool) {
     reason = "one submission needs what the driver holds, and the driver holds no less"
 )]
 fn apply(
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     streams: &mut BTreeMap<u64, StreamState>,
     datagrams: &mut VecDeque<(Payload, u64)>,
     budget: &SharedBudget,
@@ -2908,7 +2967,7 @@ fn finish_datagrams(
 /// this one will never go, so it is dropped and the caller told, because
 /// holding it would block every datagram behind it forever.
 fn write_datagrams(
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     datagrams: &mut VecDeque<(Payload, u64)>,
     pending_state: &mut Option<NativeEvent>,
     inbound: &Arc<Mutex<Inbound>>,
@@ -2937,12 +2996,17 @@ fn write_datagrams(
 
 /// Writes what a stream has waiting, as far as flow control allows, giving
 /// back what the connection took. The release side of [`apply`]'s charge.
-fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState, queued: &mut Queued) {
+fn write_outbox(conn: &mut Connection, stream: &mut StreamState, queued: &mut Queued) {
     let id = stream.id;
     while let Some((bytes, sent)) = stream.outbox.front_mut() {
         let owed = bytes.len() - *sent;
-        match conn.stream_send(id, &bytes[*sent..], false) {
-            Ok(written) => {
+        let offered = SharedBuf {
+            bytes: bytes.clone(),
+            start: *sent,
+            end: bytes.len(),
+        };
+        match conn.stream_send_zc(id, offered, false) {
+            Ok((written, _)) => {
                 *sent += written;
                 // One release for both answers, because what the connection
                 // took is what is no longer owed either way.
@@ -2974,7 +3038,7 @@ fn write_outbox(conn: &mut quiche::Connection, stream: &mut StreamState, queued:
 
 /// Reads every readable stream and turns its bytes into frames.
 fn read_streams(
-    conn: &mut quiche::Connection,
+    conn: &mut Connection,
     streams: &mut BTreeMap<u64, StreamState>,
     budget: &SharedBudget,
     inbound: &Arc<Mutex<Inbound>>,
@@ -3091,11 +3155,7 @@ fn read_streams(
 /// One the inbound budget cannot hold is dropped: it is an unreliable
 /// datagram, and leaving it queued would stall the connection's datagram
 /// credit for the ones behind it.
-fn drain_datagrams(
-    conn: &mut quiche::Connection,
-    inbound: &Arc<Mutex<Inbound>>,
-    buffer: &mut [u8],
-) {
+fn drain_datagrams(conn: &mut Connection, inbound: &Arc<Mutex<Inbound>>, buffer: &mut [u8]) {
     while let Ok(len) = conn.dgram_recv(buffer) {
         let event = NativeEvent::Datagram(vot_transport_api::shared_payload(&buffer[..len]));
         if let Ok(mut queue) = inbound.lock() {
@@ -3107,6 +3167,10 @@ fn drain_datagrams(
 /// Reads the active path's measurements, when there is one.
 #[must_use]
 pub fn path_sample(conn: &quiche::Connection) -> Option<PathStats> {
+    path_sample_from(conn)
+}
+
+fn path_sample_from<F: quiche::BufFactory>(conn: &quiche::Connection<F>) -> Option<PathStats> {
     let stats = conn.path_stats().find(|path| path.active)?;
     Some(PathStats {
         smoothed_rtt_us: u64::try_from(stats.rtt.as_micros()).ok(),
@@ -3129,6 +3193,45 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn shared_buffers_split_without_copying() {
+        let bytes = Payload::from(vec![1, 2, 3, 4]);
+        let allocation = bytes.as_ptr();
+        let mut head = SharedBuf {
+            bytes,
+            start: 0,
+            end: 4,
+        };
+        let mut tail = quiche::BufSplit::split_at(&mut head, 2);
+        let last = quiche::BufSplit::split_at(&mut tail, 1);
+        assert_eq!(head.as_ref(), [1, 2]);
+        assert_eq!(tail.as_ref(), [3]);
+        assert_eq!(last.as_ref(), [4]);
+        assert_eq!(head.as_ref().as_ptr(), allocation);
+        assert_eq!(tail.as_ref().as_ptr(), allocation.wrapping_add(2));
+        assert_eq!(last.as_ref().as_ptr(), allocation.wrapping_add(3));
+    }
+
+    #[test]
+    fn public_path_sample_reads_quiches_default_connection() {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a config");
+        config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("the protocol");
+        let scid = quiche::ConnectionId::from_ref(&[9; 16]);
+        let conn = quiche::connect(
+            None,
+            &scid,
+            "127.0.0.1:1".parse().expect("an address"),
+            "127.0.0.1:2".parse().expect("an address"),
+            &mut config,
+        )
+        .expect("a connection");
+        let sample = path_sample(&conn).expect("an active path");
+        assert!(sample.congestion_window_bytes.unwrap_or(0) > 0);
+        assert!(sample.mtu_bytes.unwrap_or(0) > 0);
+    }
 
     #[test]
     fn supported_and_unknown_versions_take_opposite_paths() {
@@ -3955,7 +4058,7 @@ mod tests {
         // One client Initial, minted without a socket, is what both servers
         // answer.
         let scid = quiche::ConnectionId::from_ref(&[11; 16]);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
             Some("localhost"),
             &scid,
             client_address,
@@ -3972,7 +4075,7 @@ mod tests {
         let mut flight = |index: u8, duplicates: usize| {
             let identifier = [index; 16];
             let scid = quiche::ConnectionId::from_ref(&identifier);
-            let mut server = quiche::accept(
+            let mut server = quiche::accept_with_buf_factory::<SharedBufFactory>(
                 &scid,
                 None,
                 server_address,
@@ -4031,7 +4134,7 @@ mod tests {
         let mut flight = |index: u8, duplicates: usize| {
             let identifier = [index; 16];
             let scid = quiche::ConnectionId::from_ref(&identifier);
-            let mut client = quiche::connect(
+            let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
                 Some("localhost"),
                 &scid,
                 sender.local_addr().expect("its address"),
@@ -4066,7 +4169,7 @@ mod tests {
             .set_application_protos(&[vot_transport_api::ALPN])
             .expect("the protocol");
         let scid = quiche::ConnectionId::from_ref(&[7; 16]);
-        let mut conn = quiche::connect(
+        let mut conn = quiche::connect_with_buffer_factory::<SharedBufFactory>(
             None,
             &scid,
             "127.0.0.1:1".parse().expect("an address"),
@@ -4103,7 +4206,7 @@ mod tests {
             .expect("the protocol");
         let scid = quiche::ConnectionId::from_ref(&[8; 16]);
         let connect = |config: &mut quiche::Config| {
-            quiche::connect(
+            quiche::connect_with_buffer_factory::<SharedBufFactory>(
                 None,
                 &scid,
                 "127.0.0.1:1".parse().expect("an address"),
@@ -4981,8 +5084,14 @@ mod tests {
             .set_application_protos(&[vot_transport_api::ALPN])
             .expect("a protocol");
         let scid = scid_for(local);
-        let mut conn =
-            quiche::connect(Some("localhost"), &scid, local, peer, &mut config).expect("a client");
+        let mut conn = quiche::connect_with_buffer_factory::<SharedBufFactory>(
+            Some("localhost"),
+            &scid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("a client");
         let mut junk = [0_u8; 64];
         feed_received(&mut conn, local, &mut junk, peer, Some(0));
         feed_received(&mut conn, local, &mut junk, peer, Some(16));
@@ -4990,7 +5099,7 @@ mod tests {
     }
 
     /// A handshaked sans-IO pair with every stream window at `window`.
-    fn sans_io_pair(window: u64) -> (quiche::Connection, quiche::Connection) {
+    fn sans_io_pair(window: u64) -> (Connection, Connection) {
         let (certificate, key) = credentials();
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
@@ -5021,7 +5130,7 @@ mod tests {
         server_config.set_initial_max_stream_data_bidi_remote(window);
         server_config.set_initial_max_streams_bidi(16);
         server_config.enable_dgram(true, DATAGRAM_QUEUE_LEN, DATAGRAM_QUEUE_LEN);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
             Some("localhost"),
             &scid_for(local),
             local,
@@ -5029,8 +5138,14 @@ mod tests {
             &mut client_config,
         )
         .expect("a client");
-        let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_config)
-            .expect("a server");
+        let mut server = quiche::accept_with_buf_factory::<SharedBufFactory>(
+            &scid_for(remote),
+            None,
+            remote,
+            local,
+            &mut server_config,
+        )
+        .expect("a server");
         for _ in 0_u32..64 {
             shuttle(&mut client, local, &mut server, remote);
             shuttle(&mut server, remote, &mut client, local);
@@ -5044,9 +5159,9 @@ mod tests {
 
     /// Carries everything one sans-IO connection has to say to the other.
     fn shuttle(
-        a: &mut quiche::Connection,
+        a: &mut Connection,
         a_address: SocketAddr,
-        b: &mut quiche::Connection,
+        b: &mut Connection,
         b_address: SocketAddr,
     ) {
         let mut packet = [0_u8; 2_048];
@@ -5074,7 +5189,7 @@ mod tests {
         let mut client_quiche = client_config.build(Role::Client).expect("a client config");
         let server_config = Config::server(limits(), certificate, key);
         let mut server_quiche = server_config.build(Role::Server).expect("a server config");
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
             Some("localhost"),
             &scid_for(local),
             local,
@@ -5082,8 +5197,14 @@ mod tests {
             &mut client_quiche,
         )
         .expect("a client");
-        let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_quiche)
-            .expect("a server");
+        let mut server = quiche::accept_with_buf_factory::<SharedBufFactory>(
+            &scid_for(remote),
+            None,
+            remote,
+            local,
+            &mut server_quiche,
+        )
+        .expect("a server");
         for _ in 0_u32..64 {
             shuttle(&mut client, local, &mut server, remote);
             shuttle(&mut server, remote, &mut client, local);
@@ -5151,7 +5272,7 @@ mod tests {
         server_config.set_initial_max_stream_data_bidi_local(window);
         server_config.set_initial_max_stream_data_bidi_remote(window);
         server_config.set_initial_max_streams_bidi(16);
-        let mut client = quiche::connect(
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
             Some("localhost"),
             &scid_for(local),
             local,
@@ -5159,8 +5280,14 @@ mod tests {
             &mut client_config,
         )
         .expect("a client");
-        let mut server = quiche::accept(&scid_for(remote), None, remote, local, &mut server_config)
-            .expect("a server");
+        let mut server = quiche::accept_with_buf_factory::<SharedBufFactory>(
+            &scid_for(remote),
+            None,
+            remote,
+            local,
+            &mut server_config,
+        )
+        .expect("a server");
 
         for _ in 0_u32..64 {
             shuttle(&mut client, local, &mut server, remote);
@@ -5590,10 +5717,7 @@ mod tests {
     }
 
     /// One SETTINGS frame on the wire toward the server, returned encoded.
-    fn frame_on_the_wire(
-        client: &mut quiche::Connection,
-        server: &mut quiche::Connection,
-    ) -> Vec<u8> {
+    fn frame_on_the_wire(client: &mut Connection, server: &mut Connection) -> Vec<u8> {
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
         let mut frame = Vec::new();

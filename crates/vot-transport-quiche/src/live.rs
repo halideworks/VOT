@@ -3214,6 +3214,26 @@ mod tests {
     }
 
     #[test]
+    fn public_path_sample_reads_quiches_default_connection() {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("a config");
+        config
+            .set_application_protos(&[vot_transport_api::ALPN])
+            .expect("the protocol");
+        let scid = quiche::ConnectionId::from_ref(&[9; 16]);
+        let conn = quiche::connect(
+            None,
+            &scid,
+            "127.0.0.1:1".parse().expect("an address"),
+            "127.0.0.1:2".parse().expect("an address"),
+            &mut config,
+        )
+        .expect("a connection");
+        let sample = path_sample(&conn).expect("an active path");
+        assert!(sample.congestion_window_bytes.unwrap_or(0) > 0);
+        assert!(sample.mtu_bytes.unwrap_or(0) > 0);
+    }
+
+    #[test]
     fn supported_and_unknown_versions_take_opposite_paths() {
         assert!(!version_unsupported(quiche::PROTOCOL_VERSION));
         assert!(version_unsupported(u32::MAX));

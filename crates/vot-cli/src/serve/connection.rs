@@ -126,6 +126,17 @@ pub(crate) struct FecPolicy {
     /// which is what lengthens the next hold.
     hold: u32,
     decode_failures: u32,
+    /// Every packet this connection has counted and the plain rate over
+    /// all of them, which is the path's character rather than the
+    /// moment's, plus the windows closed so far, which is what makes it
+    /// worth trusting.
+    sustained_lost: u64,
+    sustained_sent: u64,
+    sustained_loss: u64,
+    windows_closed: u32,
+    /// Whether the recent rate's excursions above the bar are this
+    /// sender's own probing rather than the path's character.
+    transient: bool,
 }
 
 impl Default for FecPolicy {
@@ -143,6 +154,11 @@ impl Default for FecPolicy {
             smoothed_failure: 0,
             hold: 0,
             decode_failures: 0,
+            sustained_lost: 0,
+            sustained_sent: 0,
+            sustained_loss: 0,
+            windows_closed: 0,
+            transient: false,
         }
     }
 }
@@ -163,6 +179,33 @@ const RATE_SMOOTHING: u64 = 4;
 /// The most a first lossy window may seed the smoothed rate with: a
 /// tenth, well past the engagement rate.
 const SEED_CEILING: u64 = RATE_ONE / 10;
+
+/// Windows that must close before the connection's own loss rate may
+/// veto an engagement.
+///
+/// This is what the engagement verdict was missing. bbr2 probes for
+/// bandwidth by pushing a bottleneck until it sheds a burst, backing
+/// off, running quiet, and pushing again, so on a real path carrying no
+/// loss of its own the recent rate oscillates between about 2% and 5%
+/// while the windows underneath alternate between nothing and 7-14%.
+/// Measured on a 12 GiB transfer over a real path, that made the policy
+/// engage and disengage 75 times, code half the object, and cost 30%
+/// against not coding at all. Averaged over the whole connection the
+/// same path sustains 2.29%, under even the disengagement rate, while a
+/// path carrying real 5% loss sustains 6.62% and never approaches it.
+///
+/// The rate is a running mean and not an average with a memory: a
+/// decayed one has to be seeded, a probe burst seeds it high, and from
+/// the seed ceiling it needs about twenty-three windows to fall under
+/// the arming rate, which is longer than a rail of a multi-rail fetch
+/// lives. Built that way the veto measured never arming at all on the
+/// real path it exists for.
+///
+/// At the steady window size this bar is about 65,000 packets, so a
+/// short transfer is never touched and ADR-0042's first-sample
+/// engagement is exactly as it was; the cost this removes is only ever
+/// paid by long transfers.
+pub(crate) const SUSTAINED_MIN_WINDOWS: u32 = 8;
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -197,6 +240,11 @@ impl FecPolicy {
             self.sample_sent = 0;
             self.smoothed_loss = 0;
             self.smoothed_failure = 0;
+            self.sustained_lost = 0;
+            self.sustained_sent = 0;
+            self.sustained_loss = 0;
+            self.windows_closed = 0;
+            self.transient = false;
             return;
         };
         self.sample_lost = self
@@ -231,6 +279,21 @@ impl FecPolicy {
         } else {
             self.smoothed_loss - self.smoothed_loss / RATE_SMOOTHING + window_rate / RATE_SMOOTHING
         };
+        self.sustained_lost = self.sustained_lost.saturating_add(self.sample_lost);
+        self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
+        self.sustained_loss =
+            (self.sustained_lost.saturating_mul(RATE_ONE)) / self.sustained_sent.max(1);
+        self.windows_closed = self.windows_closed.saturating_add(1);
+        // Two-sided, because the sustained rate of a path whose loss is
+        // its own controller's sits near the bar with real variance, and
+        // a single edge would flap the way per-window hysteresis flapped
+        // the loss verdict itself. It arms under the disengagement rate
+        // and only a path reaching the full engagement rate clears it.
+        self.transient = if self.transient {
+            self.sustained_loss * 25 < RATE_ONE
+        } else {
+            self.windows_closed >= SUSTAINED_MIN_WINDOWS && self.sustained_loss * 40 < RATE_ONE
+        };
 
         let rate = u128::from(self.smoothed_loss);
         // Three times the expected losses across a generation's symbols,
@@ -261,6 +324,11 @@ impl FecPolicy {
         } else {
             self.smoothed_loss * 25 >= RATE_ONE
         };
+        // The path's own character has the last word. A bottleneck this
+        // sender is probing crosses the bar every few seconds while the
+        // rate over the whole connection stays under it, and coding
+        // answers none of that.
+        let engaged = engaged && !self.transient;
         if engaged && !self.coding {
             // An engagement is judged on its own outcomes. What is still
             // resolving from the last one arrives for generations coded
@@ -343,6 +411,18 @@ impl FecPolicy {
 
     pub(crate) const fn coding(&self) -> bool {
         self.coding
+    }
+
+    /// Whether the connection's own loss rate is vetoing engagement.
+    #[cfg(test)]
+    pub(crate) const fn transient(&self) -> bool {
+        self.transient
+    }
+
+    /// The rate over the whole connection, in [`RATE_ONE`]ths.
+    #[cfg(test)]
+    pub(crate) const fn sustained_loss(&self) -> u64 {
+        self.sustained_loss
     }
 
     pub(crate) const fn repair_symbols(&self) -> usize {

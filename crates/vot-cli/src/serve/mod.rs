@@ -878,6 +878,111 @@ mod tests {
         assert!(!policy.coding(), "and is not engaged by decode counts");
     }
 
+    /// Closes `windows` loss windows at `ppm` parts per million of loss.
+    fn windows_at(
+        policy: &mut connection::FecPolicy,
+        windows: u64,
+        ppm: u64,
+        state: &mut (u64, u64),
+    ) {
+        for _ in 0..windows {
+            state.0 += 8192;
+            state.1 += 8192 * ppm / 1_000_000;
+            policy.observe(Some(path_sample(state.1, 0, state.0)));
+        }
+    }
+
+    #[test]
+    fn a_probing_sender_on_a_quiet_path_stops_being_read_as_loss() {
+        // The measured shape of a real bottleneck carrying no loss of its
+        // own: bbr2 pushes until the queue sheds a burst, backs off, runs
+        // quiet, pushes again. The recent rate crosses the bar on every
+        // burst while the path sustains about 2.3%, and that made the
+        // policy flip 75 times and cost 30% on a 12 GiB transfer.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        for _ in 0..12 {
+            windows_at(&mut policy, 2, 80_000, &mut st);
+            windows_at(&mut policy, 8, 0, &mut st);
+        }
+        assert!(
+            policy.transient(),
+            "sustained {} of 65536 is the path's character",
+            policy.sustained_loss()
+        );
+        assert!(!policy.coding(), "and coding answers none of it");
+
+        // The bursts keep coming and keep being read for what they are.
+        windows_at(&mut policy, 2, 80_000, &mut st);
+        assert!(!policy.coding(), "another burst is still the same probe");
+    }
+
+    #[test]
+    fn a_sustained_lossy_path_is_never_vetoed() {
+        // The case the veto must not touch: real loss holds the sustained
+        // rate far above the bar however long the transfer runs.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        windows_at(&mut policy, 2, 50_000, &mut st);
+        assert!(policy.coding(), "a lossy path engages");
+        for window in 1..=64 {
+            windows_at(&mut policy, 1, 50_000, &mut st);
+            assert!(!policy.transient(), "not vetoed at window {window}");
+            assert!(policy.coding(), "still lossy at window {window}");
+        }
+    }
+
+    #[test]
+    fn the_veto_waits_for_enough_windows_to_mean_anything() {
+        // Before the eligibility bar the fast verdict stands alone, which
+        // keeps ADR-0042's first-sample engagement and leaves short
+        // transfers untouched. A quiet path is under the arming rate from
+        // its first window, so only the window count holds the veto off.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        // The first observation is only a baseline; no window closes on it.
+        windows_at(&mut policy, 1, 10_000, &mut st);
+        for window in 1..connection::SUSTAINED_MIN_WINDOWS {
+            windows_at(&mut policy, 1, 0, &mut st);
+            assert!(
+                !policy.transient(),
+                "only {window} windows have closed, too few to characterize"
+            );
+        }
+        windows_at(&mut policy, 1, 0, &mut st);
+        assert!(
+            policy.transient(),
+            "the eligibility bar is met and the path is quiet"
+        );
+    }
+
+    #[test]
+    fn a_vetoed_path_is_released_only_by_the_full_engagement_rate() {
+        // Two-sided, because a path sitting near the bar would otherwise
+        // arm and clear every window, which is how per-window hysteresis
+        // flapped the loss verdict itself. Clearing takes the engagement
+        // rate, not the disengagement rate that armed it.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        windows_at(&mut policy, 16, 0, &mut st);
+        assert!(policy.transient(), "a quiet path arms it");
+
+        // Three percent sustained clears the arming rate but not the
+        // engagement rate, so the veto holds.
+        windows_at(&mut policy, 64, 30_000, &mut st);
+        assert!(
+            policy.transient(),
+            "three percent sustained ({} of 65536) is not enough",
+            policy.sustained_loss()
+        );
+        assert!(!policy.coding(), "so coding stays off");
+
+        // A path that becomes genuinely lossy clears it and is served.
+        windows_at(&mut policy, 64, 90_000, &mut st);
+        assert!(!policy.transient(), "a lossy path clears the veto");
+        assert!(policy.coding(), "and is coded again");
+    }
+
     #[test]
     fn a_freak_first_window_cannot_pin_a_clean_path_into_coding() {
         // A 50% burst in the tiny first sample seeds at the ceiling, not

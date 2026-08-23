@@ -540,6 +540,7 @@ mod tests {
         let whole = frame(1_024);
         collect(&mut framing, &whole[..100]).expect("a partial frame");
         assert_eq!(shared.held(), 128, "only amortized storage is reserved");
+        assert_eq!(framing.reserved(), 128, "the public reservation matches");
         assert!(
             shared.held() < whole.len(),
             "future payload is not precharged"

@@ -293,8 +293,17 @@ impl FecPolicy {
             self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
             self.sustained_loss =
                 (self.sustained_lost.saturating_mul(RATE_ONE)) / self.sustained_sent.max(1);
-            self.windows_closed = self.windows_closed.saturating_add(1);
         }
+        // Every window counts toward eligibility, including the coded
+        // ones that contribute no measurement. Otherwise a connection
+        // that engages on its first sample and never falls back stops
+        // its own clock and can never be judged: measured, that is what
+        // separated a run that recovered the whole cost from one that
+        // recovered none of it. A connection with nothing unaided to
+        // show reads zero, arms the veto, and so buys itself the windows
+        // it needs; a path that really is lossy clears the veto again
+        // one window later and pays a single cycle for the answer.
+        self.windows_closed = self.windows_closed.saturating_add(1);
         // Two-sided, because the sustained rate of a path whose loss is
         // its own controller's sits near the bar with real variance, and
         // a single edge would flap the way per-window hysteresis flapped

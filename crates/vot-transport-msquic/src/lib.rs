@@ -955,11 +955,11 @@ pub mod live {
                         let outcome = framing.accept(buffer.as_bytes(), |frame| {
                             let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             let event = match kind {
-                                StreamKind::Control => NativeEvent::Control(frame.to_vec()),
+                                StreamKind::Control => NativeEvent::Control(frame.into_vec()),
                                 StreamKind::Reliable { lane } => NativeEvent::Reliable {
                                     stream: lane,
                                     sequence: next,
-                                    bytes: frame.to_vec(),
+                                    bytes: frame.into_vec(),
                                 },
                             };
                             if push(&inbound, event) {
@@ -2183,7 +2183,7 @@ pub mod live {
             let mut delivered = 0;
             framing
                 .accept(&read, |frame| {
-                    assert_eq!(frame, record.as_slice());
+                    assert_eq!(frame.as_ref(), record.as_slice());
                     delivered += 1;
                     Ok(())
                 })
@@ -2230,9 +2230,9 @@ pub mod live {
             let refused = refused.expect("the shared budget never bit");
             assert_eq!(refused, super::FrameFault::exhausted());
             assert!(
-                streams.len() * head.len() <= MAX_CALLBACK_BYTES,
+                streams.len() * record.len() <= MAX_CALLBACK_BYTES,
                 "held {} bytes across {} streams",
-                streams.len() * head.len(),
+                streams.len() * record.len(),
                 streams.len()
             );
             assert!(
@@ -2266,7 +2266,7 @@ pub mod live {
                 framing.accept(&head, |_| Ok(())).unwrap();
                 assert_eq!(
                     budget.lock().unwrap().charged(),
-                    head.len(),
+                    record.len(),
                     "the partial frame is charged while it is held"
                 );
                 drop(framing);

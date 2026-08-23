@@ -208,6 +208,15 @@ impl AsRef<[u8]> for Payload {
     }
 }
 
+impl Payload {
+    /// Recovers the allocation when this is its only owner, or copies shared
+    /// bytes into a new exact-size buffer.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|bytes| bytes.as_slice().to_vec())
+    }
+}
+
 impl From<Vec<u8>> for Payload {
     fn from(bytes: Vec<u8>) -> Self {
         let bytes = bytes.into_boxed_slice().into_vec();
@@ -1109,6 +1118,13 @@ mod tests {
         assert_eq!(payload.as_ptr(), allocation);
         assert_eq!(cloned.as_ptr(), allocation);
         assert_eq!(payload.as_ref(), [1, 2, 3]);
+        drop(cloned);
+        let recovered = payload.into_vec();
+        assert_eq!(recovered.as_ptr(), allocation);
+
+        let shared = Payload::from(vec![4, 5, 6]);
+        let kept = shared.clone();
+        assert_eq!(shared.into_vec(), kept.as_ref());
 
         let mut oversized = Vec::with_capacity(1 << 20);
         oversized.push(7);

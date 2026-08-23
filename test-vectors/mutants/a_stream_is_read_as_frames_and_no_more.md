@@ -72,3 +72,8 @@ The required `vot-transport-framing` mutation run reports 61 mutants, 55 caught,
 survivor, and its 58 live tests pass in debug, in release, and under
 AddressSanitizer with LeakSanitizer, which is what says the extraction changed
 the carrier's behaviour in no way.
+
+The owned-frame handoff rerun selected all 66 mutants in
+`vot-transport-framing`: 61 were caught, 5 were unviable, and none survived.
+The framing suite and 88 live quiche tests passed, with 1 benchmark ignored,
+while completed reassembly buffers moved into payloads instead of being copied.

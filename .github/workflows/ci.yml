@@ -800,8 +800,9 @@ jobs:
     needs: mutation-plan
     if: needs.mutation-plan.outputs.packages != '[]'
     runs-on: ubuntu-24.04
-    # Sized for a diff that spans a whole package, which a module-split PR is.
-    timeout-minutes: 75
+    # Targeted changes finish early, but the scheduled sweep mutates 1,241
+    # vot-cli sites and reached the old hard limit before it could finish.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:

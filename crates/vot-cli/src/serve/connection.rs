@@ -139,6 +139,9 @@ pub(crate) struct FecPolicy {
     coded_since_probe: u32,
     probe_interval: u32,
     pausing: u32,
+    /// When a pause with an RTT sample may begin measuring. Samples before
+    /// this instant can still contain reports from the coded flight.
+    probe_settle_until: Option<std::time::Instant>,
     /// Closed windows so far, only to skip the opening ramp.
     windows_closed: u32,
     /// Whether the last look said this path does not need coding.
@@ -167,6 +170,7 @@ impl Default for FecPolicy {
             coded_since_probe: 0,
             probe_interval: PROBE_FIRST_INTERVAL,
             pausing: 0,
+            probe_settle_until: None,
             windows_closed: 0,
             quiet_path: false,
         }
@@ -201,11 +205,10 @@ const PROBE_WINDOWS: usize = 16;
 
 /// Unaided windows that must be in hand before a look will judge.
 ///
-/// A pause always records its whole length, so this is a statement about
-/// the pause being long enough to mean anything rather than a runtime
-/// gate that can fail.
+/// A pause always records this many windows after its settling prefix, so
+/// this is a statement about the pause being long enough to mean anything
+/// rather than a runtime gate that can fail.
 const PROBE_MIN_WINDOWS: usize = 4;
-const _: () = assert!(PROBE_PAUSE_WINDOWS as usize >= PROBE_MIN_WINDOWS);
 
 /// Coded windows before the first pause, doubling to
 /// [`PROBE_MAX_INTERVAL`] each time the pause says to carry on.
@@ -223,16 +226,22 @@ pub(crate) const PROBE_FIRST_INTERVAL: u32 = 8;
 /// The longest a settled answer goes unchecked.
 const PROBE_MAX_INTERVAL: u32 = 64;
 
-/// Windows one pause lasts.
+/// Opening pause windows allowed for the coded flight to resolve when the
+/// carrier has no RTT sample.
 ///
-/// The cost is arithmetic and bounded, which is what separates this from
-/// an open-ended experiment on a path where coding may be winning: six
-/// windows in every seventy at the settled cadence is about 9% of a
-/// transfer uncoded, so on a path where coding wins 6% the probe costs
-/// well under a percent of the wall, against the 30% it recovers where
-/// coding is wrong. Measured, the lossy cell came out ahead of not
-/// probing at all.
-const PROBE_PAUSE_WINDOWS: u32 = 6;
+/// At the measured 218 ms WAN RTT, one loss window closes in about 80 ms;
+/// reading those first windows attributed the coded flight's losses to the
+/// unaided path and over-sized every later generation.
+const PROBE_SETTLE_WINDOWS: u32 = 3;
+
+/// Whole unaided windows recorded after the coded flight has settled.
+const PROBE_MEASURE_WINDOWS: u32 = 4;
+
+/// Fallback windows one pause lasts, including the settling prefix.
+///
+/// With RTT telemetry the wall clock replaces the opening three windows;
+/// either path then records four whole unaided windows before judging.
+const PROBE_PAUSE_WINDOWS: u32 = PROBE_SETTLE_WINDOWS + PROBE_MEASURE_WINDOWS;
 
 /// The rate a look must read under for the path to be judged not to need
 /// coding: the engagement rate, so the question is whether this path
@@ -251,6 +260,7 @@ impl FecPolicy {
     /// start a new baseline; missing telemetry leaves the last decision intact.
     pub(crate) fn observe(&mut self, stats: Option<PathStats>) {
         let Some(PathStats {
+            smoothed_rtt_us,
             lost_packets: Some(lost),
             spurious_lost_packets: Some(spurious),
             packets_sent: Some(sent),
@@ -286,10 +296,22 @@ impl FecPolicy {
             self.coded_since_probe = 0;
             self.probe_interval = PROBE_FIRST_INTERVAL;
             self.pausing = 0;
+            self.probe_settle_until = None;
             self.windows_closed = 0;
             self.quiet_path = false;
             return;
         };
+        if let Some(until) = self.probe_settle_until {
+            // Keep advancing the counter baseline while the coded flight
+            // drains. The first observation past the RTT becomes the clean
+            // baseline, so the next whole packet window is unaided.
+            self.sample_lost = 0;
+            self.sample_sent = 0;
+            if std::time::Instant::now() >= until {
+                self.probe_settle_until = None;
+            }
+            return;
+        }
         self.sample_lost = self
             .sample_lost
             .saturating_add(lost.saturating_sub(spurious));
@@ -322,21 +344,9 @@ impl FecPolicy {
         } else {
             self.smoothed_loss - self.smoothed_loss / RATE_SMOOTHING + window_rate / RATE_SMOOTHING
         };
+        let was_pausing = self.pausing > 0;
         self.observe_unaided(window_rate);
-        self.run_probe();
-
-        let rate = u128::from(self.smoothed_loss);
-        // Three times the expected losses across a generation's symbols,
-        // plus one: at that margin a generation losing past its repair is
-        // rarer than one in ten thousand at the loss rates this engages
-        // for, so covered bytes stop paying retransmission round trips
-        // (ADR-0042). The floor of two keeps one unlucky drop from
-        // touching the reliable path on a barely lossy sample.
-        self.repair_symbols = usize::try_from(
-            (rate * 3 * vot_fec::MAX_SYMBOLS as u128).div_ceil(u128::from(RATE_ONE)) + 1,
-        )
-        .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
-        .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
+        self.run_probe(smoothed_rtt_us);
         // Engagement sits a margin under the loss rates it serves, not at
         // them: at exactly 5% the smoothed estimate of a 5% path converges
         // onto the threshold and the verdict becomes a coin flip per
@@ -358,6 +368,13 @@ impl FecPolicy {
         // on whether this path wants coding at all.
         let engaged = engaged && self.pausing == 0 && !self.quiet_path;
         if engaged && !self.coding {
+            if !was_pausing {
+                // A new engagement sizes from the loss that caused it, not
+                // unaided history from an older, cleaner path state.
+                self.recent_at = 0;
+                self.recent_len = 0;
+                self.unaided_loss = 0;
+            }
             // An engagement is judged on its own outcomes. What is still
             // resolving from the last one arrives for generations coded
             // before it ended, and describes a path this may no longer be.
@@ -371,6 +388,27 @@ impl FecPolicy {
             self.failed_sample = 0;
             self.smoothed_failure = 0;
         }
+        // Once the path has been measured without redundancy in flight,
+        // size redundancy from that measurement. Loss observed while coding
+        // includes the repair traffic itself and otherwise makes coding buy
+        // more coding. The smoothed rate remains the startup fallback.
+        let measured_loss = if self.recent_len >= PROBE_MIN_WINDOWS {
+            self.unaided_loss
+        } else {
+            self.smoothed_loss
+        };
+        let rate = u128::from(measured_loss);
+        // Three times the expected losses across a generation's symbols,
+        // plus one: at that margin a generation losing past its repair is
+        // rarer than one in ten thousand at the loss rates this engages
+        // for, so covered bytes stop paying retransmission round trips
+        // (ADR-0042). The floor of two keeps one unlucky drop from
+        // touching the reliable path on a barely lossy sample.
+        self.repair_symbols = usize::try_from(
+            (rate * 3 * vot_fec::MAX_SYMBOLS as u128).div_ceil(u128::from(RATE_ONE)) + 1,
+        )
+        .unwrap_or(super::server::FEC_REPAIR_SYMBOLS)
+        .clamp(2, super::server::FEC_REPAIR_SYMBOLS);
         self.coding = engaged;
         self.sample_lost = 0;
         self.sample_sent = 0;
@@ -383,7 +421,7 @@ impl FecPolicy {
     /// no path, and a coded window describes coding as much as the path,
     /// so neither is evidence.
     fn observe_unaided(&mut self, window_rate: u64) {
-        if self.coding || self.windows_closed == 0 {
+        if self.coding || self.windows_closed == 0 || self.pausing > PROBE_MEASURE_WINDOWS {
             self.windows_closed = self.windows_closed.saturating_add(1);
             return;
         }
@@ -400,7 +438,7 @@ impl FecPolicy {
 
     /// Runs the pause cadence: counts coded windows toward the next
     /// look, spends a pause, and reads the verdict when one ends.
-    fn run_probe(&mut self) {
+    fn run_probe(&mut self, smoothed_rtt_us: Option<u64>) {
         if self.pausing > 0 {
             self.pausing -= 1;
             if self.pausing == 0 {
@@ -441,7 +479,14 @@ impl FecPolicy {
         self.coded_since_probe = self.coded_since_probe.saturating_add(1);
         if self.coded_since_probe >= self.probe_interval {
             self.coded_since_probe = 0;
-            self.pausing = PROBE_PAUSE_WINDOWS;
+            self.probe_settle_until = smoothed_rtt_us.and_then(|rtt_us| {
+                std::time::Instant::now().checked_add(std::time::Duration::from_micros(rtt_us))
+            });
+            self.pausing = if self.probe_settle_until.is_some() {
+                PROBE_MEASURE_WINDOWS
+            } else {
+                PROBE_PAUSE_WINDOWS
+            };
             // The look is over this pause's own windows and nothing
             // older, so the verdict cannot be carried by history from
             // before the engagement it is judging.

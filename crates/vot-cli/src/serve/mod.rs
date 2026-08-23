@@ -521,6 +521,18 @@ mod tests {
         }
     }
 
+    fn path_sample_at_rtt(
+        lost: u64,
+        spurious: u64,
+        sent: u64,
+        rtt_us: u64,
+    ) -> vot_transport_api::PathStats {
+        vot_transport_api::PathStats {
+            smoothed_rtt_us: Some(rtt_us),
+            ..path_sample(lost, spurious, sent)
+        }
+    }
+
     #[test]
     fn repair_count_tracks_recent_real_loss_after_startup() {
         let repair = |lost, spurious, sent| {
@@ -798,6 +810,24 @@ mod tests {
             !policy.quiet_path(),
             "and the path itself was never the reason"
         );
+    }
+
+    #[test]
+    fn a_loss_window_does_not_clear_the_decode_sample() {
+        let mut policy = connection::FecPolicy::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(410, 0, 8192)));
+        assert!(policy.coding(), "a lossy path engages");
+
+        code_generations(
+            &mut policy,
+            connection::FEC_DECODE_SAMPLE - 1,
+            connection::FEC_DECODE_SAMPLE - 1,
+        );
+        policy.observe(Some(path_sample(820, 0, 16_384)));
+        policy.note_repaired();
+
+        assert!(!policy.coding(), "the full failing sample is judged");
     }
 
     #[test]
@@ -1122,6 +1152,98 @@ mod tests {
         }
         assert!(!policy.quiet_path(), "the look found the path's own loss");
         assert!(policy.coding(), "and coding carried on");
+    }
+
+    #[test]
+    fn repair_uses_the_paths_unaided_loss_after_a_look() {
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 50_000);
+            let (pausing, _, since, interval) = policy.probe_state();
+            if pausing == 0 && since > 0 && interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+
+        assert!(policy.coding(), "five percent path loss keeps coding on");
+        assert_eq!(
+            policy.repair_symbols(),
+            13,
+            "unaided rate {} of 65536",
+            policy.unaided_loss()
+        );
+    }
+
+    #[test]
+    fn fresh_loss_does_not_size_repair_from_old_clean_windows() {
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        policy.observe(Some(path_sample(0, 0, sent)));
+        for _ in 0..16 {
+            sent += 8192;
+            policy.observe(Some(path_sample(0, 0, sent)));
+        }
+
+        sent += 8192;
+        policy.observe(Some(path_sample(409, 0, sent)));
+
+        assert!(policy.coding(), "fresh loss engages coding");
+        assert_eq!(
+            policy.repair_symbols(),
+            13,
+            "old clean windows do not dilute fresh repair"
+        );
+    }
+
+    #[test]
+    fn a_probe_cannot_settle_faster_than_the_round_trip() {
+        let mut policy = connection::FecPolicy::default();
+        let mut sent = 0_u64;
+        let mut lost = 0_u64;
+        policy.observe(Some(path_sample_at_rtt(0, 0, 0, 10_000_000)));
+        for _ in 0..32 {
+            sent += 8192;
+            lost += 655;
+            policy.observe(Some(path_sample_at_rtt(lost, 0, sent, 10_000_000)));
+            if policy.probe_state().0 > 0 {
+                break;
+            }
+        }
+        let began = policy.probe_state();
+        assert!(began.0 > 0, "the probe began");
+        assert_eq!(began.0, 4, "only measurement windows follow the RTT");
+
+        for _ in 0..32 {
+            sent += 8192;
+            lost += 655;
+            policy.observe(Some(path_sample_at_rtt(lost, 0, sent, 10_000_000)));
+        }
+
+        assert_eq!(
+            policy.probe_state(),
+            began,
+            "packet windows inside one RTT cannot consume the pause"
+        );
+        assert!(!policy.coding(), "the probe stays unaided while it drains");
+    }
+
+    #[test]
+    fn a_probe_without_an_rtt_skips_three_settling_windows() {
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..32 {
+            if policy.probe_state().0 > 0 {
+                break;
+            }
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 50_000);
+        }
+        assert_eq!(policy.probe_state().0, 7, "the fallback pause began");
+
+        for _ in 0..3 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 50_000);
+            assert_eq!(policy.probe_state().1, 0, "coded flight is not evidence");
+        }
+        feedback_windows(&mut policy, &mut st, 1, 80_000, 50_000);
+        assert_eq!(policy.probe_state().1, 1, "the first clean window counts");
     }
 
     #[test]

@@ -343,6 +343,38 @@ mod tests {
     }
 
     #[test]
+    fn owned_verified_range_reports_its_nonzero_offset() {
+        let fixture = make_fixture(Suite::Blake3Bao64);
+        let proof =
+            vot_proof_blake3::prove(&fixture.bytes, RANGE_UNIT_BYTES, RANGE_UNIT_BYTES).unwrap();
+        let bundle = ProofBundle {
+            requested_offset: RANGE_UNIT_BYTES,
+            requested_length: RANGE_UNIT_BYTES,
+            covered_offset: proof.covered_offset,
+            covered_length: proof.data.len() as u64,
+            data_record_count: 1,
+            total_plaintext_length: proof.data.len() as u64,
+            proof: proof.proof,
+            ..fixture.bundle
+        };
+        let records = [DataRecord {
+            bundle_id: bundle.bundle_id,
+            record_index: 0,
+            plaintext_offset: proof.covered_offset,
+            plaintext_length: proof.data.len() as u64,
+            compression: 0,
+            encoded: proof.data,
+        }];
+
+        let range = verify_typed_bundle(fixture.object, &bundle, &records).unwrap();
+        assert_eq!(range.covered_offset(), RANGE_UNIT_BYTES);
+        assert_eq!(
+            range.data(),
+            &fixture.bytes[usize::try_from(RANGE_UNIT_BYTES).unwrap()..]
+        );
+    }
+
+    #[test]
     fn both_frozen_suites_verify_borrowed_ranges() {
         fn authenticated_data<'data>(verified: &VerifiedSlice<'data>) -> &'data [u8] {
             verified.data()

@@ -768,17 +768,35 @@ mod tests {
         lossy(&mut policy, 2);
         assert!(policy.coding(), "a lossy path engages");
 
-        // One sample's worth of failures, a loss window between every one
-        // of them, and the engagement alive throughout.
+        // One sample's worth of failures with a loss window between every
+        // one of them. The engagement pauses for the odd unaided look
+        // along the way, which is a separate mechanism; what this pins is
+        // that the decode sample keeps accumulating across all of it.
         for _ in 0..connection::FEC_DECODE_SAMPLE - 1 {
             policy.note_repaired();
             lossy(&mut policy, 1);
-            assert!(policy.coding(), "still short of a sample");
         }
-        policy.note_repaired();
+        // The engagement pauses for the odd unaided look along the way,
+        // which is a separate mechanism and takes the decode verdict with
+        // it while it runs. Wait for coding to be back, bounded, then
+        // close a sample under it.
+        for _ in 0..32 {
+            if policy.coding() {
+                break;
+            }
+            lossy(&mut policy, 1);
+        }
+        assert!(policy.coding(), "the lossy path is coded between looks");
+        for _ in 0..connection::FEC_DECODE_SAMPLE {
+            policy.note_repaired();
+        }
         assert!(
             !policy.coding(),
             "the sample accumulated across the windows and was judged"
+        );
+        assert!(
+            !policy.quiet_path(),
+            "and the path itself was never the reason"
         );
     }
 
@@ -878,6 +896,252 @@ mod tests {
         assert!(!policy.coding(), "and is not engaged by decode counts");
     }
 
+    /// Closes `windows` on a path whose loss depends on whether this end
+    /// is coding, which is the real shape: a bottleneck the sender is
+    /// filling drops far more when redundancy is added to it. Measured on
+    /// a real path, 6.5% while coding against 2.29% without.
+    fn feedback_windows(
+        policy: &mut connection::FecPolicy,
+        st: &mut (u64, u64),
+        windows: u64,
+        coded_ppm: u64,
+        unaided_ppm: u64,
+    ) {
+        for _ in 0..windows {
+            let ppm = if policy.coding() {
+                coded_ppm
+            } else {
+                unaided_ppm
+            };
+            st.0 += 8192;
+            st.1 += 8192 * ppm / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+        }
+    }
+
+    /// Engages the policy the way a burst does, and returns the counters.
+    fn engaged_policy() -> (connection::FecPolicy, (u64, u64)) {
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        for _ in 0..6 {
+            st.0 += 8192;
+            st.1 += 8192 * 80_000 / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+        }
+        assert!(policy.coding(), "a lossy path engages, as it always did");
+        (policy, st)
+    }
+
+    #[test]
+    fn a_pause_reads_the_path_and_a_quiet_one_stops_being_coded() {
+        // The case that costs 30% of a real transfer: coding itself holds
+        // the measured loss above the bar, so the engagement sustains
+        // itself and no reading taken while it runs can say otherwise.
+        // The policy stops adding for a moment and looks.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(
+            policy.quiet_path(),
+            "the look found {} of 65536 with nothing added",
+            policy.unaided_loss()
+        );
+        assert!(!policy.coding(), "so the path is not coded");
+
+        // And it stays that way, now on evidence that keeps arriving
+        // because nothing is being added to the path.
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 20_000);
+        assert!(!policy.coding(), "a path that does not need coding is left");
+    }
+
+    #[test]
+    fn a_flapping_engagement_is_still_audited() {
+        // The real path's shape, and the one the probe exists for: the
+        // engagement flaps, seventy-five times over a 12 GiB transfer,
+        // because each of the controller's probe cycles crosses the bar
+        // and falls back. Coded windows therefore arrive in short
+        // episodes, and the count toward the next look has to carry
+        // across them or the look never happens on the very path it is
+        // for.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        let mut fired = false;
+        for window in 0..600_u64 {
+            // Bursts every fourth window keep the recent rate crossing
+            // the bar; underneath, the path is quiet.
+            let ppm = if policy.coding() {
+                65_000
+            } else if window % 4 == 0 {
+                90_000
+            } else {
+                0
+            };
+            st.0 += 8192;
+            st.1 += 8192 * ppm / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+            if policy.quiet_path() {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "the look never happened on a flapping engagement (unaided {})",
+            policy.unaided_loss()
+        );
+        assert!(!policy.coding(), "and it ended the coding");
+    }
+
+    #[test]
+    fn the_looks_two_edges_are_where_they_are_said_to_be() {
+        // Both edges sit at the engagement rate: a look asks whether the
+        // path would engage coding on its own merits, measured with
+        // nothing added. They are not offset, because a gap wide enough
+        // to matter would sit on top of the five percent paths this
+        // serves and make their verdict the coin flip instead.
+        let quiet_at = |ppm: u64| {
+            let (mut policy, mut st) = engaged_policy();
+            for _ in 0..800 {
+                feedback_windows(&mut policy, &mut st, 1, 80_000, ppm);
+                if policy.quiet_path() {
+                    break;
+                }
+            }
+            policy.quiet_path()
+        };
+        assert!(quiet_at(20_000), "two percent unaided is not a lossy path");
+        assert!(quiet_at(30_000), "nor is three, under the engagement rate");
+        assert!(
+            !quiet_at(80_000),
+            "eight percent unaided is the path's own loss"
+        );
+
+        // And the same edge from the other side: once armed, a path is
+        // coded again exactly when its unaided rate reaches the bar.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..200 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(policy.quiet_path(), "armed on a quiet path");
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 39_000);
+        assert!(
+            policy.quiet_path(),
+            "just under the bar does not earn coding back ({} of 65536)",
+            policy.unaided_loss()
+        );
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 41_000);
+        assert!(
+            !policy.quiet_path(),
+            "and just over it does ({} of 65536)",
+            policy.unaided_loss()
+        );
+    }
+
+    #[test]
+    fn the_bar_a_look_reads_against_has_an_exact_edge() {
+        assert!(connection::under_probe_bar(0));
+        assert!(connection::under_probe_bar(connection::PROBE_BAR - 1));
+        assert!(!connection::under_probe_bar(connection::PROBE_BAR));
+        assert!(!connection::under_probe_bar(u64::MAX));
+    }
+
+    #[test]
+    fn a_coded_window_is_not_evidence_about_the_path() {
+        // The whole point: what the path does while this end is adding
+        // redundancy to it says as much about the redundancy as the path.
+        // Read the path's rate on a quiet stretch first, so there is a
+        // value the coded windows could move.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        let before = policy.unaided_loss();
+        assert!(before > 0, "the quiet stretch was measured");
+
+        // Now hand it coded windows at twenty percent, stopping short of
+        // the arming that would reset the reading anyway.
+        feedback_windows(&mut policy, &mut st, 24, 20_000, 200_000);
+        assert!(policy.coding(), "the path turned lossy and is coded again");
+        let coded_before = policy.unaided_loss();
+        for _ in 0..3 {
+            st.0 += 8192;
+            st.1 += 8192 * 200_000 / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+        }
+        assert_eq!(
+            policy.unaided_loss(),
+            coded_before,
+            "twenty percent under coding moved the path's own rate"
+        );
+    }
+
+    #[test]
+    fn one_pause_is_one_look() {
+        // The verdict lands when the pause ends, not on each window of
+        // it: a look that carried on pushes the next one out once, from
+        // eight coded windows to sixteen, and not six times.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..400 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
+            let (pausing, _, _, interval) = policy.probe_state();
+            if pausing == 0 && interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+        let (_, _, _, interval) = policy.probe_state();
+        assert_eq!(
+            interval,
+            connection::PROBE_FIRST_INTERVAL * 2,
+            "one look doubled the interval once"
+        );
+    }
+
+    #[test]
+    fn a_pause_on_a_lossy_path_resumes_coding() {
+        // The other verdict. Here the loss is the path's own, so removing
+        // coding does not remove it and the look says carry on.
+        let (mut policy, mut st) = engaged_policy();
+        // Well past the first look, and landing outside a pause so the
+        // steady state is what is read.
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
+            let (pausing, _, since, _) = policy.probe_state();
+            if pausing == 0 && since > 0 {
+                break;
+            }
+        }
+        assert!(!policy.quiet_path(), "the look found the path's own loss");
+        assert!(policy.coding(), "and coding carried on");
+    }
+
+    #[test]
+    fn a_quiet_path_that_turns_lossy_is_served_again() {
+        // Once it stops coding nothing is being added, so the evidence
+        // arrives on its own and no pause is needed to notice a change.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(policy.quiet_path(), "not needed, and not coded");
+
+        feedback_windows(&mut policy, &mut st, 24, 80_000, 80_000);
+        assert!(!policy.quiet_path(), "the path turned lossy and it saw");
+        assert!(policy.coding(), "and it is served again");
+    }
+
     #[test]
     fn a_freak_first_window_cannot_pin_a_clean_path_into_coding() {
         // A 50% burst in the tiny first sample seeds at the ceiling, not
@@ -895,6 +1159,42 @@ mod tests {
         assert!(
             !policy.coding(),
             "the fifth clean window crosses the off-hysteresis"
+        );
+    }
+
+    #[test]
+    fn a_counter_reset_clears_the_looks_state_too() {
+        // A reset is a new path, and what the old one was measured to
+        // need says nothing about it.
+        // A carry-on look first, so the cadence has moved off its
+        // starting value and the reset has something to undo.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..400 {
+            feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
+            let (_, _, _, interval) = policy.probe_state();
+            if interval > connection::PROBE_FIRST_INTERVAL {
+                break;
+            }
+        }
+        let (_, _, _, interval) = policy.probe_state();
+        assert!(
+            interval > connection::PROBE_FIRST_INTERVAL,
+            "a look carried on"
+        );
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(policy.quiet_path(), "armed on the old path");
+
+        policy.observe(Some(path_sample(0, 0, 0)));
+        assert!(!policy.quiet_path(), "the verdict went with the counters");
+        assert_eq!(
+            policy.probe_state(),
+            (0, 0, 0, connection::PROBE_FIRST_INTERVAL),
+            "and so did the cadence and the evidence"
         );
     }
 

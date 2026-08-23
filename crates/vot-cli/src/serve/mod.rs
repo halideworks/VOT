@@ -959,6 +959,90 @@ mod tests {
     }
 
     #[test]
+    fn a_flapping_engagement_is_still_audited() {
+        // The real path's shape, and the one the probe exists for: the
+        // engagement flaps, seventy-five times over a 12 GiB transfer,
+        // because each of the controller's probe cycles crosses the bar
+        // and falls back. Coded windows therefore arrive in short
+        // episodes, and the count toward the next look has to carry
+        // across them or the look never happens on the very path it is
+        // for.
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        let mut fired = false;
+        for window in 0..200_u64 {
+            // Bursts every fourth window keep the recent rate crossing
+            // the bar; underneath, the path is quiet.
+            let ppm = if policy.coding() {
+                65_000
+            } else if window % 4 == 0 {
+                90_000
+            } else {
+                0
+            };
+            st.0 += 8192;
+            st.1 += 8192 * ppm / 1_000_000;
+            policy.observe(Some(path_sample(st.1, 0, st.0)));
+            if policy.quiet_path() {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "the look never happened on a flapping engagement (unaided {})",
+            policy.unaided_loss()
+        );
+        assert!(!policy.coding(), "and it ended the coding");
+    }
+
+    #[test]
+    fn the_looks_two_edges_are_where_they_are_said_to_be() {
+        // Arming takes a reading under the disengagement rate, and
+        // clearing takes the full engagement rate. A path sitting between
+        // them stays as it was, which is what keeps a path near the bar
+        // from arming and clearing every look.
+        let quiet_at = |ppm: u64| {
+            let (mut policy, mut st) = engaged_policy();
+            for _ in 0..200 {
+                feedback_windows(&mut policy, &mut st, 1, 80_000, ppm);
+                let (pausing, _, since) = policy.probe_state();
+                if pausing == 0 && since == 0 && policy.probe_state().1 >= 4 {
+                    break;
+                }
+            }
+            policy.quiet_path()
+        };
+        assert!(quiet_at(20_000), "two percent unaided is not a lossy path");
+        assert!(
+            !quiet_at(30_000),
+            "three percent is over the arming rate and left alone"
+        );
+        assert!(
+            !quiet_at(80_000),
+            "eight percent unaided is the path's own loss"
+        );
+
+        // And the other edge: once armed, a path has to reach the full
+        // engagement rate to be coded again, not merely the arming rate
+        // it fell under.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..200 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(policy.quiet_path(), "armed on a quiet path");
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 30_000);
+        assert!(
+            policy.quiet_path(),
+            "three percent does not earn coding back ({} of 65536)",
+            policy.unaided_loss()
+        );
+    }
+
+    #[test]
     fn a_pause_on_a_lossy_path_resumes_coding() {
         // The other verdict. Here the loss is the path's own, so removing
         // coding does not remove it and the look says carry on.

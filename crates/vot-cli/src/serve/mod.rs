@@ -13,9 +13,9 @@ use vot_codec::frames::{
 use vot_codec::{DecodeLimits, error_code, frame_type};
 use vot_object::{ObjectBuilder, PreparedObject};
 use vot_session::{ErrorKind, Session};
-use vot_transport_api::{
-    Event, MAX_CONTROL_FRAME_PAYLOAD, Payload, StreamId, TransportAdapter, shared_payload,
-};
+#[cfg(test)]
+use vot_transport_api::shared_payload;
+use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, Payload, StreamId, TransportAdapter};
 use vot_verifier::{GROUP_SIZE, Suite};
 
 use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
@@ -96,13 +96,13 @@ pub(crate) fn is_backpressure(error: &vot_session::Error) -> bool {
 pub(crate) fn encoded(frame: &TypedFrame) -> Result<Payload, Error> {
     let mut wire = Vec::new();
     frames::encode(frame, &mut wire)?;
-    Ok(shared_payload(&wire))
+    Ok(Payload::from(wire))
 }
 
 pub(crate) fn encoded_record(record: DataRecordRef<'_>) -> Result<Payload, Error> {
     let mut wire = Vec::new();
     frames::encode_data_record(record, &mut wire)?;
-    Ok(shared_payload(&wire))
+    Ok(Payload::from(wire))
 }
 
 #[cfg(test)]
@@ -237,6 +237,24 @@ mod tests {
     use vot_manifest::StorageRef;
     use vot_scheduler::ReliableReceiver;
     use vot_transport_api::SubjectId;
+
+    #[test]
+    fn an_encoded_record_keeps_its_allocation_as_a_payload() {
+        let encoded = vec![0xaa; RECORD_PLAINTEXT_BYTES];
+        let record = DataRecordRef {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: encoded.len() as u64,
+            compression: 0,
+            encoded: &encoded,
+        };
+        let mut wire = Vec::new();
+        frames::encode_data_record(record, &mut wire).unwrap();
+        assert_eq!(wire.capacity(), wire.len());
+        let allocation = wire.as_ptr();
+        assert_eq!(Payload::from(wire).as_ptr(), allocation);
+    }
 
     fn forced_fec_server(bundle: &std::path::Path) -> BundleServer {
         let mut server = BundleServer::open(bundle).unwrap();

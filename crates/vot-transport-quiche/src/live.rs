@@ -5895,7 +5895,7 @@ mod tests {
         let record: Payload = vec![7_u8; 8].into();
         assert!(
             client
-                .send_reliable_shared(StreamId(u64::MAX), Arc::clone(&record))
+                .send_reliable_shared(StreamId(u64::MAX), record.clone())
                 .is_err()
         );
         assert!(

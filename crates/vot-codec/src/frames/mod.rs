@@ -161,7 +161,12 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
 pub fn encode_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) -> Result<(), Error> {
     validate_data_record(value)?;
     let payload_len = data_record_payload_len(value);
-    output.reserve(payload_len.saturating_add(9));
+    let length_width = match payload_len {
+        0..=63 => 1,
+        64..=16_383 => 2,
+        _ => 4,
+    };
+    output.reserve_exact(payload_len.saturating_add(1 + length_width));
     encode_varint(frame_type::DATA_RECORD, output)?;
     encode_varint(payload_len as u64, output)?;
     encode_validated_data_record(value, output);
@@ -1493,6 +1498,24 @@ mod tests {
             Err(Error::InvalidValue)
         );
         assert_eq!(borrowed, before);
+    }
+
+    #[test]
+    fn data_record_envelopes_reserve_each_varint_width_exactly() {
+        for encoded_length in [1, 128, 20_000] {
+            let encoded = vec![0xaa; encoded_length];
+            let record = DataRecordRef {
+                bundle_id: [2; 16],
+                record_index: 0,
+                plaintext_offset: 0,
+                plaintext_length: encoded_length as u64,
+                compression: 0,
+                encoded: &encoded,
+            };
+            let mut wire = Vec::new();
+            encode_data_record(record, &mut wire).unwrap();
+            assert_eq!(wire.capacity(), wire.len());
+        }
     }
 
     #[test]

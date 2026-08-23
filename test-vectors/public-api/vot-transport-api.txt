@@ -22,6 +22,7 @@ struct vot_transport_api::ConnectionId
 struct vot_transport_api::EventSignal
 struct vot_transport_api::Ledger
 struct vot_transport_api::PathStats
+struct vot_transport_api::Payload
 struct vot_transport_api::Permit
 struct vot_transport_api::ReceiveLimits
 struct vot_transport_api::StagingCapacity
@@ -29,4 +30,3 @@ struct vot_transport_api::StreamId
 struct vot_transport_api::SubjectId
 struct vot_transport_api::TransportAck
 trait vot_transport_api::TransportAdapter
-type_alias vot_transport_api::Payload

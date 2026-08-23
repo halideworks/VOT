@@ -955,11 +955,11 @@ pub mod live {
                         let outcome = framing.accept(buffer.as_bytes(), |frame| {
                             let next = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             let event = match kind {
-                                StreamKind::Control => NativeEvent::Control(frame.to_vec()),
+                                StreamKind::Control => NativeEvent::Control(frame.into_vec()),
                                 StreamKind::Reliable { lane } => NativeEvent::Reliable {
                                     stream: lane,
                                     sequence: next,
-                                    bytes: frame.to_vec(),
+                                    bytes: frame.into_vec(),
                                 },
                             };
                             if push(&inbound, event) {

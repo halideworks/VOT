@@ -219,25 +219,101 @@ impl ServedObject {
     /// from. Uses the witness stat first; falls back to hashing only when
     /// metadata can't vouch for the file.
     pub(crate) fn read_covered(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
-        let mut file = File::open(&self.path).map_err(missing_object)?;
-        file.seek(SeekFrom::Start(offset))?;
         let size = usize::try_from(length).map_err(|_| Error::InvalidBundle)?;
         let mut plaintext = vec![0u8; size];
-        file.read_exact(&mut plaintext).map_err(short_read)?;
-        let span = spanned_groups(offset, plaintext.len());
+        self.read_covered_into(offset, &mut [plaintext.as_mut_slice()])?;
+        Ok(plaintext)
+    }
+
+    /// Reads one cover into caller-owned pieces and verifies their joined bytes.
+    pub(crate) fn read_covered_into(
+        &self,
+        offset: u64,
+        parts: &mut [&mut [u8]],
+    ) -> Result<(), Error> {
+        let length = parts.iter().try_fold(0usize, |length, part| {
+            length.checked_add(part.len()).ok_or(Error::InvalidBundle)
+        })?;
+        let mut file = File::open(&self.path).map_err(missing_object)?;
+        file.seek(SeekFrom::Start(offset))?;
+        for part in parts.iter_mut() {
+            file.read_exact(part).map_err(short_read)?;
+        }
+        let span = spanned_groups(offset, length);
         let checked = self.verified.as_ref().is_none_or(|verified| {
             span.is_some_and(|(first, count)| verified.holds_span(first, count))
         });
         if checked && self.witness.reports_untouched(&Witness::of(&file)?) {
-            return Ok(plaintext);
+            return Ok(());
         }
-        if !self.layer.holds(offset, &plaintext) {
+        if !self.holds_parts(offset, length, parts) {
             return Err(Error::SourceMutation);
         }
         if let (Some(verified), Some((first, count))) = (self.verified.as_ref(), span) {
             verified.insert_span(first, count);
         }
-        Ok(plaintext)
+        Ok(())
+    }
+
+    pub(super) fn holds_parts(&self, offset: u64, length: usize, parts: &[&mut [u8]]) -> bool {
+        if length == 0 || !offset.is_multiple_of(GROUP_SIZE as u64) {
+            return false;
+        }
+        let mut part_index = 0;
+        let mut part_offset = 0;
+        let mut remaining = length;
+        let mut group_offset = offset;
+        let mut scratch = Vec::with_capacity(GROUP_SIZE);
+        while remaining > 0 {
+            while parts
+                .get(part_index)
+                .is_some_and(|part| part_offset == part.len())
+            {
+                part_index += 1;
+                part_offset = 0;
+            }
+            let take = remaining.min(GROUP_SIZE);
+            let Some(part) = parts.get(part_index) else {
+                return false;
+            };
+            let available = part.len() - part_offset;
+            let held = if available >= take {
+                let group = &part[part_offset..part_offset + take];
+                part_offset += take;
+                self.layer.holds(group_offset, group)
+            } else {
+                scratch.clear();
+                while scratch.len() < take {
+                    let Some(part) = parts.get(part_index) else {
+                        return false;
+                    };
+                    let available = part.len() - part_offset;
+                    let copied = available.min(take - scratch.len());
+                    if copied == 0 {
+                        return false;
+                    }
+                    scratch.extend_from_slice(&part[part_offset..part_offset + copied]);
+                    part_offset += copied;
+                    if part_offset == part.len() {
+                        part_index += 1;
+                        part_offset = 0;
+                    }
+                }
+                self.layer.holds(group_offset, &scratch)
+            };
+            if !held {
+                return false;
+            }
+            remaining -= take;
+            let Ok(take) = u64::try_from(take) else {
+                return false;
+            };
+            let Some(next) = group_offset.checked_add(take) else {
+                return false;
+            };
+            group_offset = next;
+        }
+        true
     }
 }
 

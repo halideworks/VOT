@@ -6,9 +6,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(test)]
+use vot_codec::frames::DataRecordRef;
 use vot_codec::frames::{
-    self, DataRecord, DataRecordRef, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest,
-    TypedFrame,
+    self, DataRecord, ManifestRequest, PackageDescriptor, ProofBundle, RangeRequest, TypedFrame,
 };
 use vot_codec::{DecodeLimits, error_code, frame_type};
 use vot_object::{ObjectBuilder, PreparedObject};
@@ -96,12 +97,6 @@ pub(crate) fn is_backpressure(error: &vot_session::Error) -> bool {
 pub(crate) fn encoded(frame: &TypedFrame) -> Result<Payload, Error> {
     let mut wire = Vec::new();
     frames::encode(frame, &mut wire)?;
-    Ok(Payload::from(wire))
-}
-
-pub(crate) fn encoded_record(record: DataRecordRef<'_>) -> Result<Payload, Error> {
-    let mut wire = Vec::new();
-    frames::encode_data_record(record, &mut wire)?;
     Ok(Payload::from(wire))
 }
 
@@ -3945,6 +3940,25 @@ mod tests {
         stored.layer = refusing();
         let outcome = stored.read_covered(0, GROUP_SIZE as u64);
         assert!(matches!(outcome, Err(Error::SourceMutation)));
+    }
+
+    #[test]
+    fn a_prepared_read_verifies_groups_split_across_destination_parts() {
+        let source = patterned(vot_pack::CANDIDATE_MAX + 1);
+        let (bundle, _) = built_bundle("split-read", &[("big.bin", source.clone())]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let stored = server.objects.values().next().unwrap();
+        assert!(stored.verified.is_some(), "the leaves prepared it");
+
+        let mut first = vec![0; GROUP_SIZE - 1];
+        let mut second = vec![0; GROUP_SIZE + 1];
+        stored
+            .read_covered_into(0, &mut [first.as_mut_slice(), second.as_mut_slice()])
+            .unwrap();
+        first.extend_from_slice(&second);
+        assert_eq!(first, source[..GROUP_SIZE * 2]);
+
+        assert!(!stored.holds_parts(0, 0, &[]));
     }
 
     #[test]

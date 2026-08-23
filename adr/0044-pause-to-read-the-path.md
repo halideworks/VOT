@@ -93,6 +93,20 @@ The policy stops adding to the path for a moment and reads it.
 - A policy that deliberately stops doing the thing it is for, to check
   whether it should be doing it, is a behavior worth naming. It is why
   this is an ADR and not a constant.
+- **A look's opening windows are not fully unaided, and the bias is
+  toward carrying on.** A pause switches the denominator the instant it
+  starts, because new range answers go reliable, but the numerator keeps
+  arriving from the coded flight for about a round trip, which is the
+  same detection lag `FIRST_FEC_SAMPLE_PACKETS` documents. At this ADR's
+  reference path a window is roughly 80 ms against a 218 ms round trip,
+  so the first windows of each six-window pause carry losses coding
+  caused, and `unaided_loss` reads high. Every number above was measured
+  with that bias present, so the design is validated in spite of it and
+  the obvious refinement, dropping a settling prefix from each look, can
+  only move the clean-path result further in the direction it already
+  went. It is deliberately not in this change: it alters the measurement
+  the numbers above describe, so it earns its own rig run rather than
+  riding on this one's evidence.
 
 ## Rejected alternatives
 

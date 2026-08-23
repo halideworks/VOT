@@ -141,9 +141,7 @@ pub(crate) struct FecPolicy {
     pausing: u32,
     /// Closed windows so far, only to skip the opening ramp.
     windows_closed: u32,
-    /// Consecutive looks that have said this path does not need coding,
-    /// and whether enough of them have agreed.
-    quiet_looks: u8,
+    /// Whether the last look said this path does not need coding.
     quiet_path: bool,
 }
 
@@ -170,7 +168,6 @@ impl Default for FecPolicy {
             probe_interval: PROBE_FIRST_INTERVAL,
             pausing: 0,
             windows_closed: 0,
-            quiet_looks: 0,
             quiet_path: false,
         }
     }
@@ -202,8 +199,13 @@ const SEED_CEILING: u64 = RATE_ONE / 10;
 /// twenty-one before decaying to 2.4% by window forty.
 const PROBE_WINDOWS: usize = 16;
 
-/// Unaided windows that must be in hand before the probe will judge.
+/// Unaided windows that must be in hand before a look will judge.
+///
+/// A pause always records its whole length, so this is a statement about
+/// the pause being long enough to mean anything rather than a runtime
+/// gate that can fail.
 const PROBE_MIN_WINDOWS: usize = 4;
+const _: () = assert!(PROBE_PAUSE_WINDOWS as usize >= PROBE_MIN_WINDOWS);
 
 /// Coded windows before the first pause, doubling to
 /// [`PROBE_MAX_INTERVAL`] each time the pause says to carry on.
@@ -224,23 +226,13 @@ const PROBE_MAX_INTERVAL: u32 = 64;
 /// Windows one pause lasts.
 ///
 /// The cost is arithmetic and bounded, which is what separates this from
-/// an open-ended experiment on a path where coding may be winning:
-/// pausing four windows in sixty-four leaves about 6% of a transfer
-/// uncoded, so on a path where coding wins 6% the probe costs about 0.4%
-/// of the wall, against the 30% it recovers on a path where coding is
-/// wrong.
+/// an open-ended experiment on a path where coding may be winning: six
+/// windows in every seventy at the settled cadence is about 9% of a
+/// transfer uncoded, so on a path where coding wins 6% the probe costs
+/// well under a percent of the wall, against the 30% it recovers where
+/// coding is wrong. Measured, the lossy cell came out ahead of not
+/// probing at all.
 const PROBE_PAUSE_WINDOWS: u32 = 6;
-
-/// Looks that must agree before coding is taken away.
-///
-/// One, because the two errors are not the same size. A look that wrongly
-/// says quiet costs almost nothing and corrects itself: coding stops, and
-/// with nothing being added the unaided evidence then arrives every
-/// window and puts it back within a few of them. A look that wrongly says
-/// carry on costs the 30% this exists to remove, and on a path whose
-/// engagement flaps it may be the last look for a long time, because the
-/// count toward the next one only advances while coding.
-const PROBE_AGREEING_LOOKS: u8 = 1;
 
 /// The rate a look must read under for the path to be judged not to need
 /// coding: the engagement rate, so the question is whether this path
@@ -295,7 +287,6 @@ impl FecPolicy {
             self.probe_interval = PROBE_FIRST_INTERVAL;
             self.pausing = 0;
             self.windows_closed = 0;
-            self.quiet_looks = 0;
             self.quiet_path = false;
             return;
         };
@@ -413,16 +404,18 @@ impl FecPolicy {
         if self.pausing > 0 {
             self.pausing -= 1;
             if self.pausing == 0 {
-                if self.judged_quiet() {
-                    // One look is an estimate. Coding is taken away only
-                    // when consecutive looks agree.
-                    self.quiet_looks = self.quiet_looks.saturating_add(1);
-                    self.quiet_path = self.quiet_looks >= PROBE_AGREEING_LOOKS;
-                } else {
-                    // The look said carry on, so the next one is further
-                    // off; a settled answer is not worth re-asking at
-                    // the same rate.
-                    self.quiet_looks = 0;
+                // One look decides, because the two errors are not the
+                // same size. A look that wrongly says quiet corrects
+                // itself within a few windows, since coding stops and
+                // the unaided evidence then arrives every window. A look
+                // that wrongly says carry on costs the 30% this exists
+                // to remove, and on a path whose engagement flaps it may
+                // be the last look for a long time, because the count
+                // toward the next one only advances while coding.
+                self.quiet_path = self.judged_quiet();
+                if !self.quiet_path {
+                    // A settled answer is not worth re-asking at the
+                    // same rate, so the next look is further off.
                     self.probe_interval = self
                         .probe_interval
                         .saturating_mul(2)
@@ -437,7 +430,6 @@ impl FecPolicy {
             // without a pause to discover it.
             if self.recent_len >= PROBE_MIN_WINDOWS && !under_probe_bar(self.unaided_loss) {
                 self.quiet_path = false;
-                self.quiet_looks = 0;
                 self.coded_since_probe = 0;
                 self.probe_interval = PROBE_FIRST_INTERVAL;
             }
@@ -462,11 +454,11 @@ impl FecPolicy {
     /// Whether the unaided look says this path does not need coding.
     /// The bar is the engagement rate, not the disengagement rate below
     /// it: the question a look asks is whether this path would engage
-    /// coding on its own merits, measured honestly. Both edges sit
-    /// there, and what keeps the verdict from flapping is agreement
-    /// between looks rather than a gap between bars, because a gap wide
-    /// enough to matter would sit on top of the five percent paths this
-    /// serves and make *their* verdict the coin flip instead.
+    /// coding on its own merits, measured with nothing added. Both edges
+    /// sit there rather than straddling, because a gap wide enough to
+    /// matter would sit on top of the five percent paths this serves and
+    /// make *their* verdict the coin flip, which is the defect the
+    /// engagement thresholds were moved to avoid.
     const fn judged_quiet(&self) -> bool {
         self.recent_len >= PROBE_MIN_WINDOWS && under_probe_bar(self.unaided_loss)
     }

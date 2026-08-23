@@ -998,10 +998,11 @@ mod tests {
 
     #[test]
     fn the_looks_two_edges_are_where_they_are_said_to_be() {
-        // Arming takes a reading under the disengagement rate, and
-        // clearing takes the full engagement rate. A path sitting between
-        // them stays as it was, which is what keeps a path near the bar
-        // from arming and clearing every look.
+        // Both edges sit at the engagement rate: a look asks whether the
+        // path would engage coding on its own merits, measured with
+        // nothing added. They are not offset, because a gap wide enough
+        // to matter would sit on top of the five percent paths this
+        // serves and make their verdict the coin flip instead.
         let quiet_at = |ppm: u64| {
             let (mut policy, mut st) = engaged_policy();
             for _ in 0..800 {
@@ -1019,9 +1020,8 @@ mod tests {
             "eight percent unaided is the path's own loss"
         );
 
-        // And the other edge: once armed, a path has to reach the full
-        // engagement rate to be coded again, not merely the arming rate
-        // it fell under.
+        // And the same edge from the other side: once armed, a path is
+        // coded again exactly when its unaided rate reaches the bar.
         let (mut policy, mut st) = engaged_policy();
         for _ in 0..200 {
             feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
@@ -1033,8 +1033,13 @@ mod tests {
         feedback_windows(&mut policy, &mut st, 32, 65_000, 39_000);
         assert!(
             policy.quiet_path(),
-            "just under the engagement rate does not earn coding back \
-             ({} of 65536)",
+            "just under the bar does not earn coding back ({} of 65536)",
+            policy.unaided_loss()
+        );
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 41_000);
+        assert!(
+            !policy.quiet_path(),
+            "and just over it does ({} of 65536)",
             policy.unaided_loss()
         );
     }
@@ -1143,6 +1148,28 @@ mod tests {
         assert!(
             !policy.coding(),
             "the fifth clean window crosses the off-hysteresis"
+        );
+    }
+
+    #[test]
+    fn a_counter_reset_clears_the_looks_state_too() {
+        // A reset is a new path, and what the old one was measured to
+        // need says nothing about it.
+        let (mut policy, mut st) = engaged_policy();
+        for _ in 0..600 {
+            feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
+            if policy.quiet_path() {
+                break;
+            }
+        }
+        assert!(policy.quiet_path(), "armed on the old path");
+
+        policy.observe(Some(path_sample(0, 0, 0)));
+        assert!(!policy.quiet_path(), "the verdict went with the counters");
+        assert_eq!(
+            policy.probe_state(),
+            (0, 0, 0, connection::PROBE_FIRST_INTERVAL),
+            "and so did the cadence and the evidence"
         );
     }
 

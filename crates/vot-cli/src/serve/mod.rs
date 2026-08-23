@@ -939,7 +939,7 @@ mod tests {
         // itself and no reading taken while it runs can say otherwise.
         // The policy stops adding for a moment and looks.
         let (mut policy, mut st) = engaged_policy();
-        for _ in 0..160 {
+        for _ in 0..600 {
             feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
             if policy.quiet_path() {
                 break;
@@ -970,7 +970,7 @@ mod tests {
         let mut policy = connection::FecPolicy::default();
         let mut st = (0_u64, 0_u64);
         let mut fired = false;
-        for window in 0..200_u64 {
+        for window in 0..600_u64 {
             // Bursts every fourth window keep the recent rate crossing
             // the bar; underneath, the path is quiet.
             let ppm = if policy.coding() {
@@ -1004,20 +1004,16 @@ mod tests {
         // from arming and clearing every look.
         let quiet_at = |ppm: u64| {
             let (mut policy, mut st) = engaged_policy();
-            for _ in 0..200 {
+            for _ in 0..800 {
                 feedback_windows(&mut policy, &mut st, 1, 80_000, ppm);
-                let (pausing, _, since) = policy.probe_state();
-                if pausing == 0 && since == 0 && policy.probe_state().1 >= 4 {
+                if policy.quiet_path() {
                     break;
                 }
             }
             policy.quiet_path()
         };
         assert!(quiet_at(20_000), "two percent unaided is not a lossy path");
-        assert!(
-            !quiet_at(30_000),
-            "three percent is over the arming rate and left alone"
-        );
+        assert!(quiet_at(30_000), "nor is three, under the engagement rate");
         assert!(
             !quiet_at(80_000),
             "eight percent unaided is the path's own loss"
@@ -1034,10 +1030,11 @@ mod tests {
             }
         }
         assert!(policy.quiet_path(), "armed on a quiet path");
-        feedback_windows(&mut policy, &mut st, 32, 65_000, 30_000);
+        feedback_windows(&mut policy, &mut st, 32, 65_000, 39_000);
         assert!(
             policy.quiet_path(),
-            "three percent does not earn coding back ({} of 65536)",
+            "just under the engagement rate does not earn coding back \
+             ({} of 65536)",
             policy.unaided_loss()
         );
     }
@@ -1049,7 +1046,7 @@ mod tests {
         let (mut policy, mut st) = engaged_policy();
         // Well past the first look, and landing outside a pause so the
         // steady state is what is read.
-        for _ in 0..160 {
+        for _ in 0..600 {
             feedback_windows(&mut policy, &mut st, 1, 80_000, 80_000);
             let (pausing, _, since) = policy.probe_state();
             if pausing == 0 && since > 0 {
@@ -1065,7 +1062,7 @@ mod tests {
         // Once it stops coding nothing is being added, so the evidence
         // arrives on its own and no pause is needed to notice a change.
         let (mut policy, mut st) = engaged_policy();
-        for _ in 0..160 {
+        for _ in 0..600 {
             feedback_windows(&mut policy, &mut st, 1, 65_000, 20_000);
             if policy.quiet_path() {
                 break;

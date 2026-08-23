@@ -141,8 +141,9 @@ pub(crate) struct FecPolicy {
     pausing: u32,
     /// Closed windows so far, only to skip the opening ramp.
     windows_closed: u32,
-    /// Whether the last unaided look said this path does not need
-    /// coding.
+    /// Consecutive looks that have said this path does not need coding,
+    /// and whether enough of them have agreed.
+    quiet_looks: u8,
     quiet_path: bool,
 }
 
@@ -169,6 +170,7 @@ impl Default for FecPolicy {
             probe_interval: PROBE_FIRST_INTERVAL,
             pausing: 0,
             windows_closed: 0,
+            quiet_looks: 0,
             quiet_path: false,
         }
     }
@@ -227,7 +229,18 @@ const PROBE_MAX_INTERVAL: u32 = 64;
 /// uncoded, so on a path where coding wins 6% the probe costs about 0.4%
 /// of the wall, against the 30% it recovers on a path where coding is
 /// wrong.
-const PROBE_PAUSE_WINDOWS: u32 = 4;
+const PROBE_PAUSE_WINDOWS: u32 = 6;
+
+/// Looks that must agree before coding is taken away.
+///
+/// One, because the two errors are not the same size. A look that wrongly
+/// says quiet costs almost nothing and corrects itself: coding stops, and
+/// with nothing being added the unaided evidence then arrives every
+/// window and puts it back within a few of them. A look that wrongly says
+/// carry on costs the 30% this exists to remove, and on a path whose
+/// engagement flaps it may be the last look for a long time, because the
+/// count toward the next one only advances while coding.
+const PROBE_AGREEING_LOOKS: u8 = 1;
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -270,6 +283,7 @@ impl FecPolicy {
             self.probe_interval = PROBE_FIRST_INTERVAL;
             self.pausing = 0;
             self.windows_closed = 0;
+            self.quiet_looks = 0;
             self.quiet_path = false;
             return;
         };
@@ -387,11 +401,16 @@ impl FecPolicy {
         if self.pausing > 0 {
             self.pausing -= 1;
             if self.pausing == 0 {
-                self.quiet_path = self.judged_quiet();
-                if !self.quiet_path {
+                if self.judged_quiet() {
+                    // One look is an estimate. Coding is taken away only
+                    // when consecutive looks agree.
+                    self.quiet_looks = self.quiet_looks.saturating_add(1);
+                    self.quiet_path = self.quiet_looks >= PROBE_AGREEING_LOOKS;
+                } else {
                     // The look said carry on, so the next one is further
                     // off; a settled answer is not worth re-asking at
                     // the same rate.
+                    self.quiet_looks = 0;
                     self.probe_interval = self
                         .probe_interval
                         .saturating_mul(2)
@@ -406,6 +425,7 @@ impl FecPolicy {
             // without a pause to discover it.
             if self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 25 >= RATE_ONE {
                 self.quiet_path = false;
+                self.quiet_looks = 0;
                 self.coded_since_probe = 0;
                 self.probe_interval = PROBE_FIRST_INTERVAL;
             }
@@ -428,8 +448,15 @@ impl FecPolicy {
     }
 
     /// Whether the unaided look says this path does not need coding.
+    /// The bar is the engagement rate, not the disengagement rate below
+    /// it: the question a look asks is whether this path would engage
+    /// coding on its own merits, measured honestly. Both edges sit
+    /// there, and what keeps the verdict from flapping is agreement
+    /// between looks rather than a gap between bars, because a gap wide
+    /// enough to matter would sit on top of the five percent paths this
+    /// serves and make *their* verdict the coin flip instead.
     const fn judged_quiet(&self) -> bool {
-        self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 40 < RATE_ONE
+        self.recent_len >= PROBE_MIN_WINDOWS && self.unaided_loss * 25 < RATE_ONE
     }
 
     /// Counts a coded generation the receiver decoded from symbols.

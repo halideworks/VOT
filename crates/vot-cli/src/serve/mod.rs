@@ -547,25 +547,44 @@ mod tests {
 
     #[test]
     fn automatic_fec_decides_first_from_a_covers_worth_of_packets() {
-        // The first verdict closes at 256 packets so a short transfer is
-        // covered rather than mostly issued before a full window closes
-        // (ADR-0042). The bar is four percent: a margin under the five
-        // percent paths it serves, where sitting exactly at them made the
-        // verdict a coin flip on the estimate's own noise.
-        let worthwhile = |lost, spurious, sent| {
+        // ADR-0042 had the first verdict close at 256 packets and code on
+        // it. That is what this reverses: a lossy first sample no longer
+        // codes on its own, because a congestion controller probing a
+        // bottleneck produces exactly that reading on a path with no loss
+        // of its own, and acting on it cost 30% of a real transfer. The
+        // sample still closes early and still feeds the recent rate; what
+        // changed is that the path must also be measured lossy without
+        // coding's help before any of it is coded.
+        let first_sample = |lost, spurious, sent| {
             let mut policy = connection::FecPolicy::default();
             policy.observe(Some(path_sample(0, 0, 0)));
             policy.observe(Some(path_sample(lost, spurious, sent)));
             policy.coding()
         };
-        assert!(!worthwhile(13, 0, 255), "below the first sample");
-        assert!(!worthwhile(10, 0, 256), "under four percent");
-        assert!(worthwhile(11, 0, 256));
-        assert!(!worthwhile(11, 1, 256), "spurious losses do not count");
+        assert!(!first_sample(11, 0, 256), "one lossy sample is not a path");
+        assert!(!first_sample(13, 0, 255), "below the first sample");
+
+        // Listened to, the same rate is served.
+        let (mut policy, mut st) = listened_lossy(50_000);
+        assert!(policy.coding());
+        // And spurious losses still do not count toward it.
+        let mut clean = connection::FecPolicy::default();
+        let mut cst = (0_u64, 0_u64);
+        for _ in 0..8 {
+            cst.0 += 8192;
+            cst.1 += 8192 * 50_000 / 1_000_000;
+            clean.observe(Some(path_sample(cst.1, cst.1, cst.0)));
+        }
+        assert!(!clean.coding(), "losses the carrier retracted are not loss");
+        windows_at(&mut policy, 1, 50_000, &mut st);
+        assert!(policy.coding(), "and the lossy path stays served");
     }
 
     #[test]
     fn automatic_fec_accumulates_subwindow_counter_deltas() {
+        // Sub-window observations still accumulate into one decision; the
+        // repair count still follows the rate the moment it closes. Only
+        // the engagement now waits for the path to be measured unaided.
         let mut policy = connection::FecPolicy::default();
         for sent in [0, 64, 128, 192] {
             policy.observe(Some(path_sample(u64::from(sent > 0) * 13, 0, sent)));
@@ -573,8 +592,8 @@ mod tests {
             assert_eq!(policy.repair_symbols(), 16);
         }
         policy.observe(Some(path_sample(13, 0, 256)));
-        assert!(policy.coding());
-        assert_eq!(policy.repair_symbols(), 14);
+        assert_eq!(policy.repair_symbols(), 14, "the closed window is read");
+        assert!(!policy.coding(), "but one window is not a path's character");
     }
 
     #[test]
@@ -586,33 +605,34 @@ mod tests {
         let mut policy = connection::FecPolicy::default();
         for (lost, sent, coding) in [
             (0, 0, false),
-            (410, 8192, true),
-            (738, 16_384, true),
-            (984, 24_576, true),
-            (1229, 32_768, true),
-            (1557, 40_960, true),
-            (1967, 49_152, true),
+            (410, 8192, false),
+            (738, 16_384, false),
+            (984, 24_576, false),
+            (1229, 32_768, false),
+            (1557, 40_960, false),
+            (1967, 49_152, false),
+            (2377, 57_344, true),
         ] {
             policy.observe(Some(path_sample(lost, 0, sent)));
-            assert_eq!(policy.coding(), coding, "at {lost} losses of {sent}");
+            assert_eq!(
+                policy.coding(),
+                coding,
+                "at {lost} losses of {sent}: the path is listened to first, \
+                 and its opening window is not part of the measure"
+            );
         }
         policy.observe(None);
         assert!(policy.coding(), "missing telemetry keeps the last verdict");
 
-        policy.observe(Some(path_sample(1967, 0, 57_344)));
+        policy.observe(Some(path_sample(2377, 0, 65_536)));
         assert!(
             policy.coding(),
             "one clean window softens the rate, it does not end coding"
         );
-        policy.observe(Some(path_sample(1967, 0, 65_536)));
+        policy.observe(Some(path_sample(2377, 0, 73_728)));
         assert!(
             !policy.coding(),
             "a sustained clean run disables coding through the smoothing"
-        );
-        assert_eq!(
-            policy.repair_symbols(),
-            7,
-            "repair follows the smoothed rate"
         );
     }
 
@@ -645,9 +665,9 @@ mod tests {
         // about the path tells the two apart, so the policy reads whether
         // the coding worked.
         let mut policy = connection::FecPolicy::default();
-        policy.observe(Some(path_sample(0, 0, 0)));
-        policy.observe(Some(path_sample(410, 0, 8192)));
-        assert!(policy.coding(), "a lossy path engages");
+        let mut st = (0_u64, 0_u64);
+        windows_at(&mut policy, 6, 50_000, &mut st);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
 
         // Half of every sample failing is the shaped bottleneck's own
         // measurement. Smoothed, it takes three samples to be believed.
@@ -659,15 +679,11 @@ mod tests {
 
         // The loss is still there, and it is exactly what must not
         // re-engage coding while the hold runs.
-        for window in 1..=4_u64 {
-            policy.observe(Some(path_sample(
-                410 * (window + 1),
-                0,
-                8192 * (window + 1),
-            )));
+        for window in 1..=connection::DECODE_FAILURE_HOLD_WINDOWS {
+            windows_at(&mut policy, 1, 50_000, &mut st);
             assert!(!policy.coding(), "held off at window {window}");
         }
-        policy.observe(Some(path_sample(2460, 0, 49_152)));
+        windows_at(&mut policy, 1, 50_000, &mut st);
         assert!(
             policy.coding(),
             "past the hold the path is judged on its loss again"
@@ -690,8 +706,8 @@ mod tests {
                 policy.observe(Some(path_sample(sent / 20, 0, sent)));
             }
         };
-        lossy(&mut policy, 2);
-        assert!(policy.coding(), "a lossy path engages");
+        lossy(&mut policy, 6);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
 
         for (failure, expected_hold) in [(1_u32, 4_u64), (2, 8), (3, 16), (4, 32)] {
             // Every generation failing: one sample is a verdict on its own
@@ -724,8 +740,8 @@ mod tests {
         // coded, and acting on them cost that arm coding it should have
         // kept.
         let mut policy = connection::FecPolicy::default();
-        policy.observe(Some(path_sample(0, 0, 0)));
-        policy.observe(Some(path_sample(410, 0, 8192)));
+        let mut st = (0_u64, 0_u64);
+        windows_at(&mut policy, 6, 50_000, &mut st);
         assert!(policy.coding());
 
         for lump in 1..=8 {
@@ -765,8 +781,8 @@ mod tests {
                 policy.observe(Some(path_sample(sent / 20, 0, sent)));
             }
         };
-        lossy(&mut policy, 2);
-        assert!(policy.coding(), "a lossy path engages");
+        lossy(&mut policy, 6);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
 
         // One sample's worth of failures, a loss window between every one
         // of them, and the engagement alive throughout.
@@ -796,8 +812,8 @@ mod tests {
                 policy.observe(Some(path_sample(sent / 20, 0, sent)));
             }
         };
-        lossy(&mut policy, 2);
-        assert!(policy.coding(), "a lossy path engages");
+        lossy(&mut policy, 6);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
         decode_sample(&mut policy, connection::FEC_DECODE_SAMPLE);
         assert!(!policy.coding(), "a sample that wholly failed ends coding");
 
@@ -831,8 +847,8 @@ mod tests {
                 policy.observe(Some(path_sample(sent / 20, 0, sent)));
             }
         };
-        lossy(&mut policy, 2);
-        assert!(policy.coding(), "a lossy path engages");
+        lossy(&mut policy, 6);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
 
         // Climb well past the bar before the verdict: two half-failing
         // samples and then a whole one.
@@ -855,8 +871,8 @@ mod tests {
         // A steady trickle inside the repair budget: the smoothed rate
         // settles under the share and stays there however long it runs.
         let mut policy = connection::FecPolicy::default();
-        policy.observe(Some(path_sample(0, 0, 0)));
-        policy.observe(Some(path_sample(410, 0, 8192)));
+        let mut st = (0_u64, 0_u64);
+        windows_at(&mut policy, 6, 50_000, &mut st);
         assert!(policy.coding());
 
         for sample in 1..=64 {
@@ -876,6 +892,24 @@ mod tests {
         assert!(!policy.coding(), "a clean path codes nothing");
         code_generations(&mut policy, 256, 256);
         assert!(!policy.coding(), "and is not engaged by decode counts");
+    }
+
+    /// Drives the unaided listening a path must pass before the policy
+    /// will code, at `ppm` parts per million, and leaves it engaged.
+    fn listened_lossy(ppm: u64) -> (connection::FecPolicy, (u64, u64)) {
+        let mut policy = connection::FecPolicy::default();
+        let mut st = (0_u64, 0_u64);
+        windows_at(
+            &mut policy,
+            u64::from(connection::SUSTAINED_MIN_WINDOWS) + 2,
+            ppm,
+            &mut st,
+        );
+        assert!(
+            policy.coding(),
+            "a path measured lossy without help is coded"
+        );
+        (policy, st)
     }
 
     /// Closes `windows` loss windows at `ppm` parts per million of loss.
@@ -923,8 +957,8 @@ mod tests {
         // rate far above the bar however long the transfer runs.
         let mut policy = connection::FecPolicy::default();
         let mut st = (0_u64, 0_u64);
-        windows_at(&mut policy, 2, 50_000, &mut st);
-        assert!(policy.coding(), "a lossy path engages");
+        windows_at(&mut policy, 6, 50_000, &mut st);
+        assert!(policy.coding(), "a path measured lossy unaided is coded");
         for window in 1..=64 {
             windows_at(&mut policy, 1, 50_000, &mut st);
             assert!(!policy.transient(), "not vetoed at window {window}");
@@ -934,25 +968,25 @@ mod tests {
 
     #[test]
     fn the_veto_waits_for_enough_windows_to_mean_anything() {
-        // Before the eligibility bar the fast verdict stands alone, which
-        // keeps ADR-0042's first-sample engagement and leaves short
-        // transfers untouched. A quiet path is under the arming rate from
-        // its first window, so only the window count holds the veto off.
+        // The listening is the whole point: a path is not coded on one
+        // loud window, only on a rate measured over enough of them with
+        // nothing added to the path.
         let mut policy = connection::FecPolicy::default();
         let mut st = (0_u64, 0_u64);
-        // The first observation is only a baseline; no window closes on it.
-        windows_at(&mut policy, 1, 10_000, &mut st);
-        for window in 1..connection::SUSTAINED_MIN_WINDOWS {
-            windows_at(&mut policy, 1, 0, &mut st);
-            assert!(
-                !policy.transient(),
-                "only {window} windows have closed, too few to characterize"
-            );
+        // The opening window is excluded, so the count starts after it.
+        windows_at(&mut policy, 1, 100_000, &mut st);
+        for window in 1..=connection::SUSTAINED_MIN_WINDOWS {
+            windows_at(&mut policy, 1, 100_000, &mut st);
+            if window < connection::SUSTAINED_MIN_WINDOWS {
+                assert!(
+                    !policy.coding(),
+                    "only {window} windows measured, too few to characterize"
+                );
+            }
         }
-        windows_at(&mut policy, 1, 0, &mut st);
         assert!(
-            policy.transient(),
-            "the eligibility bar is met and the path is quiet"
+            policy.coding(),
+            "measured lossy over the listening, the path is served"
         );
     }
 
@@ -985,22 +1019,18 @@ mod tests {
 
     #[test]
     fn a_freak_first_window_cannot_pin_a_clean_path_into_coding() {
-        // A 50% burst in the tiny first sample seeds at the ceiling, not
-        // its raw rate, so a path that is clean ever after disengages
-        // within five windows instead of thirteen.
+        // A 50% burst in the tiny first sample used to engage and then
+        // decay out of it over five windows. Now it never engages at all:
+        // one burst is what a congestion controller's probe looks like,
+        // and the path it sits on is measured clean.
         let mut policy = connection::FecPolicy::default();
         policy.observe(Some(path_sample(0, 0, 0)));
         policy.observe(Some(path_sample(128, 0, 256)));
-        assert!(policy.coding(), "a lossy first sample engages");
-        for window in 1..=4_u64 {
+        assert!(!policy.coding(), "one burst is not a lossy path");
+        for window in 1..=5_u64 {
             policy.observe(Some(path_sample(128, 0, 256 + window * 8192)));
-            assert!(policy.coding(), "still decaying at clean window {window}");
+            assert!(!policy.coding(), "still clean at window {window}");
         }
-        policy.observe(Some(path_sample(128, 0, 256 + 5 * 8192)));
-        assert!(
-            !policy.coding(),
-            "the fifth clean window crosses the off-hysteresis"
-        );
     }
 
     #[test]
@@ -1012,9 +1042,16 @@ mod tests {
         policy.observe(Some(path_sample(0, 0, 8192)));
         assert!(!policy.coding());
         assert_eq!(policy.repair_symbols(), 2);
-        policy.observe(Some(path_sample(410, 0, 16_384)));
-        assert!(policy.coding());
-        assert_eq!(policy.repair_symbols(), 14);
+        // The reset dropped the listening too, so the new path earns its
+        // engagement from scratch.
+        let mut sent = 16_384_u64;
+        let mut lost = 410_u64;
+        for _ in 0..connection::SUSTAINED_MIN_WINDOWS + 3 {
+            policy.observe(Some(path_sample(lost, 0, sent)));
+            sent += 8192;
+            lost += 8192 * 5 / 100;
+        }
+        assert!(policy.coding(), "measured lossy unaided, it is served");
     }
 
     #[test]
@@ -1070,10 +1107,20 @@ mod tests {
         server.service(&mut session, &mut connection).unwrap();
         session.driver().control.clear();
 
-        for (request_id, offset, lost, sent, coded) in
-            [(1, 0, 0, 8192, false), (2, 65_536, 410, 16_384, true)]
+        // The policy listens to the path before it codes anything, so
+        // each arm is preceded by the windows that establish it.
+        let mut sent = 0_u64;
+        let mut lost = 0_u64;
+        for (request_id, offset, ppm, coded) in
+            [(1_u8, 0_u64, 0_u64, false), (2, 65_536, 200_000, true)]
         {
-            session.driver().path_stats = Some(path_sample(lost, 0, sent));
+            for _ in 0..8 {
+                sent += 8192;
+                lost += 8192 * ppm / 1_000_000;
+                session.driver().path_stats = Some(path_sample(lost, 0, sent));
+                server.service(&mut session, &mut connection).unwrap();
+                session.driver().control.clear();
+            }
             session
                 .driver()
                 .events

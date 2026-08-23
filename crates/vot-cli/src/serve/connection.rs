@@ -75,7 +75,7 @@ const DECODE_FAILURE_SHARE: u64 = 4;
 /// for the length of the transfer. A counted hold bounds that duty cycle
 /// instead, and the first one is short so a path that has genuinely
 /// changed is retried rather than written off on one bad sample.
-const DECODE_FAILURE_HOLD_WINDOWS: u32 = 4;
+pub(crate) const DECODE_FAILURE_HOLD_WINDOWS: u32 = 4;
 
 /// Doublings the hold may take across repeated failures on one
 /// connection.
@@ -158,7 +158,7 @@ impl Default for FecPolicy {
             sustained_sent: 0,
             sustained_loss: 0,
             windows_closed: 0,
-            transient: false,
+            transient: true,
         }
     }
 }
@@ -205,7 +205,7 @@ const SEED_CEILING: u64 = RATE_ONE / 10;
 /// short transfer is never touched and ADR-0042's first-sample
 /// engagement is exactly as it was; the cost this removes is only ever
 /// paid by long transfers.
-pub(crate) const SUSTAINED_MIN_WINDOWS: u32 = 8;
+pub(crate) const SUSTAINED_MIN_WINDOWS: u32 = 4;
 
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
@@ -244,7 +244,7 @@ impl FecPolicy {
             self.sustained_sent = 0;
             self.sustained_loss = 0;
             self.windows_closed = 0;
-            self.transient = false;
+            self.transient = true;
             return;
         };
         self.sample_lost = self
@@ -288,7 +288,10 @@ impl FecPolicy {
         // which is measured: a veto reading the coded rate never armed.
         // What this holds is the rate the path shows when nothing is
         // being added to it.
-        if !self.coding {
+        // The opening window is the amplification-shaped ramp and says
+        // nothing about the path, and a window under coding is partly
+        // coding's own doing, so neither is evidence.
+        if !self.coding && self.windows_closed > 0 {
             self.sustained_lost = self.sustained_lost.saturating_add(self.sample_lost);
             self.sustained_sent = self.sustained_sent.saturating_add(self.sample_sent);
             self.sustained_loss =
@@ -309,10 +312,17 @@ impl FecPolicy {
         // a single edge would flap the way per-window hysteresis flapped
         // the loss verdict itself. It arms under the disengagement rate
         // and only a path reaching the full engagement rate clears it.
+        // Armed until the path earns its way out. Listening costs the
+        // opening of a transfer and settles the question the other way
+        // round: coding starts because the path was measured lossy
+        // without it, never because a probe cycle made it look lossy.
+        // The two rates differ, so this is two-sided: clearing takes the
+        // engagement rate, re-arming takes a fall to the disengagement
+        // rate.
         self.transient = if self.transient {
-            self.sustained_loss * 25 < RATE_ONE
+            !(self.windows_closed >= SUSTAINED_MIN_WINDOWS && self.sustained_loss * 25 >= RATE_ONE)
         } else {
-            self.windows_closed >= SUSTAINED_MIN_WINDOWS && self.sustained_loss * 40 < RATE_ONE
+            self.sustained_loss * 40 < RATE_ONE
         };
 
         let rate = u128::from(self.smoothed_loss);

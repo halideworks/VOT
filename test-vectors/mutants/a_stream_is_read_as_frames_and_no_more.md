@@ -75,5 +75,5 @@ the carrier's behaviour in no way.
 
 The owned-frame handoff rerun selected all 66 mutants in
 `vot-transport-framing`: 61 were caught, 5 were unviable, and none survived.
-The framing suite and the 88-test live quiche suite both passed with completed
-reassembly buffers moved into transport payloads instead of copied into them.
+The framing suite and 88 live quiche tests passed, with 1 benchmark ignored,
+while completed reassembly buffers moved into payloads instead of being copied.

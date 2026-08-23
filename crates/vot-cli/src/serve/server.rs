@@ -5,7 +5,7 @@ use super::{
     MAX_CONTROL_FRAME_PAYLOAD, ManifestReader, ManifestRequest, OpenedEpoch, PackageDescriptor,
     PackageSummary, Path, PathBuf, Payload, ProofBundle, RECORD_PLAINTEXT_BYTES, RangeRequest,
     ServeConnection, ServeStatus, ServedObject, Session, Storage, Suite, TransportAdapter,
-    TypedFrame, encoded, encoded_record, error_code, fail, frame_type, frames,
+    TypedFrame, encoded, error_code, fail, frame_type, frames,
 };
 
 /// One bundle, opened and proved once, answering any number of sessions.
@@ -742,8 +742,8 @@ impl BundleServer {
             .prove(offset, length)
             .map_err(Error::from)?
             .into_parts();
-        let plaintext = served.read_covered(covered_offset, covered_length)?;
-        let chunks = plaintext.chunks(RECORD_PLAINTEXT_BYTES);
+        let covered_bytes = usize::try_from(covered_length).map_err(|_| Error::InvalidBundle)?;
+        let record_count = covered_bytes.div_ceil(RECORD_PLAINTEXT_BYTES);
         let bundle = TypedFrame::ProofBundle(ProofBundle {
             request_id,
             bundle_id,
@@ -752,23 +752,38 @@ impl BundleServer {
             requested_length: length,
             covered_offset,
             covered_length,
-            data_record_count: chunks.len() as u64,
+            data_record_count: record_count as u64,
             total_plaintext_length: covered_length,
             proof,
         });
-        connection.queue_control(encoded(&bundle)?);
+        let mut records = Vec::with_capacity(record_count);
         let mut record_offset = covered_offset;
-        for (index, chunk) in plaintext.chunks(RECORD_PLAINTEXT_BYTES).enumerate() {
-            let record = frames::DataRecordRef {
+        let mut remaining = covered_bytes;
+        for index in 0..record_count {
+            let encoded_length = remaining.min(RECORD_PLAINTEXT_BYTES);
+            let record = frames::DataRecordHeader {
                 bundle_id,
                 record_index: index as u64,
                 plaintext_offset: record_offset,
-                plaintext_length: chunk.len() as u64,
+                plaintext_length: encoded_length as u64,
                 compression: 0,
-                encoded: chunk,
+                encoded_length,
             };
-            connection.queue_record(encoded_record(record)?);
-            record_offset = record_offset.saturating_add(chunk.len() as u64);
+            let mut wire = Vec::new();
+            let encoded = frames::reserve_data_record(record, &mut wire).map_err(Error::from)?;
+            records.push((wire, encoded));
+            record_offset = record_offset.saturating_add(encoded_length as u64);
+            remaining -= encoded_length;
+        }
+        let mut parts: Vec<&mut [u8]> = records
+            .iter_mut()
+            .map(|(wire, encoded)| &mut wire[encoded.clone()])
+            .collect();
+        served.read_covered_into(covered_offset, &mut parts)?;
+        drop(parts);
+        connection.queue_control(encoded(&bundle)?);
+        for (wire, _) in records {
+            connection.queue_record(Payload::from(wire));
         }
         Ok(())
     }

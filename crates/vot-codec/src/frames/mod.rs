@@ -5,6 +5,7 @@
 use super::{
     DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, encode_varint, frame_type,
 };
+use std::ops::Range;
 
 const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 const GROUP_BYTES: u64 = 65_536;
@@ -159,7 +160,19 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
 
 /// Encodes one borrowed data record and its bounded envelope.
 pub fn encode_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) -> Result<(), Error> {
-    validate_data_record(value)?;
+    let encoded = value.encoded;
+    let range = reserve_data_record(value.into(), output)?;
+    output[range].copy_from_slice(encoded);
+    Ok(())
+}
+
+/// Encodes a data-record envelope with a zeroed encoded-byte field and returns
+/// the field's range so a caller can fill it in place.
+pub fn reserve_data_record(
+    value: DataRecordHeader,
+    output: &mut Vec<u8>,
+) -> Result<Range<usize>, Error> {
+    validate_data_record_header(value)?;
     let payload_len = data_record_payload_len(value);
     let length_width = match payload_len {
         0..=63 => 1,
@@ -169,8 +182,10 @@ pub fn encode_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) -> Res
     output.reserve_exact(payload_len.saturating_add(1 + length_width));
     encode_varint(frame_type::DATA_RECORD, output)?;
     encode_varint(payload_len as u64, output)?;
-    encode_validated_data_record(value, output);
-    Ok(())
+    encode_validated_data_record_header(value, output);
+    let start = output.len();
+    output.resize(start.saturating_add(value.encoded_length), 0);
+    Ok(start..output.len())
 }
 
 /// Decodes one typed frame without accepting an unknown application payload.
@@ -1485,6 +1500,11 @@ mod tests {
         let mut borrowed = vec![0xaa];
         encode_data_record((&data).into(), &mut borrowed).unwrap();
         assert_eq!(borrowed, expected);
+        let mut reserved = vec![0xaa];
+        let encoded = reserve_data_record((&data).into(), &mut reserved).unwrap();
+        assert_eq!(reserved[encoded.clone()], [0, 0, 0]);
+        reserved[encoded].copy_from_slice(&data.encoded);
+        assert_eq!(reserved, expected);
 
         data.record_index = 17;
         let before = actual.clone();
@@ -1498,6 +1518,11 @@ mod tests {
             Err(Error::InvalidValue)
         );
         assert_eq!(borrowed, before);
+        assert_eq!(
+            reserve_data_record((&data).into(), &mut reserved),
+            Err(Error::InvalidValue)
+        );
+        assert_eq!(reserved, expected);
     }
 
     #[test]

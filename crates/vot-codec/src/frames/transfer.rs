@@ -71,6 +71,36 @@ pub struct DataRecordRef<'data> {
     pub encoded: &'data [u8],
 }
 
+/// Data-record fields needed before its encoded bytes have been filled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataRecordHeader {
+    pub bundle_id: [u8; 16],
+    pub record_index: u64,
+    pub plaintext_offset: u64,
+    pub plaintext_length: u64,
+    pub compression: u8,
+    pub encoded_length: usize,
+}
+
+impl From<DataRecordRef<'_>> for DataRecordHeader {
+    fn from(value: DataRecordRef<'_>) -> Self {
+        Self {
+            bundle_id: value.bundle_id,
+            record_index: value.record_index,
+            plaintext_offset: value.plaintext_offset,
+            plaintext_length: value.plaintext_length,
+            compression: value.compression,
+            encoded_length: value.encoded.len(),
+        }
+    }
+}
+
+impl From<&DataRecord> for DataRecordHeader {
+    fn from(value: &DataRecord) -> Self {
+        DataRecordRef::from(value).into()
+    }
+}
+
 impl<'data> From<&'data DataRecord> for DataRecordRef<'data> {
     fn from(value: &'data DataRecord) -> Self {
         Self {
@@ -305,7 +335,7 @@ pub(super) fn proof_bundle_payload_len_with(value: &ProofBundle, proof_len: usiz
         .saturating_add(cbor_byte_string_len(proof_len))
 }
 
-pub(super) fn encode_validated_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) {
+pub(super) fn encode_validated_data_record_header(value: DataRecordHeader, output: &mut Vec<u8>) {
     vot_cbor::map(output, 8);
     vot_cbor::uint(output, 0);
     vot_cbor::uint(output, 0);
@@ -320,9 +350,15 @@ pub(super) fn encode_validated_data_record(value: DataRecordRef<'_>, output: &mu
     vot_cbor::uint(output, 5);
     vot_cbor::uint(output, u64::from(value.compression));
     vot_cbor::uint(output, 6);
-    vot_cbor::uint(output, value.encoded.len() as u64);
+    vot_cbor::uint(output, value.encoded_length as u64);
     vot_cbor::uint(output, 7);
-    vot_cbor::bytes(output, value.encoded);
+    vot_cbor::head(output, vot_cbor::major::BYTES, value.encoded_length as u64);
+}
+
+#[cfg(test)]
+pub(super) fn encode_validated_data_record(value: DataRecordRef<'_>, output: &mut Vec<u8>) {
+    encode_validated_data_record_header(value.into(), output);
+    output.extend_from_slice(value.encoded);
 }
 
 pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
@@ -363,7 +399,11 @@ pub(super) fn decode_data_record(input: &[u8]) -> Result<DataRecord, Error> {
 }
 
 pub(super) fn validate_data_record(value: DataRecordRef<'_>) -> Result<(), Error> {
-    let encoded_length = value.encoded.len() as u64;
+    validate_data_record_header(value.into())
+}
+
+pub(super) fn validate_data_record_header(value: DataRecordHeader) -> Result<(), Error> {
+    let encoded_length = value.encoded_length as u64;
     if value.record_index > 16
         || value.plaintext_offset > MAX_OBJECT_LENGTH
         || value.plaintext_length == 0
@@ -379,7 +419,7 @@ pub(super) fn validate_data_record(value: DataRecordRef<'_>) -> Result<(), Error
     }
 }
 
-pub(super) fn data_record_payload_len(value: DataRecordRef<'_>) -> usize {
+pub(super) fn data_record_payload_len(value: DataRecordHeader) -> usize {
     cbor_head_len(8)
         .saturating_add(cbor_head_len(0))
         .saturating_add(cbor_head_len(0))
@@ -394,9 +434,9 @@ pub(super) fn data_record_payload_len(value: DataRecordRef<'_>) -> usize {
         .saturating_add(cbor_head_len(5))
         .saturating_add(cbor_head_len(u64::from(value.compression)))
         .saturating_add(cbor_head_len(6))
-        .saturating_add(cbor_head_len(value.encoded.len() as u64))
+        .saturating_add(cbor_head_len(value.encoded_length as u64))
         .saturating_add(cbor_head_len(7))
-        .saturating_add(cbor_byte_string_len(value.encoded.len()))
+        .saturating_add(cbor_byte_string_len(value.encoded_length))
 }
 
 pub(super) fn encode_have(value: &Have, output: &mut Vec<u8>) -> Result<(), Error> {

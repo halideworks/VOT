@@ -122,9 +122,11 @@ pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 /// Datagrams are not held to this bound; they have their own, below.
 const MAX_INBOUND_EVENTS: usize = 1_024;
 
-/// Datagrams quiche queues outbound before it refuses one. Refusals are
-/// counted and backpressured through the outbox, so this stays small.
-const DATAGRAM_QUEUE_LEN: usize = 1_024;
+/// Bounds the burst one pump pass hands the socket. A receiver whose kernel
+/// clamped its 16 MiB buffer request to `rmem_max` drops from a 1,024 burst
+/// and absorbs 256; what quiche will not take waits in the outbox, so the
+/// small bound loses nothing.
+const DATAGRAM_QUEUE_LEN: usize = 256;
 
 /// Datagrams quiche queues inbound before it silently discards the oldest.
 ///
@@ -5186,6 +5188,10 @@ mod tests {
         // whole burst is across: quiche silently discards the oldest inbound
         // datagram past its queue depth, so a depth under what the wire's
         // credit invites loses datagrams no counter in this stack sees.
+        //
+        // Twice the old send queue's depth, tied to no send bound in this
+        // file: what this measures is receive depth.
+        const BURST: usize = 2_048;
         let (certificate, key) = credentials();
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
@@ -5218,26 +5224,25 @@ mod tests {
             }
         }
         assert!(client.is_established() && server.is_established());
-        let burst = 2 * DATAGRAM_QUEUE_LEN;
         let payload = [7_u8; 64];
         let mut sent = 0_usize;
         // Bounded by its own count: each round queues what the send queue
         // takes and shuttles both ways so acks keep the window growing.
         for _ in 0..64 {
-            while sent < burst && server.dgram_send(&payload).is_ok() {
+            while sent < BURST && server.dgram_send(&payload).is_ok() {
                 sent += 1;
             }
             shuttle(&mut server, remote, &mut client, local);
             shuttle(&mut client, local, &mut server, remote);
-            if sent == burst && server.dgram_send_queue_len() == 0 {
+            if sent == BURST && server.dgram_send_queue_len() == 0 {
                 break;
             }
         }
-        assert_eq!(sent, burst, "the whole burst was handed to the carrier");
+        assert_eq!(sent, BURST, "the whole burst was handed to the carrier");
         assert_eq!(server.dgram_send_queue_len(), 0, "and it all went out");
         assert_eq!(
             client.dgram_recv_queue_len(),
-            burst,
+            BURST,
             "an undrained receiver holds every datagram the sender put on a lossless wire"
         );
     }

@@ -1691,9 +1691,6 @@ mod tests {
             "no cover completed within the round budget"
         );
 
-        // The decisive pass must wait, not spin; set now so the earlier
-        // rounds are not slowed.
-        fetcher.proving.wait = std::time::Duration::from_secs(5);
         fetcher.pump_provers().unwrap();
         let pool = fetcher
             .proving

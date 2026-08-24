@@ -90,6 +90,13 @@ roots, and the manifest proves those roots to the package seal. Address-based
 fetches therefore require `PACKAGE_ROOT`. Set `VOT_FETCH_UNPINNED=1` only when
 the remote package is intentionally accepted without a trusted root.
 
+Both ends ask the kernel for a 16 MiB UDP receive buffer and an 8 MiB send
+buffer, and without `CAP_NET_ADMIN` the kernel clamps those to `net.core.rmem_max`
+and `net.core.wmem_max`, which on a stock Linux is 208 KiB and drops around a
+tenth of the packets at multi-gigabit rates. The CLI prints one warning line to
+stderr when it is clamped; raise the two sysctls (64 MiB each is ample) to clear
+it.
+
 ### Who may fetch
 
 A serve answers anyone by default. Give it an issuer key and it requires a

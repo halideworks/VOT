@@ -2379,7 +2379,9 @@ fn send_and_revalidate(
     sending: &mut Sending,
 ) -> Result<Option<Instant>, Error> {
     sending.open_duplication(conn.is_established());
-    let paced = send_all(socket, conn, out, sending)?;
+    // Taken once: a per-packet `now` would let a long pass drift its own
+    // horizon forward and never end.
+    let paced = send_all(socket, conn, out, sending, Instant::now() + PACE_QUANTUM)?;
     if should_revalidate(sending.refused) {
         conn.revalidate_pmtu();
         sending.refused = 0;
@@ -2557,13 +2559,11 @@ fn send_all(
     conn: &mut Connection,
     out: &mut [u8],
     sending: &mut Sending,
+    pass_horizon: Instant,
 ) -> Result<Option<Instant>, Error> {
     // Packets are gathered into one buffer and handed over together so
     // segmentation offload takes the whole burst in one call.
     let ceiling = sending.ceiling;
-    // Taken once: a per-packet `now` would let a long pass drift its own
-    // horizon forward and never end.
-    let pass_horizon = Instant::now() + PACE_QUANTUM;
     let mut filled = 0_usize;
     let mut segment = 0_usize;
     let mut destination = None;
@@ -2616,8 +2616,10 @@ fn send_all(
                 // the front of `out` to open the next pass at its own release
                 // time. Decided before the append, or the burst it was meant to
                 // follow would carry it early. That bounds a burst's time by
-                // the pacer's clock, to within one quantum.
-                if info.at > pass_horizon {
+                // the pacer's clock, to within one quantum. A release is only
+                // in the future against the clock now: a pass outrunning its
+                // own horizon must not park a packet already due.
+                if info.at > pass_horizon && info.at > Instant::now() {
                     flush_burst(socket, &out[..filled], segment, destination, sending)?;
                     out.copy_within(filled..filled + written, 0);
                     sending.held = written;
@@ -5341,6 +5343,11 @@ mod tests {
         out[..bytes].to_vec()
     }
 
+    /// The horizon a pass takes for itself when the pump opens it.
+    fn horizon() -> Instant {
+        Instant::now() + PACE_QUANTUM
+    }
+
     const HELD_BYTES: usize = 200;
 
     #[test]
@@ -5355,13 +5362,13 @@ mod tests {
         let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
         let parked = park(&mut out, &mut sending, HELD_BYTES, destination);
 
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("the pass");
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("the pass");
         let first = collected(&receiver);
         assert_eq!(first.first(), Some(&parked), "the held packet went first");
         assert_eq!(sending.held, 0, "and the hold was released");
         assert_eq!(sending.held_to, None);
 
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("a further pass");
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("a further pass");
         assert!(
             !collected(&receiver).contains(&parked),
             "a held packet is sent once, not on every later pass"
@@ -5386,7 +5393,7 @@ mod tests {
         let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
         let parked = park(&mut out, &mut sending, HELD_BYTES, held_to);
 
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("the pass");
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("the pass");
         assert_eq!(
             collected(&elsewhere),
             vec![parked.clone()],
@@ -5413,7 +5420,7 @@ mod tests {
         let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
         let parked = park(&mut out, &mut sending, HELD_BYTES, remote);
 
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("the pass");
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("the pass");
         let sent = collected(&peer);
         assert_eq!(sent.first(), Some(&parked), "the held packet opened it");
         assert!(
@@ -5494,7 +5501,7 @@ mod tests {
         let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
 
         let before = Instant::now();
-        let paced = send_all(&sender, &mut client, &mut out, &mut sending)
+        let paced = send_all(&sender, &mut client, &mut out, &mut sending, horizon())
             .expect("the pass")
             .expect("a release time the pacer set");
         assert!(
@@ -5508,12 +5515,41 @@ mod tests {
             !collected(&peer).contains(&parked),
             "the parked packet did not ride out ahead of its release"
         );
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("the next pass");
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("the next pass");
         assert_eq!(
             collected(&peer).first(),
             Some(&parked),
             "and it opened the next pass"
         );
+    }
+
+    #[test]
+    fn a_pass_past_its_horizon_never_parks_a_packet_already_due() {
+        // With no pacer every release is `now`, so a pass running longer than
+        // the quantum outruns the horizon it took at the start. Nothing is
+        // owed the future there, and parking would end the pass for nothing.
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let peer = bounded_receiver();
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote = peer.local_addr().expect("its address");
+        let (mut client, _server) = sans_io_pair_at(1024 * 1024, local, remote, None);
+        client
+            .stream_send(0, &vec![7_u8; 256 * 1024], false)
+            .expect("a stream the pass has to drain");
+        let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+        let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
+        // The horizon a pass longer than a quantum is left holding, without
+        // waiting a quantum out.
+        let stale = Instant::now()
+            .checked_sub(PACE_QUANTUM)
+            .expect("a clock past the quantum");
+
+        let paced =
+            send_all(&sender, &mut client, &mut out, &mut sending, stale).expect("the pass");
+
+        assert_eq!(paced, None, "no release time is owed the next wake");
+        assert_eq!(sending.held, 0, "and nothing due now was parked");
+        assert_eq!(sending.held_to, None);
     }
 
     /// A cap above the rate the controller itself sets on a fresh connection,
@@ -5541,7 +5577,9 @@ mod tests {
             .expect("a stream the pacer has to meter");
         let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
         let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
-        send_all(&sender, &mut client, &mut out, &mut sending).expect("the pass");
+        // Through the pump's own entry point, so the horizon it hands the pass
+        // is under test too.
+        send_and_revalidate(&sender, &mut client, &mut out, &mut sending).expect("the pass");
         collected(&peer).len()
     }
 

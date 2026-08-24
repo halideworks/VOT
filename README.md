@@ -99,6 +99,15 @@ and the socket keeps its much smaller default. The CLI prints one warning line
 to stderr naming the knob when it got less than it asked for; raise it (64 MiB
 is ample) to clear the warning.
 
+A serve behind Linux's default `fq_codel` root qdisc loses packets on long paths for
+a different reason: CoDel drops on queue sojourn time against a 5 ms target, and a
+sender whose round trip is 100 ms keeps its queue above that permanently, so on one
+measured 107 ms path 6.5% of the serve's packets were dropped by its own qdisc as
+whole segmentation bursts. Raising the qdisc's limit does nothing; replacing it
+(`tc qdisc replace dev eth0 root pfifo limit 100000`) took that to 0.001% and cut
+the serve's CPU by a quarter, while the wall moved only 6% because eight rails are
+not loss bound there.
+
 ### Who may fetch
 
 A serve answers anyone by default. Give it an issuer key and it requires a

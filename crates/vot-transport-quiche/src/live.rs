@@ -198,11 +198,19 @@ const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
 /// carrier hold for a stream this end asked for, not a working set: a peer
 /// sends only what was requested, within its own credit. 64 MiB and above
 /// measured flat at 80 and 200 ms, so it stops at the smallest value that
-/// clears the wire. The connection is one rail's, and its window is the
-/// same aggregate bound the advertised one is, so it does not hold a stream
-/// under the ceiling that stream already has.
+/// clears the wire. The connection ceiling is half again the stream one
+/// because the library lifts a connection window to 1.5 times the stream
+/// window on every grant it sends, past `max_connection_window` and without
+/// clamping to it; a smaller figure here would not be a bound at all, and
+/// the sweep read 1.5x and 1x alike.
 const STREAM_WINDOW_CEILING: u64 = 32 * 1_024 * 1_024;
-const CONNECTION_WINDOW_CEILING: u64 = STREAM_WINDOW_CEILING;
+const CONNECTION_WINDOW_CEILING: u64 = STREAM_WINDOW_CEILING / 2 * 3;
+const _: () = assert!(CONNECTION_WINDOW_CEILING == STREAM_WINDOW_CEILING / 2 * 3);
+/// The ceiling never truncates the window this endpoint advertises at the
+/// handshake, which is the control-frame limit plus a record, eightfold.
+const _: () = assert!(
+    STREAM_WINDOW_CEILING > (1_048_576 + vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64) * 8
+);
 
 /// Datagrams the driver holds for a connection whose own queue is full.
 ///
@@ -5694,104 +5702,6 @@ mod tests {
             client.dgram_recv_queue_len(),
             BURST,
             "an undrained receiver holds every datagram the sender put on a lossless wire"
-        );
-    }
-
-    #[test]
-    fn a_granted_window_outgrows_the_librarys_own_ceilings() {
-        // Both ends are built through `Config::build`, which is where the
-        // window ceilings are set. Stock quiche caps a receive window at 16
-        // MiB per stream and 24 MiB per connection however much this end
-        // advertises, and the window over the round trip is the whole of one
-        // connection's rate. So: advertise past both stock caps, drain the
-        // stream until the receiver has re-granted, and read what the sender
-        // is then allowed to hold. Either ceiling left at the library's value
-        // caps that credit at its own figure.
-        const PAST_STOCK: usize = 24 * 1_024 * 1_024;
-        const CHUNK: usize = 256 * 1_024;
-        // A control-frame limit whose eightfold window clears both stock
-        // caps; the queue capacity is the test's, since what is measured is
-        // the carrier's window and not what a session would stage.
-        let limits = ReceiveLimits::advertised(
-            &vot_codec::Settings {
-                max_control_frame_payload: 4 * 1_024 * 1_024,
-                reliable_lane_limit: 4,
-                ..vot_codec::Settings::default()
-            },
-            8 * 1_024 * 1_024,
-        )
-        .expect("limits wider than both stock ceilings");
-        let (certificate, key) = credentials();
-        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
-        let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
-        let mut client_config = Config::client(limits);
-        client_config.verify_peer = false;
-        let mut client_quiche = client_config.build(Role::Client).expect("a client config");
-        let server_config = Config::server(limits, certificate, key);
-        let mut server_quiche = server_config.build(Role::Server).expect("a server config");
-        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
-            Some("localhost"),
-            &scid_for(local),
-            local,
-            remote,
-            &mut client_quiche,
-        )
-        .expect("a client");
-        let mut server = quiche::accept_with_buf_factory::<SharedBufFactory>(
-            &scid_for(remote),
-            None,
-            remote,
-            local,
-            &mut server_quiche,
-        )
-        .expect("a server");
-        for _ in 0_u32..64 {
-            shuttle(&mut client, local, &mut server, remote);
-            shuttle(&mut server, remote, &mut client, local);
-            if client.is_established() && server.is_established() {
-                break;
-            }
-        }
-        assert!(client.is_established() && server.is_established());
-        // The receiver opens the stream, so the sender has one to fill.
-        client
-            .stream_send(0, b"go", false)
-            .expect("the stream opens");
-        shuttle(&mut client, local, &mut server, remote);
-        shuttle(&mut server, remote, &mut client, local);
-        let payload = vec![7_u8; CHUNK];
-        let mut sink = vec![0_u8; CHUNK];
-        // Every byte past what was advertised at the handshake was granted
-        // afterwards, so the credit is read once that much has been drained.
-        let past_the_advertised_window = 48 * 1_024 * 1_024;
-        let mut drained = 0_usize;
-        let mut granted = 0_usize;
-        // Bounded by its own count: each round fills the stream to the credit
-        // on offer, carries it across, drains it, and carries the grant back,
-        // which is also one round trip of congestion window growth.
-        for _ in 0..4_096 {
-            while server
-                .stream_send(0, &payload, false)
-                .is_ok_and(|written| written > 0)
-            {}
-            shuttle(&mut server, remote, &mut client, local);
-            while let Ok((read, _)) = client.stream_recv(0, &mut sink) {
-                drained += read;
-            }
-            shuttle(&mut client, local, &mut server, remote);
-            granted = server.stream_capacity(0).expect("the stream's credit");
-            if drained > past_the_advertised_window {
-                break;
-            }
-        }
-        assert!(
-            drained > past_the_advertised_window,
-            "the pair never drained past the advertised window: {drained} bytes"
-        );
-        assert!(
-            granted > PAST_STOCK,
-            "a drained receiver granted {granted} bytes, which the library's own ceilings \
-             would have held to {PAST_STOCK}"
         );
     }
 

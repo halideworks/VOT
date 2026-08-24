@@ -122,9 +122,11 @@ pub const LARGEST_DATAGRAM_SIZE: usize = 65_507;
 /// Datagrams are not held to this bound; they have their own, below.
 const MAX_INBOUND_EVENTS: usize = 1_024;
 
-/// Datagrams quiche queues outbound before it refuses one. Refusals are
-/// counted and backpressured through the outbox, so this stays small.
-const DATAGRAM_QUEUE_LEN: usize = 1_024;
+/// Datagrams quiche queues outbound before it refuses one, which bounds the
+/// burst one pump pass hands the socket: a receiver's default UDP buffer
+/// absorbs 256 of them and drops from 1,024. Refusals are counted and
+/// backpressured through the outbox, so the small bound loses none of them.
+const DATAGRAM_QUEUE_LEN: usize = 256;
 
 /// Datagrams quiche queues inbound before it silently discards the oldest.
 ///

@@ -1735,27 +1735,19 @@ mod tests {
         assert_eq!(served, built);
         // 1500000 bytes of object are 23 generations, every one of them
         // offered over the datagram path; the manifest and the small tail
-        // travel reliably.
-        //
-        // How many of them decode is not asserted here and cannot be. The
-        // serve queues every symbol of a piece at once and the receiving
-        // carrier drops what it cannot hold at that instant, so the share
-        // that arrives is a race: runs of this test have decoded anywhere
-        // from none of five generations to all 23. That is a serve-side
-        // pacing defect, it is what the FEC measurement exists to quantify,
-        // and a threshold here would only turn it into a flaky gate. What
-        // this test owns is that the path is offered and that the object
-        // arrives whole however much of it the symbols carried, which the
-        // reliable repair behind a closed epoch is what guarantees. The
-        // decode path itself is pinned deterministically by
-        // `a_transfer_in_process_rides_the_datagram_path_when_both_ends_offer_it`,
-        // over a carrier with no queue to overrun.
+        // travel reliably. The connection's send queue bounds a pass's burst
+        // to what a receiver's UDP buffer absorbs, so every offered epoch
+        // decodes from its symbols rather than waiting on reliable repair.
         let counts = outcome.fec;
         assert_eq!(
             counts.offered, 23,
             "the epochs opened span every generation of the object"
         );
         assert_eq!(counts.refused, 0, "credit admitted every epoch");
+        assert_eq!(
+            counts.decoded, counts.offered,
+            "every offered epoch was carried by its symbols: {counts:?}"
+        );
         assert!(
             counts.decoded + counts.abandoned <= counts.offered,
             "the outcomes are disjoint subsets of what was offered: {counts:?}"

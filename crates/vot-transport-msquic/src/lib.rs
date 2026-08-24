@@ -343,7 +343,7 @@ pub mod live {
             smoothed_rtt_us: measured(u64::from(statistics.Rtt)),
             congestion_window_bytes: measured(u64::from(statistics.SendCongestionWindow)),
             mtu_bytes: measured(u64::from(statistics.SendPathMtu)),
-            pacing_rate_bps: None,
+            delivery_rate_bps: None,
             lost_packets: Some(statistics.SendSuspectedLostPackets),
             spurious_lost_packets: Some(statistics.SendSpuriousLostPackets),
             packets_sent: Some(statistics.SendTotalPackets),
@@ -4333,7 +4333,7 @@ pub mod live {
             assert!(stats.smoothed_rtt_us.is_some());
             assert!(stats.congestion_window_bytes.is_some());
             assert!(stats.mtu_bytes.is_some());
-            assert_eq!(stats.pacing_rate_bps, None);
+            assert_eq!(stats.delivery_rate_bps, None);
             {
                 let mut adapter = sampled_adapter.lock().unwrap();
                 adapter.record_path_stats(ConnectionId(1), stats);
@@ -4478,7 +4478,7 @@ mod tests {
             smoothed_rtt_us: Some(18_500),
             congestion_window_bytes: Some(1_048_576),
             mtu_bytes: Some(1350),
-            pacing_rate_bps: None,
+            delivery_rate_bps: None,
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,

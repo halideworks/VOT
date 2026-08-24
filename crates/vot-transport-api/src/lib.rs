@@ -329,8 +329,8 @@ pub struct PathStats {
     pub congestion_window_bytes: Option<u64>,
     /// Current path MTU in bytes, when available.
     pub mtu_bytes: Option<u64>,
-    /// Current pacing rate in bits per second, when available.
-    pub pacing_rate_bps: Option<u64>,
+    /// Most recent delivery rate in bits per second, when available.
+    pub delivery_rate_bps: Option<u64>,
     /// Packets declared lost over the connection's lifetime, when counted.
     pub lost_packets: Option<u64>,
     /// Of the declared losses, how many a later ACK disproved. Spurious losses

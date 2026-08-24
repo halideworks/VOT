@@ -74,9 +74,7 @@ the same function. The reasons fall into six classes:
 | `replace != with == in send_all` | burst geometry | destination comparison; every test speaks to one peer, so no burst ever splits by address |
 | `replace + with - in send_all` | burst geometry | the moved-packet arithmetic behind the destination split, unreachable with one peer |
 | `replace + with * in send_all` | burst geometry | as above |
-| `replace > with == in send_all` | burst geometry | the pacing deadline comparison; ignoring the pacer reshapes bursts without corrupting them |
-| `replace > with < in send_all` | burst geometry | as above |
-| `replace > with >= in send_all` | burst geometry | as above |
+| `replace > with >= in send_all` | equivalent behavior | the release-time comparison against the clock read beside it; the two agree unless a packet's release falls on that exact instant, and holding a packet already due changes nothing |
 | `replace < with == in send_all` | burst geometry | the short-packet burst close; a misdrawn boundary costs flushes, not bytes |
 | `replace < with > in send_all` | burst geometry | as above |
 | `replace < with <= in send_all` | burst geometry | as above |

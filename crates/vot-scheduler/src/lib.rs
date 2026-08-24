@@ -386,7 +386,7 @@ mod tests {
         let mut receiver = ReliableReceiver::new(4096, 1, 4096).unwrap();
         assert_eq!(receiver.advertised_credit(), 1);
         receiver.observe_path_stats(PathStats {
-            pacing_rate_bps: Some(8_000_000),
+            delivery_rate_bps: Some(8_000_000),
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,
@@ -397,7 +397,7 @@ mod tests {
         });
         assert_eq!(receiver.advertised_credit(), 1_000);
         receiver.observe_path_stats(PathStats {
-            pacing_rate_bps: None,
+            delivery_rate_bps: None,
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,
@@ -410,7 +410,7 @@ mod tests {
 
         let mut zero_bdp = ReliableReceiver::new(4096, 1, 4096).unwrap();
         zero_bdp.observe_path_stats(PathStats {
-            pacing_rate_bps: Some(1),
+            delivery_rate_bps: Some(1),
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,
@@ -421,7 +421,7 @@ mod tests {
         });
         assert_eq!(zero_bdp.advertised_credit(), 1);
         zero_bdp.observe_path_stats(PathStats {
-            pacing_rate_bps: None,
+            delivery_rate_bps: None,
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,

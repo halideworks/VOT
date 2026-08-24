@@ -558,7 +558,7 @@ mod tests {
             smoothed_rtt_us: Some(4_000),
             congestion_window_bytes: Some(65_536),
             mtu_bytes: Some(1_350),
-            pacing_rate_bps: Some(1_000_000),
+            delivery_rate_bps: Some(1_000_000),
             lost_packets: None,
             spurious_lost_packets: None,
             packets_sent: None,

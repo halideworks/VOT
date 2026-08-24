@@ -385,7 +385,7 @@ impl ReliableReceiver {
     /// Updates staging credit from the backend's current path measurements.
     pub fn observe_path_stats(&mut self, stats: PathStats) {
         let bdp_target = match (
-            stats.pacing_rate_bps,
+            stats.delivery_rate_bps,
             stats.smoothed_rtt_us,
             stats.congestion_window_bytes,
         ) {

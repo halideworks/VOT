@@ -1715,6 +1715,10 @@ mod tests {
         // The default width, wired through the same call a caller uses.
         assert_eq!(fetcher.proving.width, DEFAULT_PROVING_THREADS);
         assert_eq!(
+            fetcher.proving.wait, TEST_PROVER_WAIT,
+            "a test round waits for the witness it is owed"
+        );
+        assert_eq!(
             fetcher.receiver.deferred_limit(),
             DEFAULT_PROVING_THREADS + 1
         );

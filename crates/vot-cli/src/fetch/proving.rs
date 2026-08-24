@@ -14,6 +14,10 @@ pub(crate) const DEFAULT_PROVING_THREADS: usize = 4;
 /// this end's own and already in hand.
 pub(crate) const PROVER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// What a test's pass waits instead: a test round waits for the witness it
+/// is owed, so starvation cannot turn a counted round budget into a clock.
+pub(crate) const TEST_PROVER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a prover is handed: a bundle to prove and where its bytes go.
 pub(crate) struct Proving {
     pub(crate) completed: CompletedBundle,

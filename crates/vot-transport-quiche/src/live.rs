@@ -2399,6 +2399,13 @@ const fn should_revalidate(refused: usize) -> bool {
 /// held packet ahead of its release.
 const PACE_HOLD_TICK: Duration = Duration::from_millis(5);
 
+/// How far past now a send pass will still release a packet: releases due
+/// within one wake go now, as one burst, so a wake carries the rate times the
+/// quantum rather than a single packet. The pacer forfeits time it was not
+/// woken for, so a schedule finer than the wake cadence is only ever met by
+/// bursting it.
+const PACE_QUANTUM: Duration = TICK;
+
 /// What a send pass needs beyond the connection: the ceiling, whether
 /// segmentation offload is available, the size-refusal ledger, and what
 /// the startup prefix still owes a second copy of.
@@ -2554,6 +2561,9 @@ fn send_all(
     // Packets are gathered into one buffer and handed over together so
     // segmentation offload takes the whole burst in one call.
     let ceiling = sending.ceiling;
+    // Taken once: a per-packet `now` would let a long pass drift its own
+    // horizon forward and never end.
+    let pass_horizon = Instant::now() + PACE_QUANTUM;
     let mut filled = 0_usize;
     let mut segment = 0_usize;
     let mut destination = None;
@@ -2600,14 +2610,14 @@ fn send_all(
                     filled = 0;
                 }
                 destination = Some(info.to);
-                // Pacing is the connection's decision, and the first packet
-                // the pacer holds back ends the pass: what was released goes
-                // as one call, and the held packet is parked at the front of
-                // `out` to open the next pass at its own release time. Decided
-                // before the append, or the burst it was meant to follow would
-                // carry it early. That bounds a burst's time by the pacer's
-                // clock.
-                if info.at > Instant::now() {
+                // Pacing is the connection's decision, and a packet released
+                // beyond this pass's horizon ends the pass: what is due within
+                // one wake goes as one call, and the held packet is parked at
+                // the front of `out` to open the next pass at its own release
+                // time. Decided before the append, or the burst it was meant to
+                // follow would carry it early. That bounds a burst's time by
+                // the pacer's clock, to within one quantum.
+                if info.at > pass_horizon {
                     flush_burst(socket, &out[..filled], segment, destination, sending)?;
                     out.copy_within(filled..filled + written, 0);
                     sending.held = written;
@@ -5212,8 +5222,9 @@ mod tests {
     }
 
     /// The same pair at chosen addresses, with the client's pacer on and
-    /// capped at `paced` bytes per second when asked, which is what makes
-    /// `send` report a release time in the future at all.
+    /// capped at `paced` megabits per second when asked, which is what makes
+    /// `send` report a release time in the future at all. Megabits because
+    /// `set_max_pacing_rate` is read as `Bandwidth::from_mbits_per_second`.
     fn sans_io_pair_at(
         window: u64,
         local: SocketAddr,
@@ -5466,15 +5477,16 @@ mod tests {
 
     #[test]
     fn a_future_release_time_parks_its_packet_rather_than_flushing_it() {
-        // The pacer's whole purpose: a packet it released for later must not
-        // ride out with the burst before it. The rate is low enough that
-        // every packet past the first is held for a wait the tick cannot
-        // cover, which is the deadline the pass returns.
+        // The pacer's whole purpose: a packet it released beyond the pass's
+        // horizon must not ride out with the burst before it. The rate is low
+        // enough that every packet past the burst tokens is held for a wait no
+        // single wake covers, which is the deadline the pass returns.
         let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
         let peer = bounded_receiver();
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote = peer.local_addr().expect("its address");
-        let (mut client, _server) = sans_io_pair_at(1024 * 1024, local, remote, Some(1_200));
+        let (mut client, _server) =
+            sans_io_pair_at(1024 * 1024, local, remote, Some(BEYOND_QUANTUM_RATE));
         client
             .stream_send(0, &vec![9_u8; 256 * 1024], false)
             .expect("a stream the pacer has to meter");
@@ -5485,7 +5497,10 @@ mod tests {
         let paced = send_all(&sender, &mut client, &mut out, &mut sending)
             .expect("the pass")
             .expect("a release time the pacer set");
-        assert!(paced > before, "the deadline is the held packet's release");
+        assert!(
+            paced > before + PACE_QUANTUM,
+            "the deadline is the held packet's release, and it is past the horizon"
+        );
         assert!(sending.held > 0, "and the packet it belongs to is parked");
         assert_eq!(sending.held_to, Some(remote));
         let parked = out[..sending.held].to_vec();
@@ -5498,6 +5513,65 @@ mod tests {
             collected(&peer).first(),
             Some(&parked),
             "and it opened the next pass"
+        );
+    }
+
+    /// A cap above the rate the controller itself sets on a fresh connection,
+    /// so the pacer runs at the controller's own rate and commands about
+    /// 180 us per packet: a fraction of the quantum.
+    const WITHIN_QUANTUM_RATE: u64 = 1_000;
+
+    /// A cap that binds, at about 5 ms per packet: comfortably past the
+    /// quantum, so the packet is the pacer's to hold.
+    const BEYOND_QUANTUM_RATE: u64 = 2;
+
+    /// Passes the within-quantum arm takes the best of.
+    const WITHIN_QUANTUM_PASSES: u32 = 5;
+
+    /// Packets one send pass gets out of a freshly established connection
+    /// whose pacer is capped at `rate` megabits per second.
+    fn packets_in_one_paced_pass(rate: u64) -> usize {
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let peer = bounded_receiver();
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote = peer.local_addr().expect("its address");
+        let (mut client, _server) = sans_io_pair_at(1024 * 1024, local, remote, Some(rate));
+        client
+            .stream_send(0, &vec![9_u8; 256 * 1024], false)
+            .expect("a stream the pacer has to meter");
+        let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+        let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
+        send_all(&sender, &mut client, &mut out, &mut sending).expect("the pass");
+        collected(&peer).len()
+    }
+
+    #[test]
+    fn a_release_within_the_quantum_goes_now_rather_than_waiting_a_wake() {
+        // The starvation the quantum exists for: honouring a gap finer than
+        // the pump's wake cadence one packet per wake throttles the sender to
+        // the wake rate. Both rates park eventually, since the schedule
+        // accumulates past any fixed horizon; what separates them is how much
+        // the pass releases first. Ending the pass at the first future release
+        // makes these two counts equal, which is the whole defect.
+        //
+        // The best of a counted few passes, because the horizon is fixed at
+        // pass start while the pacer's schedule ratchets off the clock
+        // (`ideal_next_packet_send_time.set_max(sent_time)`): one preemption
+        // of a quantum anywhere in a pass pushes every remaining release past
+        // the horizon and leaves only the burst tokens, which is the same
+        // count a broken horizon gives. A stalled runner loses a repetition;
+        // a broken horizon loses all of them.
+        let within = (0..WITHIN_QUANTUM_PASSES)
+            .map(|_| packets_in_one_paced_pass(WITHIN_QUANTUM_RATE))
+            .max()
+            .expect("a counted repetition");
+        let beyond = packets_in_one_paced_pass(BEYOND_QUANTUM_RATE);
+        assert!(
+            within > beyond,
+            "a pass carries the releases due inside one wake, not one packet: \
+             best of {WITHIN_QUANTUM_PASSES} is {within} at \
+             {WITHIN_QUANTUM_RATE} Mbit/s against {beyond} at \
+             {BEYOND_QUANTUM_RATE}"
         );
     }
 

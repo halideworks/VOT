@@ -5189,8 +5189,8 @@ mod tests {
         // datagram past its queue depth, so a depth under what the wire's
         // credit invites loses datagrams no counter in this stack sees.
         //
-        // The burst is what the old send queue could hand over in one pass,
-        // not tied to the sender's current bound: this measures receive depth.
+        // Twice the old send queue's depth, tied to no send bound in this
+        // file: what this measures is receive depth.
         const BURST: usize = 2_048;
         let (certificate, key) = credentials();
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");

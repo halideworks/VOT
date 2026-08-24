@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, Once, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,53 @@ pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 /// out.
 const RECEIVE_BUFFER_BYTES: u32 = 16_777_216;
 const SEND_BUFFER_BYTES: u32 = 8_388_608;
+
+/// What an operator can do about a clamped buffer, which is a different knob
+/// on each kernel and none at all where nothing clamps silently.
+#[cfg(target_os = "linux")]
+const RECEIVE_CLAMP_HINT: &str = "raise net.core.rmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates";
+#[cfg(target_os = "linux")]
+const SEND_CLAMP_HINT: &str = "raise net.core.wmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates";
+#[cfg(target_os = "macos")]
+const RECEIVE_CLAMP_HINT: &str =
+    "raise kern.ipc.maxsockbuf (sysctl), or expect packet loss at high rates";
+#[cfg(target_os = "macos")]
+const SEND_CLAMP_HINT: &str =
+    "raise kern.ipc.maxsockbuf (sysctl), or expect packet loss at high rates";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const RECEIVE_CLAMP_HINT: &str = "expect packet loss at high rates";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEND_CLAMP_HINT: &str = "expect packet loss at high rates";
+
+/// Sizes a socket's buffers, best effort: they are throughput, not
+/// correctness. A kernel that clamps the request sheds packets under bursts
+/// with no other signal, so say so once per process.
+fn size_buffers_reporting_clamps(socket: &UdpSocket) {
+    static RECEIVE_WARNED: Once = Once::new();
+    static SEND_WARNED: Once = Once::new();
+
+    if let Ok(granted) =
+        vot_platform_net::size_buffers(socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES)
+    {
+        if let Some(got) =
+            vot_platform_net::buffer_shortfall(RECEIVE_BUFFER_BYTES, granted.receive_bytes)
+        {
+            RECEIVE_WARNED.call_once(|| {
+                eprintln!(
+                    "vot: UDP receive buffer is {got} bytes, asked for {RECEIVE_BUFFER_BYTES}; {RECEIVE_CLAMP_HINT}"
+                );
+            });
+        }
+        if let Some(got) = vot_platform_net::buffer_shortfall(SEND_BUFFER_BYTES, granted.send_bytes)
+        {
+            SEND_WARNED.call_once(|| {
+                eprintln!(
+                    "vot: UDP send buffer is {got} bytes, asked for {SEND_BUFFER_BYTES}; {SEND_CLAMP_HINT}"
+                );
+            });
+        }
+    }
+}
 
 /// Largest UDP payload: IPv4's 65535-byte total length minus its own and
 /// UDP's headers. Not worth a family-dependent ceiling for IPv6's extra 20
@@ -724,10 +771,7 @@ impl Transport {
         // fragmented and reassembled: a reassembled probe reads as success and
         // locks the connection above the path for good.
         vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
-        // Best effort: buffer sizes are throughput, not correctness. A kernel
-        // that grants less sheds under bursts, measurable in path stats rather
-        // than fatal.
-        let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
+        size_buffers_reporting_clamps(&socket);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
         let mut quiche_config = config.build(role)?;
 
@@ -1678,7 +1722,7 @@ impl Listener {
     pub fn bind(address: SocketAddr, config: &Config) -> Result<Self, Error> {
         let socket = UdpSocket::bind(address).map_err(|_| Error::Backend)?;
         vot_platform_net::refuse_fragmentation(&socket).map_err(|_| Error::Backend)?;
-        let _ = vot_platform_net::size_buffers(&socket, RECEIVE_BUFFER_BYTES, SEND_BUFFER_BYTES);
+        size_buffers_reporting_clamps(&socket);
         enable_receive_offload(&socket);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
         // Built here to surface a bad configuration at the bind rather

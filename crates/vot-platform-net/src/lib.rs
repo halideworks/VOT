@@ -137,11 +137,34 @@ fn refuse_fragmentation_windows(socket: &UdpSocket) -> io::Result<()> {
     }
 }
 
-/// Requests socket buffer sizes of at least `send` and `receive` bytes.
+/// Socket buffer sizes the kernel granted, in the same terms as the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Granted {
+    /// Receive buffer bytes the kernel granted.
+    pub receive_bytes: u32,
+    /// Send buffer bytes the kernel granted.
+    pub send_bytes: u32,
+}
+
+/// Reports the granted size when it falls short of the request, `None` when
+/// the kernel met or exceeded it.
+#[must_use]
+pub fn buffer_shortfall(requested: u32, granted: u32) -> Option<u32> {
+    (granted < requested).then_some(granted)
+}
+
+/// Requests socket buffer sizes of at least `send` and `receive` bytes and
+/// reports what the kernel granted, which its own caps may hold below the
+/// request or refuse outright.
 ///
 /// # Errors
-/// Returns the OS error when a size cannot be set.
-pub fn size_buffers(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+/// Returns the OS error when a granted size cannot be read back. A refused
+/// request is not an error: the size the socket kept is what it reports.
+pub fn size_buffers(
+    socket: &UdpSocket,
+    receive_bytes: u32,
+    send_bytes: u32,
+) -> io::Result<Granted> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         size_buffers_unix(socket, receive_bytes, send_bytes)
@@ -159,7 +182,11 @@ pub fn size_buffers(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> 
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(unsafe_code)]
-fn size_buffers_unix(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+fn size_buffers_unix(
+    socket: &UdpSocket,
+    receive_bytes: u32,
+    send_bytes: u32,
+) -> io::Result<Granted> {
     use std::os::fd::AsRawFd as _;
 
     fn set(fd: i32, option: i32, bytes: u32) -> io::Result<()> {
@@ -186,26 +213,68 @@ fn size_buffers_unix(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) ->
         }
     }
 
+    fn get(fd: i32, option: i32) -> io::Result<u32> {
+        let mut value: libc::c_int = 0;
+        let mut length = libc::socklen_t::try_from(size_of::<libc::c_int>())
+            .expect("an int's length fits its own kind");
+        // SAFETY: the descriptor is owned by the borrowed socket for the whole
+        // call, and the pointers describe the one int this option yields and
+        // its length.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        u32::try_from(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    // Every set is best effort: a kernel that clamps keeps its own size, and
+    // macOS refuses a request past kern.ipc.maxsockbuf outright rather than
+    // clamping it. The forced variants, which CAP_NET_ADMIN allows past
+    // Linux's rmem_max and wmem_max, are refused without that privilege. The
+    // read-back below is what says which of those happened.
     let fd = socket.as_raw_fd();
-    set(fd, libc::SO_RCVBUF, receive_bytes)?;
-    set(fd, libc::SO_SNDBUF, send_bytes)?;
-    // Then the forced variants, which CAP_NET_ADMIN allows past the
-    // kernel's rmem_max and wmem_max caps. Without that privilege the
-    // kernel refuses them and the clamped values above stand, which is
-    // why these two results are not consulted.
+    let _ = set(fd, libc::SO_RCVBUF, receive_bytes);
+    let _ = set(fd, libc::SO_SNDBUF, send_bytes);
     #[cfg(target_os = "linux")]
     {
         let _ = set(fd, libc::SO_RCVBUFFORCE, receive_bytes);
         let _ = set(fd, libc::SO_SNDBUFFORCE, send_bytes);
     }
-    Ok(())
+    let receive = get(fd, libc::SO_RCVBUF)?;
+    let send = get(fd, libc::SO_SNDBUF)?;
+    // Linux reports twice what it granted, the second half being its own
+    // bookkeeping allowance, so halve it to compare against the request.
+    #[cfg(target_os = "linux")]
+    let (receive, send) = (receive / 2, send / 2);
+    Ok(Granted {
+        receive_bytes: receive,
+        send_bytes: send,
+    })
 }
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn size_buffers_windows(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32) -> io::Result<()> {
+fn size_buffers_windows(
+    socket: &UdpSocket,
+    receive_bytes: u32,
+    send_bytes: u32,
+) -> io::Result<Granted> {
     use std::os::windows::io::AsRawSocket as _;
     use windows_sys::Win32::Networking::WinSock;
+
+    fn last_error() -> io::Error {
+        // SAFETY: reading the calling thread's last WinSock error takes no
+        // arguments and touches no memory of ours.
+        io::Error::from_raw_os_error(unsafe { WinSock::WSAGetLastError() })
+    }
 
     fn set(handle: usize, option: i32, bytes: u32) -> io::Result<()> {
         let value =
@@ -226,17 +295,40 @@ fn size_buffers_windows(socket: &UdpSocket, receive_bytes: u32, send_bytes: u32)
         if result == 0 {
             Ok(())
         } else {
-            // SAFETY: reading the calling thread's last WinSock error takes no
-            // arguments and touches no memory of ours.
-            Err(io::Error::from_raw_os_error(unsafe {
-                WinSock::WSAGetLastError()
-            }))
+            Err(last_error())
         }
     }
 
+    fn get(handle: usize, option: i32) -> io::Result<u32> {
+        let mut value: i32 = 0;
+        let mut length =
+            i32::try_from(size_of::<i32>()).expect("an int's length fits its own kind");
+        // SAFETY: the handle is owned by the borrowed socket for the whole
+        // call, and the pointers describe the one int this option yields and
+        // its length.
+        let result = unsafe {
+            WinSock::getsockopt(
+                handle,
+                WinSock::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(last_error());
+        }
+        u32::try_from(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    // Best effort, as on unix: the read-back reports what the socket kept.
     let handle = usize::try_from(socket.as_raw_socket()).expect("a socket handle is one word");
-    set(handle, WinSock::SO_RCVBUF, receive_bytes)?;
-    set(handle, WinSock::SO_SNDBUF, send_bytes)
+    let _ = set(handle, WinSock::SO_RCVBUF, receive_bytes);
+    let _ = set(handle, WinSock::SO_SNDBUF, send_bytes);
+    Ok(Granted {
+        receive_bytes: get(handle, WinSock::SO_RCVBUF)?,
+        send_bytes: get(handle, WinSock::SO_SNDBUF)?,
+    })
 }
 
 #[cfg(test)]
@@ -289,7 +381,8 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("a socket");
         let receive_before = read(&socket, receive_option);
         let send_before = read(&socket, send_option);
-        super::size_buffers(&socket, receive_request, send_request).expect("the sizes");
+        let granted =
+            super::size_buffers(&socket, receive_request, send_request).expect("the sizes");
         let receive = read(&socket, receive_option);
         let send = read(&socket, send_option);
         assert!(
@@ -302,6 +395,36 @@ mod tests {
                 && send >= 200 * 1024,
             "send buffer {send} from {send_before}"
         );
+        // Linux reports twice what it granted; the report is in request terms.
+        #[cfg(target_os = "linux")]
+        let halve = 2;
+        #[cfg(not(target_os = "linux"))]
+        let halve = 1;
+        assert_eq!(
+            granted.receive_bytes,
+            u32::try_from(receive).expect("a size") / halve
+        );
+        assert_eq!(
+            granted.send_bytes,
+            u32::try_from(send).expect("a size") / halve
+        );
+    }
+
+    #[test]
+    fn a_shortfall_is_only_reported_below_the_request() {
+        for (requested, granted, expected) in [
+            (1024u32, 1024u32, None),
+            (1024, 2048, None),
+            (1024, 512, Some(512)),
+            (1024, 0, Some(0)),
+            (0, 0, None),
+        ] {
+            assert_eq!(
+                super::buffer_shortfall(requested, granted),
+                expected,
+                "requested {requested}, granted {granted}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

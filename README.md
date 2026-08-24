@@ -90,6 +90,15 @@ roots, and the manifest proves those roots to the package seal. Address-based
 fetches therefore require `PACKAGE_ROOT`. Set `VOT_FETCH_UNPINNED=1` only when
 the remote package is intentionally accepted without a trusted root.
 
+Both ends ask the kernel for a 16 MiB UDP receive buffer and an 8 MiB send
+buffer. On Linux without `CAP_NET_ADMIN` the kernel clamps those to
+`net.core.rmem_max` and `net.core.wmem_max`, 208 KiB on a stock system, which
+dropped around a tenth of the packets at 12 to 15 Gbit/s over loopback. macOS
+refuses a request above `kern.ipc.maxsockbuf` (about 7.4 MB by default) outright
+and the socket keeps its much smaller default. The CLI prints one warning line
+to stderr naming the knob when it got less than it asked for; raise it (64 MiB
+is ample) to clear the warning.
+
 ### Who may fetch
 
 A serve answers anyone by default. Give it an issuer key and it requires a

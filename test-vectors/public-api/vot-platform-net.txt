@@ -1,2 +1,4 @@
+function vot_platform_net::buffer_shortfall
 function vot_platform_net::refuse_fragmentation
 function vot_platform_net::size_buffers
+struct vot_platform_net::Granted

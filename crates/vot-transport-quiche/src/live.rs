@@ -109,6 +109,23 @@ pub const MIN_DATAGRAM_SIZE: usize = 1_200;
 const RECEIVE_BUFFER_BYTES: u32 = 16_777_216;
 const SEND_BUFFER_BYTES: u32 = 8_388_608;
 
+/// What an operator can do about a clamped buffer, which is a different knob
+/// on each kernel and none at all where nothing clamps silently.
+#[cfg(target_os = "linux")]
+const RECEIVE_CLAMP_HINT: &str = "raise net.core.rmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates";
+#[cfg(target_os = "linux")]
+const SEND_CLAMP_HINT: &str = "raise net.core.wmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates";
+#[cfg(target_os = "macos")]
+const RECEIVE_CLAMP_HINT: &str =
+    "raise kern.ipc.maxsockbuf (sysctl), or expect packet loss at high rates";
+#[cfg(target_os = "macos")]
+const SEND_CLAMP_HINT: &str =
+    "raise kern.ipc.maxsockbuf (sysctl), or expect packet loss at high rates";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const RECEIVE_CLAMP_HINT: &str = "expect packet loss at high rates";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const SEND_CLAMP_HINT: &str = "expect packet loss at high rates";
+
 /// Sizes a socket's buffers, best effort: they are throughput, not
 /// correctness. A kernel that clamps the request sheds packets under bursts
 /// with no other signal, so say so once per process.
@@ -124,7 +141,7 @@ fn size_buffers_reporting_clamps(socket: &UdpSocket) {
         {
             RECEIVE_WARNED.call_once(|| {
                 eprintln!(
-                    "vot: UDP receive buffer is {got} bytes, asked for {RECEIVE_BUFFER_BYTES}; raise net.core.rmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates"
+                    "vot: UDP receive buffer is {got} bytes, asked for {RECEIVE_BUFFER_BYTES}; {RECEIVE_CLAMP_HINT}"
                 );
             });
         }
@@ -132,7 +149,7 @@ fn size_buffers_reporting_clamps(socket: &UdpSocket) {
         {
             SEND_WARNED.call_once(|| {
                 eprintln!(
-                    "vot: UDP send buffer is {got} bytes, asked for {SEND_BUFFER_BYTES}; raise net.core.wmem_max (sysctl) or run with CAP_NET_ADMIN, or expect packet loss at high rates"
+                    "vot: UDP send buffer is {got} bytes, asked for {SEND_BUFFER_BYTES}; {SEND_CLAMP_HINT}"
                 );
             });
         }

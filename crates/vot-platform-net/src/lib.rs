@@ -155,10 +155,11 @@ pub fn buffer_shortfall(requested: u32, granted: u32) -> Option<u32> {
 
 /// Requests socket buffer sizes of at least `send` and `receive` bytes and
 /// reports what the kernel granted, which its own caps may hold below the
-/// request.
+/// request or refuse outright.
 ///
 /// # Errors
-/// Returns the OS error when a size cannot be set or read back.
+/// Returns the OS error when a granted size cannot be read back. A refused
+/// request is not an error: the size the socket kept is what it reports.
 pub fn size_buffers(
     socket: &UdpSocket,
     receive_bytes: u32,
@@ -234,13 +235,14 @@ fn size_buffers_unix(
         u32::try_from(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
     }
 
+    // Every set is best effort: a kernel that clamps keeps its own size, and
+    // macOS refuses a request past kern.ipc.maxsockbuf outright rather than
+    // clamping it. The forced variants, which CAP_NET_ADMIN allows past
+    // Linux's rmem_max and wmem_max, are refused without that privilege. The
+    // read-back below is what says which of those happened.
     let fd = socket.as_raw_fd();
-    set(fd, libc::SO_RCVBUF, receive_bytes)?;
-    set(fd, libc::SO_SNDBUF, send_bytes)?;
-    // Then the forced variants, which CAP_NET_ADMIN allows past the
-    // kernel's rmem_max and wmem_max caps. Without that privilege the
-    // kernel refuses them and the clamped values above stand, which is
-    // why these two results are not consulted.
+    let _ = set(fd, libc::SO_RCVBUF, receive_bytes);
+    let _ = set(fd, libc::SO_SNDBUF, send_bytes);
     #[cfg(target_os = "linux")]
     {
         let _ = set(fd, libc::SO_RCVBUFFORCE, receive_bytes);
@@ -319,9 +321,10 @@ fn size_buffers_windows(
         u32::try_from(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
     }
 
+    // Best effort, as on unix: the read-back reports what the socket kept.
     let handle = usize::try_from(socket.as_raw_socket()).expect("a socket handle is one word");
-    set(handle, WinSock::SO_RCVBUF, receive_bytes)?;
-    set(handle, WinSock::SO_SNDBUF, send_bytes)?;
+    let _ = set(handle, WinSock::SO_RCVBUF, receive_bytes);
+    let _ = set(handle, WinSock::SO_SNDBUF, send_bytes);
     Ok(Granted {
         receive_bytes: get(handle, WinSock::SO_RCVBUF)?,
         send_bytes: get(handle, WinSock::SO_SNDBUF)?,

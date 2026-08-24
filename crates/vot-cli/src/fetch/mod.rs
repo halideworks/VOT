@@ -1691,9 +1691,6 @@ mod tests {
             "no cover completed within the round budget"
         );
 
-        // The decisive pass must wait, not spin; set now so the earlier
-        // rounds are not slowed.
-        fetcher.proving.wait = std::time::Duration::from_secs(5);
         fetcher.pump_provers().unwrap();
         let pool = fetcher
             .proving
@@ -1714,6 +1711,10 @@ mod tests {
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
         // The default width, wired through the same call a caller uses.
         assert_eq!(fetcher.proving.width, DEFAULT_PROVING_THREADS);
+        assert_eq!(
+            fetcher.proving.wait, TEST_PROVER_WAIT,
+            "a test round waits for the witness it is owed"
+        );
         assert_eq!(
             fetcher.receiver.deferred_limit(),
             DEFAULT_PROVING_THREADS + 1

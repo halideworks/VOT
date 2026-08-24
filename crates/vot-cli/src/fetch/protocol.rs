@@ -8,10 +8,10 @@ use super::{
     OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES, PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH,
     PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject,
     Proving, ProvingPool, RESUME_STORE, RangeRequest, ReliableReceiver, ResumeStore, Session,
-    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TransportAdapter, TypedFrame,
-    UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
-    remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
-    total_units_of,
+    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter,
+    TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure,
+    package_sentinel, remove_store_files, reservations_of, resume_failure, resumed_extents,
+    subject_of, total_units_of,
 };
 
 /// Credit advertised to the server: the covers this end asked for.
@@ -154,7 +154,13 @@ impl Default for ProvingConfig {
         Self {
             pool: None,
             width: 0,
-            wait: PROVER_WAIT,
+            // A test round waits for the witness it is owed, so starvation
+            // cannot turn a counted round budget into a clock.
+            wait: if cfg!(test) {
+                TEST_PROVER_WAIT
+            } else {
+                PROVER_WAIT
+            },
         }
     }
 }

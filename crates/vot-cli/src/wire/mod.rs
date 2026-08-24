@@ -1735,9 +1735,9 @@ mod tests {
         assert_eq!(served, built);
         // 1500000 bytes of object are 23 generations, every one of them
         // offered over the datagram path; the manifest and the small tail
-        // travel reliably. The connection's send queue bounds a pass's burst
-        // to what a receiver's UDP buffer absorbs, so every offered epoch
-        // decodes from its symbols rather than waiting on reliable repair.
+        // travel reliably. Coverage and decode are asserted separately: coded
+        // against offered is how much of the object the coded path carried,
+        // and decoded against coded is how well it decoded what it carried.
         let counts = outcome.fec;
         assert_eq!(
             counts.offered, 23,
@@ -1745,8 +1745,12 @@ mod tests {
         );
         assert_eq!(counts.refused, 0, "credit admitted every epoch");
         assert_eq!(
-            counts.decoded, counts.offered,
-            "every offered epoch was carried by its symbols: {counts:?}"
+            counts.coded, counts.offered,
+            "every offered generation was coded: {counts:?}"
+        );
+        assert_eq!(
+            counts.decoded, counts.coded,
+            "every coded generation decoded from its symbols: {counts:?}"
         );
         assert!(
             counts.decoded + counts.abandoned <= counts.offered,

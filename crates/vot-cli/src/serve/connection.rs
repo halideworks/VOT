@@ -586,6 +586,12 @@ impl FecPolicy {
         self.unaided_loss
     }
 
+    /// The decode sample so far as `(resolved, failed)`.
+    #[cfg(test)]
+    pub(crate) const fn decode_sample(&self) -> (u64, u64) {
+        (self.resolved_sample, self.failed_sample)
+    }
+
     #[cfg(test)]
     pub(crate) const fn probe_state(&self) -> (u32, usize, u32, u32) {
         (
@@ -709,11 +715,83 @@ impl OpenedEpoch {
     }
 }
 
+/// Retired epochs whose verdict may wait for the receiver's word at once.
+/// The queue drains on the grace, so this only bounds a burst of
+/// retirements inside one of them.
+pub(crate) const MAX_DEFERRED_EPOCHS: usize = 64;
+
 /// The sender side of datagram FEC for one connection.
 #[derive(Debug, Default)]
 pub(crate) struct FecSender {
     pub(crate) sender: vot_fec::Sender,
     pub(crate) epochs: std::collections::BTreeMap<u32, OpenedEpoch>,
+    /// Retired epochs the policy has not judged yet: when the wait for the
+    /// receiver's word is up, the epoch, and the generations no word has
+    /// come for. Drained from the front, which a shrinking grace can leave
+    /// out of order; the effect is a later verdict for one entry and never
+    /// an earlier one, because the front's own deadline still gates it.
+    ///
+    /// A quiet retirement is a timeout on the receiver's silence, not its
+    /// word about decoding, and the two are far apart on a lossy path: the
+    /// receiver owes a `GEN_DONE` for every generation it settled, and that
+    /// frame queues behind the reliable traffic and the loss under it.
+    /// Measured on a 12 GiB emulated transfer at 7% loss each way, 4,740
+    /// generations were retired and 3,964 of them reported `Decoded`
+    /// afterwards, 96.7% of those inside one more grace and all of them
+    /// inside a second, against 392 the receiver truly could not decode.
+    /// Judged at the retirement they are a twelve-fold over-count, and they
+    /// arrive in whole epochs, so one retirement is a whole
+    /// [`FEC_DECODE_SAMPLE`] of nothing but failures.
+    pub(crate) pending_verdicts:
+        VecDeque<(std::time::Instant, u32, std::collections::BTreeSet<u32>)>,
+}
+
+impl FecSender {
+    /// Holds one retired epoch's unheard generations until `due`, and
+    /// returns how many generations an overflow eviction gave up on.
+    pub(crate) fn defer(
+        &mut self,
+        due: std::time::Instant,
+        epoch: u32,
+        unheard: std::collections::BTreeSet<u32>,
+    ) -> usize {
+        self.pending_verdicts.push_back((due, epoch, unheard));
+        // One in, at most one out: a branch rather than a drain, so no
+        // arrangement of the two can loop.
+        if self.pending_verdicts.len() > MAX_DEFERRED_EPOCHS {
+            self.pending_verdicts
+                .pop_front()
+                .map_or(0, |(_, _, held)| held.len())
+        } else {
+            0
+        }
+    }
+
+    /// Takes the receiver's late word about one generation, and says
+    /// whether a deferred verdict was waiting for it. A repeat is not: the
+    /// first word is the outcome and it is counted where it lands.
+    pub(crate) fn settle(&mut self, epoch: u32, generation: u32) -> bool {
+        self.pending_verdicts
+            .iter_mut()
+            .find(|(_, held, _)| *held == epoch)
+            .is_some_and(|(_, _, unheard)| unheard.remove(&generation))
+    }
+
+    /// Generations no word ever came for, once their wait is up.
+    pub(crate) fn overdue(&mut self, now: std::time::Instant) -> usize {
+        let mut unheard = 0;
+        while self
+            .pending_verdicts
+            .front()
+            .is_some_and(|(due, _, _)| now >= *due)
+        {
+            unheard += self
+                .pending_verdicts
+                .pop_front()
+                .map_or(0, |(_, _, held)| held.len());
+        }
+        unheard
+    }
 }
 
 pub(crate) struct Remembered {

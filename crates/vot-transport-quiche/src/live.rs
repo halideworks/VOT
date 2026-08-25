@@ -199,17 +199,19 @@ const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
 /// sends only what was requested, within its own credit. 64 MiB and above
 /// measured flat at 80 and 200 ms, so it stops at the smallest value that
 /// clears the wire. The connection ceiling is half again the stream one
-/// because the library lifts a connection window to 1.5 times the stream
-/// window on every grant it sends, past `max_connection_window` and without
-/// clamping to it; a smaller figure here would not be a bound at all, and
-/// the sweep read 1.5x and 1x alike.
+/// because the library raises a connection window to 1.5 times the stream
+/// window on each grant and clamps it here, so an equal figure would pin
+/// the connection window at the stream window.
 const STREAM_WINDOW_CEILING: u64 = 32 * 1_024 * 1_024;
 const CONNECTION_WINDOW_CEILING: u64 = STREAM_WINDOW_CEILING / 2 * 3;
 const _: () = assert!(CONNECTION_WINDOW_CEILING == STREAM_WINDOW_CEILING / 2 * 3);
-/// The ceiling never truncates the window this endpoint advertises at the
-/// handshake, which is the control-frame limit plus a record, eightfold.
+/// The default advertised initial window, the control-frame limit plus a
+/// record eightfold, sits under the ceiling, so regrants only ever grow it.
 const _: () = assert!(
-    STREAM_WINDOW_CEILING > (1_048_576 + vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64) * 8
+    STREAM_WINDOW_CEILING
+        > (vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD as u64
+            + vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64)
+            * 8
 );
 
 /// Datagrams the driver holds for a connection whose own queue is full.

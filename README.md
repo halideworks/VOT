@@ -108,6 +108,21 @@ whole segmentation bursts. Raising the qdisc's limit does nothing; replacing it
 the serve's CPU by a quarter, while the wall moved only 6% because eight rails are
 not loss bound there.
 
+A virtio guest with a single transmit queue commonly boots with
+`tx-udp-segmentation` off, and then the serve's UDP_SEGMENT writes are taken apart
+by the guest kernel and reach the queue as one 1.5 KB descriptor per packet, about
+150,000 a second. That caps the serve near 1.6 Gbit/s at every rail count with no
+drop counter moving and no thread busy, which is 98% of what plain UDP gets on the
+same box and 17% of eight TCP streams at 3 ms, TCP keeping its own segmentation
+offload. `ethtool -K eth0 tx-udp-segmentation on` (check with `ethtool -k eth0 |
+grep tx-udp-segmentation`) put 30 KB in each descriptor and took the same binary to
+6.1 Gbit/s at four rails and 6.0 at eight at 3 ms, 71% and 69% of eight TCP
+streams, and to 3.9 at 83 ms, 189% of TCP. With it on, the fetch host's single
+receive queue is the next limit: one core saturates in softirq near 380,000 packets
+a second and the eighth rail adds loss rather than rate, so multiple receive queues
+(RSS) or receive-side UDP GRO on the fetch host is the lever. VOT prints no warning
+for this, because unlike the buffer clamp nothing socket-local reveals it.
+
 ### Who may fetch
 
 A serve answers anyone by default. Give it an issuer key and it requires a

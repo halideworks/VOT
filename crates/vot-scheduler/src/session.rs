@@ -592,6 +592,10 @@ pub struct SessionReceiver<A> {
     admitted: BTreeSet<SubjectId>,
     delivered: VecDeque<([u8; 16], Delivered)>,
     credit_applied: bool,
+    /// Range record bytes this session has taken off the carrier, only ever
+    /// going up. What a caller paces its requests on: a record counted here
+    /// is a record no longer in flight, whoever proves it and whenever.
+    arrived_range_bytes: u64,
     /// The datagram FEC intake, armed once the session is ready with
     /// `DATAGRAM_FEC` negotiated; idle otherwise.
     fec: Intake,
@@ -613,6 +617,7 @@ impl<A: TransportAdapter> SessionReceiver<A> {
             admitted: BTreeSet::new(),
             delivered: VecDeque::new(),
             credit_applied: false,
+            arrived_range_bytes: 0,
             fec: Intake::default(),
             fec_armed: false,
         }
@@ -757,6 +762,16 @@ impl<A: TransportAdapter> SessionReceiver<A> {
     #[must_use]
     pub const fn deferred_limit(&self) -> usize {
         self.deferred_limit
+    }
+
+    /// Range record bytes taken off the carrier, only ever going up.
+    ///
+    /// A caller pacing requests against this asks again as a cover's records
+    /// land rather than when its proof holds; what the proof still gates is
+    /// placement and coverage, which no byte reaches without it.
+    #[must_use]
+    pub const fn arrived_range_bytes(&self) -> u64 {
+        self.arrived_range_bytes
     }
 
     /// Delivered bundle identities still remembered.
@@ -1090,7 +1105,12 @@ impl<A: TransportAdapter> SessionReceiver<A> {
                 return Err(Error::ProofInvalid);
             }
         }
+        // Counted from the encoded length the ledger charges, which the codec
+        // pins to the plaintext length for the only compression the proof
+        // path accepts, so a cover's records sum to its covered length.
+        let arrived = record.encoded.len() as u64;
         self.pending.append_record(record)?;
+        self.arrived_range_bytes = self.arrived_range_bytes.saturating_add(arrived);
         self.deliver(id)
     }
 
@@ -1460,6 +1480,54 @@ mod tests {
         assert_eq!(driver.pending_bundles(), 0, "the bundle was delivered");
         assert!(driver.is_verified(subject));
         assert!(driver.credit_applied());
+    }
+
+    #[test]
+    fn arrived_range_bytes_counts_a_cover_s_records_once() {
+        // A caller's request window is what it asked for minus this, so a
+        // record counted twice buys a request nothing arrived for, and one
+        // counted only at proof holds the next request back for the verify.
+        let (subject, bundle, records) = object();
+        let mut driver = ready();
+        driver.admit(subject, Box::new(DiscardSink)).unwrap();
+        driver.defer_proving(true);
+        assert_eq!(driver.arrived_range_bytes(), 0);
+
+        // The records, and one of them again: a repeat is idempotent and
+        // buys no credit.
+        for record in records.iter().chain(records.first()) {
+            driver
+                .session_mut()
+                .driver()
+                .events
+                .push_back(carried(&wire(&TypedFrame::DataRecord(record.clone()))));
+        }
+        assert_eq!(driver.poll().unwrap(), None);
+        assert_eq!(
+            driver.arrived_range_bytes(),
+            bundle.covered_length,
+            "a cover's records are its covered length, counted once each"
+        );
+        assert!(
+            driver.take_completed().is_none(),
+            "no proof has arrived, so nothing is provable"
+        );
+
+        // The proof completes the cover. Arrival was counted before it, and
+        // proving adds nothing to it.
+        let covered = bundle.covered_length;
+        driver
+            .session_mut()
+            .driver()
+            .events
+            .push_back(carried(&wire(&TypedFrame::ProofBundle(bundle))));
+        assert_eq!(driver.poll().unwrap(), None);
+        assert!(driver.take_completed().is_some(), "the cover is provable");
+        assert_eq!(
+            driver.arrived_range_bytes(),
+            covered,
+            "proving a cover is not arriving again"
+        );
     }
 
     #[test]

@@ -340,6 +340,18 @@ mod tests {
         assert!(settled, "the rails never finished the fetch");
         assert_eq!(primary.rail.taken_bytes, MAX_REQUESTED_RANGE);
         assert_eq!(secondary.rail.taken_bytes, MAX_REQUESTED_RANGE);
+        // Each rail's window closed on its own arrivals: the two accounts
+        // agree per rail, so neither asked on the other's bytes.
+        assert_eq!(
+            primary.receiver.arrived_range_bytes(),
+            MAX_REQUESTED_RANGE,
+            "the primary's arrivals are its own span"
+        );
+        assert_eq!(
+            secondary.receiver.arrived_range_bytes(),
+            MAX_REQUESTED_RANGE,
+            "the rail's arrivals are its own span"
+        );
         assert!(!primary.has_backlog());
         assert!(!secondary.has_backlog());
         assert_eq!(primary.package(), Some(built));
@@ -2408,7 +2420,7 @@ mod tests {
 
     #[test]
     pub(crate) fn no_more_is_asked_for_than_may_be_outstanding() {
-        // The bound is asked-for minus placed; queue bounding instead would
+        // The bound is asked-for minus arrived; queue bounding instead would
         // fetch an object in full before any cover lands.
         let (bundle, summary) = built_bundle("inflight", &[("a.txt", patterned(1000))]);
         let output = temporary("inflight-fetched");
@@ -2448,21 +2460,35 @@ mod tests {
             "asked for more than may be outstanding"
         );
 
-        // Pacing is per rail; asking on another's arrivals overdraws both receivers.
-        sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
-        fetcher.rail.settled_bytes = MAX_REQUESTED_RANGE;
+        // Nothing has arrived, so the window is exactly full and the edge
+        // holds from the closed side.
+        assert_eq!(fetcher.rail.taken_bytes, OUTSTANDING_REQUEST_BYTES);
+        assert_eq!(fetcher.receiver.arrived_range_bytes(), 0);
+        fetcher.issue_ranges().unwrap();
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            OUTSTANDING_REQUEST_BYTES,
+            "a full window bought a request"
+        );
+
+        // One byte of arrival is one span's worth of room: the gap is
+        // asked-for minus arrived, so lowering what was asked for is the
+        // same lever from the other side. The edge holds from the open
+        // side too, and no witness has settled anywhere.
+        fetcher.rail.taken_bytes = OUTSTANDING_REQUEST_BYTES - 1;
         fetcher.issue_ranges().unwrap();
         assert_eq!(
             fetcher.locked_plan().unwrap().next_offset,
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
-            "a settled cover did not buy the next request"
+            "a byte of room did not buy the next request"
         );
         // Placing counts as progress, so a driving loop keeps a slow transfer alive.
+        sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
         assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
 
         // A span is committed only once its frame is queued, or a failure
         // leaves a hole nobody re-requests.
-        fetcher.rail.settled_bytes = 2 * MAX_REQUESTED_RANGE;
+        fetcher.rail.taken_bytes = 0;
         let owed = fetcher.locked_plan().unwrap().next_offset;
         fetcher.rail.next_request = u64::MAX;
         assert!(
@@ -2476,9 +2502,10 @@ mod tests {
         );
 
         // The shared sink is not this rail's account; a full window blocks
-        // regardless of placement.
+        // regardless of placement, and inline proving is paced the same way
+        // rather than on a count every rail writes into.
         fetcher.rail.next_request = 0;
-        fetcher.rail.settled_bytes = MAX_REQUESTED_RANGE;
+        fetcher.rail.taken_bytes = OUTSTANDING_REQUEST_BYTES;
         sink.placed
             .store(40 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
         fetcher.issue_ranges().unwrap();
@@ -2487,14 +2514,12 @@ mod tests {
             owed,
             "the shared sink paid for a rail's spans"
         );
-
-        // Inline proving has no witnesses, so the sink's placement is the pace.
         fetcher.set_proving_threads(0).unwrap();
         fetcher.issue_ranges().unwrap();
         assert_eq!(
             fetcher.locked_plan().unwrap().next_offset,
-            owed + OUTSTANDING_REQUEST_BYTES,
-            "an inline fetch paces on what its own sink placed"
+            owed,
+            "an inline fetch paced on the shared sink"
         );
 
         discard(&[&bundle, &output]);

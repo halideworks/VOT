@@ -88,11 +88,10 @@ pub(crate) struct RailProgress {
     /// index. Admission is per rail; the plan cannot do it.
     pub(crate) admitted: Option<(usize, SubjectId)>,
     /// Range bytes this rail has committed to spans, only ever going up.
+    /// The gap between this and what its own receiver has taken off the
+    /// carrier paces requests per rail; pacing on the shared sink would let
+    /// one rail overdraw on another's arrivals.
     pub(crate) taken_bytes: u64,
-    /// Range bytes this rail has settled witnesses for. The gap between
-    /// taken and settled paces requests per rail; pacing on the shared
-    /// sink would let one rail overdraw on another's arrivals.
-    pub(crate) settled_bytes: u64,
     /// The most this rail keeps outstanding:
     /// [`OUTSTANDING_REQUEST_BYTES`] always, narrowed only by tests so a
     /// small object stripes without a window's worth of data.
@@ -106,7 +105,6 @@ impl Default for RailProgress {
         Self {
             admitted: None,
             taken_bytes: 0,
-            settled_bytes: 0,
             window_bytes: OUTSTANDING_REQUEST_BYTES,
             pending: VecDeque::new(),
             next_request: 0,
@@ -765,12 +763,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     }
                     pool.witnesses = pool.witnesses.saturating_add(1);
                     let bundle = proved.completed.bundle();
-                    // Earned back against this rail's window: what was
-                    // taken is settled, so the next span may be asked for.
-                    self.rail.settled_bytes = self
-                        .rail
-                        .settled_bytes
-                        .saturating_add(bundle.covered_length);
                     // Booked into shared coverage, which completes the object.
                     // The subject check drops stragglers.
                     if let Some(mut plan) = self.locked_plan()
@@ -1268,9 +1260,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// between the two leaves the span owed. The lock across the pair
     /// prevents two takers from framing the same span.
     ///
-    /// Pacing is per rail (taken minus settled): a rail asking on another's
-    /// arrivals would overdraw its own receiver. Inline proving uses the
-    /// sink's placed count instead of settled witnesses.
+    /// Pacing is per rail, against what this rail's own receiver has taken
+    /// off the carrier: a rail asking on another's arrivals would overdraw
+    /// its own receiver. Credit returns as a cover's records land rather
+    /// than when its proof holds, so the next span leaves while the current
+    /// one is still arriving; the proof still gates placement and coverage.
     pub(crate) fn issue_ranges(&mut self) -> Result<(), Error> {
         let Some(shared) = self.plan.clone() else {
             return Ok(());
@@ -1281,18 +1275,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Counted rather than conditioned on the queue length, so the pass
         // is bounded by the cap itself and no span can spin it.
         for _ in 0..OUTSTANDING_COVERS {
-            let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            let outstanding = if self.proving.width == 0 {
-                plan.next_offset
-                    .saturating_sub(plan.active.as_ref().map_or(0, |sink| sink.placed()))
-            } else {
-                self.rail
-                    .taken_bytes
-                    .saturating_sub(self.rail.settled_bytes)
-            };
+            let outstanding = self
+                .rail
+                .taken_bytes
+                .saturating_sub(self.receiver.arrived_range_bytes());
             if outstanding >= self.rail.window_bytes {
                 return Ok(());
             }
+            let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
             let Some((object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };

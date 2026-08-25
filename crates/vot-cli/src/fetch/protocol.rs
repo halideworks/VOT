@@ -241,8 +241,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Surfaces a deferred bound the receiver refuses.
     pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
         if (self.secondary || self.resuming) && threads == 0 {
-            // Inline proving books no witnesses: a rail paces on them and
-            // a resumed fetch completes on coverage they feed.
+            // Shared coverage is booked in `pump_provers`, which returns at
+            // once at width 0, so an inline rail never advances the plan: a
+            // rail's spans and a resumed fetch's completion both need it.
             return Err(Error::InvalidArguments);
         }
         self.proving.width = threads;

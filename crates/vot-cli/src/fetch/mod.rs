@@ -2419,6 +2419,107 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn a_landed_cover_buys_the_next_request_before_its_proof() {
+        // The whole point of the change: credit returns as a cover's records
+        // land. The serve's proofs are dropped on its own carrier and
+        // `pump_provers` never runs, so nothing is verified, placed or
+        // covered, and the only account that can advance the handout is what
+        // arrived.
+        let length = 3 * usize::try_from(MAX_REQUESTED_RANGE).unwrap();
+        let (bundle, _) = built_bundle("landed", &[("big.bin", patterned(length))]);
+        let output = temporary("landed-fetched");
+        let (server, mut session, mut connection) = serving(&bundle);
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // Two spans of window against a three-span object, so the third span
+        // is owed and only room can buy it.
+        fetcher.rail.window_bytes = 2 * MAX_REQUESTED_RANGE;
+        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
+
+        // Manifest rounds, stopping on the pass that asks for spans and
+        // before its requests reach the serve.
+        let mut asked = false;
+        for _ in 0..ROUND_BUDGET {
+            fetcher.service().unwrap();
+            if fetcher.rail.taken_bytes > 0 {
+                asked = true;
+                break;
+            }
+            pump(
+                fetcher.session_mut().driver(),
+                session.driver(),
+                &mut sequence,
+            );
+            for _ in 0..ROUND_BUDGET {
+                server.service(&mut session, &mut connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            pump(
+                session.driver(),
+                fetcher.session_mut().driver(),
+                &mut sequence,
+            );
+        }
+        assert!(asked, "the rail never asked for a span");
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            2 * MAX_REQUESTED_RANGE,
+            "the window is what it asked for"
+        );
+
+        // The serve answers, and its proofs are thrown away before the pump.
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        for _ in 0..ROUND_BUDGET {
+            server.service(&mut session, &mut connection).unwrap();
+            if !connection.has_backlog() {
+                break;
+            }
+        }
+        assert!(
+            !session.driver().control.is_empty(),
+            "the serve had proofs to withhold"
+        );
+        session.driver().control.clear();
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+
+        // Taken off the carrier, and bounded by the events there are.
+        for _ in 0..ROUND_BUDGET {
+            if fetcher.receiver.poll().unwrap().is_none() {
+                break;
+            }
+        }
+        assert!(fetcher.receiver.arrived_range_bytes() > 0, "records landed");
+        assert_eq!(
+            fetcher.placed_bytes(),
+            0,
+            "no proof held, so nothing placed"
+        );
+
+        fetcher.issue_ranges().unwrap();
+        assert_eq!(
+            fetcher.locked_plan().unwrap().next_offset,
+            3 * MAX_REQUESTED_RANGE,
+            "an arrived cover did not buy the next request"
+        );
+        assert_eq!(
+            fetcher.locked_plan().unwrap().covered.extents().len(),
+            0,
+            "coverage advanced without a witness"
+        );
+
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
     pub(crate) fn no_more_is_asked_for_than_may_be_outstanding() {
         // The bound is asked-for minus arrived; queue bounding instead would
         // fetch an object in full before any cover lands.

@@ -20,7 +20,17 @@ pub(crate) fn reservations_of(objects: &[PlannedObject]) -> Vec<(SubjectId, u64)
 /// The bound is on the wire, not the queue: a pass costs microseconds and
 /// an answer costs a round trip, so bounding the queue lets an object of
 /// any size be asked for in full before the first cover lands.
-pub(crate) const OUTSTANDING_COVERS: usize = 4;
+///
+/// Eight is a memory budget: the credit it buys, 33.55 MB, has to comfortably
+/// exceed the congestion window for a rail to sit at that window rather than
+/// at its own turnaround, and the fork pins the window at 29.46 MB. Four
+/// covers bound every round trip measured, with every serve pass ending on an
+/// empty outbox; eight with the doubled receive-window ceiling moves the
+/// binder to the congestion window and takes one rail from 174 to 289 MB/s at
+/// 80 ms and 93 to 159 at 160 ms, for 16 to 25 MiB a rail on the serve.
+/// Sixteen buys a further 12 to 20% for 2.4 times the added memory, which is
+/// the trade this stops short of.
+pub(crate) const OUTSTANDING_COVERS: usize = 8;
 
 /// Bundles one cover can be answered in.
 ///
@@ -56,7 +66,7 @@ const _: () = assert!(
     PIECES_PER_COVER as u64
         == vot_scheduler::MAX_PROOF_RANGE_BYTES.div_ceil(crate::serve::server::FEC_PIECE_BYTES) + 1
 );
-const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
+const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 40);
 // An open epoch spans a whole requested cover (ADR-0042) and pins that
 // cover's piece bundles for its whole life, so the depth has to hold the
 // epochs' pieces on top of the reliable pipeline rather than carve them out
@@ -66,7 +76,7 @@ const _: () = assert!(RELIABLE_BUNDLE_DEPTH == 20);
 // the repair records are queued, so the next request opens a fresh epoch and
 // fresh bundles while the retired one is still incomplete at the receiver,
 // a transit behind. One slot can hold both for that transit.
-const _: () = assert!(PENDING_BUNDLE_DEPTH == 100);
+const _: () = assert!(PENDING_BUNDLE_DEPTH == 120);
 
 /// Bytes a fetch may hold across part-built bundles.
 ///
@@ -79,7 +89,7 @@ const _: () = assert!(PENDING_BUNDLE_DEPTH == 100);
 /// bundles and never completes them holds this much until the session ends.
 ///
 /// Returning credit as records arrive puts up to a window and one span in
-/// flight, five covers rather than four, and that does not reach this: an
+/// flight, nine covers rather than eight, and that does not reach this: an
 /// entry leaves the pending ledger the moment its last record lands, and
 /// `answer_reliably` serializes one cover at a time, so what is part-built
 /// here is the one being answered.
@@ -97,8 +107,8 @@ pub(crate) const ORPHAN_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
 // Spelled out, so a slip in either sum is a build failure rather than a
 // budget that silently refuses a conforming transfer or admits far more than
 // it meant to.
-const _: () = assert!(PENDING_BUNDLE_BYTES == 90_177_536);
-const _: () = assert!(ORPHAN_BUNDLE_BYTES == 85_983_232);
+const _: () = assert!(PENDING_BUNDLE_BYTES == 112_197_632);
+const _: () = assert!(ORPHAN_BUNDLE_BYTES == 103_809_024);
 
 const COVER_BYTES_USIZE: usize = 4_259_840;
 const _: () = assert!(COVER_BYTES_USIZE as u64 == vot_scheduler::MAX_PROOF_RANGE_BYTES);
@@ -118,7 +128,7 @@ pub(crate) const ORPHAN_BUNDLE_DEPTH: usize = ORPHAN_BUNDLE_BYTES / FEC_GENERATI
 const FEC_GENERATION_BYTES_USIZE: usize = 65_536;
 const _: () =
     assert!(FEC_GENERATION_BYTES_USIZE as u64 == crate::serve::server::FEC_GENERATION_BYTES);
-const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_312);
+const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_584);
 
 /// Bytes this fetch may have asked for and not yet seen arrive.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;

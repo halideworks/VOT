@@ -2772,9 +2772,11 @@ fn send_segmented(
 ///
 /// A kernel that refuses the control message falls back for that burst.
 ///
-/// The receive side (`UDP_GRO`) is deliberately left alone: it returns several
-/// coalesced packets in one buffer, which must be split before `Connection::recv`
-/// or it cannot parse them. It needs its own read path, not just the option.
+/// The receive side has its own switch, `enable_receive_offload`, because
+/// `UDP_GRO` returns several coalesced packets in one buffer, which
+/// `Connection::recv` cannot parse: `receive_segmented` reads the segment size
+/// beside the bytes and `feed_received` cuts the buffer back into datagrams
+/// first.
 const fn offload_available() -> bool {
     cfg!(target_os = "linux")
 }
@@ -4046,6 +4048,11 @@ mod tests {
         assert_eq!(segment_step(9, Some(0)), 9, "no offload is one datagram");
         assert_eq!(segment_step(9, None), 9);
         assert_eq!(segment_step(0, None), 1, "a step of zero would not walk");
+        assert_eq!(
+            segment_step(9, Some(16)),
+            16,
+            "a segment wider than the read is still one datagram"
+        );
         let coalesced = [1, 2, 3, 4, 5];
         assert_eq!(
             split_read(&coalesced, Some(2)).collect::<Vec<_>>(),
@@ -4053,6 +4060,10 @@ mod tests {
         );
         assert_eq!(
             split_read(&coalesced, None).collect::<Vec<_>>(),
+            vec![&coalesced[..]]
+        );
+        assert_eq!(
+            split_read(&coalesced, Some(16)).collect::<Vec<_>>(),
             vec![&coalesced[..]]
         );
     }

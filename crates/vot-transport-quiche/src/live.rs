@@ -861,7 +861,7 @@ impl Transport {
         let datagram_bytes = config.max_datagram_bytes;
         let accept_timeout_ms = config.accept_timeout_ms;
         let prefix_duplication = config.prefix_duplication_datagrams;
-        let keepalive = keepalive_interval(config.idle_timeout_ms);
+        let keepalive = keepalive_interval(role, config.idle_timeout_ms);
 
         let session = config.session.clone();
         let driver = std::thread::Builder::new()
@@ -2087,7 +2087,7 @@ fn accept_routed(
     let connection = ConnectionId(routed_connection_id(local.port(), index));
     let datagram_bytes = config.max_datagram_bytes;
     let prefix_duplication = config.prefix_duplication_datagrams;
-    let keepalive = keepalive_interval(config.idle_timeout_ms);
+    let keepalive = keepalive_interval(Role::Server, config.idle_timeout_ms);
 
     let pump_socket = Arc::clone(socket);
     let pump_inbound = Arc::clone(&inbound);
@@ -2611,12 +2611,23 @@ const fn ramp_ping_due(ramp_pings: u32) -> bool {
 const KEEPALIVE_DIVISOR: u64 = 3;
 
 /// The keepalive cadence for an endpoint whose idle timeout is
-/// `idle_timeout_ms`. Pure, so a table test pins what it derives.
+/// `idle_timeout_ms`, or none for an endpoint with no business holding a
+/// connection open. Pure, so a table test pins what it derives.
 ///
-/// A zero timeout disables QUIC's idle timer, so there is nothing to hold
-/// open and the cadence is off, which [`ping_interval`] reads as never due.
-const fn keepalive_interval(idle_timeout_ms: u64) -> Option<Duration> {
-    if idle_timeout_ms == 0 {
+/// Only a client keeps one alive. A client knows whether it still needs
+/// the session: a fetch rail that has finished its ranges is still owed
+/// the rest of its plan. A server has no such knowledge, and a server that
+/// pinged would answer its own pings for as long as a peer's stack kept
+/// acknowledging them, which is what the peer stops doing when it goes.
+/// The serving end's stall budget counts the carrier, so a serve that
+/// generated its own carrier traffic would never reap a session again.
+///
+/// The interval comes from this endpoint's own idle timeout. The one in
+/// force is the smaller of the two ends' (RFC 9000 section 10.1), so a peer
+/// that installs less than three times this interval is not held open by
+/// it. Both ends of this protocol install the same value.
+const fn keepalive_interval(role: Role, idle_timeout_ms: u64) -> Option<Duration> {
+    if !matches!(role, Role::Client) || idle_timeout_ms == 0 {
         return None;
     }
     Some(Duration::from_millis(idle_timeout_ms / KEEPALIVE_DIVISOR))
@@ -2640,10 +2651,11 @@ fn ping_interval(ramp_pings: u32, keepalive: Option<Duration>) -> Duration {
 }
 
 /// Whether the pump owes the peer an ack-eliciting packet: not before
-/// establishment, where `send_ack_eliciting` does nothing and would spend
-/// the ramp's budget on it, and then once per [`ping_interval`] since the
-/// last one. Pure, so the whole decision is pinned by a table test rather
-/// than assembled in the loop where nothing can reach it.
+/// establishment, where a ping would spend the ramp's budget on packets
+/// the handshake's own flights already elicit acks for, and then once per
+/// [`ping_interval`] since the last one. Pure, so the whole decision is
+/// pinned by a table test rather than assembled in the loop where nothing
+/// can reach it.
 fn ping_due(
     announced: bool,
     since_last_ping: Duration,
@@ -3503,8 +3515,12 @@ mod tests {
 
     #[test]
     fn the_cadence_hands_the_ramp_over_to_the_keepalive() {
-        let keepalive = keepalive_interval(IDLE_TIMEOUT_MS);
+        let keepalive = keepalive_interval(Role::Client, IDLE_TIMEOUT_MS);
         assert_eq!(keepalive, Some(Duration::from_secs(10)));
+        // A server holds nothing open: its own pings would feed the stall
+        // budget that is meant to reap it.
+        assert_eq!(keepalive_interval(Role::Server, IDLE_TIMEOUT_MS), None);
+        assert_eq!(keepalive_interval(Role::Server, 3_000), None);
         // The handover from both sides of the budget.
         assert_eq!(ping_interval(0, keepalive), RAMP_PING_INTERVAL);
         assert_eq!(
@@ -3516,12 +3532,15 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(ping_interval(u32::MAX, keepalive), Duration::from_secs(10));
-        // A disabled idle timeout has nothing to hold open, so the cadence
-        // ends with the ramp rather than pinging every pass.
-        assert_eq!(keepalive_interval(0), None);
+        // A zero timeout is a cadence with no interval to derive, so the
+        // cadence ends with the ramp rather than pinging every pass.
+        assert_eq!(keepalive_interval(Role::Client, 0), None);
         assert_eq!(ping_interval(RAMP_PING_BUDGET, None), Duration::MAX);
         assert_eq!(ping_interval(0, None), RAMP_PING_INTERVAL);
-        assert_eq!(keepalive_interval(3_000), Some(Duration::from_secs(1)));
+        assert_eq!(
+            keepalive_interval(Role::Client, 3_000),
+            Some(Duration::from_secs(1))
+        );
         // Room in any timeout for two lost pings.
         const {
             assert!(KEEPALIVE_DIVISOR >= 3);
@@ -3530,7 +3549,7 @@ mod tests {
 
     #[test]
     fn a_ping_is_due_once_established_and_once_an_interval_is_up() {
-        let keepalive = keepalive_interval(IDLE_TIMEOUT_MS);
+        let keepalive = keepalive_interval(Role::Client, IDLE_TIMEOUT_MS);
         // Nothing is due before establishment, however long the wait: an
         // unestablished connection answers send_ack_eliciting with nothing.
         assert!(!ping_due(false, Duration::MAX, 0, keepalive));
@@ -3567,11 +3586,16 @@ mod tests {
         assert!(ping_due(true, RAMP_PING_INTERVAL, 0, None));
     }
 
-    /// Rounds of silence [`a_connection_with_nothing_to_send_outlives_its_idle_timeout`]
-    /// holds and what each costs. Six seconds: without the keepalive that
-    /// connection dies at 3.4 s, the ramp cadence carrying the first 1.2 s
-    /// of it and the 2 s idle timeout the rest.
-    const SILENT_ROUNDS: u32 = 30;
+    /// The idle timeout the test below installs on both ends. Longer than
+    /// the wait a loaded runner can impose on a pump thread, since a
+    /// keepalive that misses its whole window would close the connection
+    /// and read as a defect.
+    const SILENT_IDLE_MS: u64 = 4_000;
+
+    /// Rounds of silence that test holds and what each costs. Eight
+    /// seconds: without the keepalive the connection dies at 5.2 s, the
+    /// ramp cadence carrying the first 1.2 s and the idle timeout the rest.
+    const SILENT_ROUNDS: u32 = 40;
     const SILENT_ROUND: Duration = Duration::from_millis(200);
 
     /// A fetch rail that has finished its ranges sends nothing for the rest
@@ -3582,13 +3606,13 @@ mod tests {
     fn a_connection_with_nothing_to_send_outlives_its_idle_timeout() {
         let (certificate, key) = credentials();
         let mut server_config = Config::server(limits(), certificate, key);
-        server_config.idle_timeout_ms = 2_000;
+        server_config.idle_timeout_ms = SILENT_IDLE_MS;
         let mut server =
             Transport::serve("127.0.0.1:0".parse().expect("an address"), &server_config)
                 .expect("a server");
         let mut client_config = Config::client(limits());
         client_config.verify_peer = false;
-        client_config.idle_timeout_ms = 2_000;
+        client_config.idle_timeout_ms = SILENT_IDLE_MS;
         let mut client = Transport::connect(
             "127.0.0.1:0".parse().expect("an address"),
             server.local_address(),

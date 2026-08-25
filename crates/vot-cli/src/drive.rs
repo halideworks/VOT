@@ -777,8 +777,14 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 /// carrier queues nothing more and hands nothing more over, so its own
 /// counter freezes while the peer is receiving megabytes: at 5% loss a
 /// draining rail was called stalled and dropped with the fetch 99.9% placed.
-/// A packet in either direction is the session's proof it is not stalled,
-/// and it is what a peer that has gone stops producing.
+/// A packet either way is the session's proof it is not stalled.
+///
+/// The sent half includes this end's own retransmissions and probes, which
+/// a peer that has gone does not stop, so the count alone does not reap an
+/// abandoned session. What ends that is the carrier's idle timeout, which
+/// no traffic this end generates can hold off: QUIC restarts the idle timer
+/// on a send only for the first ack-eliciting packet since a packet last
+/// arrived. A serving carrier never pings for the same reason.
 fn carrier_progress(stats: Option<vot_transport_api::PathStats>) -> u64 {
     let Some(stats) = stats else {
         return 0;

@@ -63,7 +63,7 @@ const _: () = assert!(
 /// An epoch lives at least a round trip, so the share of requests that find
 /// a free slot falls as latency rises and the rest are answered reliably.
 /// Under ADR-0042 a slot holds a whole requested cover rather than one
-/// piece, so eight slots hold about 34 MB in flight, deeper than the request
+/// piece, so eight slots hold about 34 MB in flight, matching the request
 /// pipeline that feeds them. The slot-count sweep measured under per-piece
 /// epochs does not carry over; this count is re-measured under cover-sized
 /// epochs before it moves.

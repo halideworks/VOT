@@ -186,7 +186,7 @@ const DATAGRAM_QUEUE_LEN: usize = 256;
 /// kilobyte and up, so that count is the most the queue is ever asked to
 /// hold in both units.
 const DATAGRAM_RECV_QUEUE_LEN: usize = MAX_DATAGRAM_INBOUND_EVENTS;
-const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
+const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 131_072);
 
 /// The ceiling quiche autotunes a receive window up to, per stream and for
 /// the connection.
@@ -196,22 +196,32 @@ const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
 /// Gbit/s however much this end advertised, and 32 MiB took the same
 /// transfer to 1.23. What a ceiling bounds is what a peer could make the
 /// carrier hold for a stream this end asked for, not a working set: a peer
-/// sends only what was requested, within its own credit. 64 MiB and above
-/// measured flat at 80 and 200 ms, so it stops at the smallest value that
-/// clears the wire. The connection ceiling is half again the stream one
-/// because the library raises a connection window to 1.5 times the stream
-/// window on each grant and clamps it here, so an equal figure would pin
-/// the connection window at the stream window.
-const STREAM_WINDOW_CEILING: u64 = 32 * 1_024 * 1_024;
+/// sends only what was requested, within its own credit: the sized arm's
+/// fetch peak resident set moved 3 MiB while this moved 32.
+///
+/// 64 MiB is where the ceiling stops binding against the request credit
+/// beside it. At four outstanding covers the credit bound every round trip
+/// and this constant was worth 0.7% at 80 ms; at eight, 32 MiB refused 593
+/// to 791 sends a second with stream capacity 0 while 12 to 25 MB of
+/// connection credit and 11 to 12 MB of congestion window sat free, and 64
+/// MiB moves the binder to the congestion window. 128 MiB measured flat
+/// against 64 at eight covers, 284.1 MB/s against 289.0 at 80 ms and 159.8
+/// against 159.3 at 160, because the congestion window binds first.
+///
+/// The connection ceiling is half again the stream one because the library
+/// raises a connection window to 1.5 times the stream window on each grant
+/// and clamps it here, so an equal figure would pin the connection window
+/// at the stream window.
+const STREAM_WINDOW_CEILING: u64 = 64 * 1_024 * 1_024;
 const CONNECTION_WINDOW_CEILING: u64 = STREAM_WINDOW_CEILING / 2 * 3;
 const _: () = assert!(CONNECTION_WINDOW_CEILING == STREAM_WINDOW_CEILING / 2 * 3);
 /// The default advertised initial window, the control-frame limit plus a
-/// record eightfold, sits under the ceiling, so regrants only ever grow it.
+/// record sixteenfold, sits under the ceiling, so regrants only ever grow it.
 const _: () = assert!(
     STREAM_WINDOW_CEILING
         > (vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD as u64
             + vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64)
-            * 8
+            * 16
 );
 
 /// Datagrams the driver holds for a connection whose own queue is full.
@@ -242,16 +252,17 @@ const DATAGRAM_OUTBOX_BYTES: usize = 1 << 20;
 /// cannot starve the stream reader's headroom.
 ///
 /// Sized to what the wire's own datagram credit invites: the receiver
-/// advertises its staging capacity (about 17 MB) as `max_unretired_bytes`,
+/// advertises its staging capacity (about 34 MB) as `max_unretired_bytes`,
 /// and a conforming sender may have that many generation bytes of symbols
-/// in flight, which with the repair overhead is about 22 MB. The old
+/// in flight, which with the repair overhead is about 44 MB. The old
 /// quarter-of-assembly cap (4 MB) sat far under that invitation, and the
 /// pump silently dropped the difference whenever the session thread fell a
 /// burst behind: 8-10% of a coded transfer's symbols on a clean path,
 /// bimodally, measured on the netem rig. A bound the credit can outspend
-/// is the PR 301 class again, one layer up.
-const MAX_DATAGRAM_INBOUND_BYTES: usize = 32 * 1024 * 1024;
-const _: () = assert!(MAX_DATAGRAM_INBOUND_BYTES == 33_554_432);
+/// is the PR 301 class again, one layer up, so this follows the staging
+/// capacity: eight outstanding covers doubled it and this doubles with it.
+const MAX_DATAGRAM_INBOUND_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(MAX_DATAGRAM_INBOUND_BYTES == 67_108_864);
 
 /// Received datagrams the driver holds for a caller that has not drained them.
 ///
@@ -656,12 +667,17 @@ impl Config {
         let stream_window = u64::try_from(self.limits.control_payload())
             .map_err(|_| Error::InvalidConfiguration)?
             .saturating_add(vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64);
-        let connection_window = stream_window.saturating_mul(8);
+        // Sixteenfold rather than eightfold: the ceiling above governs only
+        // what autotuning may climb to, and this is what a rail rides on
+        // until it gets there. The sized arm was measured with the two
+        // raised together, so this moves with the ceiling rather than being
+        // credited apart from it. 21 MB, still under the ceiling.
+        let connection_window = stream_window.saturating_mul(16);
         config.set_max_stream_window(STREAM_WINDOW_CEILING);
         config.set_max_connection_window(CONNECTION_WINDOW_CEILING);
         config.set_initial_max_data(connection_window);
         // The aggregate window remains the memory bound. Let one bulk stream
-        // use all of it instead of stalling after one eighth of the credit.
+        // use all of it instead of stalling after one sixteenth of the credit.
         config.set_initial_max_stream_data_bidi_local(connection_window);
         config.set_initial_max_stream_data_bidi_remote(connection_window);
         // The control stream plus what was advertised, so a peer opening the

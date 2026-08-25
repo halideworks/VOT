@@ -22,6 +22,16 @@ worse because it inflates the recovery round trip itself, duplicating the
 small serial-spine packets moves tails but not the median, and the FEC
 extension as currently driven codes too little to matter.
 
+Note, 2026-08-25: the deeper-pipeline half of that sentence is superseded.
+It was measured at four outstanding covers against the receive window this
+stack shipped then, where the credit already bound and depth only lengthened
+the recovery round trip. With the receive-window ceiling raised beside it,
+eight covers measured faster under loss, not slower: one rail on an emulated
+80 ms path at 3% each way went 58.5 to 103.2 MB/s reliably and 67.5 to 105.3
+with coding forced, and the coded share rose from 82% of offered generations
+to essentially all of them. What the original result still says is that
+depth alone, without the window, buys nothing.
+
 Why FEC underdelivers today is an implementation shape, not the wire
 protocol. The serve opens one coding epoch per `FEC_PIECE_BYTES` piece
 (~1.1 MB, 17 generations) and holds at most `MAX_CODING_EPOCHS = 8` slots,
@@ -51,8 +61,10 @@ round trip in expectation.
    requested range, not an epoch per piece. Pieces remain the receiver's
    bundle unit: the fetch maps an epoch's generations onto piece bundles by
    offset, as the geometry already determines. Eight epoch slots then hold
-   eight covers (~34 MB) rather than eight pieces (~9 MB), which is deeper
-   than the request pipeline that feeds them.
+   eight covers (~34 MB) rather than eight pieces (~9 MB). That was deeper
+   than the request pipeline that feeds them at four outstanding covers; at
+   the eight this stack now ships the two are equal, 8 x 4,259,840 bytes
+   either way (2026-08-25).
 
 2. **Repair sized from measured loss plus margin, up to the spec's 16.**
    The repair count becomes `clamp(ceil(3 * observed_loss * (k + r)) + 1,

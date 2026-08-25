@@ -310,6 +310,16 @@ jobs:
         # loop is per-platform and otherwise never compiled off Linux.
         run: cargo +1.97.1 test -p vot-commit-platform -p vot-platform-fs -p vot-platform-net -p vot-platform-proc -p vot-resume -p vot-scheduler --locked
 
+      # vot-cli holds the per-platform file primitives and the aliases that
+      # name them, and no other job compiles it off Linux, so a Windows-only
+      # name resolution break sat in main unseen. Compiling is the gap, so a
+      # check over every target rather than a test run, and without the wire
+      # feature: that one pulls quiche's BoringSSL through cmake, bindgen and
+      # nasm, which this job installs none of, and the imports that broke are
+      # outside it.
+      - name: Check the CLI
+        run: cargo +1.97.1 check -p vot-cli --all-targets --locked
+
   quiche-live:
     name: quiche live (loopback)
     runs-on: ubuntu-24.04

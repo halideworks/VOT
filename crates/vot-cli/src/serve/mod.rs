@@ -2188,6 +2188,232 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_verdict_waits_for_the_receivers_word() {
+        // The queue the retirement hands its verdict to. Nothing is judged
+        // inside the wait, the receiver's word takes a generation out of
+        // it, a repeat says nothing new, and what no word ever came for is
+        // judged once when the wait is up.
+        let mut fec = connection::FecSender::default();
+        let now = std::time::Instant::now();
+        let due = now + server::EPOCH_QUIET_GRACE;
+        assert_eq!(fec.defer(due, 7, (0..4).collect()), 0, "nothing is evicted");
+        assert_eq!(fec.overdue(now), 0, "inside the wait nothing is judged");
+        assert!(fec.settle(7, 1), "the receiver's word settles one");
+        assert!(!fec.settle(7, 1), "and a repeat of it settles nothing");
+        assert!(!fec.settle(8, 0), "an epoch nothing was deferred for");
+        assert_eq!(fec.overdue(due), 3, "the rest are what no word came for");
+        assert_eq!(fec.overdue(due), 0, "and they are judged once");
+    }
+
+    #[test]
+    fn a_burst_of_retirements_cannot_grow_the_deferred_queue() {
+        // The wait drains the queue on this connection's grace, so the cap
+        // only bounds a burst of retirements inside one of them.
+        let mut fec = connection::FecSender::default();
+        let due = std::time::Instant::now() + server::MAX_QUIET_GRACE;
+        for epoch in 0..u32::try_from(connection::MAX_DEFERRED_EPOCHS).unwrap() {
+            assert_eq!(fec.defer(due, epoch, (0..2).collect()), 0);
+        }
+        assert_eq!(
+            fec.defer(due, 99, (0..2).collect()),
+            2,
+            "the oldest is judged to make room"
+        );
+    }
+
+    #[test]
+    fn a_verdict_deferred_before_a_re_engagement_never_votes_after_it() {
+        // A fresh engagement zeroes the decode sample, because it is judged
+        // on its own outcomes. The deferred verdicts have to go with it: they
+        // belong to the engagement that ended, nothing was coded in between,
+        // and one retired epoch's unheard generations folded onto a zeroed
+        // base are a whole sample of failures that meets the quarter bar on
+        // equality. The first hold is four windows, which is shorter than the
+        // grace on any path fast enough to close them.
+        let (bundle, _) = built_bundle("stale", &[("small.bin", patterned(1024))]);
+        let server = forced_fec_server(&bundle);
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(!connection.fec_policy.coding(), "not engaged yet");
+
+        // A whole sample of unheard generations, already past its wait.
+        let due = std::time::Instant::now();
+        let whole = u32::try_from(connection::FEC_DECODE_SAMPLE).unwrap();
+        assert_eq!(connection.fec.defer(due, 3, (0..whole).collect()), 0);
+
+        session.driver().path_stats = Some(path_sample(410, 0, 8192));
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(connection.fec_policy.coding(), "the lossy sample engages");
+        assert!(
+            connection.fec.pending_verdicts.is_empty(),
+            "the ended engagement's verdicts went with it"
+        );
+        assert_eq!(
+            connection.fec_policy.decode_sample(),
+            (0, 0),
+            "so none of them voted on the fresh sample"
+        );
+
+        // Only the transition clears. A verdict deferred while the
+        // engagement runs belongs to it and survives the passes under it,
+        // and its wait is put far past any deadline a pass could reach so
+        // that the clear is the only thing under test here.
+        let far = std::time::Instant::now() + std::time::Duration::from_hours(1);
+        assert_eq!(connection.fec.defer(far, 4, (0..whole).collect()), 0);
+        session.driver().path_stats = Some(path_sample(820, 0, 16_384));
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(connection.fec_policy.coding(), "still the same engagement");
+        assert_eq!(
+            connection.fec.pending_verdicts.len(),
+            1,
+            "so its own deferred verdict still stands"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn what_a_resend_says_about_coding_depends_on_why_it_happened() {
+        // The table. A resend is delivery, and only two of the three ways
+        // one happens are the receiver's word about decoding. A quiet
+        // retirement is this end's silence budget running out: measured on
+        // a 12 GiB emulated transfer at 7% loss each way, 3,964 of the
+        // 4,740 generations a retirement gave up on reported `Decoded`
+        // afterwards, against 392 the receiver truly could not decode.
+        let (bundle, _) = built_bundle("causes", &[("big.bin", patterned(200_000))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        session.driver().path_stats = Some(path_sample(0, 0, 0));
+        server.service(&mut session, &mut connection).unwrap();
+
+        // The receiver's word that a generation did not decode: counted
+        // where it lands, because there is nothing further to wait for.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [51; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let epoch = *connection.fec.epochs.keys().last().expect("an epoch");
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch,
+                generation: 0,
+                outcome: frames::GenOutcome::Abandoned,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.fec_policy.decode_sample(), (1, 1));
+
+        // And its word that the whole epoch is refused, the same way.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GenDone(frames::GenDone {
+                epoch,
+                generation: 0,
+                outcome: frames::GenOutcome::Refused,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(
+            connection.fec_policy.decode_sample(),
+            (4, 4),
+            "the three still live under the refused epoch"
+        );
+
+        // A quiet retirement is not a word. The records go now and the
+        // verdict waits.
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [52; 16],
+                object,
+                offset: 0,
+                length: object.length,
+            })));
+        server.service(&mut session, &mut connection).unwrap();
+        let epoch = *connection.fec.epochs.keys().last().expect("an epoch");
+        let live = connection.fec.epochs[&epoch].live.len();
+        assert_eq!(live, 4, "200000 bytes are four generations");
+        session.driver().records.clear();
+        let retired = std::time::Instant::now();
+        assert!(server.retire_quiet_epochs(&mut connection, retired).is_ok());
+        assert!(
+            server
+                .retire_quiet_epochs(&mut connection, retired + server::MAX_QUIET_GRACE)
+                .is_ok()
+        );
+        connection.drain(&mut session).unwrap();
+        assert!(connection.fec.epochs.is_empty(), "retired");
+        assert_eq!(session.driver().records.len(), live, "and repaired now");
+        assert_eq!(
+            connection.fec_policy.decode_sample(),
+            (4, 4),
+            "the timeout judged none of them"
+        );
+        let wait = connection.quiet_grace;
+        assert!(
+            server
+                .retire_quiet_epochs(
+                    &mut connection,
+                    retired + server::MAX_QUIET_GRACE + wait / 2
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            connection.fec_policy.decode_sample(),
+            (4, 4),
+            "and the wait runs from the retirement, not before it"
+        );
+
+        // The word the retirement did not wait for still decides, and which
+        // word it is decides which way. A generation the receiver decoded is
+        // not coding failing.
+        // Dispatched rather than serviced: a service pass reads the wall
+        // clock, and a stall past the deferral's own deadline would drain
+        // the queue before these land.
+        for (generation, outcome, sample) in [
+            (0, frames::GenOutcome::Decoded, (5, 4)),
+            (1, frames::GenOutcome::Abandoned, (6, 5)),
+        ] {
+            let wire = encoded(&TypedFrame::GenDone(frames::GenDone {
+                epoch,
+                generation,
+                outcome,
+            }))
+            .unwrap();
+            assert!(server.dispatch(&wire, &mut connection, 16).is_ok());
+            assert_eq!(
+                connection.fec_policy.decode_sample(),
+                sample,
+                "the receiver's late word about generation {generation}"
+            );
+        }
+
+        // The two nothing was ever said about are the failures, once the
+        // wait is up.
+        assert!(
+            server
+                .retire_quiet_epochs(
+                    &mut connection,
+                    retired + server::MAX_QUIET_GRACE * 2 + wait
+                )
+                .is_ok()
+        );
+        assert_eq!(connection.fec_policy.decode_sample(), (8, 7));
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     fn an_epoch_whose_symbols_are_still_queued_is_never_retired() {
         // The other half: silence about an epoch this end has not finished
         // sending says nothing about the receiver, however long it lasts.

@@ -30,7 +30,9 @@ eight covers measured faster under loss, not slower: one rail on an emulated
 80 ms path at 3% each way went 58.5 to 103.2 MB/s reliably and 67.5 to 105.3
 with coding forced, and the coded share rose from 82% of offered generations
 to essentially all of them. What the original result still says is that
-depth alone, without the window, buys nothing.
+depth alone runs into the per-stream receive window after one step: at the
+shipped ceiling eight covers took 80 ms from 174.2 to 194.5 MB/s and sixteen
+were flat at 194.0.
 
 Why FEC underdelivers today is an implementation shape, not the wire
 protocol. The serve opens one coding epoch per `FEC_PIECE_BYTES` piece

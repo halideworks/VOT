@@ -181,11 +181,10 @@ const DATAGRAM_QUEUE_LEN: usize = 256;
 /// account admits: at 1,024 the queue held 1.2 MB under the 32 MB account of
 /// the day, since doubled below, and a seeded first flight overran it between
 /// driver passes, so quiche discarded whole coding epochs below every counter
-/// this stack owns. The
-/// account admits at most [`MAX_DATAGRAM_INBOUND_EVENTS`] datagrams
-/// whatever their size, because its byte bound is what governs at half a
-/// kilobyte and up, so that count is the most the queue is ever asked to
-/// hold in both units.
+/// this stack owns. The account admits at most
+/// [`MAX_DATAGRAM_INBOUND_EVENTS`] datagrams whatever their size, because its
+/// byte bound is what governs at half a kilobyte and up, so that count is the
+/// most the queue is ever asked to hold in both units.
 const DATAGRAM_RECV_QUEUE_LEN: usize = MAX_DATAGRAM_INBOUND_EVENTS;
 const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 131_072);
 
@@ -693,7 +692,8 @@ impl Config {
         config.set_max_connection_window(CONNECTION_WINDOW_CEILING);
         config.set_initial_max_data(connection_window);
         // The aggregate window remains the memory bound. Let one bulk stream
-        // use all of it instead of stalling after one sixteenth of the credit.
+        // use all of it instead of stalling at the frame bound the session
+        // promised.
         config.set_initial_max_stream_data_bidi_local(connection_window);
         config.set_initial_max_stream_data_bidi_remote(connection_window);
         // The control stream plus what was advertised, so a peer opening the

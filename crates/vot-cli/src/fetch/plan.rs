@@ -77,6 +77,12 @@ const _: () = assert!(PENDING_BUNDLE_DEPTH == 100);
 /// full-sized bundles, and the coded pipeline holds two covers a slot,
 /// which are at most `MAX_PROOF_RANGE_BYTES` each. A peer that announces
 /// bundles and never completes them holds this much until the session ends.
+///
+/// Returning credit as records arrive puts up to a window and one span in
+/// flight, five covers rather than four, and that does not reach this: an
+/// entry leaves the pending ledger the moment its last record lands, and
+/// `answer_reliably` serializes one cover at a time, so what is part-built
+/// here is the one being answered.
 pub(crate) const PENDING_BUNDLE_BYTES: usize = OUTSTANDING_COVERS
     * vot_scheduler::session::MAX_PENDING_BUNDLE_BYTES
     + 2 * vot_scheduler::session::MAX_CODING_EPOCHS * COVER_BYTES_USIZE;
@@ -114,7 +120,7 @@ const _: () =
     assert!(FEC_GENERATION_BYTES_USIZE as u64 == crate::serve::server::FEC_GENERATION_BYTES);
 const _: () = assert!(ORPHAN_BUNDLE_DEPTH == 1_312);
 
-/// Bytes this fetch may have asked for and not yet placed.
+/// Bytes this fetch may have asked for and not yet seen arrive.
 pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MAX_REQUESTED_RANGE;
 
 /// One stored object the manifest names, in fetch order.

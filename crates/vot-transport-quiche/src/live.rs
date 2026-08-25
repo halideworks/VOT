@@ -188,6 +188,32 @@ const DATAGRAM_QUEUE_LEN: usize = 256;
 const DATAGRAM_RECV_QUEUE_LEN: usize = MAX_DATAGRAM_INBOUND_EVENTS;
 const _: () = assert!(DATAGRAM_RECV_QUEUE_LEN == 65_536);
 
+/// The ceiling quiche autotunes a receive window up to, per stream and for
+/// the connection.
+///
+/// The window over the round trip is the most one connection can carry, so
+/// the library's own 16 MiB stream ceiling held an 80 ms path to 0.83
+/// Gbit/s however much this end advertised, and 32 MiB took the same
+/// transfer to 1.23. What a ceiling bounds is what a peer could make the
+/// carrier hold for a stream this end asked for, not a working set: a peer
+/// sends only what was requested, within its own credit. 64 MiB and above
+/// measured flat at 80 and 200 ms, so it stops at the smallest value that
+/// clears the wire. The connection ceiling is half again the stream one
+/// because the library raises a connection window to 1.5 times the stream
+/// window on each grant and clamps it here, so an equal figure would pin
+/// the connection window at the stream window.
+const STREAM_WINDOW_CEILING: u64 = 32 * 1_024 * 1_024;
+const CONNECTION_WINDOW_CEILING: u64 = STREAM_WINDOW_CEILING / 2 * 3;
+const _: () = assert!(CONNECTION_WINDOW_CEILING == STREAM_WINDOW_CEILING / 2 * 3);
+/// The default advertised initial window, the control-frame limit plus a
+/// record eightfold, sits under the ceiling, so regrants only ever grow it.
+const _: () = assert!(
+    STREAM_WINDOW_CEILING
+        > (vot_transport_api::MAX_CONTROL_FRAME_PAYLOAD as u64
+            + vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64)
+            * 8
+);
+
 /// Datagrams the driver holds for a connection whose own queue is full.
 ///
 /// A refused datagram waits here instead of being thrown away, so a sender
@@ -631,6 +657,8 @@ impl Config {
             .map_err(|_| Error::InvalidConfiguration)?
             .saturating_add(vot_transport_api::MAX_DATA_RECORD_WIRE_BYTES as u64);
         let connection_window = stream_window.saturating_mul(8);
+        config.set_max_stream_window(STREAM_WINDOW_CEILING);
+        config.set_max_connection_window(CONNECTION_WINDOW_CEILING);
         config.set_initial_max_data(connection_window);
         // The aggregate window remains the memory bound. Let one bulk stream
         // use all of it instead of stalling after one eighth of the credit.

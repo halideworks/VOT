@@ -3267,6 +3267,11 @@ fn read_streams(
             // chunk itself plus the largest partial a frame can be. Checked
             // per chunk, because one pass reads until the stream is dry and
             // the caller drains nothing meanwhile.
+            //
+            // What this stream already holds for a partial frame is no part
+            // of that room: the frame it completes is queued as an event of
+            // its own length, so the charge moves from `assembling` to
+            // `bytes` rather than being freed.
             let headroom = {
                 let Ok(queue) = inbound.lock() else {
                     break;
@@ -3276,9 +3281,7 @@ fn read_streams(
             let partial_limit = state
                 .kind
                 .partial_frame_limit(control_limit.load(Ordering::Relaxed));
-            let needed = partial_limit
-                .saturating_add(buffer.len())
-                .saturating_sub(state.framing.reserved());
+            let needed = partial_limit.saturating_add(buffer.len());
             if headroom < needed {
                 break;
             }
@@ -6482,12 +6485,17 @@ mod tests {
     }
 
     #[test]
-    fn a_split_frame_reuses_its_reserved_headroom() {
+    fn a_held_partial_frame_is_not_headroom_the_account_gets_back() {
+        // The charge a partial frame holds is not room the account will get
+        // back: the frame it completes is queued as an event of its own
+        // length, so the bytes move from `assembling` to `bytes` and stay.
+        // Crediting that charge admits a chunk the account cannot hold, and
+        // the trailing partial's reservation then fails as a fault, which
+        // closes the connection under RESOURCE_LIMIT for this endpoint's own
+        // lag.
         let (mut client, mut server) = sans_io_pair(1_000_000);
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote: SocketAddr = "127.0.0.1:4434".parse().expect("an address");
-        let frame = record(&vec![0x27; vot_transport_api::MAX_DATA_RECORD_BYTES]);
-        let split = frame.len() / 2;
         let inbound = Arc::new(Mutex::new(Inbound::default()));
         let budget = SharedBudget(Arc::clone(&inbound));
         let control_limit = Arc::new(AtomicUsize::new(1_000_000));
@@ -6501,16 +6509,40 @@ mod tests {
             &budget,
             &control_limit,
         );
+
+        // A stream part-way through a record, which is the charge the guard
+        // used to credit itself.
+        let first = record(&vec![0x27; vot_transport_api::MAX_DATA_RECORD_BYTES]);
+        let held = 260_000;
         state
             .framing
-            .accept(&frame[..split], |_| panic!("a partial frame completed"))
+            .accept(&first[..held], |_| panic!("a partial frame completed"))
             .expect("the prefix fits");
         let reserved = state.framing.reserved();
-        assert!(reserved > split, "the prefix reserved no spare capacity");
+        assert_eq!(reserved, 262_144, "the prefix charged its geometric target");
 
-        let mut sent = split;
-        while sent < frame.len() {
-            match client.stream_send(id, &frame[sent..], false) {
+        // One chunk that completes that record, carries a whole small one,
+        // and starts a third. Its completions are queued, its charge is not
+        // freed, and the third record's reservation is what the account
+        // cannot hold.
+        let small = record(&vec![0x5a; 7_750]);
+        assert_eq!(small.len(), 7_753, "the small record's wire length moved");
+        let next = record(&vec![0x33; vot_transport_api::MAX_DATA_RECORD_BYTES]);
+        let started = 200_000;
+        let mut chunk = first[held..].to_vec();
+        chunk.extend_from_slice(&small);
+        chunk.extend_from_slice(&next[..started]);
+        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
+        assert!(
+            chunk.len() <= buffer.len(),
+            "the chunk is more than one read"
+        );
+        let mut sent = 0_usize;
+        let mut attempts = 0_u32;
+        while sent < chunk.len() {
+            attempts += 1;
+            assert!(attempts < 1_000, "the pair stopped moving");
+            match client.stream_send(id, &chunk[sent..], false) {
                 Ok(written) => sent += written,
                 Err(quiche::Error::Done) => {}
                 Err(error) => panic!("a stream: {error:?}"),
@@ -6518,14 +6550,35 @@ mod tests {
             shuttle(&mut client, local, &mut server, remote);
             shuttle(&mut server, remote, &mut client, local);
         }
-        let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
-        let old_threshold = vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len();
-        inbound.lock().expect("the queue").bytes = MAX_ASSEMBLY_BYTES - old_threshold;
+
+        // Room for one chunk and one partial frame, less this stream's own
+        // charge: the headroom the credited guard read as enough. Reading
+        // here queues 269,902 bytes against 262,176 of room, which is the
+        // state every fire of this close printed: 16,523,054 bytes queued,
+        // 254,418 free, and a 262,144-byte reservation refused.
+        let credited = vot_transport_framing::MAX_PARTIAL_FRAME + buffer.len() - reserved;
+        inbound.lock().expect("the queue").bytes = MAX_ASSEMBLY_BYTES - credited - reserved;
+        read_streams(
+            &mut server,
+            &mut streams,
+            &budget,
+            &inbound,
+            &control_limit,
+            Role::Server,
+            &mut buffer,
+        );
         assert!(
-            MAX_ASSEMBLY_BYTES - inbound.lock().expect("the queue").charged() < old_threshold,
-            "the test left enough headroom for the old gate"
+            server.local_error().is_none(),
+            "a held partial's charge was credited as free room and the read closed the connection"
+        );
+        assert!(
+            inbound.lock().expect("the queue").events.is_empty(),
+            "a chunk the account cannot hold was read anyway"
         );
 
+        // The caller drains and the paused chunk arrives whole: two records
+        // queued, the third still assembling.
+        inbound.lock().expect("the queue").bytes = 0;
         read_streams(
             &mut server,
             &mut streams,
@@ -6538,8 +6591,16 @@ mod tests {
         assert!(server.local_error().is_none());
         assert_eq!(
             inbound.lock().expect("the queue").events.len(),
-            1,
-            "the charged spare capacity did not unblock the tail"
+            2,
+            "the paused records never arrived"
+        );
+        assert!(
+            streams
+                .get(&id)
+                .expect("the stream")
+                .framing
+                .is_assembling(),
+            "the trailing partial was dropped"
         );
     }
 

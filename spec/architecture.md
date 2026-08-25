@@ -230,12 +230,14 @@ older credit and places absolute caps on unretired bytes, active generations,
 open coding epochs, and decode work (`spec/fec.md` section 11). Wall-clock
 expiry is not a correctness mechanism.
 
-The default connection idle timeout is 90 seconds. There is no keepalive:
-ADR-0035 retired the setting that configured one, because nothing implemented
-a keepalive timer, and it returns with the timer rather than before it. Server
-connection IDs are opaque to application logic. The default relay profile uses
-a nonzero 16-byte server CID and transport adapters support a deployment-supplied
-CID generator or router.
+The default connection idle timeout is 90 seconds. There is no negotiated
+keepalive: ADR-0035 retired the setting that configured one, and it returns
+only with something a peer can ask for. A transport may hold open a connection
+its owner still needs on its own account, as the quiche adapter does with an
+ack-eliciting cadence at a third of the idle timeout it installed, and neither
+end negotiates that. Server connection IDs are opaque to application logic. The
+default relay profile uses a nonzero 16-byte server CID and transport adapters
+support a deployment-supplied CID generator or router.
 
 ## 7. Rails and congestion domains
 

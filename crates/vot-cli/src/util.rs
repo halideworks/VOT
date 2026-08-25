@@ -272,10 +272,10 @@ pub(crate) fn unsupported_rename_noreplace(
 }
 
 #[cfg(target_os = "windows")]
-use windows_rename_noreplace as atomic_rename_noreplace;
+pub(crate) use windows_rename_noreplace as atomic_rename_noreplace;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-use unsupported_rename_noreplace as atomic_rename_noreplace;
+pub(crate) use unsupported_rename_noreplace as atomic_rename_noreplace;
 
 /// Makes a directory's own entries durable, once the files in it are.
 #[cfg(not(windows))]
@@ -296,7 +296,7 @@ pub(crate) fn windows_sync_directory(_directory: &Path) -> Result<(), Error> {
 }
 
 #[cfg(windows)]
-use windows_sync_directory as sync_directory;
+pub(crate) use windows_sync_directory as sync_directory;
 
 pub(crate) fn staging_path(destination: &Path) -> Result<PathBuf, Error> {
     let name = destination

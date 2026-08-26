@@ -121,18 +121,7 @@ impl BundleServer {
         connection.drain(session)?;
         let path = session.adapter().path_stats();
         connection.quiet_grace = quiet_grace(path.and_then(|stats| stats.smoothed_rtt_us));
-        let was_coding = connection.fec_policy.coding();
         connection.fec_policy.observe(path);
-        if !was_coding && connection.fec_policy.coding() {
-            // A fresh engagement judges its own outcomes, so `observe` zeroed
-            // the decode sample; the deferred verdicts go with it. Every one
-            // of them belongs to the engagement that ended, because nothing
-            // was coded in between, and one retired epoch's unheard
-            // generations folded onto a zeroed base are a whole sample of
-            // failures again. The first hold is four windows, which is under
-            // the grace on any path fast enough to close them.
-            connection.fec.pending_verdicts.clear();
-        }
         let repair_symbols = connection.fec_policy.repair_symbols();
         connection.fec_coding = !self.automatic_fec || connection.fec_policy.coding();
         loop {
@@ -243,7 +232,9 @@ impl BundleServer {
         connection: &mut ServeConnection,
         now: std::time::Instant,
     ) -> Result<(), Fault> {
-        let unheard = connection.fec.overdue(now);
+        let unheard = connection
+            .fec
+            .overdue(connection.fec_policy.failure_base(), now);
         for _ in 0..unheard {
             // Nothing was ever said about these. A generation the receiver
             // gave up on owes a `GEN_DONE Abandoned` and is counted where
@@ -331,7 +322,12 @@ impl BundleServer {
             // `Decoded` reports at 7% loss each way and 90.6% at 12% arrive
             // inside one more grace, and none of them later than a second.
             // The rest still count against coding, as they all did before.
-            let unheard = connection.fec.defer(now + grace, epoch, opened.live);
+            let unheard = connection.fec.defer(
+                connection.fec_policy.failure_base(),
+                now + grace,
+                epoch,
+                opened.live,
+            );
             for _ in 0..unheard {
                 connection.fec_policy.note_repaired();
             }
@@ -592,7 +588,11 @@ impl BundleServer {
             // (section 12). It is still the receiver's word on a generation
             // the quiet retirement gave up on before hearing one, and that
             // word is the decode verdict the retirement could not give.
-            if connection.fec.settle(done.epoch, done.generation) {
+            if connection.fec.settle(
+                connection.fec_policy.failure_base(),
+                done.epoch,
+                done.generation,
+            ) {
                 if done.outcome == frames::GenOutcome::Decoded {
                     connection.fec_policy.note_decoded();
                 } else {

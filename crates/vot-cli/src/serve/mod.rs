@@ -2256,13 +2256,17 @@ mod tests {
         let mut fec = connection::FecSender::default();
         let now = std::time::Instant::now();
         let due = now + server::EPOCH_QUIET_GRACE;
-        assert_eq!(fec.defer(due, 7, (0..4).collect()), 0, "nothing is evicted");
-        assert_eq!(fec.overdue(now), 0, "inside the wait nothing is judged");
-        assert!(fec.settle(7, 1), "the receiver's word settles one");
-        assert!(!fec.settle(7, 1), "and a repeat of it settles nothing");
-        assert!(!fec.settle(8, 0), "an epoch nothing was deferred for");
-        assert_eq!(fec.overdue(due), 3, "the rest are what no word came for");
-        assert_eq!(fec.overdue(due), 0, "and they are judged once");
+        assert_eq!(
+            fec.defer(0, due, 7, (0..4).collect()),
+            0,
+            "nothing is evicted"
+        );
+        assert_eq!(fec.overdue(0, now), 0, "inside the wait nothing is judged");
+        assert!(fec.settle(0, 7, 1), "the receiver's word settles one");
+        assert!(!fec.settle(0, 7, 1), "and a repeat of it settles nothing");
+        assert!(!fec.settle(0, 8, 0), "an epoch nothing was deferred for");
+        assert_eq!(fec.overdue(0, due), 3, "the rest are what no word came for");
+        assert_eq!(fec.overdue(0, due), 0, "and they are judged once");
     }
 
     #[test]
@@ -2272,10 +2276,10 @@ mod tests {
         let mut fec = connection::FecSender::default();
         let due = std::time::Instant::now() + server::MAX_QUIET_GRACE;
         for epoch in 0..u32::try_from(connection::MAX_DEFERRED_EPOCHS).unwrap() {
-            assert_eq!(fec.defer(due, epoch, (0..2).collect()), 0);
+            assert_eq!(fec.defer(0, due, epoch, (0..2).collect()), 0);
         }
         assert_eq!(
-            fec.defer(due, 99, (0..2).collect()),
+            fec.defer(0, due, 99, (0..2).collect()),
             2,
             "the oldest is judged to make room"
         );
@@ -2285,11 +2289,11 @@ mod tests {
     fn a_verdict_deferred_before_a_re_engagement_never_votes_after_it() {
         // A fresh engagement zeroes the decode sample, because it is judged
         // on its own outcomes. The deferred verdicts have to go with it: they
-        // belong to the engagement that ended, nothing was coded in between,
-        // and one retired epoch's unheard generations folded onto a zeroed
-        // base are a whole sample of failures that meets the quarter bar on
-        // equality. The first hold is four windows, which is shorter than the
-        // grace on any path fast enough to close them.
+        // belong to the engagement that ended, because a pass sets
+        // `fec_coding` from `coding()` once and opening an epoch is gated on
+        // it, so nothing was coded in between, and one retired epoch's
+        // unheard generations folded onto a zeroed base are a whole sample of
+        // failures that meets the quarter bar on equality.
         let (bundle, _) = built_bundle("stale", &[("small.bin", patterned(1024))]);
         let server = forced_fec_server(&bundle);
         let mut session = ready_session_fec(ample_credit());
@@ -2301,7 +2305,8 @@ mod tests {
         // A whole sample of unheard generations, already past its wait.
         let due = std::time::Instant::now();
         let whole = u32::try_from(connection::FEC_DECODE_SAMPLE).unwrap();
-        assert_eq!(connection.fec.defer(due, 3, (0..whole).collect()), 0);
+        let base = connection.fec_policy.failure_base();
+        assert_eq!(connection.fec.defer(base, due, 3, (0..whole).collect()), 0);
 
         session.driver().path_stats = Some(path_sample(1024, 0, 8192));
         server.service(&mut session, &mut connection).unwrap();
@@ -2316,12 +2321,13 @@ mod tests {
             "so none of them voted on the fresh sample"
         );
 
-        // Only the transition clears. A verdict deferred while the
+        // Only a zeroing drops them. A verdict deferred while the
         // engagement runs belongs to it and survives the passes under it,
         // and its wait is put far past any deadline a pass could reach so
         // that the clear is the only thing under test here.
         let far = std::time::Instant::now() + std::time::Duration::from_hours(1);
-        assert_eq!(connection.fec.defer(far, 4, (0..whole).collect()), 0);
+        let base = connection.fec_policy.failure_base();
+        assert_eq!(connection.fec.defer(base, far, 4, (0..whole).collect()), 0);
         session.driver().path_stats = Some(path_sample(2048, 0, 16_384));
         server.service(&mut session, &mut connection).unwrap();
         assert!(connection.fec_policy.coding(), "still the same engagement");
@@ -2331,6 +2337,112 @@ mod tests {
             "so its own deferred verdict still stands"
         );
         crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn a_verdict_deferred_before_a_counter_reset_never_votes_after_it() {
+        // The other place the failure share is zeroed. A counter reset is
+        // a new baseline, so what the old counters' windows smoothed into
+        // the share describes a path this one no longer is; the verdicts
+        // deferred to be judged against that share go with it, or one
+        // retired epoch's unheard generations fill a whole sample at 100%
+        // on the fresh zero and meet the quarter bar on equality.
+        let mut policy = connection::FecPolicy::default();
+        let mut fec = connection::FecSender::default();
+        policy.observe(Some(path_sample(0, 0, 0)));
+        policy.observe(Some(path_sample(3277, 0, 8192)));
+        assert!(policy.coding(), "a 40% window engages");
+        policy.note_repaired();
+        policy.note_repaired();
+        policy.note_repaired();
+        assert_eq!(policy.decode_sample(), (3, 3), "a sample under way");
+        let now = std::time::Instant::now();
+        let base = policy.failure_base();
+        assert_eq!(fec.defer(base, now, 3, (0..3).collect()), 0);
+
+        policy.observe(Some(path_sample(0, 0, 0)));
+        assert_ne!(policy.failure_base(), base, "the reset zeroed the share");
+        assert_eq!(
+            policy.decode_sample(),
+            (0, 0),
+            "and the sample that was filling it"
+        );
+        for _ in 0..fec.overdue(policy.failure_base(), now) {
+            policy.note_repaired();
+        }
+        assert_eq!(
+            policy.decode_sample(),
+            (0, 0),
+            "so nothing deferred before the reset voted after it"
+        );
+        assert!(fec.pending_verdicts.is_empty(), "and none of it is held");
+
+        // One deferred after the reset belongs to the new baseline and is
+        // judged the way it always was.
+        let base = policy.failure_base();
+        assert_eq!(fec.defer(base, now, 4, (0..3).collect()), 0);
+        for _ in 0..fec.overdue(base, now) {
+            policy.note_repaired();
+        }
+        assert_eq!(policy.decode_sample(), (3, 3), "which this one is");
+    }
+
+    #[test]
+    fn a_verdict_deferred_before_a_fresh_engagement_never_votes_after_it() {
+        // The same property at the other zeroing site, without a session
+        // around it: the engagement that ended leaves its retirements
+        // deferred, coding stops, and the next engagement zeroes the share
+        // to judge its own outcomes. What the last one deferred cannot be
+        // the first thing the new one reads.
+        let mut policy = connection::FecPolicy::default();
+        let mut fec = connection::FecSender::default();
+        let mut lost = 0;
+        let mut sent = 0;
+        let mut window = |policy: &mut connection::FecPolicy, window_lost: u64| {
+            lost += window_lost;
+            sent += 8192;
+            policy.observe(Some(path_sample(lost, 0, sent)));
+        };
+        policy.observe(Some(path_sample(0, 0, 0)));
+        window(&mut policy, 3277);
+        assert!(policy.coding(), "a 40% window engages");
+        let mut clean = 0;
+        while policy.coding() && clean < 64 {
+            window(&mut policy, 0);
+            clean += 1;
+        }
+        assert!(!policy.coding(), "and clean windows end the engagement");
+
+        let now = std::time::Instant::now();
+        let base = policy.failure_base();
+        assert_eq!(fec.defer(base, now, 3, (0..3).collect()), 0);
+        let mut lossy = 0;
+        while !policy.coding() && lossy < 64 {
+            window(&mut policy, 3277);
+            lossy += 1;
+        }
+        assert!(policy.coding(), "the path turns lossy again");
+        assert_ne!(
+            policy.failure_base(),
+            base,
+            "the fresh engagement zeroed the share"
+        );
+        for _ in 0..fec.overdue(policy.failure_base(), now) {
+            policy.note_repaired();
+        }
+        assert_eq!(
+            policy.decode_sample(),
+            (0, 0),
+            "so nothing the last engagement deferred voted on this one"
+        );
+
+        // One deferred inside the engagement is its own outcome and votes.
+        let base = policy.failure_base();
+        assert_eq!(fec.defer(base, now, 4, (0..3).collect()), 0);
+        for _ in 0..fec.overdue(base, now) {
+            policy.note_repaired();
+        }
+        assert_eq!(policy.decode_sample(), (3, 3), "as it always did");
     }
 
     #[test]

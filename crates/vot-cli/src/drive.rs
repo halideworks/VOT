@@ -1055,7 +1055,11 @@ mod tests {
         let serving = std::thread::spawn(move || {
             let server = crate::BundleServer::open(&serving_bundle)?;
             let mut half = Some(half);
-            serve_sessions_within(Some(1), TEST_STALL, || {
+            // The peer is a real thread, so its silence is the scheduler's
+            // rather than a stall: this end takes the same budget the fetch
+            // end holds, whose floor is above the silences a starved runner
+            // produces.
+            serve_sessions_within(Some(1), stalled_wait(), || {
                 half.take()
                     .map_or(Err(Error::CarrierUnavailable), |carrier| {
                         ServeSession::begin(&server, carrier, not_required())

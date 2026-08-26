@@ -121,6 +121,10 @@ pub(crate) struct FecPolicy {
     /// The share of coded generations failing, in [`RATE_ONE`]ths,
     /// smoothed across samples the way the loss rate is.
     smoothed_failure: u64,
+    /// How many times that share has been zeroed. A verdict deferred
+    /// under one value describes the sample that ended, so it is dropped
+    /// rather than folded onto the fresh one.
+    failure_base: u64,
     /// Loss windows still owed to a decode failure before coding may be
     /// reconsidered, and how many samples have failed on this connection,
     /// which is what lengthens the next hold.
@@ -161,6 +165,7 @@ impl Default for FecPolicy {
             resolved_sample: 0,
             failed_sample: 0,
             smoothed_failure: 0,
+            failure_base: 0,
             hold: 0,
             decode_failures: 0,
             recent: [0; PROBE_WINDOWS],
@@ -312,7 +317,9 @@ impl FecPolicy {
             self.sample_lost = 0;
             self.sample_sent = 0;
             self.smoothed_loss = 0;
-            self.smoothed_failure = 0;
+            self.resolved_sample = 0;
+            self.failed_sample = 0;
+            self.zero_failure();
             self.recent = [0; PROBE_WINDOWS];
             self.recent_at = 0;
             self.recent_len = 0;
@@ -411,7 +418,7 @@ impl FecPolicy {
             // and its doubling, not this.
             self.resolved_sample = 0;
             self.failed_sample = 0;
-            self.smoothed_failure = 0;
+            self.zero_failure();
         }
         // Once the path has been measured without redundancy in flight,
         // size redundancy from that measurement. Loss observed while coding
@@ -530,6 +537,25 @@ impl FecPolicy {
     /// looks reading against a lower bar.
     const fn judged_quiet(&self) -> bool {
         self.recent_len >= PROBE_MIN_WINDOWS && under_probe_bar(self.unaided_loss)
+    }
+
+    /// Zeroes the failure share and moves the base with it, which is the
+    /// only way it is ever zeroed: a verdict deferred under the old base
+    /// has to be dropped rather than counted, because one retired epoch's
+    /// unheard generations are a whole [`FEC_DECODE_SAMPLE`] of failures
+    /// and folded onto a zeroed share they meet the quarter bar on
+    /// equality. The rollover in `note_resolved` is not one of these: it
+    /// closes a sample into the share rather than discarding the share,
+    /// and the verdicts outstanding across it are the same engagement's.
+    fn zero_failure(&mut self) {
+        self.smoothed_failure = 0;
+        self.failure_base = self.failure_base.saturating_add(1);
+    }
+
+    /// Which zeroing of the failure share the outcomes counted now belong
+    /// to.
+    pub(crate) const fn failure_base(&self) -> u64 {
+        self.failure_base
     }
 
     /// Counts a coded generation the receiver decoded from symbols.
@@ -768,17 +794,38 @@ pub(crate) struct FecSender {
     /// [`FEC_DECODE_SAMPLE`] of nothing but failures.
     pub(crate) pending_verdicts:
         VecDeque<(std::time::Instant, u32, std::collections::BTreeSet<u32>)>,
+    /// The failure base the queued verdicts were deferred under.
+    verdicts_base: u64,
 }
 
 impl FecSender {
+    /// Drops every queued verdict when the policy has zeroed its failure
+    /// share under them. They were deferred to be judged against the
+    /// sample that has just been discarded, so they belong to it, and one
+    /// retirement's worth of them lands on the fresh share as a whole
+    /// sample of failures. Nothing counts them on the way out: the
+    /// generations they name were resent when the epoch retired, and the
+    /// share they would have voted on no longer exists. Nothing valid is
+    /// lost either way: a fresh engagement is the only zeroing a running
+    /// connection reaches, and the hold it waits out is four windows,
+    /// which is under the grace on any path fast enough to close them.
+    fn align(&mut self, base: u64) {
+        if self.verdicts_base != base {
+            self.verdicts_base = base;
+            self.pending_verdicts.clear();
+        }
+    }
+
     /// Holds one retired epoch's unheard generations until `due`, and
     /// returns how many generations an overflow eviction gave up on.
     pub(crate) fn defer(
         &mut self,
+        base: u64,
         due: std::time::Instant,
         epoch: u32,
         unheard: std::collections::BTreeSet<u32>,
     ) -> usize {
+        self.align(base);
         self.pending_verdicts.push_back((due, epoch, unheard));
         // One in, at most one out: a branch rather than a drain, so no
         // arrangement of the two can loop.
@@ -794,7 +841,8 @@ impl FecSender {
     /// Takes the receiver's late word about one generation, and says
     /// whether a deferred verdict was waiting for it. A repeat is not: the
     /// first word is the outcome and it is counted where it lands.
-    pub(crate) fn settle(&mut self, epoch: u32, generation: u32) -> bool {
+    pub(crate) fn settle(&mut self, base: u64, epoch: u32, generation: u32) -> bool {
+        self.align(base);
         self.pending_verdicts
             .iter_mut()
             .find(|(_, held, _)| *held == epoch)
@@ -802,7 +850,8 @@ impl FecSender {
     }
 
     /// Generations no word ever came for, once their wait is up.
-    pub(crate) fn overdue(&mut self, now: std::time::Instant) -> usize {
+    pub(crate) fn overdue(&mut self, base: u64, now: std::time::Instant) -> usize {
+        self.align(base);
         let mut unheard = 0;
         while self
             .pending_verdicts

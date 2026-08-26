@@ -3736,6 +3736,278 @@ mod tests {
         assert!(!server::answer_request(&[0xff]));
     }
 
+    /// Drives service passes over a path lossy enough to engage until the
+    /// policy is in the last window of a look, and answers with the
+    /// counters it left off at. Counted, so a policy that never looks
+    /// fails rather than hangs.
+    fn driven_into_a_look(
+        server: &BundleServer,
+        session: &mut Session<Loopback>,
+        connection: &mut ServeConnection,
+    ) -> (u64, u64) {
+        let mut counters = (0_u64, 0_u64);
+        let mut looked = false;
+        for _ in 0..64 {
+            counters = lossy_window(server, session, connection, counters);
+            let pausing = connection.fec_policy.probe_state().0;
+            looked |= pausing > 0;
+            if pausing == 1 {
+                return counters;
+            }
+            assert!(
+                !looked || pausing > 0,
+                "the look ended before its last window"
+            );
+        }
+        panic!("the policy never took a look");
+    }
+
+    /// One closed loss window at 20% loss, and the service pass that reads
+    /// it.
+    fn lossy_window(
+        server: &BundleServer,
+        session: &mut Session<Loopback>,
+        connection: &mut ServeConnection,
+        counters: (u64, u64),
+    ) -> (u64, u64) {
+        let sent = counters.0 + 8192;
+        let lost = counters.1 + 8192 * 200_000 / 1_000_000;
+        session.driver().path_stats = Some(path_sample(lost, 0, sent));
+        server.service(session, connection).unwrap();
+        (sent, lost)
+    }
+
+    /// Queues `count` range requests for distinct generations of `object`.
+    fn request_covers(session: &mut Session<Loopback>, object: frames::ObjectId, count: u8) {
+        for request_id in 0..count {
+            session
+                .driver()
+                .events
+                .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                    request_id: [request_id; 16],
+                    object,
+                    offset: u64::from(request_id) * 65_536,
+                    length: 65_536,
+                })));
+        }
+    }
+
+    #[test]
+    fn only_the_last_window_of_a_pause_or_a_hold_keeps_covers_back() {
+        // A path that is coding is not blocked, whatever the counters say,
+        // and a path a look judged quiet is not blocked either: nothing is
+        // going to re-engage it on its own, so a cover kept back for that
+        // end would wait forever. Earlier windows of a block are not it: a
+        // cover kept back then waits the rest of the block for nothing.
+        for (coding, pausing, hold, blocked) in [
+            (false, 0, 0, false),
+            (false, 1, 0, true),
+            (false, 0, 1, true),
+            (false, 1, 1, true),
+            (false, 2, 0, false),
+            (false, 0, 2, false),
+            (false, 7, 13, false),
+            (true, 0, 0, false),
+            (true, 1, 0, false),
+            (true, 0, 1, false),
+            (true, 1, 1, false),
+        ] {
+            assert_eq!(
+                connection::block_last_window(coding, pausing, hold),
+                blocked,
+                "coding {coding}, pausing {pausing}, hold {hold}"
+            );
+        }
+    }
+
+    #[test]
+    fn covers_are_kept_back_only_through_a_block_that_is_still_sending() {
+        assert_eq!(connection::PROBE_HELD_COVERS, 3);
+        assert_eq!(connection::PROBE_QUIET_PASSES, 64);
+        let quiet = connection::PROBE_QUIET_PASSES;
+        for (blocked, queued, passes, held) in [
+            (false, true, 0, 0),
+            (false, false, 0, 0),
+            (true, true, 0, 3),
+            // Queued bytes are enough on their own, however long the
+            // carrier has been quiet.
+            (true, true, quiet, 3),
+            (true, true, u32::MAX, 3),
+            // With nothing queued the run of quiet passes decides, and its
+            // edge is one pass wide.
+            (true, false, 0, 3),
+            (true, false, quiet - 1, 3),
+            (true, false, quiet, 0),
+            (true, false, u32::MAX, 0),
+        ] {
+            assert_eq!(
+                connection::held_covers(blocked, queued, passes),
+                held,
+                "blocked {blocked}, queued {queued}, passes {passes}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_request_is_taken_back_when_there_is_room_above_the_depth() {
+        // The other half of the queue rule. At exactly the depth a block
+        // wants kept back neither this nor `defers_request` fires, which is
+        // that block's resting state.
+        for (over_budget, deferred, held, takes) in [
+            (false, 0, 0, false),
+            (false, 1, 0, true),
+            (false, 9, 0, true),
+            (true, 9, 0, false),
+            (true, 1, 0, false),
+            (false, 2, 3, false),
+            (false, 3, 3, false),
+            (false, 4, 3, true),
+        ] {
+            assert_eq!(
+                connection::takes_held(over_budget, deferred, held),
+                takes,
+                "over_budget {over_budget}, deferred {deferred}, held {held}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_off_the_carrier_is_held_under_backpressure_or_for_a_block() {
+        // The rule that decides about a frame the carrier just handed over.
+        // A request taken back off the held queue never reaches it, which is
+        // what keeps the service loop terminating however this reads.
+        for (over_budget, deferred, held, defers) in [
+            (false, 0, 0, false),
+            (false, 3, 0, false),
+            (true, 0, 0, true),
+            (true, 9, 0, true),
+            (false, 2, 3, true),
+            (false, 3, 3, false),
+            (false, 4, 3, false),
+        ] {
+            assert_eq!(
+                connection::defers_request(over_budget, deferred, held),
+                defers,
+                "over_budget {over_budget}, deferred {deferred}, held {held}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_look_keeps_covers_back_and_codes_them_when_it_ends() {
+        // The measured shape: a look answers every range reliably and opens
+        // no epoch, so by its end the coded pipeline is empty and reopening
+        // it waits eight coded windows on a request window the look's own
+        // covers hold. The covers kept back are what it reopens on.
+        let (bundle, _) = built_bundle("look-refill", &[("five.bin", patterned(5 * 65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        let mut counters = driven_into_a_look(&server, &mut session, &mut connection);
+        assert!(!connection.fec_coding, "a look codes nothing");
+        assert!(connection.fec.epochs.is_empty(), "and drains the pipeline");
+
+        // Five covers arrive during the look's last window. Three are kept
+        // back and the rest are answered reliably, so the look still fills
+        // the path.
+        request_covers(&mut session, object, 5);
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.deferred.len(), 3);
+        assert!(
+            connection.fec.epochs.is_empty(),
+            "and nothing was coded while the look ran"
+        );
+
+        // The look reads 20% with nothing added, so it says carry on, and
+        // the covers it kept back reopen the pipeline without the fetch
+        // asking again.
+        for _ in 0..64 {
+            counters = lossy_window(&server, &mut session, &mut connection, counters);
+            if connection.fec_coding {
+                break;
+            }
+        }
+        assert!(connection.fec_coding, "the look said carry on");
+        assert!(
+            connection.deferred.is_empty(),
+            "so the held covers went out"
+        );
+        assert_eq!(connection.fec.epochs.len(), 3, "each as its own epoch");
+    }
+
+    #[test]
+    fn a_carrier_that_stopped_sending_gets_the_cover_a_look_is_holding() {
+        // The progress guarantee. A look ends on its own closed loss
+        // windows, which need packets, so a connection that has gone quiet
+        // while holding covers answers one rather than waiting for a path
+        // that is no longer moving.
+        let (bundle, _) = built_bundle("look-quiet", &[("five.bin", patterned(5 * 65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        driven_into_a_look(&server, &mut session, &mut connection);
+        request_covers(&mut session, object, 5);
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.deferred.len(), 3);
+
+        // The same counters over and over: nothing queued here and not a
+        // packet moved. A run one pass short of the bound still answers
+        // nothing, which is the edge; the pass that reaches it answers one,
+        // and a carrier that stays quiet gets the rest. The pass that kept
+        // them back was itself the first with nothing sent, so the bound is
+        // two further passes away.
+        for _ in 0..connection::PROBE_QUIET_PASSES - 2 {
+            server.service(&mut session, &mut connection).unwrap();
+        }
+        assert_eq!(connection.deferred.len(), 3, "one pass short of the bound");
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.deferred.len(), 2, "the pass that reaches it");
+        for remaining in [1, 0] {
+            server.service(&mut session, &mut connection).unwrap();
+            assert_eq!(connection.deferred.len(), remaining);
+        }
+        assert!(!connection.fec_coding, "the look is still running");
+        assert!(
+            connection.fec.epochs.is_empty(),
+            "so they went out reliably, not coded"
+        );
+    }
+
+    #[test]
+    fn a_forced_serve_keeps_no_cover_back_through_a_look() {
+        // `VOT_DATAGRAM_FEC=1` bypasses the policy, so its epochs never
+        // drain and there is nothing for the end of a look to reopen.
+        let (bundle, _) = built_bundle("look-forced", &[("five.bin", patterned(5 * 65_536))]);
+        let server = forced_fec_server(&bundle);
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session_fec(ample_credit());
+        let mut connection = ServeConnection::new();
+        driven_into_a_look(&server, &mut session, &mut connection);
+        assert!(connection.fec_coding, "forced coding ignores the look");
+        request_covers(&mut session, object, 3);
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(connection.deferred.is_empty(), "nothing was kept back");
+        assert_eq!(connection.fec.epochs.len(), 3, "all three coded");
+    }
+
+    #[test]
+    fn a_peer_without_the_extension_keeps_no_cover_back_through_a_look() {
+        // Nothing here can ever be coded, so a cover kept back would only
+        // arrive later than it had to.
+        let (bundle, _) = built_bundle("look-plain", &[("five.bin", patterned(5 * 65_536))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let object = server.objects.values().next().unwrap().object;
+        let mut session = ready_session();
+        let mut connection = ServeConnection::new();
+        driven_into_a_look(&server, &mut session, &mut connection);
+        assert!(!connection.fec_negotiated, "the peer offered no extension");
+        request_covers(&mut session, object, 5);
+        server.service(&mut session, &mut connection).unwrap();
+        assert!(connection.deferred.is_empty(), "nothing was kept back");
+    }
+
     #[test]
     fn malformed_request_is_refused_instead_of_deferred_under_backpressure() {
         let (bundle, _) = built_bundle("malformed-deferred", &[("a.bin", patterned(1))]);

@@ -122,6 +122,17 @@ impl BundleServer {
         let path = session.adapter().path_stats();
         connection.quiet_grace = quiet_grace(path.and_then(|stats| stats.smoothed_rtt_us));
         connection.fec_policy.observe(path);
+        let sent_packets = path.and_then(|stats| stats.packets_sent);
+        // Whether the carrier moved anything since the previous pass, which
+        // is what tells a connection keeping covers back that holding them
+        // is costing the path nothing.
+        let carrier_moved = sent_packets != connection.serviced_at_packets;
+        connection.serviced_at_packets = sent_packets;
+        connection.quiet_passes = if carrier_moved {
+            0
+        } else {
+            connection.quiet_passes.saturating_add(1)
+        };
         let repair_symbols = connection.fec_policy.repair_symbols();
         connection.fec_coding = !self.automatic_fec || connection.fec_policy.coding();
         loop {
@@ -135,14 +146,51 @@ impl BundleServer {
                 .extension_negotiated(vot_codec::extension_id::DATAGRAM_FEC)
                 && session.extension_negotiated(vot_codec::extension_id::FEC_COVER_EPOCHS);
             let over_budget = connection.outbound.bytes() >= connection.budget;
-            let polled = if over_budget || connection.deferred.is_empty() {
-                session.poll()
-            } else {
-                Ok(connection.deferred.pop_front().map(Event::Control))
-            };
-            match polled {
+            // A look, or a decode failure's hold, answers every range on the
+            // reliable path and opens no epoch, so by the time it ends the
+            // coded pipeline is empty and reopening it waits on the fetch's
+            // request window, which the block's own reliable covers hold:
+            // measured, open epochs 5.6 to 0.3 and eight coded windows to
+            // come back. Keeping a few covers back through the block's last
+            // window gives the end of it something to code that the fetch
+            // has already asked for. Nothing is coded while the block runs,
+            // so what it measures is unchanged (ADR-0044).
+            let held = super::connection::held_covers(
+                connection.fec_negotiated
+                    && !connection.fec_coding
+                    && connection.fec_policy.in_block_last_window(),
+                !connection.outbound.is_empty(),
+                connection.quiet_passes,
+            );
+            // A request taken back off the held queue is answered here and
+            // never re-examined against the rule that put it there, so no
+            // arrangement of that rule can hand this loop a frame it keeps
+            // deferring: every turn either takes one off the queue or reads
+            // a new event, and both supplies are finite.
+            let taken =
+                if super::connection::takes_held(over_budget, connection.deferred.len(), held) {
+                    connection.deferred.pop_front()
+                } else {
+                    None
+                };
+            if let Some(bytes) = taken {
+                // Announce before the first answer.
+                self.ensure_announced(connection, session.is_ready());
+                if let Err(fault) = self.dispatch(&bytes, connection, repair_symbols) {
+                    return fail(fault, session, connection);
+                }
+                continue;
+            }
+            match session.poll() {
                 Ok(Some(Event::Control(bytes))) => {
-                    if let (true, true) = (over_budget, answer_request(&bytes)) {
+                    if let (true, true) = (
+                        super::connection::defers_request(
+                            over_budget,
+                            connection.deferred.len(),
+                            held,
+                        ),
+                        answer_request(&bytes),
+                    ) {
                         if connection.deferred.len() == super::connection::REMEMBERED_REQUESTS {
                             return fail(
                                 Fault::Peer(error_code::RESOURCE_LIMIT),

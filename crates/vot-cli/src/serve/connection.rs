@@ -284,6 +284,95 @@ pub(crate) const fn stays_engaged(rate: u64) -> bool {
     rate * 16 >= RATE_ONE
 }
 
+/// Covers the serve keeps back rather than answering reliably through the
+/// last window of a block, so the block ends with something to code.
+///
+/// A block answers every range on the reliable path, and a cover of
+/// records does not back up the outbound queue the way a cover of symbols
+/// does, so the requests the connection holds while coding drain away:
+/// measured over four 12 GiB runs on the netem rig at 11 and 12 percent
+/// loss, the held queue reads 2.4 to 2.9 covers while coding and 0.03 to
+/// 0.38 through a look, and the coded pipeline then reopens one cover at a
+/// time as the fetch's request window turns over, taking eight coded
+/// windows. Three is the depth the connection holds while coding, so the
+/// block's last window keeps back no more than a coded window already
+/// does, and about that many ranges arrive inside one window anyway.
+pub(crate) const PROBE_HELD_COVERS: usize = 3;
+
+/// Whether coding is off for a bounded reason and this is the last window
+/// of it: a look's pause, or a decode failure's hold. Both re-engage
+/// without needing anything further from the path, so a cover kept back
+/// now is answered coded a moment later rather than reliably.
+///
+/// The last window and not the whole block. Only the covers still held
+/// when a block ends reopen the pipeline, so one kept back earlier waits
+/// out the rest of the block for nothing: on the netem rig's 12% cell that
+/// is about three seconds of a cover's bytes. A whole-block version was
+/// built first and dropped for that reason.
+///
+/// Pure, so every term is pinned by a table test rather than by whichever
+/// policy state a fixture happens to reach: a path that is coding is not
+/// blocked, and a path left alone because a look judged it quiet is not
+/// blocked either, because nothing is going to re-engage it on its own.
+pub(crate) const fn block_last_window(coding: bool, pausing: u32, hold: u32) -> bool {
+    !coding && (pausing == 1 || hold == 1)
+}
+
+/// Service passes with no packet leaving before a connection lets go of a
+/// cover it is keeping back.
+///
+/// One pass says nothing: a pass is microseconds on a busy connection and
+/// the carrier sends on the order of one packet every hundred, so a single
+/// pass with nothing sent is the ordinary case. Measured on the netem rig
+/// at 12% loss, a one-pass rule released a cover almost as fast as one
+/// arrived and the held queue never rose above about one. A run of passes
+/// with nothing sent is this end having gone quiet, and the carrier still
+/// has whatever it was handed to drain before that happens. Counted in
+/// passes rather than timed, so the bound is exact and a mutant of it is
+/// killable; at the busy wait's millisecond it is at most a fraction of a
+/// second before a quiet connection has answered everything it holds.
+pub(crate) const PROBE_QUIET_PASSES: u32 = 64;
+
+/// How many answered range requests a connection keeps back.
+///
+/// Pure for the same reason, and the last two terms are the progress
+/// guarantee. Keeping a cover back can only cost a block its own loss
+/// windows if this end goes quiet while holding it, so that is the one
+/// state that releases one: nothing left in the outbound queue and
+/// [`PROBE_QUIET_PASSES`] passes with no packet sent. Read off the
+/// carrier's packet counter rather than a clock, and the counter is always
+/// there while a block runs, because the policy cannot enter one without
+/// it.
+pub(crate) const fn held_covers(blocked: bool, queued: bool, quiet_passes: u32) -> usize {
+    if blocked && (queued || quiet_passes < PROBE_QUIET_PASSES) {
+        PROBE_HELD_COVERS
+    } else {
+        0
+    }
+}
+
+/// Whether a range request just read off the carrier is held rather than
+/// answered: because answers are backpressured, or because this end is
+/// keeping covers back for the end of a block.
+///
+/// Pure, and it decides only about a frame the carrier just handed over.
+/// One taken back off the held queue is answered without consulting this,
+/// which is what keeps the service loop terminating whatever this answers.
+/// Whether the service loop takes a request back off the held queue: it
+/// has room to answer, and holds more than the block wants kept back.
+///
+/// Pure, and its counterpart is [`defers_request`], which decides only
+/// about frames the carrier just handed over. The two are deliberately not
+/// complements: at exactly the held depth neither fires, which is the
+/// resting state of a block that has all the covers it wants.
+pub(crate) const fn takes_held(over_budget: bool, deferred: usize, held: usize) -> bool {
+    !over_budget && deferred > held
+}
+
+pub(crate) const fn defers_request(over_budget: bool, deferred: usize, held: usize) -> bool {
+    over_budget || deferred < held
+}
+
 impl FecPolicy {
     /// Adds the packets since the preceding carrier sample. Counter resets
     /// start a new baseline; missing telemetry leaves the last decision intact.
@@ -652,6 +741,12 @@ impl FecPolicy {
         )
     }
 
+    /// Whether this policy is in the last window of a bounded block: see
+    /// [`block_last_window`].
+    pub(crate) const fn in_block_last_window(&self) -> bool {
+        block_last_window(self.coding, self.pausing, self.hold)
+    }
+
     pub(crate) const fn repair_symbols(&self) -> usize {
         self.repair_symbols
     }
@@ -669,6 +764,12 @@ pub struct ServeConnection {
     pub(crate) closed: Option<u16>,
     /// Answers queued this session, only ever increasing.
     pub(crate) progress: u64,
+    /// Packets the carrier had sent at the previous service pass, and the
+    /// run of passes since one moved, which is how a connection keeping
+    /// covers back tells a path that is still sending from one that has
+    /// gone quiet. See [`held_covers`].
+    pub(crate) serviced_at_packets: Option<u64>,
+    pub(crate) quiet_passes: u32,
     /// Answers the carrier has taken, which the outbound budget may hide.
     pub(crate) handed_over: u64,
     /// Requests read while answers are backpressured. Kept in wire order so
@@ -698,6 +799,8 @@ impl Default for ServeConnection {
             announced: false,
             replay: ReplayWindow::default(),
             outbound: OutboundQueue::default(),
+            serviced_at_packets: None,
+            quiet_passes: 0,
             manifest_cursor: None,
             budget: OUTBOUND_BUDGET_BYTES,
             closed: None,

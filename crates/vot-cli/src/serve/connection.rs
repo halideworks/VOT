@@ -191,8 +191,14 @@ const RATE_ONE: u64 = 65_536;
 const RATE_SMOOTHING: u64 = 4;
 
 /// The most a first lossy window may seed the smoothed rate with: a
-/// tenth, well past the engagement rate.
-const SEED_CEILING: u64 = RATE_ONE / 10;
+/// quarter, well past the engagement rate.
+///
+/// It has to clear that rate with room, not sit on it. At `RATE_ONE / 10`
+/// the ceiling is 6,553 units and `6553 * 10` is 65,530, one unit under
+/// [`RATE_ONE`], so a seeded first window would fail the engagement test
+/// by that unit and ADR-0042's first-sample decision would never fire on
+/// a path at or above the bar.
+pub(crate) const SEED_CEILING: u64 = RATE_ONE / 4;
 
 /// Unaided windows the path's own rate is averaged over.
 ///
@@ -246,13 +252,31 @@ const PROBE_PAUSE_WINDOWS: u32 = PROBE_SETTLE_WINDOWS + PROBE_MEASURE_WINDOWS;
 /// The rate a look must read under for the path to be judged not to need
 /// coding: the engagement rate, so the question is whether this path
 /// would engage on its own merits when measured with nothing added.
-pub(crate) const PROBE_BAR: u64 = RATE_ONE / 25;
+pub(crate) const PROBE_BAR: u64 = RATE_ONE / 10;
 
 /// Whether a measured rate is under the bar. Pure, so both sides of the
 /// edge are pinned by a table test rather than by whichever cell happens
 /// to straddle it.
 pub(crate) const fn under_probe_bar(rate: u64) -> bool {
     rate < PROBE_BAR
+}
+
+/// Whether a smoothed rate earns coding on a path that is not coding:
+/// 10.00%, a shade under the measured crossover where coding starts
+/// paying for itself.
+///
+/// Pure for the same reason [`under_probe_bar`] is: the edge is one unit
+/// wide and belongs in a table test rather than in whichever rig cell
+/// happens to straddle it.
+pub(crate) const fn engages(rate: u64) -> bool {
+    rate * 10 >= RATE_ONE
+}
+
+/// Whether a smoothed rate keeps coding on a path already coding: 6.25%,
+/// the off-hysteresis, five eighths of the engagement rate as it has
+/// always been.
+pub(crate) const fn stays_engaged(rate: u64) -> bool {
+    rate * 16 >= RATE_ONE
 }
 
 impl FecPolicy {
@@ -327,8 +351,8 @@ impl FecPolicy {
         self.decided = true;
 
         // The window's own rate folds into the smoothed one, and every
-        // verdict below reads the smoothed rate: engagement at 4%, the
-        // off-hysteresis at 2.5%, and the repair count, so one bunched or
+        // verdict below reads the smoothed rate: engagement at 10%, the
+        // off-hysteresis at 6.25%, and the repair count, so one bunched or
         // starved window cannot flip what a steady path deserves.
         let window_rate = (self.sample_lost.saturating_mul(RATE_ONE)) / self.sample_sent.max(1);
         // Seeded whole by the first lossy window: until then there is
@@ -347,11 +371,12 @@ impl FecPolicy {
         let was_pausing = self.pausing > 0;
         self.observe_unaided(window_rate);
         self.run_probe(smoothed_rtt_us);
-        // Engagement sits a margin under the loss rates it serves, not at
-        // them: at exactly 5% the smoothed estimate of a 5% path converges
-        // onto the threshold and the verdict becomes a coin flip per
-        // window, measured coding anywhere from zero to 1,536 of 4,096
-        // generations across identical cells.
+        // Engagement sits a shade under the measured crossover, the loss
+        // rate where coding first pays for itself, rather than under the
+        // loss rates it serves: below the crossover coding is slower than
+        // the reliable path however well it decodes. Erring low is
+        // deliberate, because the two errors cost differently
+        // (ADR-0044's 2026-08-25 amendment).
         let engaged = if let Some(remaining) = self.hold.checked_sub(1) {
             // A decode failure is serving out its hold. The loss that
             // engaged coding is still on the path and would re-engage it
@@ -360,9 +385,9 @@ impl FecPolicy {
             self.hold = remaining;
             false
         } else if self.coding {
-            self.smoothed_loss * 40 >= RATE_ONE
+            stays_engaged(self.smoothed_loss)
         } else {
-            self.smoothed_loss * 25 >= RATE_ONE
+            engages(self.smoothed_loss)
         };
         // A pause is a measurement, and the last one has the final word
         // on whether this path wants coding at all.
@@ -500,10 +525,9 @@ impl FecPolicy {
     /// The bar is the engagement rate, not the disengagement rate below
     /// it: the question a look asks is whether this path would engage
     /// coding on its own merits, measured with nothing added. Both edges
-    /// sit there rather than straddling, because a gap wide enough to
-    /// matter would sit on top of the five percent paths this serves and
-    /// make *their* verdict the coin flip, which is the defect the
-    /// engagement thresholds were moved to avoid.
+    /// sit there rather than straddling, because a gap between them would
+    /// let a path engage once on a burst and then be ratified forever by
+    /// looks reading against a lower bar.
     const fn judged_quiet(&self) -> bool {
         self.recent_len >= PROBE_MIN_WINDOWS && under_probe_bar(self.unaided_loss)
     }

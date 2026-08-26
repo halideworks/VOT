@@ -174,7 +174,7 @@ authenticates received content. See ADR-0037.
 | `VOT_PREFIX_DUP` | 200 | Datagrams each end sends twice at the start of a connection, up to 4096, where `0` sends each once. The serial prefix is sparse, so a loss in it waits on a recovery round trip nothing else can shorten; the copies cost about 240 KB once per connection and removed the multi-second first-byte tail at 5% loss |
 | `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
-| `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only after measured corrected packet loss reaches 5%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |
+| `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only once the smoothed measured loss reaches 10%, and stops again below 6.25%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
 | `VOT_FETCH_PROVERS` | unset | Total proving thread ceiling for a fetch, divided evenly across its rails with at least one per rail |
 | `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, total milliseconds, milliseconds to first verified payload, and what the datagram FEC path offered, decoded, abandoned, and refused |

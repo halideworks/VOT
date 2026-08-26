@@ -67,7 +67,7 @@ else and takes no other divergence.
 ## Amendment, 2026-08-26: unpaced bbr2 leaves DRAIN and probes past inflight_hi
 
 The fork takes a second change to the recovery path, at
-`98a5ad93c290a219002fc623037c9643d4a99df7`. `BBRv2::new` now receives the
+`ce7e5b71f3198125ab92a1626390bbe3a2c7faa0`. `BBRv2::new` now receives the
 recovery config's `pacing` flag and stores it in `Params`. When pacing is
 true the controller is the pinned fork unchanged. When it is false, which
 is this product's shipping default, two of the controller's phases behave
@@ -105,9 +105,13 @@ trip. Those numbers come from a build that reached both halves through
 environment variables so every setting could interleave on one binary;
 the same grid on plain release binaries is pending.
 
-Two gates are not yet run. The first is a shaped cell, delay-only netem
-over an 800 Mbit token bucket with a 400 kb queue, which is what screens
-a sender that overruns a shaper; the change probes harder after loss, so
-that cell is the one most likely to refuse it. The second is a real
-policed home link. Until both are measured the pin carries the change on
-the emulated grid alone.
+Three gates are not yet run. The first is the 2026-08-06 loss grid, the
+one where unpaced bbr2 finishes three to five times faster than cubic at
+0.5 to 1 percent loss, which is the claim the shipped default rests on;
+this change alters how the window recovers after every loss episode, so
+it governs that grid directly. The second is a shaped cell, delay-only
+netem over an 800 Mbit token bucket with a 400 kb queue, which is what
+screens a sender that overruns a shaper; the change probes harder after
+loss, so that cell is the one most likely to refuse it. The third is a
+real policed home link. Until all three are measured the pin carries the
+change on the emulated grid alone.

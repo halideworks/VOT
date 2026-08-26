@@ -28,4 +28,4 @@ pedantic = "warn"
 # amendment. All three live in the maintained fork; this pin dissolves when
 # upstream releases equivalents.
 [patch.crates-io]
-quiche = { git = "https://github.com/halideworks/quiche.git", rev = "98a5ad93c290a219002fc623037c9643d4a99df7" }
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }

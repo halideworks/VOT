@@ -63,3 +63,51 @@ else and takes no other divergence.
   residual declarations only fire past a 6ms effective threshold, which
   is stall territory, and closing that gap is future pump work, not
   threshold work.
+
+## Amendment, 2026-08-26: unpaced bbr2 leaves DRAIN and probes past inflight_hi
+
+The fork takes a second change to the recovery path, at
+`98a5ad93c290a219002fc623037c9643d4a99df7`. `BBRv2::new` now receives the
+recovery config's `pacing` flag and stores it in `Params`. When pacing is
+true the controller is the pinned fork unchanged. When it is false, which
+is this product's shipping default, two of the controller's phases behave
+differently.
+
+DRAIN's exit test asks bytes in flight to fall to one bandwidth delay
+product, and its only actuator with a pacer is `drain_pacing_gain`. With
+no pacer that gain never throttles a packet and the congestion window is
+what sets bytes in flight, but DRAIN sets `cwnd_gain` to
+`drain_cwnd_gain`, which is 2.0, so the window holds them at twice the
+target the exit test reads and DRAIN does not end. Unpaced, DRAIN now
+sets `cwnd_gain` to 1.0 and allows `max_ack_height` in the exit target,
+because `update_congestion_window` adds `max_ack_height` on top of the
+gain's product once full bandwidth is reached.
+
+PROBE_UP has the same missing actuator, and `inflight_hi` caps the window
+at whatever the last loss episode set, so the probe walks up to the
+previous ceiling and stops rather than probing. Unpaced, the constructor
+sets `probe_up_ignore_inflight_hi`, an option the fork already carries and
+ships false, which bounds PROBE_UP by `inflight_lo` alone. PROBE_REFILL
+has just cleared that bound. A round allowed to overshoot raises its own
+delivery sample, and that sample is what `adapt_lower_bounds` floors its
+next cut against, so the recovery after a loss episode compounds instead
+of stepping.
+
+Measured on an emulated 107 ms 2 Gbit/s path, eight rails, 213 graded
+runs, both ends in one network namespace pair. A 12 GiB transfer at 12
+percent loss each way falls from a median 154.95 s to 120.07 s on the
+reliable path, with every changed run faster than every stock run, and
+from 105.09 s to 85.76 s with automatic forward error correction. One
+rail at 12 percent falls from 414 s to 301 s. A 4 GiB transfer at 0, 1,
+3, 5 and 12 percent loss stays inside the stock spread at every rate, and
+the clean standing queue falls from 8.51 to 7.93 times the minimum round
+trip. Those numbers come from a build that reached both halves through
+environment variables so every setting could interleave on one binary;
+the same grid on plain release binaries is pending.
+
+Two gates are not yet run. The first is a shaped cell, delay-only netem
+over an 800 Mbit token bucket with a 400 kb queue, which is what screens
+a sender that overruns a shaper; the change probes harder after loss, so
+that cell is the one most likely to refuse it. The second is a real
+policed home link. Until both are measured the pin carries the change on
+the emulated grid alone.

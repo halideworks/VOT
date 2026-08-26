@@ -1742,7 +1742,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.6"
-source = "git+https://github.com/halideworks/quiche.git?rev=2bb421877826605514a4c21e7315b3439619c35f#2bb421877826605514a4c21e7315b3439619c35f"
+source = "git+https://github.com/halideworks/quiche.git?rev=98a5ad93c290a219002fc623037c9643d4a99df7#98a5ad93c290a219002fc623037c9643d4a99df7"
 
 [[package]]
 name = "oid-registry"
@@ -1894,7 +1894,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.29.3"
-source = "git+https://github.com/halideworks/quiche.git?rev=2bb421877826605514a4c21e7315b3439619c35f#2bb421877826605514a4c21e7315b3439619c35f"
+source = "git+https://github.com/halideworks/quiche.git?rev=98a5ad93c290a219002fc623037c9643d4a99df7#98a5ad93c290a219002fc623037c9643d4a99df7"
 dependencies = [
  "boring",
  "bytes",

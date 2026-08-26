@@ -2636,7 +2636,11 @@ const fn keepalive_interval(role: Role, idle_timeout_ms: u64) -> Option<Duration
     if !matches!(role, Role::Client) || idle_timeout_ms == 0 {
         return None;
     }
-    Some(Duration::from_millis(idle_timeout_ms / KEEPALIVE_DIVISOR))
+    // Rounded up, because a timeout under the divisor would otherwise floor
+    // to a zero interval and ping every pass rather than never.
+    Some(Duration::from_millis(
+        idle_timeout_ms.div_ceil(KEEPALIVE_DIVISOR),
+    ))
 }
 
 /// How long the pump waits before eliciting the next ack: the ramp's
@@ -3546,6 +3550,20 @@ mod tests {
         assert_eq!(
             keepalive_interval(Role::Client, 3_000),
             Some(Duration::from_secs(1))
+        );
+        // A timeout too short to divide still names an interval, since a
+        // zero one is a ping every pass.
+        assert_eq!(
+            keepalive_interval(Role::Client, 1),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            keepalive_interval(Role::Client, 2),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            keepalive_interval(Role::Client, 3),
+            Some(Duration::from_millis(1))
         );
         // Room in any timeout for two lost pings.
         const {

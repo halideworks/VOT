@@ -785,6 +785,14 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 /// no traffic this end generates can hold off: QUIC restarts the idle timer
 /// on a send only for the first ack-eliciting packet since a packet last
 /// arrived. A serving carrier never pings for the same reason.
+///
+/// What a slot costs is the residual: a session is held for as long as its
+/// peer keeps any packet flowing, and every conforming client moves one
+/// every ten seconds, so eight connected but idle peers hold a serve's
+/// whole [`CONCURRENT_SESSIONS`]. Bounding that is a slot policy, not this
+/// budget's job. Crediting only bytes the peer acknowledged would reap
+/// them, and would reap with them the finished rail this exists to keep
+/// alive, which acknowledges everything and asks for nothing.
 fn carrier_progress(stats: Option<vot_transport_api::PathStats>) -> u64 {
     let Some(stats) = stats else {
         return 0;

@@ -2289,11 +2289,11 @@ mod tests {
     fn a_verdict_deferred_before_a_re_engagement_never_votes_after_it() {
         // A fresh engagement zeroes the decode sample, because it is judged
         // on its own outcomes. The deferred verdicts have to go with it: they
-        // belong to the engagement that ended, nothing was coded in between,
-        // and one retired epoch's unheard generations folded onto a zeroed
-        // base are a whole sample of failures that meets the quarter bar on
-        // equality. The first hold is four windows, which is shorter than the
-        // grace on any path fast enough to close them.
+        // belong to the engagement that ended, because a pass sets
+        // `fec_coding` from `coding()` once and opening an epoch is gated on
+        // it, so nothing was coded in between, and one retired epoch's
+        // unheard generations folded onto a zeroed base are a whole sample of
+        // failures that meets the quarter bar on equality.
         let (bundle, _) = built_bundle("stale", &[("small.bin", patterned(1024))]);
         let server = forced_fec_server(&bundle);
         let mut session = ready_session_fec(ample_credit());

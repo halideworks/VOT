@@ -204,7 +204,12 @@ Nothing else changes. The hold, the pause cadence, the smoothing, the
 window sizes and the repair sizing are all untouched. One consequence
 of the new bar is worth naming: the repair count saturates at the
 spec's 16 from 6.25%, which is now below the rate that keeps coding on,
-so every engaged path sizes repair at the ceiling.
+so every engaged path sizes repair at the ceiling. That makes the
+sizing branch that prefers the unaided rate over the smoothed one
+dormant at these bars, since both inputs saturate on any path that is
+coding; it is kept because it becomes live again under a lower bar or a
+larger `MAX_REPAIR_SYMBOLS`, and the quantity it selects is pinned by a
+test rather than by a repair count that can no longer tell them apart.
 
 ### The counter-evidence
 
@@ -234,8 +239,14 @@ The campaign that would settle it is a real pair with armed loss swept
 through 5, 7, 9, 11 and 13 percent at 12 GiB with the policy's trace
 beside every run, plus this ADR's tbf congestion cell re-run on merged
 main to confirm a 10% bar does not break the case the pause was built
-for. It should only help there: the false engagement the pause fixes
-happens at a smoothed 4 to 5%, which a 10% bar refuses outright.
+for. It should help there, with one qualification: the false engagement
+the pause fixes crosses the old bar at a smoothed 4 to 5%, which a 10%
+bar refuses outright, but that is the smoothed crossing only. On the
+real policer path all eight connections engaged on their first window,
+seeded at exactly the old ceiling within 0.9 s, and under a 25% ceiling
+that first window seeds higher and engages just the same. On that path
+shape the new bar changes only how quickly the off-hysteresis and the
+pause let the engagement go, not whether it happens.
 
 ### Verification of the amendment
 

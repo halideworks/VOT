@@ -1245,12 +1245,17 @@ mod tests {
             policy.coding(),
             "twelve and a half percent of path loss keeps coding on"
         );
-        assert_eq!(
-            policy.repair_symbols(),
-            16,
-            "every rate that keeps coding on is past where repair saturates, unaided rate {} of 65536",
-            policy.unaided_loss()
+        // The repair count cannot say which rate was read: every rate that
+        // keeps coding on is past where repair saturates at the spec's 16.
+        // So assert the quantity the sizing branch selects instead, which
+        // is the path's own rate and not the twenty percent measured under
+        // coding.
+        let unaided = policy.unaided_loss();
+        assert!(
+            (7000..=9400).contains(&unaided),
+            "the look read the path's own twelve and a half percent, got {unaided} of 65536"
         );
+        assert_eq!(policy.repair_symbols(), 16, "and repair takes the ceiling");
     }
 
     #[test]
@@ -1270,7 +1275,7 @@ mod tests {
         assert_eq!(
             policy.repair_symbols(),
             16,
-            "old clean windows do not dilute fresh repair, which would floor it at two"
+            "old clean windows do not dilute fresh repair, which would read three"
         );
     }
 

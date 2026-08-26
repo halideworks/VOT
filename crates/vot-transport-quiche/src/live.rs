@@ -2700,6 +2700,70 @@ fn flush_held(socket: &UdpSocket, out: &[u8], sending: &mut Sending) -> Result<(
     flush_burst(socket, &out[..held], held, destination, sending)
 }
 
+/// What a packet just built does to the burst that is gathering it.
+///
+/// Segmentation offload cuts a burst into equal pieces of which only the
+/// last may be shorter, so a packet's length against the burst's segment is
+/// the whole decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gather {
+    /// Nothing is gathered yet, so this packet sets the burst's segment.
+    Opens,
+    /// The segment's own length, so it joins the burst.
+    Joins,
+    /// Shorter than the segment, so it is the burst's last piece.
+    Closes,
+    /// Longer than the segment, which no segmentation expresses, so the
+    /// burst goes without it and it opens the next one.
+    Restarts,
+}
+
+/// Decides that, from the burst so far and the length that came back.
+///
+/// Pure and clock-free, so a table over size sequences pins every edge of
+/// it. Before this the burst offered later packets exactly the opening
+/// packet's length, so one short head, a lone ACK or a stream tail, capped
+/// every full packet behind it: 412 thousand sub-200-byte packets in a
+/// healthy 4 GiB transfer.
+const fn gather(filled: usize, segment: usize, written: usize) -> Gather {
+    if filled == 0 {
+        Gather::Opens
+    } else if written > segment {
+        Gather::Restarts
+    } else if written < segment {
+        Gather::Closes
+    } else {
+        Gather::Joins
+    }
+}
+
+/// What the gathering buffer can offer the next packet of a burst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Room {
+    /// Bytes the connection may build into, from where the burst has filled
+    /// to. Never more than the ceiling and never past the buffer.
+    Slot(usize),
+    /// Not enough is left for another packet of this burst's own size, so
+    /// the burst goes and the next one opens at the front of the buffer.
+    Full,
+}
+
+/// Decides that. A burst that has filled is only ever a burst that has
+/// something in it, so `segment` is set whenever `filled` is not zero.
+///
+/// Offering the room that is left rather than the burst's segment is what
+/// lets a packet be the size the path carries: quiche builds into the room
+/// it is given, so a slot cut to a short opening packet's length made every
+/// packet behind it that length too.
+fn room_for(ceiling: usize, buffer: usize, filled: usize, segment: usize) -> Room {
+    let left = buffer - filled;
+    if filled != 0 && left < segment {
+        Room::Full
+    } else {
+        Room::Slot(left.min(ceiling))
+    }
+}
+
 fn send_all(
     socket: &UdpSocket,
     conn: &mut Connection,
@@ -2714,8 +2778,8 @@ fn send_all(
     let mut segment = 0_usize;
     let mut destination = None;
     // A packet parked for its release time already sits at the front of
-    // `out`, so this pass opens with it filled: it leaves first, and the
-    // equal slots the kernel's segmentation needs are measured from it.
+    // `out`, so this pass opens with it filled: it leaves first, and it is
+    // the burst's segment until a packet of another length ends the burst.
     if let Some(to) = sending.held_to.take() {
         filled = std::mem::take(&mut sending.held);
         segment = filled;
@@ -2723,28 +2787,31 @@ fn send_all(
     }
     let mut packets: u32 = 0;
     loop {
-        // The opening slot is the ceiling so a discovery probe fits; later
-        // packets are capped under it, so the burst is a run of equal slots and
-        // `filled` stays on a segment boundary.
-        let slot = if filled == 0 { ceiling } else { segment };
-        let Some(room) = out.get_mut(filled..filled + slot) else {
-            // The buffer holds no further packet, so this burst goes now.
-            flush_burst(socket, &out[..filled], segment, destination, sending)?;
-            filled = 0;
-            destination = None;
-            continue;
-        };
-        // A pass's own bound on the stream, counted in this loop's body. A
-        // healthy connection ends the pass itself at Done or its pacer, but
-        // a wedged one was caught feeding this loop for half an hour inside
-        // one call, and the driver's own close budget can only fire between
-        // passes. What was not sent by here waits for the next pass, which
-        // first reads commands and the close request.
+        // A pass's own bound on the stream, counted at the top of this loop's
+        // body so every turn of it is counted, the ones that only flush a
+        // filled buffer included: the bound is then the body's own rather
+        // than a property of what `room_for` returns. A healthy connection
+        // ends the pass itself at Done or its pacer, but a wedged one was
+        // caught feeding this loop for half an hour inside one call, and the
+        // driver's own close budget can only fire between passes. What was
+        // not sent by here waits for the next pass, which first reads
+        // commands and the close request.
         packets = packets.saturating_add(1);
         if send_exhausted(packets) {
             flush_burst(socket, &out[..filled], segment, destination, sending)?;
             return Ok(None);
         }
+        // Every packet is offered the room that is left, to the ceiling, so
+        // what quiche builds is the datagram the path itself carries rather
+        // than the length of whatever opened the burst. The opening packet
+        // gets the ceiling, which is where a discovery probe fits.
+        let Room::Slot(slot) = room_for(ceiling, out.len(), filled, segment) else {
+            flush_burst(socket, &out[..filled], segment, destination, sending)?;
+            filled = 0;
+            destination = None;
+            continue;
+        };
+        let room = &mut out[filled..filled + slot];
         match conn.send(room) {
             Ok((written, info)) => {
                 // A different destination cannot share a burst.
@@ -2772,27 +2839,40 @@ fn send_all(
                     sending.held_to = Some(info.to);
                     return Ok(Some(info.at));
                 }
-                if filled == 0 {
-                    segment = written;
-                }
-                filled += written;
-                // A packet shorter than a segment closes the burst, because
-                // the kernel cuts every segment to the same length but the
-                // last; the connection may still have more to say.
-                if written < segment {
-                    flush_burst(socket, &out[..filled], segment, destination, sending)?;
-                    filled = 0;
-                    destination = None;
+                match gather(filled, segment, written) {
+                    Gather::Opens => {
+                        segment = written;
+                        filled = written;
+                    }
+                    Gather::Joins => filled += written,
+                    // The burst's last piece may be shorter than its segment,
+                    // and the connection may still have more to say.
+                    Gather::Closes => {
+                        filled += written;
+                        flush_burst(socket, &out[..filled], segment, destination, sending)?;
+                        filled = 0;
+                        destination = None;
+                    }
+                    // No segmentation expresses a piece longer than the ones
+                    // before it, so the burst goes without this packet and
+                    // this packet opens the next one. That is what stops a
+                    // short opening packet, a lone ACK or a stream tail, from
+                    // capping every full packet behind it: the copy is one
+                    // packet per restart rather than a shrunk run.
+                    Gather::Restarts => {
+                        flush_burst(socket, &out[..filled], segment, destination, sending)?;
+                        out.copy_within(filled..filled + written, 0);
+                        segment = written;
+                        filled = written;
+                    }
                 }
             }
             Err(quiche::Error::Done) => {
                 flush_burst(socket, &out[..filled], segment, destination, sending)?;
-                // Done in a segment-sized slot only says the next packet did
-                // not fit this burst's segment: a burst opened by a lone ACK
-                // pins the segment near thirty bytes, and ending the pass
-                // there would hand the wait floor back one packet at a time.
-                // Reopen at the ceiling; Done with the ceiling on offer is
-                // the connection actually finished.
+                // Done in a slot under the ceiling only says what was left of
+                // the buffer did not hold the next packet, which a probe can
+                // outgrow on its own; reopen at the ceiling. Done with the
+                // ceiling on offer is the connection actually finished.
                 if slot == ceiling {
                     return Ok(None);
                 }
@@ -5741,14 +5821,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_opened_by_a_held_packet_keeps_its_slots_equal() {
-        // The kernel cuts a burst into equal segments, so the held packet's
-        // length is the slot every later packet of that burst is drawn into.
+    fn a_short_opening_packet_caps_only_itself() {
+        // The kernel cuts a burst into equal segments, so an opening packet
+        // shorter than the ones behind it can only be a burst of its own. A
+        // held packet is the shortest head the pump builds; before this the
+        // burst drew every packet behind it into the held packet's length.
         let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
         let peer = bounded_receiver();
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
         let remote = peer.local_addr().expect("its address");
-        let (mut client, _server) = sans_io_pair_at(1024 * 1024, local, remote, None);
+        let (mut client, mut server) = sans_io_pair_at(1024 * 1024, local, remote, None);
         client
             .stream_send(0, &vec![5_u8; 64 * 1024], false)
             .expect("a stream the pass has to drain");
@@ -5760,9 +5842,253 @@ mod tests {
         let sent = collected(&peer);
         assert_eq!(sent.first(), Some(&parked), "the held packet opened it");
         assert!(
-            sent[1].len() <= HELD_BYTES,
-            "the packet after it was drawn into the held packet's slot, not the ceiling"
+            sent[1].len() > HELD_BYTES,
+            "the packet after it kept its own size rather than the held packet's slot"
         );
+        // The bytes and not only the lengths: a burst that restarts carries
+        // the packet it restarted on, not whatever the buffer held there.
+        for packet in sent.iter().skip(1) {
+            let mut bytes = packet.clone();
+            let info = quiche::RecvInfo {
+                from: local,
+                to: remote,
+            };
+            server
+                .recv(&mut bytes, info)
+                .expect("a packet the peer can read");
+        }
+        let mut read = vec![0_u8; 64 * 1024];
+        let (bytes, _) = server
+            .stream_recv(0, &mut read)
+            .expect("the stream the pass carried");
+        assert!(
+            bytes > HELD_BYTES,
+            "the peer read the packets the pass restarted on: {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn a_short_tail_closes_its_burst_and_the_burst_carries_all_of_it() {
+        // The last piece of a burst may be shorter than the segment, and it
+        // is still the connection's own bytes: a burst that goes without it,
+        // or with less of it, loses what the peer was owed.
+        const SENT: usize = 4_096;
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a sender");
+        let peer = bounded_receiver();
+        let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let remote = peer.local_addr().expect("its address");
+        let (mut client, mut server) = sans_io_pair_at(1024 * 1024, local, remote, None);
+        client
+            .stream_send(0, &vec![7_u8; SENT], true)
+            .expect("a stream that ends inside one pass");
+        let mut out = vec![0_u8; LARGEST_DATAGRAM_SIZE];
+        let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
+
+        send_all(&sender, &mut client, &mut out, &mut sending, horizon()).expect("the pass");
+        for packet in collected(&peer) {
+            let mut bytes = packet;
+            let info = quiche::RecvInfo {
+                from: local,
+                to: remote,
+            };
+            server
+                .recv(&mut bytes, info)
+                .expect("a packet the peer can read");
+        }
+        let mut read = vec![0_u8; SENT];
+        let (bytes, fin) = server.stream_recv(0, &mut read).expect("the stream");
+        assert_eq!(bytes, SENT, "every byte crossed, the short tail included");
+        assert!(fin, "and the pass carried the stream's end");
+    }
+
+    #[test]
+    fn the_room_a_burst_offers_is_a_table_over_what_is_left() {
+        // Both shapes the pump configures: a ceiling under the buffer, and a
+        // ceiling that is the whole buffer, which is what `vot` itself asks
+        // for. A burst packs until what is left cannot hold another packet
+        // its own size, and the opening packet always gets the ceiling.
+        const CEILING: usize = 1_472;
+        const BUFFER: usize = LARGEST_DATAGRAM_SIZE;
+        const SEGMENT: usize = 1_350;
+        for (shape, ceiling, buffer, filled, segment, expected) in [
+            (
+                "an opening packet gets the ceiling",
+                CEILING,
+                BUFFER,
+                0,
+                0,
+                Room::Slot(CEILING),
+            ),
+            (
+                "and gets it whatever the last burst's segment was",
+                CEILING,
+                BUFFER,
+                0,
+                SEGMENT,
+                Room::Slot(CEILING),
+            ),
+            (
+                "a packet mid-burst gets the ceiling while the buffer holds it",
+                CEILING,
+                BUFFER,
+                SEGMENT,
+                SEGMENT,
+                Room::Slot(CEILING),
+            ),
+            (
+                "room for one more segment but under the ceiling is that room",
+                CEILING,
+                BUFFER,
+                BUFFER - SEGMENT - 1,
+                SEGMENT,
+                Room::Slot(SEGMENT + 1),
+            ),
+            (
+                "room for exactly one more segment is still offered",
+                CEILING,
+                BUFFER,
+                BUFFER - SEGMENT,
+                SEGMENT,
+                Room::Slot(SEGMENT),
+            ),
+            (
+                "a segment short of room ends the burst",
+                CEILING,
+                BUFFER,
+                BUFFER - SEGMENT + 1,
+                SEGMENT,
+                Room::Full,
+            ),
+            (
+                "a full buffer ends the burst",
+                CEILING,
+                BUFFER,
+                BUFFER,
+                SEGMENT,
+                Room::Full,
+            ),
+            (
+                "a ceiling the size of the buffer opens on the whole buffer",
+                BUFFER,
+                BUFFER,
+                0,
+                0,
+                Room::Slot(BUFFER),
+            ),
+            (
+                "and packs the rest of it rather than one packet a burst",
+                BUFFER,
+                BUFFER,
+                SEGMENT,
+                SEGMENT,
+                Room::Slot(BUFFER - SEGMENT),
+            ),
+        ] {
+            assert_eq!(
+                room_for(ceiling, buffer, filled, segment),
+                expected,
+                "{shape}"
+            );
+        }
+        // The send loop counts every turn of its own body, the ones that
+        // only flush a filled buffer included, so its bound does not rest on
+        // this. It holds anyway: a burst with nothing in it is never full,
+        // whatever ceiling the pump was given.
+        for ceiling in [1, SEGMENT, CEILING, BUFFER] {
+            assert_eq!(
+                room_for(ceiling, BUFFER, 0, SEGMENT),
+                Room::Slot(ceiling),
+                "an empty burst is never full, ceiling {ceiling}"
+            );
+        }
+    }
+
+    /// The bursts the send pass builds from a sequence of packet lengths:
+    /// each one its segment and the pieces it carried. Pure and clock-free,
+    /// and `gather` is the whole rule it runs.
+    fn bursts(lengths: &[usize]) -> Vec<(usize, Vec<usize>)> {
+        let mut sent = Vec::new();
+        let mut segment = 0_usize;
+        let mut burst: Vec<usize> = Vec::new();
+        for &written in lengths {
+            let filled: usize = burst.iter().sum();
+            match gather(filled, segment, written) {
+                Gather::Opens => {
+                    segment = written;
+                    burst.push(written);
+                }
+                Gather::Joins => burst.push(written),
+                Gather::Closes => {
+                    burst.push(written);
+                    sent.push((segment, std::mem::take(&mut burst)));
+                }
+                Gather::Restarts => {
+                    sent.push((segment, std::mem::take(&mut burst)));
+                    segment = written;
+                    burst.push(written);
+                }
+            }
+        }
+        if !burst.is_empty() {
+            sent.push((segment, burst));
+        }
+        sent
+    }
+
+    #[test]
+    fn the_burst_assembly_is_a_table_over_packet_lengths() {
+        // Every shape a pass can hand the assembly, and the offload's own
+        // rule checked over each one: the pieces of a burst are equal but
+        // for the last, which may be shorter.
+        const FULL: usize = 1_350;
+        const SHORT: usize = 40;
+        for (shape, lengths, expected) in [
+            (
+                "a run of full packets is one burst",
+                vec![FULL, FULL, FULL, FULL],
+                vec![(FULL, vec![FULL, FULL, FULL, FULL])],
+            ),
+            (
+                "a short head goes alone and the full packets behind it keep their size",
+                vec![SHORT, FULL, FULL],
+                vec![(SHORT, vec![SHORT]), (FULL, vec![FULL, FULL])],
+            ),
+            (
+                "a short tail is the burst's last piece",
+                vec![FULL, FULL, SHORT],
+                vec![(FULL, vec![FULL, FULL, SHORT])],
+            ),
+            (
+                "a run of equal short packets is still one burst",
+                vec![SHORT, SHORT, SHORT],
+                vec![(SHORT, vec![SHORT, SHORT, SHORT])],
+            ),
+            (
+                "alternating lengths close a burst and open the next",
+                vec![FULL, SHORT, FULL, SHORT],
+                vec![(FULL, vec![FULL, SHORT]), (FULL, vec![FULL, SHORT])],
+            ),
+            (
+                "each longer packet restarts rather than joining short",
+                vec![SHORT, SHORT + 1, FULL],
+                vec![
+                    (SHORT, vec![SHORT]),
+                    (SHORT + 1, vec![SHORT + 1]),
+                    (FULL, vec![FULL]),
+                ],
+            ),
+        ] {
+            let built = bursts(&lengths);
+            assert_eq!(built, expected, "{shape}");
+            for (segment, pieces) in &built {
+                let (last, rest) = pieces.split_last().expect("a burst carries a packet");
+                assert!(
+                    rest.iter().all(|piece| piece == segment),
+                    "{shape}: every piece but the last is the segment"
+                );
+                assert!(last <= segment, "{shape}: the last piece is never longer");
+            }
+        }
     }
 
     #[test]

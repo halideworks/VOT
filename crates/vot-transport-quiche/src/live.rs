@@ -2626,6 +2626,12 @@ const KEEPALIVE_DIVISOR: u64 = 3;
 /// force is the smaller of the two ends' (RFC 9000 section 10.1), so a peer
 /// that installs less than three times this interval is not held open by
 /// it. Both ends of this protocol install the same value.
+///
+/// What a serve's sessions are bounded by is their count, never their age:
+/// a client that keeps any packet flowing holds its slot, and this cadence
+/// is indistinguishable on the wire from a peer that sends one byte a
+/// second. Reaping a connected peer that asks for nothing would be a slot
+/// policy, which this is not.
 const fn keepalive_interval(role: Role, idle_timeout_ms: u64) -> Option<Duration> {
     if !matches!(role, Role::Client) || idle_timeout_ms == 0 {
         return None;
@@ -3550,8 +3556,8 @@ mod tests {
     #[test]
     fn a_ping_is_due_once_established_and_once_an_interval_is_up() {
         let keepalive = keepalive_interval(Role::Client, IDLE_TIMEOUT_MS);
-        // Nothing is due before establishment, however long the wait: an
-        // unestablished connection answers send_ack_eliciting with nothing.
+        // Nothing is due before establishment, however long the wait: the
+        // ramp's budget is for the flights after it.
         assert!(!ping_due(false, Duration::MAX, 0, keepalive));
         assert!(!ping_due(false, Duration::MAX, RAMP_PING_BUDGET, keepalive));
         // The ramp's interval from both sides.

@@ -235,7 +235,9 @@ keepalive: ADR-0035 retired the setting that configured one, and it returns
 only with something a peer can ask for. A transport may hold open a connection
 its owner still needs on its own account, as the quiche adapter does with an
 ack-eliciting cadence at a third of the idle timeout it installed, and neither
-end negotiates that. Server connection IDs are opaque to application logic. The
+end negotiates that. It is the connecting end's cadence alone: a serving end
+that generated traffic of its own would never see a peer go quiet, which is
+how it reaps a session. Server connection IDs are opaque to application logic. The
 default relay profile uses a nonzero 16-byte server CID and transport adapters
 support a deployment-supplied CID generator or router.
 

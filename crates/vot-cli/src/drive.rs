@@ -22,7 +22,8 @@ const BUSY_BOUND: Duration = Duration::from_millis(BUSY_BOUND_MS);
 /// Max cumulative wait without progress before declaring a stall.
 /// Any progress resets it. Measured in wait time, not pass count, so both
 /// bounds cost what they actually wait. Quiche's idle timeout settles most
-/// sessions first; this is the backstop.
+/// sessions first; this is the backstop, and on the serving end
+/// [`carrier_progress`] is what keeps it behind rather than ahead of it.
 const STALLED_WAIT_MS: u64 = 30_000;
 const STALLED_WAIT: Duration = Duration::from_millis(STALLED_WAIT_MS);
 
@@ -756,7 +757,9 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
     }
 
     fn progress(&self) -> u64 {
-        self.connection.progress()
+        self.connection
+            .progress()
+            .saturating_add(carrier_progress(self.session.adapter().path_stats()))
     }
 
     fn wait(&mut self, bound: Duration) -> Duration {
@@ -764,6 +767,40 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
         self.session.driver().wait_for_event(bound);
         began.elapsed()
     }
+}
+
+/// What the carrier moved either way over this connection's life, from the
+/// backend's own counters, or nothing from a backend that keeps none.
+///
+/// The serving end's answers are progress only until the last one is handed
+/// over. After that a session with the whole tail of a transfer still in the
+/// carrier queues nothing more and hands nothing more over, so its own
+/// counter freezes while the peer is receiving megabytes: at 5% loss a
+/// draining rail was called stalled and dropped with the fetch 99.9% placed.
+/// A packet either way is the session's proof it is not stalled.
+///
+/// The sent half includes this end's own retransmissions and probes, which
+/// a peer that has gone does not stop, so the count alone does not reap an
+/// abandoned session. What ends that is the carrier's idle timeout, which
+/// no traffic this end generates can hold off: QUIC restarts the idle timer
+/// on a send only for the first ack-eliciting packet since a packet last
+/// arrived. A serving carrier never pings for the same reason.
+///
+/// What a slot costs is the residual: a session is held for as long as its
+/// peer keeps any packet flowing, and every conforming client moves one
+/// every ten seconds, so eight connected but idle peers hold a serve's
+/// whole [`CONCURRENT_SESSIONS`]. Bounding that is a slot policy, not this
+/// budget's job. Crediting only bytes the peer acknowledged would reap
+/// them, and would reap with them the finished rail this exists to keep
+/// alive, which acknowledges everything and asks for nothing.
+fn carrier_progress(stats: Option<vot_transport_api::PathStats>) -> u64 {
+    let Some(stats) = stats else {
+        return 0;
+    };
+    stats
+        .packets_sent
+        .unwrap_or(0)
+        .saturating_add(stats.packets_received.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -1300,6 +1337,98 @@ mod tests {
         );
 
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn the_carrier_reports_what_it_moved_either_way() {
+        use vot_transport_api::PathStats;
+        assert_eq!(carrier_progress(None), 0, "a backend that counts nothing");
+        assert_eq!(carrier_progress(Some(PathStats::default())), 0);
+        assert_eq!(
+            carrier_progress(Some(PathStats {
+                packets_sent: Some(3),
+                ..PathStats::default()
+            })),
+            3
+        );
+        assert_eq!(
+            carrier_progress(Some(PathStats {
+                packets_received: Some(4),
+                ..PathStats::default()
+            })),
+            4
+        );
+        assert_eq!(
+            carrier_progress(Some(PathStats {
+                packets_sent: Some(3),
+                packets_received: Some(4),
+                ..PathStats::default()
+            })),
+            7,
+            "both directions count"
+        );
+        assert_eq!(
+            carrier_progress(Some(PathStats {
+                packets_sent: Some(u64::MAX),
+                packets_received: Some(1),
+                ..PathStats::default()
+            })),
+            u64::MAX,
+            "the sum saturates rather than wrapping to a fall"
+        );
+    }
+
+    /// Passes the delivering session is driven for. Well past what the
+    /// budget buys a session with nothing moving, which is the free spins
+    /// before the loop paces itself plus the paced passes [`TEST_STALL`]
+    /// then affords, so the control below stalls before it runs out.
+    const DRAINING_PASSES: u64 = 4 * (SPINNING_BEFORE_PACING + IDLE_PASSES);
+
+    /// A session whose answers are all handed over queues nothing and hands
+    /// nothing over, however much of them the carrier is still delivering.
+    /// The carrier's own counters are what says the difference between that
+    /// and a session that has stopped.
+    #[test]
+    fn a_delivering_carrier_is_progress_the_serve_makes_no_answers_for() {
+        use crate::harness::{Loopback, built_bundle, not_required, patterned};
+
+        let (bundle, _) = built_bundle("draining", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+
+        let mut draining =
+            ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
+        draining.session.driver().deliver_on_wait = 1;
+        let mut passes = 0;
+        let outcome = drive_until_within(
+            &mut draining,
+            |_| {
+                passes += 1;
+                passes >= DRAINING_PASSES
+            },
+            TEST_STALL,
+        );
+        assert!(
+            matches!(outcome, Ok(None)),
+            "a carrier still delivering is not a stalled session: {outcome:?}"
+        );
+
+        let mut stopped =
+            ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
+        let mut passes = 0;
+        let outcome = drive_until_within(
+            &mut stopped,
+            |_| {
+                passes += 1;
+                passes >= DRAINING_PASSES
+            },
+            TEST_STALL,
+        );
+        assert!(
+            matches!(outcome, Err(Error::Stalled)),
+            "a carrier moving nothing still spends the budget: {outcome:?}"
+        );
+
+        crate::harness::discard(&[&bundle]);
     }
 
     #[test]

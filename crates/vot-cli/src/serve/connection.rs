@@ -977,6 +977,11 @@ impl ServeConnection {
     /// Queued plus handed-over answers, only ever increasing. Both are needed:
     /// the outbound budget can stall queuing while the carrier still drains,
     /// or vice versa.
+    ///
+    /// This is what the session prepared, not what the wire carried: once
+    /// the last answer is handed over both halves freeze however much of it
+    /// the carrier still has to deliver. The stall budget adds the carrier's
+    /// own counters to this for that reason.
     #[must_use]
     pub fn progress(&self) -> u64 {
         self.progress.saturating_add(self.handed_over)

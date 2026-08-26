@@ -27,6 +27,9 @@ pub(crate) struct Loopback {
     pub(crate) fail_sends_with: Option<vot_transport_api::Error>,
     pub(crate) closed: Option<u16>,
     pub(crate) path_stats: Option<PathStats>,
+    /// Packets [`Self::path_stats`] gains at every wait, which is what a
+    /// carrier draining a tail of its own looks like to a driving loop.
+    pub(crate) deliver_on_wait: u64,
     /// What the carrier reports when a driving loop waits on it.
     pub(crate) on_wait: VecDeque<Event>,
     /// A rendezvous for concurrency tests. A wait blocks until the expected
@@ -126,6 +129,15 @@ impl TransportAdapter for Loopback {
     fn wait_for_event(&mut self, _bound: std::time::Duration) {
         if let Some(gate) = self.rendezvous.take() {
             gate.meet();
+        }
+        if self.deliver_on_wait > 0 {
+            let stats = self.path_stats.get_or_insert_default();
+            stats.packets_sent = Some(
+                stats
+                    .packets_sent
+                    .unwrap_or(0)
+                    .saturating_add(self.deliver_on_wait),
+            );
         }
         if let Some(event) = self.on_wait.pop_front() {
             self.events.push_back(event);

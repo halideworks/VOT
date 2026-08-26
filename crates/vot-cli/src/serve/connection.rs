@@ -806,9 +806,10 @@ impl FecSender {
     /// sample of failures. Nothing counts them on the way out: the
     /// generations they name were resent when the epoch retired, and the
     /// share they would have voted on no longer exists. Nothing valid is
-    /// lost either way: a fresh engagement is the only zeroing a running
-    /// connection reaches, and the hold it waits out is four windows,
-    /// which is under the grace on any path fast enough to close them.
+    /// lost at either site: a verdict deferred before a counter reset
+    /// describes the baseline the reset discarded, and a fresh engagement
+    /// waits out a hold of four windows, which is under the grace on any
+    /// path fast enough to close them.
     fn align(&mut self, base: u64) {
         if self.verdicts_base != base {
             self.verdicts_base = base;

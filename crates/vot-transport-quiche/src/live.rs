@@ -562,6 +562,8 @@ pub struct Config {
     /// waits on a recovery round trip that no other traffic can shorten.
     /// [`PREFIX_DUPLICATION_DATAGRAMS`] is the measured default.
     pub prefix_duplication_datagrams: usize,
+    /// Whether a listener validates an address with QUIC Retry before accepting it.
+    pub stateless_retry: bool,
 }
 
 /// Which congestion controller carries the connection.
@@ -608,6 +610,7 @@ impl Config {
             session: None,
             side_channel_lead: None,
             prefix_duplication_datagrams: PREFIX_DUPLICATION_DATAGRAMS,
+            stateless_retry: false,
         }
     }
 
@@ -627,6 +630,7 @@ impl Config {
             session: None,
             side_channel_lead: None,
             prefix_duplication_datagrams: PREFIX_DUPLICATION_DATAGRAMS,
+            stateless_retry: false,
         }
     }
 
@@ -747,6 +751,7 @@ pub struct Transport {
     /// what keeps records in the order the peer sent them.
     held: Option<NativeEvent>,
     local: SocketAddr,
+    peer: Option<SocketAddr>,
     connection: ConnectionId,
     driver: Option<JoinHandle<()>>,
 }
@@ -864,6 +869,7 @@ impl Transport {
         let keepalive = keepalive_interval(role, config.idle_timeout_ms);
 
         let session = config.session.clone();
+        let peer_address = peer.as_ref().map(|(address, _)| *address);
         let driver = std::thread::Builder::new()
             .name(format!("vot-quiche-{}", local.port()))
             .spawn(move || {
@@ -915,6 +921,7 @@ impl Transport {
             close,
             held: None,
             local,
+            peer: peer_address,
             connection,
             driver: Some(driver),
         })
@@ -946,6 +953,12 @@ impl Transport {
     #[must_use]
     pub const fn local_address(&self) -> SocketAddr {
         self.local
+    }
+
+    /// The peer address when the caller or listener established it.
+    #[must_use]
+    pub const fn peer_address(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
     /// The identifier this endpoint reports its connection under.
@@ -1711,9 +1724,86 @@ const ACCEPT_BACKLOG: usize = 8;
 /// is gone.
 const ROUTER_TICK: Duration = Duration::from_millis(50);
 
+const RETRY_TOKEN_SECONDS: u64 = 30;
+const RETRY_TOKEN_TAG_BYTES: usize = 32;
+
 /// Tells one routed connection from another in this process, because a
 /// listener's connections share one local address and port.
 static ROUTED: AtomicU64 = AtomicU64::new(0);
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn mint_retry_token(secret: &[u8; 32], peer: SocketAddr, odcid: &[u8], now: u64) -> Vec<u8> {
+    let mut token = Vec::with_capacity(1 + 8 + 1 + 16 + 2 + 1 + odcid.len() + 32);
+    token.push(1);
+    token.extend_from_slice(&now.saturating_add(RETRY_TOKEN_SECONDS).to_be_bytes());
+    match peer.ip() {
+        std::net::IpAddr::V4(ip) => {
+            token.push(4);
+            token.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            token.push(6);
+            token.extend_from_slice(&ip.octets());
+        }
+    }
+    token.extend_from_slice(&peer.port().to_be_bytes());
+    token.push(u8::try_from(odcid.len()).unwrap_or(u8::MAX));
+    token.extend_from_slice(odcid);
+    let tag = blake3::keyed_hash(secret, &token);
+    token.extend_from_slice(tag.as_bytes());
+    token
+}
+
+fn validate_retry_token(
+    secret: &[u8; 32],
+    peer: SocketAddr,
+    token: &[u8],
+    now: u64,
+) -> Option<Vec<u8>> {
+    let body_len = token.len().checked_sub(RETRY_TOKEN_TAG_BYTES)?;
+    let (body, found_tag) = token.split_at(body_len);
+    let expected_tag = blake3::keyed_hash(secret, body);
+    let different = found_tag
+        .iter()
+        .zip(expected_tag.as_bytes())
+        .fold(0, |difference, (left, right)| difference | (left ^ right));
+    if different != 0 || body.first().copied()? != 1 {
+        return None;
+    }
+    let expiry = u64::from_be_bytes(body.get(1..9)?.try_into().ok()?);
+    if now > expiry {
+        return None;
+    }
+    let family = *body.get(9)?;
+    let mut at = 10;
+    let ip = match family {
+        4 => {
+            let octets: [u8; 4] = body.get(at..at + 4)?.try_into().ok()?;
+            at += 4;
+            std::net::IpAddr::V4(octets.into())
+        }
+        6 => {
+            let octets: [u8; 16] = body.get(at..at + 16)?.try_into().ok()?;
+            at += 16;
+            std::net::IpAddr::V6(octets.into())
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes(body.get(at..at + 2)?.try_into().ok()?);
+    at += 2;
+    if SocketAddr::new(ip, port) != peer {
+        return None;
+    }
+    let length = usize::from(*body.get(at)?);
+    at += 1;
+    let end = at.checked_add(length)?;
+    (end == body.len()).then(|| body[at..end].to_vec())
+}
 
 /// One socket serving many connections, so W rails reach one fixed address.
 ///
@@ -1727,6 +1817,7 @@ pub struct Listener {
     arrivals: mpsc::Receiver<Transport>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     accept_timeout_ms: u64,
+    stateless_retry: bool,
     router: Option<JoinHandle<()>>,
     side: Option<SideChannel>,
 }
@@ -1809,10 +1900,9 @@ impl Listener {
         size_buffers_reporting_clamps(&socket);
         enable_receive_offload(&socket);
         let local = socket.local_addr().map_err(|_| Error::Backend)?;
-        // Built here to surface a bad configuration at the bind rather
-        // than as a silently dead router; the router builds the one it
-        // shares across every accept.
-        let _ = config.build(Role::Server)?;
+        // Build once while credential paths are guaranteed to exist, then
+        // move the shared TLS context into the router.
+        let server_config = config.build(Role::Server)?;
         let socket = Arc::new(socket);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (arrived, arrivals) = mpsc::sync_channel(ACCEPT_BACKLOG);
@@ -1824,6 +1914,13 @@ impl Listener {
         let router_socket = Arc::clone(&socket);
         let router_stop = Arc::clone(&stop);
         let router_config = config.clone();
+        let retry_secret = if config.stateless_retry {
+            let mut secret = [0; 32];
+            getrandom::fill(&mut secret).map_err(|_| Error::Backend)?;
+            Some(secret)
+        } else {
+            None
+        };
         let router = std::thread::Builder::new()
             .name(format!("vot-quiche-listen-{}", local.port()))
             .spawn(move || {
@@ -1834,6 +1931,8 @@ impl Listener {
                     &arrived,
                     &aside,
                     &router_stop,
+                    retry_secret,
+                    server_config,
                 );
             })
             .map_err(|_| Error::Backend)?;
@@ -1843,6 +1942,7 @@ impl Listener {
             arrivals,
             stop,
             accept_timeout_ms: config.accept_timeout_ms,
+            stateless_retry: config.stateless_retry,
             router: Some(router),
             side,
         })
@@ -1858,6 +1958,13 @@ impl Listener {
     #[must_use]
     pub const fn local_address(&self) -> SocketAddr {
         self.local
+    }
+
+    /// Whether this listener validates an address with stateless Retry before
+    /// allocating connection state.
+    #[must_use]
+    pub const fn stateless_retry_enabled(&self) -> bool {
+        self.stateless_retry
     }
 
     /// Waits for the next connection, as long as the accept allows
@@ -1900,8 +2007,20 @@ struct Route {
     sibling: Vec<u8>,
 }
 
+fn routed_connection_count(routes: &std::collections::HashMap<Vec<u8>, Route>) -> usize {
+    routes
+        .iter()
+        .filter(|(key, row)| key.as_slice() <= row.sibling.as_slice())
+        .count()
+}
+
 /// The listener's receive loop: reads the socket, routes by connection
 /// ID, and accepts what no route claims.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the routing loop keeps its socket, policy, channels, TLS context, and packet decisions in one place"
+)]
 fn route(
     socket: &Arc<UdpSocket>,
     local: SocketAddr,
@@ -1909,17 +2028,14 @@ fn route(
     arrived: &mpsc::SyncSender<Transport>,
     aside: &mpsc::SyncSender<(Vec<u8>, SocketAddr)>,
     stop: &std::sync::atomic::AtomicBool,
+    retry_secret: Option<[u8; 32]>,
+    mut server_config: quiche::Config,
 ) {
     let mut buffer = vec![0_u8; vot_transport_framing::MAX_PARTIAL_FRAME.max(65_535)];
     let mut space = receive_space();
     let mut routes: std::collections::HashMap<Vec<u8>, Route> = std::collections::HashMap::new();
     // One TLS context for every connection this listener accepts, so the
-    // session tickets it issues resume across connections: each context
-    // draws its own ticket key, and a ticket no later context can read is
-    // a full handshake wearing a resumption's clothes.
-    let Ok(mut server_config) = config.build(Role::Server) else {
-        return;
-    };
+    // session tickets it issues resume across connections.
     if socket.set_read_timeout(Some(ROUTER_TICK)).is_err() {
         return;
     }
@@ -1973,6 +2089,12 @@ fn route(
             });
             continue;
         }
+        // RFC 9000 requires a client's first Initial datagram to be at least
+        // 1200 bytes. Never amplify a shorter spoof with Version Negotiation
+        // or Retry.
+        if first < MIN_DATAGRAM_SIZE {
+            continue;
+        }
         if version_unsupported(header.version) {
             // Answered rather than dropped, which is what lets a client
             // try another version.
@@ -1987,8 +2109,35 @@ fn route(
             // Dropped rather than growing a connection for it.
             continue;
         }
+        let odcid = if let Some(secret) = &retry_secret {
+            let token = header.token.as_deref().unwrap_or_default();
+            if token.is_empty() {
+                let index = ROUTED.fetch_add(1, Ordering::Relaxed);
+                let scid = scid_routed(local, index);
+                let now = unix_seconds();
+                let token = mint_retry_token(secret, from, &header.dcid, now);
+                let mut out = [0; MIN_DATAGRAM_SIZE];
+                if let Ok(written) = quiche::retry(
+                    &header.scid,
+                    &header.dcid,
+                    &scid,
+                    &token,
+                    header.version,
+                    &mut out,
+                ) {
+                    let _ = socket.send_to(&out[..written], from);
+                }
+                continue;
+            }
+            let Some(odcid) = validate_retry_token(secret, from, token, unix_seconds()) else {
+                continue;
+            };
+            Some(odcid)
+        } else {
+            None
+        };
         routes.retain(|_, row| !row.done.load(Ordering::Relaxed));
-        if routes.len() >= MAX_LISTENER_CONNECTIONS.saturating_mul(2) {
+        if routed_connection_count(&routes) >= MAX_LISTENER_CONNECTIONS {
             // Past the bound the Initial is shed; the client retransmits
             // it, and room appears when a session ends.
             continue;
@@ -2002,6 +2151,7 @@ fn route(
             from,
             segment,
             &key,
+            odcid.as_deref(),
         ) else {
             continue;
         };
@@ -2052,18 +2202,23 @@ fn accept_routed(
     from: SocketAddr,
     segment: Option<usize>,
     original: &[u8],
+    odcid: Option<&[u8]>,
 ) -> Option<(Transport, Route)> {
     let index = ROUTED.fetch_add(1, Ordering::Relaxed);
-    let scid = scid_routed(local, index);
+    let generated = scid_routed(local, index);
+    // After Retry, the client's new DCID is the server-selected SCID from
+    // the Retry packet and must become the accepted connection's SCID.
+    let scid = odcid.map_or(generated, |_| quiche::ConnectionId::from_ref(original));
     let scid_key = scid.as_ref().to_vec();
-    if scid_key == original {
+    if odcid.is_none() && scid_key == original {
         // A client naming this end's own identifier before it exists is
         // not a connection this listener will route two ways.
         return None;
     }
+    let odcid = odcid.map(quiche::ConnectionId::from_ref);
     let mut conn = quiche::accept_with_buf_factory::<SharedBufFactory>(
         &scid,
-        None,
+        odcid.as_ref(),
         local,
         from,
         quiche_config,
@@ -2152,6 +2307,7 @@ fn accept_routed(
             close,
             held: None,
             local,
+            peer: Some(from),
             connection,
             driver: Some(driver),
         },
@@ -3464,6 +3620,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_tokens_bind_the_peer_expiry_and_contents() {
+        let secret = [0x41; 32];
+        let peer: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
+        let odcid = [0x52; 16];
+        let token = mint_retry_token(&secret, peer, &odcid, 100);
+        assert_eq!(
+            validate_retry_token(&secret, peer, &token, 130),
+            Some(odcid.to_vec())
+        );
+        assert!(validate_retry_token(&secret, peer, &token, 131).is_none());
+        assert!(
+            validate_retry_token(
+                &secret,
+                "127.0.0.2:4433".parse().expect("an address"),
+                &token,
+                100,
+            )
+            .is_none()
+        );
+        let mut forged = token;
+        forged[12] ^= 1;
+        assert!(validate_retry_token(&secret, peer, &forged, 100).is_none());
+        assert!(validate_retry_token(&secret, peer, &[1, 2, 3], 100).is_none());
+    }
+
+    #[test]
     fn shared_buffers_split_without_copying() {
         let bytes = Payload::from(vec![1, 2, 3, 4]);
         let allocation = bytes.as_ptr();
@@ -4162,6 +4344,119 @@ mod tests {
             listener.local_address()
         };
         UdpSocket::bind(local).expect("the dropped listener released its port");
+    }
+
+    #[test]
+    fn a_retrying_listener_allocates_nothing_for_an_unanswered_initial() {
+        let (certificate, key) = credentials();
+        let mut config = Config::server(limits(), certificate, key);
+        config.stateless_retry = true;
+        config.accept_timeout_ms = 300;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let server = listener.local_address();
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a peer");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a bound");
+        let local = peer.local_addr().expect("its address");
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        let mut client_config = client_config.build(Role::Client).expect("a config");
+        let scid = quiche::ConnectionId::from_ref(&[0x31; 16]);
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
+            Some("localhost"),
+            &scid,
+            local,
+            server,
+            &mut client_config,
+        )
+        .expect("a client");
+        let mut initial = vec![0; LARGEST_DATAGRAM_SIZE];
+        let (written, _) = client.send(&mut initial).expect("an initial");
+        peer.send_to(&initial[..written], server)
+            .expect("the initial");
+        let mut retry = vec![0; LARGEST_DATAGRAM_SIZE];
+        let (written, from) = peer.recv_from(&mut retry).expect("a retry");
+        assert_eq!(from, server);
+        let header = quiche::Header::from_slice(&mut retry[..written], quiche::MAX_CONN_ID_LEN)
+            .expect("a retry header");
+        assert_eq!(header.ty, quiche::Type::Retry);
+        drop(peer);
+        assert!(
+            listener.accept().is_err(),
+            "an unanswered Retry created a connection"
+        );
+    }
+
+    #[test]
+    fn a_retrying_listener_drops_an_undersized_initial_without_answering() {
+        let (certificate, key) = credentials();
+        let mut config = Config::server(limits(), certificate, key);
+        config.stateless_retry = true;
+        config.accept_timeout_ms = 200;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        let server = listener.local_address();
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("a peer");
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("a bound");
+        let local = peer.local_addr().expect("its address");
+        let mut client_config = Config::client(limits());
+        client_config.verify_peer = false;
+        let mut client_config = client_config.build(Role::Client).expect("a config");
+        let scid = quiche::ConnectionId::from_ref(&[0x32; 16]);
+        let mut client = quiche::connect_with_buffer_factory::<SharedBufFactory>(
+            Some("localhost"),
+            &scid,
+            local,
+            server,
+            &mut client_config,
+        )
+        .expect("a client");
+        let mut initial = vec![0; LARGEST_DATAGRAM_SIZE];
+        let (written, _) = client.send(&mut initial).expect("an initial");
+        assert!(written >= MIN_DATAGRAM_SIZE);
+        peer.send_to(&initial[..MIN_DATAGRAM_SIZE - 1], server)
+            .expect("the truncated initial");
+        let mut answer = vec![0; LARGEST_DATAGRAM_SIZE];
+        assert!(
+            peer.recv_from(&mut answer).is_err(),
+            "a short Initial was amplified"
+        );
+        assert!(
+            listener.accept().is_err(),
+            "a short Initial made connection state"
+        );
+    }
+
+    #[test]
+    fn retry_routes_count_connections_not_identifier_rows() {
+        let (pump, _) = mpsc::sync_channel(1);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut routes = std::collections::HashMap::new();
+        for index in 0..MAX_LISTENER_CONNECTIONS {
+            let key = index.to_be_bytes().to_vec();
+            routes.insert(
+                key.clone(),
+                Route {
+                    pump: pump.clone(),
+                    done: Arc::clone(&done),
+                    sibling: key,
+                },
+            );
+        }
+        assert_eq!(routed_connection_count(&routes), MAX_LISTENER_CONNECTIONS);
+
+        routes.clear();
+        for (key, sibling) in [(vec![1], vec![2]), (vec![2], vec![1])] {
+            routes.insert(
+                key,
+                Route {
+                    pump: pump.clone(),
+                    done: Arc::clone(&done),
+                    sibling,
+                },
+            );
+        }
+        assert_eq!(routed_connection_count(&routes), 1);
     }
 
     #[test]

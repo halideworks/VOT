@@ -171,10 +171,13 @@ their encodings, and every verification rule keeps its place.**
    hook, called once with the sealed manifest after the chain check and before
    any `RANGE_REQUEST`, returning admit or a refusal that ends the session
    with `ADMISSION_DENIED`; a sink factory, called once per object with the
-   object's root, length, and manifest entry, returning a `Box<dyn RangeSink>`
-   or a decision to skip the object, in which case no `RANGE_REQUEST` is
-   issued for it; a completion callback per object, called after the object's
-   last range is verified and the sink flushed; and a cancellation handle the
+   object's root, length, and every manifest entry that references that stored
+   object, returning a `Box<dyn ReceiveSink>` or a decision to skip the object,
+   in which case no `RANGE_REQUEST` is issued for it. `ReceiveSink` extends
+   `RangeSink` with `flush` and `discard_partial`; the engine calls `flush`
+   before the completion callback and `discard_partial` when cancellation
+   abandons the active object. A completion callback per object is called after
+   the object's last range is verified and the sink flushed; and a cancellation handle the
    embedder can trigger from another thread, which sends `GOAWAY` and returns
    from the fetch loop with the objects completed so far. `GOAWAY` (`0x83`) is
    registered with a 4 KiB limit and the rule "lower or equal final accepted
@@ -182,15 +185,23 @@ their encodings, and every verification rule keeps its place.**
    down and has no encoder in `vot-codec`. This ADR defines the payload in
    `spec/wire.md` section 1, beside the other base frames, since `GOAWAY` is a
    base frame any endpoint may send: one QUIC varint, the plan cursor, which
-   is the count of objects in manifest order the sender of `GOAWAY` is
+   is the count of transfer objects in first-seen manifest order the sender of `GOAWAY` is
    finished with, whether by accepting the final range, skipping the
    object, finding it already whole, or its being empty. Zero means no
    object is finished. Section 1.2 adds the `PUSH` reading: the server is
    both requester and acceptor, the cursor bounds objects and not request
-   identifiers, and a holder that receives `GOAWAY` with cursor `n` sends no
-   `PUBLISH` frame for any object at manifest index `n` or above. The cursor
+   identifiers. A transfer object is one unique stored object root; repeated
+   direct entries and entries sharing a pack root belong to the same transfer
+   object. A holder that receives `GOAWAY` with cursor `n` sends no
+   object-bearing `PUBLISH` frame for any transfer object at index `n` or
+   above, including an answer already queued but not handed to the carrier. The cursor
    is `plan.current` verbatim and is monotonic because the fetch plan
-   advances it by one and finishes one object at a time. `CountingSink`
+   advances it by one and finishes one object at a time. A final `GOAWAY` is
+   also the receiver's completion acknowledgement: it is
+   sent only after every sink flush and completion callback succeeds, and a
+   holder treats disconnect before that cursor as failure. Push rejects a
+   package with no transfer objects, so cursor zero remains unambiguously
+   cancellation before the plan exists. `CountingSink`
    becomes public and implements `RangeSink` so the
    default factory is the sink `fetch_bundle` uses today; `fetch_bundle`
    itself is unchanged.
@@ -204,6 +215,8 @@ their encodings, and every verification rule keeps its place.**
    exposes `push_bundle` and `receive_push` beside `serve_bundle` and
    `fetch_bundle`, and `receive_push_on(listener, policy)`, which takes a
    bound `Listener` and an admission policy the embedder supplies. The
+   companion `bind_push_listener` constructs that listener with Retry enabled
+   and returns its certificate identity for advertisement or pinning. The
    engine owns the accept loop; the policy is called once per
    `SESSION_OPEN` with the presented capability and the peer address, and
    returns either a refusal or the grant together with the `ReceiveSeams`
@@ -212,8 +225,14 @@ their encodings, and every verification rule keeps its place.**
    the session it belongs to. `Listener` gains stateless retry
    (`quiche::retry`, token binding the source address and the original
    destination connection id, which `accept` then receives as `odcid`
-   where today it is passed `None`), off by default and
-   on for `receive_push_on`: a public receiver takes handshakes from anyone,
+   before allocating connection state). The receive portal also applies a
+   ten-second absolute deadline from session start through authorization;
+   traffic cannot refresh it, so eight reachable but unauthenticated peers
+   cannot retain all worker slots. An embedder's admission callback is trusted
+   local code and owns its own runtime bound; the deadline is checked again
+   after it returns and before any grant is sent.
+   Retry remains off by default and is mandatory for `receive_push_on`: a
+   public receiver takes handshakes from anyone,
    and today `accept_one` creates connection state for any source with only
    quiche's three-times amplification bound behind it. With retry, a
    connection exists only for an address that answered. An embedder that
@@ -222,11 +241,26 @@ their encodings, and every verification rule keeps its place.**
    separates replication from publication.
 
 10. **Rendezvous and relay stay for peers.** Nothing in ADR-0033 or ADR-0034
-    changes. A holder that can reach the receiver dials it; a pair that
-    cannot reach each other still walks the route ladder. `vot push` accepts
-    the same `VOT_RENDEZVOUS` and `VOT_RELAY` settings `vot fetch` does, so a
-    push can also be punched when the receiver is not fixed, but that is a
-    composition of existing routes, not new ones.
+    changes. A holder that can reach the receiver dials it. The
+    `VOT_RENDEZVOUS` and `VOT_RELAY` settings are deferred for push. Those
+    services currently register a holder under a package root; a receiver
+    cannot register under a root it learns only after `SESSION_OPEN`. The first
+    implementation accepts a literal receiver address. Receiver discovery needs
+    a separate decision naming a key the receiver knows before the session.
+
+11. **The CLI can issue the capability push requires.** `vot capability
+    issue-push ISSUER_KEY_SOURCE ISSUER AUDIENCE HOLDER_PUBLIC PACKAGE_ROOT
+    PACKAGE_LENGTH SECONDS OUT.cbor` issues only `PUBLISH` and writes the exact
+    package length into the scope. The existing `capability issue` command and
+    its read-only capability remain unchanged.
+
+12. **Retry tokens are authenticated and short-lived.** A listener that
+    enables retry draws a secret when it binds. Its token carries the canonical
+    source address, the original destination connection ID, and an expiry, and
+    authenticates those bytes with a keyed digest. A malformed, expired,
+    wrong-address, or forged token creates no connection state. The accepted
+    quiche `Transport` retains the peer address for `receive_push_on` without
+    adding peer addressing to `vot-transport-api`.
 
 ## Consequences
 
@@ -316,6 +350,11 @@ their encodings, and every verification rule keeps its place.**
 - Retry: a `receive_push_on` listener answers an initial packet from an
   unseen address with a retry and creates no connection; a spoofed source
   that never answers leaves no state behind.
+- Completion and admission bounds: a receiver completion-hook failure leaves
+  the holder without a final `GOAWAY` and both ends fail; eight clients that
+  keep sending authentication-exempt frames expire on the absolute deadline
+  and cannot starve a valid ninth push. A secondary rail cancelled while its
+  primary is still building sends cursor-zero `GOAWAY` and returns.
 - quiche-live job: a push over loopback at one rail and at four, pinned
   identity, with the receiver's certificate digest mismatched once and the
   connection dropped before `HELLO`, and a push attempted without a pin
@@ -324,3 +363,9 @@ their encodings, and every verification rule keeps its place.**
   loopback, interleaved three reps each. The push is within noise of the
   fetch; a gap is a defect in the reversed credit or pacing path, not a
   tuning question.
+
+Implementation evidence (2026-08-27): a release build over four loopback
+rails moved the same 4 GiB BLAKE3 bundle in interleaved push/fetch runs of
+9.23/8.72 s, 8.65/8.53 s, and 9.13/7.67 s. Median push was 9.13 s and median
+fetch 8.53 s (7.0% apart); every received bundle matched apart from the
+holder-only proof cache.

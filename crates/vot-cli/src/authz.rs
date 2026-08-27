@@ -5,7 +5,7 @@
 //! between them, which is the part the spec leaves to a deployment.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use vot_capability::verify::{Anchors, AuthorizedRequest, IssuerEntry, Policy, Presentation};
+use vot_capability::verify::{Anchors, IssuerEntry, Policy, Presentation};
 use vot_capability::{Capability, Operation, Scope};
 use vot_codec::frames::{AuthContext, Binding, SessionOpen};
 use vot_transport_api::ChannelBinding;
@@ -95,51 +95,124 @@ impl Requirement {
         if open.capability_format != u64::from(vot_capability::FORMAT_ID) {
             return None;
         }
-        let signed = vot_capability::decode(&open.capability).ok()?;
-        let authorized = vot_capability::verify::authorize(
-            &signed,
-            Presentation {
-                nonce: &challenge.nonce,
-                session_id: open.session_id,
-                channel_binding,
-                proof: &open.binding_proof,
-            },
+        let capability = authorize_capability(
+            challenge,
+            open,
+            channel_binding,
             &self.anchors,
-            Policy {
-                audience: &self.audience,
-                now,
-                skew: SKEW_SECONDS,
-                denied: &[],
-                // Nothing here installs a capability limit, and an
-                // unenforceable one fails closed, so a token carrying any is
-                // refused rather than half honoured.
-                known_limits: &[],
-            },
-        )
-        .ok()?;
+            &self.audience,
+            now,
+        )?;
         // Both, because a fetch reads the manifest and then its ranges, and a
         // token that allows one without the other authorizes half a transfer.
-        authorized
-            .allows(AuthorizedRequest::ReadManifest {
-                suite: PACKAGE_SUITE,
-                root: self.root,
-            })
-            .ok()?;
-        if !authorized.capability().allows(Operation::ReadRanges) {
+        if !capability.allows(Operation::ReadManifest)
+            || !capability.allows(Operation::ReadRanges)
+            || capability.scope.suite != PACKAGE_SUITE
+            || capability.scope.root != self.root
+        {
             return None;
         }
         // The scope names the package root (ADR-0036), so a length or range
         // list has no object to apply to and nothing on the serve path
         // consults either; a token that narrows is refused rather than half
         // honoured, as an unenforceable limit is.
-        let scope = &authorized.capability().scope;
+        let scope = &capability.scope;
         if scope.length.is_some() || !scope.ranges.is_empty() {
             return None;
         }
         // The whole scope the token carries. A client asking for a subset is
         // allowed by section 1.1 and this one never does, so granting the
         // token's own scope grants no more than it allows.
-        vot_capability::encode_scope(&authorized.capability().scope).ok()
+        vot_capability::encode_scope(&capability.scope).ok()
+    }
+}
+
+fn authorize_capability(
+    challenge: &AuthContext,
+    open: &SessionOpen,
+    channel_binding: ChannelBinding,
+    anchors: &Anchors,
+    audience: &str,
+    now: u64,
+) -> Option<Capability> {
+    if open.capability_format != u64::from(vot_capability::FORMAT_ID) {
+        return None;
+    }
+    let signed = vot_capability::decode(&open.capability).ok()?;
+    let authorized = vot_capability::verify::authorize(
+        &signed,
+        Presentation {
+            nonce: &challenge.nonce,
+            session_id: open.session_id,
+            channel_binding,
+            proof: &open.binding_proof,
+        },
+        anchors,
+        Policy {
+            audience,
+            now,
+            skew: SKEW_SECONDS,
+            denied: &[],
+            known_limits: &[],
+        },
+    )
+    .ok()?;
+    Some(authorized.capability().clone())
+}
+
+/// What a push receiver requires before accepting a package.
+#[derive(Clone)]
+pub struct PushRequirement {
+    anchors: Anchors,
+    audience: String,
+}
+
+impl PushRequirement {
+    #[must_use]
+    pub fn new(issuer: &str, key_id: Vec<u8>, key: VerifyingKey, audience: &str) -> Self {
+        Self {
+            anchors: Anchors::new().with(IssuerEntry {
+                issuer: issuer.to_owned(),
+                audiences: vec![audience.to_owned()],
+                key_id,
+                key,
+            }),
+            audience: audience.to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn challenge(&self, nonce: [u8; 32]) -> AuthContext {
+        AuthContext {
+            nonce: nonce.to_vec(),
+            binding: Binding::ProofOfPossession,
+            formats: vec![u64::from(vot_capability::FORMAT_ID)],
+        }
+    }
+
+    #[must_use]
+    pub fn decide(
+        &self,
+        challenge: &AuthContext,
+        open: &SessionOpen,
+        channel_binding: ChannelBinding,
+        now: u64,
+    ) -> Option<Scope> {
+        let capability = authorize_capability(
+            challenge,
+            open,
+            channel_binding,
+            &self.anchors,
+            &self.audience,
+            now,
+        )?;
+        let publishes = capability.allows(Operation::Publish);
+        let scope = capability.scope;
+        (publishes
+            && scope.suite == PACKAGE_SUITE
+            && scope.length.is_some()
+            && scope.ranges.is_empty())
+        .then_some(scope)
     }
 }
 
@@ -206,6 +279,11 @@ impl Holder {
             binding_proof: proof,
         })
     }
+
+    /// The capability's exact scope, for a client that refuses a narrower grant.
+    pub fn scope_bytes(&self) -> Result<Vec<u8>, Error> {
+        vot_capability::encode_scope(&self.capability.scope).map_err(|_| Error::InvalidArguments)
+    }
 }
 
 /// The scope a capability for one package carries: the whole package, no
@@ -220,6 +298,16 @@ pub fn package_scope(root: [u8; 32]) -> Scope {
         root,
         // The issuer does not know it, and nothing checks a length here.
         length: None,
+        ranges: Vec::new(),
+    }
+}
+
+#[must_use]
+pub const fn push_scope(root: [u8; 32], length: u64) -> Scope {
+    Scope {
+        suite: PACKAGE_SUITE,
+        root,
+        length: Some(length),
         ranges: Vec::new(),
     }
 }
@@ -377,6 +465,48 @@ pub fn issue(
     vot_capability::encode(&signed).map_err(|_| Error::InvalidArguments)
 }
 
+/// Issues a capability for pushing one exact package.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the issuer API mirrors the signed capability's required fields"
+)]
+pub fn issue_push(
+    issuer: &str,
+    audience: &str,
+    issuer_key: &SigningKey,
+    holder_key: [u8; 32],
+    root: [u8; 32],
+    length: u64,
+    now: u64,
+    seconds: u64,
+) -> Result<Vec<u8>, Error> {
+    if seconds == 0 {
+        return Err(Error::InvalidArguments);
+    }
+    let expiry = now.checked_add(seconds).ok_or(Error::InvalidArguments)?;
+    let mut token_id = [0_u8; 16];
+    getrandom::fill(&mut token_id).map_err(|_| Error::Randomness)?;
+    let capability = Capability {
+        issuer: issuer.to_owned(),
+        audience: audience.to_owned(),
+        holder_key,
+        operations: vec![Operation::Publish.identifier()],
+        scope: push_scope(root, length),
+        limits: Vec::new(),
+        not_before: now,
+        expiry,
+        token_id,
+        delegation: vot_capability::NO_FURTHER_DELEGATION,
+    };
+    let signed = vot_capability::sign(
+        &capability,
+        &key_id_of(&issuer_key.verifying_key()),
+        issuer_key,
+    )
+    .map_err(|_| Error::InvalidArguments)?;
+    vot_capability::encode(&signed).map_err(|_| Error::InvalidArguments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +546,99 @@ mod tests {
         )
         .expect("a token");
         Holder::new(token, holder_key.clone()).expect("a holder")
+    }
+
+    fn push_requirement(issuer_key: &SigningKey) -> PushRequirement {
+        PushRequirement::new(
+            ISSUER,
+            key_id_of(&issuer_key.verifying_key()),
+            issuer_key.verifying_key(),
+            AUDIENCE,
+        )
+    }
+
+    fn push_holder(issuer_key: &SigningKey, holder_key: &SigningKey, length: u64) -> Holder {
+        Holder::new(
+            issue_push(
+                ISSUER,
+                AUDIENCE,
+                issuer_key,
+                holder_key.verifying_key().to_bytes(),
+                ROOT,
+                length,
+                NOW,
+                3_600,
+            )
+            .expect("a push token"),
+            holder_key.clone(),
+        )
+        .expect("a holder")
+    }
+
+    fn publish_holder_with_scope(
+        issuer_key: &SigningKey,
+        holder_key: &SigningKey,
+        scope: Scope,
+    ) -> Holder {
+        let capability = Capability {
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            holder_key: holder_key.verifying_key().to_bytes(),
+            operations: vec![Operation::Publish.identifier()],
+            scope,
+            limits: Vec::new(),
+            not_before: NOW,
+            expiry: NOW + 3_600,
+            token_id: [3; 16],
+            delegation: vot_capability::NO_FURTHER_DELEGATION,
+        };
+        let signed = vot_capability::sign(
+            &capability,
+            &key_id_of(&issuer_key.verifying_key()),
+            issuer_key,
+        )
+        .expect("a signature");
+        Holder::new(
+            vot_capability::encode(&signed).expect("an encoding"),
+            holder_key.clone(),
+        )
+        .expect("a holder")
+    }
+
+    #[test]
+    fn a_push_token_is_publish_only_exact_and_accepted() {
+        let issuer = keypair(31);
+        let holder_key = keypair(32);
+        let push = push_holder(&issuer, &holder_key, 42);
+        assert_eq!(
+            push.capability.operations,
+            [Operation::Publish.identifier()]
+        );
+        assert_eq!(push.capability.scope, push_scope(ROOT, 42));
+        let requirement = push_requirement(&issuer);
+        let challenge = requirement.challenge([9; 32]);
+        let binding = channel(9);
+        let open = push.answer(&challenge, binding).expect("an answer");
+        assert_eq!(
+            requirement.decide(&challenge, &open, binding, NOW),
+            Some(push_scope(ROOT, 42))
+        );
+
+        let read = holder(&issuer, &holder_key, ROOT);
+        let open = read.answer(&challenge, binding).expect("an answer");
+        assert!(
+            requirement
+                .decide(&challenge, &open, binding, NOW)
+                .is_none()
+        );
+
+        let null_length = publish_holder_with_scope(&issuer, &holder_key, package_scope(ROOT));
+        let open = null_length.answer(&challenge, binding).expect("an answer");
+        assert!(
+            requirement
+                .decide(&challenge, &open, binding, NOW)
+                .is_none()
+        );
     }
 
     #[test]

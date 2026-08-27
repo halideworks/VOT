@@ -1,8 +1,8 @@
 //! The counting sink, its durability hook, and stride flushing.
 
 use super::{
-    Arc, AtomicU64, FetchPlan, FileSink, Mutex, Ordering, Path, ResumeStore, SubjectId,
-    durable_units, subject_of, total_units_of,
+    Arc, AtomicU64, Error, FetchPlan, FileSink, Mutex, Ordering, Path, PathBuf, ReceiveSink,
+    ResumeStore, SubjectId, durable_units, fs, subject_of, total_units_of,
 };
 
 /// Bytes placed between stride flushes.
@@ -15,8 +15,11 @@ pub(crate) const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
 ///
 /// The fetch cannot see answers arrive; the placed-byte count is the only
 /// signal that paces requests and reports progress.
-pub(crate) struct CountingSink {
-    pub(crate) file: FileSink,
+pub struct CountingSink {
+    pub(crate) sink: Box<dyn ReceiveSink>,
+    /// Serializes placement with abandonment. Once abandoned, no prover on
+    /// any rail may recreate bytes after `discard_partial` returns.
+    gate: Mutex<bool>,
     pub(crate) placed: AtomicU64,
     /// Next placed-byte crossing due a flush; the exchange keeps two
     /// writers from flushing the same stride.
@@ -25,6 +28,31 @@ pub(crate) struct CountingSink {
     pub(crate) flushes: AtomicU64,
     /// Stride flush checkpoint hook, when a store rides the fetch.
     pub(crate) durable: Option<DurableHook>,
+}
+
+struct DirectorySink {
+    file: FileSink,
+    path: PathBuf,
+}
+
+impl vot_scheduler::RangeSink for DirectorySink {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        self.file.write_at(covered_offset, data)
+    }
+}
+
+impl ReceiveSink for DirectorySink {
+    fn flush(&self) -> Result<(), Error> {
+        self.file.file().sync_all().map_err(Error::Io)
+    }
+
+    fn discard_partial(&self) -> Result<(), Error> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
 }
 
 /// What a stride flush needs to turn durability into a checkpoint.
@@ -40,7 +68,7 @@ pub(crate) struct DurableHook {
 
 impl DurableHook {
     /// One stride's durability: snapshot, sync, checkpoint.
-    pub(crate) fn flush(&self, file: &FileSink) {
+    pub(crate) fn flush(&self, sink: &dyn ReceiveSink) {
         let covered = self.plan.upgrade().and_then(|plan| {
             let plan = plan.lock().ok()?;
             // Coverage is the current object's; a sink outliving its
@@ -48,7 +76,7 @@ impl DurableHook {
             (plan.objects.get(plan.current).map(subject_of) == Some(self.subject))
                 .then(|| plan.covered.extents().clone())
         });
-        if file.file().sync_data().is_err() {
+        if sink.flush().is_err() {
             // Nothing durable to claim; the completion sync will tell
             // the truth loudly.
             return;
@@ -77,9 +105,10 @@ pub(crate) const fn stride_after(placed: u64) -> u64 {
 impl CountingSink {
     /// Counters seeded from `placed`, so pacing and reporting start true
     /// whether the file is fresh or reopened.
-    fn opened(file: FileSink, placed: u64, durable: Option<DurableHook>) -> Self {
+    fn opened(sink: Box<dyn ReceiveSink>, placed: u64, durable: Option<DurableHook>) -> Self {
         Self {
-            file,
+            sink,
+            gate: Mutex::new(false),
             placed: AtomicU64::new(placed),
             flush_due: AtomicU64::new(stride_after(placed)),
             flushes: AtomicU64::new(0),
@@ -92,7 +121,15 @@ impl CountingSink {
         length: u64,
         durable: Option<DurableHook>,
     ) -> std::io::Result<Self> {
-        Ok(Self::opened(FileSink::create(path, length)?, 0, durable))
+        let file = FileSink::create(path, length)?;
+        Ok(Self::opened(
+            Box::new(DirectorySink {
+                file,
+                path: path.to_owned(),
+            }),
+            0,
+            durable,
+        ))
     }
 
     /// Reopens a partial object with what the last fetch already placed.
@@ -102,21 +139,52 @@ impl CountingSink {
         placed: u64,
         durable: Option<DurableHook>,
     ) -> std::io::Result<Self> {
+        let file = FileSink::resume(path, length)?;
         Ok(Self::opened(
-            FileSink::resume(path, length)?,
+            Box::new(DirectorySink {
+                file,
+                path: path.to_owned(),
+            }),
             placed,
             durable,
         ))
     }
 
+    pub(crate) fn custom(sink: Box<dyn ReceiveSink>) -> Self {
+        Self::opened(sink, 0, None)
+    }
+
+    /// Creates the directory-backed sink used by a normal fetch.
+    pub fn at(path: &Path, length: u64) -> std::io::Result<Self> {
+        Self::create(path, length, None)
+    }
+
     pub(crate) fn placed(&self) -> u64 {
         self.placed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn flush(&self) -> Result<(), Error> {
+        let discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
+        if *discarded {
+            return Err(Error::InvalidBundle);
+        }
+        self.sink.flush()
+    }
+
+    pub(crate) fn discard_partial(&self) -> Result<(), Error> {
+        let mut discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
+        *discarded = true;
+        self.sink.discard_partial()
     }
 }
 
 impl vot_scheduler::RangeSink for CountingSink {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
-        self.file.write_at(covered_offset, data)?;
+        let discarded = self.gate.lock().map_err(|_| vot_scheduler::SinkError)?;
+        if *discarded {
+            return Err(vot_scheduler::SinkError);
+        }
+        self.sink.write_at(covered_offset, data)?;
         let placed = self
             .placed
             .fetch_add(data.len() as u64, Ordering::Relaxed)
@@ -139,13 +207,24 @@ impl vot_scheduler::RangeSink for CountingSink {
             // here costs only the tail.
             self.flushes.fetch_add(1, Ordering::Relaxed);
             match &self.durable {
-                Some(hook) => hook.flush(&self.file),
+                Some(hook) => hook.flush(self.sink.as_ref()),
                 None => {
-                    let _ = self.file.file().sync_data();
+                    let _ = self.sink.flush();
                 }
             }
         }
+        drop(discarded);
         Ok(())
+    }
+}
+
+impl ReceiveSink for CountingSink {
+    fn flush(&self) -> Result<(), Error> {
+        CountingSink::flush(self)
+    }
+
+    fn discard_partial(&self) -> Result<(), Error> {
+        CountingSink::discard_partial(self)
     }
 }
 
@@ -170,4 +249,94 @@ pub(crate) const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<
             .saturating_sub(placed % quantum)
             .saturating_add(quantum),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vot_scheduler::RangeSink as _;
+
+    #[derive(Default)]
+    struct BlockingState {
+        started: bool,
+        release: bool,
+        discarded: bool,
+        writes: usize,
+    }
+
+    #[derive(Default)]
+    struct BlockingSink {
+        shared: Arc<(std::sync::Mutex<BlockingState>, std::sync::Condvar)>,
+    }
+
+    impl Clone for BlockingSink {
+        fn clone(&self) -> Self {
+            Self {
+                shared: Arc::clone(&self.shared),
+            }
+        }
+    }
+
+    impl vot_scheduler::RangeSink for BlockingSink {
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            let mut state = self.shared.0.lock().map_err(|_| vot_scheduler::SinkError)?;
+            state.started = true;
+            self.shared.1.notify_all();
+            while !state.release {
+                state = self
+                    .shared
+                    .1
+                    .wait(state)
+                    .map_err(|_| vot_scheduler::SinkError)?;
+            }
+            state.writes += 1;
+            Ok(())
+        }
+    }
+
+    impl ReceiveSink for BlockingSink {
+        fn flush(&self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            self.shared
+                .0
+                .lock()
+                .map_err(|_| Error::InvalidBundle)?
+                .discarded = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn discard_waits_for_a_writer_and_refuses_every_later_write() {
+        let inner = Arc::new(BlockingSink::default());
+        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone())));
+        let writing = {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || sink.write_at(0, &[1]))
+        };
+        {
+            let mut state = inner.shared.0.lock().unwrap();
+            while !state.started {
+                state = inner.shared.1.wait(state).unwrap();
+            }
+        }
+        let discarding = {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || sink.discard_partial())
+        };
+        {
+            let mut state = inner.shared.0.lock().unwrap();
+            state.release = true;
+            inner.shared.1.notify_all();
+        }
+        writing.join().unwrap().unwrap();
+        discarding.join().unwrap().unwrap();
+        assert!(sink.write_at(1, &[2]).is_err());
+        let state = inner.shared.0.lock().unwrap();
+        assert!(state.discarded);
+        assert_eq!(state.writes, 1);
+    }
 }

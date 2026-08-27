@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +22,9 @@ use vot_transport_api::{Event, MAX_CONTROL_FRAME_PAYLOAD, SubjectId, TransportAd
 use vot_resume::{ResumeStore, UnitRanges};
 
 use crate::serve::is_backpressure;
-use crate::{Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage};
+use crate::{
+    EntryRecord, Error, MANIFEST_DIRECTORY, MANIFEST_SEAL, ManifestReader, PackageSummary, Storage,
+};
 
 mod coverage;
 mod plan;
@@ -35,6 +37,7 @@ pub(crate) use plan::*;
 pub use protocol::BundleFetcher;
 pub(crate) use protocol::*;
 pub(crate) use proving::*;
+pub use sink::CountingSink;
 pub(crate) use sink::*;
 
 /// What one fetch pass left the session as.
@@ -48,12 +51,87 @@ pub enum FetchStatus {
     Disconnected,
     /// This end closed the session under a registered code.
     Closed(u16),
+    /// The caller cancelled after this many transfer objects were finished.
+    Cancelled(usize),
+}
+
+/// Identifies one receive session across all of its seam callbacks.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReceiveSessionId(u64);
+
+/// One unique stored object and every manifest entry that references it.
+#[derive(Clone, Debug)]
+pub struct ReceiveObject {
+    pub object: frames::ObjectId,
+    pub entries: Vec<EntryRecord>,
+}
+
+/// A verified-range destination with explicit completion and abandonment.
+pub trait ReceiveSink: vot_scheduler::RangeSink {
+    fn flush(&self) -> Result<(), Error>;
+    fn discard_partial(&self) -> Result<(), Error>;
+}
+
+impl<S: ReceiveSink + ?Sized> ReceiveSink for Arc<S> {
+    fn flush(&self) -> Result<(), Error> {
+        (**self).flush()
+    }
+
+    fn discard_partial(&self) -> Result<(), Error> {
+        (**self).discard_partial()
+    }
+}
+
+/// A cloneable, thread-safe request to stop one receive.
+#[derive(Clone, Default)]
+pub struct CancellationHandle(Arc<AtomicBool>);
+
+impl CancellationHandle {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+pub type ManifestHook = Arc<
+    dyn Fn(ReceiveSessionId, PackageSummary, &[EntryRecord]) -> Result<(), Error> + Send + Sync,
+>;
+pub type SinkFactory = Arc<
+    dyn Fn(ReceiveSessionId, &ReceiveObject) -> Result<Option<Box<dyn ReceiveSink>>, Error>
+        + Send
+        + Sync,
+>;
+pub type CompletionHook =
+    Arc<dyn Fn(ReceiveSessionId, &ReceiveObject) -> Result<(), Error> + Send + Sync>;
+
+/// Optional receive integration points. Missing hooks retain directory behavior.
+#[derive(Clone, Default)]
+pub struct ReceiveSeams {
+    pub manifest: Option<ManifestHook>,
+    pub sink: Option<SinkFactory>,
+    pub complete: Option<CompletionHook>,
+    pub cancellation: CancellationHandle,
+}
+
+impl ReceiveSeams {
+    #[must_use]
+    pub fn new(cancellation: CancellationHandle) -> Self {
+        Self {
+            cancellation,
+            ..Self::default()
+        }
+    }
 }
 
 /// Why a frame could not be taken: server protocol fault, wrong package,
 /// or local failure.
 pub(crate) enum Fault {
     Peer(u16),
+    Reported(u16),
     Pin,
     Local(Error),
 }
@@ -65,7 +143,7 @@ impl From<Error> for Fault {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::harness::{
         Loopback, built_bundle, control_event, decode_control, discard, noise, not_required,
@@ -246,6 +324,281 @@ mod tests {
         assert_eq!(report.package, built);
         assert_same_tree(&source, &destination);
         discard(&[&source, &bundle, &output, &destination, &receipt]);
+    }
+
+    struct SeamSink {
+        bytes: Mutex<Vec<u8>>,
+        flushed: AtomicBool,
+        discarded: AtomicBool,
+    }
+
+    impl vot_scheduler::RangeSink for SeamSink {
+        fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            let mut bytes = self.bytes.lock().map_err(|_| vot_scheduler::SinkError)?;
+            let at = usize::try_from(offset).map_err(|_| vot_scheduler::SinkError)?;
+            bytes[at..at + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    impl ReceiveSink for SeamSink {
+        fn flush(&self) -> Result<(), Error> {
+            self.flushed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            self.bytes.lock().map_err(|_| Error::InvalidBundle)?.clear();
+            self.discarded.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn receive_seams_see_the_manifest_object_entries_and_flushed_completion() {
+        let payload = patterned(8_500_000);
+        let (bundle, _) = built_bundle(
+            "receive-seams",
+            &[("a.bin", payload.clone()), ("b.bin", payload.clone())],
+        );
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("receive-seams-output");
+        let sink = Arc::new(SeamSink {
+            bytes: Mutex::new(vec![0; payload.len()]),
+            flushed: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
+        });
+        let manifest_calls = Arc::new(AtomicU64::new(0));
+        let completion_calls = Arc::new(AtomicU64::new(0));
+        let mut seams = ReceiveSeams::default();
+        let seen_manifest = Arc::clone(&manifest_calls);
+        seams.manifest = Some(Arc::new(move |_, _, entries| {
+            assert_eq!(entries.len(), 2);
+            seen_manifest.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }));
+        let placed = Arc::clone(&sink);
+        seams.sink = Some(Arc::new(move |_, object| {
+            assert_eq!(object.entries.len(), 2);
+            Ok(Some(Box::new(Arc::clone(&placed))))
+        }));
+        let completed_sink = Arc::clone(&sink);
+        let completed = Arc::clone(&completion_calls);
+        seams.complete = Some(Arc::new(move |_, object| {
+            assert_eq!(object.entries.len(), 2);
+            assert!(completed_sink.flushed.load(Ordering::Acquire));
+            completed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }));
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(seams);
+        assert_eq!(
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap(),
+            FetchStatus::Complete
+        );
+        assert_eq!(*sink.bytes.lock().unwrap(), payload);
+        assert_eq!(manifest_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
+        assert!(!sink.discarded.load(Ordering::Relaxed));
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_manifest_seam_refusal_precedes_every_range_request() {
+        let (bundle, _) = built_bundle("receive-refused", &[("a.bin", patterned(200_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("receive-refused-output");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let seams = ReceiveSeams {
+            manifest: Some(Arc::new(|_, _, _| Err(Error::InvalidArguments))),
+            ..ReceiveSeams::default()
+        };
+        fetcher.set_receive_seams(seams);
+        assert_eq!(
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap(),
+            FetchStatus::Closed(error_code::ADMISSION_DENIED)
+        );
+        assert_eq!(
+            fetcher.rail.taken_bytes, 0,
+            "admission runs before any object range"
+        );
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_failed_completion_hook_does_not_commit_the_object_cursor() {
+        let (bundle, _) = built_bundle("completion-refused", &[("a.bin", patterned(200_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("completion-refused-output");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(Arc::new(|_, _| Err(Error::InvalidArguments))),
+            ..ReceiveSeams::default()
+        });
+        assert!(run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).is_err());
+        let plan = fetcher.locked_plan().unwrap();
+        assert_eq!(plan.current, 0);
+        assert!(!plan.syncing);
+        assert!(plan.abandoned);
+        assert!(plan.active.is_some());
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn cancellation_discards_the_partial_and_bounds_queued_answers() {
+        let (bundle, _) = built_bundle(
+            "receive-cancelled",
+            &[
+                ("first.bin", patterned(300_001)),
+                ("second.bin", patterned(8_500_000)),
+            ],
+        );
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("receive-cancelled-output");
+        let sinks = Arc::new(Mutex::new(Vec::<Arc<SeamSink>>::new()));
+        let cancellation = CancellationHandle::default();
+        let mut seams = ReceiveSeams::new(cancellation.clone());
+        let placed = Arc::clone(&sinks);
+        seams.sink = Some(Arc::new(move |_, object| {
+            let sink = Arc::new(SeamSink {
+                bytes: Mutex::new(vec![0; usize::try_from(object.object.length).unwrap()]),
+                flushed: AtomicBool::new(false),
+                discarded: AtomicBool::new(false),
+            });
+            placed.lock().unwrap().push(Arc::clone(&sink));
+            Ok(Some(Box::new(sink)))
+        }));
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(seams);
+        let _ = planned(&server, &mut session, &mut connection, &mut fetcher);
+        let mut sequence = 0;
+        for _ in 0..ROUND_BUDGET {
+            if fetcher.locked_plan().unwrap().current == 1 {
+                break;
+            }
+            round(
+                &server,
+                &mut session,
+                &mut connection,
+                &mut fetcher,
+                &mut sequence,
+            );
+        }
+        assert_eq!(fetcher.locked_plan().unwrap().current, 1);
+        assert!(fetcher.locked_plan().unwrap().active.is_some());
+
+        // Remove answers already handed to the fake carrier, then put a
+        // fresh answer request immediately ahead of GOAWAY. This isolates
+        // the contract for queued-but-not-handed answers.
+        session.driver().control.clear();
+        session.driver().records.clear();
+        session.driver().datagrams.clear();
+        fetcher.session_mut().driver().events.clear();
+        let second = server
+            .object_indices
+            .iter()
+            .find_map(|(root, index)| (*index == 1).then_some(server.objects[root].object))
+            .unwrap();
+        session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::RangeRequest(RangeRequest {
+                request_id: [0xff; 16],
+                object: second,
+                offset: 0,
+                length: second.length.min(65_536),
+            })));
+        cancellation.cancel();
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Cancelled(1));
+        let held = sinks.lock().unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!(*held[0].bytes.lock().unwrap(), patterned(300_001));
+        assert!(held[0].flushed.load(Ordering::Acquire));
+        assert!(!held[0].discarded.load(Ordering::Acquire));
+        assert!(held[1].discarded.load(Ordering::Acquire));
+        assert!(held[1].bytes.lock().unwrap().is_empty());
+        drop(held);
+        pump(
+            fetcher.session_mut().driver(),
+            session.driver(),
+            &mut sequence,
+        );
+        server.service(&mut session, &mut connection).unwrap();
+        assert_eq!(connection.goaway_cursor, Some(1));
+        assert_eq!(connection.pending_answer_bytes(), 0);
+        pump(
+            session.driver(),
+            fetcher.session_mut().driver(),
+            &mut sequence,
+        );
+        let after_goaway = fetcher.session_mut().poll().unwrap();
+        assert!(
+            after_goaway.is_none(),
+            "an answer queued ahead of GOAWAY reached the carrier: {after_goaway:?}"
+        );
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn a_skipped_object_is_never_requested_or_completed() {
+        let (bundle, _) = built_bundle(
+            "receive-skipped",
+            &[
+                ("a.bin", patterned(300_001)),
+                ("b.bin", vec![2; 300_002]),
+                ("c.bin", vec![3; 300_003]),
+            ],
+        );
+        let (server, mut session, mut connection) = serving(&bundle);
+        let skipped = server
+            .object_indices
+            .iter()
+            .find_map(|(root, index)| (*index == 1).then_some(*root))
+            .unwrap();
+        let expected_requested: u64 = server
+            .objects
+            .iter()
+            .filter(|(root, _)| **root != skipped)
+            .map(|(_, object)| object.object.length)
+            .sum();
+        let output = temporary("receive-skipped-output");
+        let destination = output.to_path_buf();
+        let completions = Arc::new(AtomicU64::new(0));
+        let completed = Arc::clone(&completions);
+        let seams = ReceiveSeams {
+            sink: Some(Arc::new(move |_, object| {
+                if object.object.root == skipped {
+                    return Ok(None);
+                }
+                let path = destination
+                    .join("objects")
+                    .join(crate::object_name(&object.object.root));
+                Ok(Some(Box::new(CountingSink::at(
+                    &path,
+                    object.object.length,
+                )?)))
+            })),
+            complete: Some(Arc::new(move |_, _| {
+                completed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })),
+            ..ReceiveSeams::default()
+        };
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(seams);
+        assert_eq!(
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap(),
+            FetchStatus::Complete
+        );
+        assert_eq!(fetcher.rail.taken_bytes, expected_requested);
+        assert_eq!(completions.load(Ordering::Relaxed), 2);
+        assert!(
+            !output
+                .join("objects")
+                .join(crate::object_name(&skipped))
+                .exists()
+        );
+        discard(&[&bundle, &output]);
     }
 
     /// Rounds one rail until its plan exists, which is where rails join.
@@ -923,6 +1276,220 @@ mod tests {
     }
 
     #[test]
+    fn a_push_uses_the_same_engines_with_the_holder_as_client() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) = built_bundle("in-process-push", &[("a.bin", patterned(60_000))]);
+        let issuer = SigningKey::from_bytes(&[41; 32]);
+        let holder_key = SigningKey::from_bytes(&[42; 32]);
+        let descriptor = match decode_control(&BundleServer::open(&bundle).unwrap().announcement[0])
+        {
+            TypedFrame::PackageDescriptor(descriptor) => descriptor.package,
+            _ => panic!("the announcement descriptor"),
+        };
+        let package_length = descriptor.length;
+        let requirement = crate::authz::PushRequirement::new(
+            "issuer.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "receiver.example",
+        );
+        let token = crate::authz::issue_push(
+            "issuer.example",
+            "receiver.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            package_length,
+            crate::authz::now_seconds().unwrap(),
+            3_600,
+        )
+        .unwrap();
+        let holder = Arc::new(crate::authz::Holder::new(token, holder_key).unwrap());
+        let binding = vot_transport_api::ChannelBinding::from_bytes(
+            [0x37; vot_transport_api::CHANNEL_BINDING_LEN],
+        );
+        let (mut client, mut receiver) = crate::harness::duplex_pair();
+        client.set_channel_binding(binding);
+        receiver.set_channel_binding(binding);
+
+        let serving_bundle = bundle.to_path_buf();
+        let pushing = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let extensions = BTreeSet::from([vot_codec::extension_id::PUSH]);
+            let session = Session::client(
+                client,
+                vot_codec::Settings::default(),
+                extensions,
+                vot_session::Authentication::Presenting,
+            );
+            let mut push = crate::ServeSession::begin_push_session(&server, session, holder)?;
+            crate::drive(&mut push)
+        });
+
+        let extensions = BTreeSet::from([vot_codec::extension_id::PUSH]);
+        let mut session = Session::server(
+            receiver,
+            vot_codec::Settings::default(),
+            extensions,
+            vot_session::Authentication::Capability {
+                challenge: requirement.challenge([9; 32]),
+            },
+        );
+        session.begin().unwrap();
+        let scope = loop {
+            if let Some((challenge, open)) = session.pending_authorization() {
+                let scope = requirement
+                    .decide(
+                        challenge,
+                        open,
+                        binding,
+                        crate::authz::now_seconds().unwrap(),
+                    )
+                    .expect("the push capability");
+                session
+                    .grant(vot_capability::encode_scope(&scope).unwrap())
+                    .unwrap();
+                break scope;
+            }
+            let _ = session.poll().unwrap();
+            session.flush().unwrap();
+            session
+                .driver()
+                .wait_for_event(std::time::Duration::from_millis(10));
+        };
+        let output = temporary("in-process-pushed");
+        assert_eq!(
+            (scope.suite, scope.root, scope.length),
+            (descriptor.suite, descriptor.root, Some(descriptor.length))
+        );
+        let mut fetcher = BundleFetcher::from_started_session(session, &output, Some(scope.root))
+            .expect("a receiver");
+        assert_eq!(crate::drive(&mut fetcher).unwrap(), FetchStatus::Complete);
+        assert_eq!(fetcher.package(), Some(built));
+        drop(fetcher);
+        assert_eq!(
+            pushing.join().unwrap().unwrap(),
+            crate::ServeStatus::Disconnected,
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    fn a_push_descriptor_must_match_the_granted_scope_before_any_object() {
+        let push = BTreeSet::from([vot_codec::extension_id::PUSH]);
+        let client_adapter = Loopback::default();
+        let server_adapter = Loopback::default();
+        let mut client = Session::client(
+            client_adapter,
+            Settings::default(),
+            push.clone(),
+            Authentication::Presenting,
+        );
+        let challenge = vot_codec::frames::AuthContext {
+            nonce: vec![7; 32],
+            binding: vot_codec::frames::Binding::None,
+            formats: vec![3],
+        };
+        let mut server = Session::server(
+            server_adapter,
+            Settings::default(),
+            push,
+            Authentication::Capability {
+                challenge: challenge.clone(),
+            },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        let mut sequence = 0;
+        pump(client.driver(), server.driver(), &mut sequence);
+        server.poll().unwrap();
+        pump(server.driver(), client.driver(), &mut sequence);
+        client.poll().unwrap();
+        let scope = crate::authz::push_scope([8; 32], 10);
+        client
+            .present(vot_codec::frames::SessionOpen {
+                session_id: [2; 16],
+                capability_format: 3,
+                capability: vec![1],
+                requested_scope: Vec::new(),
+                binding_proof: Vec::new(),
+            })
+            .unwrap();
+        pump(client.driver(), server.driver(), &mut sequence);
+        server.poll().unwrap();
+        server
+            .grant(vot_capability::encode_scope(&scope).unwrap())
+            .unwrap();
+        let output = temporary("push-descriptor-mismatch");
+        let mut fetcher = BundleFetcher::from_started_session(server, &output, None).unwrap();
+        let reported = fetcher
+            .dispatch(
+                &encoded(&TypedFrame::Error(frames::ErrorFrame {
+                    code: error_code::ADMISSION_DENIED,
+                    detail: b"refused".to_vec(),
+                }))
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            reported,
+            Fault::Reported(error_code::ADMISSION_DENIED)
+        ));
+        let descriptor = PackageDescriptor {
+            package: frames::ObjectId {
+                suite: 1,
+                root: [9; 32],
+                length: 10,
+            },
+            manifest_id: [0; 16],
+            page_count: 1,
+        };
+        let fault = fetcher
+            .dispatch(&encoded(&TypedFrame::PackageDescriptor(descriptor)).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            &fault,
+            Fault::Peer(error_code::OBJECT_IDENTITY_MISMATCH)
+        ));
+        assert_eq!(
+            fetcher.fail(fault).unwrap(),
+            FetchStatus::Closed(error_code::OBJECT_IDENTITY_MISMATCH)
+        );
+        pump(
+            fetcher.session_mut().driver(),
+            client.driver(),
+            &mut sequence,
+        );
+        let mut reported = false;
+        for _ in 0..4 {
+            match client.poll() {
+                Ok(Some(Event::Control(bytes))) => {
+                    reported = matches!(
+                        decode_control(&bytes),
+                        TypedFrame::Error(frames::ErrorFrame {
+                            code,
+                            detail,
+                        }) if code == error_code::OBJECT_IDENTITY_MISMATCH
+                            && detail.is_empty()
+                    );
+                    break;
+                }
+                Ok(Some(_) | None) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(reported, "the descriptor mismatch sent no ERROR frame");
+        assert!(
+            fs::read_dir(output.join("objects"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
     pub(crate) fn a_striped_fetch_over_threads_completes_and_spawns_its_rails() {
         // The connect count pins that the rail was spawned; width one
         // would pass every other assertion.
@@ -1119,6 +1686,64 @@ mod tests {
         );
         assert_same_tree(&bundle, &output);
         discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn custom_sinks_do_not_inherit_the_directory_resume_map() {
+        let (bundle, _) = built_bundle(
+            "custom-resume",
+            &[("a.bin", patterned(300_001)), ("b.bin", noise(300_002))],
+        );
+        let output = temporary("custom-resume-old");
+        {
+            let (server, mut session, mut connection) = serving(&bundle);
+            let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            let mut sequence = 0;
+            for _ in 0..ROUND_BUDGET {
+                round(
+                    &server,
+                    &mut session,
+                    &mut connection,
+                    &mut fetcher,
+                    &mut sequence,
+                );
+                if fetcher.locked_plan().is_some_and(|plan| plan.current == 1) {
+                    break;
+                }
+            }
+            assert_eq!(fetcher.locked_plan().unwrap().current, 1);
+        }
+
+        let custom = temporary("custom-resume-new");
+        fs::create_dir_all(&custom).unwrap();
+        let destination = custom.to_path_buf();
+        let seams = ReceiveSeams {
+            sink: Some(Arc::new(move |_, object| {
+                Ok(Some(Box::new(CountingSink::at(
+                    &destination.join(crate::object_name(&object.object.root)),
+                    object.object.length,
+                )?)))
+            })),
+            ..ReceiveSeams::default()
+        };
+        let (server, mut session, mut connection) = serving(&bundle);
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        assert!(fetcher.resuming);
+        fetcher.set_receive_seams(seams);
+        assert_eq!(
+            run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).unwrap(),
+            FetchStatus::Complete
+        );
+        let plan = fetcher.locked_plan().unwrap();
+        let total: u64 = plan.objects.iter().map(|object| object.object.length).sum();
+        assert_eq!(fetcher.rail.taken_bytes, total);
+        assert!(plan.objects.iter().all(|object| object.resumed.is_empty()));
+        assert!(plan.objects.iter().all(|object| {
+            custom
+                .join(crate::object_name(&object.object.root))
+                .exists()
+        }));
+        discard(&[&bundle, &output, &custom]);
     }
 
     #[test]
@@ -1450,7 +2075,7 @@ mod tests {
         )
         .unwrap();
 
-        sink.durable.as_ref().unwrap().flush(&sink.file);
+        sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
         assert_eq!(
             store
                 .lock()
@@ -1477,7 +2102,7 @@ mod tests {
             plan.covered.insert(0, unit);
         }
         let before = store.lock().unwrap().checkpointed(subject).unwrap().count();
-        sink.durable.as_ref().unwrap().flush(&sink.file);
+        sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
         assert_eq!(
             store.lock().unwrap().checkpointed(subject).unwrap().count(),
             before,
@@ -1938,7 +2563,44 @@ mod tests {
             !fetcher.has_backlog(),
             "nothing was asked for on its account"
         );
-        discard(&[&output]);
+
+        let skipped_output = temporary("emptyobj-skipped");
+        let mut skipped = BundleFetcher::begin(Loopback::default(), &skipped_output, None).unwrap();
+        skipped.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary,
+            objects: vec![PlannedObject::fresh(empty)],
+            current: 0,
+            active: None,
+            placed_before: 0,
+            carried_before: 0,
+            next_offset: 0,
+            covered: CoverageMap::new(),
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: None,
+            finished: false,
+        })));
+        let factory_calls = Arc::new(AtomicU64::new(0));
+        let called = Arc::clone(&factory_calls);
+        skipped.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, object| {
+                assert_eq!(object.object, empty);
+                called.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            })),
+            ..ReceiveSeams::default()
+        });
+        skipped.advance().unwrap();
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+        assert!(skipped.complete());
+        assert!(
+            !skipped_output
+                .join("objects")
+                .join(crate::object_name(&empty.root))
+                .exists()
+        );
+        discard(&[&output, &skipped_output]);
     }
 
     #[test]
@@ -1950,20 +2612,18 @@ mod tests {
         announce(&server, &mut session, &mut connection, &mut fetcher);
         fetcher.service().unwrap();
 
-        // A well-formed frame this end does not consume is not an answer,
-        // and not a fault either.
+        // A well-formed bidirectional frame this end does not consume is not
+        // an answer, and not a fault either.
         fetcher
             .session_mut()
             .driver()
             .events
-            .push_back(control_event(&TypedFrame::ManifestRequest(
-                ManifestRequest {
-                    request_id: [3; 16],
-                    manifest_id: [4; 16],
-                    first_page: 0,
-                    page_count: 1,
-                },
-            )));
+            .push_back(control_event(&TypedFrame::Capacity(frames::Capacity {
+                epoch: 3,
+                available_bytes: 4,
+                bdp_target_bytes: 5,
+                max_inflight_bytes: 6,
+            })));
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
 
         // Bytes past the frame the envelope declared are malformed.

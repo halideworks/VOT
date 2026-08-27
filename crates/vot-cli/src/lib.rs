@@ -15,9 +15,9 @@ use vot_manifest::{
 use vot_manifest::{EntryKind, ObjectId, StorageRef, encode_page, encode_seal};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 pub use vot_package::PackageSummary;
+pub use vot_package::{EntryRecord, Storage};
 pub(crate) use vot_package::{
-    EntryRecord, PackageAssembly, PackageBuilder, PackageIngest, PackageRootBuilder, PageDraft,
-    Storage,
+    PackageAssembly, PackageBuilder, PackageIngest, PackageRootBuilder, PageDraft,
 };
 use vot_receipt::{
     AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
@@ -46,15 +46,21 @@ mod side_channel;
 mod wire;
 
 pub use drive::{Engine, ServeSession, drive};
-pub use fetch::{BundleFetcher, FetchStatus};
+pub use fetch::{
+    BundleFetcher, CancellationHandle, CountingSink, FetchStatus, ReceiveObject, ReceiveSeams,
+    ReceiveSessionId, ReceiveSink,
+};
 #[cfg(not(feature = "wire"))]
 pub use nowire::{
-    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+    fetch_bundle, fetch_via_rendezvous, push_bundle, receive_push, relay_service,
+    rendezvous_service, serve_bundle,
 };
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
 pub use wire::{
-    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+    Listener, PushAdmission, PushPresentation, bind_push_listener, fetch_bundle,
+    fetch_via_rendezvous, push_bundle, receive_push, receive_push_on, relay_service,
+    rendezvous_service, serve_bundle,
 };
 
 mod keys;

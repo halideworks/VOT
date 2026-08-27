@@ -2586,6 +2586,41 @@ mod tests {
     }
 
     #[test]
+    fn goaway_may_narrow_but_never_increase_its_cursor() {
+        let (bundle, _) = built_bundle("goaway-cursor", &[("a.bin", patterned(10))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut connection = ServeConnection::new();
+        for cursor in [1, 0, 0] {
+            let wire = encoded(&TypedFrame::GoAway(frames::GoAway { cursor })).unwrap();
+            assert!(server.dispatch(&wire, &mut connection, 16).is_ok());
+            assert_eq!(connection.goaway_cursor, Some(cursor));
+        }
+        let wire = encoded(&TypedFrame::GoAway(frames::GoAway { cursor: 1 })).unwrap();
+        assert!(server.dispatch(&wire, &mut connection, 16).is_err());
+        let mut fresh = ServeConnection::new();
+        let wire = encoded(&TypedFrame::GoAway(frames::GoAway { cursor: 2 })).unwrap();
+        assert!(server.dispatch(&wire, &mut fresh, 16).is_err());
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn a_reported_error_is_terminal_to_the_server() {
+        let (bundle, _) = built_bundle("reported-error", &[("a.bin", patterned(10))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        let mut connection = ServeConnection::new();
+        let wire = encoded(&TypedFrame::Error(frames::ErrorFrame {
+            code: error_code::ADMISSION_DENIED,
+            detail: Vec::new(),
+        }))
+        .unwrap();
+        assert!(matches!(
+            server.dispatch(&wire, &mut connection, 16),
+            Err(Fault::Peer(error_code::ADMISSION_DENIED))
+        ));
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     fn an_epoch_whose_symbols_are_still_queued_is_never_retired() {
         // The other half: silence about an epoch this end has not finished
         // sending says nothing about the receiver, however long it lasts.

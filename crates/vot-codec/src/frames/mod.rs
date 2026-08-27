@@ -3,7 +3,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::missing_errors_doc)]
 
 use super::{
-    DecodeError, DecodeLimits, DecodedFrame, decode_one, encode_frame, encode_varint, frame_type,
+    DecodeError, DecodeLimits, DecodedFrame, decode_one, decode_varint, encode_frame,
+    encode_varint, frame_type,
 };
 use std::ops::Range;
 
@@ -65,6 +66,8 @@ pub enum TypedFrame {
     SessionOpen(SessionOpen),
     SessionAccept(SessionAccept),
     SessionReject(SessionReject),
+    GoAway(GoAway),
+    Error(ErrorFrame),
     PackageDescriptor(PackageDescriptor),
     ManifestRequest(ManifestRequest),
     ManifestPage(Vec<u8>),
@@ -93,6 +96,8 @@ impl TypedFrame {
             Self::SessionOpen(_) => frame_type::SESSION_OPEN,
             Self::SessionAccept(_) => frame_type::SESSION_ACCEPT,
             Self::SessionReject(_) => frame_type::SESSION_REJECT,
+            Self::GoAway(_) => frame_type::GOAWAY,
+            Self::Error(_) => frame_type::ERROR,
             Self::PackageDescriptor(_) => frame_type::PACKAGE_DESCRIPTOR,
             Self::ManifestRequest(_) => frame_type::MANIFEST_REQUEST,
             Self::ManifestPage(_) => frame_type::MANIFEST_PAGE,
@@ -126,6 +131,8 @@ pub fn encode(frame: &TypedFrame, output: &mut Vec<u8>) -> Result<(), Error> {
         TypedFrame::SessionOpen(value) => encode_session_open(value, &mut payload)?,
         TypedFrame::SessionAccept(value) => encode_session_accept(value, &mut payload)?,
         TypedFrame::SessionReject(value) => encode_session_reject(value, &mut payload)?,
+        TypedFrame::GoAway(value) => encode_goaway(*value, &mut payload)?,
+        TypedFrame::Error(value) => encode_error(value, &mut payload)?,
         TypedFrame::PackageDescriptor(value) => encode_package_descriptor(value, &mut payload)?,
         TypedFrame::ManifestRequest(value) => encode_manifest_request(value, &mut payload)?,
         TypedFrame::ManifestPage(bytes) => {
@@ -231,6 +238,8 @@ pub fn decode(input: &[u8], limits: DecodeLimits) -> Result<(TypedFrame, usize),
         frame_type::SESSION_OPEN => TypedFrame::SessionOpen(decode_session_open(payload)?),
         frame_type::SESSION_ACCEPT => TypedFrame::SessionAccept(decode_session_accept(payload)?),
         frame_type::SESSION_REJECT => TypedFrame::SessionReject(decode_session_reject(payload)?),
+        frame_type::GOAWAY => TypedFrame::GoAway(decode_goaway(payload)?),
+        frame_type::ERROR => TypedFrame::Error(decode_error(payload)?),
         frame_type::PACKAGE_DESCRIPTOR => {
             TypedFrame::PackageDescriptor(decode_package_descriptor(payload)?)
         }
@@ -1267,6 +1276,49 @@ mod tests {
             reason: u64::from(crate::error_code::REPLAY_REJECTED),
             detail: "scope".to_owned(),
         }));
+    }
+
+    #[test]
+    fn goaway_has_one_varint_payload() {
+        let frame = TypedFrame::GoAway(GoAway { cursor: 7 });
+        let mut encoded = Vec::new();
+        encode(&frame, &mut encoded).unwrap();
+        assert_eq!(encoded, [0x40, 0x83, 0x01, 0x07]);
+        round_trip(&frame);
+
+        assert_eq!(
+            decode(
+                &[0x40, 0x83, 0x02, 0x07, 0x00],
+                DecodeLimits {
+                    max_unknown_payload: 1 << 20,
+                    max_frames: 1,
+                },
+            ),
+            Err(Error::Malformed),
+        );
+    }
+
+    #[test]
+    fn error_carries_a_code_then_diagnostics() {
+        let frame = TypedFrame::Error(ErrorFrame {
+            code: crate::error_code::OBJECT_IDENTITY_MISMATCH,
+            detail: b"no".to_vec(),
+        });
+        let mut encoded = Vec::new();
+        encode(&frame, &mut encoded).unwrap();
+        assert_eq!(encoded, [0x40, 0x85, 0x04, 0x43, 0x02, b'n', b'o']);
+        round_trip(&frame);
+
+        assert_eq!(
+            decode(
+                &[0x40, 0x85, 0x01, 0x01],
+                DecodeLimits {
+                    max_unknown_payload: 1 << 20,
+                    max_frames: 1,
+                },
+            ),
+            Err(Error::InvalidValue),
+        );
     }
 
     #[test]

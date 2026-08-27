@@ -96,7 +96,7 @@ pub struct Negotiation {
     /// Why the last attempt was refused, for a caller deciding whether another
     /// is worth making. Cleared when one is.
     refusal: Option<SessionReject>,
-    peer_hello: Option<Hello>,
+    pub(super) peer_hello: Option<Hello>,
     pub(super) peer_settings: Option<Settings>,
 }
 
@@ -215,6 +215,10 @@ impl Negotiation {
         self.peer_hello.as_ref().is_some_and(|hello| {
             self.extensions.contains(&extension) && hello.extensions.contains(&extension)
         })
+    }
+
+    pub(super) const fn peer_hello_received(&self) -> bool {
+        self.peer_hello.is_some()
     }
 
     /// What the peer said about itself.
@@ -702,8 +706,11 @@ impl Negotiation {
         };
         // Encoded and measured before the request is spent. Dropping it first
         // would leave a peer waiting on a decision nothing holds.
-        let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionAccept(accept))?;
+        let frame = Self::session_frame(&vot_codec::frames::TypedFrame::SessionAccept(
+            accept.clone(),
+        ))?;
         self.within_peer_control_limit(&frame)?;
+        self.granted = Some(accept);
         self.open = None;
         self.state = State::Authenticated;
         Ok(vec![frame])

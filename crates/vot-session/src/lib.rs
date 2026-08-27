@@ -848,6 +848,56 @@ mod tests {
         };
         assert_eq!(accept.session_id, [7; 16], "the identity of the request");
         assert_eq!(accept.granted_scope, b"read:objects");
+        assert_eq!(
+            server.granted().map(|grant| grant.granted_scope.as_slice()),
+            Some(b"read:objects".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_required_extension_and_exact_grant_are_enforced_immediately() {
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::from([vot_codec::extension_id::PUSH]),
+            Authentication::NotRequired { nonce: [1; 32] },
+        );
+        client.require_extension(vot_codec::extension_id::PUSH);
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [1; 32] },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        let error = client.poll().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::RequiredExtensionUnavailable {
+                extension: vot_codec::extension_id::PUSH
+            }
+        );
+
+        let (mut client, mut server) = demanding_pair(Settings::default(), Settings::default());
+        client.require_granted_scope(b"exact".to_vec());
+        client.present(request([7; 16], 4)).unwrap();
+        pump(&mut client, &mut server);
+        server.grant(b"narrow".to_vec()).unwrap();
+        for frame in std::mem::take(&mut server.adapter.sent) {
+            client.adapter.events.push_back(control(&frame));
+        }
+        assert_eq!(
+            client.poll().unwrap_err().kind(),
+            &ErrorKind::GrantedScopeMismatch
+        );
     }
 
     #[test]
@@ -1011,7 +1061,7 @@ mod tests {
             "the scope the server authorized, which the caller has no other way to learn"
         );
         assert!(client.last_refusal().is_none());
-        client
+        server
             .send_reliable(StreamId(1), &data_record(b"payload"))
             .unwrap();
     }
@@ -1807,11 +1857,11 @@ mod tests {
             "nothing reached the backend"
         );
 
-        let (mut client, _server) = negotiated();
-        client
+        let (_client, mut server) = negotiated();
+        server
             .send_reliable(StreamId(1), &data_record(b"record"))
             .unwrap();
-        assert_eq!(client.adapter.records.len(), 1);
+        assert_eq!(server.adapter.records.len(), 1);
     }
 
     #[test]
@@ -1831,20 +1881,26 @@ mod tests {
         client.begin().unwrap();
         server.begin().unwrap();
 
-        let sent = std::mem::take(&mut client.adapter.sent);
-        server.adapter.events.push_back(control(&sent[0]));
-        server.adapter.events.push_back(record(7, b"early"));
-        server.adapter.events.push_back(control(&sent[1]));
-        server.adapter.events.push_back(record(8, b"also early"));
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        server.poll().unwrap();
+        let sent = std::mem::take(&mut server.adapter.sent);
+        client.adapter.events.push_back(control(&sent[0]));
+        client.adapter.events.push_back(record(7, b"early"));
+        for frame in &sent[1..] {
+            client.adapter.events.push_back(control(frame));
+        }
+        client.adapter.events.push_back(record(8, b"also early"));
 
-        let first = server
+        let first = client
             .poll()
             .unwrap()
             .expect("the held records are released");
-        assert!(server.is_ready());
+        assert!(client.is_ready());
         assert_eq!(first, record(7, b"early"));
-        assert_eq!(server.poll().unwrap(), Some(record(8, b"also early")));
-        assert_eq!(server.poll().unwrap(), None);
+        assert_eq!(client.poll().unwrap(), Some(record(8, b"also early")));
+        assert_eq!(client.poll().unwrap(), None);
     }
 
     #[test]
@@ -2204,7 +2260,7 @@ mod tests {
 
     #[test]
     fn every_submission_path_reaches_the_backend() {
-        let (mut client, _server) = negotiated();
+        let (mut client, mut server) = negotiated();
         let flushes = client.adapter().flushes;
         let control = vot_transport_api::shared_payload(&frame_of(frame_type::PING, 0));
         client.send_control_shared(control.clone()).unwrap();
@@ -2212,20 +2268,20 @@ mod tests {
             control.as_ptr(),
             client.adapter().shared_controls[0].as_ptr()
         );
-        client
+        server
             .send_reliable_shared(
                 StreamId(3),
                 vot_transport_api::shared_payload(&data_record(b"shared")),
             )
             .unwrap();
         assert_eq!(
-            client.adapter().records,
+            server.adapter().records,
             vec![(StreamId(3), data_record(b"shared"))]
         );
         client.flush().unwrap();
         assert_eq!(client.adapter().flushes, flushes + 1);
 
-        let mut refusing = Session::client(
+        let mut refusing = Session::server(
             Loopback {
                 refuse_sends: Some(TransportError::RecordTooLarge),
                 ..Loopback::default()
@@ -2820,13 +2876,13 @@ mod tests {
         };
         let mut client = Session::client(
             Loopback::default(),
-            Settings::default(),
+            peer,
             BTreeSet::new(),
             Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         let mut server = Session::server(
             Loopback::default(),
-            peer,
+            Settings::default(),
             BTreeSet::new(),
             Authentication::NotRequired { nonce: [0x5a; 32] },
         );
@@ -2840,12 +2896,12 @@ mod tests {
             client.adapter.events.push_back(control(&frame));
         }
         client.poll().unwrap();
-        assert!(client.is_ready());
+        assert!(client.is_ready() && server.is_ready());
 
-        client
+        server
             .send_reliable(StreamId(1), &data_record(&vec![0; 64 * 1024]))
             .unwrap();
-        let error = client
+        let error = server
             .send_reliable(StreamId(1), &data_record(&vec![0; 64 * 1024 + 1]))
             .unwrap_err();
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
@@ -2860,7 +2916,7 @@ mod tests {
         );
         assert!(data_record(&vec![0; 64 * 1024]).len() > 64 * 1024);
         assert_eq!(
-            client
+            server
                 .send_reliable_shared(
                     StreamId(1),
                     vot_transport_api::shared_payload(&data_record(&vec![0; 64 * 1024 + 1]))
@@ -2869,7 +2925,7 @@ mod tests {
                 .kind(),
             error.kind()
         );
-        assert_eq!(client.adapter().records.len(), 1, "only the one that fits");
+        assert_eq!(server.adapter().records.len(), 1, "only the one that fits");
     }
 
     #[test]
@@ -2969,6 +3025,8 @@ mod tests {
                     ExtensionPolicy::Negotiated(&nothing),
                     lane,
                     side,
+                    EndpointRole::Client,
+                    false,
                 )
                 .unwrap();
                 let error = check_frame(
@@ -2977,6 +3035,8 @@ mod tests {
                     ExtensionPolicy::Negotiated(&nothing),
                     lane,
                     side,
+                    EndpointRole::Client,
+                    false,
                 )
                 .unwrap_err();
                 assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
@@ -3005,31 +3065,160 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table pins all ten frames in both modes and both directions"
+    )]
+    fn push_reverses_exactly_the_publish_and_request_frames() {
+        let negotiation_for = |role, push| {
+            let extensions = if push {
+                BTreeSet::from([vot_codec::extension_id::PUSH])
+            } else {
+                BTreeSet::new()
+            };
+            let mut negotiation = match role {
+                EndpointRole::Client => {
+                    Negotiation::client(Settings::default(), extensions.clone())
+                }
+                EndpointRole::Server => Negotiation::server(
+                    Settings::default(),
+                    extensions.clone(),
+                    no_capability([0; 32]),
+                ),
+            };
+            negotiation.peer_hello = Some(vot_codec::Hello {
+                draft_revision: vot_codec::DRAFT_REVISION,
+                endpoint_role: match role {
+                    EndpointRole::Client => EndpointRole::Server,
+                    EndpointRole::Server => EndpointRole::Client,
+                },
+                extensions,
+            });
+            negotiation
+        };
+        let cases = [
+            (frame_type::PACKAGE_DESCRIPTOR, true),
+            (frame_type::MANIFEST_PAGE, true),
+            (frame_type::PROGRESSIVE_PAGE, true),
+            (frame_type::SEAL, true),
+            (frame_type::PROOF_BUNDLE, true),
+            (frame_type::DATA_RECORD, true),
+            (frame_type::MANIFEST_REQUEST, false),
+            (frame_type::HAVE, false),
+            (frame_type::RANGE_REQUEST, false),
+            (frame_type::RANGE_CANCEL, false),
+        ];
+        for push in [false, true] {
+            let publisher = if push {
+                EndpointRole::Client
+            } else {
+                EndpointRole::Server
+            };
+            for (kind, publication) in cases {
+                let expected = if publication {
+                    publisher
+                } else if publisher == EndpointRole::Client {
+                    EndpointRole::Server
+                } else {
+                    EndpointRole::Client
+                };
+                for sender in [EndpointRole::Client, EndpointRole::Server] {
+                    let allowed = sender == expected;
+                    assert_eq!(
+                        direction_allowed(kind, sender, push, Side::Peer),
+                        allowed,
+                        "outbound {kind:#x}, push {push}, sender {sender:?}",
+                    );
+                    assert_eq!(
+                        check_direction(kind, &negotiation_for(sender, push), sender, Side::Peer)
+                            .is_ok(),
+                        allowed,
+                    );
+                    let local = if sender == EndpointRole::Client {
+                        EndpointRole::Server
+                    } else {
+                        EndpointRole::Client
+                    };
+                    assert_eq!(
+                        direction_allowed(kind, local, push, Side::Local),
+                        allowed,
+                        "inbound {kind:#x}, push {push}, sender {sender:?}",
+                    );
+                    assert_eq!(
+                        check_direction(kind, &negotiation_for(local, push), local, Side::Local)
+                            .is_ok(),
+                        allowed,
+                    );
+                }
+            }
+        }
+
+        let (mut client, mut server) = negotiated();
+        assert!(matches!(
+            client
+                .send_reliable(StreamId(1), &data_record(b"wrong publisher"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::FrameFromWrongRole { .. }
+        ));
+        assert!(matches!(
+            server
+                .send_control(&frame_of(frame_type::MANIFEST_REQUEST, 0))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::FrameFromWrongRole { .. }
+        ));
+
+        let mut client = Session::client(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [1; 32] },
+        );
+        let mut server = Session::server(
+            Loopback::default(),
+            Settings::default(),
+            BTreeSet::new(),
+            Authentication::NotRequired { nonce: [1; 32] },
+        );
+        client.begin().unwrap();
+        server.begin().unwrap();
+        server.adapter.events.push_back(record(1, b"too early"));
+        for frame in std::mem::take(&mut client.adapter.sent) {
+            server.adapter.events.push_back(control(&frame));
+        }
+        assert!(matches!(
+            server.poll().unwrap_err().kind(),
+            ErrorKind::FrameFromWrongRole { .. }
+        ));
+    }
+
+    #[test]
     fn a_frame_past_a_negotiated_limit_is_refused_on_the_way_out_and_in() {
         let peer = Settings {
             max_manifest_page_payload: 64 * 1024,
             ..Settings::default()
         };
-        let (mut client, mut server) = negotiated_with(Settings::default(), peer);
+        let (mut client, mut server) = negotiated_with(peer, Settings::default());
 
-        client
+        server
             .send_control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024))
             .unwrap();
-        let error = client
+        let error = server
             .send_control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024 + 1))
             .unwrap_err();
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert!(!error.kind().is_peer_fault());
-        assert!(client.adapter().closed.is_empty());
+        assert!(server.adapter().closed.is_empty());
 
-        server
+        client
             .adapter
             .events
             .push_back(control(&frame_of(frame_type::MANIFEST_PAGE, 64 * 1024 + 1)));
-        let error = server.poll().unwrap_err();
+        let error = client.poll().unwrap_err();
         assert_eq!(error.close_code(), error_code::FRAME_TOO_LARGE);
         assert!(error.kind().is_peer_fault());
-        assert_eq!(server.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
+        assert_eq!(client.adapter().closed, vec![error_code::FRAME_TOO_LARGE]);
     }
 
     #[test]
@@ -3038,12 +3227,12 @@ mod tests {
             reliable_lane_limit: 1,
             ..Settings::default()
         };
-        let (mut client, _server) = negotiated_with(Settings::default(), peer);
+        let (_client, mut server) = negotiated_with(peer, Settings::default());
         let record = data_record(b"record");
 
-        client.send_reliable(StreamId(1), &record).unwrap();
-        client.send_reliable(StreamId(1), &record).unwrap();
-        let error = client.send_reliable(StreamId(2), &record).unwrap_err();
+        server.send_reliable(StreamId(1), &record).unwrap();
+        server.send_reliable(StreamId(1), &record).unwrap();
+        let error = server.send_reliable(StreamId(2), &record).unwrap_err();
         assert_eq!(error.close_code(), error_code::RESOURCE_LIMIT);
         assert_eq!(
             error.kind(),
@@ -3053,7 +3242,7 @@ mod tests {
             }
         );
         assert!(!error.kind().is_peer_fault());
-        assert_eq!(client.adapter().records.len(), 2);
+        assert_eq!(server.adapter().records.len(), 2);
     }
 
     #[test]
@@ -3062,16 +3251,16 @@ mod tests {
             reliable_lane_limit: 1,
             ..Settings::default()
         };
-        let (mut client, _server) = negotiated_with(Settings::default(), peer);
-        client.adapter.refuse_sends = Some(TransportError::OutboundQueueFull);
+        let (_client, mut server) = negotiated_with(peer, Settings::default());
+        server.adapter.refuse_sends = Some(TransportError::OutboundQueueFull);
         let record = data_record(b"record");
-        assert!(client.send_reliable(StreamId(1), &record).is_err());
+        assert!(server.send_reliable(StreamId(1), &record).is_err());
 
-        client.adapter.refuse_sends = None;
-        client.send_reliable(StreamId(2), &record).unwrap();
-        assert_eq!(client.adapter().records.len(), 1);
+        server.adapter.refuse_sends = None;
+        server.send_reliable(StreamId(2), &record).unwrap();
+        assert_eq!(server.adapter().records.len(), 1);
         assert_eq!(
-            client
+            server
                 .send_reliable(StreamId(3), &record)
                 .unwrap_err()
                 .kind(),

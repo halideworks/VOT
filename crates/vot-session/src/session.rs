@@ -36,6 +36,8 @@ pub struct Session<A> {
     channel_binding: Option<ChannelBinding>,
     /// Whether this authentication policy requires carrier-derived material.
     binding_required: bool,
+    required_extensions: BTreeSet<u64>,
+    expected_granted_scope: Option<Vec<u8>>,
 }
 
 impl<A: TransportAdapter> Session<A> {
@@ -94,6 +96,8 @@ impl<A: TransportAdapter> Session<A> {
             control_limit_applied: false,
             channel_binding: None,
             binding_required: false,
+            required_extensions: BTreeSet::new(),
+            expected_granted_scope: None,
         }
     }
 
@@ -126,6 +130,16 @@ impl<A: TransportAdapter> Session<A> {
     #[must_use]
     pub fn extension_negotiated(&self, extension: u64) -> bool {
         self.negotiation.extension_is_negotiated(extension)
+    }
+
+    /// Requires a client-offered extension to appear in the server's answer.
+    pub fn require_extension(&mut self, extension: u64) {
+        self.required_extensions.insert(extension);
+    }
+
+    /// Requires the server to grant exactly `scope` before the data plane opens.
+    pub fn require_granted_scope(&mut self, scope: Vec<u8>) {
+        self.expected_granted_scope = Some(scope);
     }
 
     /// Whether the application may use the data plane.
@@ -309,7 +323,7 @@ impl<A: TransportAdapter> Session<A> {
             return Ok(self.drain_lifecycle());
         }
         if self.negotiation.is_ready()
-            && let Some(event) = self.take_pending()
+            && let Some(event) = self.take_pending()?
         {
             return Ok(Some(event));
         }
@@ -321,7 +335,40 @@ impl<A: TransportAdapter> Session<A> {
                 }
                 Event::Control(bytes) => {
                     self.check_inbound(&bytes, Lane::Control)?;
-                    if let Some(event) = self.accept_control(&bytes)? {
+                    let accepted = self.accept_control(&bytes)?;
+                    // A rejection is an application decision even when the
+                    // carrier closes immediately behind it. Give the caller
+                    // a turn to read `last_refusal` before lifecycle handling.
+                    if self.negotiation.last_refusal().is_some() {
+                        return Ok(None);
+                    }
+                    if let (Some(expected), Some(granted)) =
+                        (&self.expected_granted_scope, self.negotiation.granted())
+                        && &granted.granted_scope != expected
+                    {
+                        let error = Error::new(
+                            ErrorKind::GrantedScopeMismatch,
+                            error_code::AUTHORIZATION_FAILED,
+                        );
+                        return Err(self.fail(error));
+                    }
+                    if self.negotiation.peer_hello_received()
+                        && let Some(extension) = self
+                            .required_extensions
+                            .iter()
+                            .find(|extension| {
+                                !self.negotiation.extension_is_negotiated(**extension)
+                            })
+                            .copied()
+                    {
+                        let _ = self.adapter.close(error_code::EXPERIMENT_NOT_NEGOTIATED);
+                        self.negotiation.abandon();
+                        return Err(Error::new(
+                            ErrorKind::RequiredExtensionUnavailable { extension },
+                            error_code::EXPERIMENT_NOT_NEGOTIATED,
+                        ));
+                    }
+                    if let Some(event) = accepted {
                         return Ok(Some(event));
                     }
                 }
@@ -359,7 +406,7 @@ impl<A: TransportAdapter> Session<A> {
                 other => return Ok(Some(other)),
             }
             if self.negotiation.is_ready()
-                && let Some(event) = self.take_pending()
+                && let Some(event) = self.take_pending()?
             {
                 return Ok(Some(event));
             }
@@ -644,8 +691,14 @@ impl<A: TransportAdapter> Session<A> {
         None
     }
 
-    fn take_pending(&mut self) -> Option<Event> {
-        self.pending.pop_front()
+    fn take_pending(&mut self) -> Result<Option<Event>, Error> {
+        let Some(event) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+        if let Event::Reliable { bytes, .. } = &event {
+            self.check_inbound(bytes, Lane::Reliable)?;
+        }
+        Ok(Some(event))
     }
 
     /// Whether the application may put a frame on the carrier.
@@ -685,6 +738,8 @@ impl<A: TransportAdapter> Session<A> {
             ExtensionPolicy::Negotiated(&self.negotiation),
             lane,
             Side::Peer,
+            self.negotiation.role,
+            self.is_ready(),
         )
     }
 
@@ -697,6 +752,8 @@ impl<A: TransportAdapter> Session<A> {
             ExtensionPolicy::Negotiated(&self.negotiation),
             lane,
             Side::Local,
+            self.negotiation.role,
+            self.is_ready(),
         )
     }
 

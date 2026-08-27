@@ -1,8 +1,8 @@
 //! The shared fetch plan and its planned objects.
 
 use super::{
-    Arc, BTreeMap, CountingSink, Error, MAX_REQUESTED_RANGE, Mutex, PackageSummary, ResumeStore,
-    SubjectId, frames, range_span, total_units_of,
+    Arc, BTreeMap, CountingSink, EntryRecord, Error, MAX_REQUESTED_RANGE, Mutex, PackageSummary,
+    ResumeStore, SubjectId, frames, range_span, total_units_of,
 };
 
 /// Store reservations for objects with units to checkpoint; zero-length
@@ -137,6 +137,8 @@ pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MA
 #[derive(Clone)]
 pub(crate) struct PlannedObject {
     pub(crate) object: frames::ObjectId,
+    pub(crate) entries: Vec<EntryRecord>,
+    pub(crate) sink_chosen: bool,
     /// Byte extents a previous fetch made durable; the handout skips them.
     pub(crate) resumed: BTreeMap<u64, u64>,
 }
@@ -145,6 +147,8 @@ impl PlannedObject {
     pub(crate) fn fresh(object: frames::ObjectId) -> Self {
         Self {
             object,
+            entries: Vec::new(),
+            sink_chosen: false,
             resumed: BTreeMap::new(),
         }
     }

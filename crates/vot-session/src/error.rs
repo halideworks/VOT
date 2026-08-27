@@ -63,6 +63,8 @@ pub enum ErrorKind {
     /// Neither identifier is carried: a `Debug` derive is one log line from
     /// leaking a session identifier.
     SessionIdentifierMismatch,
+    /// The server granted a different scope from the exact scope required.
+    GrantedScopeMismatch,
     /// The caller answered a request with something that cannot be encoded: a
     /// scope too wide for the frame, or a reason the registry does not assign
     /// to authentication or authorization.
@@ -115,12 +117,20 @@ pub enum ErrorKind {
         extension: u64,
         side: Side,
     },
+    /// A client-required extension was absent from the server's answer.
+    RequiredExtensionUnavailable { extension: u64 },
     /// An application submitted a frame the exchange owns.
     NegotiationFrameFromApplication { frame_type: u64 },
     /// A frame on a stream that does not carry its type.
     FrameOnTheWrongLane {
         frame_type: u64,
         lane: Lane,
+        side: Side,
+    },
+    /// A publish or request frame came from the role that does not send it.
+    FrameFromWrongRole {
+        frame_type: u64,
+        role: EndpointRole,
         side: Side,
     },
     /// The backend refused something the session needed.
@@ -173,6 +183,7 @@ impl ErrorKind {
             | Self::SessionOpenInvalid
             | Self::SessionAnswerInvalid { .. }
             | Self::SessionIdentifierMismatch { .. }
+            | Self::GrantedScopeMismatch
             | Self::BindingProofMismatch { .. }
             | Self::SessionIdentifierReused
             | Self::CapabilityFormatNotOffered { .. }
@@ -187,7 +198,8 @@ impl ErrorKind {
             | Self::LaneLimitExceeded { side, .. }
             | Self::NotExactlyOneFrame { side, .. }
             | Self::ExperimentNotNegotiated { side, .. }
-            | Self::FrameOnTheWrongLane { side, .. } => matches!(side, Side::Local),
+            | Self::FrameOnTheWrongLane { side, .. }
+            | Self::FrameFromWrongRole { side, .. } => matches!(side, Side::Local),
             // Local. Closing over these would blame the peer for something it
             // did not do, or turn backpressure into a teardown.
             Self::NotReady { .. }
@@ -198,6 +210,7 @@ impl ErrorKind {
             | Self::SessionAnswerUnencodable
             | Self::PresentationInvalid(_)
             | Self::AuthenticationRoleMismatch { .. }
+            | Self::RequiredExtensionUnavailable { .. }
             | Self::HandshakeUnsent { .. } => false,
         }
     }

@@ -100,6 +100,7 @@ thing it configures.
 | `0x05` | `CUSTOM_CONGESTION_CONTROL` | experimental | disabled |
 | `0x06` | `MULTIPATH_QUIC` | experimental | disabled |
 | `0x07` | `FEC_COVER_EPOCHS` | experimental | enabled |
+| `0x08` | `PUSH` | experimental | disabled |
 
 Advertising an extension does not authorize its use. Both endpoints must
 negotiate it and local policy must enable it.
@@ -344,6 +345,9 @@ frames it authorizes, in the direction the holder sends them:
   a seal.
 - `READ_RANGES` covers `HAVE`, `RANGE_REQUEST`, and `RANGE_CANCEL`, whose answer
   is proof bundles and data records.
+
+When `PUSH` is negotiated, `READ_MANIFEST` and `READ_RANGES` are not consulted.
+Their request frames are the receiver's answer to the `PUBLISH` offer.
 
 Reading metadata and reading payload are separate because a deployment may allow
 a holder to learn that an object exists and what shape it is without allowing it

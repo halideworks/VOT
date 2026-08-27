@@ -109,6 +109,40 @@ with `AUTHENTICATION_FAILED`. The bound is fixed rather than negotiated so both
 sides know it without a setting, and it bounds the work an unauthenticated peer
 can ask for, which section 7 of `spec/security.md` requires.
 
+### 1.2 Push
+
+When `PUSH` is negotiated, the client holds the data and presents `PUBLISH`.
+The client sends `PACKAGE_DESCRIPTOR`, `MANIFEST_PAGE`, `PROGRESSIVE_PAGE`,
+`SEAL`, `PROOF_BUNDLE`, and `DATA_RECORD`. The server sends
+`MANIFEST_REQUEST`, `HAVE`, `RANGE_REQUEST`, and `RANGE_CANCEL`. Without
+`PUSH`, those ten frame directions are reversed. `CAPACITY` remains
+bidirectional. Datagram FEC frames follow the sender and receiver of the data
+records they describe.
+
+A client offering `PUSH` closes after the server's `HELLO` when the server does
+not negotiate it. It sends no application or authentication frame first.
+
+The `GOAWAY` payload is one QUIC varint containing the transfer-object cursor.
+Transfer objects are unique stored object roots in first-seen manifest order.
+The cursor counts objects the sender has completed, skipped, found whole, or
+found empty. It starts at zero and never decreases locally. A repeated peer
+cursor lower than or equal to the first accepted cursor is idempotent; an
+increase is `MALFORMED_FRAME`.
+
+The `ERROR` payload is a registered error-code QUIC varint followed by optional
+opaque diagnostic bytes. Diagnostics obey the 64 KiB frame limit and the
+redaction requirements in `spec/registries.md` section 8.
+
+Under `PUSH`, the server is the requester and acceptor. After receiving
+`GOAWAY` with cursor `n`, the holder sends no object-bearing `PUBLISH` frame
+for transfer object `n` or above, including answers queued but not yet handed
+to the carrier. A server sends `GOAWAY` at the final transfer-object cursor only
+after every object is durable and every completion hook has succeeded. The
+holder MUST treat that final cursor as the push completion acknowledgement and
+MUST treat disconnect before it as failure. A push package MUST contain at
+least one transfer object, keeping final cursor zero distinct from cancellation
+before the plan exists.
+
 ## 2. Frame envelope
 
 Every control or reliable-record frame is encoded as:

@@ -165,6 +165,26 @@ exporter. Authentication fails closed when the carrier cannot provide that
 binding. The exporter does not authenticate the server; the package root
 authenticates received content. See ADR-0037.
 
+### Push to a receiver
+
+Push authenticates both ends. The receiver requires the same issuer triple as
+an authenticated serve and prints the certificate identity the holder must
+pin. Issue a publish token for the exact package root and logical length, then
+push with that token and its holder key:
+
+```sh
+export VOT_SERVE_ISSUER=env:ISSUER_PUBLIC
+export VOT_SERVE_ISSUER_NAME=you.example
+export VOT_SERVE_AUDIENCE=them.example
+vot receive-push 0.0.0.0:9000 RECEIVED_BUNDLES CERT.pem KEY.pem
+# Prints: identity HEX (pin with VOT_PUSH_IDENTITY)
+
+vot capability issue-push env:ISSUER_SECRET you.example them.example \
+  env:HOLDER_PUBLIC PACKAGE_ROOT PACKAGE_LENGTH 86400 push-token.cbor
+export VOT_PUSH_IDENTITY=HEX
+vot push BUNDLE_DIR ADDR push-token.cbor env:HOLDER_SECRET
+```
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -172,7 +192,7 @@ authenticates received content. See ADR-0037.
 | `VOT_CONGESTION` | `bbr2` | Congestion controller (`bbr2` or `cubic`) |
 | `VOT_INITIAL_CWND` | controller default | Initial congestion window in 1200-byte packets (10 to 7100, so up to ~8.5 MB of first-flight window). Set on the serve to skip most of slow start on a path the operator knows; size it near the path's bandwidth-delay product. The seed acts while the connection starts up and decays as the path's datagram size settles, so a generous value costs a burst, not the connection |
 | `VOT_PREFIX_DUP` | 200 | Datagrams each end sends twice at the start of a connection, up to 4096, where `0` sends each once. The serial prefix is sparse, so a loss in it waits on a recovery round trip nothing else can shorten; the copies cost about 240 KB once per connection and removed the multi-second first-byte tail at 5% loss |
-| `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch sessions (multi-rail) |
+| `VOT_FETCH_RAILS` | `clamp(2 * cores, 1, 8)` | Concurrent fetch or push sessions (multi-rail) |
 | `VOT_DATAGRAM_BYTES` | auto (PMTU) | Max datagram size override |
 | `VOT_DATAGRAM_FEC` | `auto` | Negotiates datagram FEC but codes only once the smoothed measured loss reaches 10%, and stops again below 6.25%; `off` disables negotiation and `on` forces coding. The reliable path carries clean traffic. |
 | `VOT_RENDEZVOUS` | unset | Rendezvous service, `ADDR:PORT` or `NAME:PORT`. A serve registers there; a fetch given a root instead of an address resolves there. No default: both ends name the same one. |
@@ -180,11 +200,12 @@ authenticates received content. See ADR-0037.
 | `VOT_FETCH_STATS` | unset | Set to `1` for a fetch to write one line to stderr when it finishes: the bytes it placed itself, total milliseconds, milliseconds to first verified payload, and what the datagram FEC path offered, decoded, abandoned, and refused |
 | `VOT_FETCH_UNPINNED` | unset | Set to fetch at an address without a `PACKAGE_ROOT`, accepting whichever package the server serves |
 | `VOT_FETCH_SERVE_IDENTITY` | unset | Pins the serve's identity: the 64 hex characters of the certificate digest `vot serve` prints. The fetch drops any connection whose certificate differs, before it sends anything |
-| `VOT_SERVE_ISSUER` | unset | Issuer public key a serve accepts capabilities from, as a `KEY_SOURCE`. With the two below, the serve requires one |
-| `VOT_SERVE_ISSUER_NAME` | unset | The issuer name that key signs under |
-| `VOT_SERVE_AUDIENCE` | unset | The deployment a capability must name |
+| `VOT_SERVE_ISSUER` | unset | Issuer public key a serve or receive-push accepts capabilities from, as a `KEY_SOURCE`. The triple is optional for serve and required for receive-push |
+| `VOT_SERVE_ISSUER_NAME` | unset | The issuer name that key signs under; required for receive-push |
+| `VOT_SERVE_AUDIENCE` | unset | The deployment a capability must name; required for receive-push |
 | `VOT_FETCH_CAPABILITY` | unset | Path to the token a fetch presents |
 | `VOT_FETCH_HOLDER_KEY` | unset | The holder secret that token names, as a `KEY_SOURCE` |
+| `VOT_PUSH_IDENTITY` | required by `push` | Pins the receive-push certificate identity printed when its listener starts |
 | `VOT_RELAY_SLOTS` | 8 | Slots a relay opens at once |
 | `VOT_RELAY_TTL_MS` | 600000 | How long one slot lives |
 | `VOT_RELAY_BYTES` | 8589934592 | Bytes one slot forwards before it closes |

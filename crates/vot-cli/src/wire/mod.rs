@@ -7,19 +7,24 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use vot_transport_api::ReceiveLimits;
-use vot_transport_quiche::live::{Config, CongestionControl, Listener, SideChannel, Transport};
+pub use vot_transport_quiche::live::Listener;
+use vot_transport_quiche::live::{Config, CongestionControl, SideChannel, Transport};
 
 use crate::{BundleFetcher, BundleServer, Credentials, Error, PackageSummary, ServeSession};
 
 mod certificate;
 mod config;
 mod fetch;
+mod push;
 mod registration;
 mod relay;
 mod resolution;
 mod serve;
 
 pub use fetch::{fetch_bundle, fetch_via_rendezvous};
+pub use push::{
+    PushAdmission, PushPresentation, bind_push_listener, push_bundle, receive_push, receive_push_on,
+};
 pub use registration::rendezvous_service;
 pub use relay::relay_service;
 pub use serve::serve_bundle;
@@ -2117,6 +2122,635 @@ mod tests {
             .expect("served");
 
         crate::harness::discard(&[&source, &bundle, &refused_into, &fetched]);
+    }
+
+    #[test]
+    fn a_push_crosses_a_retrying_live_listener() {
+        use ed25519_dalek::SigningKey;
+
+        let source = crate::tests::temporary("push-live-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("data.bin"),
+            crate::harness::patterned(8_500_000),
+        )
+        .unwrap();
+        let bundle = crate::tests::temporary("push-live-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+        let opened = BundleServer::open(&bundle).unwrap();
+        let descriptor = match crate::harness::decode_control(&opened.announcement[0]) {
+            vot_codec::frames::TypedFrame::PackageDescriptor(descriptor) => descriptor.package,
+            _ => panic!("the descriptor"),
+        };
+        let issuer = SigningKey::from_bytes(&[51; 32]);
+        let holder_key = SigningKey::from_bytes(&[52; 32]);
+        let requirement = crate::authz::PushRequirement::new(
+            "issuer.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "receiver.example",
+        );
+        let token = crate::authz::issue_push(
+            "issuer.example",
+            "receiver.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            descriptor.length,
+            crate::authz::now_seconds().unwrap(),
+            3_600,
+        )
+        .unwrap();
+        let token_path = crate::tests::temporary("push-live-token.cbor");
+        std::fs::write(&token_path, token).unwrap();
+        let holder_path = crate::tests::temporary("push-live-holder.key");
+        std::fs::write(
+            &holder_path,
+            format!("ed25519-secret:{}", crate::hex_of(&holder_key.to_bytes())),
+        )
+        .unwrap();
+
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(1), |_| {
+                    panic!("identity mismatch reached SESSION_OPEN")
+                })
+            });
+            let mut wrong = identity;
+            wrong[0] ^= 1;
+            assert!(matches!(
+                push::push_bundle_railed(
+                    &bundle,
+                    at,
+                    &token_path,
+                    holder_path.to_str().unwrap(),
+                    wrong,
+                    1,
+                ),
+                Err(Error::ServeIdentityMismatch)
+            ));
+            assert!(receiving.join().unwrap().is_err());
+        }
+        {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let refused_output = crate::tests::temporary("push-live-refused");
+            let refused_path = refused_output.to_path_buf();
+            let policy_output = refused_path.clone();
+            let wrong_issuer = SigningKey::from_bytes(&[53; 32]);
+            let refusal = crate::authz::PushRequirement::new(
+                "issuer.example",
+                crate::authz::key_id_of(&wrong_issuer.verifying_key()),
+                wrong_issuer.verifying_key(),
+                "receiver.example",
+            );
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(1), |presentation| {
+                    refusal
+                        .decide(
+                            presentation.challenge,
+                            presentation.open,
+                            presentation.channel_binding,
+                            presentation.now,
+                        )
+                        .map(|scope| push::PushAdmission {
+                            scope,
+                            directory: policy_output.clone(),
+                            seams: crate::ReceiveSeams::default(),
+                        })
+                })
+            });
+            let refused = push::push_bundle_railed(
+                &bundle,
+                at,
+                &token_path,
+                holder_path.to_str().unwrap(),
+                identity,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &refused,
+                    Error::PeerClosed(vot_codec::error_code::AUTHORIZATION_FAILED)
+                ),
+                "wrong refusal: {refused:?}"
+            );
+            assert!(receiving.join().unwrap().is_err());
+            assert!(
+                !refused_path.exists(),
+                "a refused push accepted a descriptor"
+            );
+        }
+        {
+            let null_scope = vot_capability::Capability {
+                issuer: "issuer.example".to_owned(),
+                audience: "receiver.example".to_owned(),
+                holder_key: holder_key.verifying_key().to_bytes(),
+                operations: vec![vot_capability::Operation::Publish.identifier()],
+                scope: crate::authz::package_scope(built.root),
+                limits: Vec::new(),
+                not_before: crate::authz::now_seconds().unwrap(),
+                expiry: crate::authz::now_seconds().unwrap() + 3_600,
+                token_id: [54; 16],
+                delegation: vot_capability::NO_FURTHER_DELEGATION,
+            };
+            let signed = vot_capability::sign(
+                &null_scope,
+                &crate::authz::key_id_of(&issuer.verifying_key()),
+                &issuer,
+            )
+            .unwrap();
+            let null_token = crate::tests::temporary("push-live-null-length.cbor");
+            std::fs::write(&null_token, vot_capability::encode(&signed).unwrap()).unwrap();
+            let output = crate::tests::temporary("push-live-null-length-output");
+            let receiver_output = output.to_path_buf();
+            let requirement = requirement.clone();
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(1), |presentation| {
+                    requirement
+                        .decide(
+                            presentation.challenge,
+                            presentation.open,
+                            presentation.channel_binding,
+                            presentation.now,
+                        )
+                        .map(|scope| push::PushAdmission {
+                            scope,
+                            directory: receiver_output.clone(),
+                            seams: crate::ReceiveSeams::default(),
+                        })
+                })
+            });
+            let refused = push::push_bundle_railed(
+                &bundle,
+                at,
+                &null_token,
+                holder_path.to_str().unwrap(),
+                identity,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &refused,
+                    Error::PeerClosed(vot_codec::error_code::AUTHORIZATION_FAILED)
+                ),
+                "wrong refusal: {refused:?}"
+            );
+            assert!(receiving.join().unwrap().is_err());
+            assert!(
+                !output.exists(),
+                "a null-length scope accepted a descriptor"
+            );
+            crate::harness::discard(&[&null_token]);
+        }
+        {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let output = crate::tests::temporary("push-live-hook-failure");
+            let receiver_output = output.to_path_buf();
+            let requirement = requirement.clone();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(1), |presentation| {
+                    requirement
+                        .decide(
+                            presentation.challenge,
+                            presentation.open,
+                            presentation.channel_binding,
+                            presentation.now,
+                        )
+                        .map(|scope| push::PushAdmission {
+                            scope,
+                            directory: receiver_output.clone(),
+                            seams: crate::ReceiveSeams {
+                                complete: Some(std::sync::Arc::new(|_, _| {
+                                    Err(Error::InvalidArguments)
+                                })),
+                                ..crate::ReceiveSeams::default()
+                            },
+                        })
+                })
+            });
+            let pushed = push::push_bundle_railed(
+                &bundle,
+                at,
+                &token_path,
+                holder_path.to_str().unwrap(),
+                identity,
+                1,
+            );
+            assert!(pushed.is_err(), "a failed receiver acknowledged the push");
+            assert!(receiving.join().unwrap().is_err());
+            crate::harness::discard(&[&output]);
+        }
+        {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let output = crate::tests::temporary("push-live-policy-deadline");
+            let receiver_output = output.to_path_buf();
+            let requirement = requirement.clone();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded_with_timeout(
+                    &listener,
+                    Some(1),
+                    Duration::from_millis(10),
+                    |presentation| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        requirement
+                            .decide(
+                                presentation.challenge,
+                                presentation.open,
+                                presentation.channel_binding,
+                                presentation.now,
+                            )
+                            .map(|scope| push::PushAdmission {
+                                scope,
+                                directory: receiver_output.clone(),
+                                seams: crate::ReceiveSeams::default(),
+                            })
+                    },
+                )
+            });
+            let pushed = push::push_bundle_railed(
+                &bundle,
+                at,
+                &token_path,
+                holder_path.to_str().unwrap(),
+                identity,
+                1,
+            );
+            assert!(pushed.is_err(), "a late admission was granted");
+            assert!(receiving.join().unwrap().is_err());
+            assert!(!output.exists(), "a late admission accepted a descriptor");
+        }
+        for rails in [1, 4] {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let output = crate::tests::temporary(&format!("push-live-output-{rails}"));
+            let receiver_output = output.to_path_buf();
+            let requirement = requirement.clone();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(rails), |presentation| {
+                    assert!(presentation.peer.ip().is_loopback());
+                    requirement
+                        .decide(
+                            presentation.challenge,
+                            presentation.open,
+                            presentation.channel_binding,
+                            presentation.now,
+                        )
+                        .map(|scope| push::PushAdmission {
+                            scope,
+                            directory: receiver_output.clone(),
+                            seams: crate::ReceiveSeams::default(),
+                        })
+                })
+            });
+
+            let pushed = push::push_bundle_railed(
+                &bundle,
+                at,
+                &token_path,
+                holder_path.to_str().unwrap(),
+                identity,
+                rails as usize,
+            );
+            let received = receiving.join().unwrap();
+            assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
+            assert_eq!(pushed.unwrap(), built);
+            crate::fetch::tests::assert_same_tree(&bundle, &output);
+            let destination = crate::tests::temporary(&format!("push-live-destination-{rails}"));
+            let receipt = crate::tests::temporary(&format!("push-live-receipt-{rails}.cbor"));
+            let _summary = crate::tests::guarded(receipt.with_extension("json"));
+            let published = crate::receive_bundle(
+                &output,
+                &destination,
+                &receipt,
+                &crate::KeyMaterial::Shared(vec![7; 32]),
+                "2026-08-27T00:00:00Z",
+            )
+            .unwrap();
+            assert_eq!(published.package, built);
+            crate::fetch::tests::assert_same_tree(&source, &destination);
+            crate::harness::discard(&[&output, &destination, &receipt]);
+        }
+        {
+            let empty_source = crate::tests::temporary("push-live-empty-source");
+            std::fs::create_dir_all(&empty_source).unwrap();
+            std::fs::write(empty_source.join("empty.bin"), []).unwrap();
+            let empty_bundle = crate::tests::temporary("push-live-empty-bundle");
+            let empty = crate::build_bundle(&empty_source, &empty_bundle).unwrap();
+            let empty_token = crate::tests::temporary("push-live-empty-token.cbor");
+            std::fs::write(
+                &empty_token,
+                crate::authz::issue_push(
+                    "issuer.example",
+                    "receiver.example",
+                    &issuer,
+                    holder_key.verifying_key().to_bytes(),
+                    empty.root,
+                    empty.logical_length,
+                    crate::authz::now_seconds().unwrap(),
+                    3_600,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let output = crate::tests::temporary("push-live-empty-output");
+            let receiver_output = output.to_path_buf();
+            let requirement = requirement.clone();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded(&listener, Some(4), |presentation| {
+                    requirement
+                        .decide(
+                            presentation.challenge,
+                            presentation.open,
+                            presentation.channel_binding,
+                            presentation.now,
+                        )
+                        .map(|scope| push::PushAdmission {
+                            scope,
+                            directory: receiver_output.clone(),
+                            seams: crate::ReceiveSeams::default(),
+                        })
+                })
+            });
+            let pushed = push::push_bundle_railed(
+                &empty_bundle,
+                at,
+                &empty_token,
+                holder_path.to_str().unwrap(),
+                identity,
+                4,
+            );
+            let received = receiving.join().unwrap();
+            assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
+            assert_eq!(pushed.unwrap(), empty);
+            crate::fetch::tests::assert_same_tree(&empty_bundle, &output);
+            crate::harness::discard(&[&empty_source, &empty_bundle, &empty_token, &output]);
+        }
+        {
+            let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+            let at = listener.local_address();
+            let output = crate::tests::temporary("push-live-auth-deadline");
+            crate::harness::discard(&[&output]);
+            let receiver_output = output.to_path_buf();
+            let holding_output = crate::tests::temporary("push-live-auth-holding");
+            crate::harness::discard(&[&holding_output]);
+            let policy_holding_output = holding_output.to_path_buf();
+            let holding_now = crate::authz::now_seconds().unwrap().saturating_sub(1);
+            let holding_token = crate::authz::issue_push(
+                "issuer.example",
+                "receiver.example",
+                &issuer,
+                holder_key.verifying_key().to_bytes(),
+                built.root,
+                descriptor.length,
+                holding_now,
+                3_601,
+            )
+            .unwrap();
+            let holding_token_path = crate::tests::temporary("push-live-holding-token.cbor");
+            std::fs::write(&holding_token_path, &holding_token).unwrap();
+            let first_admission = std::sync::atomic::AtomicBool::new(true);
+            let requirement = requirement.clone();
+            let receiving = std::thread::spawn(move || {
+                push::receive_push_on_bounded_with_timeout(
+                    &listener,
+                    Some(9),
+                    Duration::from_secs(3),
+                    |presentation| {
+                        requirement
+                            .decide(
+                                presentation.challenge,
+                                presentation.open,
+                                presentation.channel_binding,
+                                presentation.now,
+                            )
+                            .map(|scope| push::PushAdmission {
+                                scope,
+                                directory: if first_admission
+                                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                                {
+                                    policy_holding_output.clone()
+                                } else {
+                                    receiver_output.clone()
+                                },
+                                seams: crate::ReceiveSeams::default(),
+                            })
+                    },
+                )
+            });
+            let mut client = fetch::client_config().unwrap();
+            apply_datagram_bytes(&mut client).unwrap();
+            let carrier =
+                Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &client).unwrap();
+            let mut extensions = extensions_from(None).unwrap();
+            extensions.insert(vot_codec::extension_id::PUSH);
+            let session = vot_session::Session::client(
+                carrier,
+                vot_codec::Settings::default(),
+                extensions,
+                vot_session::Authentication::Presenting,
+            );
+            let holding_holder =
+                crate::load_capability_holder(&holding_token_path, holder_path.to_str().unwrap())
+                    .unwrap();
+            let mut holding =
+                crate::ServeSession::begin_push_session(&opened, session, holding_holder).unwrap();
+            holding.negotiate_push().unwrap();
+            let (ready, started) = mpsc::channel();
+            let attackers: Vec<_> = (1..crate::drive::CONCURRENT_SESSIONS)
+                .map(|_| {
+                    let ready = ready.clone();
+                    std::thread::spawn(move || {
+                        let mut client = fetch::client_config().unwrap();
+                        apply_datagram_bytes(&mut client).unwrap();
+                        let carrier = Transport::connect(
+                            local_for(at).unwrap(),
+                            at,
+                            Some("localhost"),
+                            &client,
+                        )
+                        .unwrap();
+                        let mut extensions = extensions_from(None).unwrap();
+                        extensions.insert(vot_codec::extension_id::PUSH);
+                        let mut session = vot_session::Session::client(
+                            carrier,
+                            vot_codec::Settings::default(),
+                            extensions,
+                            vot_session::Authentication::Presenting,
+                        );
+                        session.require_extension(vot_codec::extension_id::PUSH);
+                        session.begin().unwrap();
+                        while session.pending_presentation().is_none() {
+                            let _ = session.poll().unwrap();
+                            session.flush().unwrap();
+                            vot_transport_api::TransportAdapter::wait_for_event(
+                                session.driver(),
+                                Duration::from_millis(10),
+                            );
+                        }
+                        let mut ping = Vec::new();
+                        vot_codec::encode_frame(vot_codec::frame_type::PING, &[], &mut ping)
+                            .unwrap();
+                        let until = std::time::Instant::now() + Duration::from_secs(5);
+                        let mut ready = Some(ready);
+                        let mut sent = 0;
+                        while std::time::Instant::now() < until {
+                            if vot_transport_api::TransportAdapter::send_control(
+                                session.driver(),
+                                &ping,
+                            )
+                            .is_ok()
+                                && vot_transport_api::TransportAdapter::flush(session.driver())
+                                    .is_ok()
+                            {
+                                sent += 1;
+                                if let Some(ready) = ready.take() {
+                                    ready.send(()).unwrap();
+                                }
+                            }
+                            vot_transport_api::TransportAdapter::wait_for_event(
+                                session.driver(),
+                                Duration::from_millis(20),
+                            );
+                            if session.poll().is_err() {
+                                break;
+                            }
+                        }
+                        sent
+                    })
+                })
+                .collect();
+            drop(ready);
+            for _ in 1..crate::drive::CONCURRENT_SESSIONS {
+                started.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            let pushed = push::push_bundle_railed(
+                &bundle,
+                at,
+                &token_path,
+                holder_path.to_str().unwrap(),
+                identity,
+                1,
+            );
+            for attacker in attackers {
+                assert!(attacker.join().unwrap() > 1, "the attacker sent no drip");
+            }
+            assert!(
+                pushed.is_ok(),
+                "finished later slots behind an active first starved {pushed:?}"
+            );
+            drop(holding);
+            assert!(receiving.join().unwrap().is_err());
+            crate::harness::discard(&[&output, &holding_output, &holding_token_path]);
+        }
+        crate::harness::discard(&[&source, &bundle, &token_path, &holder_path]);
+    }
+
+    #[test]
+    fn a_push_portal_refuses_a_listener_without_stateless_retry() {
+        let credentials = Ephemeral::generate().unwrap();
+        let config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let result = push::receive_push_on_bounded(&listener, Some(0), |_| None);
+        assert!(matches!(result, Err(Error::InvalidArguments)));
+
+        let (protected, identity) =
+            push::bind_push_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .unwrap();
+        assert!(protected.stateless_retry_enabled());
+        assert_ne!(identity, [0; 32]);
+        let at = protected.local_address();
+        let connecting = std::thread::spawn(move || {
+            let client = fetch::client_config().unwrap();
+            Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &client)
+        });
+        let accepted = protected.accept();
+        assert!(accepted.is_ok(), "the ephemeral listener router died");
+        assert!(connecting.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_push_rejects_zero_transfer_objects_before_dial() {
+        let bundle = crate::tests::temporary("push-empty-canonical");
+        let manifest = bundle.join(crate::MANIFEST_DIRECTORY);
+        std::fs::create_dir_all(&manifest).unwrap();
+        let package = vot_package::PackageRootBuilder::new()
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut manifest_id = [0; 16];
+        manifest_id.copy_from_slice(&package.root[..16]);
+        let page = vot_manifest::ManifestPage {
+            manifest_id,
+            index: 0,
+            total: None,
+            previous_digest: [0; 32],
+            profile: vot_manifest::PathProfile::Portable,
+            entries: Vec::new(),
+        };
+        let page = vot_manifest::encode_page(&page).unwrap();
+        let page_digest = *blake3::hash(&page).as_bytes();
+        let seal = vot_manifest::Seal {
+            manifest_id,
+            final_page_count: 1,
+            final_page_digest: page_digest,
+            package: vot_manifest::ObjectId {
+                suite: 1,
+                root: package.root,
+                length: 0,
+            },
+            pages: vec![vot_manifest::PageCommitment {
+                index: 0,
+                digest: page_digest,
+            }],
+        };
+        std::fs::write(crate::manifest_page_path(&manifest, 0), page).unwrap();
+        std::fs::write(
+            manifest.join(crate::MANIFEST_SEAL),
+            vot_manifest::encode_seal(&seal).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::scan_manifest(&bundle),
+            Err(Error::InvalidBundle)
+        ));
+        assert!(matches!(
+            push::push_bundle_railed(
+                &bundle,
+                "127.0.0.1:9".parse().unwrap(),
+                Path::new("unused-capability"),
+                "unused-key",
+                [0; 32],
+                1,
+            ),
+            Err(Error::InvalidBundle)
+        ));
+
+        crate::harness::discard(&[&bundle]);
     }
 
     #[test]

@@ -207,6 +207,7 @@ def render_identifiers(document: dict) -> str:
     setting_list = ",\n    ".join(f"setting_id::{row['name']}" for row in settings)
     operation_list = ",\n    ".join(f"operation::{row['name']}" for row in operations)
     limit_list = ",\n    ".join(f"resource_limit::{row['name']}" for row in limits)
+    error_list = ",\n    ".join(f"error_code::{row['name']}" for row in errors)
     return (
         "// Generated from spec/registries.yaml by tools/generate_registries.py.\n"
         "// Do not edit.\n"
@@ -246,6 +247,11 @@ def render_identifiers(document: dict) -> str:
         "pub mod error_code {\n"
         f"{_const_block(errors, 'u16')}\n"
         "}\n"
+        "\n"
+        f"/// Every registered error code, in identifier order.\n"
+        f"pub const REGISTERED_ERROR_CODES: [u16; {len(errors)}] = [\n"
+        f"    {error_list},\n"
+        "];\n"
         "\n"
         f"/// Every registered setting, in identifier order.\n"
         f"pub const REGISTERED_SETTINGS: [u64; {len(settings)}] = [\n"

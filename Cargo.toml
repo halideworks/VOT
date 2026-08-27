@@ -22,8 +22,10 @@ unsafe_code = "forbid"
 all = "warn"
 pedantic = "warn"
 
-# quiche 0.29.3 plus two changes: the ADR-0028 ack-latency loss floor, and a
-# narrow TLS exporter used to implement ADR-0037 channel binding. Both live in
-# the maintained fork; this pin dissolves when upstream releases equivalents.
+# quiche 0.29.3 plus three changes: the ADR-0028 ack-latency loss floor, a
+# narrow TLS exporter used to implement ADR-0037 channel binding, and the
+# unpaced bbr2 DRAIN exit and PROBE_UP bound of ADR-0028's 2026-08-26
+# amendment. All three live in the maintained fork; this pin dissolves when
+# upstream releases equivalents.
 [patch.crates-io]
-quiche = { git = "https://github.com/halideworks/quiche.git", rev = "2bb421877826605514a4c21e7315b3439619c35f" }
+quiche = { git = "https://github.com/halideworks/quiche.git", rev = "ce7e5b71f3198125ab92a1626390bbe3a2c7faa0" }

@@ -170,7 +170,9 @@ authenticates received content. See ADR-0037.
 Push authenticates both ends. The receiver requires the same issuer triple as
 an authenticated serve and prints the certificate identity the holder must
 pin. Issue a publish token for the exact package root and logical length, then
-push with that token and its holder key:
+push with that token and its holder key. The receive portal currently requires
+Unix directory-containment guarantees; the dialing `push` command remains
+available on every supported platform.
 
 ```sh
 export VOT_SERVE_ISSUER=env:ISSUER_PUBLIC
@@ -228,8 +230,10 @@ forge them.
 
 ## Platform support
 
-Linux, macOS, and Windows. Platform-specific code is isolated in
-`vot-platform-fs`, `vot-platform-net`, and `vot-platform-proc`.
+Linux, macOS, and Windows. `receive-push` is Unix-only until guarded directory
+operations exist on Windows; all other commands, including `push`, retain the
+three-platform support. Platform-specific code is isolated in `vot-platform-fs`,
+`vot-platform-net`, and `vot-platform-proc`.
 
 ## Documentation
 

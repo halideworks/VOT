@@ -1,19 +1,23 @@
 //! Session and frame dispatch: the [`BundleFetcher`] passes.
 
 use super::{
-    Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap, DEFAULT_PROVING_THREADS,
-    DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY,
-    MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE,
-    ManifestReader, ManifestRequest, Mutex, ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH,
-    OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES, PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH,
-    PROVER_WAIT, PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject,
-    Proving, ProvingPool, RESUME_STORE, RangeRequest, ReceiveObject, ReceiveSeams,
-    ReceiveSessionId, ReliableReceiver, ResumeStore, Session, SessionReceiver, Settings,
-    SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter, TypedFrame, UnitRanges,
-    VecDeque, crossing, error_code, frames, fs, is_backpressure, package_sentinel,
-    remove_store_files, reservations_of, resume_failure, resumed_extents, subject_of,
-    total_units_of,
+    ActiveSink, Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap,
+    DEFAULT_PROVING_THREADS, DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan,
+    FetchStatus, MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD,
+    MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestReader, ManifestRequest, Mutex,
+    ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
+    PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary,
+    Path, PathBuf, PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
+    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReliableReceiver, ResumeStore, Session,
+    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter,
+    TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure,
+    package_sentinel, remove_store_files, reservations_of, resume_failure, resumed_extents,
+    subject_of, total_units_of,
 };
+
+pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
+    length == 0 || fully_resumed && stored
+}
 
 /// Credit advertised to the server: the covers this end asked for.
 pub(crate) const FETCH_CREDIT_BYTES: u64 =
@@ -243,7 +247,11 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
 ///
 /// One function rather than the same sum in each accessor that means it.
 fn placed_in(plan: &FetchPlan) -> u64 {
-    plan.placed_before + plan.active.as_ref().map_or(0, |sink| sink.placed())
+    plan.placed_before
+        + plan
+            .active
+            .as_ref()
+            .map_or(0, |active| active.sink.placed())
 }
 
 impl<A: TransportAdapter> BundleFetcher<A> {
@@ -342,18 +350,34 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         start: bool,
     ) -> Result<Self, Error> {
         let store_path = bundle.join(RESUME_STORE);
-        let resuming = bundle.exists();
+        let existing = fs::symlink_metadata(bundle).ok();
+        if existing
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_dir())
+        {
+            return Err(Error::DestinationExists);
+        }
+        let exists = existing.is_some();
+        let resuming = store_path.exists();
+        if exists && !resuming && fs::read_dir(bundle)?.next().is_some() {
+            return Err(Error::DestinationExists);
+        }
         if resuming {
-            if !store_path.exists() {
-                return Err(Error::DestinationExists);
-            }
             // The manifest is re-fetched, not resumed: partial pages went
             // with the fetch that died, and re-validating fresh re-derives
             // the identity the store is checked against.
             fs::remove_dir_all(bundle.join(MANIFEST_DIRECTORY))?;
+        } else if !exists {
+            crate::create_private_directory(bundle)?;
         }
-        fs::create_dir_all(bundle.join(MANIFEST_DIRECTORY))?;
-        fs::create_dir_all(bundle.join("objects"))?;
+        let manifests = bundle.join(MANIFEST_DIRECTORY);
+        if !manifests.exists() {
+            crate::create_private_directory(&manifests)?;
+        }
+        let objects = bundle.join("objects");
+        if !objects.exists() {
+            crate::create_private_directory(&objects)?;
+        }
         let store = ResumeStore::create(&store_path).map_err(resume_failure)?;
         // The store's identity is the resume pin; a caller's pin that
         // disagrees is refused. A store too young to know binds to the
@@ -733,12 +757,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.drain()?;
         loop {
             match self.receiver.poll() {
-                Ok(Some(Event::Control(bytes))) => {
-                    self.report.progress = self.report.progress.saturating_add(1);
-                    if let Err(fault) = self.dispatch(&bytes) {
-                        return self.fail(fault);
+                Ok(Some(Event::Control(bytes))) => match self.dispatch(&bytes) {
+                    Ok(true) => {
+                        self.report.progress = self.report.progress.saturating_add(1);
                     }
-                }
+                    Ok(false) => {}
+                    Err(fault) => return self.fail(fault),
+                },
                 Ok(Some(Event::Disconnected(_))) => {
                     self.terminal.disconnected = true;
                     break;
@@ -796,7 +821,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let frame = encoded(&TypedFrame::GoAway(frames::GoAway {
             cursor: cursor as u64,
         }))?;
-        let discarded = active.map_or(Ok(()), |active| active.discard_partial());
+        let discarded = active.map_or(Ok(()), |active| active.sink.discard_partial());
         let reset = if let (Some(store), Some(subject)) = (store, subject)
             && let Ok(mut store) = store.lock()
         {
@@ -893,7 +918,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // lock: taken apart, another rail can advance the plan between
             // the two and the pair no longer describes one object.
             let Some((sink, subject)) = self.locked_plan().and_then(|plan| {
-                let sink = plan.active.clone()?;
+                let sink = Arc::clone(&plan.active.as_ref()?.sink);
                 let subject = plan.objects.get(plan.current).map(subject_of)?;
                 Some((sink, subject))
             }) else {
@@ -1033,7 +1058,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     /// Takes one control frame, or ignores one that is not the fetch's.
-    pub(crate) fn dispatch(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+    pub(crate) fn dispatch(&mut self, bytes: &[u8]) -> Result<bool, Fault> {
         let limits = DecodeLimits {
             max_unknown_payload: MAX_CONTROL_FRAME_PAYLOAD,
             max_frames: 1,
@@ -1041,7 +1066,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let (frame, consumed) = match frames::decode(bytes, limits) {
             Ok(decoded) => decoded,
             // An unknown optional frame is skipped, per `spec/wire.md`.
-            Err(frames::Error::WrongFrameType(_)) => return Ok(()),
+            Err(frames::Error::WrongFrameType(_)) => return Ok(false),
             Err(frames::Error::Envelope(error)) => {
                 return Err(Fault::Peer(error.protocol_code()));
             }
@@ -1056,15 +1081,15 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             TypedFrame::Seal(seal) => self.take_seal(seal),
             TypedFrame::ManifestPage(page) => self.take_page(&page),
             // A well-formed frame this fetch does not consume.
-            _ => Ok(()),
+            _ => Ok(false),
         }
     }
 
-    pub(crate) fn take_descriptor(&mut self, descriptor: PackageDescriptor) -> Result<(), Fault> {
+    pub(crate) fn take_descriptor(&mut self, descriptor: PackageDescriptor) -> Result<bool, Fault> {
         if let Some(existing) = &self.manifest.descriptor {
             if *existing == descriptor {
                 // An exact re-announcement is idempotent, per the registry.
-                return Ok(());
+                return Ok(false);
             }
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
@@ -1097,10 +1122,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
         self.manifest.descriptor = Some(descriptor);
-        Ok(())
+        Ok(true)
     }
 
-    pub(crate) fn take_seal(&mut self, seal_bytes: Vec<u8>) -> Result<(), Fault> {
+    pub(crate) fn take_seal(&mut self, seal_bytes: Vec<u8>) -> Result<bool, Fault> {
         let Some(descriptor) = &self.manifest.descriptor else {
             // The descriptor leads the announcement; a seal without one is
             // out of sequence.
@@ -1108,7 +1133,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         };
         if let Some(existing) = &self.manifest.seal_bytes {
             if *existing == seal_bytes {
-                return Ok(());
+                return Ok(false);
             }
             return Err(Fault::Peer(error_code::MANIFEST_INVALID));
         }
@@ -1126,14 +1151,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // A rail already has the manifest through its plan; nothing
             // further is asked.
             self.manifest.seal_bytes = Some(seal_bytes);
-            return Ok(());
+            return Ok(true);
         }
         self.manifest.page_digests = crate::seal_page_digests(&seal)
             .map_err(|_| Fault::Peer(error_code::MANIFEST_INVALID))?;
         self.manifest.spans = manifest_spans(seal.final_page_count);
         self.manifest.seal_bytes = Some(seal_bytes);
         self.request_pages()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Issues the next manifest span, one at a time: page arrival order is
@@ -1164,11 +1189,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(())
     }
 
-    pub(crate) fn take_page(&mut self, page_bytes: &[u8]) -> Result<(), Fault> {
+    pub(crate) fn take_page(&mut self, page_bytes: &[u8]) -> Result<bool, Fault> {
         if self.secondary {
             // A page this rail never asked for; the manifest on disk is
             // the primary's and already validated.
-            return Ok(());
+            return Ok(false);
         }
         if self.manifest.seal_bytes.is_none() {
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
@@ -1186,7 +1211,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         }
         if index < self.manifest.pages_received {
             // An exact duplicate of a page already taken is idempotent.
-            return Ok(());
+            return Ok(false);
         }
         if index > self.manifest.pages_received {
             // The control stream is ordered; a gap is the server's doing.
@@ -1208,7 +1233,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         {
             self.finish_manifest()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Writes the seal, validates the whole manifest the way `receive`
@@ -1344,7 +1369,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 self.rail.admitted = None;
             }
-            if let Some(sink) = plan.active.clone() {
+            if let Some(active) = plan.active.clone() {
+                let sink = active.sink;
                 let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
                 let subject = subject_of(planned);
                 let length = planned.object.length;
@@ -1384,8 +1410,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 });
                 drop(plan);
                 let completed = synced.and_then(|()| {
-                    if let (Some(hook), Some(completed)) = (&self.seams.complete, &completed) {
-                        hook(self.receive_session, completed)?;
+                    if let (Some(hook), Some(completed)) = (&active.complete, &completed) {
+                        hook(active.receive_session, completed)?;
                     }
                     Ok(())
                 });
@@ -1402,7 +1428,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // A cursor that stands still here re-fetches the object it
                 // just settled, forever and over the wire; failing at once
                 // is what keeps that spin out of every suite's budget.
-                plan.current += 1;
+                plan.current = plan.current.saturating_add(1);
                 continue;
             }
             if plan.syncing {
@@ -1434,9 +1460,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let at = plan.current;
             let planned = plan.objects.get(at).ok_or(Error::InvalidBundle)?;
             let object = planned.object;
-            let whole_from_before = planned.fully_resumed();
+            let mut whole_from_before = planned.fully_resumed();
             let sink_chosen = planned.sink_chosen;
-            let planned_resumed = planned.resumed.clone();
+            let mut planned_resumed = planned.resumed.clone();
             let receive_object = ReceiveObject {
                 object,
                 entries: planned.entries.clone(),
@@ -1449,6 +1475,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 if sink_chosen {
                     return Ok(());
                 }
+                let stale = match vot_platform_fs::guard_staging_file(&path) {
+                    Ok(file) => Some(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        plan.abandoned = true;
+                        return Err(error.into());
+                    }
+                };
                 plan.objects[at].sink_chosen = true;
                 plan.syncing = true;
                 drop(plan);
@@ -1459,8 +1493,25 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 let chosen = chosen?;
-                if plan.current != at {
-                    return Ok(());
+                if !planned_resumed.is_empty() {
+                    let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
+                    if let Some(store) = &plan.store {
+                        store
+                            .lock()
+                            .map_err(|_| Error::InvalidBundle)?
+                            .reset(subject)
+                            .map_err(resume_failure)?;
+                    }
+                    plan.objects[at].resumed.clear();
+                    planned_resumed.clear();
+                    whole_from_before = false;
+                }
+                if let Some(stale) = stale {
+                    if let Err(error) = vot_platform_fs::remove_file_handle(&stale, &path) {
+                        plan.abandoned = true;
+                        return Err(error.into());
+                    }
+                    whole_from_before = false;
                 }
                 let Some(chosen) = chosen else {
                     plan.current += 1;
@@ -1470,7 +1521,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             } else {
                 None
             };
-            if (object.length == 0 || whole_from_before && path.exists())
+            if custom_flush_due(object.length, whole_from_before, path.exists())
                 && let Some(sink) = &custom
             {
                 plan.syncing = true;
@@ -1482,9 +1533,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 synced?;
-                if plan.current != at {
-                    return Ok(());
-                }
             }
             if object.length == 0 {
                 // Nothing to fetch or verify; the empty object simply is.
@@ -1506,9 +1554,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 completed?;
-                if plan.current != at {
-                    return Ok(());
-                }
                 plan.current += 1;
                 continue;
             }
@@ -1569,7 +1614,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             });
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
             self.rail.admitted = Some((plan.current, subject));
-            plan.active = Some(sink);
+            plan.active = Some(ActiveSink {
+                sink,
+                complete: self.seams.complete.clone(),
+                receive_session: self.receive_session,
+            });
             plan.next_offset = 0;
             // The resumed extents seed both accounts: coverage, so the
             // object completes when the gaps do, and the skip set, so the

@@ -2604,6 +2604,19 @@ mod tests {
     }
 
     #[test]
+    fn goaway_cursor_answers_only_earlier_known_objects() {
+        for (index, cursor, expected) in [
+            (None, 1, false),
+            (Some(0), 0, false),
+            (Some(0), 1, true),
+            (Some(1), 1, false),
+            (Some(2), 1, false),
+        ] {
+            assert_eq!(server::range_blocked_by_cursor(index, cursor), !expected);
+        }
+    }
+
+    #[test]
     fn a_reported_error_is_terminal_to_the_server() {
         let (bundle, _) = built_bundle("reported-error", &[("a.bin", patterned(10))]);
         let server = BundleServer::open(&bundle).unwrap();

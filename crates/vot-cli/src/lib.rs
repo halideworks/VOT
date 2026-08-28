@@ -28,6 +28,21 @@ use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
 
+/// Creates a directory only this user can enter.
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
+
 pub mod authz;
 mod drive;
 mod fetch;
@@ -584,6 +599,14 @@ mod tests {
         ));
         assert!(matches!(
             fetch_bundle(address, &bundle, None),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            push_bundle(&bundle, address, &bundle, "-", [0; 32]),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            receive_push(address, &bundle, &Credentials::Ephemeral, None, |_, _| {}),
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(

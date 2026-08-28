@@ -177,7 +177,7 @@ mod tests {
         // TMPDIR whose tree the caller expects to be made on demand.
         let root = std::env::temp_dir().join(format!("vot-serve-root-{suffix}"));
         let leaf = root.join("deeper").join("credentials");
-        create_private_directory(&leaf).expect("a tree that did not exist yet");
+        crate::create_private_directory(&leaf).expect("a tree that did not exist yet");
         assert!(leaf.is_dir());
         #[cfg(unix)]
         {
@@ -1211,6 +1211,16 @@ mod tests {
             .is_some(),
             "a serve given all three required nothing"
         );
+        assert!(
+            push_requirement_from(None, None, None)
+                .expect("no requirement")
+                .is_none()
+        );
+        assert!(
+            push_requirement_from(Some(&named), Some("you.example"), Some("them.example"))
+                .expect("a push requirement")
+                .is_some()
+        );
         // Any partial configuration. A key with no audience would take a
         // token minted for another deployment, and an audience with no key
         // would refuse everyone, which reads as a bug rather than a policy.
@@ -1229,6 +1239,10 @@ mod tests {
                 ),
                 "{partial:?} was not refused"
             );
+            assert!(matches!(
+                push_requirement_from(partial.0, partial.1, partial.2),
+                Err(Error::InvalidArguments)
+            ));
         }
         // A secret where the public half belongs would let a serve mint what
         // it checks.
@@ -1251,6 +1265,16 @@ mod tests {
             std::env::var(SERVE_ISSUER).is_err(),
             "the suite owns no env"
         );
+        assert!(matches!(
+            push::receive_push(
+                "127.0.0.1:0".parse().unwrap(),
+                Path::new("/vot-unused-push-output"),
+                &Credentials::Ephemeral,
+                Some(0),
+                |_, _| {}
+            ),
+            Err(Error::InvalidArguments)
+        ));
     }
 
     #[test]
@@ -2575,7 +2599,9 @@ mod tests {
                     .unwrap();
             let mut holding =
                 crate::ServeSession::begin_push_session(&opened, session, holding_holder).unwrap();
+            assert!(!holding.push_ready());
             holding.negotiate_push().unwrap();
+            assert!(holding.push_ready());
             let (ready, started) = mpsc::channel();
             let attackers: Vec<_> = (1..crate::drive::CONCURRENT_SESSIONS)
                 .map(|_| {
@@ -2675,7 +2701,7 @@ mod tests {
             credentials.key.to_str().unwrap().to_owned(),
         );
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
-        let result = push::receive_push_on_bounded(&listener, Some(0), |_| None);
+        let result = push::receive_push_on(&listener, |_| None);
         assert!(matches!(result, Err(Error::InvalidArguments)));
 
         let (protected, identity) =
@@ -2691,6 +2717,29 @@ mod tests {
         let accepted = protected.accept();
         assert!(accepted.is_ok(), "the ephemeral listener router died");
         assert!(connecting.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn push_rail_count_uses_the_whole_supported_range() {
+        let missing = Path::new("/vot-missing-push-bundle");
+        let address = "127.0.0.1:1".parse().unwrap();
+        for rails in [0, crate::drive::CONCURRENT_SESSIONS + 1] {
+            assert!(matches!(
+                push::push_bundle_railed(missing, address, missing, "-", [0; 32], rails),
+                Err(Error::InvalidArguments)
+            ));
+        }
+        assert!(!matches!(
+            push::push_bundle_railed(
+                missing,
+                address,
+                missing,
+                "-",
+                [0; 32],
+                crate::drive::CONCURRENT_SESSIONS
+            ),
+            Err(Error::InvalidArguments)
+        ));
     }
 
     #[test]

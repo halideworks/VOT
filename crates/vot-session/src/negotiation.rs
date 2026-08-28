@@ -217,10 +217,6 @@ impl Negotiation {
         })
     }
 
-    pub(super) const fn peer_hello_received(&self) -> bool {
-        self.peer_hello.is_some()
-    }
-
     /// What the peer said about itself.
     #[must_use]
     pub const fn peer_hello(&self) -> Option<&Hello> {

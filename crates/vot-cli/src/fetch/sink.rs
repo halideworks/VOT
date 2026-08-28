@@ -2,7 +2,7 @@
 
 use super::{
     Arc, AtomicU64, Error, FetchPlan, FileSink, Mutex, Ordering, Path, PathBuf, ReceiveSink,
-    ResumeStore, SubjectId, durable_units, fs, subject_of, total_units_of,
+    ResumeStore, SubjectId, durable_units, subject_of, total_units_of,
 };
 
 /// Bytes placed between stride flushes.
@@ -47,9 +47,15 @@ impl ReceiveSink for DirectorySink {
     }
 
     fn discard_partial(&self) -> Result<(), Error> {
-        match fs::remove_file(&self.path) {
+        if let Err(error) = std::fs::symlink_metadata(&self.path) {
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(Error::Io(error))
+            };
+        }
+        match vot_platform_fs::remove_file_handle(self.file.file(), &self.path) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Io(error)),
         }
     }
@@ -121,7 +127,7 @@ impl CountingSink {
         length: u64,
         durable: Option<DurableHook>,
     ) -> std::io::Result<Self> {
-        let file = FileSink::create(path, length)?;
+        let file = FileSink::create_new(path, length)?;
         Ok(Self::opened(
             Box::new(DirectorySink {
                 file,
@@ -256,6 +262,24 @@ mod tests {
     use super::*;
     use vot_scheduler::RangeSink as _;
 
+    struct FailingSink;
+
+    impl vot_scheduler::RangeSink for FailingSink {
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            Err(vot_scheduler::SinkError)
+        }
+    }
+
+    impl ReceiveSink for FailingSink {
+        fn flush(&self) -> Result<(), Error> {
+            Err(Error::InvalidBundle)
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            Err(Error::InvalidBundle)
+        }
+    }
+
     #[derive(Default)]
     struct BlockingState {
         started: bool,
@@ -320,7 +344,13 @@ mod tests {
         {
             let mut state = inner.shared.0.lock().unwrap();
             while !state.started {
-                state = inner.shared.1.wait(state).unwrap();
+                let (next, timeout) = inner
+                    .shared
+                    .1
+                    .wait_timeout(state, std::time::Duration::from_secs(1))
+                    .unwrap();
+                state = next;
+                assert!(!timeout.timed_out(), "the write never reached the sink");
             }
         }
         let discarding = {
@@ -338,5 +368,40 @@ mod tests {
         let state = inner.shared.0.lock().unwrap();
         assert!(state.discarded);
         assert_eq!(state.writes, 1);
+    }
+
+    #[test]
+    fn counting_sink_propagates_inner_failures() {
+        let sink = CountingSink::custom(Box::new(FailingSink));
+        assert!(sink.write_at(0, &[1]).is_err());
+        assert!(<CountingSink as ReceiveSink>::flush(&sink).is_err());
+        assert!(<CountingSink as ReceiveSink>::discard_partial(&sink).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_discard_is_idempotent_and_reports_other_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "vot-directory-sink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        crate::create_private_directory(&root).unwrap();
+        let path = root.join("object");
+        let sink = DirectorySink {
+            file: FileSink::create(&path, 0).unwrap(),
+            path: path.clone(),
+        };
+        sink.discard_partial().unwrap();
+        sink.discard_partial().unwrap();
+
+        let directory = root.join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        let sink = DirectorySink {
+            file: FileSink::create(&path, 0).unwrap(),
+            path: directory,
+        };
+        assert!(sink.discard_partial().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

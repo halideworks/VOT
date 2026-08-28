@@ -30,6 +30,10 @@ struct CodedGeneration<'a> {
     repair: Vec<Vec<u8>>,
 }
 
+pub(crate) fn range_blocked_by_cursor(index: Option<u64>, cursor: u64) -> bool {
+    index.is_none_or(|index| index >= cursor)
+}
+
 impl BundleServer {
     /// Opens a bundle for serving: the chain walk `receive_bundle` trusts,
     /// then a proving layer per stored object, built once.
@@ -536,9 +540,10 @@ impl BundleServer {
             TypedFrame::RangeRequest(request) => {
                 connection.admit_request(frame_type::RANGE_REQUEST, request.request_id, bytes)?;
                 if connection.goaway_cursor.is_some_and(|cursor| {
-                    self.object_indices
-                        .get(&request.object.root)
-                        .is_none_or(|index| *index >= cursor)
+                    range_blocked_by_cursor(
+                        self.object_indices.get(&request.object.root).copied(),
+                        cursor,
+                    )
                 }) {
                     return Ok(());
                 }

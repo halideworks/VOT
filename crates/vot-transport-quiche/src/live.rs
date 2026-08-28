@@ -3639,10 +3639,28 @@ mod tests {
             )
             .is_none()
         );
-        let mut forged = token;
+        let mut forged = token.clone();
         forged[12] ^= 1;
         assert!(validate_retry_token(&secret, peer, &forged, 100).is_none());
+        let mut bad_tag = token;
+        let tag = bad_tag.len() - RETRY_TOKEN_TAG_BYTES;
+        bad_tag[tag] ^= 1;
+        assert!(validate_retry_token(&secret, peer, &bad_tag, 100).is_none());
+        bad_tag[tag + 1] ^= 1;
+        assert!(validate_retry_token(&secret, peer, &bad_tag, 100).is_none());
+        let peer6: SocketAddr = "[::1]:4433".parse().expect("an address");
+        let token6 = mint_retry_token(&secret, peer6, &odcid, 100);
+        assert_eq!(
+            validate_retry_token(&secret, peer6, &token6, 100),
+            Some(odcid.to_vec())
+        );
         assert!(validate_retry_token(&secret, peer, &[1, 2, 3], 100).is_none());
+    }
+
+    #[test]
+    fn retry_uses_the_system_clock() {
+        let now = unix_seconds();
+        assert!((1_767_225_600..4_102_444_800).contains(&now));
     }
 
     #[test]
@@ -4072,6 +4090,8 @@ mod tests {
         };
         let mut client1 = connect();
         let mut server1 = listener.accept().expect("the first connection");
+        assert_eq!(client1.peer_address(), Some(address));
+        assert_eq!(server1.peer_address(), Some(client1.local_address()));
         let mut client2 = connect();
         let mut server2 = listener.accept().expect("the second connection");
 
@@ -4341,6 +4361,7 @@ mod tests {
         let local = {
             let listener = Listener::bind("127.0.0.1:0".parse().expect("an address"), &config)
                 .expect("a bind");
+            assert!(!listener.stateless_retry_enabled());
             listener.local_address()
         };
         UdpSocket::bind(local).expect("the dropped listener released its port");
@@ -4353,6 +4374,7 @@ mod tests {
         config.stateless_retry = true;
         config.accept_timeout_ms = 300;
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        assert!(listener.stateless_retry_enabled());
         let server = listener.local_address();
         let peer = UdpSocket::bind("127.0.0.1:0").expect("a peer");
         peer.set_read_timeout(Some(Duration::from_secs(2)))

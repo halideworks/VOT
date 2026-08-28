@@ -1,6 +1,6 @@
 # ADR-0045: Push, the holder dials
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-27
 - Decision owners: A00 architecture; A10 transport
 - Applies to: `spec/wire.md` section 1 (the `GOAWAY` payload, and a new
@@ -222,7 +222,10 @@ their encodings, and every verification rule keeps its place.**
    returns either a refusal or the grant together with the `ReceiveSeams`
    for that session, so the embedding process owns the socket, the
    certificate, the grant, and the placement, and every seam call carries
-   the session it belongs to. `Listener` gains stateless retry
+   the session it belongs to. Receive-side push is initially Unix-only: it
+   fails closed elsewhere until the platform layer can retain and mutate a
+   destination through a guarded directory handle. Dialing `push` remains
+   cross-platform. `Listener` gains stateless retry
    (`quiche::retry`, token binding the source address and the original
    destination connection id, which `accept` then receives as `odcid`
    before allocating connection state). The receive portal also applies a

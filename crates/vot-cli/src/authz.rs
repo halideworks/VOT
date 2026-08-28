@@ -575,16 +575,17 @@ mod tests {
         .expect("a holder")
     }
 
-    fn publish_holder_with_scope(
+    fn holder_with_capability(
         issuer_key: &SigningKey,
         holder_key: &SigningKey,
+        operations: Vec<u64>,
         scope: Scope,
     ) -> Holder {
         let capability = Capability {
             issuer: ISSUER.to_owned(),
             audience: AUDIENCE.to_owned(),
             holder_key: holder_key.verifying_key().to_bytes(),
-            operations: vec![Operation::Publish.identifier()],
+            operations,
             scope,
             limits: Vec::new(),
             not_before: NOW,
@@ -632,13 +633,41 @@ mod tests {
                 .is_none()
         );
 
-        let null_length = publish_holder_with_scope(&issuer, &holder_key, package_scope(ROOT));
+        let null_length = holder_with_capability(
+            &issuer,
+            &holder_key,
+            vec![Operation::Publish.identifier()],
+            package_scope(ROOT),
+        );
         let open = null_length.answer(&challenge, binding).expect("an answer");
         assert!(
             requirement
                 .decide(&challenge, &open, binding, NOW)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_read_token_requires_each_read_operation() {
+        let issuer = keypair(33);
+        let holder_key = keypair(34);
+        let requirement = requirement(&issuer);
+        let challenge = requirement.challenge([10; 32]);
+        let binding = channel(10);
+        for operation in [Operation::ReadManifest, Operation::ReadRanges] {
+            let holder = holder_with_capability(
+                &issuer,
+                &holder_key,
+                vec![operation.identifier()],
+                package_scope(ROOT),
+            );
+            let open = holder.answer(&challenge, binding).expect("an answer");
+            assert!(
+                requirement
+                    .decide(&challenge, &open, binding, NOW)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -2619,6 +2619,7 @@ dependencies = [
  "vot-object",
  "vot-pack",
  "vot-package",
+ "vot-platform-fs",
  "vot-receipt",
  "vot-resume",
  "vot-scheduler",

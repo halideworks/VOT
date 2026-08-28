@@ -1,9 +1,16 @@
 //! The shared fetch plan and its planned objects.
 
 use super::{
-    Arc, BTreeMap, CountingSink, EntryRecord, Error, MAX_REQUESTED_RANGE, Mutex, PackageSummary,
-    ResumeStore, SubjectId, frames, range_span, total_units_of,
+    Arc, BTreeMap, CompletionHook, CountingSink, EntryRecord, Error, MAX_REQUESTED_RANGE, Mutex,
+    PackageSummary, ReceiveSessionId, ResumeStore, SubjectId, frames, range_span, total_units_of,
 };
+
+#[derive(Clone)]
+pub(crate) struct ActiveSink {
+    pub(crate) sink: Arc<CountingSink>,
+    pub(crate) complete: Option<CompletionHook>,
+    pub(crate) receive_session: ReceiveSessionId,
+}
 
 /// Store reservations for objects with units to checkpoint; zero-length
 /// objects are written directly.
@@ -259,7 +266,7 @@ pub(crate) struct FetchPlan {
     pub(crate) current: usize,
     /// The sink the current object's verified ranges flow into, kept for
     /// the sync that makes its bytes durable before the fetch moves on.
-    pub(crate) active: Option<Arc<CountingSink>>,
+    pub(crate) active: Option<ActiveSink>,
     /// Bytes placed for objects already left behind, so what this fetch
     /// has settled only ever goes up.
     pub(crate) placed_before: u64,

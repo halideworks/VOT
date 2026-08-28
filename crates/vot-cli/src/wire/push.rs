@@ -38,14 +38,150 @@ enum PlanSlot {
     Failed,
 }
 
-type PlanKey = ([u8; 32], [u8; 32], std::path::PathBuf);
+type PlanScope = ([u8; 32], u64);
 type PlanGroup = (std::sync::Mutex<PlanSlot>, std::sync::Condvar);
 type ReceivePlans = std::sync::Arc<
-    std::sync::Mutex<std::collections::BTreeMap<PlanKey, std::sync::Weak<PlanGroup>>>,
+    std::sync::Mutex<
+        std::collections::BTreeMap<std::path::PathBuf, (PlanScope, std::sync::Weak<PlanGroup>)>,
+    >,
 >;
 
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PLAN_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+const fn valid_rail_count(rails: usize) -> bool {
+    rails != 0 && rails <= crate::drive::CONCURRENT_SESSIONS
+}
+
+const fn should_record_failure(bounded: bool, clean: bool) -> bool {
+    bounded && clean
+}
+
+fn valid_push_scope(scope: &vot_capability::Scope) -> bool {
+    scope.suite == 1 && scope.length.is_some() && scope.ranges.is_empty()
+}
+
+const fn real_directory(is_directory: bool) -> bool {
+    is_directory
+}
+
+const fn missing_path(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::NotFound)
+}
+
+const fn safe_parent(strict: bool, sticky: bool) -> bool {
+    strict || sticky
+}
+
+const fn raced_existing(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::AlreadyExists)
+}
+
+#[cfg(not(unix))]
+fn prepare_push_destination_unsupported(_path: &Path) -> Result<(), Error> {
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "push receive requires guarded directory operations on this platform",
+    )))
+}
+
+#[cfg(not(unix))]
+use prepare_push_destination_unsupported as prepare_push_destination;
+
+#[cfg(not(unix))]
+fn canonical_push_destination_unsupported(path: &Path) -> Result<std::path::PathBuf, Error> {
+    prepare_push_destination(path)?;
+    Ok(path.to_path_buf())
+}
+
+#[cfg(not(unix))]
+use canonical_push_destination_unsupported as canonical_push_destination;
+
+fn canonical_push_destination_before(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<std::path::PathBuf>, Error> {
+    let canonical = canonical_push_destination(path)?;
+    Ok(deadline_live(std::time::Instant::now(), deadline).then_some(canonical))
+}
+
+fn deadline_live(now: std::time::Instant, deadline: std::time::Instant) -> bool {
+    now < deadline
+}
+
+#[cfg(unix)]
+fn prepare_push_destination(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !real_directory(metadata.file_type().is_dir()) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "push destination is not a real directory",
+                )));
+            }
+            vot_platform_fs::validate_removal_parent(&path.join("objects")).map_err(Error::Io)
+        }
+        Err(error) => prepare_absent_destination(path, error),
+    }
+}
+
+#[cfg(unix)]
+fn canonical_push_destination(path: &Path) -> Result<std::path::PathBuf, Error> {
+    prepare_push_destination(path)?;
+    let canonical = std::fs::canonicalize(path)?;
+    prepare_push_destination(&canonical)?;
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn prepare_absent_destination(path: &Path, error: std::io::Error) -> Result<(), Error> {
+    if !missing_path(error.kind()) {
+        return Err(Error::Io(error));
+    }
+    let strict = vot_platform_fs::validate_removal_parent(path).is_ok();
+    #[cfg(unix)]
+    let sticky = sticky_parent(path)?;
+    #[cfg(not(unix))]
+    let sticky = false;
+    if !safe_parent(strict, sticky) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "push destination has an unsafe parent",
+        )));
+    }
+    finish_destination_create(path, crate::create_private_directory(path))
+}
+
+#[cfg(unix)]
+fn finish_destination_create(path: &Path, result: Result<(), Error>) -> Result<(), Error> {
+    match result {
+        Ok(()) => prepare_push_destination(path),
+        Err(Error::Io(error)) if raced_existing(error.kind()) => prepare_push_destination(path),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn sticky_parent(path: &Path) -> Result<bool, Error> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = std::fs::symlink_metadata(parent)?;
+    Ok(trusted_sticky_parent(
+        metadata.file_type().is_dir(),
+        metadata.mode() & 0o1000 != 0,
+        metadata.uid(),
+        rustix::process::geteuid().as_raw(),
+    ))
+}
+
+#[cfg(unix)]
+const fn trusted_sticky_parent(directory: bool, sticky: bool, owner: u32, effective: u32) -> bool {
+    directory && sticky && (owner == 0 || owner == effective)
+}
 
 struct PrimaryPlan {
     group: std::sync::Arc<PlanGroup>,
@@ -81,21 +217,47 @@ impl Drop for PrimaryPlan {
     }
 }
 
+struct SharedPlanFailure(Option<crate::fetch::SharedPlan>);
+
+impl SharedPlanFailure {
+    fn arm(&mut self, plan: crate::fetch::SharedPlan) {
+        self.0 = Some(plan);
+    }
+
+    fn complete(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SharedPlanFailure {
+    fn drop(&mut self) {
+        if let Some(plan) = &self.0 {
+            crate::fetch::abandon_plan(plan);
+        }
+    }
+}
+
 fn plan_group(
     plans: &ReceivePlans,
-    key: PlanKey,
-) -> Result<(std::sync::Arc<PlanGroup>, bool), Error> {
+    key: (std::path::PathBuf, PlanScope),
+) -> Result<Option<(std::sync::Arc<PlanGroup>, bool)>, Error> {
+    let (directory, scope) = key;
     let mut held = plans.lock().map_err(|_| Error::CarrierUnavailable)?;
-    held.retain(|_, group| group.strong_count() != 0);
-    if let Some(group) = held.get(&key).and_then(std::sync::Weak::upgrade) {
-        return Ok((group, false));
+    held.retain(|_, (_, group)| group.strong_count() != 0);
+    if let Some((held_scope, group)) = held.get(&directory)
+        && let Some(group) = group.upgrade()
+    {
+        if *held_scope != scope {
+            return Ok(None);
+        }
+        return Ok(Some((group, false)));
     }
     let group = std::sync::Arc::new((
         std::sync::Mutex::new(PlanSlot::Building),
         std::sync::Condvar::new(),
     ));
-    held.insert(key, std::sync::Arc::downgrade(&group));
-    Ok((group, true))
+    held.insert(directory, (scope, std::sync::Arc::downgrade(&group)));
+    Ok(Some((group, true)))
 }
 
 fn await_push_close(session: &mut vot_session::Session<Transport>) -> Result<(), Error> {
@@ -161,7 +323,7 @@ pub(super) fn push_bundle_railed(
     identity: [u8; 32],
     rails: usize,
 ) -> Result<PackageSummary, Error> {
-    if rails == 0 || rails > crate::drive::CONCURRENT_SESSIONS {
+    if !valid_rail_count(rails) {
         return Err(Error::InvalidArguments);
     }
     let server = crate::BundleServer::open(bundle)?;
@@ -203,10 +365,7 @@ pub(super) fn push_bundle_railed(
             running.push(scope.spawn(move || {
                 match crate::drive::drive_until(&mut pushing, crate::ServeSession::push_completed)?
                 {
-                    None => {
-                        pushing.finish_push();
-                        Ok(())
-                    }
+                    None => Ok(()),
                     Some(crate::ServeStatus::Closed(code)) => Err(Error::PeerClosed(code)),
                     Some(crate::ServeStatus::Disconnected | crate::ServeStatus::Active) => {
                         Err(Error::CarrierUnavailable)
@@ -221,7 +380,10 @@ pub(super) fn push_bundle_railed(
     })
 }
 
-/// Receives pushed bundles below `directory`.
+/// Receives pushed bundles below `directory` on Unix.
+///
+/// Non-Unix platforms fail closed until guarded directory operations are
+/// available there. Dialing [`push_bundle`] remains cross-platform.
 pub fn receive_push(
     address: SocketAddr,
     directory: &Path,
@@ -235,6 +397,7 @@ pub fn receive_push(
         std::env::var(super::SERVE_AUDIENCE).ok().as_deref(),
     )?
     .ok_or(Error::InvalidArguments)?;
+    prepare_push_destination(directory)?;
     let ephemeral = match credentials {
         Credentials::Ephemeral => Some(super::Ephemeral::generate()?),
         Credentials::Files { .. } => None,
@@ -308,6 +471,7 @@ pub fn bind_push_listener(
 ///
 /// `policy` receives an untrusted pending presentation and must authenticate
 /// and authorize it before returning [`PushAdmission`].
+/// Non-Unix platforms refuse every admitted destination.
 pub fn receive_push_on<P>(listener: &Listener, policy: P) -> Result<(), Error>
 where
     P: Fn(PushPresentation<'_>) -> Option<PushAdmission> + Sync,
@@ -345,7 +509,11 @@ where
         > = std::collections::VecDeque::new();
         let mut failed = Ok(());
         for _ in 0..sessions.unwrap_or(u32::MAX) {
-            while running.len() >= crate::drive::CONCURRENT_SESSIONS {
+            while running
+                .len()
+                .checked_sub(crate::drive::CONCURRENT_SESSIONS)
+                .is_some()
+            {
                 let finished = loop {
                     if let Some(finished) = running
                         .iter()
@@ -357,7 +525,7 @@ where
                 };
                 let done = running.remove(finished).ok_or(Error::CarrierUnavailable)?;
                 let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
-                if sessions.is_some() && failed.is_ok() {
+                if should_record_failure(sessions.is_some(), failed.is_ok()) {
                     failed = result.map(|_| ());
                 }
             }
@@ -370,7 +538,7 @@ where
         }
         while let Some(done) = running.pop_front() {
             let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
-            if sessions.is_some() && failed.is_ok() {
+            if should_record_failure(sessions.is_some(), failed.is_ok()) {
                 failed = result.map(|_| ());
             }
         }
@@ -420,8 +588,7 @@ where
             let binding = session
                 .channel_binding()
                 .ok_or(Error::ChannelBindingUnavailable)?;
-            let capability_id = *blake3::hash(&open.capability).as_bytes();
-            let Some(admission) = policy(PushPresentation {
+            let Some(mut admission) = policy(PushPresentation {
                 peer,
                 challenge,
                 open,
@@ -443,10 +610,7 @@ where
                     vot_codec::error_code::AUTHENTICATION_FAILED,
                 ));
             }
-            if admission.scope.suite != 1
-                || admission.scope.length.is_none()
-                || !admission.scope.ranges.is_empty()
-            {
+            if !valid_push_scope(&admission.scope) {
                 session.refuse(
                     vot_codec::error_code::AUTHORIZATION_FAILED,
                     crate::authz::REFUSAL_DETAIL.to_owned(),
@@ -454,9 +618,30 @@ where
                 session.flush()?;
                 continue;
             }
-            let root = admission.scope.root;
-            let key = (root, capability_id, admission.directory.clone());
-            let (group, primary) = plan_group(plans, key)?;
+            let Some(directory) =
+                canonical_push_destination_before(&admission.directory, authentication_deadline)?
+            else {
+                let _ = session
+                    .driver()
+                    .close(vot_codec::error_code::AUTHENTICATION_FAILED);
+                return Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHENTICATION_FAILED,
+                ));
+            };
+            admission.directory = directory;
+            let scope = (
+                admission.scope.root,
+                admission.scope.length.ok_or(Error::InvalidArguments)?,
+            );
+            let Some((group, primary)) = plan_group(plans, (admission.directory.clone(), scope))?
+            else {
+                session.refuse(
+                    vot_codec::error_code::AUTHORIZATION_FAILED,
+                    crate::authz::REFUSAL_DETAIL.to_owned(),
+                )?;
+                session.flush()?;
+                continue;
+            };
             let primary_plan = primary.then(|| PrimaryPlan {
                 group: std::sync::Arc::clone(&group),
                 published: false,
@@ -504,6 +689,7 @@ where
         }
     };
 
+    let mut shared_failure = SharedPlanFailure(plan.clone());
     let mut fetcher = if let Some(plan) = plan {
         crate::BundleFetcher::join_started_session(session, &admission.directory, plan)?
     } else {
@@ -533,7 +719,8 @@ where
                 primary_plan
                     .as_mut()
                     .ok_or(Error::CarrierUnavailable)?
-                    .publish(plan)?;
+                    .publish(plan.clone())?;
+                shared_failure.arm(plan);
             }
             Err(error) => {
                 return Err(error);
@@ -545,7 +732,9 @@ where
         crate::FetchStatus::Complete => {
             fetcher.acknowledge_push()?;
             fetcher.await_push_close()?;
-            fetcher.package().ok_or(Error::InvalidBundle)
+            let package = fetcher.package().ok_or(Error::InvalidBundle)?;
+            shared_failure.complete();
+            Ok(package)
         }
         crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
         crate::FetchStatus::Disconnected
@@ -558,26 +747,212 @@ where
 mod tests {
     use super::*;
 
-    fn key(index: u8) -> PlanKey {
+    fn key(index: u8) -> (std::path::PathBuf, PlanScope) {
         (
-            [index; 32],
-            [index.wrapping_add(1); 32],
             index.to_string().into(),
+            ([index; 32], u64::from(index.wrapping_add(1))),
         )
+    }
+
+    #[test]
+    fn push_bounds_and_scope_are_exact() {
+        assert!(!valid_rail_count(0));
+        assert!(valid_rail_count(1));
+        assert!(valid_rail_count(crate::drive::CONCURRENT_SESSIONS));
+        assert!(!valid_rail_count(crate::drive::CONCURRENT_SESSIONS + 1));
+        let now = std::time::Instant::now();
+        assert!(!deadline_live(now, now));
+        assert!(deadline_live(now, now + std::time::Duration::from_nanos(1)));
+        for (bounded, clean, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(should_record_failure(bounded, clean), expected);
+        }
+
+        let exact = crate::authz::push_scope([7; 32], 42);
+        assert!(valid_push_scope(&exact));
+        assert!(!valid_push_scope(&vot_capability::Scope {
+            suite: 2,
+            ..exact.clone()
+        }));
+        assert!(!valid_push_scope(&vot_capability::Scope {
+            length: None,
+            ..exact.clone()
+        }));
+        assert!(!valid_push_scope(&vot_capability::Scope {
+            ranges: vec![vot_capability::Range::new(0, 1).unwrap()],
+            ..exact
+        }));
+        assert!(real_directory(true));
+        assert!(!real_directory(false));
+        assert!(missing_path(std::io::ErrorKind::NotFound));
+        assert!(!missing_path(std::io::ErrorKind::PermissionDenied));
+        assert!(raced_existing(std::io::ErrorKind::AlreadyExists));
+        assert!(!raced_existing(std::io::ErrorKind::PermissionDenied));
+        for (strict, sticky, expected) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            assert_eq!(safe_parent(strict, sticky), expected);
+        }
+        #[cfg(unix)]
+        {
+            assert!(trusted_sticky_parent(true, true, 0, 42));
+            assert!(trusted_sticky_parent(true, true, 42, 42));
+            assert!(!trusted_sticky_parent(true, true, 41, 42));
+            assert!(!trusted_sticky_parent(false, true, 42, 42));
+            assert!(!trusted_sticky_parent(true, false, 42, 42));
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn push_receive_is_refused_without_guarded_directories() {
+        assert!(prepare_push_destination(Path::new("push")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_destinations_must_be_owned_directories() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        let parent = crate::tests::temporary("push-destination");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(&parent).unwrap();
+        let destination = parent.join("bundle");
+        let not_directory = parent.join("file");
+        std::fs::write(&not_directory, []).unwrap();
+        let error = prepare_absent_destination(
+            &not_directory.join("bundle"),
+            std::io::Error::from(std::io::ErrorKind::NotADirectory),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::NotADirectory)
+        );
+
+        let denied = parent.join("denied");
+        let error = finish_destination_create(
+            &denied,
+            Err(Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!denied.exists());
+        finish_destination_create(
+            &denied,
+            Err(Error::Io(std::io::Error::from(
+                std::io::ErrorKind::AlreadyExists,
+            ))),
+        )
+        .unwrap();
+        assert!(denied.is_dir());
+
+        assert!(!sticky_parent(&destination).unwrap());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1700)).unwrap();
+        assert!(sticky_parent(&destination).unwrap());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_push_destination(&destination).unwrap();
+        prepare_push_destination(&destination).unwrap();
+
+        let sub = parent.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let dotdot = sub.join("..").join("bundle");
+        let ancestor = parent.join("ancestor");
+        std::os::unix::fs::symlink(".", &ancestor).unwrap();
+        let through_symlink = ancestor.join("bundle");
+        let canonical = canonical_push_destination(&destination).unwrap();
+        assert_eq!(
+            canonical_push_destination_before(
+                &destination,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap(),
+            Some(canonical.clone())
+        );
+        assert!(
+            canonical_push_destination_before(
+                &destination,
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(canonical_push_destination(&dotdot).unwrap(), canonical);
+        assert_eq!(
+            canonical_push_destination(&through_symlink).unwrap(),
+            canonical
+        );
+
+        let plans = ReceivePlans::default();
+        let scope = ([7; 32], 8);
+        let (primary, first) = plan_group(&plans, (canonical.clone(), scope))
+            .unwrap()
+            .unwrap();
+        assert!(first);
+        let (joined, first) = plan_group(
+            &plans,
+            (canonical_push_destination(&dotdot).unwrap(), scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!first);
+        assert!(std::sync::Arc::ptr_eq(&primary, &joined));
+        assert!(
+            plan_group(
+                &plans,
+                (
+                    canonical_push_destination(&through_symlink).unwrap(),
+                    ([7; 32], 9),
+                ),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_push_destination(&destination).is_err());
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&destination).unwrap();
+
+        let outside = parent.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &destination).unwrap();
+        assert!(prepare_push_destination(&destination).is_err());
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
     fn a_failed_primary_wakes_every_waiter() {
         let plans = ReceivePlans::default();
-        let (group, primary) = plan_group(&plans, key(1)).unwrap();
+        let (group, primary) = plan_group(&plans, key(1)).unwrap().unwrap();
         assert!(primary);
-        let (joined, primary) = plan_group(&plans, key(1)).unwrap();
+        let (joined, primary) = plan_group(&plans, key(1)).unwrap().unwrap();
         assert!(!primary);
         let waiting = {
             std::thread::spawn(move || {
                 let mut state = joined.0.lock().unwrap();
                 while matches!(*state, PlanSlot::Building) {
-                    state = joined.1.wait(state).unwrap();
+                    let (next, timeout) = joined
+                        .1
+                        .wait_timeout(state, std::time::Duration::from_secs(1))
+                        .unwrap();
+                    state = next;
+                    if timeout.timed_out() {
+                        return false;
+                    }
                 }
                 matches!(*state, PlanSlot::Failed)
             })
@@ -590,29 +965,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_rail_abandons_its_plan_and_a_completed_one_does_not() {
+        let (bundle, _) = crate::harness::built_bundle("push-plan-guard", &[("a", vec![1; 8])]);
+        let (server, mut session, mut connection) = crate::fetch::tests::serving(&bundle);
+        let output = crate::tests::temporary("push-plan-guard-output");
+        let mut fetcher =
+            crate::BundleFetcher::begin(crate::harness::Loopback::default(), &output, None)
+                .unwrap();
+        let plan =
+            crate::fetch::tests::planned(&server, &mut session, &mut connection, &mut fetcher);
+
+        let mut failed = SharedPlanFailure(None);
+        failed.arm(plan.clone());
+        drop(failed);
+        assert!(plan.lock().unwrap().abandoned);
+        plan.lock().unwrap().abandoned = false;
+        SharedPlanFailure(Some(plan.clone())).complete();
+        assert!(!plan.lock().unwrap().abandoned);
+        crate::harness::discard(&[&bundle, &output]);
+    }
+
+    #[test]
     fn completed_groups_are_replaced_and_dead_roots_are_pruned() {
         let plans = ReceivePlans::default();
         for index in 0..100 {
-            let (group, primary) = plan_group(&plans, key(index)).unwrap();
+            let (group, primary) = plan_group(&plans, key(index)).unwrap().unwrap();
             assert!(primary);
             drop(group);
         }
-        let (first, primary) = plan_group(&plans, key(7)).unwrap();
+        let (first, primary) = plan_group(&plans, key(7)).unwrap().unwrap();
         assert!(primary);
-        let (joined, primary) = plan_group(&plans, key(7)).unwrap();
+        let (joined, primary) = plan_group(&plans, key(7)).unwrap().unwrap();
         assert!(!primary);
         assert!(std::sync::Arc::ptr_eq(&first, &joined));
         assert_eq!(plans.lock().unwrap().len(), 1);
     }
 
     #[test]
+    fn equivalent_grants_join_and_conflicting_scopes_are_refused() {
+        let plans = ReceivePlans::default();
+        let key = ("bundle".into(), ([7; 32], 8));
+        let (primary, first) = plan_group(&plans, key.clone()).unwrap().unwrap();
+        assert!(first);
+        let (joined, first) = plan_group(&plans, key).unwrap().unwrap();
+        assert!(!first);
+        assert!(std::sync::Arc::ptr_eq(&primary, &joined));
+        assert!(
+            plan_group(&plans, ("bundle".into(), ([7; 32], 9)))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn one_root_admitted_to_two_destinations_never_shares_a_plan() {
         let plans = ReceivePlans::default();
-        let root = [7; 32];
-        let capability = [8; 32];
-        let (left, left_primary) = plan_group(&plans, (root, capability, "left".into())).unwrap();
-        let (right, right_primary) =
-            plan_group(&plans, (root, capability, "right".into())).unwrap();
+        let scope = ([7; 32], 8);
+        let (left, left_primary) = plan_group(&plans, ("left".into(), scope)).unwrap().unwrap();
+        let (right, right_primary) = plan_group(&plans, ("right".into(), scope))
+            .unwrap()
+            .unwrap();
         assert!(left_primary && right_primary);
         assert!(!std::sync::Arc::ptr_eq(&left, &right));
     }
@@ -641,15 +1053,20 @@ mod tests {
 
     #[test]
     fn a_cancelled_joiner_leaves_a_building_primary() {
-        let group = (
+        let group = std::sync::Arc::new((
             std::sync::Mutex::new(PlanSlot::Building),
             std::sync::Condvar::new(),
-        );
+        ));
         let cancellation = crate::CancellationHandle::default();
         let cancelling = cancellation.clone();
+        let finishing = std::sync::Arc::clone(&group);
         let wake = std::thread::spawn(move || {
             std::thread::sleep(PLAN_WAIT_POLL);
             cancelling.cancel();
+            finishing.1.notify_all();
+            std::thread::sleep(PLAN_WAIT_POLL);
+            *finishing.0.lock().unwrap() = PlanSlot::Failed;
+            finishing.1.notify_all();
         });
         assert!(joined_plan(&group, &cancellation).unwrap().is_none());
         wake.join().unwrap();

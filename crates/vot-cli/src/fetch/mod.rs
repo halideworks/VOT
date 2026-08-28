@@ -153,6 +153,14 @@ pub(crate) mod tests {
     use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
     use vot_transport_api::ConnectionId;
 
+    fn active(sink: Arc<CountingSink>) -> ActiveSink {
+        ActiveSink {
+            sink,
+            complete: None,
+            receive_session: ReceiveSessionId(0),
+        }
+    }
+
     /// A served session and its state, ready to answer a fetch.
     pub(crate) fn serving(bundle: &Path) -> (BundleServer, Session<Loopback>, ServeConnection) {
         let server = BundleServer::open(bundle).unwrap();
@@ -644,8 +652,31 @@ pub(crate) mod tests {
 
         let output = temporary("striped-fetched");
         let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let callbacks = Arc::new(Mutex::new(Vec::new()));
+        let selected = Arc::clone(&callbacks);
+        let completed = Arc::clone(&callbacks);
+        let destination = output.to_path_buf();
+        primary.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |session, object| {
+                selected.lock().unwrap().push(("selected", session));
+                let path = destination
+                    .join("objects")
+                    .join(crate::object_name(&object.object.root));
+                Ok(Some(Box::new(CountingSink::at(
+                    &path,
+                    object.object.length,
+                )?)))
+            })),
+            complete: Some(Arc::new(move |session, _| {
+                completed.lock().unwrap().push(("completed", session));
+                Ok(())
+            })),
+            ..ReceiveSeams::default()
+        });
         primary.rail.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
+        primary.advance().unwrap();
+        assert!(plan.lock().unwrap().active.is_some());
         let mut secondary = BundleFetcher::join(
             Loopback::default(),
             &output,
@@ -654,6 +685,17 @@ pub(crate) mod tests {
             BTreeSet::new(),
         )
         .unwrap();
+        let wrong = Arc::clone(&callbacks);
+        secondary.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |session, _| {
+                wrong.lock().unwrap().push(("wrong sink", session));
+                Ok(None)
+            })),
+            complete: Some(Arc::new(move |session, _| {
+                panic!("the joining rail completed the selected sink: {session:?}")
+            })),
+            ..ReceiveSeams::default()
+        });
 
         let (mut seq1, mut seq2) = (0, 0);
         // Admit the rail before the primary settles, so the handout is deterministic.
@@ -709,6 +751,11 @@ pub(crate) mod tests {
         assert!(!secondary.has_backlog());
         assert_eq!(primary.package(), Some(built));
         assert_eq!(secondary.package(), Some(built));
+        let callbacks = callbacks.lock().unwrap();
+        assert_eq!(callbacks.len(), 2);
+        assert_eq!(callbacks[0].0, "selected");
+        assert_eq!(callbacks[1].0, "completed");
+        assert_eq!(callbacks[0].1, callbacks[1].1);
         assert_same_tree(&bundle, &output);
         discard(&[&bundle, &output]);
     }
@@ -833,7 +880,7 @@ pub(crate) mod tests {
             },
             objects: vec![first, second],
             current: 0,
-            active: Some(sink0),
+            active: Some(active(sink0)),
             placed_before: 0,
             carried_before: 0,
             next_offset: 0,
@@ -855,7 +902,7 @@ pub(crate) mod tests {
         {
             let mut plan = fetcher.locked_plan().unwrap();
             plan.current = 1;
-            plan.active = Some(sink1);
+            plan.active = Some(active(sink1));
         }
         fetcher.advance().unwrap();
         assert_eq!(
@@ -1559,7 +1606,7 @@ pub(crate) mod tests {
         // The crossing writer flushes once; the next mark is a stride
         // above what is placed.
         let output = temporary("stride");
-        fs::create_dir_all(&output).unwrap();
+        crate::create_private_directory(&output).unwrap();
         let stride = usize::try_from(FLUSH_STRIDE_BYTES).unwrap();
         let sink =
             CountingSink::create(&output.join("s.obj"), 4 * FLUSH_STRIDE_BYTES, None).unwrap();
@@ -1695,6 +1742,7 @@ pub(crate) mod tests {
             &[("a.bin", patterned(300_001)), ("b.bin", noise(300_002))],
         );
         let output = temporary("custom-resume-old");
+        let skipped;
         {
             let (server, mut session, mut connection) = serving(&bundle);
             let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
@@ -1712,13 +1760,17 @@ pub(crate) mod tests {
                 }
             }
             assert_eq!(fetcher.locked_plan().unwrap().current, 1);
+            skipped = fetcher.locked_plan().unwrap().objects[0].object.root;
         }
 
         let custom = temporary("custom-resume-new");
-        fs::create_dir_all(&custom).unwrap();
+        crate::create_private_directory(&custom).unwrap();
         let destination = custom.to_path_buf();
         let seams = ReceiveSeams {
             sink: Some(Arc::new(move |_, object| {
+                if object.object.root == skipped {
+                    return Ok(None);
+                }
                 Ok(Some(Box::new(CountingSink::at(
                     &destination.join(crate::object_name(&object.object.root)),
                     object.object.length,
@@ -1735,15 +1787,200 @@ pub(crate) mod tests {
             FetchStatus::Complete
         );
         let plan = fetcher.locked_plan().unwrap();
-        let total: u64 = plan.objects.iter().map(|object| object.object.length).sum();
-        assert_eq!(fetcher.rail.taken_bytes, total);
+        let requested: u64 = plan
+            .objects
+            .iter()
+            .filter(|object| object.object.root != skipped)
+            .map(|object| object.object.length)
+            .sum();
+        assert_eq!(fetcher.rail.taken_bytes, requested);
         assert!(plan.objects.iter().all(|object| object.resumed.is_empty()));
         assert!(plan.objects.iter().all(|object| {
-            custom
-                .join(crate::object_name(&object.object.root))
-                .exists()
+            let name = crate::object_name(&object.object.root);
+            !output.join("objects").join(&name).exists()
+                && custom.join(name).exists() == (object.object.root != skipped)
         }));
         discard(&[&bundle, &output, &custom]);
+    }
+
+    #[test]
+    fn a_custom_rail_restarts_partial_and_whole_directory_resumes() {
+        for (name, whole) in [("partial", false), ("whole", true)] {
+            let (bundle, _) = built_bundle(name, &[("a.bin", patterned(300_001))]);
+            let (server, mut session, mut connection) = serving(&bundle);
+            let output = temporary(&format!("mixed-resume-{name}"));
+            let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            let plan = planned(&server, &mut session, &mut connection, &mut primary);
+            let object = plan.lock().unwrap().objects[0].object;
+            let length = object.length;
+            {
+                let mut held = plan.lock().unwrap();
+                held.active = None;
+                held.objects[0].sink_chosen = false;
+                held.objects[0]
+                    .resumed
+                    .insert(0, if whole { length } else { length / 2 });
+                held.next_offset = 0;
+                held.covered = CoverageMap::new();
+                held.skip.clear();
+            }
+
+            let custom = temporary(&format!("mixed-resume-custom-{name}"));
+            crate::create_private_directory(&custom).unwrap();
+            let destination = custom.to_path_buf();
+            let mut secondary = BundleFetcher::join(
+                Loopback::default(),
+                &output,
+                Arc::clone(&plan),
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap();
+            secondary.manifest.descriptor = primary.manifest.descriptor.clone();
+            secondary.set_receive_seams(ReceiveSeams {
+                sink: Some(Arc::new(move |_, object| {
+                    Ok(Some(Box::new(CountingSink::at(
+                        &destination.join(crate::object_name(&object.object.root)),
+                        object.object.length,
+                    )?)))
+                })),
+                ..ReceiveSeams::default()
+            });
+            secondary.advance().unwrap();
+
+            let held = plan.lock().unwrap();
+            assert!(held.objects[0].resumed.is_empty());
+            assert!(held.covered.extents().is_empty());
+            assert!(held.skip.is_empty());
+            assert_eq!(secondary.rail.taken_bytes, length);
+            assert!(
+                !output
+                    .join("objects")
+                    .join(crate::object_name(&object.root))
+                    .exists()
+            );
+            drop(held);
+            discard(&[&bundle, &output, &custom]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_sink_selection_never_removes_a_replacement_staging_file() {
+        let (bundle, _) = built_bundle("custom-replacement", &[("a.bin", patterned(300_001))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("custom-replacement-output");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let plan = planned(&server, &mut session, &mut connection, &mut fetcher);
+        let object = plan.lock().unwrap().objects[0].object;
+        let path = output
+            .join("objects")
+            .join(crate::object_name(&object.root));
+        let renamed = path.with_extension("stale");
+        fs::write(&path, b"stale").unwrap();
+        {
+            let mut held = plan.lock().unwrap();
+            held.active = None;
+            held.objects[0].sink_chosen = false;
+        }
+        let replaced = path.clone();
+        fetcher.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, _| {
+                fs::rename(&replaced, &renamed)?;
+                fs::write(&replaced, b"replacement")?;
+                Ok(None)
+            })),
+            ..ReceiveSeams::default()
+        });
+
+        assert!(fetcher.advance().is_err());
+        assert!(plan.lock().unwrap().abandoned);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        discard(&[&bundle, &output]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_sink_selection_rejects_an_invalid_staging_file() {
+        let (bundle, _) = built_bundle("custom-invalid-staging", &[("a.bin", patterned(8))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("custom-invalid-staging-output");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let plan = planned(&server, &mut session, &mut connection, &mut fetcher);
+        let object = plan.lock().unwrap().objects[0].object;
+        let path = output
+            .join("objects")
+            .join(crate::object_name(&object.root));
+        {
+            let mut held = plan.lock().unwrap();
+            held.active = None;
+            held.objects[0].sink_chosen = false;
+        }
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let factory_called = Arc::clone(&called);
+        fetcher.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, _| {
+                factory_called.store(true, Ordering::Relaxed);
+                Ok(None)
+            })),
+            ..ReceiveSeams::default()
+        });
+
+        assert!(fetcher.advance().is_err());
+        assert!(plan.lock().unwrap().abandoned);
+        assert!(!called.load(Ordering::Relaxed));
+        discard(&[&bundle, &output]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_path_custom_sink_does_not_inherit_resume_extents() {
+        let (bundle, _) = built_bundle("custom-same-path-resume", &[("a.bin", patterned(300_001))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("custom-same-path-resume-output");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let plan = planned(&server, &mut session, &mut connection, &mut fetcher);
+        let object = plan.lock().unwrap().objects[0].object;
+        let path = output
+            .join("objects")
+            .join(crate::object_name(&object.root));
+        {
+            let mut held = plan.lock().unwrap();
+            held.active = None;
+            held.objects[0].sink_chosen = false;
+            held.objects[0].resumed.insert(0, object.length / 2);
+        }
+        fs::remove_file(&path).unwrap();
+        let destination = path.clone();
+        let mut secondary = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        secondary.manifest.descriptor = fetcher.manifest.descriptor.clone();
+        secondary.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, object| {
+                Ok(Some(Box::new(CountingSink::at(
+                    &destination,
+                    object.object.length,
+                )?)))
+            })),
+            ..ReceiveSeams::default()
+        });
+
+        secondary.advance().unwrap();
+        let held = plan.lock().unwrap();
+        assert!(held.objects[0].resumed.is_empty());
+        assert!(held.covered.extents().is_empty());
+        assert!(held.skip.is_empty());
+        assert_eq!(secondary.rail.taken_bytes, object.length);
+        drop(held);
+        discard(&[&bundle, &output]);
     }
 
     #[test]
@@ -1976,6 +2213,20 @@ pub(crate) mod tests {
         let mut whole = stored;
         whole.resumed.insert(0, 100);
         assert!(whole.fully_resumed());
+
+        for (length, resumed, stored, expected) in [
+            (0, false, false, true),
+            (0, false, true, true),
+            (1, false, false, false),
+            (1, false, true, false),
+            (1, true, false, false),
+            (1, true, true, true),
+        ] {
+            assert_eq!(
+                protocol::custom_flush_due(length, resumed, stored),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1992,7 +2243,7 @@ pub(crate) mod tests {
         // The seed arms the next stride above resumed bytes, so the first
         // flush is new work.
         let output = temporary("resume-seed");
-        fs::create_dir_all(&output).unwrap();
+        crate::create_private_directory(&output).unwrap();
         let path = output.join("s.obj");
         drop(CountingSink::create(&path, 4 * FLUSH_STRIDE_BYTES, None).unwrap());
 
@@ -2027,7 +2278,7 @@ pub(crate) mod tests {
         // moved-past object checkpoints nothing.
         let unit = vot_scheduler::RANGE_UNIT_BYTES;
         let output = temporary("hook");
-        fs::create_dir_all(&output).unwrap();
+        crate::create_private_directory(&output).unwrap();
         let object = frames::ObjectId {
             suite: 1,
             root: [5; 32],
@@ -2125,7 +2376,7 @@ pub(crate) mod tests {
         // Held for the test, not for the expression that makes the sink: the
         // guard removes the directory when it goes, and the sink needs it.
         let output = temporary("handout-skip");
-        fs::create_dir_all(&output).unwrap();
+        crate::create_private_directory(&output).unwrap();
         let plan = FetchPlan {
             summary: PackageSummary {
                 root: [0; 32],
@@ -2134,9 +2385,9 @@ pub(crate) mod tests {
             },
             objects: vec![PlannedObject::fresh(object)],
             current: 0,
-            active: Some(Arc::new(
+            active: Some(active(Arc::new(
                 CountingSink::create(&output.join("s.obj"), object.length, None).unwrap(),
-            )),
+            ))),
             placed_before: 0,
             carried_before: 0,
             next_offset: 0,
@@ -2600,7 +2851,93 @@ pub(crate) mod tests {
                 .join(crate::object_name(&empty.root))
                 .exists()
         );
-        discard(&[&output, &skipped_output]);
+
+        let custom_output = temporary("emptyobj-custom");
+        let mut custom = BundleFetcher::begin(Loopback::default(), &custom_output, None).unwrap();
+        custom.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary,
+            objects: vec![PlannedObject::fresh(empty)],
+            current: 0,
+            active: None,
+            placed_before: 0,
+            carried_before: 0,
+            next_offset: 0,
+            covered: CoverageMap::new(),
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: None,
+            finished: false,
+        })));
+        let sink = Arc::new(SeamSink {
+            bytes: Mutex::new(Vec::new()),
+            flushed: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
+        });
+        let placed = Arc::clone(&sink);
+        custom.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, _| {
+                Ok(Some(Box::new(Arc::clone(&placed))))
+            })),
+            ..ReceiveSeams::default()
+        });
+        custom.advance().unwrap();
+        assert!(sink.flushed.load(Ordering::Acquire));
+        assert!(custom.complete());
+        assert!(
+            !custom_output
+                .join("objects")
+                .join(crate::object_name(&empty.root))
+                .exists()
+        );
+
+        let resumed_output = temporary("resumed-custom");
+        let mut resumed = BundleFetcher::begin(Loopback::default(), &resumed_output, None).unwrap();
+        let object = frames::ObjectId {
+            suite: 1,
+            root: *blake3::hash(&[1]).as_bytes(),
+            length: 1,
+        };
+        let mut planned = PlannedObject::fresh(object);
+        planned.resumed.insert(0, 1);
+        let path = resumed_output
+            .join("objects")
+            .join(crate::object_name(&object.root));
+        fs::write(&path, [1]).unwrap();
+        let sink = Arc::new(SeamSink {
+            bytes: Mutex::new(vec![0]),
+            flushed: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
+        });
+        let placed = Arc::clone(&sink);
+        resumed.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, _| {
+                Ok(Some(Box::new(Arc::clone(&placed))))
+            })),
+            ..ReceiveSeams::default()
+        });
+        resumed.plan = Some(Arc::new(Mutex::new(FetchPlan {
+            summary,
+            objects: vec![planned],
+            current: 0,
+            active: None,
+            placed_before: 0,
+            carried_before: 0,
+            next_offset: 0,
+            covered: CoverageMap::new(),
+            syncing: false,
+            abandoned: false,
+            skip: BTreeMap::new(),
+            store: None,
+            finished: false,
+        })));
+        resumed.advance().unwrap();
+        assert!(!sink.flushed.load(Ordering::Acquire));
+        assert!(!resumed.complete());
+        assert!(resumed.locked_plan().unwrap().objects[0].resumed.is_empty());
+        assert!(!path.exists());
+        assert_eq!(resumed.rail.taken_bytes, 1);
+        discard(&[&output, &skipped_output, &custom_output, &resumed_output]);
     }
 
     #[test]
@@ -2614,6 +2951,7 @@ pub(crate) mod tests {
 
         // A well-formed bidirectional frame this end does not consume is not
         // an answer, and not a fault either.
+        let progress = fetcher.report.progress;
         fetcher
             .session_mut()
             .driver()
@@ -2624,7 +2962,15 @@ pub(crate) mod tests {
                 bdp_target_bytes: 5,
                 max_inflight_bytes: 6,
             })));
+        let mut ping = Vec::new();
+        vot_codec::encode_frame(vot_codec::frame_type::PING, &[], &mut ping).unwrap();
+        fetcher
+            .session_mut()
+            .driver()
+            .events
+            .push_back(Event::Control(vot_transport_api::shared_payload(&ping)));
         assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        assert_eq!(fetcher.report.progress, progress);
 
         // Bytes past the frame the envelope declared are malformed.
         let mut trailing = Vec::new();
@@ -3198,7 +3544,7 @@ pub(crate) mod tests {
             summary,
             objects: vec![PlannedObject::fresh(object)],
             current: 0,
-            active: Some(Arc::clone(&sink)),
+            active: Some(active(Arc::clone(&sink))),
             placed_before: 0,
             carried_before: 0,
             next_offset: 0,
@@ -3288,11 +3634,16 @@ pub(crate) mod tests {
 
     #[test]
     pub(crate) fn an_existing_destination_is_refused() {
+        let empty = temporary("empty-destination");
+        crate::create_private_directory(&empty).unwrap();
+        drop(BundleFetcher::begin(Loopback::default(), &empty, None).unwrap());
+
         let existing = temporary("occupied");
-        fs::create_dir_all(&existing).unwrap();
+        crate::create_private_directory(&existing).unwrap();
+        fs::write(existing.join("occupied"), []).unwrap();
         let outcome = BundleFetcher::begin(Loopback::default(), &existing, None);
         assert!(matches!(outcome, Err(Error::DestinationExists)));
-        discard(&[&existing]);
+        discard(&[&empty, &existing]);
     }
 
     #[test]

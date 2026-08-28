@@ -53,7 +53,8 @@ Push always authenticates both ends. receive-push requires VOT_SERVE_ISSUER,
 VOT_SERVE_ISSUER_NAME, and VOT_SERVE_AUDIENCE. It prints its certificate
 identity; set VOT_PUSH_IDENTITY to that value before push. Mint the required
 publish token with `capability issue-push`, then pass that token and its holder
-KEY_SOURCE to `push`.
+KEY_SOURCE to `push`. receive-push requires Unix guarded-directory semantics;
+push remains available on every supported platform.
 
 What the token decides is that whoever opened the session holds the key it
 names on the TLS session carrying the request. The proof covers the session

@@ -352,7 +352,7 @@ impl<A: TransportAdapter> Session<A> {
                         );
                         return Err(self.fail(error));
                     }
-                    if self.negotiation.peer_hello_received()
+                    if self.negotiation.peer_hello().is_some()
                         && let Some(extension) = self
                             .required_extensions
                             .iter()

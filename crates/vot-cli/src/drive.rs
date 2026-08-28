@@ -498,16 +498,15 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
         Ok(())
     }
 
+    #[cfg(all(test, feature = "wire"))]
+    pub(crate) fn push_ready(&self) -> bool {
+        self.session.is_ready()
+    }
+
     /// Whether the push receiver acknowledged every transfer object.
     #[cfg(feature = "wire")]
     pub(crate) fn push_completed(&self) -> bool {
         push_completion(self.connection.goaway_cursor, self.server.objects.len())
-    }
-
-    /// Ends a push after its completion acknowledgement was received.
-    #[cfg(feature = "wire")]
-    pub(crate) fn finish_push(&mut self) {
-        let _ = self.session.driver().close(0);
     }
 
     /// Grants or refuses a capability the peer presented.

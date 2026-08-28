@@ -104,6 +104,54 @@ pub fn load_capability_holder(
     )?))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_push_writes_the_requested_token() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("vot-issue-push-{suffix}"));
+        std::fs::create_dir(&directory).unwrap();
+        let issuer = SigningKey::from_bytes(&[41; 32]);
+        let holder = SigningKey::from_bytes(&[42; 32]);
+        let issuer_path = directory.join("issuer");
+        let holder_path = directory.join("holder");
+        let output = directory.join("token.cbor");
+        std::fs::write(
+            &issuer_path,
+            format!("ed25519-secret:{}", hex_of(&issuer.to_bytes())),
+        )
+        .unwrap();
+        std::fs::write(
+            &holder_path,
+            format!(
+                "ed25519-public:{}",
+                hex_of(&holder.verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+
+        issue_push_capability(
+            issuer_path.to_str().unwrap(),
+            "issuer.example",
+            "receiver.example",
+            holder_path.to_str().unwrap(),
+            &hex_of(&[7; 32]),
+            "42",
+            "60",
+            &output,
+        )
+        .unwrap();
+        assert!(!std::fs::read(&output).unwrap().is_empty());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 /// A fresh Ed25519 keypair, as the two `KEY_SOURCE` strings it is used as.
 ///
 /// The holder of a capability needs a key before one can be issued to them,

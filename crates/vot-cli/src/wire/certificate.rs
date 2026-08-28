@@ -45,7 +45,7 @@ impl Ephemeral {
             let _ = write!(name, "{byte:02x}");
         }
         let directory = std::env::temp_dir().join(name);
-        create_private_directory(&directory)?;
+        crate::create_private_directory(&directory)?;
         let written = Self {
             certificate: directory.join("cert.pem"),
             key: directory.join("key.pem"),
@@ -55,29 +55,6 @@ impl Ephemeral {
         write_private_synced(&written.key, key.serialize_pem().as_bytes())?;
         Ok(written)
     }
-}
-
-/// Creates a directory only this user can enter. A directory that takes the
-/// umask leaves the key inside it readable by anyone on the host. Windows has
-/// no mode bits here, so there the per-user temp directory and the
-/// unguessable name are the protection.
-///
-/// Any missing parents are created first, without the mode: they are the
-/// temp root, shared by everything, and only the leaf holds a key. Creating
-/// just the leaf was a regression, because a `TMPDIR` whose tree does not
-/// exist yet then aborts a serve before it binds.
-pub(crate) fn create_private_directory(path: &Path) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    Ok(())
 }
 
 /// Writes a new file only this user can read, and syncs it.

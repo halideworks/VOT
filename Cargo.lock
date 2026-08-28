@@ -2619,6 +2619,7 @@ dependencies = [
  "vot-object",
  "vot-pack",
  "vot-package",
+ "vot-platform-fs",
  "vot-receipt",
  "vot-resume",
  "vot-scheduler",
@@ -2957,6 +2958,8 @@ dependencies = [
 name = "vot-transport-quiche"
 version = "0.0.1"
 dependencies = [
+ "blake3",
+ "getrandom 0.4.3",
  "nix",
  "quiche",
  "vot-codec",

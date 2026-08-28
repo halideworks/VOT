@@ -8,10 +8,13 @@ enum vot_cli::KeyMaterial
 enum vot_cli::ServeStatus
 function vot_cli::address_pin
 function vot_cli::authz::issue
+function vot_cli::authz::issue_push
 function vot_cli::authz::key_id_of
 function vot_cli::authz::now_seconds
 function vot_cli::authz::package_operations
 function vot_cli::authz::package_scope
+function vot_cli::authz::push_scope
+function vot_cli::bind_push_listener
 function vot_cli::build_bundle
 function vot_cli::build_bundle_with_suite
 function vot_cli::decode_key
@@ -21,11 +24,16 @@ function vot_cli::fetch_via_rendezvous
 function vot_cli::generate_keypair
 function vot_cli::hex_of
 function vot_cli::issue_capability
+function vot_cli::issue_push_capability
+function vot_cli::load_capability_holder
 function vot_cli::load_key_spec
 function vot_cli::parse_package_root
 function vot_cli::parse_rendezvous
 function vot_cli::parse_suite
+function vot_cli::push_bundle
 function vot_cli::receive_bundle
+function vot_cli::receive_push
+function vot_cli::receive_push_on
 function vot_cli::relay_service
 function vot_cli::rendezvous_service
 function vot_cli::serve_bundle
@@ -33,12 +41,24 @@ function vot_cli::verify_receipt_file
 module vot_cli::authz
 struct vot_cli::BundleFetcher
 struct vot_cli::BundleServer
+struct vot_cli::CancellationHandle
+struct vot_cli::CountingSink
+struct vot_cli::PushAdmission
+struct vot_cli::PushPresentation
+struct vot_cli::ReceiveObject
 struct vot_cli::ReceiveReport
+struct vot_cli::ReceiveSeams
+struct vot_cli::ReceiveSessionId
 struct vot_cli::ServeConnection
 struct vot_cli::ServeSession
 struct vot_cli::VerifiedReceipt
 struct vot_cli::authz::Holder
+struct vot_cli::authz::PushRequirement
 struct vot_cli::authz::Requirement
 struct vot_cli::authz::Stance
 trait vot_cli::Engine
+trait vot_cli::ReceiveSink
+use vot_cli::EntryRecord <- vot_package::EntryRecord
+use vot_cli::Listener <- wire::Listener
 use vot_cli::PackageSummary <- vot_package::PackageSummary
+use vot_cli::Storage <- vot_package::Storage

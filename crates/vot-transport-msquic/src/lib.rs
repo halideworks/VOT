@@ -3352,7 +3352,7 @@ pub mod live {
             let mut client = Session::client(
                 transport,
                 vot_codec::Settings::default(),
-                BTreeSet::from([1]),
+                BTreeSet::from([1, vot_codec::extension_id::PUSH]),
                 vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
 
@@ -3382,7 +3382,7 @@ pub mod live {
             let mut server = Session::server(
                 accepted,
                 peer_settings,
-                BTreeSet::new(),
+                BTreeSet::from([vot_codec::extension_id::PUSH]),
                 vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             server.begin().unwrap();
@@ -3545,6 +3545,7 @@ pub mod live {
         /// test ends.
         fn peer_against_server(
             connection_id: u64,
+            push: bool,
         ) -> (
             MsQuicServer,
             MsQuicTransport,
@@ -3598,18 +3599,23 @@ pub mod live {
                     max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
                     ..vot_codec::Settings::default()
                 },
-                BTreeSet::new(),
+                push.then_some(vot_codec::extension_id::PUSH)
+                    .into_iter()
+                    .collect(),
                 vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             (listener, peer, server, deadline)
         }
 
         /// One encoded HELLO from a client on `revision`.
-        fn hello_frame(revision: u64) -> Vec<u8> {
+        fn hello_frame(revision: u64, push: bool) -> Vec<u8> {
             let hello = vot_codec::Hello {
                 draft_revision: revision,
                 endpoint_role: vot_codec::EndpointRole::Client,
-                extensions: BTreeSet::new(),
+                extensions: push
+                    .then_some(vot_codec::extension_id::PUSH)
+                    .into_iter()
+                    .collect(),
             };
             let mut payload = Vec::new();
             vot_codec::encode_hello(&hello, &mut payload).unwrap();
@@ -3646,10 +3652,10 @@ pub mod live {
 
         #[test]
         fn a_registered_close_code_reaches_the_peer() {
-            let (listener, mut peer, mut server, deadline) = peer_against_server(71);
+            let (listener, mut peer, mut server, deadline) = peer_against_server(71, false);
             server.begin().unwrap();
 
-            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION - 1))
+            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION - 1, false))
                 .unwrap();
             peer.flush().unwrap();
 
@@ -3679,11 +3685,11 @@ pub mod live {
 
         #[test]
         fn records_sent_before_readiness_are_held_over_the_real_carrier() {
-            let (listener, mut peer, mut server, deadline) = peer_against_server(81);
+            let (listener, mut peer, mut server, deadline) = peer_against_server(81, true);
             server.begin().unwrap();
 
             let record = framed(vot_codec::frame_type::DATA_RECORD, b"in flight");
-            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION))
+            peer.send_control(&hello_frame(vot_codec::DRAFT_REVISION, true))
                 .unwrap();
             peer.send_reliable(StreamId(1), &record).unwrap();
             peer.send_control(&settings_frame()).unwrap();
@@ -3883,7 +3889,7 @@ pub mod live {
             let mut client = Session::client(
                 transport,
                 vot_codec::Settings::default(),
-                BTreeSet::new(),
+                BTreeSet::from([vot_codec::extension_id::PUSH]),
                 vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -3910,7 +3916,7 @@ pub mod live {
                     max_control_frame_payload: SERVER_CONTROL_LIMIT as u64,
                     ..vot_codec::Settings::default()
                 },
-                BTreeSet::new(),
+                BTreeSet::from([vot_codec::extension_id::PUSH]),
                 vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
             );
             let mut receiver = vot_scheduler::session::SessionReceiver::new(

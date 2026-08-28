@@ -1,8 +1,8 @@
 //! Per-frame checks: lanes, sides, extensions, and negotiated limits.
 
 use super::{
-    BTreeSet, DecodeError, Error, ErrorKind, Negotiation, Settings, StreamId, decode_error,
-    error_code, frame_type,
+    BTreeSet, DecodeError, EndpointRole, Error, ErrorKind, Negotiation, Settings, StreamId,
+    decode_error, error_code, frame_type,
 };
 
 /// Whether one more lane fits a negotiated limit. A lane already in use is
@@ -105,6 +105,8 @@ pub(super) fn check_frame(
     extensions: ExtensionPolicy<'_>,
     lane: Lane,
     side: Side,
+    local_role: EndpointRole,
+    enforce_direction: bool,
 ) -> Result<(), Error> {
     let limits = vot_codec::DecodeLimits {
         max_unknown_payload: usize::try_from(settings.max_control_frame_payload)
@@ -172,16 +174,88 @@ pub(super) fn check_frame(
         )
     })?;
     let limit = negotiated_payload_limit(envelope.frame_type, settings);
-    if payload <= limit {
+    if payload > limit {
+        return Err(Error::new(
+            ErrorKind::FrameExceedsLimit {
+                frame_type: envelope.frame_type,
+                bytes: payload,
+                limit,
+                side,
+            },
+            error_code::FRAME_TOO_LARGE,
+        ));
+    }
+    if enforce_direction {
+        let ExtensionPolicy::Negotiated(negotiation) = extensions;
+        check_direction(envelope.frame_type, negotiation, local_role, side)?;
+    }
+    Ok(())
+}
+
+pub(super) fn check_direction(
+    frame_type: u64,
+    negotiation: &Negotiation,
+    local_role: EndpointRole,
+    side: Side,
+) -> Result<(), Error> {
+    let push = negotiation.extension_is_negotiated(vot_codec::extension_id::PUSH);
+    if direction_allowed(frame_type, local_role, push, side) {
         return Ok(());
     }
     Err(Error::new(
-        ErrorKind::FrameExceedsLimit {
-            frame_type: envelope.frame_type,
-            bytes: payload,
-            limit,
+        ErrorKind::FrameFromWrongRole {
+            frame_type,
+            role: sender_role(local_role, side),
             side,
         },
-        error_code::FRAME_TOO_LARGE,
+        error_code::MALFORMED_FRAME,
     ))
+}
+
+const fn sender_role(local: EndpointRole, side: Side) -> EndpointRole {
+    match (local, side) {
+        (role, Side::Peer) => role,
+        (EndpointRole::Client, Side::Local) => EndpointRole::Server,
+        (EndpointRole::Server, Side::Local) => EndpointRole::Client,
+    }
+}
+
+pub(super) fn direction_allowed(
+    frame_type: u64,
+    local_role: EndpointRole,
+    push: bool,
+    side: Side,
+) -> bool {
+    let sender = sender_role(local_role, side);
+    let publisher = if push {
+        EndpointRole::Client
+    } else {
+        EndpointRole::Server
+    };
+    let requester = if push {
+        EndpointRole::Server
+    } else {
+        EndpointRole::Client
+    };
+    if matches!(
+        frame_type,
+        frame_type::PACKAGE_DESCRIPTOR
+            | frame_type::MANIFEST_PAGE
+            | frame_type::PROGRESSIVE_PAGE
+            | frame_type::SEAL
+            | frame_type::PROOF_BUNDLE
+            | frame_type::DATA_RECORD
+    ) {
+        sender == publisher
+    } else if matches!(
+        frame_type,
+        frame_type::MANIFEST_REQUEST
+            | frame_type::HAVE
+            | frame_type::RANGE_REQUEST
+            | frame_type::RANGE_CANCEL
+    ) {
+        sender == requester
+    } else {
+        true
+    }
 }

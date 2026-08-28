@@ -255,6 +255,29 @@ pub(crate) fn requirement_from(
     }
 }
 
+/// What a push receiver requires, or nothing when no issuer is configured.
+pub(crate) fn push_requirement_from(
+    issuer_source: Option<&str>,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+) -> Result<Option<crate::authz::PushRequirement>, Error> {
+    match (issuer_source, issuer, audience) {
+        (None, None, None) => Ok(None),
+        (Some(source), Some(issuer), Some(audience)) => {
+            let crate::KeyMaterial::Verifying(key) = crate::load_key_spec(source)? else {
+                return Err(Error::InvalidArguments);
+            };
+            Ok(Some(crate::authz::PushRequirement::new(
+                issuer,
+                crate::authz::key_id_of(&key),
+                *key,
+                audience,
+            )))
+        }
+        _ => Err(Error::InvalidArguments),
+    }
+}
+
 /// Slots this relay opens at once, its slot lifetime in milliseconds, and the
 /// bytes one slot forwards. Each is a hard bound the operator sets.
 pub(crate) const RELAY_SLOTS: &str = "VOT_RELAY_SLOTS";

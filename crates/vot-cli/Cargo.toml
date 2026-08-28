@@ -23,6 +23,7 @@ vot-manifest = { path = "../vot-manifest" }
 vot-object = { path = "../vot-object" }
 vot-pack = { path = "../vot-pack" }
 vot-package = { path = "../vot-package" }
+vot-platform-fs = { path = "../vot-platform-fs" }
 vot-receipt = { path = "../vot-receipt" }
 vot-resume = { path = "../vot-resume" }
 vot-fec = { path = "../vot-fec" }

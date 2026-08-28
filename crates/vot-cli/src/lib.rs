@@ -15,9 +15,9 @@ use vot_manifest::{
 use vot_manifest::{EntryKind, ObjectId, StorageRef, encode_page, encode_seal};
 use vot_pack::{CANDIDATE_MAX, LogicalFile, Pack, StreamingPacker};
 pub use vot_package::PackageSummary;
+pub use vot_package::{EntryRecord, Storage};
 pub(crate) use vot_package::{
-    EntryRecord, PackageAssembly, PackageBuilder, PackageIngest, PackageRootBuilder, PageDraft,
-    Storage,
+    PackageAssembly, PackageBuilder, PackageIngest, PackageRootBuilder, PageDraft,
 };
 use vot_receipt::{
     AssuranceLevel, AuthenticatedReceipt, CommitProfile, Receipt, SubjectKind,
@@ -27,6 +27,21 @@ use vot_receipt::{
 use vot_scheduler::ReliableReceiver;
 use vot_transport_api::{MAX_DATA_RECORD_BYTES, SubjectId};
 use vot_verifier::{StreamVerifier, Suite};
+
+/// Creates a directory only this user can enter.
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
 
 pub mod authz;
 mod drive;
@@ -46,15 +61,21 @@ mod side_channel;
 mod wire;
 
 pub use drive::{Engine, ServeSession, drive};
-pub use fetch::{BundleFetcher, FetchStatus};
+pub use fetch::{
+    BundleFetcher, CancellationHandle, CountingSink, FetchStatus, ReceiveObject, ReceiveSeams,
+    ReceiveSessionId, ReceiveSink,
+};
 #[cfg(not(feature = "wire"))]
 pub use nowire::{
-    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+    fetch_bundle, fetch_via_rendezvous, push_bundle, receive_push, relay_service,
+    rendezvous_service, serve_bundle,
 };
 pub use serve::{BundleServer, ServeConnection, ServeStatus};
 #[cfg(feature = "wire")]
 pub use wire::{
-    fetch_bundle, fetch_via_rendezvous, relay_service, rendezvous_service, serve_bundle,
+    Listener, PushAdmission, PushPresentation, bind_push_listener, fetch_bundle,
+    fetch_via_rendezvous, push_bundle, receive_push, receive_push_on, relay_service,
+    rendezvous_service, serve_bundle,
 };
 
 mod keys;
@@ -578,6 +599,14 @@ mod tests {
         ));
         assert!(matches!(
             fetch_bundle(address, &bundle, None),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            push_bundle(&bundle, address, &bundle, "-", [0; 32]),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            receive_push(address, &bundle, &Credentials::Ephemeral, None, |_, _| {}),
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(

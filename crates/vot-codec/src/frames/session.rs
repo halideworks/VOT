@@ -2,7 +2,7 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::missing_errors_doc)]
 
-use super::{Error, Reader, frame_type};
+use super::{Error, Reader, decode_varint, encode_varint, frame_type};
 
 pub(super) const MAX_AUTH_NONCE: usize = 64;
 pub(super) const MIN_AUTH_NONCE: usize = 16;
@@ -76,6 +76,53 @@ pub struct SessionReject {
     pub session_id: [u8; 16],
     pub reason: u64,
     pub detail: String,
+}
+
+/// The first transfer object the sender will not accept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GoAway {
+    pub cursor: u64,
+}
+
+/// A terminal registered error code and bounded diagnostic bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ErrorFrame {
+    pub code: u16,
+    pub detail: Vec<u8>,
+}
+
+pub(super) fn encode_goaway(value: GoAway, output: &mut Vec<u8>) -> Result<(), Error> {
+    encode_varint(value.cursor, output)?;
+    Ok(())
+}
+
+pub(super) fn decode_goaway(input: &[u8]) -> Result<GoAway, Error> {
+    let (cursor, consumed) = decode_varint(input)?;
+    if consumed != input.len() {
+        return Err(Error::Malformed);
+    }
+    Ok(GoAway { cursor })
+}
+
+pub(super) fn encode_error(value: &ErrorFrame, output: &mut Vec<u8>) -> Result<(), Error> {
+    if !crate::REGISTERED_ERROR_CODES.contains(&value.code) {
+        return Err(Error::InvalidValue);
+    }
+    encode_varint(u64::from(value.code), output)?;
+    output.extend_from_slice(&value.detail);
+    Ok(())
+}
+
+pub(super) fn decode_error(input: &[u8]) -> Result<ErrorFrame, Error> {
+    let (code, consumed) = decode_varint(input)?;
+    let code = u16::try_from(code).map_err(|_| Error::InvalidValue)?;
+    if !crate::REGISTERED_ERROR_CODES.contains(&code) {
+        return Err(Error::InvalidValue);
+    }
+    Ok(ErrorFrame {
+        code,
+        detail: input[consumed..].to_vec(),
+    })
 }
 
 pub(super) fn encode_auth_context(value: &AuthContext, output: &mut Vec<u8>) -> Result<(), Error> {

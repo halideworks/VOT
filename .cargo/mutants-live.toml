@@ -24,7 +24,9 @@ timeout_multiplier = 4.0
 # the same reason: code compiled out on this runner's OS builds and passes
 # trivially when mutated, which reads as missed. `live::` is deliberately not
 # repeated; measuring it is this configuration's purpose.
-exclude_re = ["(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "VerifiedRange::is_empty", "remove_lock_file_other"]
+# DirectorySink::flush is the same successful fsync side effect excluded from
+# the default sweep; failure propagation is tested at CountingSink.
+exclude_re = ["(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "VerifiedRange::is_empty", "remove_lock_file_other", "<impl ReceiveSink for DirectorySink>::flush", "(prepare|canonical)_push_destination_unsupported"]
 exclude_globs = [
   # This configuration is run with a feature on, so the file holding what
   # the wire commands answer without it compiles nowhere here.

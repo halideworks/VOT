@@ -56,6 +56,102 @@ pub fn issue_capability(
     write_new_synced(out, &token)
 }
 
+/// Mints a capability for pushing one exact package and writes it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the CLI helper takes the command's eight required operands"
+)]
+pub fn issue_push_capability(
+    issuer_source: &str,
+    issuer: &str,
+    audience: &str,
+    holder_source: &str,
+    root: &str,
+    length: &str,
+    seconds: &str,
+    out: &Path,
+) -> Result<(), Error> {
+    let KeyMaterial::Signing(issuer_key) = load_key_spec(issuer_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let KeyMaterial::Verifying(holder_key) = load_key_spec(holder_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    let token = authz::issue_push(
+        issuer,
+        audience,
+        &issuer_key,
+        holder_key.to_bytes(),
+        parse_package_root(root)?,
+        length.parse().map_err(|_| Error::InvalidArguments)?,
+        authz::now_seconds()?,
+        seconds.parse().map_err(|_| Error::InvalidArguments)?,
+    )?;
+    write_new_synced(out, &token)
+}
+
+/// Loads a capability and the private holder key it names.
+pub fn load_capability_holder(
+    capability: &Path,
+    key_source: &str,
+) -> Result<std::sync::Arc<authz::Holder>, Error> {
+    let KeyMaterial::Signing(key) = load_key_spec(key_source)? else {
+        return Err(Error::InvalidArguments);
+    };
+    Ok(std::sync::Arc::new(authz::Holder::new(
+        std::fs::read(capability)?,
+        *key,
+    )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_push_writes_the_requested_token() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("vot-issue-push-{suffix}"));
+        std::fs::create_dir(&directory).unwrap();
+        let issuer = SigningKey::from_bytes(&[41; 32]);
+        let holder = SigningKey::from_bytes(&[42; 32]);
+        let issuer_path = directory.join("issuer");
+        let holder_path = directory.join("holder");
+        let output = directory.join("token.cbor");
+        std::fs::write(
+            &issuer_path,
+            format!("ed25519-secret:{}", hex_of(&issuer.to_bytes())),
+        )
+        .unwrap();
+        std::fs::write(
+            &holder_path,
+            format!(
+                "ed25519-public:{}",
+                hex_of(&holder.verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+
+        issue_push_capability(
+            issuer_path.to_str().unwrap(),
+            "issuer.example",
+            "receiver.example",
+            holder_path.to_str().unwrap(),
+            &hex_of(&[7; 32]),
+            "42",
+            "60",
+            &output,
+        )
+        .unwrap();
+        assert!(!std::fs::read(&output).unwrap().is_empty());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 /// A fresh Ed25519 keypair, as the two `KEY_SOURCE` strings it is used as.
 ///
 /// The holder of a capability needs a key before one can be issued to them,

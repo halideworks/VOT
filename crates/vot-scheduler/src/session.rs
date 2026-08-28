@@ -1382,23 +1382,27 @@ mod tests {
 
     /// The same over a given backend.
     fn ready_with(backend: Loopback) -> SessionReceiver<Loopback> {
-        let mut session = Session::server(
+        let mut session = Session::client(
             backend,
             vot_codec::Settings::default(),
             std::collections::BTreeSet::new(),
             vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         session.begin().unwrap();
-        // Driven to readiness through the client's frames, which is the only
-        // way a session reaches it.
-        let mut client = Session::client(
+        let mut peer = Session::server(
             Loopback::default(),
             vot_codec::Settings::default(),
             std::collections::BTreeSet::new(),
             vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
-        client.begin().unwrap();
-        for frame in std::mem::take(&mut client.driver().sent) {
+        peer.begin().unwrap();
+        for frame in std::mem::take(&mut session.driver().sent) {
+            peer.driver()
+                .events
+                .push_back(Event::Control(Payload::from(frame.as_slice())));
+        }
+        peer.poll().unwrap();
+        for frame in std::mem::take(&mut peer.driver().sent) {
             session
                 .driver()
                 .events
@@ -2589,21 +2593,27 @@ mod tests {
 
     fn ready_fec_with_depth(depth: usize) -> SessionReceiver<Loopback> {
         let fec = std::collections::BTreeSet::from([vot_codec::extension_id::DATAGRAM_FEC]);
-        let mut session = Session::server(
+        let mut session = Session::client(
             Loopback::default(),
             vot_codec::Settings::default(),
             fec.clone(),
             vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
         session.begin().unwrap();
-        let mut client = Session::client(
+        let mut peer = Session::server(
             Loopback::default(),
             vot_codec::Settings::default(),
             fec,
             vot_session::Authentication::NotRequired { nonce: [0x5a; 32] },
         );
-        client.begin().unwrap();
-        for frame in std::mem::take(&mut client.driver().sent) {
+        peer.begin().unwrap();
+        for frame in std::mem::take(&mut session.driver().sent) {
+            peer.driver()
+                .events
+                .push_back(Event::Control(Payload::from(frame.as_slice())));
+        }
+        peer.poll().unwrap();
+        for frame in std::mem::take(&mut peer.driver().sent) {
             session
                 .driver()
                 .events

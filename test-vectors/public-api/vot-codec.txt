@@ -7,6 +7,7 @@ constant vot_codec::MAX_EXTENSIONS_PER_HELLO
 constant vot_codec::MAX_QUIC_VARINT
 constant vot_codec::MAX_SETTINGS_PER_FRAME
 constant vot_codec::MIN_CONTROL_FRAME_PAYLOAD
+constant vot_codec::REGISTERED_ERROR_CODES
 constant vot_codec::REGISTERED_LIMITS
 constant vot_codec::REGISTERED_OPERATIONS
 constant vot_codec::REGISTERED_SETTINGS
@@ -43,6 +44,7 @@ constant vot_codec::extension_id::DATAGRAM_FEC
 constant vot_codec::extension_id::FEC_COVER_EPOCHS
 constant vot_codec::extension_id::MULTIPATH_QUIC
 constant vot_codec::extension_id::PUBLIC_MULTI_RAIL
+constant vot_codec::extension_id::PUSH
 constant vot_codec::extension_id::VCRC
 constant vot_codec::extension_id::ZSTD_RECORDS
 constant vot_codec::frame_type::AUTH_CONTEXT
@@ -169,8 +171,10 @@ struct vot_codec::frames::DataRecord
 struct vot_codec::frames::DataRecordHeader
 struct vot_codec::frames::DataRecordRef
 struct vot_codec::frames::DatagramCredit
+struct vot_codec::frames::ErrorFrame
 struct vot_codec::frames::GenDone
 struct vot_codec::frames::GenState
+struct vot_codec::frames::GoAway
 struct vot_codec::frames::Have
 struct vot_codec::frames::HaveRun
 struct vot_codec::frames::ManifestRequest

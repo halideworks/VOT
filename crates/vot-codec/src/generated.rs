@@ -54,6 +54,7 @@ pub mod extension_id {
     pub const CUSTOM_CONGESTION_CONTROL: u64 = 0x05;
     pub const MULTIPATH_QUIC: u64 = 0x06;
     pub const FEC_COVER_EPOCHS: u64 = 0x07;
+    pub const PUSH: u64 = 0x08;
 }
 
 pub mod error_code {
@@ -85,6 +86,37 @@ pub mod error_code {
     pub const RISK_BUDGET_EXHAUSTED: u16 = 0x0702;
     pub const CODING_EPOCH_CONFLICT: u16 = 0x0703;
 }
+
+/// Every registered error code, in identifier order.
+pub const REGISTERED_ERROR_CODES: [u16; 27] = [
+    error_code::UNKNOWN_CRITICAL_FRAME,
+    error_code::MALFORMED_FRAME,
+    error_code::FRAME_TOO_LARGE,
+    error_code::UNSUPPORTED_VERSION,
+    error_code::INVALID_SETTING,
+    error_code::DUPLICATE_SETTING,
+    error_code::AUTHENTICATION_FAILED,
+    error_code::AUTHORIZATION_FAILED,
+    error_code::REPLAY_REJECTED,
+    error_code::MANIFEST_INVALID,
+    error_code::OBJECT_IDENTITY_MISMATCH,
+    error_code::PROOF_INVALID,
+    error_code::SOURCE_MUTATED,
+    error_code::STORAGE_WRITE_FAILED,
+    error_code::DURABILITY_FAILED,
+    error_code::AT_REST_VERIFICATION_FAILED,
+    error_code::PUBLICATION_FAILED,
+    error_code::STALE_INCARNATION,
+    error_code::ASSURANCE_UNSUPPORTED,
+    error_code::ADMISSION_DENIED,
+    error_code::RESOURCE_LIMIT,
+    error_code::FLOW_CONTROL_VIOLATION,
+    error_code::CARRIER_UNAVAILABLE,
+    error_code::PATH_STATE_REJECTED,
+    error_code::EXPERIMENT_NOT_NEGOTIATED,
+    error_code::RISK_BUDGET_EXHAUSTED,
+    error_code::CODING_EPOCH_CONFLICT,
+];
 
 /// Every registered setting, in identifier order.
 pub const REGISTERED_SETTINGS: [u64; 5] = [

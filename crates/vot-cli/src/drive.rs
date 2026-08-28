@@ -224,7 +224,7 @@ fn fetch_verdict(status: crate::FetchStatus) -> Result<(), Error> {
         // Preserve the original error code for the caller.
         crate::FetchStatus::Closed(code) => Err(Error::PeerClosed(code)),
         crate::FetchStatus::Disconnected => Err(Error::CarrierUnavailable),
-        crate::FetchStatus::Active => Err(Error::InvalidBundle),
+        crate::FetchStatus::Active | crate::FetchStatus::Cancelled(_) => Err(Error::InvalidBundle),
     }
 }
 
@@ -389,6 +389,12 @@ pub struct ServeSession<'server, A: TransportAdapter> {
     session: vot_session::Session<A>,
     connection: crate::ServeConnection,
     requirement: Option<&'server crate::authz::Requirement>,
+    holder: Option<std::sync::Arc<crate::authz::Holder>>,
+}
+
+#[cfg(feature = "wire")]
+fn push_completion(cursor: Option<u64>, objects: usize) -> bool {
+    objects != 0 && cursor == Some(objects as u64)
 }
 
 impl<'server, A: TransportAdapter> ServeSession<'server, A> {
@@ -408,19 +414,99 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
         } else {
             stance.extensions
         };
-        let mut session = vot_session::Session::server(
+        let session = vot_session::Session::server(
             carrier,
             vot_codec::Settings::default(),
             extensions,
             stance.authentication,
         );
+        Self::begin_session(server, session, requirement)
+    }
+
+    /// Begins serving through a caller-constructed client or server session.
+    pub fn begin_session(
+        server: &'server crate::BundleServer,
+        mut session: vot_session::Session<A>,
+        requirement: Option<&'server crate::authz::Requirement>,
+    ) -> Result<Self, Error> {
         session.begin()?;
         Ok(Self {
             server,
             session,
             connection: crate::ServeConnection::new(),
             requirement,
+            holder: None,
         })
+    }
+
+    /// Begins pushing through a caller-constructed client session.
+    pub fn begin_push_session(
+        server: &'server crate::BundleServer,
+        mut session: vot_session::Session<A>,
+        holder: std::sync::Arc<crate::authz::Holder>,
+    ) -> Result<Self, Error> {
+        session.require_extension(vot_codec::extension_id::PUSH);
+        session.require_granted_scope(holder.scope_bytes()?);
+        session.begin()?;
+        Ok(Self {
+            server,
+            session,
+            connection: crate::ServeConnection::new(),
+            requirement: None,
+            holder: Some(holder),
+        })
+    }
+
+    fn present_capability(&mut self) -> Result<(), Error> {
+        if let Some(refusal) = self.session.last_refusal() {
+            return Err(Error::PeerClosed(
+                u16::try_from(refusal.reason).map_err(|_| Error::InvalidBundle)?,
+            ));
+        }
+        let Some(holder) = self.holder.clone() else {
+            return Ok(());
+        };
+        let request = {
+            let Some(challenge) = self.session.pending_presentation() else {
+                return Ok(());
+            };
+            let binding = self
+                .session
+                .channel_binding()
+                .ok_or(Error::ChannelBindingUnavailable)?;
+            holder.answer(challenge, binding)?
+        };
+        self.session.present(request)?;
+        Ok(())
+    }
+
+    /// Completes push authentication before any rail begins serving data.
+    #[cfg(feature = "wire")]
+    pub(crate) fn negotiate_push(&mut self) -> Result<(), Error> {
+        let began = Instant::now();
+        while !self.session.is_ready() {
+            self.present_capability()?;
+            if let Some(vot_transport_api::Event::Disconnected(_)) = self.session.poll()? {
+                return Err(Error::CarrierUnavailable);
+            }
+            self.session.flush()?;
+            if began.elapsed() >= STALLED_WAIT {
+                return Err(Error::Stalled);
+            }
+            self.session.driver().wait_for_event(BUSY_BOUND);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "wire"))]
+    pub(crate) fn push_ready(&self) -> bool {
+        self.session.is_ready()
+    }
+
+    /// Whether the push receiver acknowledged every transfer object.
+    #[cfg(feature = "wire")]
+    pub(crate) fn push_completed(&self) -> bool {
+        push_completion(self.connection.goaway_cursor, self.server.objects.len())
     }
 
     /// Grants or refuses a capability the peer presented.
@@ -745,6 +831,7 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
 
     fn service(&mut self) -> Result<Self::Status, Error> {
         self.answer_authorization()?;
+        self.present_capability()?;
         self.server.service(&mut self.session, &mut self.connection)
     }
 
@@ -1654,5 +1741,13 @@ mod tests {
             late + IDLE_PASSES,
             "the budget starts again from the pass that made progress"
         );
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn cursor_zero_is_never_push_completion() {
+        assert!(!push_completion(Some(0), 0));
+        assert!(!push_completion(None, 1));
+        assert!(push_completion(Some(1), 1));
     }
 }

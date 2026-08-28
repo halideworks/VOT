@@ -8,11 +8,15 @@ Usage:
   vot receive BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE OBSERVED_AT
   vot verify-receipt RECEIPT.cbor KEY_SOURCE
   vot serve BUNDLE_DIR LISTEN_ADDR [CERT.pem KEY.pem]
+  vot push BUNDLE_DIR CONNECT_ADDR CAPABILITY.cbor KEY_SOURCE
+  vot receive-push LISTEN_ADDR BUNDLE_DIR CERT.pem KEY.pem
   vot rendezvous LISTEN_ADDR
   vot relay LISTEN_ADDR
   vot capability keygen
   vot capability issue ISSUER_KEY_SOURCE ISSUER AUDIENCE HOLDER_PUBLIC
                        PACKAGE_ROOT SECONDS OUT.cbor
+  vot capability issue-push ISSUER_KEY_SOURCE ISSUER AUDIENCE HOLDER_PUBLIC
+                            PACKAGE_ROOT PACKAGE_LENGTH SECONDS OUT.cbor
   vot fetch CONNECT_ADDR BUNDLE_DIR PACKAGE_ROOT
   vot fetch ROOT BUNDLE_DIR
   vot pull CONNECT_ADDR BUNDLE_DIR DESTINATION_DIR RECEIPT.cbor KEY_SOURCE
@@ -44,6 +48,13 @@ A fetch presents one when VOT_FETCH_CAPABILITY and VOT_FETCH_HOLDER_KEY are
 both set. `capability keygen` makes a holder a key, and `capability issue`
 mints a token for one package under an issuer key. Every key there is a
 KEY_SOURCE, so it says where to read a key from rather than being one.
+
+Push always authenticates both ends. receive-push requires VOT_SERVE_ISSUER,
+VOT_SERVE_ISSUER_NAME, and VOT_SERVE_AUDIENCE. It prints its certificate
+identity; set VOT_PUSH_IDENTITY to that value before push. Mint the required
+publish token with `capability issue-push`, then pass that token and its holder
+KEY_SOURCE to `push`. receive-push requires Unix guarded-directory semantics;
+push remains available on every supported platform.
 
 What the token decides is that whoever opened the session holds the key it
 names on the TLS session carrying the request. The proof covers the session
@@ -183,6 +194,10 @@ fn run() -> Result<(), vot_cli::Error> {
 ///
 /// Split from [`run`] because the two halves are unrelated: one works a
 /// directory this host already has, the other opens a session.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the flat command match keeps parsing beside each command call"
+)]
 fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
     match arguments {
         [_, command, address] if command == "rendezvous" => rendezvous(address),
@@ -216,6 +231,28 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
             seconds,
             Path::new(out),
         ),
+        [
+            _,
+            command,
+            sub,
+            issuer_source,
+            issuer,
+            audience,
+            holder_public,
+            root,
+            length,
+            seconds,
+            out,
+        ] if command == "capability" && sub == "issue-push" => vot_cli::issue_push_capability(
+            issuer_source,
+            issuer,
+            audience,
+            holder_public,
+            root,
+            length,
+            seconds,
+            Path::new(out),
+        ),
         [_, command, bundle, address] if command == "serve" => {
             serve(bundle, address, &vot_cli::Credentials::Ephemeral)
         }
@@ -227,6 +264,12 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
                 key: Path::new(key).to_path_buf(),
             },
         ),
+        [_, command, bundle, address, capability, key] if command == "push" => {
+            push(bundle, address, capability, key)
+        }
+        [_, command, address, bundle, certificate, key] if command == "receive-push" => {
+            receive_push(address, bundle, certificate, key)
+        }
         [_, command, address, bundle] if command == "fetch" => fetch(address, bundle, None),
         [_, command, address, bundle, root] if command == "fetch" => {
             fetch(address, bundle, Some(root))
@@ -270,6 +313,58 @@ fn wire_command(arguments: &[String]) -> Result<(), vot_cli::Error> {
         ),
         _ => Err(vot_cli::Error::InvalidArguments),
     }
+}
+
+fn push(bundle: &str, address: &str, capability: &str, key: &str) -> Result<(), vot_cli::Error> {
+    let address = address
+        .parse()
+        .map_err(|_| vot_cli::Error::InvalidArguments)?;
+    let configured = std::env::var("VOT_PUSH_IDENTITY").ok();
+    let identity = push_identity(configured.as_deref())?;
+    let package = vot_cli::push_bundle(
+        Path::new(bundle),
+        address,
+        Path::new(capability),
+        key,
+        identity,
+    )?;
+    println!(
+        "{} {} PUSHED",
+        root_hex(&package.root),
+        package.logical_length
+    );
+    Ok(())
+}
+
+fn push_identity(value: Option<&str>) -> Result<[u8; 32], vot_cli::Error> {
+    vot_cli::parse_package_root(value.ok_or(vot_cli::Error::InvalidArguments)?)
+}
+
+fn receive_push(
+    address: &str,
+    bundle: &str,
+    certificate: &str,
+    key: &str,
+) -> Result<(), vot_cli::Error> {
+    let address = address
+        .parse()
+        .map_err(|_| vot_cli::Error::InvalidArguments)?;
+    vot_cli::receive_push(
+        address,
+        Path::new(bundle),
+        &vot_cli::Credentials::Files {
+            certificate: Path::new(certificate).to_path_buf(),
+            key: Path::new(key).to_path_buf(),
+        },
+        None,
+        |at, identity| {
+            println!("listening {at}");
+            println!(
+                "identity {} (pin with VOT_PUSH_IDENTITY)",
+                root_hex(&identity)
+            );
+        },
+    )
 }
 
 /// Runs the rendezvous service until it is stopped.
@@ -451,5 +546,18 @@ mod tests {
         let mut counted = [0_u8; 32];
         counted[31] = 0x0f;
         assert_eq!(root_hex(&counted), format!("{}0f", "00".repeat(31)));
+    }
+
+    #[test]
+    fn push_requires_an_exact_identity_before_it_can_dial() {
+        assert!(matches!(
+            push_identity(None),
+            Err(vot_cli::Error::InvalidArguments)
+        ));
+        assert!(matches!(
+            push_identity(Some("00")),
+            Err(vot_cli::Error::InvalidArguments)
+        ));
+        assert_eq!(push_identity(Some(&"ab".repeat(32))).unwrap(), [0xab; 32]);
     }
 }

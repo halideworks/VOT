@@ -47,10 +47,24 @@ impl FileSink {
     /// # Errors
     /// Surfaces a destination that does not exist or will not open.
     pub fn resume(path: &std::path::Path, length: u64) -> std::io::Result<Self> {
+        vot_platform_fs::validate_removal_parent(path)?;
+        let guard = vot_platform_fs::guard_staging_file(path)?;
+        if !vot_platform_fs::same_file_handle(&guard, path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "resume path is not the guarded regular file",
+            ));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)?;
+        if !vot_platform_fs::same_file_handle(&file, path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "resume path changed while it was opened",
+            ));
+        }
         file.set_len(length)?;
         let _ = vot_platform_fs::allow_unordered_writes(&file);
         Ok(Self { file })
@@ -213,5 +227,18 @@ mod tests {
         assert!(!path.exists());
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_and_resume_never_follow_a_symlink() {
+        let fixture = TemporaryFile::new("symlink");
+        let outside = fixture.directory.join("outside");
+        std::fs::write(&outside, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&outside, &fixture.path).unwrap();
+
+        assert!(FileSink::create_new(&fixture.path, 1).is_err());
+        assert!(FileSink::resume(&fixture.path, 1).is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"keep me");
     }
 }

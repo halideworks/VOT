@@ -690,6 +690,8 @@ pub struct ServeConnection {
     /// Per-epoch silence budget, derived from the path's smoothed round trip
     /// each service pass; the fixed default until the carrier reports one.
     pub(crate) quiet_grace: std::time::Duration,
+    /// Highest transfer-object index this receiver still permits.
+    pub(crate) goaway_cursor: Option<u64>,
 }
 
 impl Default for ServeConnection {
@@ -709,6 +711,7 @@ impl Default for ServeConnection {
             fec_coding: true,
             fec_policy: FecPolicy::default(),
             quiet_grace: super::server::EPOCH_QUIET_GRACE,
+            goaway_cursor: None,
         }
     }
 }
@@ -966,6 +969,11 @@ impl OutboundQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.queue.clear();
+        self.bytes = 0;
     }
 
     /// Answers still queued.

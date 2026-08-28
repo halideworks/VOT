@@ -8,8 +8,9 @@ use std::collections::BTreeSet;
 pub mod frames;
 mod generated;
 pub use generated::{
-    REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS, error_code, extension_id,
-    operation, resource_limit, setting_bounds, setting_default, setting_id,
+    REGISTERED_ERROR_CODES, REGISTERED_LIMITS, REGISTERED_OPERATIONS, REGISTERED_SETTINGS,
+    error_code, extension_id, operation, resource_limit, setting_bounds, setting_default,
+    setting_id,
 };
 
 pub const MAX_QUIC_VARINT: u64 = (1_u64 << 62) - 1;

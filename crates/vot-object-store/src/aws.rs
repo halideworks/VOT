@@ -1112,7 +1112,7 @@ mod tests {
         let mut store = endpoint.store();
         let (upload_id, receipt) = upload_one_part(&mut store, b"payload");
         assert_eq!(
-            store.complete_multipart(&upload_id, &[receipt.clone()]),
+            store.complete_multipart(&upload_id, std::slice::from_ref(&receipt)),
             Err(Error::Backend)
         );
         assert_eq!(

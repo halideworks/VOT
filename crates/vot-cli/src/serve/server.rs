@@ -19,6 +19,7 @@ pub struct BundleServer {
     /// The descriptor and seal frames, encoded once, announced at readiness.
     pub(crate) announcement: [Payload; 2],
     pub(crate) objects: BTreeMap<[u8; 32], ServedObject>,
+    pub(crate) object_indices: BTreeMap<[u8; 32], u64>,
     /// Whether new range answers wait for measured loss before using FEC.
     pub(crate) automatic_fec: bool,
 }
@@ -27,6 +28,10 @@ struct CodedGeneration<'a> {
     generation: u32,
     source: std::borrow::Cow<'a, [u8]>,
     repair: Vec<Vec<u8>>,
+}
+
+pub(crate) fn range_blocked_by_cursor(index: Option<u64>, cursor: u64) -> bool {
+    index.is_none_or(|index| index >= cursor)
 }
 
 impl BundleServer {
@@ -46,6 +51,7 @@ impl BundleServer {
         // Map manifest entries to their stored objects.
         let mut reader = ManifestReader::open(bundle)?;
         let mut wanted: BTreeMap<[u8; 32], (Suite, u64)> = BTreeMap::new();
+        let mut object_indices = BTreeMap::new();
         while let Some(record) = reader.next_record()? {
             let (root, length) = match record.storage {
                 Storage::Direct => (record.logical_root, record.logical_length),
@@ -54,6 +60,7 @@ impl BundleServer {
             match wanted.entry(root) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert((record.suite, length));
+                    object_indices.insert(root, object_indices.len() as u64);
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => {
                     if *entry.get() != (record.suite, length) {
@@ -92,6 +99,7 @@ impl BundleServer {
             manifest_directory,
             announcement,
             objects,
+            object_indices,
             automatic_fec: true,
         })
     }
@@ -108,8 +116,8 @@ impl BundleServer {
         self.automatic_fec = automatic;
     }
 
-    /// One non-blocking pass: drains queued answers, reads events up to the
-    /// outbound budget, and answers every request.
+    /// One non-blocking pass: reads events up to the outbound budget, then
+    /// drains the answers that remain after control such as `GOAWAY`.
     pub fn service<A: TransportAdapter>(
         &self,
         session: &mut Session<A>,
@@ -118,7 +126,6 @@ impl BundleServer {
         if let Some(code) = connection.closed {
             return Ok(ServeStatus::Closed(code));
         }
-        connection.drain(session)?;
         let path = session.adapter().path_stats();
         connection.quiet_grace = quiet_grace(path.and_then(|stats| stats.smoothed_rtt_us));
         connection.fec_policy.observe(path);
@@ -521,6 +528,7 @@ impl BundleServer {
             return Err(Fault::Peer(error_code::MALFORMED_FRAME));
         }
         match frame {
+            TypedFrame::Error(error) => Err(Fault::Peer(error.code)),
             TypedFrame::ManifestRequest(request) => {
                 connection.admit_request(
                     frame_type::MANIFEST_REQUEST,
@@ -531,7 +539,32 @@ impl BundleServer {
             }
             TypedFrame::RangeRequest(request) => {
                 connection.admit_request(frame_type::RANGE_REQUEST, request.request_id, bytes)?;
+                if connection.goaway_cursor.is_some_and(|cursor| {
+                    range_blocked_by_cursor(
+                        self.object_indices.get(&request.object.root).copied(),
+                        cursor,
+                    )
+                }) {
+                    return Ok(());
+                }
                 self.answer_range(&request, bytes, connection, repair_symbols)
+            }
+            TypedFrame::GoAway(goaway) => {
+                if goaway.cursor > self.object_indices.len() as u64
+                    || connection
+                        .goaway_cursor
+                        .is_some_and(|accepted| goaway.cursor > accepted)
+                {
+                    return Err(Fault::Peer(error_code::MALFORMED_FRAME));
+                }
+                connection.goaway_cursor = Some(goaway.cursor);
+                // Everything queued is an answer to work the receiver has now
+                // bounded; completed earlier objects need no retransmission.
+                connection.outbound.clear();
+                connection.deferred.clear();
+                connection.manifest_cursor = None;
+                connection.fec.epochs.clear();
+                Ok(())
             }
             // The receiver's side of datagram FEC (spec/fec.md section 11).
             TypedFrame::DatagramCredit(credit) => {

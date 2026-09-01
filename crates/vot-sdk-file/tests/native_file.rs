@@ -178,9 +178,9 @@ fn concurrent_publication_has_one_winner_and_a_cleanable_loser() {
     let bytes = b"verified race bytes";
     let object = prepared(bytes);
     let range = verified(&object, bytes, 0, 1);
-    let mut winner =
+    let winner =
         NativeFile::create(object.object_id(), &destination, CommitProfile::Fast).expect("winner");
-    let mut loser =
+    let loser =
         NativeFile::create(object.object_id(), &destination, CommitProfile::Fast).expect("loser");
     winner.accept(&range).unwrap();
     loser.accept(&range).unwrap();

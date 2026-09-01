@@ -298,6 +298,36 @@ impl<F: FaultInjector> PosixCommit<F> {
         Ok(())
     }
 
+    /// A second handle to open staging for positional writes performed
+    /// outside this commit's exclusive borrow (ADR-0046). The caller owns
+    /// the ordering: it must observe [`Self::state`] before counting any
+    /// such write, and report a failed write through
+    /// [`Self::poison_write_failure`]. Refused once staging is sealed.
+    pub fn try_clone_staging(&self) -> Result<File, Error> {
+        match &self.staging {
+            Staging::Open(file) => Ok(file.try_clone()?),
+            Staging::Sealed(_) => Err(Error::Io(io::Error::other("staging is sealed"))),
+        }
+    }
+
+    /// Drives the poison transition for a positional write that failed
+    /// outside this commit, returning the error the caller reports. The
+    /// state machine advances exactly as if [`Self::write_verified_at`] had
+    /// performed the write itself.
+    pub fn poison_write_failure(&mut self, error: io::Error) -> Error {
+        // Concurrent writes can fail together; the loser of the relock race
+        // finds the machine already poisoned and still reports its own
+        // write error, never a model refusal.
+        if self.machine.state() == State::Poisoned {
+            return Error::Io(error);
+        }
+        self.fail(
+            Event::DataFlushFailed,
+            TraceEvent::Poisoned,
+            Error::Io(error),
+        )
+    }
+
     /// Records that every staged byte has been transit verified.
     pub fn finish_transit_verified(&mut self) -> Result<(), Error> {
         self.ensure_admitted()?;
@@ -844,6 +874,22 @@ mod tests {
             OneFault(fault),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_second_write_failure_after_poison_reports_its_own_error() {
+        let directory = directory("double-poison");
+        let mut commit = provider(&directory, Profile::Fast, None);
+        let first = commit.poison_write_failure(io::Error::other("first failure"));
+        assert!(matches!(first, Error::Io(_)));
+        assert_eq!(commit.state(), State::Poisoned);
+        let trace_len = commit.trace().len();
+        // The loser of the relock race still reports its own write error,
+        // never a model refusal, and adds nothing to the trace.
+        let second = commit.poison_write_failure(io::Error::other("second failure"));
+        assert!(matches!(second, Error::Io(_)), "{second:?}");
+        assert_eq!(commit.trace().len(), trace_len);
+        assert_eq!(commit.state(), State::Poisoned);
     }
 
     #[test]

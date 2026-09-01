@@ -9,12 +9,18 @@
 
 use std::fmt;
 use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vot_sdk::coverage::{CoverageCheck, ObjectCoverage};
+#[cfg(not(unix))]
+use vot_sdk::coverage::CoverageCheck;
+#[cfg(unix)]
+use vot_sdk::coverage::CoverageReserve;
+use vot_sdk::coverage::ObjectCoverage;
 use vot_sdk::object::ObjectId;
 use vot_sdk::verify::VerifiedSlice;
 
@@ -41,6 +47,9 @@ pub enum ErrorKind {
     UnsupportedProfile,
     ResourceExhausted,
     StateConflict,
+    /// The range collides with an accept still in flight on another thread.
+    /// Retryable: after the holder commits, the same range is a replay.
+    RangeInFlight,
     Io,
     Internal,
 }
@@ -142,22 +151,58 @@ struct Backend {
 #[cfg(not(any(unix, windows)))]
 struct Backend;
 
-/// One native destination receiving authenticated object ranges.
-pub struct NativeFile {
-    object: ObjectId,
+/// Mutable receive state, everything the one lock covers: coverage, the
+/// commit state machine, and the lifecycle flags (ADR-0046). Bytes are
+/// written outside it.
+struct Shared {
     coverage: ObjectCoverage,
-    destination: PathBuf,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    staging: PathBuf,
     backend: Option<Backend>,
     sealed: bool,
     preserve_recovery: bool,
     published: bool,
     observation: Option<PublishObservation>,
+}
+
+/// One native destination receiving authenticated object ranges.
+///
+/// [`Self::accept`] takes `&self`: disjoint verified ranges write
+/// concurrently, with bookkeeping behind one internal lock. Lifecycle
+/// operations ([`Self::publish`], [`Self::cancel`]) take `&mut self` or
+/// `self`, so the borrow checker already serializes them against every
+/// in-flight accept.
+pub struct NativeFile {
+    object: ObjectId,
+    destination: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    staging: PathBuf,
+    /// Writable staging handle for accepts, held outside the state lock so
+    /// disjoint positional writes proceed concurrently.
+    #[cfg(unix)]
+    write_handle: File,
     #[cfg(unix)]
     profile: CommitProfile,
+    shared: std::sync::Mutex<Shared>,
     #[cfg(test)]
     publish_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    /// Forces the next unlocked positional write to fail, standing in for
+    /// the fault injector that sat below the write before ADR-0046 moved
+    /// the write out of the commit.
+    #[cfg(all(unix, test))]
+    write_fault: std::sync::atomic::AtomicBool,
+    /// Parks an accept between its successful write and its relock, so a
+    /// test can poison the commit inside exactly that window. Both waits
+    /// are bounded: a mutant that keeps either side from its rendezvous
+    /// must fail the test, never hang it.
+    #[cfg(all(unix, test))]
+    write_park: Option<std::sync::Arc<TestPark>>,
+}
+
+/// Holder-side ends of the park rendezvous: announce fires after a
+/// successful write, release lets the relock proceed.
+#[cfg(all(unix, test))]
+struct TestPark {
+    announce: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl NativeFile {
@@ -183,83 +228,239 @@ impl NativeFile {
             return Err(Error::plain(ErrorKind::UnsupportedPlatform));
         };
 
+        #[cfg(unix)]
+        let write_handle = match backend.commit.try_clone_staging() {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = backend.commit.cancel();
+                return Err(map_posix(error));
+            }
+        };
         Ok(Self {
             object: object.clone(),
-            coverage: ObjectCoverage::new(object),
             destination,
             staging,
-            backend: Some(backend),
-            sealed: false,
-            preserve_recovery: false,
-            published: false,
-            observation: None,
+            #[cfg(unix)]
+            write_handle,
             #[cfg(unix)]
             profile,
+            shared: std::sync::Mutex::new(Shared {
+                coverage: ObjectCoverage::new(object),
+                backend: Some(backend),
+                sealed: false,
+                preserve_recovery: false,
+                published: false,
+                observation: None,
+            }),
             #[cfg(test)]
             publish_barrier: None,
+            #[cfg(all(unix, test))]
+            write_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(unix, test))]
+            write_park: None,
         })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().expect("native file state lock poisoned")
+    }
+
+    fn state_mut(&mut self) -> &mut Shared {
+        self.shared
+            .get_mut()
+            .expect("native file state lock poisoned")
+    }
+
+    fn progress_of(&self, shared: &Shared) -> Progress {
+        Progress {
+            covered_bytes: shared.coverage.covered_bytes(),
+            prefix_bytes: shared.coverage.contiguous_prefix(),
+            total_bytes: self.object.length,
+            fragments: shared.coverage.fragment_count(),
+        }
     }
 
     #[must_use]
     pub fn progress(&self) -> Progress {
-        Progress {
-            covered_bytes: self.coverage.covered_bytes(),
-            prefix_bytes: self.coverage.contiguous_prefix(),
-            total_bytes: self.object.length,
-            fragments: self.coverage.fragment_count(),
-        }
+        let shared = self.lock();
+        self.progress_of(&shared)
     }
 
     /// Reports whether cleanup must preserve the files needed for recovery.
     #[must_use]
-    pub const fn recovery_required(&self) -> bool {
-        self.preserve_recovery
+    pub fn recovery_required(&self) -> bool {
+        self.lock().preserve_recovery
     }
 
     /// The provider observation from the last successful [`Self::publish`],
     /// or `None` before publication and on platforms without one.
     #[must_use]
-    pub const fn publish_observation(&self) -> Option<PublishObservation> {
-        self.observation
+    pub fn publish_observation(&self) -> Option<PublishObservation> {
+        self.lock().observation
     }
 
-    /// Writes one authenticated range and commits its coverage only after the
-    /// positional write succeeds. Callers cancel safely between calls.
-    pub fn accept(&mut self, verified: &VerifiedSlice<'_>) -> Result<Acceptance, Error> {
-        if self.published || self.sealed {
+    /// Refusals every accept observes under the lock before touching
+    /// coverage. Lifecycle flags cannot change while any accept runs, since
+    /// publish and cancel need exclusive access; the poison state can, from
+    /// a concurrent accept whose write failed.
+    #[cfg(unix)]
+    fn ensure_accepting(shared: &Shared) -> Result<(), Error> {
+        if shared.published || shared.sealed {
             return Err(Error::plain(ErrorKind::StateConflict));
         }
-        let backend = self
+        let backend = shared
+            .backend
+            .as_ref()
+            .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
+        match backend.commit.state() {
+            vot_commit_model::State::Poisoned => Err(map_posix(vot_commit_posix::Error::Poisoned)),
+            vot_commit_model::State::Admitted => Ok(()),
+            _ => Err(map_posix(vot_commit_posix::Error::Model(
+                vot_commit_model::Error::InvalidTransition,
+            ))),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_ranged(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        #[cfg(test)]
+        if self.write_fault.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected write fault"));
+        }
+        let written = self.write_handle.write_all_at(data, offset);
+        #[cfg(test)]
+        if written.is_ok()
+            && let Some(park) = &self.write_park
+        {
+            park.announce.send(()).expect("park listener gone");
+            park.release
+                .lock()
+                .expect("park release lock")
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("park release never arrived; the test side is stuck");
+        }
+        written
+    }
+
+    /// Writes one authenticated range and commits its coverage only after
+    /// the positional write succeeds. Callers cancel safely between calls.
+    ///
+    /// Takes `&self`: disjoint ranges verified elsewhere may be accepted
+    /// from as many threads as the caller runs (ADR-0046). The write lands
+    /// outside the lock; bookkeeping, replay classification, and the poison
+    /// transition stay inside it.
+    pub fn accept(&self, verified: &VerifiedSlice<'_>) -> Result<Acceptance, Error> {
+        #[cfg(unix)]
+        {
+            self.accept_parallel(verified)
+        }
+        #[cfg(not(unix))]
+        {
+            self.accept_serial(verified)
+        }
+    }
+
+    #[cfg(unix)]
+    fn accept_parallel(&self, verified: &VerifiedSlice<'_>) -> Result<Acceptance, Error> {
+        let reservation = {
+            let mut shared = self.lock();
+            Self::ensure_accepting(&shared)?;
+            match shared
+                .coverage
+                .reserve(verified)
+                .map_err(|error| map_sdk_code(error.code()))?
+            {
+                CoverageReserve::Replay => {
+                    return Ok(Acceptance {
+                        status: RangeStatus::Replay,
+                        progress: self.progress_of(&shared),
+                    });
+                }
+                CoverageReserve::New(reservation) => reservation,
+            }
+        };
+        let written = self.write_ranged(verified.covered_offset(), verified.data());
+        let mut shared = self.lock();
+        match written {
+            Ok(()) => {
+                // A concurrent accept may have poisoned the commit while
+                // this write was in flight; a range whose bytes landed then
+                // is released, never committed.
+                if let Err(error) = Self::ensure_accepting(&shared) {
+                    shared.coverage.release_reservation(reservation);
+                    return Err(error);
+                }
+                shared.coverage.commit_reservation(reservation);
+                Ok(Acceptance {
+                    status: RangeStatus::Accepted,
+                    progress: self.progress_of(&shared),
+                })
+            }
+            Err(error) => {
+                shared.coverage.release_reservation(reservation);
+                let backend = shared
+                    .backend
+                    .as_mut()
+                    .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
+                Err(map_posix(backend.commit.poison_write_failure(error)))
+            }
+        }
+    }
+
+    /// Windows and unsupported platforms keep the serial shape under the
+    /// lock; the write sink there needs exclusive access.
+    #[cfg(not(unix))]
+    fn accept_serial(&self, verified: &VerifiedSlice<'_>) -> Result<Acceptance, Error> {
+        let mut shared = self.lock();
+        if shared.published || shared.sealed {
+            return Err(Error::plain(ErrorKind::StateConflict));
+        }
+        let shared = &mut *shared;
+        let backend = shared
             .backend
             .as_mut()
             .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
-        let checked = self
+        let checked = shared
             .coverage
             .check(verified)
             .map_err(|error| map_sdk_code(error.code()))?;
         let status = match checked {
             CoverageCheck::Replay => RangeStatus::Replay,
             CoverageCheck::New(booking) => {
-                write_backend(backend, verified.covered_offset(), verified.data())?;
+                #[cfg(windows)]
+                write_all_at_windows(backend, verified.covered_offset(), verified.data())?;
+                #[cfg(not(any(unix, windows)))]
+                write_all_at_unsupported(backend, verified.covered_offset(), verified.data())?;
                 booking.commit();
                 RangeStatus::Accepted
             }
         };
         Ok(Acceptance {
             status,
-            progress: self.progress(),
+            progress: Progress {
+                covered_bytes: shared.coverage.covered_bytes(),
+                prefix_bytes: shared.coverage.contiguous_prefix(),
+                total_bytes: self.object.length,
+                fragments: shared.coverage.fragment_count(),
+            },
         })
     }
 
     /// Publishes complete verified coverage without overwriting a destination.
+    ///
+    /// Exclusive access here is what serializes publication against every
+    /// in-flight accept: an incomplete coverage, which any outstanding
+    /// reservation implies, is refused before sealing.
     pub fn publish(&mut self) -> Result<(), Error> {
-        if self.published {
+        let shared = self.state_mut();
+        if shared.published {
             return Err(Error::plain(ErrorKind::StateConflict));
         }
-        if !self.coverage.is_complete() {
+        if !shared.coverage.is_complete() {
             return Err(Error::plain(ErrorKind::Incomplete));
         }
-        if !self.sealed {
+        if !shared.sealed {
             reject_existing(&self.destination)?;
         }
         #[cfg(test)]
@@ -274,14 +475,16 @@ impl NativeFile {
         #[cfg(not(any(unix, windows)))]
         return Err(Error::plain(ErrorKind::UnsupportedPlatform));
 
-        self.published = true;
-        self.cleanup_backend();
+        let shared = self.state_mut();
+        shared.published = true;
+        Self::cleanup_backend(shared);
         Ok(())
     }
 
     /// Cancels before publication and reports cleanup failures.
     pub fn cancel(mut self) -> Result<(), Error> {
-        if self.preserve_recovery || self.published {
+        let shared = self.state_mut();
+        if shared.preserve_recovery || shared.published {
             return Err(Error::plain(ErrorKind::StateConflict));
         }
         self.remove_backend()
@@ -289,36 +492,37 @@ impl NativeFile {
 
     #[cfg(unix)]
     fn publish_unix(&mut self) -> Result<(), Error> {
-        let backend = self
+        let object = self.object.clone();
+        let profile = self.profile;
+        let shared = self.state_mut();
+        let backend = shared
             .backend
             .as_mut()
             .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
-        if !self.sealed {
+        if !shared.sealed {
             backend
                 .commit
                 .finish_transit_verified()
                 .map_err(map_posix)?;
-            self.sealed = true;
+            shared.sealed = true;
         }
         let result = if backend.commit.state() == vot_commit_model::State::RecoveryRequired {
             backend.commit.retry_publication()
         } else {
-            match self.profile {
+            match profile {
                 CommitProfile::Fast | CommitProfile::Balanced => backend.commit.publish(),
                 CommitProfile::Strict => {
-                    let suite = vot_commit_strict::Suite::try_from(self.object.suite)
+                    let suite = vot_commit_strict::Suite::try_from(object.suite)
                         .map_err(|_| Error::plain(ErrorKind::Internal))?;
-                    backend
-                        .commit
-                        .publish_strict(suite, &self.object.root, 4096)
+                    backend.commit.publish_strict(suite, &object.root, 4096)
                 }
             }
         };
-        self.preserve_recovery =
+        shared.preserve_recovery =
             backend.commit.state() == vot_commit_model::State::RecoveryRequired;
         result
             .map(|receipt| {
-                self.observation = Some(PublishObservation {
+                shared.observation = Some(PublishObservation {
                     incarnation: receipt.incarnation,
                     sequence: receipt.sequence,
                 });
@@ -328,27 +532,30 @@ impl NativeFile {
 
     #[cfg(windows)]
     fn write_all_at_windows_publish(&mut self) -> Result<(), Error> {
-        let backend = self
+        let staging = self.staging.clone();
+        let destination = self.destination.clone();
+        let shared = self.state_mut();
+        let backend = shared
             .backend
             .as_ref()
             .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
-        self.sealed = true;
+        shared.sealed = true;
         let result = vot_commit_platform::publish_native_file(
             backend.sink.file(),
-            &self.staging,
-            &self.destination,
+            &staging,
+            &destination,
             vot_receipt::CommitProfile::Fast,
         );
         if result.is_err() {
-            self.preserve_recovery =
-                vot_platform_fs::same_file_handle(backend.sink.file(), &self.destination)
+            shared.preserve_recovery =
+                vot_platform_fs::same_file_handle(backend.sink.file(), &destination)
                     .unwrap_or(true);
         }
         result.map(|_| ()).map_err(write_all_at_windows_error)
     }
 
-    fn cleanup_backend(&mut self) {
-        let Some(backend) = self.backend.take() else {
+    fn cleanup_backend(shared: &mut Shared) {
+        let Some(backend) = shared.backend.take() else {
             return;
         };
         #[cfg(unix)]
@@ -359,6 +566,7 @@ impl NativeFile {
 
     fn remove_backend(&mut self) -> Result<(), Error> {
         let backend = self
+            .state_mut()
             .backend
             .take()
             .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?;
@@ -377,7 +585,8 @@ impl NativeFile {
 
 impl Drop for NativeFile {
     fn drop(&mut self) {
-        if !self.preserve_recovery && !self.published {
+        let shared = self.state_mut();
+        if !shared.preserve_recovery && !shared.published {
             let _ = self.remove_backend();
         }
     }
@@ -499,14 +708,6 @@ fn write_all_at_windows_create(
     Err(Error::plain(ErrorKind::ResourceExhausted))
 }
 
-#[cfg(unix)]
-fn write_backend(backend: &mut Backend, offset: u64, data: &[u8]) -> Result<(), Error> {
-    backend
-        .commit
-        .write_verified_at(offset, data)
-        .map_err(map_posix)
-}
-
 #[cfg(windows)]
 fn write_all_at_windows(backend: &mut Backend, offset: u64, data: &[u8]) -> Result<(), Error> {
     use vot_scheduler::RangeSink as _;
@@ -571,6 +772,7 @@ fn map_sdk_code(code: vot_sdk::ErrorCode) -> Error {
             ErrorKind::ResourceExhausted
         }
         vot_sdk::ErrorCode::StateConflict => ErrorKind::StateConflict,
+        vot_sdk::ErrorCode::RangeInFlight => ErrorKind::RangeInFlight,
         _ => ErrorKind::Internal,
     };
     Error::plain(kind)
@@ -620,12 +822,6 @@ fn write_all_at_windows_error(error: vot_commit_platform::Error) -> Error {
         vot_commit_platform::Error::InvalidLayout => Error::plain(ErrorKind::InvalidDestination),
     }
 }
-
-#[cfg(windows)]
-use write_all_at_windows as write_backend;
-
-#[cfg(not(any(unix, windows)))]
-use write_all_at_unsupported as write_backend;
 
 #[cfg(test)]
 mod tests {
@@ -684,7 +880,7 @@ mod tests {
         )
         .unwrap();
         assert!(!file.recovery_required());
-        file.sealed = true;
+        file.state_mut().sealed = true;
         let proof = prepared.prove(0, 1).unwrap();
         let verified = vot_sdk::verify::verify_range(
             prepared.object_id(),
@@ -697,7 +893,7 @@ mod tests {
             file.accept(&verified).unwrap_err().kind(),
             ErrorKind::StateConflict
         );
-        file.preserve_recovery = true;
+        file.state_mut().preserve_recovery = true;
         assert!(file.recovery_required());
         let staging = file.staging.clone();
         assert_eq!(file.cancel().unwrap_err().kind(), ErrorKind::StateConflict);
@@ -734,12 +930,322 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    const GROUP: usize = 65_536;
+
+    fn object_with(suite: Suite, bytes: &[u8]) -> vot_sdk::object::InMemoryPreparedObject {
+        let mut builder =
+            InMemoryObjectBuilder::new(suite, Some(bytes.len() as u64), bytes.len() as u64)
+                .unwrap();
+        builder.update(bytes).unwrap();
+        builder.finish().unwrap()
+    }
+
+    /// Test-side ends of the park rendezvous, bounded on both sides.
+    #[cfg(unix)]
+    fn armed_park(
+        file: &mut NativeFile,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (announce_tx, announce_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        file.write_park = Some(std::sync::Arc::new(TestPark {
+            announce: announce_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        (announce_rx, release_tx)
+    }
+
+    /// One proof and verified slice per 64 KiB group, precomputed so worker
+    /// threads only verify and accept.
+    fn group_proofs(
+        prepared: &vot_sdk::object::InMemoryPreparedObject,
+        data: &[u8],
+    ) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
+        (0..data.len() / GROUP)
+            .map(|group| {
+                let offset = group * GROUP;
+                let proof = prepared.prove(offset as u64, 1).unwrap();
+                (
+                    proof.covered_offset(),
+                    data[offset..offset + GROUP].to_vec(),
+                    proof.proof().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_disjoint_ranges_accept_once_and_publish_the_source() {
+        for (name, suite) in [
+            ("parallel-blake3", Suite::Blake3Bao64),
+            ("parallel-sha256", Suite::Sha256Bep52),
+        ] {
+            let directory = directory(name);
+            let data: Vec<u8> = (0..8 * GROUP)
+                .map(|index| u8::try_from(index % 256).unwrap())
+                .collect();
+            let prepared = object_with(suite, &data);
+            let destination = directory.join("object");
+            let mut file =
+                NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast)
+                    .unwrap();
+            let object_id = prepared.object_id().clone();
+            std::thread::scope(|scope| {
+                let file = &file;
+                let object_id = &object_id;
+                for (offset, bytes, proof) in group_proofs(&prepared, &data) {
+                    scope.spawn(move || {
+                        let verified =
+                            vot_sdk::verify::verify_range(object_id, offset, &bytes, &proof)
+                                .unwrap();
+                        let accepted = file.accept(&verified).unwrap();
+                        assert_eq!(accepted.status, RangeStatus::Accepted);
+                        // Progress is monotone: it includes at least this
+                        // range's bytes the moment accept returns.
+                        assert!(accepted.progress.covered_bytes >= GROUP as u64);
+                    });
+                }
+            });
+            let progress = file.progress();
+            assert_eq!(progress.covered_bytes, data.len() as u64);
+            assert_eq!(progress.prefix_bytes, data.len() as u64);
+            // A committed range replays instead of double counting.
+            let (offset, bytes, proof) = group_proofs(&prepared, &data).remove(0);
+            let verified =
+                vot_sdk::verify::verify_range(&object_id, offset, &bytes, &proof).unwrap();
+            let replay = file.accept(&verified).unwrap();
+            assert_eq!(replay.status, RangeStatus::Replay);
+            assert_eq!(replay.progress.covered_bytes, data.len() as u64);
+            file.publish().unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), data);
+            drop(file);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn racing_duplicates_of_one_range_accept_exactly_once() {
+        let directory = directory("duplicate-race");
+        let data = vec![0x3c; 4 * GROUP];
+        let prepared = object(&data);
+        let file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        let object_id = prepared.object_id().clone();
+        let proof = prepared.prove(0, 1).unwrap();
+        let offset = proof.covered_offset();
+        let bytes = &data[..GROUP];
+        let proof = proof.proof().to_vec();
+        let accepted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let verified =
+                        vot_sdk::verify::verify_range(&object_id, offset, bytes, &proof).unwrap();
+                    match file.accept(&verified) {
+                        Ok(acceptance) => {
+                            if acceptance.status == RangeStatus::Accepted {
+                                accepted.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // An in-flight duplicate is refused as retryable;
+                        // its retry after the winner commits is a replay.
+                        Err(error) => assert_eq!(error.kind(), ErrorKind::RangeInFlight),
+                    }
+                });
+            }
+        });
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(file.progress().covered_bytes, GROUP as u64);
+        let verified = vot_sdk::verify::verify_range(&object_id, offset, bytes, &proof).unwrap();
+        assert_eq!(file.accept(&verified).unwrap().status, RangeStatus::Replay);
+        drop(file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_in_flight_duplicate_is_refused_as_retryable() {
+        let directory = directory("in-flight-duplicate");
+        let data = vec![0x19; 2 * GROUP];
+        let prepared = object(&data);
+        let mut file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        let (announce, release) = armed_park(&mut file);
+        let object_id = prepared.object_id().clone();
+        let proofs = group_proofs(&prepared, &data);
+        std::thread::scope(|scope| {
+            let file = &file;
+            let object_id = &object_id;
+            let (offset, bytes, proof) = proofs[0].clone();
+            let holder = scope.spawn(move || {
+                let verified =
+                    vot_sdk::verify::verify_range(object_id, offset, &bytes, &proof).unwrap();
+                file.accept(&verified)
+            });
+            // The announcement proves the holder's reservation is in
+            // flight, so the duplicate below deterministically collides
+            // with a reservation rather than a committed extent.
+            announce
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("no write reached the park");
+            let (offset, bytes, proof) = &proofs[0];
+            let verified = vot_sdk::verify::verify_range(object_id, *offset, bytes, proof).unwrap();
+            let refused = file.accept(&verified).unwrap_err();
+            assert_eq!(refused.kind(), ErrorKind::RangeInFlight);
+            release.send(()).expect("holder gone before release");
+            assert_eq!(
+                holder.join().unwrap().unwrap().status,
+                RangeStatus::Accepted
+            );
+        });
+        // After the holder commits, the same range is a replay.
+        let (offset, bytes, proof) = &proofs[0];
+        let verified = vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+        assert_eq!(file.accept(&verified).unwrap().status, RangeStatus::Replay);
+        drop(file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_poison_landing_mid_write_releases_the_landed_range() {
+        let directory = directory("poison-mid-write");
+        let data = vec![0x2b; 2 * GROUP];
+        let prepared = object(&data);
+        let mut file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        let (announce, release) = armed_park(&mut file);
+        let object_id = prepared.object_id().clone();
+        let proofs = group_proofs(&prepared, &data);
+        std::thread::scope(|scope| {
+            let file = &file;
+            let object_id = &object_id;
+            let (offset, bytes, proof) = proofs[0].clone();
+            let parked = scope.spawn(move || {
+                let verified =
+                    vot_sdk::verify::verify_range(object_id, offset, &bytes, &proof).unwrap();
+                // Writes its bytes, then parks before the relock while the
+                // main thread poisons the commit.
+                file.accept(&verified)
+            });
+            // The announcement proves the parked accept already passed
+            // its own fault check and wrote its bytes, so the fault below
+            // can only fire for this thread's accept, which returns before
+            // the park hook.
+            announce
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("no write reached the park");
+            let (offset, bytes, proof) = &proofs[1];
+            let verified = vot_sdk::verify::verify_range(object_id, *offset, bytes, proof).unwrap();
+            file.write_fault
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(file.accept(&verified).unwrap_err().kind(), ErrorKind::Io);
+            release.send(()).expect("parked accept gone before release");
+            let refused = parked.join().unwrap().unwrap_err();
+            assert_eq!(refused.kind(), ErrorKind::StateConflict);
+        });
+        // The parked range's bytes landed but were released, never counted.
+        assert_eq!(file.progress().covered_bytes, 0);
+        assert_eq!(file.progress().fragments, 0);
+        drop(file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_under_concurrency_poisons_and_releases_its_range() {
+        let directory = directory("poisoned-write");
+        let data = vec![0x77; 2 * GROUP];
+        let prepared = object(&data);
+        let file = NativeFile::create(
+            prepared.object_id(),
+            directory.join("object"),
+            CommitProfile::Fast,
+        )
+        .unwrap();
+        let object_id = prepared.object_id().clone();
+        let proofs = group_proofs(&prepared, &data);
+
+        let (offset, bytes, proof) = &proofs[0];
+        let verified = vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+        file.write_fault
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = file.accept(&verified).unwrap_err();
+        assert_eq!(failed.kind(), ErrorKind::Io);
+        // The failed range was released, never counted.
+        assert_eq!(file.progress().covered_bytes, 0);
+        assert_eq!(file.progress().fragments, 0);
+        // Every subsequent accept refuses with the poisoned error, from any
+        // number of threads.
+        std::thread::scope(|scope| {
+            for (offset, bytes, proof) in &proofs {
+                scope.spawn(|| {
+                    let verified =
+                        vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+                    let refused = file.accept(&verified).unwrap_err();
+                    assert_eq!(refused.kind(), ErrorKind::StateConflict);
+                });
+            }
+        });
+        assert_eq!(file.progress().covered_bytes, 0);
+        drop(file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_requires_committed_coverage_and_then_refuses_accepts() {
+        let directory = directory("publish-vs-accept");
+        let data = vec![0x11; 2 * GROUP];
+        let prepared = object(&data);
+        let destination = directory.join("object");
+        let mut file =
+            NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast).unwrap();
+        let object_id = prepared.object_id().clone();
+        let proofs = group_proofs(&prepared, &data);
+        let (offset, bytes, proof) = &proofs[0];
+        let verified = vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+        file.accept(&verified).unwrap();
+        // Publication observes only committed coverage; a hole refuses it.
+        // An in-flight accept implies exactly such a hole, and the borrow
+        // checker already keeps publish exclusive against one.
+        assert_eq!(
+            file.publish().unwrap_err().kind(),
+            ErrorKind::Incomplete,
+            "publish must refuse incomplete coverage"
+        );
+        let (offset, bytes, proof) = &proofs[1];
+        let verified = vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+        file.accept(&verified).unwrap();
+        file.publish().unwrap();
+        // A publish that won refuses later accepts.
+        let (offset, bytes, proof) = &proofs[0];
+        let verified = vot_sdk::verify::verify_range(&object_id, *offset, bytes, proof).unwrap();
+        assert_eq!(
+            file.accept(&verified).unwrap_err().kind(),
+            ErrorKind::StateConflict
+        );
+        assert_eq!(fs::read(&destination).unwrap(), data);
+        drop(file);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn progress_prefix_stops_at_a_hole_left_by_out_of_order_ranges() {
         let directory = directory("prefix");
         let data = vec![0x5a; 131_072];
         let prepared = object(&data);
-        let mut file = NativeFile::create(
+        let file = NativeFile::create(
             prepared.object_id(),
             directory.join("object"),
             CommitProfile::Fast,
@@ -958,13 +1464,17 @@ mod tests {
         let mut file =
             NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast).unwrap();
         file.accept(&verified).unwrap();
-        file.backend
-            .as_mut()
-            .unwrap()
-            .commit
-            .finish_transit_verified()
-            .unwrap();
-        file.sealed = true;
+        {
+            let shared = file.state_mut();
+            shared
+                .backend
+                .as_mut()
+                .unwrap()
+                .commit
+                .finish_transit_verified()
+                .unwrap();
+            shared.sealed = true;
+        }
         fs::hard_link(&file.staging, &destination).unwrap();
 
         file.publish().unwrap();
@@ -1010,10 +1520,13 @@ mod tests {
             outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
             1
         );
-        for (file, result) in outcomes {
+        for (mut file, result) in outcomes {
             if let Err(error) = result {
                 assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-                assert!(file.sealed, "post-admission conflict was not sealed");
+                assert!(
+                    file.state_mut().sealed,
+                    "post-admission conflict was not sealed"
+                );
                 assert!(!file.recovery_required());
                 file.cancel().unwrap();
             }

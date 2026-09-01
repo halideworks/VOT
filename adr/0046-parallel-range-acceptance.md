@@ -138,8 +138,11 @@ commit concurrently, and every existing refusal keeps its place.**
 - K threads accepting K disjoint verified ranges of one object: every range
   accepted exactly once, `progress()` monotone, published object bytes equal
   to the source, for both suites.
-- The same run with one duplicated range: exactly one `Accepted`, the rest
-  `Replay`, no double write observable in the published bytes.
+- The same run with one duplicated range: exactly one `Accepted`, no double
+  write observable in the published bytes. A duplicate that arrives after
+  the winner commits is a `Replay`; one that races the in-flight winner is
+  refused with the retryable in-flight classification, never `Replay`,
+  because its bytes are not covered until the winner commits.
 - A write forced to fail mid-run under concurrency: the commit is poisoned,
   every in-flight and subsequent `accept` refuses with today's error, the
   reservation of the failed range is released, and no partial range is counted
@@ -148,6 +151,7 @@ commit concurrently, and every existing refusal keeps its place.**
   committed coverage; a publish that wins refuses later accepts with the
   state-conflict error.
 - Mutation gate per CONTRIBUTING: for the lock-order and poison transitions,
-  a deliberate mutant that commits a reservation despite a failed write, and one
-  that skips the poisoned check in `accept`, each killed by a test, recorded
-  in `test-vectors/mutants/`.
+  a deliberate mutant that commits a reservation despite a failed write, one
+  that skips the poisoned check in `accept`, and one that commits a landed
+  range without re-checking the poison that arrived while it was writing,
+  each killed by a test, recorded in `test-vectors/mutants/`.

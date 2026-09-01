@@ -29,9 +29,9 @@ impl RangeState {
 
 pub(super) const fn coverage_error(error: vot_coverage::Error) -> Error {
     match error {
-        vot_coverage::Error::EmptyRange | vot_coverage::Error::PartialOverlap => {
-            Error::LengthMismatch
-        }
+        vot_coverage::Error::EmptyRange
+        | vot_coverage::Error::PartialOverlap
+        | vot_coverage::Error::ReservedOverlap => Error::LengthMismatch,
         vot_coverage::Error::LengthExceeded => Error::LengthExceeded,
         vot_coverage::Error::FragmentsExhausted => Error::RangeFragmentsExhausted,
     }

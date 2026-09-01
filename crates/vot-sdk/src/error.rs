@@ -12,6 +12,9 @@ pub enum ErrorCode {
     VerificationFailed,
     Incomplete,
     StateConflict,
+    /// The operation collides with work still in flight; retry once that
+    /// work settles.
+    RangeInFlight,
     AuthenticationFailed,
     ResourceExhausted,
     Internal,
@@ -47,6 +50,7 @@ pub(crate) const fn coverage(error: vot_coverage::Error) -> Error {
         vot_coverage::Error::EmptyRange => ErrorCode::InvalidInput,
         vot_coverage::Error::LengthExceeded => ErrorCode::LimitExceeded,
         vot_coverage::Error::PartialOverlap => ErrorCode::StateConflict,
+        vot_coverage::Error::ReservedOverlap => ErrorCode::RangeInFlight,
         vot_coverage::Error::FragmentsExhausted => ErrorCode::ResourceExhausted,
     };
     Error::new(code)
@@ -175,6 +179,10 @@ mod tests {
         assert_eq!(
             coverage(vot_coverage::Error::PartialOverlap).code(),
             ErrorCode::StateConflict
+        );
+        assert_eq!(
+            coverage(vot_coverage::Error::ReservedOverlap).code(),
+            ErrorCode::RangeInFlight
         );
         assert_eq!(
             coverage(vot_coverage::Error::FragmentsExhausted).code(),

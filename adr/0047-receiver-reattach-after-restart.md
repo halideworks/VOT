@@ -63,9 +63,9 @@ proofs still exist.**
    `fragment_limit(object_len)` allows. `ObjectCoverage` in `vot-sdk` passes
    both through.
 
-2. **Creation exposes what resume needs.** `NativeFile::create` returns,
-   alongside the handle, the staging path, the journal path, and the
-   incarnation, so a consumer can persist them with its session record the
+2. **Creation exposes what resume needs.** `NativeFile::create` exposes,
+   through accessors on the handle, the staging path, the journal path, and
+   the incarnation, so a consumer can persist them with its session record the
    moment the transfer is admitted. Today the first two are private fields
    and the incarnation is unreadable until publication.
 
@@ -80,7 +80,11 @@ proofs still exist.**
    records it; the consumer persists the profile beside the other identity
    values, and resuming with a different profile than the one the transfer
    was admitted under silently changes the publish guarantee, which is
-   exactly where the trust stance in item 4 bites. On success `resume` seeds
+   exactly where the trust stance in item 4 bites. The journal claim is an
+   exclusive file lock held by the open handle, so a receiver that shuts
+   down cleanly releases it through a consuming `NativeFile::abandon` that
+   closes every handle without cancelling; a killed process releases it by
+   dying. On success `resume` seeds
    `ObjectCoverage` through `from_runs` and returns a `NativeFile`
    indistinguishable from one that never restarted; `accept`, `seal`,
    `publish`, and cancellation behave identically from there. `reattach` is
@@ -99,7 +103,10 @@ proofs still exist.**
    acceptable under one condition, which the documentation of `resume` must
    carry: the consumer stores its runs with the same durability and the same
    trust domain as the session record it already relies on, so a lying list
-   requires the same compromise as a lying session record. Three
+   requires the same compromise as a lying session record. The staging path
+   is part of that same trusted record: the incarnation binds the journal
+   alone, and nothing verifies the staging file belongs to it beyond the
+   caller pairing them honestly. Three
    conservative alternatives remain available to every caller: persist only
    `contiguous_prefix` and pass the single prefix run to `resume`, letting
    the sender re-prove everything past it; resume under
@@ -121,9 +128,11 @@ proofs still exist.**
   path, journal path, incarnation, commit profile, and the run list. The
   portal's drain procedure becomes an optimization instead of the only safe
   upgrade path.
-- The incarnation check turns the journal into the arbiter of identity: a
-  stale or mismatched journal refuses resume before a byte is written, so a
-  consumer cannot silently re-attach the wrong staging file to a session.
+- The incarnation check makes the journal the arbiter of its own identity:
+  a stale or mismatched journal refuses resume before a byte is written.
+  The staging path is not bound to that identity; it is caller-supplied and
+  unverified, so it carries the same trust requirement as the run list, and
+  the trust stance in item 4 covers both.
 - `from_runs` is a new parser of consumer-supplied input and is bounded and
   validated like one: geometry checks precede allocation, and
   `fragment_limit` bounds memory exactly as live acceptance does.

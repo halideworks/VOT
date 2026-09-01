@@ -69,6 +69,30 @@ impl ObjectCoverage {
         &self.object
     }
 
+    /// Covered extents as `(offset, length)` pairs in ascending order, for
+    /// a caller that persists coverage across a restart (ADR-0047).
+    pub fn runs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.inner.runs()
+    }
+
+    /// Rebuilds coverage for `object` from persisted runs (ADR-0047). The
+    /// result is trusted bookkeeping, not re-verified data; the caller owns
+    /// that trust boundary. Validation and refusals follow
+    /// [`vot_coverage::Coverage::from_runs`].
+    ///
+    /// # Errors
+    /// The coverage error mapped through the SDK classifications.
+    pub fn from_runs(
+        object: &ObjectId,
+        runs: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            object: object.clone(),
+            inner: vot_coverage::Coverage::from_runs(object.length, runs)
+                .map_err(error::coverage)?,
+        })
+    }
+
     /// Checks one authenticated range without changing coverage.
     ///
     /// A new range returns a booking that the caller commits only after its
@@ -172,6 +196,19 @@ mod tests {
         .unwrap();
         builder.update(bytes).unwrap();
         builder.finish().unwrap()
+    }
+
+    #[test]
+    fn runs_reports_the_exact_extents_in_order() {
+        let bytes = vec![0x31; 3 * 65_536];
+        let object = prepared(&bytes);
+        let coverage =
+            ObjectCoverage::from_runs(object.object_id(), [(0, 65_536), (131_072, 65_536)])
+                .unwrap();
+        assert_eq!(
+            coverage.runs().collect::<Vec<_>>(),
+            vec![(0, 65_536), (131_072, 65_536)]
+        );
     }
 
     #[test]

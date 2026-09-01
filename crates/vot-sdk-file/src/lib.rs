@@ -181,6 +181,12 @@ pub struct NativeFile {
     write_handle: File,
     #[cfg(unix)]
     profile: CommitProfile,
+    /// Journal path and journal identity, exposed so a consumer can persist
+    /// them at admission and hand them back to [`Self::resume`] (ADR-0047).
+    #[cfg(unix)]
+    journal: PathBuf,
+    #[cfg(unix)]
+    incarnation: [u8; 16],
     shared: std::sync::Mutex<Shared>,
     #[cfg(test)]
     publish_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
@@ -219,7 +225,7 @@ impl NativeFile {
         reject_existing(&destination)?;
 
         #[cfg(unix)]
-        let (backend, staging, _journal) = create_unix(object, parent, &destination, profile)?;
+        let (backend, staging, journal) = create_unix(object, parent, &destination, profile)?;
         #[cfg(windows)]
         let (backend, staging, _journal) = write_all_at_windows_create(object, parent)?;
         #[cfg(not(any(unix, windows)))]
@@ -239,6 +245,10 @@ impl NativeFile {
         Ok(Self {
             object: object.clone(),
             destination,
+            #[cfg(unix)]
+            journal: journal.unwrap_or_default(),
+            #[cfg(unix)]
+            incarnation: backend_incarnation(&backend),
             staging,
             #[cfg(unix)]
             write_handle,
@@ -257,6 +267,109 @@ impl NativeFile {
             #[cfg(all(unix, test))]
             write_fault: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(unix, test))]
+            write_park: None,
+        })
+    }
+
+    /// The staging path this receiver writes, for a consumer that persists
+    /// resume identity at admission (ADR-0047).
+    #[must_use]
+    pub fn staging_path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// The journal path beside staging (ADR-0047).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn journal_path(&self) -> &Path {
+        &self.journal
+    }
+
+    /// The journal identity staging was admitted under (ADR-0047).
+    #[cfg(unix)]
+    #[must_use]
+    pub const fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
+    }
+
+    /// Reopens an admitted transfer after a process restart (ADR-0047).
+    ///
+    /// The caller supplies what it persisted at admission: the object, the
+    /// destination, the staging and journal paths, the incarnation, the
+    /// commit profile, and the covered runs from [`ObjectCoverage::runs`].
+    /// The runs are trusted bookkeeping, not re-verified data: under Fast
+    /// and Balanced a false list publishes bytes that do not match the
+    /// announced identity, so store them with the same durability and in
+    /// the same trust domain as the session record itself, or take one of
+    /// the conservative outs the ADR names, a prefix-only run list, the
+    /// Strict profile's read-back, or an external rehash before publish.
+    /// The staging path carries the same trust: the journal's incarnation
+    /// binds the journal alone, and nothing verifies the staging file
+    /// belongs to it beyond the caller pairing them honestly.
+    ///
+    /// Refuses before any write: a journal past admission, a different
+    /// incarnation, an existing destination, invalid runs, and a staging
+    /// file shorter than the highest claimed run.
+    #[cfg(unix)]
+    pub fn resume(
+        object: &ObjectId,
+        destination: impl AsRef<Path>,
+        staging_path: impl Into<PathBuf>,
+        journal_path: impl Into<PathBuf>,
+        incarnation: [u8; 16],
+        profile: CommitProfile,
+        runs: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Self, Error> {
+        #[cfg(not(target_os = "linux"))]
+        validate_profile(profile)?;
+        let destination = destination.as_ref().to_path_buf();
+        destination_parent(&destination)?;
+        reject_existing(&destination)?;
+        let staging_path = staging_path.into();
+        let journal_path = journal_path.into();
+        let coverage =
+            ObjectCoverage::from_runs(object, runs).map_err(|error| map_sdk_code(error.code()))?;
+        let claimed = coverage
+            .runs()
+            .last()
+            .map_or(0, |(offset, length)| offset + length);
+        if fs::metadata(&staging_path).map_err(Error::io)?.len() < claimed {
+            return Err(Error::plain(ErrorKind::Incomplete));
+        }
+        // A refused reattach drops the commit without cancelling, leaving
+        // staging and journal on disk for another attempt or for recover.
+        let commit = vot_commit_posix::PosixCommit::reattach(
+            map_profile(profile),
+            incarnation,
+            staging_path.clone(),
+            destination.clone(),
+            &journal_path,
+            vot_commit_posix::NoFaults,
+        )
+        .map_err(map_posix)?;
+        let backend = Backend { commit };
+        let write_handle = backend.commit.try_clone_staging().map_err(map_posix)?;
+        Ok(Self {
+            object: object.clone(),
+            destination,
+            journal: journal_path,
+            incarnation,
+            staging: staging_path,
+            write_handle,
+            profile,
+            shared: std::sync::Mutex::new(Shared {
+                coverage,
+                backend: Some(backend),
+                sealed: false,
+                preserve_recovery: false,
+                published: false,
+                observation: None,
+            }),
+            #[cfg(test)]
+            publish_barrier: None,
+            #[cfg(test)]
+            write_fault: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             write_park: None,
         })
     }
@@ -481,6 +594,16 @@ impl NativeFile {
         Ok(())
     }
 
+    /// Releases every handle without cancelling, leaving staging and the
+    /// journal in place for [`Self::resume`] (ADR-0047): the receiver's
+    /// clean way to survive its own shutdown. The journal claim is an
+    /// exclusive lock held by the open handle, so a same-process resume
+    /// requires this rather than leaking the receiver.
+    #[cfg(unix)]
+    pub fn abandon(mut self) {
+        self.state_mut().backend.take();
+    }
+
     /// Cancels before publication and reports cleanup failures.
     pub fn cancel(mut self) -> Result<(), Error> {
         let shared = self.state_mut();
@@ -639,6 +762,11 @@ fn next_name() -> (String, [u8; 16]) {
 }
 
 #[cfg(unix)]
+fn backend_incarnation(backend: &Backend) -> [u8; 16] {
+    backend.commit.incarnation()
+}
+
+#[cfg(unix)]
 fn create_unix(
     object: &ObjectId,
     parent: &Path,
@@ -790,7 +918,14 @@ fn map_posix(error: vot_commit_posix::Error) -> Error {
         vot_commit_posix::Error::DestinationIdentityMismatch
         | vot_commit_posix::Error::StagingIdentityMismatch
         | vot_commit_posix::Error::StrictIdentityMismatch
-        | vot_commit_posix::Error::Poisoned => Error::plain(ErrorKind::StateConflict),
+        | vot_commit_posix::Error::Poisoned
+        | vot_commit_posix::Error::NotAdmitted => Error::plain(ErrorKind::StateConflict),
+        // A Strict read-back that finds the wrong bytes is the caller's
+        // data problem, not a provider bug; resume's trust stance makes it
+        // reachable (ADR-0047).
+        vot_commit_posix::Error::Strict(vot_commit_strict::Error::HashMismatch) => {
+            Error::plain(ErrorKind::StateConflict)
+        }
         vot_commit_posix::Error::Model(_) | vot_commit_posix::Error::Strict(_) => {
             Error::plain(ErrorKind::Internal)
         }
@@ -804,6 +939,12 @@ fn map_journal(error: vot_journal::Error) -> Error {
         vot_journal::Error::Io(error) => Error::io(error),
         vot_journal::Error::Full | vot_journal::Error::TooLarge => {
             Error::plain(ErrorKind::ResourceExhausted)
+        }
+        // A journal claimed under another identity, or still claimed by a
+        // live handle, is a caller-visible refusal at resume, not a
+        // provider bug.
+        vot_journal::Error::StaleIncarnation | vot_journal::Error::Locked => {
+            Error::plain(ErrorKind::StateConflict)
         }
         _ => Error::plain(ErrorKind::Internal),
     }
@@ -938,6 +1079,21 @@ mod tests {
                 .unwrap();
         builder.update(bytes).unwrap();
         builder.finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_refusal_classifications_are_caller_visible() {
+        // A stale identity and a still-claimed journal are both retryable
+        // caller conditions at resume, never provider bugs.
+        assert_eq!(
+            map_journal(vot_journal::Error::StaleIncarnation).kind(),
+            ErrorKind::StateConflict
+        );
+        assert_eq!(
+            map_journal(vot_journal::Error::Locked).kind(),
+            ErrorKind::StateConflict
+        );
     }
 
     /// Test-side ends of the park rendezvous, bounded on both sides.
@@ -1238,6 +1394,297 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), data);
         drop(file);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn resume_identity(file: &NativeFile) -> (PathBuf, PathBuf, [u8; 16], Vec<(u64, u64)>) {
+        (
+            file.staging_path().to_path_buf(),
+            file.journal_path().to_path_buf(),
+            file.incarnation(),
+            file.lock().coverage.runs().collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_completes_a_fragmented_transfer_for_both_suites() {
+        for (name, suite) in [
+            ("resume-blake3", Suite::Blake3Bao64),
+            ("resume-sha256", Suite::Sha256Bep52),
+        ] {
+            let directory = directory(name);
+            let data: Vec<u8> = (0..4 * GROUP)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let prepared = object_with(suite, &data);
+            let destination = directory.join("object");
+            let file = NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast)
+                .unwrap();
+            let proofs = group_proofs(&prepared, &data);
+            // A fragmented subset: groups 0 and 2, holes at 1 and 3.
+            for index in [0, 2] {
+                let (offset, bytes, proof) = &proofs[index];
+                let verified =
+                    vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof)
+                        .unwrap();
+                file.accept(&verified).unwrap();
+            }
+            let (staging, journal, incarnation, runs) = resume_identity(&file);
+            // A restart: the process state vanishes, the files stay.
+            file.abandon();
+
+            let mut resumed = NativeFile::resume(
+                prepared.object_id(),
+                &destination,
+                &staging,
+                &journal,
+                incarnation,
+                CommitProfile::Fast,
+                runs,
+            )
+            .unwrap();
+            let progress = resumed.progress();
+            assert_eq!(progress.covered_bytes, 2 * GROUP as u64);
+            assert_eq!(progress.prefix_bytes, GROUP as u64);
+            // A replay inside resumed coverage classifies like a live one.
+            let (offset, bytes, proof) = &proofs[0];
+            let verified =
+                vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+            assert_eq!(
+                resumed.accept(&verified).unwrap().status,
+                RangeStatus::Replay
+            );
+            for index in [1, 3] {
+                let (offset, bytes, proof) = &proofs[index];
+                let verified =
+                    vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof)
+                        .unwrap();
+                assert_eq!(
+                    resumed.accept(&verified).unwrap().status,
+                    RangeStatus::Accepted
+                );
+            }
+            resumed.publish().unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), data);
+            drop(resumed);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_refuses_before_any_write() {
+        let directory = directory("resume-refusals");
+        let data = vec![0x42; 2 * GROUP];
+        let prepared = object(&data);
+        let destination = directory.join("object");
+        let file =
+            NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast).unwrap();
+        let proofs = group_proofs(&prepared, &data);
+        let (offset, bytes, proof) = &proofs[0];
+        let verified =
+            vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+        file.accept(&verified).unwrap();
+        let (staging, journal, incarnation, runs) = resume_identity(&file);
+        file.abandon();
+
+        let attempt = |incarnation, runs: &[(u64, u64)]| {
+            NativeFile::resume(
+                prepared.object_id(),
+                &destination,
+                &staging,
+                &journal,
+                incarnation,
+                CommitProfile::Fast,
+                runs.iter().copied(),
+            )
+        };
+        // Wrong incarnation: the journal is the arbiter of identity.
+        assert_eq!(
+            attempt([9; 16], &runs).err().unwrap().kind(),
+            ErrorKind::StateConflict
+        );
+        // Invalid run lists, each refused by from_runs.
+        for bad in [
+            vec![(0u64, 0u64)],
+            vec![(0, GROUP as u64), (GROUP as u64 / 2, GROUP as u64)],
+            vec![(GROUP as u64, GROUP as u64), (0, GROUP as u64)],
+            vec![(0, 3 * GROUP as u64)],
+        ] {
+            assert!(attempt(incarnation, &bad).is_err(), "{bad:?}");
+        }
+        // A staging file shorter than the highest claimed run.
+        let short = vec![(0, 2 * GROUP as u64)];
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_len(GROUP as u64)
+            .unwrap();
+        assert_eq!(
+            attempt(incarnation, &short).err().unwrap().kind(),
+            ErrorKind::Incomplete
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_len(2 * GROUP as u64)
+            .unwrap();
+        // The valid identity still resumes after every refusal above.
+        let resumed = attempt(incarnation, &runs).unwrap();
+        drop(resumed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_refuses_a_journal_past_admission() {
+        let directory = directory("resume-sealed");
+        let data = vec![0x51; GROUP];
+        let prepared = object(&data);
+        let destination = directory.join("object");
+        let mut file =
+            NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast).unwrap();
+        let proofs = group_proofs(&prepared, &data);
+        let (offset, bytes, proof) = &proofs[0];
+        let verified =
+            vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+        file.accept(&verified).unwrap();
+        let (staging, journal, incarnation, runs) = resume_identity(&file);
+        // Seal the journal past admission, then vanish.
+        file.state_mut()
+            .backend
+            .as_mut()
+            .unwrap()
+            .commit
+            .finish_transit_verified()
+            .unwrap();
+        file.abandon();
+        assert_eq!(
+            NativeFile::resume(
+                prepared.object_id(),
+                directory.join("elsewhere"),
+                &staging,
+                &journal,
+                incarnation,
+                CommitProfile::Fast,
+                runs,
+            )
+            .err()
+            .unwrap()
+            .kind(),
+            ErrorKind::StateConflict
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_only_resume_replays_the_prefix_and_accepts_the_rest() {
+        let directory = directory("resume-prefix");
+        let data = vec![0x66; 3 * GROUP];
+        let prepared = object(&data);
+        let destination = directory.join("object");
+        let file =
+            NativeFile::create(prepared.object_id(), &destination, CommitProfile::Fast).unwrap();
+        let proofs = group_proofs(&prepared, &data);
+        for index in [0, 2] {
+            let (offset, bytes, proof) = &proofs[index];
+            let verified =
+                vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+            file.accept(&verified).unwrap();
+        }
+        let (staging, journal, incarnation, _) = resume_identity(&file);
+        let prefix = file.progress().prefix_bytes;
+        file.abandon();
+
+        let mut resumed = NativeFile::resume(
+            prepared.object_id(),
+            &destination,
+            &staging,
+            &journal,
+            incarnation,
+            CommitProfile::Fast,
+            [(0, prefix)],
+        )
+        .unwrap();
+        // Inside the prefix: replay. Past it, including the group whose
+        // bytes landed but were not persisted in the prefix run: accepted.
+        let (offset, bytes, proof) = &proofs[0];
+        let verified =
+            vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+        assert_eq!(
+            resumed.accept(&verified).unwrap().status,
+            RangeStatus::Replay
+        );
+        for index in [1, 2] {
+            let (offset, bytes, proof) = &proofs[index];
+            let verified =
+                vot_sdk::verify::verify_range(prepared.object_id(), *offset, bytes, proof).unwrap();
+            assert_eq!(
+                resumed.accept(&verified).unwrap().status,
+                RangeStatus::Accepted
+            );
+        }
+        resumed.publish().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), data);
+        drop(resumed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn a_false_run_list_publishes_under_fast_and_balanced_and_poisons_under_strict() {
+        for (name, profile) in [
+            ("false-runs-fast", CommitProfile::Fast),
+            ("false-runs-balanced", CommitProfile::Balanced),
+            ("false-runs-strict", CommitProfile::Strict),
+        ] {
+            let directory = directory(name);
+            let data = vec![0x7d; 2 * GROUP];
+            let prepared = object(&data);
+            let destination = directory.join("object");
+            let file = NativeFile::create(prepared.object_id(), &destination, profile).unwrap();
+            let (staging, journal, incarnation, _) = resume_identity(&file);
+            file.abandon();
+            // The staging file holds zeroes; the run list claims everything.
+            let mut resumed = NativeFile::resume(
+                prepared.object_id(),
+                &destination,
+                &staging,
+                &journal,
+                incarnation,
+                profile,
+                [(0, 2 * GROUP as u64)],
+            )
+            .unwrap();
+            if matches!(profile, CommitProfile::Fast | CommitProfile::Balanced) {
+                // Fast and Balanced trust the list: publication succeeds
+                // and the published bytes fail against the announced
+                // identity. That is the documented trust boundary.
+                resumed.publish().unwrap();
+                assert_ne!(fs::read(&destination).unwrap(), data);
+            } else {
+                // Strict reads the staged bytes back and refuses. The
+                // read-back needs O_DIRECT; ordinary runners on tmpfs skip
+                // explicitly, and the storage runner must not skip.
+                let refused = resumed.publish().unwrap_err();
+                if refused.kind() == ErrorKind::UnsupportedProfile
+                    && std::env::var_os("VOT_STORAGE_RUNNER").is_none()
+                {
+                    eprintln!("skipping strict read-back: no O_DIRECT here");
+                    drop(resumed);
+                    fs::remove_dir_all(directory).unwrap();
+                    continue;
+                }
+                assert_eq!(refused.kind(), ErrorKind::StateConflict, "{refused:?}");
+                assert!(!destination.exists());
+            }
+            drop(resumed);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

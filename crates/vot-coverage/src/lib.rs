@@ -212,6 +212,65 @@ impl Coverage {
         self.extents.len()
     }
 
+    /// Covered extents as `(offset, length)` pairs in ascending order, for
+    /// a caller that persists coverage across a restart (ADR-0047).
+    pub fn runs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.extents
+            .iter()
+            .map(|(&start, &end)| (start, end - start))
+    }
+
+    /// Rebuilds coverage for an object of `object_len` bytes from runs a
+    /// caller persisted (ADR-0047). Refuses before any allocation
+    /// proportional to the input: runs must be sorted, non-overlapping and
+    /// non-adjacent, non-empty, inside the object length, and no more
+    /// numerous than [`fragment_limit`] allows. Adjacent runs are refused
+    /// rather than merged because [`Self::runs`] never emits them; their
+    /// presence means the list is not one this crate wrote.
+    ///
+    /// The rebuilt coverage is trusted bookkeeping, not re-verified data;
+    /// the caller owns that trust boundary.
+    ///
+    /// # Errors
+    /// [`Error::EmptyRange`] for a zero-length run,
+    /// [`Error::LengthExceeded`] for a run past `object_len` or an
+    /// overflowing bound, [`Error::PartialOverlap`] for unsorted,
+    /// overlapping, or adjacent runs, and [`Error::FragmentsExhausted`] for
+    /// more runs than the limit.
+    pub fn from_runs(
+        object_len: u64,
+        runs: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Self, Error> {
+        let limit = fragment_limit(object_len);
+        let mut extents = BTreeMap::new();
+        let mut bytes = 0u64;
+        let mut previous_end: Option<u64> = None;
+        for (index, (offset, length)) in runs.into_iter().enumerate() {
+            if index >= limit {
+                return Err(Error::FragmentsExhausted);
+            }
+            if length == 0 {
+                return Err(Error::EmptyRange);
+            }
+            let end = offset.checked_add(length).ok_or(Error::LengthExceeded)?;
+            if end > object_len {
+                return Err(Error::LengthExceeded);
+            }
+            if previous_end.is_some_and(|previous| offset <= previous) {
+                return Err(Error::PartialOverlap);
+            }
+            previous_end = Some(end);
+            bytes += length;
+            extents.insert(offset, end);
+        }
+        Ok(Self {
+            extents,
+            reserved: BTreeMap::new(),
+            bytes,
+            limit,
+        })
+    }
+
     /// Reserves a range for a write performed outside any borrow of this
     /// coverage, refusing overlap with committed and reserved extents alike
     /// and classifying a committed range as a replay exactly like
@@ -466,6 +525,66 @@ mod tests {
             coverage.covered_bytes(),
             u64::try_from(MAX_FRAGMENTS).unwrap() + 1
         );
+    }
+
+    #[test]
+    fn runs_round_trip_and_from_runs_validates_before_building() {
+        let mut coverage = Coverage::for_object(64);
+        commit(&mut coverage, 0, 10);
+        commit(&mut coverage, 20, 10);
+        commit(&mut coverage, 40, 10);
+        let runs: Vec<_> = coverage.runs().collect();
+        assert_eq!(runs, vec![(0, 10), (20, 10), (40, 10)]);
+        let rebuilt = Coverage::from_runs(64, runs).unwrap();
+        assert_eq!(rebuilt.covered_bytes(), 30);
+        assert_eq!(rebuilt.fragment_count(), 3);
+        assert_eq!(rebuilt.contiguous_prefix(), 10);
+        assert_eq!(rebuilt.fragment_limit(), fragment_limit(64));
+        // The rebuilt coverage keeps working: fill a hole, complete, replay.
+        commit(&mut coverage, 10, 10);
+        let mut rebuilt = Coverage::from_runs(64, coverage.runs()).unwrap();
+        assert!(matches!(rebuilt.check(0, 10), Ok(Check::Replay)));
+        commit(&mut rebuilt, 30, 10);
+        commit(&mut rebuilt, 50, 14);
+        assert!(rebuilt.is_complete(64));
+
+        assert!(matches!(
+            Coverage::from_runs(64, [(0, 0)]),
+            Err(Error::EmptyRange)
+        ));
+        assert!(matches!(
+            Coverage::from_runs(64, [(60, 5)]),
+            Err(Error::LengthExceeded)
+        ));
+        assert!(matches!(
+            Coverage::from_runs(64, [(u64::MAX, 1)]),
+            Err(Error::LengthExceeded)
+        ));
+        // A run ending exactly at the object length is inside it.
+        let boundary = Coverage::from_runs(64, [(54, 10)]).unwrap();
+        assert_eq!(boundary.covered_bytes(), 10);
+        assert_eq!(boundary.fragment_count(), 1);
+        // Unsorted, overlapping, and adjacent lists are all refused: this
+        // crate never writes them.
+        assert!(matches!(
+            Coverage::from_runs(64, [(20, 10), (0, 10)]),
+            Err(Error::PartialOverlap)
+        ));
+        assert!(matches!(
+            Coverage::from_runs(64, [(0, 10), (5, 10)]),
+            Err(Error::PartialOverlap)
+        ));
+        assert!(matches!(
+            Coverage::from_runs(64, [(0, 10), (10, 10)]),
+            Err(Error::PartialOverlap)
+        ));
+        // One run past the limit is refused before it is inserted.
+        let cap = u64::try_from(MAX_FRAGMENTS).unwrap();
+        let too_many = (0..=cap).map(|run| (run * 2, 1));
+        assert!(matches!(
+            Coverage::from_runs(cap * 2 + 2, too_many),
+            Err(Error::FragmentsExhausted)
+        ));
     }
 
     fn reserve_new(coverage: &mut Coverage, offset: u64, bytes: u64) -> Reservation {

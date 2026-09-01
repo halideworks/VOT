@@ -52,6 +52,9 @@ pub enum TraceEvent {
     DirectoryFlushed,
     ReceiptEmitted,
     Poisoned,
+    /// The journal replays to a state other than freshly admitted, so the
+    /// object belongs to [`recover`], not to a resume.
+    NotAdmitted,
     MissingObservation,
     RecoveryRequired,
 }
@@ -73,6 +76,9 @@ pub enum Error {
     StrictUnsupported,
     UnsupportedProfile,
     Poisoned,
+    /// The journal replays to a state other than freshly admitted, so the
+    /// object belongs to [`recover`], not to a resume.
+    NotAdmitted,
     MissingObservation,
     DestinationIdentityMismatch,
     StagingIdentityMismatch,
@@ -246,6 +252,68 @@ impl<F: FaultInjector> PosixCommit<F> {
         }
         commit.trace.push(TraceEvent::Admitted);
         Ok(commit)
+    }
+
+    /// Reopens an admitted staging file and its journal for a receiver
+    /// that restarted (ADR-0047). Refuses with [`Error::NotAdmitted`]
+    /// unless the journal replays, under the supplied incarnation, to
+    /// exactly the admission record: anything past admission belongs to
+    /// [`recover`]'s dispositions. The machine restarts under the supplied
+    /// profile, which the journal never records; resuming under a
+    /// different profile than admission silently changes the publish
+    /// guarantee, and the caller owns that hazard.
+    pub fn reattach(
+        profile: Profile,
+        incarnation: [u8; 16],
+        staging_path: PathBuf,
+        destination: PathBuf,
+        journal_path: &Path,
+        faults: F,
+    ) -> Result<Self, Error> {
+        vot_platform_fs::validate_removal_parent(&staging_path)?;
+        vot_platform_fs::validate_removal_parent(journal_path)?;
+        // The journal is read before staging is opened: a published or
+        // sealed transfer answers NotAdmitted even after publication
+        // consumed the staging name.
+        let (journal, replay) = Journal::open_current(journal_path, incarnation)?;
+        let admitted = replay
+            .records
+            .last()
+            .is_some_and(|record| record.state == JOURNAL_ADMITTED)
+            && replay
+                .records
+                .iter()
+                .all(|record| record.state == JOURNAL_ADMITTED);
+        if !admitted {
+            return Err(Error::NotAdmitted);
+        }
+        let staging = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&staging_path)?;
+        let mut commit = Self {
+            profile,
+            incarnation,
+            machine: Machine::new(profile),
+            staging: Staging::Open(staging),
+            staging_path,
+            destination,
+            journal,
+            faults,
+            trace: Vec::new(),
+        };
+        // The journal already holds the admission record; only the
+        // in-memory machine replays it.
+        commit.machine.apply(Event::Admit)?;
+        commit.trace.push(TraceEvent::Admitted);
+        Ok(commit)
+    }
+
+    /// The identity this commit's journal is claimed under, for a caller
+    /// that persists it to [`Self::reattach`] later (ADR-0047).
+    #[must_use]
+    pub const fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
     }
 
     pub fn write_transit_verified(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -874,6 +942,76 @@ mod tests {
             OneFault(fault),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reattach_refuses_a_journal_with_no_admission_record() {
+        // A torn tail can truncate the admission record away; zero records
+        // must refuse, and vacuous truth over an empty trail must not pass
+        // for admission.
+        let directory = directory("reattach-empty");
+        drop(Journal::create(&directory.join("journal"), [4; 16]).unwrap());
+        fs::write(directory.join("stage"), b"").unwrap();
+        let refused = PosixCommit::reattach(
+            Profile::Fast,
+            [4; 16],
+            directory.join("stage"),
+            directory.join("object"),
+            &directory.join("journal"),
+            NoFaults,
+        );
+        assert!(matches!(refused, Err(Error::NotAdmitted)));
+    }
+
+    #[test]
+    fn reattach_refuses_every_journal_state_past_admission() {
+        // Sealed: admission plus the transit-verified record.
+        let sealed_dir = directory("reattach-sealed");
+        let mut commit = provider(&sealed_dir, Profile::Fast, None);
+        commit.write_transit_verified(b"bytes").unwrap();
+        drop(commit);
+        let sealed = PosixCommit::reattach(
+            Profile::Fast,
+            [4; 16],
+            sealed_dir.join("stage"),
+            sealed_dir.join("object"),
+            &sealed_dir.join("journal"),
+            NoFaults,
+        );
+        assert!(matches!(sealed, Err(Error::NotAdmitted)));
+
+        // Linked and published: the full publication record trail.
+        let published_dir = directory("reattach-published");
+        let mut commit = provider(&published_dir, Profile::Fast, None);
+        commit.write_transit_verified(b"bytes").unwrap();
+        commit.publish().unwrap();
+        drop(commit);
+        let published = PosixCommit::reattach(
+            Profile::Fast,
+            [4; 16],
+            published_dir.join("stage"),
+            published_dir.join("object"),
+            &published_dir.join("journal"),
+            NoFaults,
+        );
+        assert!(matches!(published, Err(Error::NotAdmitted)));
+
+        // Freshly admitted: reattach succeeds and the machine accepts work.
+        let admitted_dir = directory("reattach-admitted");
+        let commit = provider(&admitted_dir, Profile::Fast, None);
+        drop(commit);
+        let mut resumed = PosixCommit::reattach(
+            Profile::Fast,
+            [4; 16],
+            admitted_dir.join("stage"),
+            admitted_dir.join("object"),
+            &admitted_dir.join("journal"),
+            NoFaults,
+        )
+        .unwrap();
+        assert_eq!(resumed.state(), State::Admitted);
+        assert_eq!(resumed.incarnation(), [4; 16]);
+        resumed.write_verified_at(0, b"resumed bytes").unwrap();
     }
 
     #[test]

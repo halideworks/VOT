@@ -761,7 +761,34 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
     use vot_proof_store::{MemoryNodeStorage, ProofNode};
+
+    #[test]
+    fn segment_leaves_are_the_builder_leaves_for_both_suites() {
+        let leaf = usize::try_from(PROOF_LEAF_SIZE).unwrap();
+        let data: Vec<u8> = (0..(leaf * 5 + 321))
+            .map(|i| u8::try_from(i % 229).unwrap())
+            .collect();
+        let length = data.len() as u64;
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let mut builder = ObjectBuilder::new(suite, Some(length)).unwrap();
+            builder.update(&data).unwrap();
+            let prepared = builder.finish().unwrap();
+            let expected = prepared.proof_leaves().unwrap();
+            let cut = leaf * 2;
+            let mut leaves = proof_leaves_at(suite, 0, &data[..cut], length).unwrap();
+            assert_eq!(leaves.len(), 2, "one leaf per group in the segment");
+            leaves.extend(proof_leaves_at(suite, cut as u64, &data[cut..], length).unwrap());
+            assert_eq!(leaves, expected);
+            let rebuilt = PreparedObject::from_proof_leaves(suite, length, leaves).unwrap();
+            assert_eq!(rebuilt.object_id(), prepared.object_id());
+            assert_eq!(
+                proof_leaves_at(suite, 0, &data[..cut - 1], length),
+                Err(Error::InvalidRange)
+            );
+        }
+    }
 
     fn assert_auto_traits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
 

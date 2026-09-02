@@ -1,7 +1,15 @@
-# ADR-0048: serve, the host admits
+# ADR-0048: Serve, the host admits
 
-Status: accepted, 2026-09-02. Companion to ADR-0045 (push, the holder
-dials), which gave the receive direction its embedding seam.
+- Status: Accepted
+- Date: 2026-09-02
+- Decision owners: A00 architecture; A08 CLI and wire
+- Applies to: `crates/vot-cli` (`bind_serve_listener`, `serve_on`,
+  `ServePresentation`, `ServeAdmission`, `ServeReport`, the shared
+  `accept_sessions` loop, `ServeSession::from_started_session`,
+  `goaway_cursor`, `served_bytes`, `BundleServer::object_count`). No change
+  to any spec file, wire identifier, or conformance vector. Companion to
+  ADR-0045 (push, the holder dials), which gave the receive direction its
+  embedding seam.
 
 ## Context
 

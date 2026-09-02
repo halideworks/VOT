@@ -70,7 +70,7 @@ pub use nowire::{
     fetch_bundle, fetch_via_rendezvous, push_bundle, receive_push, relay_service,
     rendezvous_service, serve_bundle,
 };
-pub use serve::{BundleServer, ServeConnection, ServeStatus};
+pub use serve::{BundleServer, ServeConnection, ServeStatus, ServedSource};
 #[cfg(feature = "wire")]
 pub use wire::{
     Listener, PushAdmission, PushPresentation, ServeAdmission, ServePresentation, ServeReport,

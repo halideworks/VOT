@@ -933,6 +933,47 @@ mod tests {
     const BUSY_PASSES: u64 = TEST_STALL_MS / BUSY_BOUND_MS;
 
     #[test]
+    fn a_serve_session_reports_what_its_host_reads() {
+        let (bundle, _built) = crate::harness::built_bundle(
+            "report-accessors",
+            &[("one.bin", vec![1; 300_000]), ("two.bin", vec![2; 400_000])],
+        );
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        assert_eq!(
+            server.object_count(),
+            2,
+            "two entries, two transfer objects"
+        );
+        let mut serving = ServeSession::begin(
+            &server,
+            crate::harness::Loopback::default(),
+            crate::harness::not_required(),
+        )
+        .unwrap();
+        assert_eq!(serving.goaway_cursor(), None, "no GOAWAY has been read");
+        assert_eq!(serving.served_bytes(), 0, "nothing has been taken");
+        serving.connection.goaway_cursor = Some(2);
+        assert_eq!(serving.goaway_cursor(), Some(2));
+        // Two answers queued and taken: the count is their bytes, not their
+        // number.
+        let frame = crate::serve::encoded(&vot_codec::frames::TypedFrame::GoAway(
+            vot_codec::frames::GoAway { cursor: 1 },
+        ))
+        .unwrap();
+        let each = frame.len() as u64;
+        serving.connection.queue_control(frame.clone());
+        serving.connection.queue_control(frame);
+        serving.connection.outbound.pop_sent();
+        serving.connection.outbound.pop_sent();
+        assert_eq!(serving.served_bytes(), 2 * each);
+        assert!(
+            each > 1,
+            "a frame of one byte would not tell bytes from count"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     fn the_stall_budget_override_is_bounded_below() {
         assert_eq!(stalled_wait_from(None), STALLED_WAIT);
         assert_eq!(stalled_wait_from(Some("nonsense")), STALLED_WAIT);

@@ -38,9 +38,8 @@ pub(crate) fn prepared_from_cache(
 /// in `file` that this bundle names as `root`.
 ///
 /// `Ok(None)` when they do not: a leaf count that cannot describe the
-/// object, a tree naming another root, a file of another length, a sampled
-/// group the layer does not hold, or a sample cut short by the end of the
-/// file. The object is still the authority: its length and its first and
+/// object, a tree naming another root, a file of another length, or a
+/// sampled group the layer does not hold. The object is still the authority: its length and its first and
 /// last groups are checked here, which is what an object replaced or
 /// truncated since the leaves were kept fails, and every later read is
 /// checked against the layer as well. Callers seek before reading; only a
@@ -72,15 +71,9 @@ pub(crate) fn prepared_from_leaves(
         let take = usize::try_from(group.min(length - offset)).map_err(|_| Error::InvalidBundle)?;
         let mut bytes = vec![0u8; take];
         file.seek(SeekFrom::Start(offset))?;
-        match file.read_exact(&mut bytes) {
-            Ok(()) => {}
-            // Shorter than its length claimed a moment ago: not this object.
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                described = false;
-                break;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        // The length matched a moment ago, so a short read here is the file
+        // changing under this end, which is its failure to report.
+        file.read_exact(&mut bytes)?;
         if !layer.holds(offset, &bytes) {
             described = false;
             break;

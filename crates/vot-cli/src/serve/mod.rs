@@ -185,36 +185,39 @@ mod tests {
 
     #[test]
     fn an_assembled_server_reads_a_one_group_object_whatever_its_leaves() {
-        // One small file packs into one stored object under a group, which
-        // has no tree to rebuild: it is read, and leaves handed in for it
-        // are not a claim that can fail.
-        let (bundle, built) =
-            crate::harness::built_bundle("assemble-small", &[("tiny.bin", vec![3; 1_000])]);
-        let opened = BundleServer::open(&bundle).unwrap();
-        assert_eq!(opened.object_count(), 1);
-        let (root, object) = opened.objects.iter().next().unwrap();
-        assert!(
-            object.object.length <= super::GROUP_SIZE as u64,
-            "one group or less"
-        );
-        let elsewhere = crate::tests::temporary("assemble-small-elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let path = elsewhere.join("host.bin");
-        std::fs::copy(bundle.join("objects").join(crate::object_name(root)), &path).unwrap();
-        let sources = std::collections::BTreeMap::from([(
-            *root,
-            crate::ServedSource {
-                path,
-                leaves: Some(vec![[0; 32]]),
-            },
-        )]);
-        let server = BundleServer::assemble(&bundle, sources).unwrap();
-        assert_eq!(server.package(), built);
-        assert!(
-            server.objects.values().next().unwrap().verified.is_none(),
-            "the object was prepared from leaves that describe nothing"
-        );
-        crate::harness::discard(&[&bundle, &elsewhere]);
+        // One small file packs into one stored object of a group or less,
+        // which has no tree to rebuild: it is read, and leaves handed in
+        // for it are not a claim that can fail. Both a small file and one
+        // of exactly a group: the bound is the group size, inclusive.
+        for (name, bytes) in [("tiny", 1_000), ("group", super::GROUP_SIZE)] {
+            let (bundle, built) = crate::harness::built_bundle(
+                &format!("assemble-small-{name}"),
+                &[("small.bin", vec![3; bytes])],
+            );
+            let opened = BundleServer::open(&bundle).unwrap();
+            assert_eq!(opened.object_count(), 1);
+            let (root, object) = opened.objects.iter().next().unwrap();
+            assert_eq!(object.object.length, bytes as u64, "{name}: stored as is");
+            let elsewhere = crate::tests::temporary(&format!("assemble-small-{name}-elsewhere"));
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let path = elsewhere.join("host.bin");
+            std::fs::copy(bundle.join("objects").join(crate::object_name(root)), &path).unwrap();
+            let sources = std::collections::BTreeMap::from([(
+                *root,
+                crate::ServedSource {
+                    path,
+                    leaves: Some(vec![[0; 32]]),
+                },
+            )]);
+            let server = BundleServer::assemble(&bundle, sources)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(server.package(), built);
+            assert!(
+                server.objects.values().next().unwrap().verified.is_none(),
+                "{name}: the object was prepared from leaves that describe nothing"
+            );
+            crate::harness::discard(&[&bundle, &elsewhere]);
+        }
     }
 
     #[test]

@@ -10,14 +10,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// largest cover across the bundle's record cap.
 pub(crate) const RECORD_PLAINTEXT_BYTES: usize = 258_048;
 
-/// One stored object: its wire identity, proving layer, and file.
 /// The proving layer rebuilt from leaves kept beside the object, when they
 /// describe the object this bundle names.
 ///
 /// `None` for no cache, a cache for another suite or length, one whose leaf
-/// count cannot describe the object, or one whose tree names a different
-/// root. Every one of those means reading the object instead, which is what
-/// this end did before the cache existed.
+/// count cannot describe the object, one whose tree names a different root,
+/// or a file the sample could not read. Every one of those means reading
+/// the object instead, which is what this end did before the cache existed.
+///
+/// `build` inlines this so the sample and the read share one handle; the
+/// tests keep it to say the cache is consulted.
+#[cfg(test)]
 pub(crate) fn prepared_from_cache(
     objects: &Path,
     root: [u8; 32],
@@ -25,34 +28,62 @@ pub(crate) fn prepared_from_cache(
     length: u64,
 ) -> Option<PreparedObject> {
     let leaves = crate::package::proof_cache::read(objects, &root, suite, length)?;
-    let layer = PreparedObject::from_proof_leaves(suite, length, leaves).ok()?;
+    let mut file = File::open(objects.join(crate::object_name(&root))).ok()?;
+    prepared_from_leaves(&mut file, root, suite, length, leaves)
+        .ok()
+        .flatten()
+}
+
+/// The proving layer rebuilt from `leaves`, when they describe the object
+/// in `file` that this bundle names as `root`.
+///
+/// `Ok(None)` when they do not: a leaf count that cannot describe the
+/// object, a tree naming another root, a file of another length, or a
+/// sampled group the layer does not hold. The object is still the authority: its length and its first and
+/// last groups are checked here, which is what an object replaced or
+/// truncated since the leaves were kept fails, and every later read is
+/// checked against the layer as well. Callers seek before reading; only a
+/// completed sample leaves the handle at the start of the file.
+///
+/// # Errors
+/// Surfaces the file's own failures to stat, seek, or read, which are not
+/// a verdict on the leaves.
+pub(crate) fn prepared_from_leaves(
+    file: &mut File,
+    root: [u8; 32],
+    suite: Suite,
+    length: u64,
+    leaves: Vec<[u8; 32]>,
+) -> Result<Option<PreparedObject>, Error> {
+    let Ok(layer) = PreparedObject::from_proof_leaves(suite, length, leaves) else {
+        return Ok(None);
+    };
     if layer.object_id().root != root {
-        return None;
+        return Ok(None);
     }
-    // The object is still the authority. Its length and its first and last
-    // groups are checked here, which is what an object replaced or truncated
-    // since the leaves were kept fails, and every later read is checked
-    // against the layer as well. Any doubt answers `None`, and reading the
-    // object in full is what says why.
-    let path = objects.join(crate::object_name(&root));
-    let mut file = File::open(&path).ok()?;
-    if file.metadata().ok()?.len() != length {
-        return None;
+    if file.metadata()?.len() != length {
+        return Ok(None);
     }
     let group = GROUP_SIZE as u64;
     let last = length.saturating_sub(1) / group * group;
+    let mut described = true;
     for offset in [0, last] {
-        let take = usize::try_from(group.min(length - offset)).ok()?;
+        let take = usize::try_from(group.min(length - offset)).map_err(|_| Error::InvalidBundle)?;
         let mut bytes = vec![0u8; take];
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        file.read_exact(&mut bytes).ok()?;
+        file.seek(SeekFrom::Start(offset))?;
+        // The length matched a moment ago, so a short read here is the file
+        // changing under this end, which is its failure to report.
+        file.read_exact(&mut bytes)?;
         if !layer.holds(offset, &bytes) {
-            return None;
+            described = false;
+            break;
         }
     }
-    Some(layer)
+    file.seek(SeekFrom::Start(0))?;
+    Ok(described.then_some(layer))
 }
 
+/// One stored object: its wire identity, proving layer, and file.
 pub(crate) struct ServedObject {
     pub(crate) object: frames::ObjectId,
     pub(crate) layer: PreparedObject,
@@ -154,8 +185,8 @@ impl Witness {
 }
 
 impl ServedObject {
-    /// Streams the object once, verifying its root while keeping only the
-    /// chaining values a proof needs.
+    /// The object stored under its root in `objects`, prepared from the
+    /// leaves a previous pass kept beside it or by reading it once.
     pub(crate) fn build(
         objects: &Path,
         root: [u8; 32],
@@ -167,23 +198,59 @@ impl ServedObject {
         // Take the witness before reading: a mid-read write would otherwise
         // stamp into the witness.
         let witness = Witness::of(&file)?;
-        // The leaves a previous pass kept, if they describe this object. The
-        // cache is not an authority: what it rebuilds names an object, and
-        // that name has to be the root this bundle already claims, or it is
-        // ignored and the object is read.
-        if let Some(layer) = prepared_from_cache(objects, root, suite, length) {
-            return Ok(Self {
-                object: frames::ObjectId {
-                    suite: crate::suite_id(suite),
-                    root,
-                    length,
-                },
-                layer,
-                path,
-                witness,
-                verified: Some(GroupSet::for_length(length)),
-            });
+        // The cache is not an authority: what it rebuilds names an object,
+        // and that name has to be the root this bundle already claims, or
+        // it is ignored and the object is read. A sample that will not read
+        // is ignored the same way, and the read says why.
+        if let Some(leaves) = crate::package::proof_cache::read(objects, &root, suite, length)
+            && let Ok(Some(layer)) = prepared_from_leaves(&mut file, root, suite, length, leaves)
+        {
+            return Ok(Self::prepared(path, root, suite, length, layer, witness));
         }
+        Self::read(path, file, witness, root, suite, length)
+    }
+
+    /// The object at `path`, served as `root`, from `leaves` the host kept
+    /// for it or by reading it once.
+    ///
+    /// Leaves the host supplies are its claim about the object, and a claim
+    /// that does not describe the file at `path` is refused rather than
+    /// quietly replaced by a read: the host would otherwise never learn its
+    /// leaves are stale. An object of one group or less has no tree to
+    /// rebuild, so it is read whatever leaves accompany it.
+    ///
+    /// # Errors
+    /// Surfaces a file that will not open, stat, seek, or read, and
+    /// [`Error::RootMismatch`] for bytes, or leaves, that do not name `root`.
+    pub(crate) fn build_at(
+        path: PathBuf,
+        root: [u8; 32],
+        suite: Suite,
+        length: u64,
+        leaves: Option<Vec<[u8; 32]>>,
+    ) -> Result<Self, Error> {
+        let mut file = File::open(&path)?;
+        let witness = Witness::of(&file)?;
+        if let Some(leaves) = leaves.filter(|_| length > GROUP_SIZE as u64) {
+            return match prepared_from_leaves(&mut file, root, suite, length, leaves)? {
+                Some(layer) => Ok(Self::prepared(path, root, suite, length, layer, witness)),
+                None => Err(Error::RootMismatch),
+            };
+        }
+        Self::read(path, file, witness, root, suite, length)
+    }
+
+    /// Streams the object once from the start, verifying its root while
+    /// keeping only the chaining values a proof needs.
+    fn read(
+        path: PathBuf,
+        mut file: File,
+        witness: Witness,
+        root: [u8; 32],
+        suite: Suite,
+        length: u64,
+    ) -> Result<Self, Error> {
+        file.seek(SeekFrom::Start(0))?;
         let mut builder = ObjectBuilder::new(suite, Some(length))?;
         let mut group = vec![0u8; GROUP_SIZE];
         let mut remaining = length;
@@ -213,6 +280,30 @@ impl ServedObject {
             witness,
             verified: None,
         })
+    }
+
+    /// An object whose layer came from leaves rather than a read: only its
+    /// first and last groups were sampled, so every group is hashed the
+    /// first time it is served, those two again.
+    fn prepared(
+        path: PathBuf,
+        root: [u8; 32],
+        suite: Suite,
+        length: u64,
+        layer: PreparedObject,
+        witness: Witness,
+    ) -> Self {
+        Self {
+            object: frames::ObjectId {
+                suite: crate::suite_id(suite),
+                root,
+                length,
+            },
+            layer,
+            path,
+            witness,
+            verified: Some(GroupSet::for_length(length)),
+        }
     }
 
     /// Reads the cover's bytes and checks they match what the layer was built

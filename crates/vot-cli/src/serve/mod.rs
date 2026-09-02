@@ -31,7 +31,7 @@ use connection::{OUTBOUND_BUDGET_BYTES, REMEMBERED_REQUESTS};
 pub(crate) use connection::OpenedEpoch;
 pub use connection::ServeConnection;
 pub(crate) use object::*;
-pub use server::BundleServer;
+pub use server::{BundleServer, ServedSource};
 
 /// The reliable lane every data record rides.
 pub(crate) const RECORD_LANE: StreamId = StreamId(1);
@@ -102,6 +102,203 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Payload, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A two-object bundle moved out of bundle shape: each object copied to
+    /// a path of the host's choosing, with the leaves `send` kept for the
+    /// first and nothing for the second.
+    fn scattered(
+        name: &str,
+    ) -> (
+        crate::tests::Temporary,
+        crate::PackageSummary,
+        std::collections::BTreeMap<[u8; 32], crate::ServedSource>,
+        crate::tests::Temporary,
+    ) {
+        let (bundle, built) = crate::harness::built_bundle(
+            name,
+            &[
+                ("one.bin", crate::harness::patterned(300_000)),
+                ("two.bin", crate::harness::patterned(400_000)),
+            ],
+        );
+        let elsewhere = crate::tests::temporary(&format!("{name}-elsewhere"));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let objects = bundle.join("objects");
+        let opened = BundleServer::open(&bundle).unwrap();
+        let suite = crate::parse_suite("sha256").unwrap();
+        let mut sources = std::collections::BTreeMap::new();
+        for (index, (root, object)) in opened.objects.iter().enumerate() {
+            let path = elsewhere.join(format!("host-{index}.bin"));
+            std::fs::copy(objects.join(crate::object_name(root)), &path).unwrap();
+            let leaves = (index == 0).then(|| {
+                crate::package::proof_cache::read(&objects, root, suite, object.object.length)
+                    .expect("send kept the leaves")
+            });
+            sources.insert(*root, crate::ServedSource { path, leaves });
+        }
+        (bundle, built, sources, elsewhere)
+    }
+
+    #[test]
+    fn an_assembled_server_serves_from_where_the_host_keeps_its_objects() {
+        let (bundle, built, sources, elsewhere) = scattered("assemble");
+        // The bundle's own objects go away: only the manifest remains there.
+        std::fs::remove_dir_all(bundle.join("objects")).unwrap();
+        let server = BundleServer::assemble(&bundle, sources).unwrap();
+        assert_eq!(server.package(), built);
+        assert_eq!(server.object_count(), 2);
+        // Leaves prepared the first object without a read; the second was
+        // read, so it needs no first-serve hashing.
+        let prepared: Vec<bool> = server
+            .objects
+            .values()
+            .map(|object| object.verified.is_some())
+            .collect();
+        assert_eq!(prepared.iter().filter(|kept| **kept).count(), 1);
+
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_thread = std::thread::spawn(move || {
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]),
+                )
+            })
+        });
+        let output = crate::tests::temporary("assemble-fetched");
+        let mut fetcher =
+            crate::BundleFetcher::begin(client, &output, Some(built.root)).expect("a fetch");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            crate::FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        drop(fetcher);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+        crate::harness::discard(&[&bundle, &elsewhere, &output]);
+    }
+
+    #[test]
+    fn an_assembled_server_reads_a_one_group_object_whatever_its_leaves() {
+        // One small file packs into one stored object of a group or less,
+        // which has no tree to rebuild: it is read, and leaves handed in
+        // for it are not a claim that can fail. Both a small file and one
+        // of exactly a group: the bound is the group size, inclusive.
+        for (name, bytes) in [("tiny", 1_000), ("group", super::GROUP_SIZE)] {
+            let (bundle, built) = crate::harness::built_bundle(
+                &format!("assemble-small-{name}"),
+                &[("small.bin", vec![3; bytes])],
+            );
+            let opened = BundleServer::open(&bundle).unwrap();
+            assert_eq!(opened.object_count(), 1);
+            let (root, object) = opened.objects.iter().next().unwrap();
+            assert_eq!(object.object.length, bytes as u64, "{name}: stored as is");
+            let elsewhere = crate::tests::temporary(&format!("assemble-small-{name}-elsewhere"));
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let path = elsewhere.join("host.bin");
+            std::fs::copy(bundle.join("objects").join(crate::object_name(root)), &path).unwrap();
+            let sources = std::collections::BTreeMap::from([(
+                *root,
+                crate::ServedSource {
+                    path,
+                    leaves: Some(vec![[0; 32]]),
+                },
+            )]);
+            let server = BundleServer::assemble(&bundle, sources)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(server.package(), built);
+            assert!(
+                server.objects.values().next().unwrap().verified.is_none(),
+                "{name}: the object was prepared from leaves that describe nothing"
+            );
+            crate::harness::discard(&[&bundle, &elsewhere]);
+        }
+    }
+
+    #[test]
+    fn an_assembled_server_refuses_leaves_that_name_another_object() {
+        let (bundle, _built, mut sources, elsewhere) = scattered("assemble-wrong-leaves");
+        // The first object's leaves handed in for the second object's file.
+        let roots: Vec<[u8; 32]> = sources.keys().copied().collect();
+        let leaves = sources.get(&roots[0]).unwrap().leaves.clone().unwrap();
+        let mut swapped = sources.clone();
+        swapped.get_mut(&roots[0]).unwrap().leaves = None;
+        swapped.get_mut(&roots[1]).unwrap().leaves = Some(leaves.clone());
+        assert!(matches!(
+            BundleServer::assemble(&bundle, swapped),
+            Err(Error::RootMismatch)
+        ));
+        // The right file with one middle leaf altered: the first and last
+        // groups still hold, so only the rebuilt root tells.
+        let mut altered = leaves;
+        assert!(altered.len() > 2, "a middle leaf needs at least three");
+        let middle = altered.len() / 2;
+        altered[middle][0] ^= 0xff;
+        sources.get_mut(&roots[0]).unwrap().leaves = Some(altered);
+        assert!(matches!(
+            BundleServer::assemble(&bundle, sources),
+            Err(Error::RootMismatch)
+        ));
+        crate::harness::discard(&[&bundle, &elsewhere]);
+    }
+
+    #[test]
+    fn an_assembled_server_refuses_a_truncated_object_behind_valid_leaves() {
+        let (bundle, _built, sources, elsewhere) = scattered("assemble-truncated");
+        let roots: Vec<[u8; 32]> = sources.keys().copied().collect();
+        let path = sources.get(&roots[0]).unwrap().path.clone();
+        let original = std::fs::read(&path).unwrap();
+        // Bytes appended: every sampled group still holds, so only the
+        // length tells.
+        let mut longer = original.clone();
+        longer.extend_from_slice(b"appended");
+        std::fs::write(&path, &longer).unwrap();
+        assert!(matches!(
+            BundleServer::assemble(&bundle, sources.clone()),
+            Err(Error::RootMismatch)
+        ));
+        // Truncated: the length check answers first, and the last group
+        // could not be read either.
+        std::fs::write(&path, &original[..299_000]).unwrap();
+        assert!(matches!(
+            BundleServer::assemble(&bundle, sources),
+            Err(Error::RootMismatch)
+        ));
+        crate::harness::discard(&[&bundle, &elsewhere]);
+    }
+
+    #[test]
+    fn an_assembled_server_refuses_a_missing_or_unnamed_source() {
+        let (bundle, _built, sources, elsewhere) = scattered("assemble-sources");
+        let roots: Vec<[u8; 32]> = sources.keys().copied().collect();
+        let mut missing = sources.clone();
+        missing.remove(&roots[1]);
+        assert!(matches!(
+            BundleServer::assemble(&bundle, missing),
+            Err(Error::InvalidBundle)
+        ));
+        let mut extra = sources;
+        let stray = elsewhere.join("stray.bin");
+        std::fs::write(&stray, b"not in the manifest").unwrap();
+        extra.insert(
+            [9; 32],
+            crate::ServedSource {
+                path: stray,
+                leaves: None,
+            },
+        );
+        assert!(matches!(
+            BundleServer::assemble(&bundle, extra),
+            Err(Error::InvalidBundle)
+        ));
+        crate::harness::discard(&[&bundle, &elsewhere]);
+    }
+
     #[test]
     fn a_serve_prepares_from_the_leaves_beside_the_object_and_falls_back_without_them() {
         // Preparation reads every byte of every object, about 1.4 seconds a

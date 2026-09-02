@@ -34,10 +34,65 @@ pub(crate) fn range_blocked_by_cursor(index: Option<u64>, cursor: u64) -> bool {
     index.is_none_or(|index| index >= cursor)
 }
 
+/// One stored object a host serves from wherever it keeps it: the file, and
+/// the proof leaves the host holds for it, if any. With leaves the server
+/// rebuilds its proving layer from them and checks only the object's length
+/// and its first and last groups at open; without them it reads the object
+/// once.
+#[derive(Clone, Debug)]
+pub struct ServedSource {
+    pub path: PathBuf,
+    pub leaves: Option<Vec<[u8; 32]>>,
+}
+
 impl BundleServer {
     /// Opens a bundle for serving: the chain walk `receive_bundle` trusts,
     /// then a proving layer per stored object, built once.
     pub fn open(bundle: &Path) -> Result<Self, Error> {
+        let objects_directory = bundle.join("objects");
+        Self::from_manifest(bundle, |root, suite, length| {
+            ServedObject::build(&objects_directory, root, suite, length)
+        })
+    }
+
+    /// Serves the package whose manifest sits under `manifest_root`
+    /// (`manifest/` with its pages and seal, as in a bundle) from objects the
+    /// host locates itself, one [`ServedSource`] per stored object root.
+    ///
+    /// Stored, not logical: entries the manifest packs share one stored root
+    /// and the host supplies that pack as one source. A host that builds its
+    /// own manifest from direct entries has no packs. Sources are resolved
+    /// in ascending root order, and an object of one group or less is read
+    /// whatever leaves accompany it.
+    ///
+    /// # Errors
+    /// Refuses a manifest naming an object `sources` lacks, a source the
+    /// manifest does not name, and a source whose bytes or leaves do not name
+    /// its root, with [`Error::InvalidBundle`] for the first two and
+    /// [`Error::RootMismatch`] for the last; a source read in full that ends
+    /// short is [`Error::SourceMutation`], as when opening a bundle.
+    pub fn assemble(
+        manifest_root: &Path,
+        mut sources: BTreeMap<[u8; 32], ServedSource>,
+    ) -> Result<Self, Error> {
+        let server = Self::from_manifest(manifest_root, |root, suite, length| {
+            let source = sources.remove(&root).ok_or(Error::InvalidBundle)?;
+            ServedObject::build_at(source.path, root, suite, length, source.leaves)
+        })?;
+        // A source the manifest never named is a host naming the wrong
+        // package, not spare material to ignore.
+        if !sources.is_empty() {
+            return Err(Error::InvalidBundle);
+        }
+        Ok(server)
+    }
+
+    /// The chain walk and the object map, with `resolve` building each stored
+    /// object once, in ascending root order.
+    fn from_manifest(
+        bundle: &Path,
+        mut resolve: impl FnMut([u8; 32], Suite, u64) -> Result<ServedObject, Error>,
+    ) -> Result<Self, Error> {
         let package = crate::scan_manifest(bundle)?;
         let manifest_directory = bundle.join(MANIFEST_DIRECTORY);
         // Bounded by the SEAL frame limit: a larger seal could never be announced.
@@ -69,13 +124,9 @@ impl BundleServer {
                 }
             }
         }
-        let objects_directory = bundle.join("objects");
         let mut objects = BTreeMap::new();
         for (root, (suite, length)) in wanted {
-            objects.insert(
-                root,
-                ServedObject::build(&objects_directory, root, suite, length)?,
-            );
+            objects.insert(root, resolve(root, suite, length)?);
         }
 
         let descriptor = TypedFrame::PackageDescriptor(PackageDescriptor {

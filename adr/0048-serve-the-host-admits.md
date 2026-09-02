@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-02
-- Decision owners: A00 architecture; A08 CLI and wire
+- Decision owners: A00 architecture; A10 transport
 - Applies to: `crates/vot-cli` (`bind_serve_listener`, `serve_on`,
   `ServePresentation`, `ServeAdmission`, `ServeReport`, the shared
   `accept_sessions` loop, `ServeSession::from_started_session`,

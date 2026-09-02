@@ -53,7 +53,7 @@ const fn valid_rail_count(rails: usize) -> bool {
     rails != 0 && rails <= crate::drive::CONCURRENT_SESSIONS
 }
 
-const fn should_record_failure(bounded: bool, clean: bool) -> bool {
+pub(super) const fn should_record_failure(bounded: bool, clean: bool) -> bool {
     bounded && clean
 }
 
@@ -443,6 +443,15 @@ pub fn bind_push_listener(
     address: SocketAddr,
     credentials: &Credentials,
 ) -> Result<(Listener, [u8; 32]), Error> {
+    bind_retry_listener(address, credentials)
+}
+
+/// A Retry-protected listener with no accept timeout, and the identity a
+/// peer pins, for a host that runs its own admission.
+pub(super) fn bind_retry_listener(
+    address: SocketAddr,
+    credentials: &Credentials,
+) -> Result<(Listener, [u8; 32]), Error> {
     let ephemeral = match credentials {
         Credentials::Ephemeral => Some(super::Ephemeral::generate()?),
         Credentials::Files { .. } => None,
@@ -499,13 +508,33 @@ pub(super) fn receive_push_on_bounded_with_timeout<P>(
 where
     P: Fn(PushPresentation<'_>) -> Option<PushAdmission> + Sync,
 {
+    let plans = ReceivePlans::default();
+    accept_sessions(listener, sessions, |carrier| {
+        receive_one(carrier, &policy, &plans, authentication_timeout).map(|_| ())
+    })
+}
+
+/// Accepts carriers from a Retry-protected listener and runs `session` on
+/// each in its own thread, at most [`crate::drive::CONCURRENT_SESSIONS`] at
+/// once, until `sessions` are answered or the listener fails. A session's
+/// own failure surfaces only under a bound; an unbounded loop outlives it.
+///
+/// # Errors
+/// Refuses a listener without Retry with [`Error::InvalidArguments`].
+pub(super) fn accept_sessions<S>(
+    listener: &Listener,
+    sessions: Option<u32>,
+    session: S,
+) -> Result<(), Error>
+where
+    S: Fn(Transport) -> Result<(), Error> + Sync,
+{
     if !listener.stateless_retry_enabled() {
         return Err(Error::InvalidArguments);
     }
     std::thread::scope(|scope| {
-        let plans = ReceivePlans::default();
         let mut running: std::collections::VecDeque<
-            std::thread::ScopedJoinHandle<'_, Result<PackageSummary, Error>>,
+            std::thread::ScopedJoinHandle<'_, Result<(), Error>>,
         > = std::collections::VecDeque::new();
         let mut failed = Ok(());
         for _ in 0..sessions.unwrap_or(u32::MAX) {
@@ -526,20 +555,17 @@ where
                 let done = running.remove(finished).ok_or(Error::CarrierUnavailable)?;
                 let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
                 if should_record_failure(sessions.is_some(), failed.is_ok()) {
-                    failed = result.map(|_| ());
+                    failed = result;
                 }
             }
             let carrier = listener.accept().map_err(carrier_failure)?;
-            let policy = &policy;
-            let plans = std::sync::Arc::clone(&plans);
-            running.push_back(
-                scope.spawn(move || receive_one(carrier, policy, &plans, authentication_timeout)),
-            );
+            let session = &session;
+            running.push_back(scope.spawn(move || session(carrier)));
         }
         while let Some(done) = running.pop_front() {
             let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
             if should_record_failure(sessions.is_some(), failed.is_ok()) {
-                failed = result.map(|_| ());
+                failed = result;
             }
         }
         failed

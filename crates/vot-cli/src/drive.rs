@@ -439,6 +439,35 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
         })
     }
 
+    /// Serves through a session whose handshake has started and whose
+    /// authorization the caller already answered, so no requirement is
+    /// consulted here.
+    pub fn from_started_session(
+        server: &'server crate::BundleServer,
+        session: vot_session::Session<A>,
+    ) -> Self {
+        Self {
+            server,
+            session,
+            connection: crate::ServeConnection::new(),
+            requirement: None,
+            holder: None,
+        }
+    }
+
+    /// The highest transfer-object index the receiver still permits, from
+    /// its `GOAWAY`; `None` while it has sent none.
+    #[must_use]
+    pub fn goaway_cursor(&self) -> Option<u64> {
+        self.connection.goaway_cursor
+    }
+
+    /// Bytes of answers the carrier has taken this session.
+    #[must_use]
+    pub fn served_bytes(&self) -> u64 {
+        self.connection.outbound.taken()
+    }
+
     /// Begins pushing through a caller-constructed client session.
     pub fn begin_push_session(
         server: &'server crate::BundleServer,
@@ -902,6 +931,47 @@ mod tests {
     const TEST_STALL: Duration = Duration::from_millis(TEST_STALL_MS);
     const IDLE_PASSES: u64 = TEST_STALL_MS / IDLE_BOUND_MS;
     const BUSY_PASSES: u64 = TEST_STALL_MS / BUSY_BOUND_MS;
+
+    #[test]
+    fn a_serve_session_reports_what_its_host_reads() {
+        let (bundle, _built) = crate::harness::built_bundle(
+            "report-accessors",
+            &[("one.bin", vec![1; 300_000]), ("two.bin", vec![2; 400_000])],
+        );
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        assert_eq!(
+            server.object_count(),
+            2,
+            "two entries, two transfer objects"
+        );
+        let mut serving = ServeSession::begin(
+            &server,
+            crate::harness::Loopback::default(),
+            crate::harness::not_required(),
+        )
+        .unwrap();
+        assert_eq!(serving.goaway_cursor(), None, "no GOAWAY has been read");
+        assert_eq!(serving.served_bytes(), 0, "nothing has been taken");
+        serving.connection.goaway_cursor = Some(2);
+        assert_eq!(serving.goaway_cursor(), Some(2));
+        // Two answers queued and taken: the count is their bytes, not their
+        // number.
+        let frame = crate::serve::encoded(&vot_codec::frames::TypedFrame::GoAway(
+            vot_codec::frames::GoAway { cursor: 1 },
+        ))
+        .unwrap();
+        let each = frame.len() as u64;
+        serving.connection.queue_control(frame.clone());
+        serving.connection.queue_control(frame);
+        serving.connection.outbound.pop_sent();
+        serving.connection.outbound.pop_sent();
+        assert_eq!(serving.served_bytes(), 2 * each);
+        assert!(
+            each > 1,
+            "a frame of one byte would not tell bytes from count"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
 
     #[test]
     fn the_stall_budget_override_is_bounded_below() {

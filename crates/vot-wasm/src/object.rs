@@ -109,6 +109,31 @@ impl ObjectBuilder {
     }
 }
 
+/// Bytes per proof leaf: a segment hashed apart must start on a multiple of
+/// it, and only the object's last leaf may be short.
+#[wasm_bindgen(js_name = proofLeafSize)]
+#[must_use]
+pub fn proof_leaf_size() -> u64 {
+    sdk_object::PROOF_LEAF_SIZE
+}
+
+/// Proof leaves of one segment that starts at `offset` in an object of
+/// `object_length` bytes, 32 bytes each, concatenated. Segments hashed in
+/// parallel workers are joined in order and handed to
+/// [`PreparedObject::from_proof_leaves`]. A segment must start on a leaf and
+/// be whole leaves unless it ends the object; an object of one leaf or less
+/// is hashed with [`ObjectBuilder`] instead.
+#[wasm_bindgen(js_name = proofLeavesAt)]
+pub fn proof_leaves_at(
+    suite: Suite,
+    offset: u64,
+    bytes: &[u8],
+    object_length: u64,
+) -> Result<Vec<u8>, VotError> {
+    let leaves = sdk_object::proof_leaves_at(suite.sdk(), offset, bytes, object_length)?;
+    Ok(leaves.concat())
+}
+
 /// Object identity bound to retained proof material.
 #[wasm_bindgen]
 pub struct PreparedObject {
@@ -117,6 +142,37 @@ pub struct PreparedObject {
 
 #[wasm_bindgen]
 impl PreparedObject {
+    /// Prepares an object from concatenated proof leaves, as
+    /// [`proof_leaves_at`] returns them, joined in object order. Refused for
+    /// an object of one leaf or less, which has no tree to assemble.
+    #[wasm_bindgen(js_name = fromProofLeaves)]
+    pub fn from_proof_leaves(
+        suite: Suite,
+        length: u64,
+        leaves: &[u8],
+        max_object_length: u64,
+    ) -> Result<Self, VotError> {
+        if !leaves.len().is_multiple_of(32) {
+            return Err(VotError::new(ErrorCode::InvalidInput));
+        }
+        let leaves: Vec<[u8; 32]> = leaves
+            .chunks_exact(32)
+            .map(|leaf| {
+                let mut out = [0; 32];
+                out.copy_from_slice(leaf);
+                out
+            })
+            .collect();
+        Ok(Self {
+            inner: sdk_object::InMemoryPreparedObject::from_proof_leaves(
+                suite.sdk(),
+                length,
+                leaves,
+                max_object_length,
+            )?,
+        })
+    }
+
     #[wasm_bindgen(getter, js_name = objectId)]
     #[must_use]
     pub fn object_id(&self) -> ObjectId {

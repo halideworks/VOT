@@ -68,6 +68,57 @@ fn left_count(count: u64) -> u64 {
     1_u64.checked_shl(shift).unwrap_or(0)
 }
 
+/// Chaining values of the groups in `bytes`, which start at `input_offset`
+/// in an object of `object_length` bytes. Each value depends only on its
+/// group and its place, so a caller may hash an object in independent
+/// segments and hand the values to [`GroupCvs::from_group_cvs`]. Only the
+/// last group of the object may be short, so a segment that does not reach
+/// the object's end must be a whole number of groups: a short read in the
+/// middle would otherwise yield a root that names an object nobody has.
+///
+/// # Errors
+/// Rejects empty input, an offset that is not a multiple of [`GROUP_SIZE`],
+/// a segment past the object's end, and a ragged segment that does not end
+/// the object.
+pub fn group_cvs_at(
+    input_offset: u64,
+    bytes: &[u8],
+    object_length: u64,
+) -> Result<Vec<[u8; 32]>, Error> {
+    check_segment(input_offset, bytes, object_length)?;
+    let mut offset = input_offset;
+    let mut cvs = Vec::with_capacity(bytes.len().div_ceil(GROUP_SIZE as usize));
+    for group in bytes.chunks(GROUP_SIZE as usize) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(offset);
+        hasher.update(group);
+        cvs.push(hasher.finalize_non_root());
+        offset += group.len() as u64;
+    }
+    Ok(cvs)
+}
+
+/// The segment rule: aligned start, inside the object, and whole groups
+/// unless the segment ends the object.
+fn check_segment(offset: u64, bytes: &[u8], object_length: u64) -> Result<(), Error> {
+    if bytes.is_empty() {
+        return Err(Error::EmptyRange);
+    }
+    if !offset.is_multiple_of(GROUP_SIZE) {
+        return Err(Error::OutOfBounds);
+    }
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::LengthOverflow)?;
+    if end > object_length {
+        return Err(Error::OutOfBounds);
+    }
+    if end != object_length && !(bytes.len() as u64).is_multiple_of(GROUP_SIZE) {
+        return Err(Error::OutOfBounds);
+    }
+    Ok(())
+}
+
 #[must_use]
 /// # Panics
 /// Panics only if the shared verifier rejects a contiguous bounded slice,
@@ -1328,6 +1379,49 @@ mod tests {
         assert!(!cvs.holds(usize::MAX, groups[0]));
         assert!(!cvs.holds(0, &[]));
         assert!(!cvs.holds(0, &fixture(GROUP_SIZE as usize + 1)));
+    }
+
+    #[test]
+    fn segment_chaining_values_rebuild_the_sequential_tree() {
+        // Boundaries at odd group counts and a short tail, so no segment is
+        // a whole subtree on its own.
+        let data: Vec<u8> = (0..(GROUP_SIZE as usize * 11 + 1234))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut sequential = GroupCvs::new();
+        for group in data.chunks(GROUP_SIZE as usize) {
+            sequential.push(group).unwrap();
+        }
+        let cut1 = GROUP_SIZE as usize * 3;
+        let cut2 = GROUP_SIZE as usize * 8;
+        let length = data.len() as u64;
+        let mut leaves = group_cvs_at(0, &data[..cut1], length).unwrap();
+        leaves.extend(group_cvs_at(cut1 as u64, &data[cut1..cut2], length).unwrap());
+        leaves.extend(group_cvs_at(cut2 as u64, &data[cut2..], length).unwrap());
+        assert_eq!(leaves, sequential.group_cvs());
+        let rebuilt = GroupCvs::from_group_cvs(leaves, length).unwrap();
+        assert_eq!(rebuilt.tree_root(), Some(root(&data)));
+        // A segment hashed at the wrong place describes a different object.
+        let wrong = group_cvs_at(GROUP_SIZE, &data[..cut1], length + GROUP_SIZE).unwrap();
+        assert_ne!(wrong, sequential.group_cvs()[..3]);
+        assert_eq!(
+            group_cvs_at(1, &data[..cut1], length),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(group_cvs_at(0, &[], length), Err(Error::EmptyRange));
+        // A short read in the middle is refused: it would hash a group that
+        // is not the object's last as if it were.
+        assert_eq!(
+            group_cvs_at(0, &data[..cut1 - 5], length),
+            Err(Error::OutOfBounds)
+        );
+        // Past the end is refused too; a ragged tail that ends the object is
+        // what the last segment looks like.
+        assert_eq!(
+            group_cvs_at(cut2 as u64, &data[cut2..], length - 1),
+            Err(Error::OutOfBounds)
+        );
+        assert!(group_cvs_at(cut2 as u64, &data[cut2..], length).is_ok());
     }
 
     #[test]

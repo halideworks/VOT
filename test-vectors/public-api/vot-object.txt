@@ -1,5 +1,7 @@
 constant vot_object::MAX_OBJECT_LENGTH
+constant vot_object::PROOF_LEAF_SIZE
 enum vot_object::Error
+function vot_object::proof_leaves_at
 struct vot_object::ObjectBuilder
 struct vot_object::PreparedObject
 struct vot_object::RangeCover

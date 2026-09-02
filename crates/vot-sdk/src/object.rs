@@ -169,6 +169,16 @@ mod tests {
             InMemoryObjectBuilder::new(Suite::Blake3Bao64, Some(length), length).unwrap();
         builder.update(&data).unwrap();
         assert_eq!(assembled.object_id(), builder.finish().unwrap().object_id());
+        // The bound is inclusive at the model's maximum, as it is for the builder.
+        assert!(
+            InMemoryPreparedObject::from_proof_leaves(
+                Suite::Blake3Bao64,
+                length,
+                leaves.clone(),
+                MAX_OBJECT_LENGTH,
+            )
+            .is_ok()
+        );
         let over = InMemoryPreparedObject::from_proof_leaves(
             Suite::Blake3Bao64,
             length,

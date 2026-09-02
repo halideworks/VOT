@@ -522,6 +522,37 @@ impl ObjectBuilder {
     }
 }
 
+/// Bytes per proof leaf in every suite: a segment hashed apart with
+/// [`proof_leaves_at`] must start on a multiple of it.
+pub const PROOF_LEAF_SIZE: u64 = GROUP_SIZE as u64;
+const _: () = assert!(PROOF_LEAF_SIZE == vot_proof_sha256::PIECE_SIZE);
+const _: () = assert!(PROOF_LEAF_SIZE == vot_proof_blake3::GROUP_SIZE);
+
+/// The proof leaves of one segment of an object of `object_length` bytes,
+/// hashed where it sits, for a caller that prepares an object from segments
+/// hashed independently and then calls [`PreparedObject::from_proof_leaves`].
+/// An object of one leaf or less cannot be assembled that way; hash it with
+/// the builder.
+///
+/// # Errors
+/// Rejects an empty segment, an offset that is not a multiple of
+/// [`PROOF_LEAF_SIZE`], a segment past the object's end, and a segment that
+/// is not whole leaves unless it ends the object.
+pub fn proof_leaves_at(
+    suite: Suite,
+    offset: u64,
+    bytes: &[u8],
+    object_length: u64,
+) -> Result<Vec<[u8; 32]>, Error> {
+    match suite {
+        Suite::Sha256Bep52 => vot_proof_sha256::piece_hashes_at(offset, bytes, object_length)
+            .map_err(map_sha256_error),
+        Suite::Blake3Bao64 => {
+            vot_proof_blake3::group_cvs_at(offset, bytes, object_length).map_err(map_blake3_error)
+        }
+    }
+}
+
 /// An immutable object identity bound to the material needed for range proofs.
 pub struct PreparedObject {
     object: ObjectId,

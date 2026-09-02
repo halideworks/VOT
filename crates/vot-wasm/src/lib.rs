@@ -12,7 +12,7 @@ mod receipt;
 pub use error::{ErrorCode, VotError};
 pub use object::{
     CoverageAcceptance, CoverageUpdate, ObjectBuilder, ObjectCoverage, ObjectId, PreparedObject,
-    RangeProof, Suite, VerifiedRange, verify_range,
+    RangeProof, Suite, VerifiedRange, proof_leaf_size, proof_leaves_at, verify_range,
 };
 pub use package::{
     EncodedManifestPage, EncodedSeal, ManifestFinalizer, ManifestPage, PackageAssembly,

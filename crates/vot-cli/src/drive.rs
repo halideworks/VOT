@@ -439,6 +439,35 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
         })
     }
 
+    /// Serves through a session whose handshake has started and whose
+    /// authorization the caller already answered, so no requirement is
+    /// consulted here.
+    pub fn from_started_session(
+        server: &'server crate::BundleServer,
+        session: vot_session::Session<A>,
+    ) -> Self {
+        Self {
+            server,
+            session,
+            connection: crate::ServeConnection::new(),
+            requirement: None,
+            holder: None,
+        }
+    }
+
+    /// The highest transfer-object index the receiver still permits, from
+    /// its `GOAWAY`; `None` while it has sent none.
+    #[must_use]
+    pub fn goaway_cursor(&self) -> Option<u64> {
+        self.connection.goaway_cursor
+    }
+
+    /// Bytes of answers the carrier has taken this session.
+    #[must_use]
+    pub fn served_bytes(&self) -> u64 {
+        self.connection.outbound.taken()
+    }
+
     /// Begins pushing through a caller-constructed client session.
     pub fn begin_push_session(
         server: &'server crate::BundleServer,

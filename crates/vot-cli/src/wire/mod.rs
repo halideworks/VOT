@@ -27,7 +27,9 @@ pub use push::{
 };
 pub use registration::rendezvous_service;
 pub use relay::relay_service;
-pub use serve::serve_bundle;
+pub use serve::{
+    ServeAdmission, ServePresentation, ServeReport, bind_serve_listener, serve_bundle, serve_on,
+};
 
 pub(crate) use certificate::*;
 pub(crate) use config::*;
@@ -105,6 +107,222 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn serve_token(
+        issuer: &ed25519_dalek::SigningKey,
+        holder: ed25519_dalek::SigningKey,
+        root: [u8; 32],
+    ) -> std::sync::Arc<crate::authz::Holder> {
+        let token = crate::authz::issue(
+            "issuer.example",
+            "serve.example",
+            issuer,
+            holder.verifying_key().to_bytes(),
+            root,
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        std::sync::Arc::new(crate::authz::Holder::new(token, holder).expect("a holder"))
+    }
+
+    fn fetch_holding(
+        at: SocketAddr,
+        into: &Path,
+        pin: [u8; 32],
+        holder: std::sync::Arc<crate::authz::Holder>,
+    ) -> Result<(crate::FetchStatus, Option<PackageSummary>), Error> {
+        let client = client_config().expect("a client config");
+        let carrier = Transport::connect(
+            local_for(at).expect("a local address"),
+            at,
+            Some("localhost"),
+            &client,
+        )
+        .expect("a carrier");
+        let mut fetcher = BundleFetcher::begin_with(
+            carrier,
+            into,
+            Some(pin),
+            Some(holder),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("a fetch holding the token");
+        let status = crate::drive::drive(&mut fetcher)?;
+        Ok((status, fetcher.package()))
+    }
+
+    #[test]
+    fn serve_on_admits_by_root_and_reports_each_session() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle_a, built_a) = crate::harness::built_bundle(
+            "serve-on-a",
+            &[("data.bin", crate::harness::patterned(200_000))],
+        );
+        let (bundle_b, built_b) =
+            crate::harness::built_bundle("serve-on-b", &[("other.bin", vec![7; 1_000])]);
+        let server_a = std::sync::Arc::new(BundleServer::open(&bundle_a).unwrap());
+        let server_b = std::sync::Arc::new(BundleServer::open(&bundle_b).unwrap());
+        let issuer = SigningKey::from_bytes(&[61; 32]);
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        let (reports, reported) = mpsc::channel::<ServeReport>();
+        let verifying = issuer.verifying_key();
+        let servers = [server_a, server_b];
+        let serving = std::thread::spawn(move || {
+            serve::serve_on_bounded(&listener, Some(3), |presentation| {
+                // The policy tries every package it holds; the token's own
+                // root is the one whose requirement decides.
+                let decided = servers.iter().find_map(|server| {
+                    crate::authz::Requirement::new(
+                        "issuer.example",
+                        crate::authz::key_id_of(&verifying),
+                        verifying,
+                        "serve.example",
+                        server.package().root,
+                    )
+                    .decide(
+                        presentation.challenge,
+                        presentation.open,
+                        presentation.channel_binding,
+                        presentation.now,
+                    )
+                    .map(|scope| (server, scope))
+                })?;
+                let (server, scope) = decided;
+                let root = vot_capability::decode_scope(&scope).expect("a scope").root;
+                // A policy that answers B's token from A: the seam refuses it.
+                let server = if root == servers[1].package().root {
+                    std::sync::Arc::clone(&servers[0])
+                } else {
+                    std::sync::Arc::clone(server)
+                };
+                let reports = reports.clone();
+                Some(ServeAdmission {
+                    server,
+                    scope,
+                    observer: Some(Box::new(move |report| {
+                        let _ = reports.send(report);
+                    })),
+                })
+            })
+        });
+
+        // A token for A is served from A to completion.
+        let fetched = crate::tests::temporary("serve-on-fetched");
+        let (status, package) = fetch_holding(
+            at,
+            &fetched,
+            built_a.root,
+            serve_token(&issuer, SigningKey::from_bytes(&[62; 32]), built_a.root),
+        )
+        .expect("a driven fetch");
+        assert_eq!(
+            status,
+            crate::FetchStatus::Complete,
+            "A's holder was refused"
+        );
+        assert_eq!(package.expect("a package"), built_a);
+        let report = reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the observer heard the session end");
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.cursor, None, "a completed fetch sends no GOAWAY");
+        assert!(
+            report.served_bytes >= 200_000,
+            "served {} bytes of a 200000 byte object",
+            report.served_bytes
+        );
+        assert!(report.status.is_ok(), "{:?}", report.status);
+        assert_eq!(report.peer.ip(), at.ip());
+
+        // A token for an unknown root, and a token for B answered from A,
+        // are both refused: the holder spends its presentation attempts on
+        // the one constant refusal and the session ends with no bundle.
+        for (name, root) in [("unknown", [9; 32]), ("mismatched", built_b.root)] {
+            let refused = crate::tests::temporary(&format!("serve-on-{name}"));
+            let outcome = fetch_holding(
+                at,
+                &refused,
+                root,
+                serve_token(&issuer, SigningKey::from_bytes(&[63; 32]), root),
+            );
+            assert!(
+                matches!(outcome, Err(Error::Session(_))),
+                "{name}: served, or refused for another reason: {outcome:?}"
+            );
+            let written = std::fs::read_dir(refused.join("objects")).map_or(0, Iterator::count);
+            assert_eq!(written, 0, "{name}: an object was written anyway");
+            crate::harness::discard(&[&refused]);
+        }
+        assert!(
+            reported.try_recv().is_err(),
+            "a refused session reached the observer"
+        );
+        // Bounded, so the refused sessions surface as the serve's failure.
+        assert!(serving.join().expect("the serving thread").is_err());
+        crate::harness::discard(&[&bundle_a, &bundle_b, &fetched]);
+    }
+
+    #[test]
+    fn serve_on_refuses_a_listener_without_retry() {
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.stateless_retry = false;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        assert!(matches!(
+            serve_on(&listener, |_| panic!("a session was accepted")),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn serve_on_closes_a_silent_peer_at_the_deadline() {
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        // Announced over a channel, so a serve that never closes the peer
+        // fails this test at the bounded wait instead of hanging it.
+        let (ended, ending) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ended.send(serve::serve_on_bounded_with_timeout(
+                &listener,
+                Some(1),
+                Duration::from_millis(300),
+                |_| panic!("a silent peer presented something"),
+            ));
+        });
+        // A carrier that completes the handshake and never opens a session.
+        let client = client_config().expect("a client config");
+        let carrier = Transport::connect(
+            local_for(at).expect("a local address"),
+            at,
+            Some("localhost"),
+            &client,
+        )
+        .expect("a carrier");
+        let outcome = ending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the serve did not close the silent peer at the deadline");
+        drop(carrier);
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHENTICATION_FAILED
+                ))
+            ),
+            "{outcome:?}"
+        );
+    }
 
     #[test]
     fn a_serve_draws_a_fresh_nonce_for_every_session() {

@@ -110,6 +110,13 @@ impl BundleServer {
         self.package
     }
 
+    /// Transfer objects this bundle serves: the count a receiver's `GOAWAY`
+    /// cursor is measured against.
+    #[must_use]
+    pub fn object_count(&self) -> u64 {
+        self.object_indices.len() as u64
+    }
+
     /// Chooses whether negotiated FEC follows measured path loss. Passing
     /// `false` forces coding whenever the peer negotiates the extension.
     pub const fn set_automatic_fec(&mut self, automatic: bool) {

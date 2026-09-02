@@ -15,6 +15,7 @@ function vot_cli::authz::package_operations
 function vot_cli::authz::package_scope
 function vot_cli::authz::push_scope
 function vot_cli::bind_push_listener
+function vot_cli::bind_serve_listener
 function vot_cli::build_bundle
 function vot_cli::build_bundle_with_suite
 function vot_cli::decode_key
@@ -37,6 +38,7 @@ function vot_cli::receive_push_on
 function vot_cli::relay_service
 function vot_cli::rendezvous_service
 function vot_cli::serve_bundle
+function vot_cli::serve_on
 function vot_cli::verify_receipt_file
 module vot_cli::authz
 struct vot_cli::BundleFetcher
@@ -49,7 +51,10 @@ struct vot_cli::ReceiveObject
 struct vot_cli::ReceiveReport
 struct vot_cli::ReceiveSeams
 struct vot_cli::ReceiveSessionId
+struct vot_cli::ServeAdmission
 struct vot_cli::ServeConnection
+struct vot_cli::ServePresentation
+struct vot_cli::ServeReport
 struct vot_cli::ServeSession
 struct vot_cli::VerifiedReceipt
 struct vot_cli::authz::Holder

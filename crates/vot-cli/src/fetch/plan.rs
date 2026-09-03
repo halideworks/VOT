@@ -194,7 +194,6 @@ pub(crate) const OUTSTANDING_REQUEST_BYTES: u64 = OUTSTANDING_COVERS as u64 * MA
 pub(crate) struct PlannedObject {
     pub(crate) object: frames::ObjectId,
     pub(crate) entries: Vec<EntryRecord>,
-    pub(crate) sink_chosen: bool,
     /// Byte extents a previous fetch made durable; the handout skips them.
     pub(crate) resumed: BTreeMap<u64, u64>,
     /// Whether this object is durable: fetched whole, found whole, empty,
@@ -207,7 +206,6 @@ impl PlannedObject {
         Self {
             object,
             entries: Vec::new(),
-            sink_chosen: false,
             resumed: BTreeMap::new(),
             done: false,
         }

@@ -722,6 +722,13 @@ where
     };
     fetcher.set_receive_seams(admission.seams);
     if primary {
+        // The receive side never learns how many sessions the sender will
+        // open, and every one of them joins this plan; the sender's own
+        // ceiling is `valid_rail_count`, so the window is the one those
+        // rails would earn.
+        fetcher.set_object_window(crate::fetch::object_window(
+            crate::drive::CONCURRENT_SESSIONS,
+        ));
         let planned =
             crate::drive::drive_until(&mut fetcher, |fetcher| fetcher.shared_plan().is_some());
         let plan = match planned {

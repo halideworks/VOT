@@ -300,6 +300,10 @@ where
     if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
         return Err(Error::InvalidArguments);
     }
+    // Set before the plan is built, which is what `drive_until` below
+    // drives to: the plan reads the window once, when the manifest names
+    // the objects.
+    primary.set_object_window(crate::fetch::object_window(rails));
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
         conclude_fetch(&mut primary, status);
         return Ok(Fetched {

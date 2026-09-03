@@ -8,39 +8,82 @@ use super::{
     ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
     PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary,
     Path, PathBuf, PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
-    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReliableReceiver, ResumeStore, Session,
-    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter,
-    TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure,
-    package_sentinel, remove_store_files, reservations_of, resume_failure, resumed_extents,
-    subject_of, total_units_of,
+    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReceiveSink, ReliableReceiver, ResumeStore,
+    Session, SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT,
+    TransportAdapter, TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs,
+    is_backpressure, package_sentinel, remove_store_files, reservations_of, resume_failure,
+    resumed_extents, subject_of, total_units_of,
 };
 
 pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
     length == 0 || fully_resumed && stored
 }
 
+/// Ends an open the plan no longer wants, discarding the sink it chose.
+///
+/// Cancellation drains the window under the plan lock, and an object being
+/// opened is not in the window yet: the rail that dropped the lock for a
+/// sink factory or a completion hook owns the only reference to what it
+/// chose, so nothing else would ever discard it. Called with the plan lock
+/// released, because a sink's gate is taken before that lock.
+fn discard_open(chosen: Option<Box<dyn ReceiveSink>>) -> Result<(), Error> {
+    match chosen {
+        Some(sink) => sink.discard_partial(),
+        None => Ok(()),
+    }
+}
+
 /// Passes [`BundleFetcher::advance`] may take over `objects` objects.
 ///
-/// Every pass returns, completes one object, or opens one, so two passes
-/// an object cover the plan and one more finds nothing left to do. A pass
+/// Every pass returns, completes one object, or opens one, and the plan
+/// opens each object once and completes it once, so two passes an object
+/// do all the work there is and one more finds nothing left to do. A pass
 /// past this is a plan that is not moving, which is a fault rather than a
 /// slow fetch.
 pub(super) const fn advance_passes(objects: usize) -> usize {
-    2 * objects + 2
+    2 * objects + 1
+}
+
+/// The most objects a fetch keeps in flight.
+///
+/// The receiver's staging budget is sized for this many admissions on top
+/// of the credit, and a receiver is built before a caller chooses a
+/// window, so no plan may hold more than this.
+pub(crate) const MAX_OBJECT_WINDOW: usize = 16;
+
+/// The window `rails` rails earn: two objects a rail, so a rail always has
+/// another object to take spans from while one of them is being synced.
+///
+/// Only a driving loop chooses a window, and those come with the carrier.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn object_window(rails: usize) -> usize {
+    rails.saturating_mul(2).clamp(1, MAX_OBJECT_WINDOW)
 }
 
 /// Credit advertised to the server: the covers this end asked for.
 pub(crate) const FETCH_CREDIT_BYTES: u64 =
     OUTSTANDING_COVERS as u64 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
 
-/// What the receiver may stage: credit plus the group reservation, so a
-/// cover at the limit can still be verified.
-pub(crate) const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE as u64;
+/// What a receiver may stage to carry a window of `window` objects: the
+/// credit, plus the group reservation each admitted object holds for as
+/// long as it is in flight. Without the window's worth of headroom a rail
+/// whose credit is fully staged cannot take the record that arrives on
+/// top, which closes the session under `RESOURCE_LIMIT` mid-transfer.
+pub(crate) const fn fetch_staging_bytes(window: usize) -> u64 {
+    FETCH_CREDIT_BYTES + window as u64 * vot_verifier::GROUP_SIZE as u64
+}
 
-// The limit clears the credit by a group; at or under it would refuse a
-// conforming answer.
+/// What the receiver may stage. Sized for the widest window rather than
+/// the one this fetch takes: the receiver is built before the manifest
+/// names an object, and a staging limit cannot be changed after.
+pub(crate) const FETCH_STAGING_BYTES: u64 = fetch_staging_bytes(MAX_OBJECT_WINDOW);
+
+// The limit clears the credit by one group an in-flight object; at or
+// under it would refuse a conforming answer. The one-object value is what
+// the budget was when the plan held one object.
 const _: () = assert!(FETCH_CREDIT_BYTES == 34_078_720);
-const _: () = assert!(FETCH_STAGING_BYTES == 34_144_256);
+const _: () = assert!(fetch_staging_bytes(1) == 34_144_256);
+const _: () = assert!(FETCH_STAGING_BYTES == 35_127_296);
 
 fn require_push_objects(push: bool, objects: usize) -> Result<(), Fault> {
     if push && objects == 0 {
@@ -93,6 +136,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     pub(crate) seams: ReceiveSeams,
     pub(crate) receive_session: ReceiveSessionId,
     pub(crate) cancelled: Option<usize>,
+    /// Objects the plan this fetch builds keeps in flight. Read when the
+    /// manifest is validated, so a caller sets it before then; a rail
+    /// joins a plan that already carries its own.
+    pub(crate) window: usize,
 }
 
 static RECEIVE_SESSION_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -288,6 +335,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(())
     }
 
+    /// Sets how many objects the plan this fetch builds keeps in flight.
+    ///
+    /// Read when the manifest is validated, so it has to be set before the
+    /// fetch is driven that far. Narrowed to [`MAX_OBJECT_WINDOW`], which
+    /// the receiver's staging budget is sized for: a wider window would
+    /// refuse a conforming answer mid-transfer rather than here.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn set_object_window(&mut self, objects: usize) {
+        self.window = objects.clamp(1, MAX_OBJECT_WINDOW);
+    }
+
     /// Opens the session and the bundle directory the fetch will fill.
     ///
     /// The optional pin is the package root this fetch will accept. A
@@ -441,6 +499,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            // One object, which is what the plan held before it held a
+            // window; a caller widens it from its rails.
+            window: 1,
         };
         // Through the one place the deferred wiring lives, so the default
         // width and a caller's cannot come apart.
@@ -502,6 +563,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            // One object, which is what the plan held before it held a
+            // window; a caller widens it from its rails.
+            window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
         Ok(fetcher)
@@ -540,6 +604,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            // One object, which is what the plan held before it held a
+            // window; a caller widens it from its rails.
+            window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
         Ok(fetcher)
@@ -821,6 +888,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // deciding which cursor and objects cancellation owns.
                 return Ok(FetchStatus::Active);
             }
+            // The cursor is taken after the step that moves it: a rail
+            // that completed an object marks it done and only advances the
+            // cursor on its next pass, and a cancel between the two would
+            // report one object fewer than this fetch has durable.
+            plan.advance_cursor();
             let cursor = plan.low;
             let window: Vec<ActiveObject> =
                 std::mem::take(&mut plan.active).into_values().collect();
@@ -1332,9 +1404,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             active: BTreeMap::new(),
             low: 0,
             next_open: 0,
-            // One object in flight, which is what the plan held before it
-            // held a window; the width comes from the rails in ADR-0051.
-            window: 1,
+            window: self.window,
             placed_before: 0,
             carried_before: 0,
             abandoned: false,
@@ -1485,19 +1555,25 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.finished = true;
                 return Ok(());
             }
+            if plan.abandoned {
+                // Cancellation drains the window under this lock and
+                // discards what it drained; an object opened after it
+                // would be a sink nothing owns.
+                return Ok(());
+            }
             if plan.in_flight() >= plan.window || plan.next_open == plan.objects.len() {
                 return Ok(());
             }
             // Taken under the lock before anything is dropped, so exactly
             // one rail opens each index however long its sink factory or
             // its completion hook runs outside the lock. This is what the
-            // cursor comparison after a hook used to stand for.
+            // cursor comparison after a hook used to stand for, and it is
+            // the whole of the one-rail-per-index invariant.
             let at = plan.next_open;
             plan.next_open += 1;
             let planned = plan.objects.get(at).ok_or(Error::InvalidBundle)?;
             let object = planned.object;
             let mut whole_from_before = planned.fully_resumed();
-            let sink_chosen = planned.sink_chosen;
             let mut planned_resumed = planned.resumed.clone();
             let receive_object = ReceiveObject {
                 object,
@@ -1508,11 +1584,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 .join("objects")
                 .join(crate::object_name(&object.root));
             let custom = if let Some(factory) = &self.seams.sink {
-                if sink_chosen {
-                    // One rail per index, so this is re-entry after that
-                    // rail failed partway through choosing the sink.
-                    continue;
-                }
                 let stale = match vot_platform_fs::guard_staging_file(&path) {
                     Ok(file) => Some(file),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1521,7 +1592,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                         return Err(error.into());
                     }
                 };
-                plan.objects[at].sink_chosen = true;
                 drop(plan);
                 let chosen = factory(self.receive_session, &receive_object);
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
@@ -1529,6 +1599,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 let chosen = chosen?;
+                if plan.abandoned {
+                    drop(plan);
+                    return discard_open(chosen);
+                }
                 if !planned_resumed.is_empty() {
                     let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
                     if let Some(store) = &plan.store {
@@ -1567,6 +1641,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 synced?;
+                if plan.abandoned {
+                    drop(plan);
+                    return discard_open(custom);
+                }
             }
             if object.length == 0 {
                 // Nothing to fetch or verify; the empty object simply is.
@@ -1586,6 +1664,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 completed?;
+                if plan.abandoned {
+                    // The hook has succeeded, so this object is durable
+                    // above the cursor and stays, as every object durable
+                    // above it does. Discarding belongs before a hook has
+                    // run, not after.
+                    return Ok(());
+                }
                 plan.objects[at].done = true;
                 continue;
             }
@@ -1603,6 +1688,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 completed?;
+                if plan.abandoned {
+                    // Durable before this fetch began and its hook has
+                    // succeeded; cancellation has nothing to take back.
+                    return Ok(());
+                }
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.carried_before = plan.carried_before.saturating_add(object.length);
                 plan.objects[at].done = true;

@@ -108,6 +108,39 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// Runs `work` on a thread and waits `seconds` for its answer. A step that
+    /// never finishes fails the test naming itself, instead of hanging the run
+    /// the way a stalled fetch, or a bounded serve left waiting for a session
+    /// that never comes, otherwise would.
+    fn within<T: Send + 'static>(
+        step: &str,
+        seconds: u64,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, answer) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        match answer.recv_timeout(Duration::from_secs(seconds)) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{step} did not finish within {seconds} seconds")
+            }
+            // The sender went with a panicking thread: report its panic.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().expect_err("a panicking thread"))
+            }
+        }
+    }
+
+    /// [`within`] for a thread already running: joins it under a bound.
+    fn joined<T: Send + 'static>(step: &str, handle: std::thread::JoinHandle<T>) -> T {
+        match within(step, 30, move || handle.join()) {
+            Ok(value) => value,
+            Err(panicked) => std::panic::resume_unwind(panicked),
+        }
+    }
+
     fn serve_token(
         issuer: &ed25519_dalek::SigningKey,
         holder: ed25519_dalek::SigningKey,
@@ -132,24 +165,27 @@ mod tests {
         pin: [u8; 32],
         holder: std::sync::Arc<crate::authz::Holder>,
     ) -> Result<(crate::FetchStatus, Option<PackageSummary>), Error> {
-        let client = client_config().expect("a client config");
-        let carrier = Transport::connect(
-            local_for(at).expect("a local address"),
-            at,
-            Some("localhost"),
-            &client,
-        )
-        .expect("a carrier");
-        let mut fetcher = BundleFetcher::begin_with(
-            carrier,
-            into,
-            Some(pin),
-            Some(holder),
-            std::collections::BTreeSet::new(),
-        )
-        .expect("a fetch holding the token");
-        let status = crate::drive::drive(&mut fetcher)?;
-        Ok((status, fetcher.package()))
+        let into = into.to_path_buf();
+        within("the fetch holding a token", 60, move || {
+            let client = client_config().expect("a client config");
+            let carrier = Transport::connect(
+                local_for(at).expect("a local address"),
+                at,
+                Some("localhost"),
+                &client,
+            )
+            .expect("a carrier");
+            let mut fetcher = BundleFetcher::begin_with(
+                carrier,
+                &into,
+                Some(pin),
+                Some(holder),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("a fetch holding the token");
+            let status = crate::drive::drive(&mut fetcher)?;
+            Ok((status, fetcher.package()))
+        })
     }
 
     #[test]
@@ -267,7 +303,7 @@ mod tests {
             "a refused session reached the observer"
         );
         // Bounded, so the refused sessions surface as the serve's failure.
-        assert!(serving.join().expect("the serving thread").is_err());
+        assert!(joined("the serving thread", serving).is_err());
         crate::harness::discard(&[&bundle_a, &bundle_b, &fetched]);
     }
 
@@ -321,7 +357,7 @@ mod tests {
         let destination = crate::tests::temporary("fetch-ack-destination");
         let holder = serve_token(&issuer, SigningKey::from_bytes(&[72; 32]), built.root);
         let config = client_config().expect("a client config");
-        let connect = || {
+        let connect = move || {
             let carrier = Transport::connect(
                 local_for(at).expect("a local address"),
                 at,
@@ -342,7 +378,10 @@ mod tests {
         .expect("a fetch holding the token");
         // Rails past one need proof workers to verify off the primary's thread.
         fetcher.set_proving_threads(2).expect("proving threads");
-        let outcome = crate::drive::fetch_striped(fetcher, 2, connect).expect("a railed fetch");
+        let outcome = within("the railed fetch", 60, move || {
+            crate::drive::fetch_striped(fetcher, 2, connect)
+        })
+        .expect("a railed fetch");
         assert_eq!(outcome.package, built);
 
         // Collect what the sessions reported. Both rails were admitted, so two
@@ -380,7 +419,7 @@ mod tests {
             "only one session carried a cursor: {collected:?}"
         );
 
-        let _ = serving.join();
+        let _ = joined("the serving thread", serving);
         crate::harness::discard(&[&bundle, &destination]);
     }
 
@@ -1443,9 +1482,14 @@ mod tests {
 
         let at = address.recv().expect("the server reported its address");
         let fetched = crate::tests::temporary("railwire-fetched");
-        let package = fetch_railed(at, &fetched, Some(built.root), 2).expect("a striped fetch");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the striped fetch", 60, move || {
+            fetch_railed(at, &into, Some(root), 2)
+        })
+        .expect("a striped fetch");
         assert_eq!(package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
         // The leaves a send keeps beside an object are skipped: a cache a
         // serve rebuilds by reading the object, which a fetch does not write.
@@ -1851,9 +1895,14 @@ mod tests {
             "the serve announced a root that is not the bundle's"
         );
         let fetched = crate::tests::temporary("wire-fetched");
-        let package = fetch_railed(at, &fetched, Some(built.root), 1).expect("a fetched bundle");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch", 60, move || {
+            fetch_railed(at, &into, Some(root), 1)
+        })
+        .expect("a fetched bundle");
         assert_eq!(package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
 
         let destination = crate::tests::temporary("wire-destination");
@@ -1919,7 +1968,7 @@ mod tests {
             "any other pin refuses the carrier"
         );
         drop(carrier);
-        let _ = serving.join().expect("the serving thread");
+        let _ = joined("the serving thread", serving);
     }
 
     #[test]
@@ -1979,7 +2028,7 @@ mod tests {
         );
         drop(first);
         drop(second);
-        let _ = serving.join().expect("the serving thread");
+        let _ = joined("the serving thread", serving);
     }
 
     #[test]
@@ -2081,21 +2130,18 @@ mod tests {
         let (at, _) = address.recv().expect("the server reported its address");
         let fetched = crate::tests::temporary("fec-wire-fetched");
         let config = client_config().unwrap();
-        let connect = || {
+        let connect = move || {
             Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config)
                 .map_err(carrier_failure)
         };
-        let outcome = fetch_over_offering(
-            connect().unwrap(),
-            connect,
-            &fetched,
-            Some(built.root),
-            1,
-            fec,
-        )
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let outcome = within("the fetch over the datagram path", 60, move || {
+            fetch_over_offering(connect().unwrap(), connect, &into, Some(root), 1, fec)
+        })
         .expect("a fetched bundle");
         assert_eq!(outcome.package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
         // 1500000 bytes of object are 23 generations, every one of them
         // offered over the datagram path; the manifest and the small tail
@@ -2205,12 +2251,16 @@ mod tests {
 
         // Fetch via rendezvous: resolve root -> connect -> transfer.
         let fetched = crate::tests::temporary("rendezvous-wire-fetched");
-        let package = fetch_via_rendezvous_railed(built.root, &fetched, &[service], &[], RAILS)
-            .expect("a fetch via rendezvous");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch via rendezvous", 60, move || {
+            fetch_via_rendezvous_railed(root, &into, &[service], &[], RAILS)
+        })
+        .expect("a fetch via rendezvous");
         assert_eq!(package, built);
 
         drop(registration);
-        let served = serving.join().expect("the serving thread");
+        let served = joined("the serving thread", serving);
         assert_eq!(served, built);
         stop.store(true, Ordering::Relaxed);
         let mut resolvers = service_thread.join().expect("the service thread");
@@ -2322,18 +2372,22 @@ mod tests {
             .expect("the rung ran")
             .expect("a relayed carrier");
         let fetched = crate::tests::temporary("relay-rung-fetched");
-        let package = fetch_over(
-            carrier,
-            || Err(Error::RelayUnavailable),
-            &fetched,
-            Some(built.root),
-            1,
-        )
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch through the slot", 60, move || {
+            fetch_over(
+                carrier,
+                || Err(Error::RelayUnavailable),
+                &into,
+                Some(root),
+                1,
+            )
+        })
         .expect("a fetch through the slot");
         assert_eq!(package, built);
 
         drop(registration);
-        let served = serving.join().expect("the serving thread");
+        let served = joined("the serving thread", serving);
         assert_eq!(served, built);
         stop.store(true, Ordering::Relaxed);
         service_thread.join().expect("the service thread");
@@ -2424,18 +2478,19 @@ mod tests {
         .expect("a carrier");
         let mut naked = BundleFetcher::begin(carrier, &refused_into, Some(built.root))
             .expect("a fetch with no token");
-        let refusal = crate::drive::drive(&mut naked).expect("a driven fetch");
-        assert_eq!(
-            refusal,
-            crate::FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
-            "a fetch with no capability was served, or refused for another reason"
-        );
-        assert!(naked.package().is_none(), "a bundle was written anyway");
-        drop(naked);
+        within("the fetch with no token", 60, move || {
+            let refusal = crate::drive::drive(&mut naked).expect("a driven fetch");
+            assert_eq!(
+                refusal,
+                crate::FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
+                "a fetch with no capability was served, or refused for another reason"
+            );
+            assert!(naked.package().is_none(), "a bundle was written anyway");
+        });
         // The peer left mid-negotiation, which a bounded serve surfaces. An
         // unbounded one outlives it, which is what a real serve is.
         assert!(
-            refusing.join().expect("the refusing thread").is_err(),
+            joined("the refusing thread", refusing).is_err(),
             "a session whose peer never presented was reported as served"
         );
 
@@ -2467,18 +2522,17 @@ mod tests {
             std::collections::BTreeSet::new(),
         )
         .expect("a fetch holding the token");
-        let status = crate::drive::drive(&mut holding).expect("a driven fetch");
-        assert_eq!(
-            status,
-            crate::FetchStatus::Complete,
-            "the holder was refused"
-        );
-        assert_eq!(holding.package().expect("a package"), built);
-        drop(holding);
-        granting
-            .join()
-            .expect("the granting thread")
-            .expect("served");
+        let package = within("the fetch holding the token", 60, move || {
+            let status = crate::drive::drive(&mut holding).expect("a driven fetch");
+            assert_eq!(
+                status,
+                crate::FetchStatus::Complete,
+                "the holder was refused"
+            );
+            holding.package().expect("a package")
+        });
+        assert_eq!(package, built);
+        joined("the granting thread", granting).expect("served");
 
         crate::harness::discard(&[&source, &bundle, &refused_into, &fetched]);
     }
@@ -2529,6 +2583,17 @@ mod tests {
         )
         .unwrap();
 
+        // Every push below rides a bounded wait: a receiver that never
+        // finishes fails the test instead of hanging it.
+        let pushing = |bundle: &Path, token: &Path, at, identity, rails| {
+            let bundle = bundle.to_path_buf();
+            let token = token.to_path_buf();
+            let holder = holder_path.to_str().expect("a path").to_owned();
+            within("the push", 60, move || {
+                push::push_bundle_railed(&bundle, at, &token, &holder, identity, rails)
+            })
+        };
+
         let credentials = Ephemeral::generate().unwrap();
         let identity = identity_digest(&credentials.certificate).unwrap();
         let mut config = Config::server(
@@ -2550,17 +2615,10 @@ mod tests {
             let mut wrong = identity;
             wrong[0] ^= 1;
             assert!(matches!(
-                push::push_bundle_railed(
-                    &bundle,
-                    at,
-                    &token_path,
-                    holder_path.to_str().unwrap(),
-                    wrong,
-                    1,
-                ),
+                pushing(&bundle, &token_path, at, wrong, 1),
                 Err(Error::ServeIdentityMismatch)
             ));
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
         }
         {
             let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
@@ -2591,15 +2649,7 @@ mod tests {
                         })
                 })
             });
-            let refused = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            )
-            .unwrap_err();
+            let refused = pushing(&bundle, &token_path, at, identity, 1).unwrap_err();
             assert!(
                 matches!(
                     &refused,
@@ -2607,7 +2657,7 @@ mod tests {
                 ),
                 "wrong refusal: {refused:?}"
             );
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(
                 !refused_path.exists(),
                 "a refused push accepted a descriptor"
@@ -2655,15 +2705,7 @@ mod tests {
                         })
                 })
             });
-            let refused = push::push_bundle_railed(
-                &bundle,
-                at,
-                &null_token,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            )
-            .unwrap_err();
+            let refused = pushing(&bundle, &null_token, at, identity, 1).unwrap_err();
             assert!(
                 matches!(
                     &refused,
@@ -2671,7 +2713,7 @@ mod tests {
                 ),
                 "wrong refusal: {refused:?}"
             );
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(
                 !output.exists(),
                 "a null-length scope accepted a descriptor"
@@ -2705,16 +2747,9 @@ mod tests {
                         })
                 })
             });
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             assert!(pushed.is_err(), "a failed receiver acknowledged the push");
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             crate::harness::discard(&[&output]);
         }
         {
@@ -2745,16 +2780,9 @@ mod tests {
                     },
                 )
             });
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             assert!(pushed.is_err(), "a late admission was granted");
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(!output.exists(), "a late admission accepted a descriptor");
         }
         for rails in [1, 4] {
@@ -2781,15 +2809,8 @@ mod tests {
                 })
             });
 
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                rails as usize,
-            );
-            let received = receiving.join().unwrap();
+            let pushed = pushing(&bundle, &token_path, at, identity, rails as usize);
+            let received = joined("the receiving thread", receiving);
             assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
             assert_eq!(pushed.unwrap(), built);
             crate::fetch::tests::assert_same_tree(&bundle, &output);
@@ -2851,15 +2872,8 @@ mod tests {
                         })
                 })
             });
-            let pushed = push::push_bundle_railed(
-                &empty_bundle,
-                at,
-                &empty_token,
-                holder_path.to_str().unwrap(),
-                identity,
-                4,
-            );
-            let received = receiving.join().unwrap();
+            let pushed = pushing(&empty_bundle, &empty_token, at, identity, 4);
+            let received = joined("the receiving thread", receiving);
             assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
             assert_eq!(pushed.unwrap(), empty);
             crate::fetch::tests::assert_same_tree(&empty_bundle, &output);
@@ -3005,14 +3019,7 @@ mod tests {
             for _ in 1..crate::drive::CONCURRENT_SESSIONS {
                 started.recv_timeout(Duration::from_secs(10)).unwrap();
             }
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             for attacker in attackers {
                 assert!(attacker.join().unwrap() > 1, "the attacker sent no drip");
             }
@@ -3021,7 +3028,7 @@ mod tests {
                 "finished later slots behind an active first starved {pushed:?}"
             );
             drop(holding);
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             crate::harness::discard(&[&output, &holding_output, &holding_token_path]);
         }
         crate::harness::discard(&[&source, &bundle, &token_path, &holder_path]);

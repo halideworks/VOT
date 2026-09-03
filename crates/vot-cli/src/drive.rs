@@ -285,8 +285,8 @@ fn conclude_fetch<A: TransportAdapter>(
 /// on fresh connections. A rail failure abandons the plan.
 ///
 /// # Errors
-/// Rejects zero width or width past one with inline proving. Surfaces the
-/// primary's failure, or the rail failure that explains a stalled primary.
+/// Rejects zero rails. Surfaces the primary's failure, or the rail failure
+/// that explains a stalled primary.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn fetch_striped<A, F>(
     mut primary: crate::BundleFetcher<A>,
@@ -297,7 +297,7 @@ where
     A: TransportAdapter + Send,
     F: Fn() -> Result<A, Error> + Sync,
 {
-    if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
+    if rails == 0 {
         return Err(Error::InvalidArguments);
     }
     // Set before the plan is built, which is what `drive_until` below
@@ -1223,20 +1223,16 @@ mod tests {
         let outcome = fetch_striped(fetcher, 0, || Err::<Loopback, _>(Error::CarrierUnavailable));
         assert!(matches!(outcome, Err(Error::InvalidArguments)));
         crate::harness::discard(&[&output]);
-
-        let output = crate::tests::temporary("widthguard-inline");
-        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        fetcher.set_proving_threads(0).unwrap();
-        let outcome = fetch_striped(fetcher, 2, || Err::<Loopback, _>(Error::CarrierUnavailable));
-        assert!(matches!(outcome, Err(Error::InvalidArguments)));
-        crate::harness::discard(&[&output]);
     }
 
+    /// One rail with the narrowest pool a fetch may run is still a whole
+    /// fetch: what a rail count of one skips is the striping, not the
+    /// proving.
     #[test]
-    fn one_rail_proving_inline_is_still_a_fetch() {
+    fn one_rail_at_the_narrowest_width_is_still_a_fetch() {
         use crate::harness::{built_bundle, duplex_pair, not_required, patterned};
 
-        let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
+        let (bundle, built) = built_bundle("onerail", &[("a.txt", patterned(1000))]);
         let (client, half) = duplex_pair();
         let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
@@ -1253,13 +1249,13 @@ mod tests {
                     })
             })
         });
-        let output = crate::tests::temporary("inlinewidth-fetched");
+        let output = crate::tests::temporary("onerail-fetched");
         let mut fetcher = crate::BundleFetcher::begin(client, &output, None).unwrap();
-        fetcher.set_proving_threads(0).unwrap();
+        fetcher.set_proving_threads(1).unwrap();
         let outcome = fetch_striped(fetcher, 1, || {
             Err::<crate::harness::Duplex, _>(Error::CarrierUnavailable)
         })
-        .expect("one rail, no provers, a whole fetch");
+        .expect("one rail, one prover, a whole fetch");
         assert_eq!(outcome.package, built);
         assert_eq!(
             outcome.moved, built.logical_length,
@@ -1272,6 +1268,26 @@ mod tests {
         );
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    /// A fetch places what it receives on its provers and nowhere else,
+    /// so a width of none is refused rather than run: it would book no
+    /// coverage, place nothing, and be called stalled.
+    #[test]
+    fn a_fetch_with_no_provers_is_refused() {
+        use crate::harness::Loopback;
+
+        let output = crate::tests::temporary("noprovers");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        assert!(matches!(
+            fetcher.set_proving_threads(0),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            fetcher.set_proving_threads(1).is_ok(),
+            "one prover is the minimum, not a refusal"
+        );
+        crate::harness::discard(&[&output]);
     }
 
     #[test]

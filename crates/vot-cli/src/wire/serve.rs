@@ -216,6 +216,9 @@ where
         served_bytes: serving.served_bytes(),
         status,
     };
+    // Release the carrier before the observer runs: a receiver waiting on this
+    // session's clean close should not wait through the observer's own work.
+    drop(serving);
     if let Some(observer) = observer {
         observer(report);
     }

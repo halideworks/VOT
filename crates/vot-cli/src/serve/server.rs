@@ -223,6 +223,15 @@ impl BundleServer {
                     if let Err(fault) = self.dispatch(&bytes, connection, repair_symbols) {
                         return fail(fault, session, connection);
                     }
+                    // A final-cursor GOAWAY is the receiver's completion
+                    // acknowledgement; conclude the session so the carrier
+                    // closes and the receiver's wait for that close returns.
+                    if crate::drive::completion_acknowledged(
+                        connection.goaway_cursor,
+                        self.object_indices.len(),
+                    ) {
+                        return Ok(ServeStatus::Completed);
+                    }
                 }
                 Ok(Some(Event::Disconnected(_))) => return Ok(ServeStatus::Disconnected),
                 Ok(Some(_)) => {}

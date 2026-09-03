@@ -260,6 +260,27 @@ fn earliest_observation(first: Option<Instant>, second: Option<Instant>) -> Opti
     [first, second].into_iter().flatten().min()
 }
 
+/// Concludes a completed fetch: the primary tells the serve so with a
+/// final-cursor `GOAWAY` and waits for the serve's clean close, matching the
+/// push receiver. The package is already proven, so a failed courtesy never
+/// fails the fetch, and the rails close abruptly.
+#[cfg(feature = "wire")]
+fn conclude_fetch<A: TransportAdapter>(
+    primary: &mut crate::BundleFetcher<A>,
+    status: crate::FetchStatus,
+) {
+    if matches!(status, crate::FetchStatus::Complete) && primary.acknowledge_completion().is_ok() {
+        let _ = primary.await_peer_close();
+    }
+}
+
+#[cfg(all(test, not(feature = "wire")))]
+fn conclude_fetch<A: TransportAdapter>(
+    _primary: &mut crate::BundleFetcher<A>,
+    _status: crate::FetchStatus,
+) {
+}
+
 /// Fetches at `rails` width. The primary builds the plan; rails join it
 /// on fresh connections. A rail failure abandons the plan.
 ///
@@ -280,6 +301,7 @@ where
         return Err(Error::InvalidArguments);
     }
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
+        conclude_fetch(&mut primary, status);
         return Ok(Fetched {
             package: fetched(&primary, status)?,
             moved: primary.moved_bytes(),
@@ -324,7 +346,13 @@ where
                 outcome
             }));
         }
-        let outcome = drive(&mut primary).and_then(|status| fetched(&primary, status));
+        let outcome = match drive(&mut primary) {
+            Ok(status) => {
+                conclude_fetch(&mut primary, status);
+                fetched(&primary, status)
+            }
+            Err(error) => Err(error),
+        };
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
         }
@@ -392,8 +420,12 @@ pub struct ServeSession<'server, A: TransportAdapter> {
     holder: Option<std::sync::Arc<crate::authz::Holder>>,
 }
 
-#[cfg(feature = "wire")]
-fn push_completion(cursor: Option<u64>, objects: usize) -> bool {
+/// Whether a receiver's `GOAWAY` cursor acknowledges every transfer object.
+///
+/// A push receiver and a fetch client conclude the same way: the final cursor
+/// equals the object count. Zero objects never acknowledges, keeping a final
+/// cursor of zero distinct from a plan that never formed.
+pub(crate) fn completion_acknowledged(cursor: Option<u64>, objects: usize) -> bool {
     objects != 0 && cursor == Some(objects as u64)
 }
 
@@ -530,12 +562,6 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     #[cfg(all(test, feature = "wire"))]
     pub(crate) fn push_ready(&self) -> bool {
         self.session.is_ready()
-    }
-
-    /// Whether the push receiver acknowledged every transfer object.
-    #[cfg(feature = "wire")]
-    pub(crate) fn push_completed(&self) -> bool {
-        push_completion(self.connection.goaway_cursor, self.server.objects.len())
     }
 
     /// Grants or refuses a capability the peer presented.
@@ -1815,9 +1841,9 @@ mod tests {
 
     #[cfg(feature = "wire")]
     #[test]
-    fn cursor_zero_is_never_push_completion() {
-        assert!(!push_completion(Some(0), 0));
-        assert!(!push_completion(None, 1));
-        assert!(push_completion(Some(1), 1));
+    fn cursor_zero_is_never_completion() {
+        assert!(!completion_acknowledged(Some(0), 0));
+        assert!(!completion_acknowledged(None, 1));
+        assert!(completion_acknowledged(Some(1), 1));
     }
 }

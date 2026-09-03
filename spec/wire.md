@@ -133,15 +133,18 @@ The `ERROR` payload is a registered error-code QUIC varint followed by optional
 opaque diagnostic bytes. Diagnostics obey the 64 KiB frame limit and the
 redaction requirements in `spec/registries.md` section 8.
 
-Under `PUSH`, the server is the requester and acceptor. After receiving
-`GOAWAY` with cursor `n`, the holder sends no object-bearing `PUBLISH` frame
-for transfer object `n` or above, including answers queued but not yet handed
-to the carrier. A server sends `GOAWAY` at the final transfer-object cursor only
-after every object is durable and every completion hook has succeeded. The
-holder MUST treat that final cursor as the push completion acknowledgement and
-MUST treat disconnect before it as failure. A push package MUST contain at
-least one transfer object, keeping final cursor zero distinct from cancellation
-before the plan exists.
+The receiver of the data acknowledges completion with a `GOAWAY` at the final
+transfer-object cursor, the cursor equal to the transfer-object count. It sends
+that final cursor only after every object is durable and every completion hook
+has succeeded. The data holder treats the final cursor as completion, sends no
+object-bearing frame for that transfer object or above, including an answer
+queued but not yet handed to the carrier, and ends the session so its carrier
+closes. The receiver awaits that close and MUST treat a disconnect before the
+final cursor as failure. In a plain fetch the client is the receiver and the
+serving end is the holder; under `PUSH` the server is the receiver, requester,
+and acceptor, and the dialing client is the holder that sends the `PUBLISH`
+frames. A package MUST contain at least one transfer object, keeping a final
+cursor of zero distinct from cancellation before the plan exists.
 
 ## 2. Frame envelope
 

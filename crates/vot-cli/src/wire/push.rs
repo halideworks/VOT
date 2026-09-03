@@ -362,16 +362,15 @@ pub(super) fn push_bundle_railed(
         }
         let mut running = Vec::with_capacity(rails);
         for mut pushing in sessions {
-            running.push(scope.spawn(move || {
-                match crate::drive::drive_until(&mut pushing, crate::ServeSession::push_completed)?
-                {
-                    None => Ok(()),
-                    Some(crate::ServeStatus::Closed(code)) => Err(Error::PeerClosed(code)),
-                    Some(crate::ServeStatus::Disconnected | crate::ServeStatus::Active) => {
+            running.push(
+                scope.spawn(move || match crate::drive::drive(&mut pushing)? {
+                    crate::ServeStatus::Completed => Ok(()),
+                    crate::ServeStatus::Closed(code) => Err(Error::PeerClosed(code)),
+                    crate::ServeStatus::Disconnected | crate::ServeStatus::Active => {
                         Err(Error::CarrierUnavailable)
                     }
-                }
-            }));
+                }),
+            );
         }
         for rail in running {
             rail.join().map_err(|_| Error::CarrierUnavailable)??;
@@ -728,12 +727,12 @@ where
         let plan = match planned {
             Ok(None) => fetcher.shared_plan().ok_or(Error::InvalidBundle),
             Ok(Some(crate::FetchStatus::Complete)) => {
-                let cursor = fetcher.acknowledge_push()?;
+                let cursor = fetcher.acknowledge_completion()?;
                 primary_plan
                     .as_mut()
                     .ok_or(Error::CarrierUnavailable)?
                     .complete(fetcher.package().ok_or(Error::InvalidBundle)?, cursor)?;
-                fetcher.await_push_close()?;
+                fetcher.await_peer_close()?;
                 return fetcher.package().ok_or(Error::InvalidBundle);
             }
             Ok(Some(crate::FetchStatus::Closed(code))) => Err(Error::PeerClosed(code)),
@@ -756,8 +755,8 @@ where
     let status = crate::drive(&mut fetcher)?;
     match status {
         crate::FetchStatus::Complete => {
-            fetcher.acknowledge_push()?;
-            fetcher.await_push_close()?;
+            fetcher.acknowledge_completion()?;
+            fetcher.await_peer_close()?;
             let package = fetcher.package().ok_or(Error::InvalidBundle)?;
             shared_failure.complete();
             Ok(package)

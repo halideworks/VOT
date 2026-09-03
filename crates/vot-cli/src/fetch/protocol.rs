@@ -846,9 +846,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.locked_plan().is_some_and(|plan| plan.finished)
     }
 
-    /// Confirms a completed push after every sink and completion hook succeeded.
+    /// Acknowledges a completed transfer with a final-cursor `GOAWAY`.
+    ///
+    /// A push receiver sends it once every sink and completion hook has
+    /// succeeded; a fetch client sends it once the package is proven. The
+    /// holder treats the final cursor as completion and ends the session.
     #[cfg(feature = "wire")]
-    pub(crate) fn acknowledge_push(&mut self) -> Result<u64, Error> {
+    pub(crate) fn acknowledge_completion(&mut self) -> Result<u64, Error> {
         let cursor = self
             .locked_plan()
             .map(|plan| plan.current as u64)
@@ -859,9 +863,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         Ok(cursor)
     }
 
-    /// Keeps the acknowledged session alive until the holder consumes it.
+    /// Keeps the acknowledged session alive until the holder closes it.
     #[cfg(feature = "wire")]
-    pub(crate) fn await_push_close(&mut self) -> Result<(), Error> {
+    pub(crate) fn await_peer_close(&mut self) -> Result<(), Error> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Some(Event::Disconnected(_)) = self.receiver.session_mut().poll()? {

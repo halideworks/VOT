@@ -258,11 +258,12 @@ pub(crate) const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use vot_scheduler::RangeSink as _;
 
-    struct FailingSink;
+    /// A sink that fails everything asked of it.
+    pub(in crate::fetch) struct FailingSink;
 
     impl vot_scheduler::RangeSink for FailingSink {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {

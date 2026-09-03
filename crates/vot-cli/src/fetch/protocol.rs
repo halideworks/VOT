@@ -66,9 +66,10 @@ pub(crate) const FETCH_CREDIT_BYTES: u64 =
 
 /// What a receiver may stage to carry a window of `window` objects: the
 /// credit, plus the group reservation each admitted object holds for as
-/// long as it is in flight. Without the window's worth of headroom a rail
-/// whose credit is fully staged cannot take the record that arrives on
-/// top, which closes the session under `RESOURCE_LIMIT` mid-transfer.
+/// long as it is in flight. Advertised credit is what is left of the
+/// staging budget, capped at the target, so on a budget of the credit
+/// alone each admitted object's reservation comes out of the credit this
+/// end advertises and the rails run on less of it the wider the window.
 pub(crate) const fn fetch_staging_bytes(window: usize) -> u64 {
     FETCH_CREDIT_BYTES + window as u64 * vot_verifier::GROUP_SIZE as u64
 }
@@ -79,8 +80,8 @@ pub(crate) const fn fetch_staging_bytes(window: usize) -> u64 {
 pub(crate) const FETCH_STAGING_BYTES: u64 = fetch_staging_bytes(MAX_OBJECT_WINDOW);
 
 // The limit clears the credit by one group an in-flight object; at or
-// under it would refuse a conforming answer. The one-object value is what
-// the budget was when the plan held one object.
+// under it the advertised credit is what shrinks. The one-object value is
+// what the budget was when the plan held one object.
 const _: () = assert!(FETCH_CREDIT_BYTES == 34_078_720);
 const _: () = assert!(fetch_staging_bytes(1) == 34_144_256);
 const _: () = assert!(FETCH_STAGING_BYTES == 35_127_296);
@@ -499,8 +500,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
-            // One object, which is what the plan held before it held a
-            // window; a caller widens it from its rails.
             window: 1,
         };
         // Through the one place the deferred wiring lives, so the default
@@ -563,8 +562,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
-            // One object, which is what the plan held before it held a
-            // window; a caller widens it from its rails.
             window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
@@ -604,8 +601,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
-            // One object, which is what the plan held before it held a
-            // window; a caller widens it from its rails.
             window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
@@ -905,13 +900,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         let frame = encoded(&TypedFrame::GoAway(frames::GoAway {
             cursor: cursor as u64,
         }))?;
+        // Every entry, not up to the first failure: a sink that cannot
+        // discard is no reason to leave the partials above it on disk.
         let discarded = window
             .iter()
-            .try_for_each(|active| active.sink.discard_partial());
+            .map(|active| active.sink.discard_partial())
+            .fold(Ok(()), Result::and);
         let reset = match store.as_ref().map(|store| store.lock()) {
             Some(Ok(mut store)) => window
                 .iter()
-                .try_for_each(|active| store.reset(active.subject).map_err(resume_failure)),
+                .map(|active| store.reset(active.subject).map_err(resume_failure))
+                .fold(Ok(()), Result::and),
             _ => Ok(()),
         };
         let notified = self
@@ -1664,14 +1663,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 completed?;
+                plan.objects[at].done = true;
                 if plan.abandoned {
-                    // The hook has succeeded, so this object is durable
-                    // above the cursor and stays, as every object durable
-                    // above it does. Discarding belongs before a hook has
-                    // run, not after.
+                    // Durable and told to its consumer, so it counts
+                    // toward the cursor and is never discarded.
                     return Ok(());
                 }
-                plan.objects[at].done = true;
                 continue;
             }
             if whole_from_before && path.exists() {
@@ -1688,14 +1685,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.abandoned = true;
                 }
                 completed?;
-                if plan.abandoned {
-                    // Durable before this fetch began and its hook has
-                    // succeeded; cancellation has nothing to take back.
-                    return Ok(());
-                }
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.carried_before = plan.carried_before.saturating_add(object.length);
                 plan.objects[at].done = true;
+                if plan.abandoned {
+                    // Durable and told to its consumer, so it counts
+                    // toward the cursor and is never discarded.
+                    return Ok(());
+                }
                 continue;
             }
             let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;

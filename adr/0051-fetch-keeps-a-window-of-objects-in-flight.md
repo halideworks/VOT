@@ -74,10 +74,13 @@ on the wire changes.**
 
 6. **The window is sized by the rails.** `drive::fetch_striped` sets the
    window to `min(2 * rails, 16)`, floor one, and the push receiver takes the
-   same width from the rail count its sender may open. Each in-flight object
-   holds one verifier reservation of receiver staging per rail for as long as
-   it is in flight, so the fetch staging budget carries one reservation for
-   every object the widest window may hold, on top of the credit.
+   same width from the rail count its sender may open. Each admitted object
+   holds one verifier reservation of receiver staging for as long as it is in
+   flight, and advertised credit is what is left of the staging budget against
+   the target, so a budget of the credit alone hands the rails a credit shrunk
+   by the window's reservations. The fetch staging budget therefore carries one
+   reservation for every object the widest window may hold, on top of the
+   credit.
 
 ## Consequences
 

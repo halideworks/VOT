@@ -1673,6 +1673,157 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub(crate) fn a_cancel_during_an_empty_objects_hook_keeps_it_done() {
+        // Past its completion hook an object is durable and told to its
+        // consumer, so a cancel under the hook cannot take it back off the
+        // cursor.
+        let (bundle, summary) = built_bundle("cancel-empty-hook", &[("a.txt", patterned(1000))]);
+        let (server, mut serving_rail, mut rail_connection) = serving(&bundle);
+        let output = temporary("cancel-empty-hook-fetched");
+        let empty = frames::ObjectId {
+            suite: 1,
+            root: *blake3::hash(&[]).as_bytes(),
+            length: 0,
+        };
+        let plan: SharedPlan = Arc::new(Mutex::new(FetchPlan {
+            summary,
+            objects: vec![PlannedObject::fresh(empty)],
+            active: BTreeMap::new(),
+            low: 0,
+            // Opened as far as the window allows, so the rail's round below
+            // opens nothing and the primary is the one that opens it.
+            next_open: 1,
+            window: 1,
+            placed_before: 0,
+            carried_before: 0,
+            abandoned: false,
+            sealing: false,
+            store: None,
+            finished: false,
+        }));
+
+        // A rail on the same plan, driven only as far as a session that can
+        // carry a `GOAWAY`.
+        let cancellation = CancellationHandle::default();
+        let mut rail = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        rail.set_receive_seams(ReceiveSeams::new(cancellation.clone()));
+        let mut sequence = 0;
+        round(
+            &server,
+            &mut serving_rail,
+            &mut rail_connection,
+            &mut rail,
+            &mut sequence,
+        );
+        rail.service().unwrap();
+        plan.lock().unwrap().next_open = 0;
+
+        // (reached the hook, released from it)
+        let gate = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        let hook_gate = Arc::clone(&gate);
+        let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        primary.plan = Some(Arc::clone(&plan));
+        primary.set_receive_seams(ReceiveSeams {
+            complete: Some(Arc::new(move |_, _| {
+                let (state, waiters) = &*hook_gate;
+                let mut state = state.lock().map_err(|_| Error::InvalidBundle)?;
+                state.0 = true;
+                waiters.notify_all();
+                while !state.1 {
+                    state = waiters.wait(state).map_err(|_| Error::InvalidBundle)?;
+                }
+                Ok(())
+            })),
+            ..ReceiveSeams::default()
+        });
+        let completing = std::thread::spawn(move || primary.advance().unwrap());
+        {
+            let (state, waiters) = &*gate;
+            let mut held = state.lock().unwrap();
+            while !held.0 {
+                let (next, timeout) = waiters
+                    .wait_timeout(held, std::time::Duration::from_secs(10))
+                    .unwrap();
+                held = next;
+                assert!(
+                    !timeout.timed_out(),
+                    "the empty object never reached a hook"
+                );
+            }
+        }
+        cancellation.cancel();
+        assert_eq!(rail.service().unwrap(), FetchStatus::Cancelled(0));
+        {
+            let (state, waiters) = &*gate;
+            state.lock().unwrap().1 = true;
+            waiters.notify_all();
+        }
+        completing.join().unwrap();
+
+        assert!(
+            plan.lock().unwrap().objects[0].done,
+            "the cancel left a durable object undone"
+        );
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    pub(crate) fn a_cancel_discards_the_partials_behind_a_sink_that_cannot() {
+        // The first failing discard is what the cancel reports, and every
+        // partial behind it still comes off disk.
+        use super::sink::tests::FailingSink;
+
+        let output = temporary("cancel-discard-all");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let cancellation = CancellationHandle::default();
+        fetcher.set_receive_seams(ReceiveSeams::new(cancellation.clone()));
+        let watched = Arc::new(SeamSink {
+            bytes: Mutex::new(vec![0; 8]),
+            flushed: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
+        });
+        let mut plan = windowed(8);
+        let second = PlannedObject::fresh(frames::ObjectId {
+            suite: 1,
+            root: [10; 32],
+            length: 8,
+        });
+        let first = subject_of(&plan.objects[0]);
+        plan.active.insert(
+            0,
+            active(first, Arc::new(CountingSink::custom(Box::new(FailingSink)))),
+        );
+        plan.active.insert(
+            1,
+            active(
+                subject_of(&second),
+                Arc::new(CountingSink::custom(Box::new(Arc::clone(&watched)))),
+            ),
+        );
+        plan.objects.push(second);
+        plan.next_open = 2;
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+        cancellation.cancel();
+
+        assert!(
+            fetcher.service().is_err(),
+            "the failing discard went unreported"
+        );
+        assert!(
+            watched.discarded.load(Ordering::Acquire),
+            "a partial behind the failing sink was left on disk"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
     pub(crate) fn a_cancel_reports_what_is_durable_not_what_the_cursor_reached() {
         // A rail that completed an object marks it done and moves the
         // cursor on its next pass. A cancel landing between the two would

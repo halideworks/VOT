@@ -3,6 +3,14 @@ name: ci
 on:
   push:
     branches: [main]
+    # Only the inputs to a cache key or to the mutation plan. Everything else
+    # a merge can touch was already checked by the pull request run.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/**"
+      - "tools/*ci_*"
   pull_request:
   workflow_dispatch:
   schedule:
@@ -12,12 +20,15 @@ permissions:
   contents: read
 
 # One run per ref. A pull request's older run is cancelled when a new commit
-# arrives, because it measures code that no longer exists. A push to main is
-# not cancelled once it is running, since its checks are the record for that
-# commit, but a newer push supersedes any run still pending, which is what
-# keeps a run of merges from queueing checks for each and starving the pull
-# requests behind them. Scheduled and manual sweeps have their own group, so a
-# long full sweep cannot hold routine main checks behind it.
+# arrives, because it measures code that no longer exists. The pull request run
+# is the record for a commit, since a squash merge lands the tree it just
+# checked. A push to main runs only when the paths filter above admits it,
+# meaning an input to a cache key or to the mutation plan changed, and it is not
+# cancelled once it is running, because its job is to save the main-scoped
+# caches every branch restores from. A newer push still supersedes any run left
+# pending, which keeps a run of merges from queueing checks for each and
+# starving the pull requests behind them. Scheduled and manual sweeps have their
+# own group, so a long full sweep cannot hold routine main checks behind it.
 #
 # A cancelled run is therefore two things now: a superseded one, and the
 # killed runner that an unbounded loop or a leaked temp file produces. Check
@@ -257,7 +268,9 @@ jobs:
         run: cargo +1.97.1 build --manifest-path fuzz/cargo-fuzz/Cargo.toml --locked
 
       - name: Save cargo registry and build directory
-        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.validate-cache.outputs.cache-hit != 'true' }}
+        # The weekly sweep saves too, so a runner image bump that misses the
+        # key is repopulated without waiting for a lockfile change.
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.validate-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: |
@@ -379,7 +392,9 @@ jobs:
       - name: Save quiche native build
         # Both profiles compiled successfully. Preserve that work even when a
         # later live gate fails so its same-commit rerun does not rebuild it.
-        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.quiche-cache.outputs.cache-hit != 'true' }}
+        # The weekly sweep saves too, because the key covers the runner image's
+        # native toolchain and no repository path can catch that drifting.
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.quiche-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ env.CARGO_TARGET_DIR }}

@@ -135,13 +135,14 @@ export LD_LIBRARY_PATH="$(dirname "$(find target -name libmsquic.so.2 | head -1)
 
 ## Mutation testing
 
-Full sweep (runs on every push to main):
+Full sweep (runs on the weekly schedule and on manual dispatch):
 
 ```sh
 cargo mutants --package PACKAGE --jobs 2
 ```
 
-Diff run (runs on pull requests):
+Diff run (runs on pull requests, and on a push to main that the workflow's
+paths filter admits):
 
 ```sh
 git diff origin/main...HEAD > changed.diff

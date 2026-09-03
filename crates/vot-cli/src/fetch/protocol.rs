@@ -1,36 +1,90 @@
 //! Session and frame dispatch: the [`BundleFetcher`] passes.
 
 use super::{
-    ActiveSink, Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap,
+    ActiveObject, Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap,
     DEFAULT_PROVING_THREADS, DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan,
     FetchStatus, MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD,
     MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestReader, ManifestRequest, Mutex,
     ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
     PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary,
     Path, PathBuf, PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
-    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReliableReceiver, ResumeStore, Session,
-    SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter,
-    TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs, is_backpressure,
-    package_sentinel, remove_store_files, reservations_of, resume_failure, resumed_extents,
-    subject_of, total_units_of,
+    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReceiveSink, ReliableReceiver, ResumeStore,
+    Session, SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT,
+    TransportAdapter, TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs,
+    is_backpressure, package_sentinel, remove_store_files, reservations_of, resume_failure,
+    resumed_extents, subject_of, total_units_of,
 };
 
 pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
     length == 0 || fully_resumed && stored
 }
 
+/// Ends an open the plan no longer wants, discarding the sink it chose.
+///
+/// Cancellation drains the window under the plan lock, and an object being
+/// opened is not in the window yet: the rail that dropped the lock for a
+/// sink factory or a completion hook owns the only reference to what it
+/// chose, so nothing else would ever discard it. Called with the plan lock
+/// released, because a sink's gate is taken before that lock.
+fn discard_open(chosen: Option<Box<dyn ReceiveSink>>) -> Result<(), Error> {
+    match chosen {
+        Some(sink) => sink.discard_partial(),
+        None => Ok(()),
+    }
+}
+
+/// Passes [`BundleFetcher::advance`] may take over `objects` objects.
+///
+/// Every pass returns, completes one object, or opens one, and the plan
+/// opens each object once and completes it once, so two passes an object
+/// do all the work there is and one more finds nothing left to do. A pass
+/// past this is a plan that is not moving, which is a fault rather than a
+/// slow fetch.
+pub(super) const fn advance_passes(objects: usize) -> usize {
+    2 * objects + 1
+}
+
+/// The most objects a fetch keeps in flight.
+///
+/// The receiver's staging budget is sized for this many admissions on top
+/// of the credit, and a receiver is built before a caller chooses a
+/// window, so no plan may hold more than this.
+pub(crate) const MAX_OBJECT_WINDOW: usize = 16;
+
+/// The window `rails` rails earn: two objects a rail, so a rail always has
+/// another object to take spans from while one of them is being synced.
+///
+/// Only a driving loop chooses a window, and those come with the carrier.
+#[cfg(any(test, feature = "wire"))]
+pub(crate) fn object_window(rails: usize) -> usize {
+    rails.saturating_mul(2).clamp(1, MAX_OBJECT_WINDOW)
+}
+
 /// Credit advertised to the server: the covers this end asked for.
 pub(crate) const FETCH_CREDIT_BYTES: u64 =
     OUTSTANDING_COVERS as u64 * vot_scheduler::MAX_PROOF_RANGE_BYTES;
 
-/// What the receiver may stage: credit plus the group reservation, so a
-/// cover at the limit can still be verified.
-pub(crate) const FETCH_STAGING_BYTES: u64 = FETCH_CREDIT_BYTES + vot_verifier::GROUP_SIZE as u64;
+/// What a receiver may stage to carry a window of `window` objects: the
+/// credit, plus the group reservation each admitted object holds for as
+/// long as it is in flight. Advertised credit is what is left of the
+/// staging budget, capped at the target, so on a budget of the credit
+/// alone each admitted object's reservation comes out of the credit this
+/// end advertises and the rails run on less of it the wider the window.
+pub(crate) const fn fetch_staging_bytes(window: usize) -> u64 {
+    FETCH_CREDIT_BYTES + window as u64 * vot_verifier::GROUP_SIZE as u64
+}
 
-// The limit clears the credit by a group; at or under it would refuse a
-// conforming answer.
+/// What the receiver may stage. Sized for the widest window rather than
+/// the one this fetch takes: the receiver is built before the manifest
+/// names an object, and a staging limit cannot be changed after.
+pub(crate) const FETCH_STAGING_BYTES: u64 = fetch_staging_bytes(MAX_OBJECT_WINDOW);
+
+// The limit clears the credit by one group an in-flight object; at or
+// under it the advertised credit is what shrinks. The one-object value is
+// what the budget was when the plan held one object.
 const _: () = assert!(FETCH_CREDIT_BYTES == 34_078_720);
-const _: () = assert!(FETCH_STAGING_BYTES == 34_144_256);
+const _: () = assert!(fetch_staging_bytes(1) == 34_144_256);
+const _: () = assert!(FETCH_STAGING_BYTES == 35_127_296);
 
 fn require_push_objects(push: bool, objects: usize) -> Result<(), Fault> {
     if push && objects == 0 {
@@ -83,6 +137,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     pub(crate) seams: ReceiveSeams,
     pub(crate) receive_session: ReceiveSessionId,
     pub(crate) cancelled: Option<usize>,
+    /// Objects the plan this fetch builds keeps in flight. Read when the
+    /// manifest is validated, so a caller sets it before then; a rail
+    /// joins a plan that already carries its own.
+    pub(crate) window: usize,
 }
 
 static RECEIVE_SESSION_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -101,9 +159,9 @@ pub(crate) struct ManifestPhase {
 
 /// What this rail has asked for, settled, and may still have outstanding.
 pub(crate) struct RailProgress {
-    /// The object this rail has admitted to its own receiver, by plan
+    /// The objects this rail has admitted to its own receiver, by plan
     /// index. Admission is per rail; the plan cannot do it.
-    pub(crate) admitted: Option<(usize, SubjectId)>,
+    pub(crate) admitted: BTreeMap<usize, SubjectId>,
     /// Range bytes this rail has committed to spans, only ever going up.
     /// The gap between this and what its own receiver has taken off the
     /// carrier paces requests per rail; pacing on the shared sink would let
@@ -120,7 +178,7 @@ pub(crate) struct RailProgress {
 impl Default for RailProgress {
     fn default() -> Self {
         Self {
-            admitted: None,
+            admitted: BTreeMap::new(),
             taken_bytes: 0,
             window_bytes: OUTSTANDING_REQUEST_BYTES,
             pending: VecDeque::new(),
@@ -243,15 +301,15 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
 }
 
 /// Bytes the bundle holds under this plan: what the objects already left
-/// behind placed, plus what the one still in flight has placed so far.
+/// behind placed, plus what the ones still in flight have placed so far.
 ///
 /// One function rather than the same sum in each accessor that means it.
 fn placed_in(plan: &FetchPlan) -> u64 {
-    plan.placed_before
-        + plan
-            .active
-            .as_ref()
-            .map_or(0, |active| active.sink.placed())
+    plan.active
+        .values()
+        .fold(plan.placed_before, |placed, active| {
+            placed + active.sink.placed()
+        })
 }
 
 impl<A: TransportAdapter> BundleFetcher<A> {
@@ -276,6 +334,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 .set_deferred_limit(threads.saturating_add(1))?;
         }
         Ok(())
+    }
+
+    /// Sets how many objects the plan this fetch builds keeps in flight.
+    ///
+    /// Read when the manifest is validated, so it has to be set before the
+    /// fetch is driven that far. Narrowed to [`MAX_OBJECT_WINDOW`], which
+    /// the receiver's staging budget is sized for: a wider window would
+    /// refuse a conforming answer mid-transfer rather than here.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn set_object_window(&mut self, objects: usize) {
+        self.window = objects.clamp(1, MAX_OBJECT_WINDOW);
     }
 
     /// Opens the session and the bundle directory the fetch will fill.
@@ -431,6 +500,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            window: 1,
         };
         // Through the one place the deferred wiring lives, so the default
         // width and a caller's cannot come apart.
@@ -492,6 +562,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
         Ok(fetcher)
@@ -530,6 +601,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 RECEIVE_SESSION_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ),
             cancelled: None,
+            window: 1,
         };
         fetcher.set_proving_threads(DEFAULT_PROVING_THREADS)?;
         Ok(fetcher)
@@ -802,32 +874,44 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     fn cancel_receive(&mut self) -> Result<FetchStatus, Error> {
-        let (cursor, active, store, subject) = if let Some(mut plan) = self.locked_plan() {
-            if plan.syncing {
-                // Another rail is flushing or running a completion hook.
-                // Let that reserved transition settle before deciding which
-                // cursor and object cancellation owns.
+        // Drained under the lock and discarded outside it: a sink's gate
+        // is taken before the plan lock, never after.
+        let (cursor, window, store) = if let Some(mut plan) = self.locked_plan() {
+            if plan.sealing || plan.active.values().any(|active| active.syncing) {
+                // Another rail is flushing, running a completion hook, or
+                // sealing. Let that reserved transition settle before
+                // deciding which cursor and objects cancellation owns.
                 return Ok(FetchStatus::Active);
             }
-            let cursor = plan.current;
-            let active = plan.active.take();
+            // The cursor is taken after the step that moves it: a rail
+            // that completed an object marks it done and only advances the
+            // cursor on its next pass, and a cancel between the two would
+            // report one object fewer than this fetch has durable.
+            plan.advance_cursor();
+            let cursor = plan.low;
+            let window: Vec<ActiveObject> =
+                std::mem::take(&mut plan.active).into_values().collect();
             let store = plan.store.clone();
-            let subject = plan.objects.get(cursor).map(subject_of);
             plan.abandoned = true;
-            (cursor, active, store, subject)
+            (cursor, window, store)
         } else {
-            (0, None, None, None)
+            (0, Vec::new(), None)
         };
         let frame = encoded(&TypedFrame::GoAway(frames::GoAway {
             cursor: cursor as u64,
         }))?;
-        let discarded = active.map_or(Ok(()), |active| active.sink.discard_partial());
-        let reset = if let (Some(store), Some(subject)) = (store, subject)
-            && let Ok(mut store) = store.lock()
-        {
-            store.reset(subject).map_err(resume_failure)
-        } else {
-            Ok(())
+        // Every entry, not up to the first failure: a sink that cannot
+        // discard is no reason to leave the partials above it on disk.
+        let discarded = window
+            .iter()
+            .map(|active| active.sink.discard_partial())
+            .fold(Ok(()), Result::and);
+        let reset = match store.as_ref().map(|store| store.lock()) {
+            Some(Ok(mut store)) => window
+                .iter()
+                .map(|active| store.reset(active.subject).map_err(resume_failure))
+                .fold(Ok(()), Result::and),
+            _ => Ok(()),
         };
         let notified = self
             .receiver
@@ -855,7 +939,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     pub(crate) fn acknowledge_completion(&mut self) -> Result<u64, Error> {
         let cursor = self
             .locked_plan()
-            .map(|plan| plan.current as u64)
+            .map(|plan| plan.low as u64)
             .ok_or(Error::InvalidBundle)?;
         let frame = encoded(&TypedFrame::GoAway(frames::GoAway { cursor }))?;
         self.receiver.session_mut().send_control(&frame)?;
@@ -918,25 +1002,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Handed over while there is room, so what is out with a prover is a
         // few covers rather than an object.
         while pool.has_room() {
-            // The sink and the subject it is for, under one hold of the
-            // lock: taken apart, another rail can advance the plan between
-            // the two and the pair no longer describes one object.
-            let Some((sink, subject)) = self.locked_plan().and_then(|plan| {
-                let sink = Arc::clone(&plan.active.as_ref()?.sink);
-                let subject = plan.objects.get(plan.current).map(subject_of)?;
-                Some((sink, subject))
-            }) else {
-                break;
-            };
             let Some(completed) = self.receiver.take_completed() else {
                 break;
             };
-            if completed.subject() != subject {
-                // A cover for an object the plan moved past: the plan only
-                // advances on full coverage, so this is a duplicate for
-                // another object's sink.
+            // The sink of the object this bundle is for, found by subject:
+            // the window holds several, and the pairing has to be the one
+            // the bundle names rather than whichever is lowest.
+            let Some(sink) = self.locked_plan().and_then(|plan| {
+                let (_, active) = plan.in_window(completed.subject())?;
+                Some(Arc::clone(&active.sink))
+            }) else {
+                // A cover for an object the window no longer holds: an
+                // object leaves it only on full coverage, so this is a
+                // duplicate for a sink already synced.
                 continue;
-            }
+            };
             if pool.work.try_send(Proving { completed, sink }).is_err() {
                 break;
             }
@@ -971,11 +1051,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     let bundle = proved.completed.bundle();
                     // Booked into shared coverage, which completes the object.
                     // The subject check drops stragglers.
-                    if let Some(mut plan) = self.locked_plan()
-                        && plan.objects.get(plan.current).map(subject_of)
-                            == Some(proved.completed.subject())
-                    {
-                        plan.cover(bundle.covered_offset, bundle.covered_length);
+                    if let Some(mut plan) = self.locked_plan() {
+                        let booked = plan.in_window(proved.completed.subject()).map(|(at, _)| at);
+                        if let Some(at) = booked {
+                            plan.cover(at, bundle.covered_offset, bundle.covered_length);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1320,15 +1400,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects,
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: self.window,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: directory_resume.then(|| self.store.clone()).flatten(),
             finished: false,
         })));
@@ -1336,11 +1415,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     }
 
     /// Moves the object plan forward: a covered object is synced and left
-    /// behind, the next is admitted and requested, the last seals the bundle.
+    /// behind, another is opened into the window, and the last seals the
+    /// bundle.
     ///
     /// Every rail runs this. Admission and abandonment are per-rail; the
-    /// transition goes to whichever rail sees coverage whole first, and
-    /// `syncing` keeps file work outside the lock without duplication.
+    /// transition on an object goes to whichever rail sees its coverage
+    /// whole first, and that object's `syncing` keeps file work outside the
+    /// lock without duplication.
     pub(crate) fn advance(&mut self) -> Result<(), Error> {
         // The handle apart from self, so the receiver and the bundle stay
         // reachable while the plan is held under its lock.
@@ -1352,48 +1433,71 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // for the pinned package.
             return Ok(());
         }
-        // Counted by the plan itself: every pass either returns or leaves
-        // one more object behind, so needing more passes than the plan
-        // names objects means the cursor is not moving.
+        // Counted by the plan itself, so a cursor that stops moving fails
+        // here rather than spinning.
         let objects = shared
             .lock()
             .map_err(|_| Error::InvalidBundle)?
             .objects
             .len();
-        for _ in 0..=objects {
+        for _ in 0..advance_passes(objects) {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            // Forget partial accounts for objects the plan left behind, so
-            // the receiver is bounded by what is current, not everything
-            // this rail touched.
-            if let Some((index, subject)) = self.rail.admitted
-                && index != plan.current
-            {
+            // Forget partial accounts for objects the window no longer
+            // holds, so the receiver is bounded by what is in flight, not
+            // by everything this rail touched. An index below the cursor
+            // has already left the window, so absence is the whole test.
+            let forgotten: Vec<(usize, SubjectId)> = self
+                .rail
+                .admitted
+                .iter()
+                .filter(|(index, _)| !plan.active.contains_key(index))
+                .map(|(index, subject)| (*index, *subject))
+                .collect();
+            for (index, subject) in forgotten {
                 if !self.receiver.is_verified(subject) {
                     self.receiver.abandon(subject);
                 }
-                self.rail.admitted = None;
+                self.rail.admitted.remove(&index);
             }
-            if let Some(active) = plan.active.clone() {
-                let sink = active.sink;
-                let planned = plan.objects.get(plan.current).ok_or(Error::InvalidBundle)?;
-                let subject = subject_of(planned);
-                let length = planned.object.length;
-                if self.rail.admitted != Some((plan.current, subject)) {
-                    self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
-                    self.rail.admitted = Some((plan.current, subject));
+            // Admit every object in the window to this rail, and take the
+            // first one that is whole and nobody is syncing.
+            let mut settled = None;
+            for (index, active) in &plan.active {
+                let length = plan
+                    .objects
+                    .get(*index)
+                    .ok_or(Error::InvalidBundle)?
+                    .object
+                    .length;
+                if !self.rail.admitted.contains_key(index) {
+                    self.receiver
+                        .admit(active.subject, Box::new(Arc::clone(&active.sink)))?;
+                    self.rail.admitted.insert(*index, active.subject);
                 }
                 // Complete when shared coverage spans the object, or this
                 // rail's receiver verified it.
-                let whole = plan.covered.is_complete(length) || self.receiver.is_verified(subject);
-                if !whole || plan.syncing {
-                    return Ok(());
+                let whole =
+                    active.covered.is_complete(length) || self.receiver.is_verified(active.subject);
+                if whole && !active.syncing {
+                    settled = Some((*index, active.subject, length));
+                    break;
                 }
-                // Durable before the fetch moves on, so a completed fetch
+            }
+            if let Some((at, subject, length)) = settled {
+                // Durable before the window drops it, so a completed fetch
                 // never names bytes that were only in the page cache.
-                // Synced outside the lock: the other rails keep booking
-                // and asking while the file flushes.
-                plan.syncing = true;
+                // Synced outside the lock: the other rails keep booking and
+                // asking while the file flushes.
+                let active = plan.active.get_mut(&at).ok_or(Error::InvalidBundle)?;
+                active.syncing = true;
+                let sink = Arc::clone(&active.sink);
+                let hook = active.complete.clone();
+                let receive_session = active.receive_session;
                 let store = plan.store.clone();
+                let completed = plan.objects.get(at).map(|planned| ReceiveObject {
+                    object: planned.object,
+                    entries: planned.entries.clone(),
+                });
                 drop(plan);
                 let synced = sink.flush();
                 if synced.is_ok() {
@@ -1407,52 +1511,41 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                         let _ = store.checkpoint_units(subject, total_units_of(length), &units);
                     }
                 }
-                let plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                let completed = plan.objects.get(plan.current).map(|planned| ReceiveObject {
-                    object: planned.object,
-                    entries: planned.entries.clone(),
-                });
-                drop(plan);
-                let completed = synced.and_then(|()| {
-                    if let (Some(hook), Some(completed)) = (&active.complete, &completed) {
-                        hook(active.receive_session, completed)?;
+                let outcome = synced.and_then(|()| {
+                    if let (Some(hook), Some(completed)) = (&hook, &completed) {
+                        hook(receive_session, completed)?;
                     }
                     Ok(())
                 });
                 let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
-                if completed.is_err() {
+                if let Some(active) = plan.active.get_mut(&at) {
+                    active.syncing = false;
+                }
+                if outcome.is_err() {
                     plan.abandoned = true;
                 }
-                completed?;
+                outcome?;
                 plan.placed_before = plan.placed_before.saturating_add(length);
-                plan.active = None;
-                plan.covered = CoverageMap::new();
-                plan.skip.clear();
-                // A cursor that stands still here re-fetches the object it
-                // just settled, forever and over the wire; failing at once
-                // is what keeps that spin out of every suite's budget.
-                plan.current = plan.current.saturating_add(1);
+                plan.active.remove(&at);
+                plan.objects[at].done = true;
                 continue;
             }
-            if plan.syncing {
-                return Ok(());
-            }
-            if plan.current == plan.objects.len() {
-                if plan.finished || plan.syncing {
+            plan.advance_cursor();
+            if plan.low == plan.objects.len() {
+                if plan.finished || plan.sealing {
                     return Ok(());
                 }
                 // The seal on the bundle, outside the lock like any sync.
                 // The store goes first: a completed bundle looks exactly
                 // as one fetched without a store, and the directory sync
                 // behind it is what makes the removal durable too.
-                plan.syncing = true;
+                plan.sealing = true;
                 drop(plan);
                 let removed = remove_store_files(&self.bundle);
                 let synced =
                     removed.and_then(|()| crate::sync_directories(&self.bundle).map(|_| ()));
                 let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
+                plan.sealing = false;
                 if synced.is_err() {
                     plan.abandoned = true;
                 }
@@ -1461,11 +1554,25 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.finished = true;
                 return Ok(());
             }
-            let at = plan.current;
+            if plan.abandoned {
+                // Cancellation drains the window under this lock and
+                // discards what it drained; an object opened after it
+                // would be a sink nothing owns.
+                return Ok(());
+            }
+            if plan.in_flight() >= plan.window || plan.next_open == plan.objects.len() {
+                return Ok(());
+            }
+            // Taken under the lock before anything is dropped, so exactly
+            // one rail opens each index however long its sink factory or
+            // its completion hook runs outside the lock. This is what the
+            // cursor comparison after a hook used to stand for, and it is
+            // the whole of the one-rail-per-index invariant.
+            let at = plan.next_open;
+            plan.next_open += 1;
             let planned = plan.objects.get(at).ok_or(Error::InvalidBundle)?;
             let object = planned.object;
             let mut whole_from_before = planned.fully_resumed();
-            let sink_chosen = planned.sink_chosen;
             let mut planned_resumed = planned.resumed.clone();
             let receive_object = ReceiveObject {
                 object,
@@ -1476,9 +1583,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 .join("objects")
                 .join(crate::object_name(&object.root));
             let custom = if let Some(factory) = &self.seams.sink {
-                if sink_chosen {
-                    return Ok(());
-                }
                 let stale = match vot_platform_fs::guard_staging_file(&path) {
                     Ok(file) => Some(file),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1487,16 +1591,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                         return Err(error.into());
                     }
                 };
-                plan.objects[at].sink_chosen = true;
-                plan.syncing = true;
                 drop(plan);
                 let chosen = factory(self.receive_session, &receive_object);
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
                 if chosen.is_err() {
                     plan.abandoned = true;
                 }
                 let chosen = chosen?;
+                if plan.abandoned {
+                    drop(plan);
+                    return discard_open(chosen);
+                }
                 if !planned_resumed.is_empty() {
                     let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
                     if let Some(store) = &plan.store {
@@ -1518,7 +1623,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     whole_from_before = false;
                 }
                 let Some(chosen) = chosen else {
-                    plan.current += 1;
+                    plan.objects[at].done = true;
                     continue;
                 };
                 Some(chosen)
@@ -1528,15 +1633,17 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             if custom_flush_due(object.length, whole_from_before, path.exists())
                 && let Some(sink) = &custom
             {
-                plan.syncing = true;
                 drop(plan);
                 let synced = sink.flush();
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
                 if synced.is_err() {
                     plan.abandoned = true;
                 }
                 synced?;
+                if plan.abandoned {
+                    drop(plan);
+                    return discard_open(custom);
+                }
             }
             if object.length == 0 {
                 // Nothing to fetch or verify; the empty object simply is.
@@ -1545,7 +1652,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 if custom.is_none() && !path.exists() {
                     crate::write_new_synced(&path, &[])?;
                 }
-                plan.syncing = true;
                 drop(plan);
                 let completed = self
                     .seams
@@ -1553,18 +1659,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
                 if completed.is_err() {
                     plan.abandoned = true;
                 }
                 completed?;
-                plan.current += 1;
+                plan.objects[at].done = true;
+                if plan.abandoned {
+                    // Durable and told to its consumer, so it counts
+                    // toward the cursor and is never discarded.
+                    return Ok(());
+                }
                 continue;
             }
             if whole_from_before && path.exists() {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
-                plan.syncing = true;
                 drop(plan);
                 let completed = self
                     .seams
@@ -1572,17 +1681,18 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.syncing = false;
                 if completed.is_err() {
                     plan.abandoned = true;
                 }
                 completed?;
-                if plan.current != at {
-                    return Ok(());
-                }
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.carried_before = plan.carried_before.saturating_add(object.length);
-                plan.current += 1;
+                plan.objects[at].done = true;
+                if plan.abandoned {
+                    // Durable and told to its consumer, so it counts
+                    // toward the cursor and is never discarded.
+                    return Ok(());
+                }
                 continue;
             }
             let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
@@ -1591,7 +1701,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             } else {
                 // The checkpoint outlived its file; clear the store too,
                 // or a later resume would trust bytes nobody placed.
-                let at = plan.current;
                 if !plan.objects[at].resumed.is_empty() {
                     if let Some(store) = &plan.store
                         && let Ok(mut store) = store.lock()
@@ -1617,24 +1726,23 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 CountingSink::create(&path, object.length, durable)?
             });
             self.receiver.admit(subject, Box::new(Arc::clone(&sink)))?;
-            self.rail.admitted = Some((plan.current, subject));
-            plan.active = Some(ActiveSink {
-                sink,
-                complete: self.seams.complete.clone(),
-                receive_session: self.receive_session,
-            });
-            plan.next_offset = 0;
-            // The resumed extents seed both accounts: coverage, so the
-            // object completes when the gaps do, and the skip set, so the
-            // handout never asks for what is already placed.
-            plan.covered = CoverageMap::seeded(resumed.clone());
-            plan.skip = resumed;
-            // Released before the requests are issued: the handout takes
-            // the same lock, and holding it here would deadlock this
-            // rail's own thread.
-            drop(plan);
-            self.issue_ranges()?;
-            return Ok(());
+            self.rail.admitted.insert(at, subject);
+            plan.active.insert(
+                at,
+                ActiveObject {
+                    sink,
+                    complete: self.seams.complete.clone(),
+                    receive_session: self.receive_session,
+                    subject,
+                    next_offset: 0,
+                    // The resumed extents seed both accounts: coverage, so
+                    // the object completes when the gaps do, and the skip
+                    // set, so the handout never asks for what is placed.
+                    covered: CoverageMap::seeded(resumed.clone()),
+                    skip: resumed,
+                    syncing: false,
+                },
+            );
         }
         Err(Error::InvalidBundle)
     }
@@ -1668,7 +1776,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 return Ok(());
             }
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-            let Some((object, offset, length)) = plan.next_span()? else {
+            let Some((at, object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
             let request_id = Self::request_identifier(&mut self.rail.next_request)?;
@@ -1681,7 +1789,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     length,
                 }),
             )?;
-            plan.take(offset, length)?;
+            plan.take(at, offset, length)?;
             self.rail.taken_bytes = self.rail.taken_bytes.saturating_add(length);
             self.report.progress = self.report.progress.saturating_add(1);
         }

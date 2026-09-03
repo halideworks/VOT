@@ -124,10 +124,10 @@ not negotiate it. It sends no application or authentication frame first.
 
 The `GOAWAY` payload is one QUIC varint containing the transfer-object cursor.
 Transfer objects are unique stored object roots in first-seen manifest order.
-The cursor counts objects the sender has completed, skipped, found whole, or
-found empty. It starts at zero and never decreases locally. A repeated peer
-cursor lower than or equal to the first accepted cursor is idempotent; an
-increase is `MALFORMED_FRAME`.
+The cursor counts the objects, in manifest order, up to the first one the
+sender has not completed, skipped, found whole, or found empty. It starts at
+zero and never decreases locally. A repeated peer cursor lower than or equal
+to the first accepted cursor is idempotent; an increase is `MALFORMED_FRAME`.
 
 The `ERROR` payload is a registered error-code QUIC varint followed by optional
 opaque diagnostic bytes. Diagnostics obey the 64 KiB frame limit and the

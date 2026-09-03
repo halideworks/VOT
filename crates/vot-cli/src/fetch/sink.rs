@@ -2,7 +2,7 @@
 
 use super::{
     Arc, AtomicU64, Error, FetchPlan, FileSink, Mutex, Ordering, Path, PathBuf, ReceiveSink,
-    ResumeStore, SubjectId, durable_units, subject_of, total_units_of,
+    ResumeStore, SubjectId, durable_units, total_units_of,
 };
 
 /// Bytes placed between stride flushes.
@@ -77,10 +77,10 @@ impl DurableHook {
     pub(crate) fn flush(&self, sink: &dyn ReceiveSink) {
         let covered = self.plan.upgrade().and_then(|plan| {
             let plan = plan.lock().ok()?;
-            // Coverage is the current object's; a sink outliving its
-            // object flushes without a claim to make.
-            (plan.objects.get(plan.current).map(subject_of) == Some(self.subject))
-                .then(|| plan.covered.extents().clone())
+            // Coverage is that object's own; a sink outliving its object
+            // leaves the window and flushes without a claim to make.
+            let (_, active) = plan.in_window(self.subject)?;
+            Some(active.covered.extents().clone())
         });
         if sink.flush().is_err() {
             // Nothing durable to claim; the completion sync will tell
@@ -258,11 +258,12 @@ pub(crate) const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use vot_scheduler::RangeSink as _;
 
-    struct FailingSink;
+    /// A sink that fails everything asked of it.
+    pub(in crate::fetch) struct FailingSink;
 
     impl vot_scheduler::RangeSink for FailingSink {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {

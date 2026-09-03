@@ -153,11 +153,50 @@ pub(crate) mod tests {
     use crate::{BundleServer, KeyMaterial, ServeConnection, build_bundle, receive_bundle};
     use vot_transport_api::ConnectionId;
 
-    fn active(sink: Arc<CountingSink>) -> ActiveSink {
-        ActiveSink {
+    fn active(subject: SubjectId, sink: Arc<CountingSink>) -> ActiveObject {
+        ActiveObject {
             sink,
             complete: None,
             receive_session: ReceiveSessionId(0),
+            subject,
+            next_offset: 0,
+            covered: CoverageMap::new(),
+            skip: BTreeMap::new(),
+            syncing: false,
+        }
+    }
+
+    /// A plan holding one object of `length` in its window, on a sink that
+    /// keeps nothing: what these tests are about is the accounts.
+    fn windowed(length: u64) -> FetchPlan {
+        let planned = PlannedObject::fresh(frames::ObjectId {
+            suite: 1,
+            root: [9; 32],
+            length,
+        });
+        let subject = subject_of(&planned);
+        let sink = Arc::new(CountingSink::custom(Box::new(Arc::new(SeamSink {
+            bytes: Mutex::new(vec![0; usize::try_from(length).unwrap()]),
+            flushed: AtomicBool::new(false),
+            discarded: AtomicBool::new(false),
+        }))));
+        FetchPlan {
+            summary: PackageSummary {
+                root: [0; 32],
+                logical_length: 0,
+                entries: 0,
+            },
+            objects: vec![planned],
+            active: BTreeMap::from([(0, active(subject, sink))]),
+            low: 0,
+            next_open: 1,
+            window: 1,
+            placed_before: 0,
+            carried_before: 0,
+            abandoned: false,
+            sealing: false,
+            store: None,
+            finished: false,
         }
     }
 
@@ -445,10 +484,10 @@ pub(crate) mod tests {
         });
         assert!(run_to_end(&server, &mut session, &mut connection, &mut fetcher, false).is_err());
         let plan = fetcher.locked_plan().unwrap();
-        assert_eq!(plan.current, 0);
-        assert!(!plan.syncing);
+        assert_eq!(plan.low, 0);
+        assert!(!plan.active[&0].syncing);
         assert!(plan.abandoned);
-        assert!(plan.active.is_some());
+        assert!(plan.active.contains_key(&0));
         discard(&[&bundle, &output]);
     }
 
@@ -481,7 +520,7 @@ pub(crate) mod tests {
         let _ = planned(&server, &mut session, &mut connection, &mut fetcher);
         let mut sequence = 0;
         for _ in 0..ROUND_BUDGET {
-            if fetcher.locked_plan().unwrap().current == 1 {
+            if fetcher.locked_plan().unwrap().low == 1 {
                 break;
             }
             round(
@@ -492,8 +531,8 @@ pub(crate) mod tests {
                 &mut sequence,
             );
         }
-        assert_eq!(fetcher.locked_plan().unwrap().current, 1);
-        assert!(fetcher.locked_plan().unwrap().active.is_some());
+        assert_eq!(fetcher.locked_plan().unwrap().low, 1);
+        assert!(fetcher.locked_plan().unwrap().active.contains_key(&1));
 
         // Remove answers already handed to the fake carrier, then put a
         // fresh answer request immediately ahead of GOAWAY. This isolates
@@ -676,7 +715,7 @@ pub(crate) mod tests {
         primary.rail.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         primary.advance().unwrap();
-        assert!(plan.lock().unwrap().active.is_some());
+        assert!(plan.lock().unwrap().active.contains_key(&0));
         let mut secondary = BundleFetcher::join(
             Loopback::default(),
             &output,
@@ -879,36 +918,37 @@ pub(crate) mod tests {
                 entries: 0,
             },
             objects: vec![first, second],
-            current: 0,
-            active: Some(active(sink0)),
+            active: BTreeMap::from([(0, active(s0, sink0))]),
+            low: 0,
+            next_open: 1,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
         fetcher.advance().unwrap();
         assert_eq!(
             fetcher.rail.admitted,
-            Some((0, s0)),
+            BTreeMap::from([(0, s0)]),
             "the first object is this rail's"
         );
 
         // Another rail saw the first object whole and moved the plan on.
         {
             let mut plan = fetcher.locked_plan().unwrap();
-            plan.current = 1;
-            plan.active = Some(active(sink1));
+            plan.objects[0].done = true;
+            plan.low = 1;
+            plan.next_open = 2;
+            plan.active = BTreeMap::from([(1, active(s1, sink1))]);
         }
         fetcher.advance().unwrap();
         assert_eq!(
             fetcher.rail.admitted,
-            Some((1, s1)),
-            "the current object is admitted"
+            BTreeMap::from([(1, s1)]),
+            "the object in the window is admitted"
         );
         assert!(
             !fetcher.receiver.abandon(s0),
@@ -930,15 +970,14 @@ pub(crate) mod tests {
                 entries: 0,
             },
             objects: Vec::new(),
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: 1,
             placed_before: 7,
             carried_before: 7,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: true,
         })));
@@ -954,102 +993,150 @@ pub(crate) mod tests {
 
     #[test]
     pub(crate) fn the_handout_commits_forward() {
-        let mut plan = FetchPlan {
-            summary: PackageSummary {
-                root: [0; 32],
-                logical_length: 0,
-                entries: 0,
-            },
-            objects: Vec::new(),
-            current: 0,
-            active: None,
-            placed_before: 0,
-            carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
-            abandoned: false,
-            skip: BTreeMap::new(),
-            store: None,
-            finished: false,
-        };
-        plan.take(5, 5).unwrap();
-        assert_eq!(plan.next_offset, 10, "a committed span moves the handout");
-        plan.take(10, 5).unwrap();
-        assert_eq!(plan.next_offset, 15);
+        let mut plan = windowed(0);
+        plan.take(0, 5, 5).unwrap();
+        assert_eq!(
+            plan.active[&0].next_offset, 10,
+            "a committed span moves the handout"
+        );
+        plan.take(0, 10, 5).unwrap();
+        assert_eq!(plan.active[&0].next_offset, 15);
+        assert!(
+            plan.take(1, 0, 5).is_err(),
+            "a span for an object outside the window commits nothing"
+        );
     }
 
     #[test]
     #[should_panic(expected = "backwards")]
     #[cfg(debug_assertions)]
     pub(crate) fn a_span_behind_the_handout_panics_instead_of_spinning() {
-        let mut plan = FetchPlan {
-            summary: PackageSummary {
-                root: [0; 32],
-                logical_length: 0,
-                entries: 0,
-            },
-            objects: Vec::new(),
-            current: 0,
-            active: None,
-            placed_before: 0,
-            carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
-            abandoned: false,
-            skip: BTreeMap::new(),
-            store: None,
-            finished: false,
-        };
-        plan.take(0, 8).unwrap();
-        let _ = plan.take(0, 8);
+        let mut plan = windowed(0);
+        plan.take(0, 0, 8).unwrap();
+        let _ = plan.take(0, 0, 8);
     }
 
     #[test]
     pub(crate) fn coverage_counts_every_byte_once() {
         // Coalescing counts each byte once, so a duplicate range cannot
         // complete an object with a hole.
-        let mut plan = FetchPlan {
-            summary: PackageSummary {
-                root: [0; 32],
-                logical_length: 0,
-                entries: 0,
-            },
-            objects: Vec::new(),
-            current: 0,
-            active: None,
-            placed_before: 0,
-            carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
-            abandoned: false,
-            skip: BTreeMap::new(),
-            store: None,
-            finished: false,
-        };
-        plan.cover(0, 10);
-        assert_eq!(plan.covered.bytes(), 10);
-        plan.cover(5, 10);
-        assert_eq!(plan.covered.bytes(), 15, "the overlap counts once");
-        plan.cover(5, 5);
-        assert_eq!(plan.covered.bytes(), 15, "a duplicate counts never");
-        plan.cover(20, 5);
-        assert_eq!(plan.covered.bytes(), 20, "a gap stays a gap");
-        plan.cover(15, 5);
-        assert_eq!(plan.covered.bytes(), 25, "the gap filled exactly");
+        let mut plan = windowed(0);
+        plan.cover(0, 0, 10);
+        assert_eq!(plan.active[&0].covered.bytes(), 10);
+        plan.cover(0, 5, 10);
         assert_eq!(
-            plan.covered.extents().iter().collect::<Vec<_>>(),
+            plan.active[&0].covered.bytes(),
+            15,
+            "the overlap counts once"
+        );
+        plan.cover(0, 5, 5);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            15,
+            "a duplicate counts never"
+        );
+        plan.cover(0, 20, 5);
+        assert_eq!(plan.active[&0].covered.bytes(), 20, "a gap stays a gap");
+        plan.cover(0, 15, 5);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            25,
+            "the gap filled exactly"
+        );
+        assert_eq!(
+            plan.active[&0].covered.extents().iter().collect::<Vec<_>>(),
             vec![(&0, &25)],
             "adjacent extents coalesce to one"
         );
-        plan.cover(0, 25);
-        assert_eq!(plan.covered.bytes(), 25, "the whole again changes nothing");
-        plan.cover(30, 0);
-        assert_eq!(plan.covered.bytes(), 25, "an empty cover covers nothing");
-        plan.cover(u64::MAX, 2);
-        assert_eq!(plan.covered.bytes(), 25, "an overflowing cover is refused");
+        plan.cover(0, 0, 25);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            25,
+            "the whole again changes nothing"
+        );
+        plan.cover(0, 30, 0);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            25,
+            "an empty cover covers nothing"
+        );
+        plan.cover(0, u64::MAX, 2);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            25,
+            "an overflowing cover is refused"
+        );
+        plan.cover(1, 0, 10);
+        assert_eq!(
+            plan.active[&0].covered.bytes(),
+            25,
+            "a cover for an object outside the window books nowhere"
+        );
+    }
+
+    #[test]
+    pub(crate) fn the_cursor_advances_only_over_the_in_order_durable_prefix() {
+        // The cursor is the prefix, not the count of what is done: an
+        // object durable above a hole waits for the hole, so a `GOAWAY`
+        // never names an object this fetch does not have.
+        let mut plan = windowed(0);
+        plan.active.clear();
+        plan.next_open = 0;
+        plan.objects = (0..3)
+            .map(|root| {
+                PlannedObject::fresh(frames::ObjectId {
+                    suite: 1,
+                    root: [root; 32],
+                    length: 1,
+                })
+            })
+            .collect();
+
+        plan.objects[1].done = true;
+        plan.advance_cursor();
+        assert_eq!(plan.low, 0, "an object done above a hole is not the cursor");
+
+        plan.objects[0].done = true;
+        plan.advance_cursor();
+        assert_eq!(plan.low, 2, "closing the hole takes the whole prefix");
+
+        plan.objects[2].done = true;
+        plan.advance_cursor();
+        assert_eq!(plan.low, 3, "and the last one reaches the object count");
+    }
+
+    #[test]
+    pub(crate) fn cancellation_waits_for_a_reserved_transition() {
+        // A rail syncing an object or sealing the bundle owns a transition
+        // the cursor is about to move; cancelling through it would name a
+        // cursor that is already stale.
+        for (syncing, sealing) in [(true, false), (false, true)] {
+            let output = temporary(&format!("cancel-waits-{syncing}-{sealing}"));
+            let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            let cancellation = CancellationHandle::default();
+            fetcher.set_receive_seams(ReceiveSeams::new(cancellation.clone()));
+            let mut plan = windowed(8);
+            plan.active.get_mut(&0).unwrap().syncing = syncing;
+            plan.sealing = sealing;
+            fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+            cancellation.cancel();
+
+            assert_eq!(
+                fetcher.service().unwrap(),
+                FetchStatus::Active,
+                "cancellation ran through a reserved transition"
+            );
+            assert!(fetcher.cancelled.is_none());
+            assert!(
+                !fetcher.locked_plan().unwrap().abandoned,
+                "the plan was abandoned before the transition settled"
+            );
+            assert!(
+                fetcher.locked_plan().unwrap().active.contains_key(&0),
+                "the window was drained before the transition settled"
+            );
+            discard(&[&output]);
+        }
     }
 
     #[test]
@@ -1755,11 +1842,11 @@ pub(crate) mod tests {
                     &mut fetcher,
                     &mut sequence,
                 );
-                if fetcher.locked_plan().is_some_and(|plan| plan.current == 1) {
+                if fetcher.locked_plan().is_some_and(|plan| plan.low == 1) {
                     break;
                 }
             }
-            assert_eq!(fetcher.locked_plan().unwrap().current, 1);
+            assert_eq!(fetcher.locked_plan().unwrap().low, 1);
             skipped = fetcher.locked_plan().unwrap().objects[0].object.root;
         }
 
@@ -1815,14 +1902,12 @@ pub(crate) mod tests {
             let length = object.length;
             {
                 let mut held = plan.lock().unwrap();
-                held.active = None;
+                held.active.clear();
+                held.next_open = 0;
                 held.objects[0].sink_chosen = false;
                 held.objects[0]
                     .resumed
                     .insert(0, if whole { length } else { length / 2 });
-                held.next_offset = 0;
-                held.covered = CoverageMap::new();
-                held.skip.clear();
             }
 
             let custom = temporary(&format!("mixed-resume-custom-{name}"));
@@ -1847,11 +1932,12 @@ pub(crate) mod tests {
                 ..ReceiveSeams::default()
             });
             secondary.advance().unwrap();
+            secondary.issue_ranges().unwrap();
 
             let held = plan.lock().unwrap();
             assert!(held.objects[0].resumed.is_empty());
-            assert!(held.covered.extents().is_empty());
-            assert!(held.skip.is_empty());
+            assert!(held.active[&0].covered.extents().is_empty());
+            assert!(held.active[&0].skip.is_empty());
             assert_eq!(secondary.rail.taken_bytes, length);
             assert!(
                 !output
@@ -1880,7 +1966,8 @@ pub(crate) mod tests {
         fs::write(&path, b"stale").unwrap();
         {
             let mut held = plan.lock().unwrap();
-            held.active = None;
+            held.active.clear();
+            held.next_open = 0;
             held.objects[0].sink_chosen = false;
         }
         let replaced = path.clone();
@@ -1913,7 +2000,8 @@ pub(crate) mod tests {
             .join(crate::object_name(&object.root));
         {
             let mut held = plan.lock().unwrap();
-            held.active = None;
+            held.active.clear();
+            held.next_open = 0;
             held.objects[0].sink_chosen = false;
         }
         fs::remove_file(&path).unwrap();
@@ -1948,7 +2036,8 @@ pub(crate) mod tests {
             .join(crate::object_name(&object.root));
         {
             let mut held = plan.lock().unwrap();
-            held.active = None;
+            held.active.clear();
+            held.next_open = 0;
             held.objects[0].sink_chosen = false;
             held.objects[0].resumed.insert(0, object.length / 2);
         }
@@ -1974,10 +2063,11 @@ pub(crate) mod tests {
         });
 
         secondary.advance().unwrap();
+        secondary.issue_ranges().unwrap();
         let held = plan.lock().unwrap();
         assert!(held.objects[0].resumed.is_empty());
-        assert!(held.covered.extents().is_empty());
-        assert!(held.skip.is_empty());
+        assert!(held.active[&0].covered.extents().is_empty());
+        assert!(held.active[&0].skip.is_empty());
         assert_eq!(secondary.rail.taken_bytes, object.length);
         drop(held);
         discard(&[&bundle, &output]);
@@ -2033,7 +2123,7 @@ pub(crate) mod tests {
             );
             if resumed
                 .locked_plan()
-                .is_some_and(|plan| plan.active.is_some())
+                .is_some_and(|plan| !plan.active.is_empty())
             {
                 break;
             }
@@ -2230,6 +2320,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub(crate) fn the_pass_budget_covers_opening_and_completing_every_object() {
+        // Two passes an object, and one that finds nothing left: a budget
+        // below that would fail a plan that is moving.
+        for (objects, passes) in [(0, 2), (1, 4), (4, 10)] {
+            assert_eq!(protocol::advance_passes(objects), passes);
+        }
+    }
+
+    #[test]
     pub(crate) fn the_stride_crossing_is_exact_at_its_edges() {
         assert_eq!(stride_after(0), FLUSH_STRIDE_BYTES);
         assert_eq!(stride_after(1), FLUSH_STRIDE_BYTES);
@@ -2303,28 +2402,35 @@ pub(crate) mod tests {
                 entries: 0,
             },
             objects: vec![planned],
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 1,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::seeded(covered),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: Some(Arc::clone(&store)),
             finished: false,
         }));
-        let sink = CountingSink::create(
-            &output.join("h.obj"),
-            object.length,
-            Some(DurableHook {
-                plan: Arc::downgrade(&plan),
-                store: Arc::clone(&store),
-                subject,
-            }),
-        )
-        .unwrap();
+        let sink = Arc::new(
+            CountingSink::create(
+                &output.join("h.obj"),
+                object.length,
+                Some(DurableHook {
+                    plan: Arc::downgrade(&plan),
+                    store: Arc::clone(&store),
+                    subject,
+                }),
+            )
+            .unwrap(),
+        );
+        {
+            let mut held = plan.lock().unwrap();
+            let mut entry = active(subject, Arc::clone(&sink));
+            entry.covered = CoverageMap::seeded(covered);
+            held.active.insert(0, entry);
+        }
 
         sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
         assert_eq!(
@@ -2339,18 +2445,24 @@ pub(crate) mod tests {
             "the whole units inside the snapshot, and no more"
         );
 
-        // The plan moves on; a late flush of the old sink claims nothing.
+        // The window moves on; a late flush of the old sink claims nothing,
+        // and the object that took its place is not its to claim either.
         let other = PlannedObject::fresh(frames::ObjectId {
             suite: 1,
             root: [6; 32],
             length: unit,
         });
+        let other_subject = subject_of(&other);
         {
             let mut plan = plan.lock().unwrap();
             plan.objects.push(other);
-            plan.current = 1;
-            plan.covered = CoverageMap::new();
-            plan.covered.insert(0, unit);
+            plan.objects[0].done = true;
+            plan.low = 1;
+            plan.next_open = 2;
+            plan.active.clear();
+            let mut entry = active(other_subject, Arc::clone(&sink));
+            entry.covered.insert(0, unit);
+            plan.active.insert(1, entry);
         }
         let before = store.lock().unwrap().checkpointed(subject).unwrap().count();
         sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
@@ -2377,42 +2489,44 @@ pub(crate) mod tests {
         // guard removes the directory when it goes, and the sink needs it.
         let output = temporary("handout-skip");
         crate::create_private_directory(&output).unwrap();
-        let plan = FetchPlan {
+        let planned = PlannedObject::fresh(object);
+        let mut entry = active(
+            subject_of(&planned),
+            Arc::new(CountingSink::create(&output.join("s.obj"), object.length, None).unwrap()),
+        );
+        entry.skip = skip;
+        let mut plan = FetchPlan {
             summary: PackageSummary {
                 root: [0; 32],
                 logical_length: 0,
                 entries: 0,
             },
-            objects: vec![PlannedObject::fresh(object)],
-            current: 0,
-            active: Some(active(Arc::new(
-                CountingSink::create(&output.join("s.obj"), object.length, None).unwrap(),
-            ))),
+            objects: vec![planned],
+            active: BTreeMap::from([(0, entry)]),
+            low: 0,
+            next_open: 1,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip,
+            sealing: false,
             store: None,
             finished: false,
         };
-        let (_, offset, length) = plan.next_span().unwrap().unwrap();
+        let (at, _, offset, length) = plan.next_span().unwrap().unwrap();
         assert_eq!(
-            (offset, length),
-            (0, MAX_REQUESTED_RANGE),
+            (at, offset, length),
+            (0, 0, MAX_REQUESTED_RANGE),
             "clipped at the hole"
         );
-        let mut plan = plan;
-        plan.take(offset, length).unwrap();
-        let (_, offset, length) = plan.next_span().unwrap().unwrap();
+        plan.take(at, offset, length).unwrap();
+        let (at, _, offset, length) = plan.next_span().unwrap().unwrap();
         assert_eq!(
-            (offset, length),
-            (2 * MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE),
+            (at, offset, length),
+            (0, 2 * MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE),
             "the walk lands past the durable middle"
         );
-        plan.take(offset, length).unwrap();
+        plan.take(at, offset, length).unwrap();
         assert!(plan.next_span().unwrap().is_none(), "nothing more is owed");
     }
 
@@ -2793,15 +2907,14 @@ pub(crate) mod tests {
         fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject::fresh(empty)],
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
@@ -2820,15 +2933,14 @@ pub(crate) mod tests {
         skipped.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject::fresh(empty)],
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
@@ -2857,15 +2969,14 @@ pub(crate) mod tests {
         custom.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject::fresh(empty)],
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
@@ -2919,19 +3030,19 @@ pub(crate) mod tests {
         resumed.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![planned],
-            current: 0,
-            active: None,
+            active: BTreeMap::new(),
+            low: 0,
+            next_open: 0,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
         resumed.advance().unwrap();
+        resumed.issue_ranges().unwrap();
         assert!(!sink.flushed.load(Ordering::Acquire));
         assert!(!resumed.complete());
         assert!(resumed.locked_plan().unwrap().objects[0].resumed.is_empty());
@@ -3158,7 +3269,8 @@ pub(crate) mod tests {
             );
             assert_eq!(status, FetchStatus::Active);
             // Everything asked for, and its answer waiting to be taken.
-            if !fetcher.has_backlog() && fetcher.locked_plan().is_some_and(|p| p.active.is_some()) {
+            if !fetcher.has_backlog() && fetcher.locked_plan().is_some_and(|p| !p.active.is_empty())
+            {
                 answered = true;
                 break;
             }
@@ -3469,7 +3581,7 @@ pub(crate) mod tests {
         }
         assert!(asked, "the rail never asked for a span");
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             2 * MAX_REQUESTED_RANGE,
             "the window is what it asked for"
         );
@@ -3512,12 +3624,15 @@ pub(crate) mod tests {
 
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             3 * MAX_REQUESTED_RANGE,
             "an arrived cover did not buy the next request"
         );
         assert_eq!(
-            fetcher.locked_plan().unwrap().covered.extents().len(),
+            fetcher.locked_plan().unwrap().active[&0]
+                .covered
+                .extents()
+                .len(),
             0,
             "coverage advanced without a witness"
         );
@@ -3543,15 +3658,17 @@ pub(crate) mod tests {
         fetcher.plan = Some(Arc::new(Mutex::new(FetchPlan {
             summary,
             objects: vec![PlannedObject::fresh(object)],
-            current: 0,
-            active: Some(active(Arc::clone(&sink))),
+            active: BTreeMap::from([(
+                0,
+                active(SubjectId::try_from(object).unwrap(), Arc::clone(&sink)),
+            )]),
+            low: 0,
+            next_open: 1,
+            window: 1,
             placed_before: 0,
             carried_before: 0,
-            next_offset: 0,
-            covered: CoverageMap::new(),
-            syncing: false,
             abandoned: false,
-            skip: BTreeMap::new(),
+            sealing: false,
             store: None,
             finished: false,
         })));
@@ -3562,7 +3679,7 @@ pub(crate) mod tests {
             fetcher.rail.pending.clear();
         }
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             OUTSTANDING_REQUEST_BYTES,
             "asked for more than may be outstanding"
         );
@@ -3573,7 +3690,7 @@ pub(crate) mod tests {
         assert_eq!(fetcher.receiver.arrived_range_bytes(), 0);
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             OUTSTANDING_REQUEST_BYTES,
             "a full window bought a request"
         );
@@ -3585,7 +3702,7 @@ pub(crate) mod tests {
         fetcher.rail.taken_bytes = OUTSTANDING_REQUEST_BYTES - 1;
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
             "a byte of room did not buy the next request"
         );
@@ -3596,14 +3713,14 @@ pub(crate) mod tests {
         // A span is committed only once its frame is queued, or a failure
         // leaves a hole nobody re-requests.
         fetcher.rail.taken_bytes = 0;
-        let owed = fetcher.locked_plan().unwrap().next_offset;
+        let owed = fetcher.locked_plan().unwrap().active[&0].next_offset;
         fetcher.rail.next_request = u64::MAX;
         assert!(
             fetcher.issue_ranges().is_err(),
             "the identifier space ended"
         );
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             owed,
             "a span whose frame never queued was consumed"
         );
@@ -3617,14 +3734,14 @@ pub(crate) mod tests {
             .store(40 * MAX_REQUESTED_RANGE, Ordering::Relaxed);
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             owed,
             "the shared sink paid for a rail's spans"
         );
         fetcher.set_proving_threads(0).unwrap();
         fetcher.issue_ranges().unwrap();
         assert_eq!(
-            fetcher.locked_plan().unwrap().next_offset,
+            fetcher.locked_plan().unwrap().active[&0].next_offset,
             owed,
             "an inline fetch paced on the shared sink"
         );

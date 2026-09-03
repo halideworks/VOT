@@ -5,11 +5,60 @@ use super::{
     PackageSummary, ReceiveSessionId, ResumeStore, SubjectId, frames, range_span, total_units_of,
 };
 
-#[derive(Clone)]
-pub(crate) struct ActiveSink {
+/// One object in flight: its sink and the accounts that describe it.
+///
+/// Every field here was a field of the plan when the plan held exactly one
+/// object; the window holds one of these per object it is fetching.
+pub(crate) struct ActiveObject {
     pub(crate) sink: Arc<CountingSink>,
     pub(crate) complete: Option<CompletionHook>,
     pub(crate) receive_session: ReceiveSessionId,
+    pub(crate) subject: SubjectId,
+    /// Where this object's next range request starts.
+    pub(crate) next_offset: u64,
+    /// Settled extents of this object; completion is full coverage, each
+    /// byte counted once however many rails a misbehaving server answers
+    /// with the same range.
+    pub(crate) covered: CoverageMap,
+    /// This object's resumed extents, which the handout walks around: what
+    /// a previous fetch made durable is never asked for.
+    pub(crate) skip: BTreeMap<u64, u64>,
+    /// Raised by the rail that saw this object whole and is syncing it
+    /// outside the plan lock, so no second rail syncs or completes it.
+    pub(crate) syncing: bool,
+}
+
+impl ActiveObject {
+    /// The next range a taker would request of this object, uncommitted.
+    ///
+    /// Steps over resumed extents so durable ranges are never re-asked
+    /// and no request overlaps one.
+    fn next_span(&self, length: u64) -> Result<Option<(u64, u64)>, Error> {
+        let mut offset = self.next_offset;
+        // Bounded by the extents themselves: each pass either lands past
+        // one more of them or answers, so the walk ends within the skip
+        // set's own size.
+        for _ in 0..=self.skip.len() {
+            if let Some((at, span)) = self
+                .skip
+                .range(..=offset)
+                .next_back()
+                .map(|(at, span)| (*at, *span))
+                && at.saturating_add(span) > offset
+            {
+                offset = at.saturating_add(span);
+                continue;
+            }
+            let Some((offset, mut span)) = range_span(offset, length) else {
+                return Ok(None);
+            };
+            if let Some(next_skip) = self.skip.range(offset..).next().map(|(at, _)| *at) {
+                span = span.min(next_skip.saturating_sub(offset));
+            }
+            return Ok(Some((offset, span)));
+        }
+        Err(Error::InvalidBundle)
+    }
 }
 
 /// Store reservations for objects with units to checkpoint; zero-length
@@ -148,6 +197,9 @@ pub(crate) struct PlannedObject {
     pub(crate) sink_chosen: bool,
     /// Byte extents a previous fetch made durable; the handout skips them.
     pub(crate) resumed: BTreeMap<u64, u64>,
+    /// Whether this object is durable: fetched whole, found whole, empty,
+    /// or skipped. The cursor is the in-order prefix of these.
+    pub(crate) done: bool,
 }
 
 impl PlannedObject {
@@ -157,6 +209,7 @@ impl PlannedObject {
             entries: Vec::new(),
             sink_chosen: false,
             resumed: BTreeMap::new(),
+            done: false,
         }
     }
 
@@ -193,6 +246,7 @@ pub(crate) struct CoverageMap {
 }
 
 impl CoverageMap {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             extents: BTreeMap::new(),
@@ -263,10 +317,15 @@ impl CoverageMap {
 pub(crate) struct FetchPlan {
     pub(crate) summary: PackageSummary,
     pub(crate) objects: Vec<PlannedObject>,
-    pub(crate) current: usize,
-    /// The sink the current object's verified ranges flow into, kept for
-    /// the sync that makes its bytes durable before the fetch moves on.
-    pub(crate) active: Option<ActiveSink>,
+    /// The objects in flight, by plan index. Ranges are handed out from
+    /// whichever of them still has some, and each completes on its own.
+    pub(crate) active: BTreeMap<usize, ActiveObject>,
+    /// Objects `[0, low)` are done in manifest order: the `GOAWAY` cursor.
+    pub(crate) low: usize,
+    /// The first object not yet opened; never below `low`.
+    pub(crate) next_open: usize,
+    /// Objects this plan opens before waiting for one to complete.
+    pub(crate) window: usize,
     /// Bytes placed for objects already left behind, so what this fetch
     /// has settled only ever goes up.
     pub(crate) placed_before: u64,
@@ -276,21 +335,12 @@ pub(crate) struct FetchPlan {
     /// crossed the wire on this run from the ones that were on disk before
     /// it, which anything divided by this run's clock has to be.
     pub(crate) carried_before: u64,
-    /// Where the current object's next range request starts.
-    pub(crate) next_offset: u64,
-    /// Settled extents of the current object; completion is full coverage,
-    /// each byte counted once however many rails a misbehaving server
-    /// answers with the same range.
-    pub(crate) covered: CoverageMap,
-    /// Raised by the rail that saw the current object whole and is syncing
-    /// it outside this lock, so no second rail syncs or advances over it.
-    pub(crate) syncing: bool,
     /// Raised by a rail that failed, so the others stop instead of waiting
     /// out their stall budgets on spans nobody will answer.
     pub(crate) abandoned: bool,
-    /// The current object's resumed extents, which the handout walks
-    /// around: what a previous fetch made durable is never asked for.
-    pub(crate) skip: BTreeMap<u64, u64>,
+    /// Raised by the rail sealing the bundle outside this lock, so no
+    /// second rail seals it too.
+    pub(crate) sealing: bool,
     /// Resume store, shared by every rail through the plan.
     pub(crate) store: Option<Arc<Mutex<ResumeStore>>>,
     pub(crate) finished: bool,
@@ -299,61 +349,74 @@ pub(crate) struct FetchPlan {
 impl FetchPlan {
     /// The next range a taker would request, uncommitted and unpaced.
     ///
-    /// Steps over resumed extents so durable ranges are never re-asked
-    /// and no request overlaps one.
-    pub(crate) fn next_span(&self) -> Result<Option<(frames::ObjectId, u64, u64)>, Error> {
-        if self.active.is_none() {
-            return Ok(None);
-        }
-        let object = self
-            .objects
-            .get(self.current)
-            .ok_or(Error::InvalidBundle)?
-            .object;
-        let mut offset = self.next_offset;
-        // Bounded by the extents themselves: each pass either lands past
-        // one more of them or answers, so the walk ends within the skip
-        // set's own size.
-        for _ in 0..=self.skip.len() {
-            if let Some((at, length)) = self
-                .skip
-                .range(..=offset)
-                .next_back()
-                .map(|(at, length)| (*at, *length))
-                && at.saturating_add(length) > offset
-            {
-                offset = at.saturating_add(length);
-                continue;
+    /// Walks the window in index order, so a rail takes from the lowest
+    /// in-flight object that still owes something.
+    pub(crate) fn next_span(&self) -> Result<Option<(usize, frames::ObjectId, u64, u64)>, Error> {
+        for (index, active) in &self.active {
+            let object = self.objects.get(*index).ok_or(Error::InvalidBundle)?.object;
+            if let Some((offset, length)) = active.next_span(object.length)? {
+                return Ok(Some((*index, object, offset, length)));
             }
-            let Some((offset, mut length)) = range_span(offset, object.length) else {
-                return Ok(None);
-            };
-            if let Some(next_skip) = self.skip.range(offset..).next().map(|(at, _)| *at) {
-                length = length.min(next_skip.saturating_sub(offset));
-            }
-            return Ok(Some((object, offset, length)));
         }
-        Err(Error::InvalidBundle)
+        Ok(None)
     }
 
     /// Commits the span [`FetchPlan::next_span`] handed out.
     ///
     /// Called only once the span's frame is queued: committing before the
     /// frame exists would consume it on a failure that leaves a hole.
-    pub(crate) fn take(&mut self, offset: u64, length: u64) -> Result<(), Error> {
+    pub(crate) fn take(&mut self, index: usize, offset: u64, length: u64) -> Result<(), Error> {
+        let active = self.active.get_mut(&index).ok_or(Error::InvalidBundle)?;
         // A span behind the cursor would be asked for again forever; failing
         // here turns that spin into a panic the suite sees immediately.
         debug_assert!(
-            offset >= self.next_offset,
+            offset >= active.next_offset,
             "a committed span moved the handout backwards"
         );
-        self.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
+        active.next_offset = offset.checked_add(length).ok_or(Error::InvalidBundle)?;
         Ok(())
     }
 
-    /// Books a settled cover into the current object's coverage.
-    pub(crate) fn cover(&mut self, offset: u64, length: u64) {
-        self.covered.insert(offset, length);
+    /// Books a settled cover into that object's coverage.
+    pub(crate) fn cover(&mut self, index: usize, offset: u64, length: u64) {
+        if let Some(active) = self.active.get_mut(&index) {
+            active.covered.insert(offset, length);
+        }
+    }
+
+    /// The window entry holding `subject`, if it is still in flight.
+    pub(crate) fn in_window(&self, subject: SubjectId) -> Option<(usize, &ActiveObject)> {
+        self.active
+            .iter()
+            .find(|(_, active)| active.subject == subject)
+            .map(|(index, active)| (*index, active))
+    }
+
+    /// Objects opened and not yet done: what the window bound counts.
+    ///
+    /// Counted from the plan rather than from `active` because an object
+    /// being opened is not in `active` yet, and the rail opening it holds
+    /// no lock while a sink factory or a completion hook runs.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.objects
+            .get(self.low..self.next_open)
+            .unwrap_or_default()
+            .iter()
+            .filter(|planned| !planned.done)
+            .count()
+    }
+
+    /// Moves the cursor over the objects that are done in manifest order.
+    ///
+    /// An object done above a hole waits for the hole: the cursor is the
+    /// in-order durable prefix, never a count of what happens to be done.
+    pub(crate) fn advance_cursor(&mut self) {
+        for planned in self.objects.iter().skip(self.low) {
+            if !planned.done {
+                break;
+            }
+            self.low += 1;
+        }
     }
 }
 

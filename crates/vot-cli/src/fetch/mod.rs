@@ -2439,6 +2439,129 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_striped_fetch_runs_the_primary_seams_on_every_rail() {
+        // Six objects against a window of four: the last two are opened
+        // after the rails are running, so a rail opens one of them.
+        use std::collections::{BTreeSet, HashSet};
+        use std::sync::Condvar;
+        use std::sync::atomic::AtomicUsize;
+
+        type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
+
+        let files: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|at| (format!("o{at}.bin"), patterned(300_000 + at)))
+            .collect();
+        let contents: Vec<(&str, Vec<u8>)> = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+            .collect();
+        let (bundle, built) = built_bundle("striped-seams", &contents);
+        let output = temporary("striped-seams-fetched");
+        let custom = temporary("striped-seams-custom");
+        crate::create_private_directory(&custom).unwrap();
+
+        let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let serving_halves = Arc::clone(&halves);
+        let serving_bundle = bundle.to_path_buf();
+        let serving = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            crate::drive::serve_sessions(Some(2), || {
+                let (queue, arrived) = &*serving_halves;
+                let queue = queue.lock().expect("the accept queue");
+                let (mut queue, waited) = arrived
+                    .wait_timeout_while(queue, std::time::Duration::from_secs(20), |waiting| {
+                        waiting.is_empty()
+                    })
+                    .expect("the accept queue");
+                if waited.timed_out() {
+                    return Err(Error::CarrierUnavailable);
+                }
+                let carrier = queue.pop_front().expect("the wait held until one came");
+                crate::drive::ServeSession::begin(&server, carrier, crate::harness::not_required())
+            })
+        });
+
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connects);
+        let connect = move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let (client, serving) = crate::harness::duplex_pair();
+            let (queue, arrived) = &*halves;
+            queue.lock().expect("the accept queue").push_back(serving);
+            arrived.notify_all();
+            Ok(client)
+        };
+
+        // Opening threads, and whether one gave up waiting for a second.
+        let openers = Arc::new((Mutex::new((HashSet::new(), false)), Condvar::new()));
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let meeting = Arc::clone(&openers);
+        let recorded = Arc::clone(&opened);
+        let railed = Arc::clone(&connects);
+        let destination = custom.to_path_buf();
+        let seams = ReceiveSeams {
+            sink: Some(Arc::new(move |_, object: &ReceiveObject| {
+                let (threads, joined) = &*meeting;
+                let mut state = threads.lock().expect("the opener set");
+                state.0.insert(std::thread::current().id());
+                joined.notify_all();
+                // Only once a rail has a carrier: before that the primary is
+                // the only thread that can open anything, and waiting for a
+                // second would wait forever.
+                while state.0.len() < 2 && !state.1 && railed.load(Ordering::Relaxed) >= 2 {
+                    let (next, timeout) = joined
+                        .wait_timeout(state, std::time::Duration::from_secs(20))
+                        .expect("the opener set");
+                    state = next;
+                    if timeout.timed_out() {
+                        state.1 = true;
+                    }
+                }
+                drop(state);
+                let name = crate::object_name(&object.object.root);
+                recorded
+                    .lock()
+                    .expect("the opened names")
+                    .push(name.clone());
+                Ok(Some(Box::new(CountingSink::at(
+                    &destination.join(name),
+                    object.object.length,
+                )?)))
+            })),
+            ..ReceiveSeams::default()
+        };
+
+        let mut fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        fetcher.set_receive_seams(seams);
+        // The primary asks for nothing, so every object completes on the rail.
+        fetcher.rail.window_bytes = 0;
+        let outcome = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
+        assert_eq!(outcome.package, built);
+        assert!(
+            openers.0.lock().unwrap().0.len() >= 2,
+            "a rail opened an object of its own"
+        );
+        let opened = opened.lock().unwrap();
+        assert_eq!(
+            opened.iter().collect::<BTreeSet<_>>().len(),
+            files.len(),
+            "the factory saw every object"
+        );
+        for name in opened.iter() {
+            assert!(custom.join(name).exists(), "the factory's sink took {name}");
+            assert!(
+                !output.join("objects").join(name).exists(),
+                "no directory sink placed {name}"
+            );
+        }
+        serving
+            .join()
+            .expect("the serving thread")
+            .expect("both sessions served");
+        discard(&[&bundle, &output, &custom]);
+    }
+
+    #[test]
     pub(crate) fn a_stride_crossing_flushes_once_and_arms_the_next() {
         // The crossing writer flushes once; the next mark is a stride
         // above what is placed.

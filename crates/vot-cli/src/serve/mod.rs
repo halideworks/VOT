@@ -45,6 +45,9 @@ pub enum ServeStatus {
     Disconnected,
     /// This end closed the session under a registered code.
     Closed(u16),
+    /// The receiver acknowledged every transfer object with a final-cursor
+    /// `GOAWAY`, so this end concluded the session and let its carrier close.
+    Completed,
 }
 
 /// Why an answer could not be built: the peer broke protocol under a
@@ -2797,6 +2800,41 @@ mod tests {
         let mut fresh = ServeConnection::new();
         let wire = encoded(&TypedFrame::GoAway(frames::GoAway { cursor: 2 })).unwrap();
         assert!(server.dispatch(&wire, &mut fresh, 16).is_err());
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
+    fn a_final_cursor_goaway_completes_the_serve() {
+        let (bundle, _) = built_bundle("goaway-complete", &[("a.bin", patterned(10))]);
+        let server = BundleServer::open(&bundle).unwrap();
+        assert_eq!(server.object_count(), 1);
+
+        // A cursor short of the object count leaves the session live.
+        let mut partial = ready_session();
+        let mut connection = ServeConnection::new();
+        partial
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GoAway(frames::GoAway {
+                cursor: 0,
+            })));
+        let status = server.service(&mut partial, &mut connection).unwrap();
+        assert_eq!(status, ServeStatus::Active);
+        assert_eq!(connection.goaway_cursor, Some(0));
+
+        // The final cursor is the receiver's completion acknowledgement, so
+        // the session concludes.
+        let mut final_session = ready_session();
+        let mut connection = ServeConnection::new();
+        final_session
+            .driver()
+            .events
+            .push_back(control_event(&TypedFrame::GoAway(frames::GoAway {
+                cursor: 1,
+            })));
+        let status = server.service(&mut final_session, &mut connection).unwrap();
+        assert_eq!(status, ServeStatus::Completed);
+        assert_eq!(connection.goaway_cursor, Some(1));
         crate::harness::discard(&[&bundle]);
     }
 

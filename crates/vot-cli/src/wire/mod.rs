@@ -230,7 +230,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the observer heard the session end");
         assert_eq!(report.objects, 1);
-        assert_eq!(report.cursor, None, "a completed fetch sends no GOAWAY");
+        // `fetch_holding` drives the engine raw, without the wire layer's
+        // completion handshake, so the serve sees the carrier drop rather than
+        // a final-cursor GOAWAY. The wire path is covered by
+        // `fetch_over_acknowledges_completion_on_one_session`.
+        assert_eq!(report.cursor, None, "the raw-drive path sends no GOAWAY");
         assert!(
             report.served_bytes >= 200_000,
             "served {} bytes of a 200000 byte object",
@@ -265,6 +269,119 @@ mod tests {
         // Bounded, so the refused sessions surface as the serve's failure.
         assert!(serving.join().expect("the serving thread").is_err());
         crate::harness::discard(&[&bundle_a, &bundle_b, &fetched]);
+    }
+
+    // A railed fetch over the wire path completes with the primary
+    // acknowledging every transfer object: exactly one serve session ends
+    // `Completed` with the final cursor, and the rails close without one.
+    #[test]
+    fn fetch_over_acknowledges_completion_on_one_session() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) = crate::harness::built_bundle(
+            "fetch-ack",
+            &[("payload.bin", crate::harness::patterned(512 * 1024))],
+        );
+        let server = std::sync::Arc::new(BundleServer::open(&bundle).unwrap());
+        let issuer = SigningKey::from_bytes(&[71; 32]);
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        let (reports, reported) = mpsc::channel::<ServeReport>();
+        let verifying = issuer.verifying_key();
+        let policy_server = std::sync::Arc::clone(&server);
+        // Two rails open two sessions; serve both, then stop.
+        let serving = std::thread::spawn(move || {
+            serve::serve_on_bounded(&listener, Some(2), |presentation| {
+                let scope = crate::authz::Requirement::new(
+                    "issuer.example",
+                    crate::authz::key_id_of(&verifying),
+                    verifying,
+                    "serve.example",
+                    policy_server.package().root,
+                )
+                .decide(
+                    presentation.challenge,
+                    presentation.open,
+                    presentation.channel_binding,
+                    presentation.now,
+                )?;
+                let reports = reports.clone();
+                Some(ServeAdmission {
+                    server: std::sync::Arc::clone(&policy_server),
+                    scope,
+                    observer: Some(Box::new(move |report| {
+                        let _ = reports.send(report);
+                    })),
+                })
+            })
+        });
+
+        let destination = crate::tests::temporary("fetch-ack-destination");
+        let holder = serve_token(&issuer, SigningKey::from_bytes(&[72; 32]), built.root);
+        let config = client_config().expect("a client config");
+        let connect = || {
+            let carrier = Transport::connect(
+                local_for(at).expect("a local address"),
+                at,
+                Some("localhost"),
+                &config,
+            )
+            .map_err(|_| Error::CarrierUnavailable)?;
+            Ok(carrier)
+        };
+        let primary = connect().expect("a primary carrier");
+        let mut fetcher = BundleFetcher::begin_with(
+            primary,
+            &destination,
+            Some(built.root),
+            Some(holder),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("a fetch holding the token");
+        // Rails past one need proof workers to verify off the primary's thread.
+        fetcher.set_proving_threads(2).expect("proving threads");
+        let outcome = crate::drive::fetch_striped(fetcher, 2, connect).expect("a railed fetch");
+        assert_eq!(outcome.package, built);
+
+        // Collect what the sessions reported. Both rails were admitted, so two
+        // reports arrive; only the primary's carries the completion cursor.
+        let mut collected = Vec::new();
+        while let Ok(report) = reported.recv_timeout(Duration::from_secs(10)) {
+            collected.push(report);
+            if collected.len() == 2 {
+                break;
+            }
+        }
+        assert!(!collected.is_empty(), "no session reached the observer");
+        let completed: Vec<_> = collected
+            .iter()
+            .filter(|report| report.status.as_ref().ok() == Some(&crate::ServeStatus::Completed))
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one session completes: {collected:?}"
+        );
+        assert_eq!(completed[0].objects, 1);
+        assert_eq!(
+            completed[0].cursor,
+            Some(1),
+            "the completing session saw the final cursor"
+        );
+        // Only the completing session carried a cursor; the rails dropped.
+        let with_cursor = collected
+            .iter()
+            .filter(|report| report.cursor.is_some())
+            .count();
+        assert_eq!(
+            with_cursor, 1,
+            "only one session carried a cursor: {collected:?}"
+        );
+
+        let _ = serving.join();
+        crate::harness::discard(&[&bundle, &destination]);
     }
 
     #[test]

@@ -21,16 +21,18 @@ timeout_multiplier = 4.0
 # configuration does not enable, so every mutant in it would be unviable here.
 # `.cargo/mutants-live.toml` is the same configuration without that exclusion,
 # and the msquic-mutation job runs it with the feature on. The push session
-# helpers and the fetch completion helper conclude_fetch are excluded here for
-# the same reason and measured by wire-mutation.
-# DirectorySink::flush is a successful fsync side effect, like the platform
-# sync functions already excluded below; its failures are propagated through
-# the mutation-tested CountingSink boundary.
+# helpers and the fetch completion helper were named here for the same
+# reason, and DirectorySink::flush for its own: it is a successful fsync side
+# effect, like the platform sync functions below, and its failures are
+# propagated through the mutation-tested CountingSink boundary. All four are
+# gone from this list because the exclude_globs below now cover the files
+# they live in. DirectorySink::flush stays in `.cargo/mutants-live.toml`,
+# which does mutate `fetch/sink.rs`.
 # NativeFile::accept_serial is the windows-and-unsupported acceptance body
 # behind the platform-common accept delegate; like write_all_at_windows it
 # never compiles here, so its mutants would be measured against a build that
 # does not contain them.
-exclude_re = ["live::","NativeFile::accept_serial","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "crates/vot-scheduler/src/receiver.rs:.*VerifiedRange::is_empty", "remove_lock_file_other", "<impl ReceiveSink for DirectorySink>::flush", "(prepare|canonical)_push_destination_unsupported", "ServeSession.*(negotiate_push|push_ready)", "conclude_fetch", "BundleFetcher.*(join_started_session|acknowledge_completion|await_peer_close)"]
+exclude_re = ["live::","NativeFile::accept_serial","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "crates/vot-scheduler/src/receiver.rs:.*VerifiedRange::is_empty", "remove_lock_file_other", "(prepare|canonical)_push_destination_unsupported"]
 # Binaries whose correctness a different check establishes. vot-capability's
 # oracle exists to be compared against an independent Python implementation of
 # spec/capability.cddl, which validate_capability_vectors.py does on every run and
@@ -66,8 +68,21 @@ exclude_re = ["live::","NativeFile::accept_serial","(windows|unsupported)_rename
 # with the feature on. `nowire.rs`, which holds what those commands answer
 # without the carrier, is what this configuration does compile, and
 # `the_wire_commands_name_the_feature_they_need` holds it to account.
+#
+# fetch, serve and drive are measured by the wire-mutation shards under the
+# `wire` feature, whose test suite is a superset of this configuration's, so
+# mutating them here as well measures the same files twice. The shards' own
+# `-f` globs are mirrored here and `tools/test_ci_mutation_plan.py` holds the
+# two lists together. `nowire.rs` is deliberately absent: it is
+# `cfg(not(feature = "wire"))`, so this configuration is the only one that
+# compiles it.
 exclude_globs = [
   "crates/vot-bench-driver/src/cycles.rs",
+  "crates/vot-cli/src/fetch.rs",
+  "crates/vot-cli/src/fetch/**",
+  "crates/vot-cli/src/serve.rs",
+  "crates/vot-cli/src/serve/**",
+  "crates/vot-cli/src/drive.rs",
   "crates/vot-cli/src/wire.rs",
   "crates/vot-cli/src/wire/**",
   "crates/vot-transport-quiche/src/live.rs",

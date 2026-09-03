@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,45 @@ class MutationPlanTests(unittest.TestCase):
         msquic = plan(["crates/vot-transport-msquic/src/live.rs"])
         self.assertFalse(msquic["quiche"])
         self.assertTrue(msquic["msquic"])
+
+    def test_the_featureless_job_excludes_what_the_wire_shards_measure(self) -> None:
+        # A `-e` on the command line replaces `exclude_globs` rather than
+        # adding to it, so the two lists have to agree in the file itself.
+        root = Path(__file__).resolve().parents[1]
+        configuration = tomllib.loads(
+            (root / ".cargo" / "mutants.toml").read_text(encoding="utf-8")
+        )
+        excluded = {
+            glob
+            for glob in configuration["exclude_globs"]
+            if glob.startswith("crates/vot-cli/")
+        }
+        measured: set[str] = set()
+        for entry in WIRE_SHARDS:
+            # `core` names no files; it is what the other shards leave.
+            if entry["shard"] == "core":
+                continue
+            tokens = shlex.split(str(entry["args"]))
+            measured |= {
+                value for flag, value in zip(tokens, tokens[1:]) if flag == "-f"
+            }
+
+        def covered(glob: str) -> bool:
+            return glob in excluded or any(
+                other.endswith("/**") and glob.startswith(other[: -len("**")])
+                for other in excluded
+            )
+
+        # Nothing is excluded from the featureless job unless a wire shard
+        # measures it. `main.rs` is the exception the configuration states:
+        # it is a binary, mutated nowhere.
+        for glob in sorted(excluded - {"crates/vot-cli/src/main.rs"}):
+            self.assertIn(glob, measured, glob)
+        # And every file a shard measures is excluded there, so it is mutated
+        # once. `nowire.rs` is the exception: it is
+        # `cfg(not(feature = "wire"))`, so only the featureless job builds it.
+        for glob in sorted(measured - {"crates/vot-cli/src/nowire.rs"}):
+            self.assertTrue(covered(glob), glob)
 
     def test_wire_source_selects_only_its_shard(self) -> None:
         result = plan(["crates/vot-cli/src/fetch/protocol.rs"])

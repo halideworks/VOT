@@ -394,7 +394,7 @@ jobs:
 
       # The engines over a real socket. The loopback tests run everywhere on a
       # fake carrier; this is the one job that carries them for real, and it is
-      # the only place the wire feature is compiled at all.
+      # the only place the wire feature is compiled at all, in either profile.
       - name: Test serve and fetch over a real socket
         run: |
           cargo +1.97.1 clippy -p vot-cli --features wire --all-targets --locked -- -D warnings
@@ -402,17 +402,19 @@ jobs:
           cargo +1.97.1 test -p vot-cli --features wire --release --locked
 
       # The benchmark driver's quiche carrier compiles only under this feature,
-      # so this job is the only one that sees it. Both profiles for the same
-      # reason the pump runs in both: a threaded carrier fails differently
-      # under a debug assertion and under an optimisation.
+      # so this job is the only one that sees it.
       #
-      # One test at a time, because each of these tests is a full transfer with
-      # a counted delivery budget sized for a machine to itself. Run in
-      # parallel on a loaded runner they contend, and two of them stalled
-      # together on a shared runner while every one passes alone.
+      # Release only: each of these tests is a full transfer against a counted
+      # delivery budget sized for a machine to itself, which is a throughput
+      # contract, and release is the profile that budget was set against. The
+      # debug run measured the same contract in the profile it does not
+      # describe.
+      #
+      # One test at a time, because a full transfer under that budget contends
+      # with another: two of them stalled together on a shared runner while
+      # every one passes alone.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.97.1 test -p vot-bench-driver --features quiche --locked -- --test-threads=1
           cargo +1.97.1 test -p vot-bench-driver --features quiche --release --locked -- --test-threads=1
 
       - name: Lint the pump
@@ -561,10 +563,10 @@ jobs:
 
       # One test at a time, for the reason the quiche job gives: every driver
       # test is a full transfer under a counted budget, and parallel transfers
-      # on a loaded runner stall each other.
+      # on a loaded runner stall each other. Release only for that job's other
+      # reason: the budget is a throughput contract stated in that profile.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.97.1 test -p vot-bench-driver --features msquic --locked -- --test-threads=1
           cargo +1.97.1 test -p vot-bench-driver --features msquic --release --locked -- --test-threads=1
 
       - name: Lint the driver's carrier
@@ -800,9 +802,15 @@ jobs:
           #
           # The ceiling covers contention, not hangs: two mutants' suites
           # share four cores, and the worst stall-heavy mutant measured 68s
-          # on two dedicated cores with the budget override in force.
+          # on two dedicated cores with the budget override above in force.
+          # Run 33795839349 measured the unmutated fetch shards at 26 to 28s
+          # of test, so 300 is over ten times the baseline and over four
+          # times that worst mutant. It bounds the test phase only: no
+          # build_timeout is set, and the same run spent 102 to 108s
+          # building, which this flag does not cap. A mutant that hangs past
+          # the ceiling reds the job the way 900 did, ten minutes sooner.
           cargo +1.97.1 mutants --package vot-cli --features wire \
-            --config .cargo/mutants-live.toml --timeout 900 --jobs 2 \
+            --config .cargo/mutants-live.toml --timeout 300 --jobs 2 \
             ${{ matrix.args }} "${scope[@]}"
 
   mutation:

@@ -1169,10 +1169,9 @@ pub(crate) mod tests {
     #[test]
     pub(crate) fn the_staging_budget_holds_the_window_and_the_whole_credit() {
         // Every admitted object holds a verifier reservation for as long
-        // as it is in flight. Sized for one of them, a window of
-        // admissions eats into the credit, and the record arriving on a
-        // credit the peer has filled is refused: a `RESOURCE_LIMIT` close
-        // partway through a transfer that was conforming.
+        // as it is in flight, and advertised credit is what is left of the
+        // staging budget: sized for one object, a window of admissions
+        // comes out of the credit the rails run on.
         let mut receiver =
             ReliableReceiver::new(FETCH_STAGING_BYTES, FETCH_CREDIT_BYTES, FETCH_CREDIT_BYTES)
                 .unwrap();

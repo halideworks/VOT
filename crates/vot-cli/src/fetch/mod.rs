@@ -857,8 +857,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    pub(crate) fn a_rail_paces_itself_and_refuses_inline_proving() {
-        // A rail's window is its own account; inline proving would never earn it back.
+    pub(crate) fn a_rail_paces_itself_on_its_own_account() {
+        // A rail's window is its own account: what another rail took and
+        // placed never earns this one its next span.
         let (bundle, _) = built_bundle("railpace", &[("a.txt", patterned(1000))]);
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("railpace-fetched");
@@ -880,7 +881,7 @@ pub(crate) mod tests {
         );
         assert!(
             secondary.set_proving_threads(0).is_err(),
-            "a rail cannot prove inline"
+            "no fetch, rail or not, proves without a prover"
         );
         assert!(
             secondary.set_proving_threads(2).is_ok(),
@@ -2527,7 +2528,7 @@ pub(crate) mod tests {
         assert!(resumed.resuming, "a store beside the bundle is a resume");
         assert!(
             resumed.set_proving_threads(0).is_err(),
-            "a resumed fetch completes on coverage, which inline proving never feeds"
+            "a fetch with no prover books no coverage and completes nothing"
         );
         let status =
             run_to_end(&server, &mut session, &mut connection, &mut resumed, false).unwrap();
@@ -3475,11 +3476,17 @@ pub(crate) mod tests {
         fetcher.set_proving_threads(2).unwrap();
         assert_eq!(fetcher.proving.width, 2);
         assert_eq!(fetcher.receiver.deferred_limit(), 3);
-        // Inline: the width is recorded and the bound is left alone, since
-        // nothing is deferred to be bounded.
-        fetcher.set_proving_threads(0).unwrap();
-        assert_eq!(fetcher.proving.width, 0);
-        assert_eq!(fetcher.receiver.deferred_limit(), 3, "no width, no change");
+        // No width at all is refused, and a refusal changes nothing.
+        assert!(matches!(
+            fetcher.set_proving_threads(0),
+            Err(Error::InvalidArguments)
+        ));
+        assert_eq!(fetcher.proving.width, 2);
+        assert_eq!(
+            fetcher.receiver.deferred_limit(),
+            3,
+            "a refusal changed a bound"
+        );
         discard(&[&bundle, &output]);
     }
 
@@ -3494,9 +3501,10 @@ pub(crate) mod tests {
         let (server, mut session, mut connection) = serving(&bundle);
         let output = temporary("orphans-fetched");
         let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        // Inline proving is the slower poll, which is what lets a real
-        // carrier queue this deep; the reordering itself is the pump's.
-        fetcher.set_proving_threads(0).unwrap();
+        // One prover is the slowest poll a fetch may run, which is what
+        // lets a real carrier queue this deep; the reordering itself is
+        // the pump's.
+        fetcher.set_proving_threads(1).unwrap();
 
         let mut sequence = 0;
         let mut status = FetchStatus::Active;
@@ -4452,8 +4460,20 @@ pub(crate) mod tests {
             OUTSTANDING_REQUEST_BYTES + MAX_REQUESTED_RANGE,
             "a byte of room did not buy the next request"
         );
-        // Placing counts as progress, so a driving loop keeps a slow transfer alive.
+        // Bytes written into a sink are not progress on their own: a
+        // duplicate answer is written before its extent is found to be a
+        // replay. Settled coverage is, so a driving loop keeps a slow
+        // transfer alive.
         sink.placed.store(MAX_REQUESTED_RANGE, Ordering::Relaxed);
+        assert_eq!(
+            fetcher.progress(),
+            0,
+            "bytes rewritten over settled ones counted as progress"
+        );
+        fetcher
+            .locked_plan()
+            .unwrap()
+            .cover(0, 0, MAX_REQUESTED_RANGE);
         assert!(fetcher.progress() >= MAX_REQUESTED_RANGE);
 
         // A span is committed only once its frame is queued, or a failure
@@ -4471,9 +4491,9 @@ pub(crate) mod tests {
             "a span whose frame never queued was consumed"
         );
 
-        // The shared sink is not this rail's account; a full window blocks
-        // regardless of placement, and inline proving is paced the same way
-        // rather than on a count every rail writes into.
+        // The shared sink is not this rail's account: a full window blocks
+        // regardless of placement, rather than on a count every rail
+        // writes into.
         fetcher.rail.next_request = 0;
         fetcher.rail.taken_bytes = OUTSTANDING_REQUEST_BYTES;
         sink.placed
@@ -4483,13 +4503,6 @@ pub(crate) mod tests {
             fetcher.locked_plan().unwrap().active[&0].next_offset,
             owed,
             "the shared sink paid for a rail's spans"
-        );
-        fetcher.set_proving_threads(0).unwrap();
-        fetcher.issue_ranges().unwrap();
-        assert_eq!(
-            fetcher.locked_plan().unwrap().active[&0].next_offset,
-            owed,
-            "an inline fetch paced on the shared sink"
         );
 
         discard(&[&bundle, &output]);
@@ -4587,5 +4600,134 @@ pub(crate) mod tests {
                 (2 * MAX_REQUESTED_RANGE, MAX_REQUESTED_RANGE - 1),
             ]
         );
+    }
+
+    /// One byte more than a single request carries, so no one answer
+    /// settles the object and a handout that stops advancing never
+    /// finishes it.
+    fn reissued_object() -> usize {
+        usize::try_from(MAX_REQUESTED_RANGE).expect("a span fits an address") + 1
+    }
+
+    /// What a bounded in-process fetch is given. Clears the silences a
+    /// starved runner was measured producing, which is what
+    /// `drive::STALL_FLOOR_MS` is set from, and is still short enough that
+    /// a fetch which cannot finish is given up on while the suite is
+    /// watching rather than by whatever times the suite out.
+    const BOUNDED_FETCH: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// A serve of `bundle` on one end of a duplex pair, and the other end.
+    fn served_in_process(
+        bundle: &std::path::Path,
+    ) -> (
+        crate::harness::Duplex,
+        std::thread::JoinHandle<Result<(), Error>>,
+    ) {
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_bundle = bundle.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]),
+                )
+            })
+        });
+        (client, thread)
+    }
+
+    /// The handshake settles nothing to place and takes no manifest page,
+    /// so without it counting the states it reaches a session would spend
+    /// its whole stall budget getting authenticated. What is pinned here
+    /// is that the first observation of a state counts once, and a pass
+    /// that reaches no new state counts nothing.
+    #[test]
+    fn negotiation_is_progress_and_a_pass_that_hears_nothing_is_not() {
+        let output = temporary("negotiation-progress");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        assert_eq!(fetcher.progress(), 0, "nothing has been driven yet");
+        fetcher.service().unwrap();
+        let reached = fetcher.progress();
+        assert!(reached > 0, "the session moved and nothing counted it");
+        fetcher.service().unwrap();
+        assert_eq!(
+            fetcher.progress(),
+            reached,
+            "a pass that heard nothing counted"
+        );
+        discard(&[&output]);
+    }
+
+    /// A fetch whose handout stops advancing asks for the same span for as
+    /// long as it is driven, and the serve answers every request. Nothing
+    /// is settled by any of it after the first answer: the requests are
+    /// this end's own doing and the answers place bytes already placed. The
+    /// stall budget has to run out on that, or a fetch that will never
+    /// finish is driven forever.
+    #[test]
+    fn a_fetch_asking_for_the_same_span_forever_stalls() {
+        let (bundle, built) = built_bundle(
+            "reissued-span",
+            &[("big.bin", patterned(reissued_object()))],
+        );
+        let (client, serving_thread) = served_in_process(&bundle);
+        let output = temporary("reissued-span-fetched");
+        let mut fetcher = BundleFetcher::begin(client, &output, Some(built.root)).unwrap();
+        // One span in flight, so the pass that hands out span zero cannot
+        // also hand out the span past it before the handout is wound back.
+        fetcher.rail.window_bytes = MAX_REQUESTED_RANGE;
+        let outcome = crate::drive::drive_until_within(
+            &mut fetcher,
+            |fetcher| {
+                if let Some(mut plan) = fetcher.locked_plan() {
+                    for active in plan.active.values_mut() {
+                        active.next_offset = 0;
+                    }
+                }
+                false
+            },
+            std::time::Duration::from_millis(500),
+        );
+        assert!(
+            matches!(outcome, Err(Error::Stalled)),
+            "a fetch that settles nothing was driven on: {outcome:?}"
+        );
+        drop(fetcher);
+        let _ = serving_thread.join().expect("the serving thread");
+        discard(&[&bundle, &output]);
+    }
+
+    /// The same object over the same carrier, with the handout left alone,
+    /// under a budget the suite watches: a fetch that stops committing the
+    /// spans it hands out is given up on here rather than running until
+    /// something else times it out.
+    #[test]
+    fn a_multi_span_fetch_completes_within_a_bounded_budget() {
+        let (bundle, built) = built_bundle(
+            "bounded-fetch",
+            &[("big.bin", patterned(reissued_object()))],
+        );
+        let (client, serving_thread) = served_in_process(&bundle);
+        let output = temporary("bounded-fetch-fetched");
+        let mut fetcher = BundleFetcher::begin(client, &output, Some(built.root)).unwrap();
+        // One span in flight, so a fetch that has stopped committing its
+        // handout is given up on for the cost of a span a pass rather than
+        // a whole window's worth.
+        fetcher.rail.window_bytes = MAX_REQUESTED_RANGE;
+        assert_eq!(
+            crate::drive::drive_within(&mut fetcher, BOUNDED_FETCH).expect("a driven fetch"),
+            FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        drop(fetcher);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+        discard(&[&bundle, &output]);
     }
 }

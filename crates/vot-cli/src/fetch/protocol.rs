@@ -201,10 +201,17 @@ pub(crate) struct Terminal {
 /// What a driving loop and a caller are told about this fetch.
 #[derive(Default)]
 pub(crate) struct ProgressReport {
-    /// Everything this end has taken or asked for, only ever going up.
+    /// Settled work, only ever going up: manifest frames this end accepted
+    /// and the negotiation states it passed through. What this end asked
+    /// for is not counted, and neither is a frame that changed nothing.
     ///
-    /// A driving loop reads it to tell a slow transfer from a stuck one.
+    /// A driving loop reads it to tell a slow transfer from a stuck one,
+    /// so anything counted here that a stuck session keeps producing would
+    /// keep that session alive forever.
     pub(crate) progress: u64,
+    /// The negotiation state the last pass saw, so a handshake is counted
+    /// by the states it reaches rather than by the frames it exchanges.
+    pub(crate) state: Option<vot_session::State>,
     /// When this fetch first observed bytes it placed itself.
     pub(crate) first_moved: Option<std::time::Instant>,
     /// Where placed-byte crossings are reported, if anywhere.
@@ -216,7 +223,8 @@ pub(crate) struct ProvingConfig {
     /// The provers, started with the first cover so a fetch that carries
     /// none starts no threads.
     pub(crate) pool: Option<ProvingPool>,
-    /// How many provers to start, or none for proving on this thread.
+    /// How many provers to start. Never zero once a fetch is built:
+    /// [`BundleFetcher::set_proving_threads`] refuses it.
     pub(crate) width: usize,
     /// How long a pass waits for a witness it is owed. Overridden in tests.
     pub(crate) wait: std::time::Duration,
@@ -300,6 +308,22 @@ pub(crate) fn encoded(frame: &TypedFrame) -> Result<Vec<u8>, Error> {
     Ok(wire)
 }
 
+/// Bytes this fetch has settled: every covered byte of the window, counted
+/// once, plus the objects the window has already finished.
+///
+/// Not [`placed_in`]. A sink counts what was written, and a duplicate
+/// answer is written before its extent is found to be a replay, so bytes
+/// written keep going up for a fetch that asks for the same span forever
+/// against a server that answers every time. Coverage counts each byte
+/// once, so it stops when the fetch stops getting anywhere.
+fn settled_in(plan: &FetchPlan) -> u64 {
+    plan.active
+        .values()
+        .fold(plan.placed_before, |settled, active| {
+            settled.saturating_add(active.covered.bytes())
+        })
+}
+
 /// Bytes the bundle holds under this plan: what the objects already left
 /// behind placed, plus what the ones still in flight have placed so far.
 ///
@@ -313,26 +337,25 @@ fn placed_in(plan: &FetchPlan) -> u64 {
 }
 
 impl<A: TransportAdapter> BundleFetcher<A> {
-    /// Sets how many provers this fetch runs, or none to prove on the
-    /// session's own thread.
+    /// Sets how many provers this fetch runs, at least one.
     ///
     /// # Errors
-    /// Surfaces a deferred bound the receiver refuses.
+    /// Refuses zero, and surfaces a deferred bound the receiver refuses.
     pub fn set_proving_threads(&mut self, threads: usize) -> Result<(), Error> {
-        if (self.secondary || self.resuming) && threads == 0 {
-            // Shared coverage is booked in `pump_provers`, which returns at
-            // once at width 0, so an inline rail never advances the plan: a
-            // rail's spans and a resumed fetch's completion both need it.
+        if threads == 0 {
+            // The plan advances only through the proving pool: shared
+            // coverage is booked where a witness comes back, and that is
+            // the only place it is booked. Without a prover nothing covers
+            // an object, so the handout, a rail's spans, a resume's
+            // completion and the stall budget's own heartbeat all stop.
             return Err(Error::InvalidArguments);
         }
         self.proving.width = threads;
-        self.receiver.defer_proving(threads > 0);
-        if threads > 0 {
-            // Room for every prover to hold one and one more to be waiting,
-            // which is what keeps them all fed without holding an object.
-            self.receiver
-                .set_deferred_limit(threads.saturating_add(1))?;
-        }
+        self.receiver.defer_proving(true);
+        // Room for every prover to hold one and one more to be waiting,
+        // which is what keeps them all fed without holding an object.
+        self.receiver
+            .set_deferred_limit(threads.saturating_add(1))?;
         Ok(())
     }
 
@@ -661,11 +684,26 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         self.proving.width
     }
 
-    /// Everything this end has settled, only ever going up: frames taken,
-    /// requests issued, and every byte placed.
+    /// Everything this end has settled, only ever going up: manifest
+    /// frames accepted, negotiation states reached, and every byte covered.
+    ///
+    /// A request this end issued is not progress, and neither is an answer
+    /// that settled nothing: a stall budget reset by either would never
+    /// give up on a fetch that asks for the same span forever against a
+    /// server that answers every time.
+    ///
+    /// That leaves a floor under how slow a transfer may be. Coverage
+    /// advances a whole answered bundle at a time, up to
+    /// [`MAX_REQUESTED_RANGE`], so a transfer has to settle about one
+    /// bundle per stall budget or be called stalled: roughly 140 KB/s at
+    /// the half-minute default. The floor is not this accessor's doing and
+    /// is what it always was; what changed is that this is now the only
+    /// heartbeat, where frames arriving used to be one as well.
     #[must_use]
     pub fn progress(&self) -> u64 {
-        self.report.progress.saturating_add(self.placed_bytes())
+        self.report
+            .progress
+            .saturating_add(self.locked_plan().map_or(0, |plan| settled_in(&plan)))
     }
 
     /// Bytes verified and placed into the bundle, only ever going up.
@@ -840,10 +878,21 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.terminal.disconnected = true;
                     break;
                 }
-                Ok(Some(_)) => self.report.progress = self.report.progress.saturating_add(1),
+                // Every other event is an acknowledgement or a carrier
+                // notice of this end's own sending; nothing settled.
+                Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(error) => return self.receive_failed(error),
             }
+        }
+        // Before there is a manifest page or a placed byte to count, the
+        // handshake is what moves this session forward. A state reached is
+        // that progress; the frames that reach it are not, so an exchange
+        // that keeps talking without arriving anywhere stalls.
+        let state = self.receiver.session().state();
+        if self.report.state != Some(state) {
+            self.report.state = Some(state);
+            self.report.progress = self.report.progress.saturating_add(1);
         }
         // Between taking frames and judging the pass: placed bytes advance the plan.
         if let Err(error) = self.pump_provers() {
@@ -989,11 +1038,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     /// Hands completed bundles to the provers, and books what they finish.
     ///
     /// Proof happens off this thread; what returns is a witness the
-    /// receiver admits like the inline path does.
+    /// receiver admits, and booking it into shared coverage is what moves
+    /// the plan. Width is never zero, so every fetch passes through here.
     pub(crate) fn pump_provers(&mut self) -> Result<(), vot_scheduler::Error> {
-        if self.proving.width == 0 {
-            return Ok(());
-        }
         let mut pool = self
             .proving
             .pool
@@ -1488,6 +1535,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 // never names bytes that were only in the page cache.
                 // Synced outside the lock: the other rails keep booking and
                 // asking while the file flushes.
+                //
+                // `placed_before` moves only after that flush returns, and
+                // it is what carries a finished object's bytes in the
+                // progress a stall budget reads. A multi-rail fetch whose
+                // window holds nothing else therefore idles its other rails
+                // on the fsync and reports no progress while it runs. That
+                // is what this has always done; it is the thing to watch if
+                // fsync times grow.
                 let active = plan.active.get_mut(&at).ok_or(Error::InvalidBundle)?;
                 active.syncing = true;
                 let sink = Arc::clone(&active.sink);
@@ -1791,7 +1846,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             )?;
             plan.take(at, offset, length)?;
             self.rail.taken_bytes = self.rail.taken_bytes.saturating_add(length);
-            self.report.progress = self.report.progress.saturating_add(1);
         }
         Ok(())
     }

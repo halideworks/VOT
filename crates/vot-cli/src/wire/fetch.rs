@@ -174,12 +174,12 @@ where
 
 /// Splits one fetch's proof workers across its rails without leaving a rail
 /// unable to place what it receives.
+///
+/// Never zero, whatever `VOT_FETCH_PROVERS` names: a fetch with no prover
+/// books no coverage, so it would place nothing and stall. One is the
+/// minimum, and `set_proving_threads` refuses anything less.
 pub(super) fn provers_per_rail(provers: usize, rails: usize) -> usize {
-    if provers == 0 {
-        0
-    } else {
-        (provers / rails.max(1)).max(1)
-    }
+    (provers / rails.max(1)).max(1)
 }
 
 /// What one fetch measured, as one line an operator or a bench harness reads:

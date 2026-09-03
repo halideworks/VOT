@@ -1838,7 +1838,9 @@ mod tests {
             (9, 8, 1),
             (17, 8, 2),
             (32, 8, 4),
-            (0, 8, 0),
+            // No prover books no coverage, so the split floors at one
+            // however small the ceiling an operator names.
+            (0, 8, 1),
         ] {
             assert_eq!(
                 fetch::provers_per_rail(provers, rails),

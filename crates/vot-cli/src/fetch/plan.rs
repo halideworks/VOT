@@ -295,8 +295,7 @@ impl CoverageMap {
     }
 
     /// Bytes covered, each counted once.
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> u64 {
+    pub(crate) const fn bytes(&self) -> u64 {
         self.bytes
     }
 

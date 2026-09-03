@@ -149,7 +149,7 @@ git diff origin/main...HEAD > changed.diff
 cargo mutants --package PACKAGE --jobs 2 --in-diff changed.diff
 ```
 
-The package matrix is in `.github/workflows/ci.yml`. Every package is required;
+The package matrix is in `tools/ci_mutation_packages.py`. Every package is required;
 no mutant survives any of them.
 
 Live transport mutation testing classifies survivors rather than requiring zero:

@@ -17,9 +17,20 @@ pub(crate) const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
 /// signal that paces requests and reports progress.
 pub struct CountingSink {
     pub(crate) sink: Box<dyn ReceiveSink>,
-    /// Serializes placement with abandonment. Once abandoned, no prover on
-    /// any rail may recreate bytes after `discard_partial` returns.
-    gate: Mutex<bool>,
+    /// Guards placement against abandonment. Placement holds it shared, so
+    /// every rail pwrites concurrently; `discard_partial` takes it
+    /// exclusively, which waits for the writes in flight and leaves no
+    /// prover able to recreate bytes after it returns.
+    ///
+    /// Concurrent placement stays durable because coverage is booked only
+    /// after `write_at` returns (`insert_checked_range` writes and then
+    /// commits its booking, `admit_written_range` records an extent whose
+    /// write already returned), so a `DurableHook` snapshot of the covered
+    /// extents never names bytes whose pwrite is still in flight. The
+    /// completion sync runs under the shared guard too: full coverage means
+    /// every byte already has a returned write, so a write still in flight
+    /// then is a proof-bound duplicate of bytes the sync persists.
+    gate: std::sync::RwLock<bool>,
     pub(crate) placed: AtomicU64,
     /// Next placed-byte crossing due a flush; the exchange keeps two
     /// writers from flushing the same stride.
@@ -114,7 +125,7 @@ impl CountingSink {
     fn opened(sink: Box<dyn ReceiveSink>, placed: u64, durable: Option<DurableHook>) -> Self {
         Self {
             sink,
-            gate: Mutex::new(false),
+            gate: std::sync::RwLock::new(false),
             placed: AtomicU64::new(placed),
             flush_due: AtomicU64::new(stride_after(placed)),
             flushes: AtomicU64::new(0),
@@ -170,7 +181,7 @@ impl CountingSink {
     }
 
     pub(crate) fn flush(&self) -> Result<(), Error> {
-        let discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
+        let discarded = self.gate.read().map_err(|_| Error::InvalidBundle)?;
         if *discarded {
             return Err(Error::InvalidBundle);
         }
@@ -178,7 +189,7 @@ impl CountingSink {
     }
 
     pub(crate) fn discard_partial(&self) -> Result<(), Error> {
-        let mut discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
+        let mut discarded = self.gate.write().map_err(|_| Error::InvalidBundle)?;
         *discarded = true;
         self.sink.discard_partial()
     }
@@ -186,7 +197,7 @@ impl CountingSink {
 
 impl vot_scheduler::RangeSink for CountingSink {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
-        let discarded = self.gate.lock().map_err(|_| vot_scheduler::SinkError)?;
+        let discarded = self.gate.read().map_err(|_| vot_scheduler::SinkError)?;
         if *discarded {
             return Err(vot_scheduler::SinkError);
         }
@@ -287,6 +298,12 @@ pub(super) mod tests {
         release: bool,
         discarded: bool,
         writes: usize,
+        /// Writers currently inside `write_at`, which the shared gate lets
+        /// exceed one.
+        inside: usize,
+        /// Writes that had returned when `discard_partial` reached the
+        /// inner sink.
+        writes_at_discard: usize,
     }
 
     #[derive(Default)]
@@ -306,6 +323,7 @@ pub(super) mod tests {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
             let mut state = self.shared.0.lock().map_err(|_| vot_scheduler::SinkError)?;
             state.started = true;
+            state.inside += 1;
             self.shared.1.notify_all();
             while !state.release {
                 state = self
@@ -315,6 +333,7 @@ pub(super) mod tests {
                     .map_err(|_| vot_scheduler::SinkError)?;
             }
             state.writes += 1;
+            state.inside -= 1;
             Ok(())
         }
     }
@@ -325,11 +344,9 @@ pub(super) mod tests {
         }
 
         fn discard_partial(&self) -> Result<(), Error> {
-            self.shared
-                .0
-                .lock()
-                .map_err(|_| Error::InvalidBundle)?
-                .discarded = true;
+            let mut state = self.shared.0.lock().map_err(|_| Error::InvalidBundle)?;
+            state.discarded = true;
+            state.writes_at_discard = state.writes;
             Ok(())
         }
     }
@@ -369,6 +386,53 @@ pub(super) mod tests {
         let state = inner.shared.0.lock().unwrap();
         assert!(state.discarded);
         assert_eq!(state.writes, 1);
+    }
+
+    #[test]
+    fn two_writers_hold_the_gate_at_once_and_discard_waits_for_both() {
+        let inner = Arc::new(BlockingSink::default());
+        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone())));
+        let writing: Vec<_> = (0..2)
+            .map(|at| {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || sink.write_at(at, &[1]))
+            })
+            .collect();
+        {
+            // Both writers inside the sink at once. A gate held exclusively
+            // holds the second one out for as long as the first writes.
+            let mut state = inner.shared.0.lock().unwrap();
+            while state.inside < 2 {
+                let (next, timeout) = inner
+                    .shared
+                    .1
+                    .wait_timeout(state, std::time::Duration::from_secs(10))
+                    .unwrap();
+                state = next;
+                assert!(!timeout.timed_out(), "the gate let one writer in at a time");
+            }
+        }
+        let discarding = {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || sink.discard_partial())
+        };
+        {
+            let mut state = inner.shared.0.lock().unwrap();
+            state.release = true;
+            inner.shared.1.notify_all();
+        }
+        for writer in writing {
+            writer.join().unwrap().unwrap();
+        }
+        discarding.join().unwrap().unwrap();
+        assert!(sink.write_at(2, &[3]).is_err());
+        let state = inner.shared.0.lock().unwrap();
+        assert!(state.discarded);
+        assert_eq!(state.writes, 2);
+        assert_eq!(
+            state.writes_at_discard, 2,
+            "discard reached the sink before both writes returned"
+        );
     }
 
     #[test]

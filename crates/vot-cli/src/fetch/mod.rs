@@ -214,6 +214,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         }
     }
@@ -256,6 +257,49 @@ pub(crate) mod tests {
         sequence
     }
 
+    /// Passes until the flusher has retired every completion job the fetch
+    /// gave it, and answers with the last status.
+    ///
+    /// The jobs run on their own thread, so a caller counting rounds of the
+    /// transfer would otherwise spend its budget on one fsync. Bounded, so
+    /// a job that never retires fails the test rather than hanging it.
+    pub(crate) fn settled(fetcher: &mut BundleFetcher<Loopback>) -> Result<FetchStatus, Error> {
+        let deadline = std::time::Instant::now() + COMPLETION_WAIT;
+        let mut status = fetcher.service()?;
+        while status == FetchStatus::Active && fetcher.completing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a completion job never retired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            status = fetcher.service()?;
+        }
+        Ok(status)
+    }
+
+    /// How long a test waits for the flusher to retire what it holds. A
+    /// completion in these tests is one fsync of a small file.
+    const COMPLETION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Passes until the fetch reaches a terminal status, with no carrier
+    /// work between them: what a fetch has left to do once its last bytes
+    /// have arrived is its own. Bounded, so a fetch that never settles
+    /// fails the test rather than hanging it.
+    pub(crate) fn ended(fetcher: &mut BundleFetcher<Loopback>) -> FetchStatus {
+        let deadline = std::time::Instant::now() + COMPLETION_WAIT;
+        loop {
+            let status = fetcher.service().unwrap();
+            if status != FetchStatus::Active {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fetch never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// One round of both engines and the pump, the way `run_to_end` runs it.
     pub(crate) fn round(
         server: &BundleServer,
@@ -264,7 +308,7 @@ pub(crate) mod tests {
         fetcher: &mut BundleFetcher<Loopback>,
         sequence: &mut u64,
     ) -> FetchStatus {
-        let status = fetcher.service().unwrap();
+        let status = settled(fetcher).unwrap();
         pump(fetcher.session_mut().driver(), serving.driver(), sequence);
         for _ in 0..ROUND_BUDGET {
             server.service(serving, connection).unwrap();
@@ -294,7 +338,7 @@ pub(crate) mod tests {
         let mut sequence = 0;
         let mut corrupted = corrupt_first_record;
         for _ in 0..ROUND_BUDGET {
-            let status = fetcher.service()?;
+            let status = settled(fetcher)?;
             if status != FetchStatus::Active {
                 return Ok(status);
             }
@@ -468,6 +512,331 @@ pub(crate) mod tests {
         discard(&[&bundle, &output]);
     }
 
+    /// A completion hook that says when it was entered and blocks until the
+    /// test lets it go.
+    #[derive(Default)]
+    struct HookGate {
+        /// Entered, and released.
+        state: Mutex<(bool, bool)>,
+        waking: std::sync::Condvar,
+    }
+
+    impl HookGate {
+        fn hook(gate: &Arc<Self>) -> CompletionHook {
+            let held = Arc::clone(gate);
+            Arc::new(move |_, _| held.wait())
+        }
+
+        /// Says the hook is inside and blocks until the test lets it go.
+        fn wait(&self) -> Result<(), Error> {
+            let mut state = self.state.lock().map_err(|_| Error::InvalidBundle)?;
+            state.0 = true;
+            self.waking.notify_all();
+            while !state.1 {
+                let (next, timeout) = self
+                    .waking
+                    .wait_timeout(state, std::time::Duration::from_secs(20))
+                    .map_err(|_| Error::InvalidBundle)?;
+                state = next;
+                assert!(!timeout.timed_out(), "the hook was never released");
+            }
+            Ok(())
+        }
+
+        /// Waits until the hook is inside, bounded so a hook that never
+        /// runs fails the test rather than hanging it.
+        fn entered(&self) {
+            let mut state = self.state.lock().expect("the hook gate");
+            while !state.0 {
+                let (next, timeout) = self
+                    .waking
+                    .wait_timeout(state, std::time::Duration::from_secs(20))
+                    .expect("the hook gate");
+                state = next;
+                assert!(!timeout.timed_out(), "the completion hook never ran");
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().expect("the hook gate").1 = true;
+            self.waking.notify_all();
+        }
+    }
+
+    /// Passes and pumps until `done`, without waiting on the flusher: what
+    /// a test with a completion hook of its own drives.
+    fn pumped_until(
+        server: &BundleServer,
+        serving: &mut Session<Loopback>,
+        connection: &mut ServeConnection,
+        fetcher: &mut BundleFetcher<Loopback>,
+        sequence: &mut u64,
+        mut done: impl FnMut(&BundleFetcher<Loopback>) -> bool,
+    ) {
+        for _ in 0..ROUND_BUDGET {
+            if done(fetcher) {
+                return;
+            }
+            assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+            pump(fetcher.session_mut().driver(), serving.driver(), sequence);
+            for _ in 0..ROUND_BUDGET {
+                server.service(serving, connection).unwrap();
+                if !connection.has_backlog() {
+                    break;
+                }
+            }
+            pump(serving.driver(), fetcher.session_mut().driver(), sequence);
+        }
+        panic!("the fetch never reached what the test was waiting for");
+    }
+
+    #[test]
+    pub(crate) fn a_blocked_completion_hook_does_not_hold_the_rail() {
+        // The completion runs on the plan's flusher: the pass that saw the
+        // object whole returns while the hook is still inside, and the
+        // object is neither done nor out of the window until it returns.
+        let (bundle, _) = built_bundle("hook-blocks", &[("a.bin", patterned(200_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("hook-blocks-fetched");
+        let gate = Arc::new(HookGate::default());
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(HookGate::hook(&gate)),
+            ..ReceiveSeams::default()
+        });
+
+        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
+        pumped_until(
+            &server,
+            &mut session,
+            &mut connection,
+            &mut fetcher,
+            &mut sequence,
+            BundleFetcher::completing,
+        );
+        gate.entered();
+
+        // The rail is not the thread in the hook: its pass returns.
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        {
+            let plan = fetcher.locked_plan().unwrap();
+            assert!(
+                plan.active.contains_key(&0),
+                "the object left the window before its hook returned"
+            );
+            assert!(plan.active[&0].syncing, "the object is reserved meanwhile");
+            assert!(!plan.objects[0].done, "the object was done before its hook");
+            assert_eq!(plan.low, 0, "and the cursor had not moved over it");
+            assert_eq!(plan.completions.outstanding, 1, "one job is owed");
+            assert_eq!(plan.completions.steps, 1, "queueing it was movement");
+        }
+        assert!(
+            fetcher.rail.pending.is_empty(),
+            "nothing is queued for the carrier"
+        );
+        assert!(
+            fetcher.has_backlog(),
+            "an outstanding completion is backlog of this end's own"
+        );
+
+        gate.release();
+        assert_eq!(ended(&mut fetcher), FetchStatus::Complete);
+        let plan = fetcher.locked_plan().unwrap();
+        assert!(
+            plan.objects[0].done,
+            "the hook returned and the object is done"
+        );
+        assert!(plan.active.is_empty(), "and it left the window");
+        assert_eq!(plan.low, 1, "and the cursor moved over it");
+        assert_eq!(plan.completions.outstanding, 0, "nothing is owed");
+        assert_eq!(
+            plan.completions.steps, 2,
+            "retiring it was movement of its own"
+        );
+        assert!(
+            plan.completions.graced_until.is_some_and(|until| until
+                .checked_duration_since(std::time::Instant::now())
+                .is_some()),
+            "and it graced whatever is queued behind it"
+        );
+        drop(plan);
+        assert_same_tree(&bundle, &output);
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    pub(crate) fn dropping_a_fetch_joins_its_flusher() {
+        // The flusher outlives no fetch: dropping one waits for the job it
+        // still holds, so a hook never runs against a fetch that is gone.
+        let (bundle, _) = built_bundle("drop-joins", &[("a.bin", patterned(200_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("drop-joins-fetched");
+        let gate = Arc::new(HookGate::default());
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(HookGate::hook(&gate)),
+            ..ReceiveSeams::default()
+        });
+        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
+        pumped_until(
+            &server,
+            &mut session,
+            &mut connection,
+            &mut fetcher,
+            &mut sequence,
+            BundleFetcher::completing,
+        );
+        gate.entered();
+
+        let dropping = std::thread::spawn(move || drop(fetcher));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !dropping.is_finished(),
+            "the fetch was dropped out from under a running completion"
+        );
+        gate.release();
+        dropping.join().expect("the dropping thread");
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    pub(crate) fn a_disconnected_pass_opens_nothing_before_the_cursor_is_at_the_end() {
+        // The seal is all a disconnected pass has left to do. A plan with
+        // objects still owed has no seal due, so the pass reports the
+        // carrier and opens nothing.
+        let output = temporary("disconnected-opens-nothing");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.objects = planned_objects(2, 8);
+        plan.active.clear();
+        plan.next_open = 0;
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+        fetcher.terminal.disconnected = true;
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Disconnected);
+        let plan = fetcher.locked_plan().unwrap();
+        assert_eq!(plan.next_open, 0, "a disconnected pass opened an object");
+        assert!(!plan.finished, "and it sealed a bundle that is not whole");
+        drop(plan);
+        discard(&[&output]);
+    }
+
+    #[test]
+    pub(crate) fn an_outstanding_completion_counts_a_pass_until_its_grace_runs_out() {
+        // A job on the flusher is work no pass can watch finish, so the
+        // pass counts as movement and the stall budget is not spent on it.
+        // Bounded, so a flusher that has wedged does not keep the fetch
+        // alive for ever, and the bound is the job's own: it is set afresh
+        // whenever one is queued or retired.
+        let output = temporary("completion-grace");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.completions.outstanding = 1;
+        plan.completions.graced_until = Some(std::time::Instant::now() + COMPLETION_GRACE);
+        let shared = Arc::new(Mutex::new(plan));
+        fetcher.plan = Some(Arc::clone(&shared));
+
+        let before = fetcher.progress();
+        for counted in 1..=8 {
+            assert!(fetcher.note_completing(), "the job is still out");
+            assert_eq!(
+                fetcher.progress() - before,
+                counted,
+                "the pass counted as movement"
+            );
+        }
+
+        // A grace that has run out is not renewed by passing again.
+        {
+            let mut plan = shared.lock().unwrap();
+            plan.completions.graced_until = Some(std::time::Instant::now());
+        }
+        let graced = fetcher.progress();
+        for _ in 0..8 {
+            assert!(fetcher.note_completing(), "the job is still out");
+        }
+        assert_eq!(
+            fetcher.progress(),
+            graced,
+            "the grace ran out rather than running for ever"
+        );
+
+        // Nothing outstanding is nothing to grace, whatever the deadline.
+        {
+            let mut plan = shared.lock().unwrap();
+            plan.completions.outstanding = 0;
+            plan.completions.graced_until = Some(std::time::Instant::now() + COMPLETION_GRACE);
+        }
+        let idle = fetcher.progress();
+        for _ in 0..8 {
+            assert!(!fetcher.note_completing(), "no job is out");
+        }
+        assert_eq!(
+            fetcher.progress(),
+            idle,
+            "a pass with no job outstanding is not movement"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    pub(crate) fn joining_the_flusher_reports_what_a_job_parked() {
+        // The parked failure is taken by whichever rail passes next, and
+        // when none does the join is what carries it out.
+        let output = temporary("parked-on-join");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.completions.parked = Some(Error::InvalidArguments);
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+        assert!(matches!(
+            fetcher.finish_completions(),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            fetcher.finish_completions().is_ok(),
+            "the failure is reported once"
+        );
+        discard(&[&output]);
+    }
+
+    #[test]
+    pub(crate) fn a_cancel_during_a_completion_waits_for_it_and_counts_it() {
+        // Cancelling while a job is out reports the cursor the drain
+        // leaves, not the one before it: the object is durable and its
+        // hook has run, so it counts.
+        let (bundle, _) = built_bundle("cancel-completing", &[("a.bin", patterned(200_000))]);
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("cancel-completing-fetched");
+        let gate = Arc::new(HookGate::default());
+        let cancellation = CancellationHandle::default();
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(HookGate::hook(&gate)),
+            ..ReceiveSeams::new(cancellation.clone())
+        });
+
+        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
+        pumped_until(
+            &server,
+            &mut session,
+            &mut connection,
+            &mut fetcher,
+            &mut sequence,
+            BundleFetcher::completing,
+        );
+        gate.entered();
+        cancellation.cancel();
+        assert_eq!(
+            fetcher.service().unwrap(),
+            FetchStatus::Active,
+            "cancellation ran through a completion that was still out"
+        );
+        assert!(fetcher.cancelled.is_none());
+
+        gate.release();
+        assert_eq!(ended(&mut fetcher), FetchStatus::Cancelled(1));
+        discard(&[&bundle, &output]);
+    }
+
     #[test]
     fn a_manifest_seam_refusal_precedes_every_range_request() {
         let (bundle, _) = built_bundle("receive-refused", &[("a.bin", patterned(200_000))]);
@@ -538,7 +907,13 @@ pub(crate) mod tests {
         let _ = planned(&server, &mut session, &mut connection, &mut fetcher);
         let mut sequence = 0;
         for _ in 0..ROUND_BUDGET {
-            if fetcher.locked_plan().unwrap().low == 1 {
+            // The cursor moves on the flusher and the next object is
+            // opened by the pass after that, so this waits for both rather
+            // than for the object it happens to see first.
+            if fetcher
+                .locked_plan()
+                .is_some_and(|plan| plan.low == 1 && plan.active.contains_key(&1))
+            {
                 break;
             }
             round(
@@ -1073,6 +1448,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
         fetcher.advance().unwrap();
@@ -1125,6 +1501,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: true,
         })));
         fs::remove_dir_all(&output).unwrap();
@@ -1813,6 +2190,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         }));
 
@@ -2675,6 +3053,293 @@ pub(crate) mod tests {
         discard(&[&bundle, &output, &custom]);
     }
 
+    /// A server answering `sessions` sessions over duplex pairs, and the
+    /// connect that hands it one. What a striped fetch in this process
+    /// runs against.
+    fn striped_serve(
+        bundle: &Path,
+        sessions: u32,
+    ) -> (
+        std::thread::JoinHandle<Result<(), Error>>,
+        impl Fn() -> Result<crate::harness::Duplex, Error> + Sync,
+    ) {
+        type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, std::sync::Condvar)>;
+        let halves: Halves = Arc::new((Mutex::new(VecDeque::new()), std::sync::Condvar::new()));
+        let serving_halves = Arc::clone(&halves);
+        let serving_bundle = bundle.to_path_buf();
+        let serving = std::thread::spawn(move || {
+            let server = BundleServer::open(&serving_bundle)?;
+            crate::drive::serve_sessions(Some(sessions), || {
+                let (queue, arrived) = &*serving_halves;
+                let queue = queue.lock().expect("the accept queue");
+                // Bounded, so a fetch that never opened its session fails
+                // this thread rather than hanging the suite on its join.
+                let (mut queue, waited) = arrived
+                    .wait_timeout_while(queue, std::time::Duration::from_secs(20), |waiting| {
+                        waiting.is_empty()
+                    })
+                    .expect("the accept queue");
+                if waited.timed_out() {
+                    return Err(Error::CarrierUnavailable);
+                }
+                let carrier = queue.pop_front().expect("the wait held until one came");
+                crate::drive::ServeSession::begin(&server, carrier, crate::harness::not_required())
+            })
+        });
+        let connect = move || {
+            let (client, serving) = crate::harness::duplex_pair();
+            let (queue, arrived) = &*halves;
+            queue.lock().expect("the accept queue").push_back(serving);
+            arrived.notify_all();
+            Ok(client)
+        };
+        (serving, connect)
+    }
+
+    /// A sink that keeps what it is given and refuses to make it durable.
+    struct UnflushableSink(Mutex<Vec<u8>>);
+
+    impl vot_scheduler::RangeSink for UnflushableSink {
+        fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            let mut bytes = self.0.lock().map_err(|_| vot_scheduler::SinkError)?;
+            let at = usize::try_from(offset).map_err(|_| vot_scheduler::SinkError)?;
+            bytes[at..at + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    impl ReceiveSink for UnflushableSink {
+        fn flush(&self) -> Result<(), Error> {
+            Err(Error::InvalidArguments)
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    pub(crate) fn a_failing_completion_flush_names_itself_however_the_fetch_ends() {
+        // The sync runs on the flusher, so no rail's own pass carries its
+        // failure back. The plan parks it and whichever rail passes next
+        // returns it, which is what keeps the cause from being reported as
+        // the carrier the abandoned plan then closed.
+        //
+        // Both ways round: the primary asking for everything, so it takes
+        // the error itself, and the primary asking for nothing, so the rail
+        // does the work and the primary only sees an abandoned plan.
+        for asking in [OUTSTANDING_REQUEST_BYTES, 0] {
+            let (bundle, _) = built_bundle(
+                &format!("flush-fails-{asking}"),
+                &[("a.bin", patterned(300_000))],
+            );
+            let output = temporary(&format!("flush-fails-{asking}-fetched"));
+            let (serving, connect) = striped_serve(&bundle, 2);
+            let mut fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+            fetcher.set_receive_seams(ReceiveSeams {
+                sink: Some(Arc::new(|_, object: &ReceiveObject| {
+                    Ok(Some(Box::new(UnflushableSink(Mutex::new(vec![
+                        0;
+                        usize::try_from(
+                            object.object.length
+                        )
+                        .unwrap()
+                    ])))))
+                })),
+                ..ReceiveSeams::default()
+            });
+            fetcher.rail.window_bytes = asking;
+            let outcome = crate::drive::fetch_striped(fetcher, 2, connect);
+            assert!(
+                matches!(outcome, Err(Error::InvalidArguments)),
+                "the flush failure named itself: {:?}",
+                outcome.map(|fetched| fetched.package)
+            );
+            let _ = serving.join().expect("the serving thread");
+            discard(&[&bundle, &output]);
+        }
+    }
+
+    #[test]
+    pub(crate) fn an_abandoned_plan_still_drains_the_completions_it_queued() {
+        // A queued job retires an object that is already durable and owes
+        // its consumer a hook, so abandoning the plan drains the queue
+        // rather than dropping it, and the join is what runs the drain out.
+        let (bundle, _) = built_bundle(
+            "drain-abandoned",
+            &[
+                ("o0.bin", patterned(300_000)),
+                ("o1.bin", patterned(300_001)),
+            ],
+        );
+        let (server, mut session, mut connection) = serving(&bundle);
+        let output = temporary("drain-abandoned-fetched");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // Two objects in flight, so the second is covered and queued while
+        // the first one's hook is still inside the flusher.
+        fetcher.set_object_window(2);
+        let gate = Arc::new(HookGate::default());
+        let ran = Arc::new(AtomicU64::new(0));
+        let first = Arc::new(AtomicBool::new(true));
+        let held = Arc::clone(&gate);
+        let counted = Arc::clone(&ran);
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(Arc::new(move |_, _| {
+                if first.swap(false, Ordering::Relaxed) {
+                    // Held until the test has seen the second object's job
+                    // queued behind this one, then refused.
+                    held.wait()?;
+                    return Err(Error::InvalidArguments);
+                }
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })),
+            ..ReceiveSeams::default()
+        });
+
+        let mut sequence = announce(&server, &mut session, &mut connection, &mut fetcher);
+        pumped_until(
+            &server,
+            &mut session,
+            &mut connection,
+            &mut fetcher,
+            &mut sequence,
+            |fetcher| {
+                fetcher
+                    .locked_plan()
+                    .is_some_and(|plan| plan.completions.outstanding == 2)
+            },
+        );
+        gate.entered();
+        gate.release();
+
+        assert!(
+            matches!(fetcher.finish_completions(), Err(Error::InvalidArguments)),
+            "the hook's refusal named itself"
+        );
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            1,
+            "the job queued behind the failure still ran before the join returned"
+        );
+        assert!(fetcher.locked_plan().unwrap().abandoned);
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    pub(crate) fn an_abandoned_plan_queues_no_second_job_for_an_object() {
+        // A failed completion clears `syncing` and leaves its object in the
+        // window with full coverage, so the settle choice has to refuse an
+        // abandoned plan: a rail passing between the abandon and this lock
+        // would otherwise queue the object again and run its hook twice.
+        let output = temporary("abandoned-requeue");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.active.get_mut(&0).unwrap().covered.insert(0, 8);
+        // Exactly what a failed retire leaves behind.
+        plan.abandoned = true;
+        plan.completions.parked = Some(Error::InvalidArguments);
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+
+        fetcher.advance().unwrap();
+        let plan = fetcher.locked_plan().unwrap();
+        assert_eq!(
+            plan.completions.outstanding, 0,
+            "the object was queued a second time"
+        );
+        assert_eq!(plan.completions.steps, 0, "and counted as a second job");
+        assert!(!plan.active[&0].syncing, "and reserved a second time");
+        assert!(!plan.objects[0].done);
+        drop(plan);
+        discard(&[&output]);
+    }
+
+    #[test]
+    pub(crate) fn a_disconnect_through_the_seal_is_not_the_end_of_the_fetch() {
+        // The seal runs outside the plan lock on one rail. A second rail
+        // passing through that window has a cursor at the end and a carrier
+        // that has gone, and reporting it would throw away a bundle a
+        // moment from whole whose store files are already removed.
+        let output = temporary("disconnect-through-seal");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.active.clear();
+        plan.objects[0].done = true;
+        plan.low = 1;
+        plan.sealing = true;
+        let shared = Arc::new(Mutex::new(plan));
+        fetcher.plan = Some(Arc::clone(&shared));
+        fetcher.terminal.disconnected = true;
+
+        assert_eq!(
+            fetcher.service().unwrap(),
+            FetchStatus::Active,
+            "the carrier was reported over a seal in flight"
+        );
+        assert!(
+            fetcher.has_backlog(),
+            "a seal in flight is this end's own work still owed"
+        );
+
+        // The rail that was sealing finishes; this one sees the bundle.
+        {
+            let mut plan = shared.lock().unwrap();
+            plan.sealing = false;
+            plan.finished = true;
+        }
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Complete);
+        discard(&[&output]);
+    }
+
+    #[test]
+    pub(crate) fn a_completion_slower_than_the_stall_budget_is_not_a_stall() {
+        // One rail, and its only object's completion takes three times the
+        // budget it is driven under, and well under the grace a test build
+        // gives a job. The rail is not the thread waiting on it, so there is no
+        // pass to charge the budget against: the job is this fetch's own
+        // work in flight and the fetch finishes.
+        let (bundle, built) = built_bundle("slow-completion", &[("a.bin", patterned(300_000))]);
+        let output = temporary("slow-completion-fetched");
+        let (serving, connect) = striped_serve(&bundle, 1);
+        let mut fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        let budget = std::time::Duration::from_millis(200);
+        fetcher.set_receive_seams(ReceiveSeams {
+            complete: Some(Arc::new(move |_, _| {
+                std::thread::sleep(budget * 3);
+                Ok(())
+            })),
+            ..ReceiveSeams::default()
+        });
+        assert_eq!(
+            crate::drive::drive_within(&mut fetcher, budget).unwrap(),
+            FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package(), Some(built));
+        drop(fetcher);
+        let _ = serving.join().expect("the serving thread");
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    pub(crate) fn a_completion_with_the_flusher_joined_abandons_the_plan() {
+        // The queue is what the flusher is reached through; once it has
+        // been joined there is nothing to retire the object, so the plan
+        // fails here rather than waiting on a job nobody holds.
+        let output = temporary("flusher-joined");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.active.get_mut(&0).unwrap().covered.insert(0, 8);
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+        assert!(fetcher.advance().is_err());
+        let plan = fetcher.locked_plan().unwrap();
+        assert!(plan.abandoned);
+        assert!(!plan.active[&0].syncing, "the object is not left reserved");
+        assert_eq!(plan.completions.outstanding, 0, "and nothing is owed");
+        assert!(!plan.objects[0].done);
+        drop(plan);
+        discard(&[&output]);
+    }
+
     #[test]
     pub(crate) fn a_stride_crossing_flushes_once_and_arms_the_next() {
         // The crossing writer flushes once; the next mark is a stride
@@ -3395,6 +4060,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: Some(Arc::clone(&store)),
+            completions: Completions::default(),
             finished: false,
         }));
         let sink = Arc::new(
@@ -3495,6 +4161,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         };
         let (at, _, offset, length) = plan.next_span().unwrap().unwrap();
@@ -3746,7 +4413,7 @@ pub(crate) mod tests {
         let mut sequence = 0;
         let mut status = FetchStatus::Active;
         for _ in 0..ROUND_BUDGET {
-            status = fetcher.service().unwrap();
+            status = settled(&mut fetcher).unwrap();
             if status != FetchStatus::Active {
                 break;
             }
@@ -3907,6 +4574,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
         fetcher.advance().unwrap();
@@ -3933,6 +4601,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
         let factory_calls = Arc::new(AtomicU64::new(0));
@@ -3969,6 +4638,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
         let sink = Arc::new(SeamSink {
@@ -4030,6 +4700,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
         resumed.advance().unwrap();
@@ -4273,7 +4944,12 @@ pub(crate) mod tests {
             .driver()
             .events
             .push_back(Event::Disconnected(ConnectionId(3)));
-        assert_eq!(fetcher.service().unwrap(), FetchStatus::Complete);
+        // The pass that takes the last bytes and the disconnect together
+        // queues that object's completion rather than running it, so the
+        // bundle is whole a pass or more later; the disconnect must not be
+        // reported over it.
+        assert_eq!(fetcher.service().unwrap(), FetchStatus::Active);
+        assert_eq!(ended(&mut fetcher), FetchStatus::Complete);
         assert_same_tree(&bundle, &output);
         discard(&[&bundle, &output]);
     }
@@ -4661,6 +5337,7 @@ pub(crate) mod tests {
             abandoned: false,
             sealing: false,
             store: None,
+            completions: Completions::default(),
             finished: false,
         })));
 

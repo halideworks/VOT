@@ -306,8 +306,10 @@ where
     primary.set_object_window(crate::fetch::object_window(rails));
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
         conclude_fetch(&mut primary, status);
+        let package = fetched(&primary, status);
+        primary.finish_completions()?;
         return Ok(Fetched {
-            package: fetched(&primary, status)?,
+            package: package?,
             moved: primary.moved_bytes(),
             first_moved: primary.first_moved(),
             fec: primary.fec_counts(),
@@ -378,17 +380,23 @@ where
                 Err(error) => rail_failure = Some(named_failure(rail_failure, error)),
             }
         }
+        // After the rails and before returning, on either outcome: a
+        // completion job one of them queued is still owed, and the object
+        // it retires is durable only once the flusher says so.
+        let flushed = primary.finish_completions();
         match outcome {
-            Ok(package) => Ok(Fetched {
+            Ok(package) => flushed.map(|()| Fetched {
                 package,
                 moved: primary.moved_bytes(),
                 first_moved,
                 fec,
             }),
-            // Report the rail's failure as the cause of a stalled primary.
-            Err(Error::Stalled | Error::CarrierUnavailable) => {
-                Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
-            }
+            // Report the rail's failure, or the completion that failed on
+            // the flusher, as the cause of a stalled primary.
+            Err(Error::Stalled | Error::CarrierUnavailable) => Err(named_failure(
+                rail_failure,
+                flushed.err().unwrap_or(Error::CarrierUnavailable),
+            )),
             Err(error) => Err(error),
         }
     })

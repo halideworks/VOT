@@ -818,6 +818,120 @@ pub(crate) mod tests {
     }
 
     #[test]
+    pub(crate) fn a_rail_admits_an_object_another_rail_opened_before_asking_for_it() {
+        // The handout is window-wide and admission is per rail, so a rail
+        // that advanced while the window held one object can be handed a
+        // span of an object a later rail opened. Asking without admitting
+        // it makes the serve's proof bundle an unknown object and ends the
+        // fetch, so the ask itself has to admit.
+        let (bundle, _) = built_bundle(
+            "admit-handout",
+            &[("a.bin", noise(262_145)), ("b.bin", noise(262_146))],
+        );
+        let (server, mut session1, mut connection1) = serving(&bundle);
+        let (_, mut session2, mut connection2) = serving(&bundle);
+        let output = temporary("admit-handout-fetched");
+        let mut primary = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        // One object in the window: the second is opened by hand later, in
+        // the gap between the joining rail's advance and its handout.
+        primary.set_object_window(1);
+        let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
+        {
+            let plan = plan.lock().unwrap();
+            assert_eq!(
+                plan.active.len(),
+                1,
+                "the window opened more than one object"
+            );
+            // The first object is spoken for, so the handout has nothing
+            // left of it and must reach into the second.
+            assert_eq!(plan.active[&0].next_offset, 262_145);
+        }
+        let mut secondary = BundleFetcher::join(
+            Loopback::default(),
+            &output,
+            Arc::clone(&plan),
+            None,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let mut seq2 = 0;
+        for _ in 0..ROUND_BUDGET {
+            round(
+                &server,
+                &mut session2,
+                &mut connection2,
+                &mut secondary,
+                &mut seq2,
+            );
+            if secondary.rail.admitted.contains_key(&0) {
+                break;
+            }
+        }
+        assert!(
+            secondary.rail.admitted.contains_key(&0),
+            "the joining rail never admitted the open object"
+        );
+        assert!(!secondary.rail.admitted.contains_key(&1));
+        // The other rail widens the window and opens the second object
+        // after this rail's advance and before its handout.
+        plan.lock().unwrap().window = 2;
+        primary.advance().unwrap();
+        assert_eq!(plan.lock().unwrap().active.len(), 2);
+        secondary.issue_ranges().unwrap();
+        assert!(
+            secondary.rail.admitted.contains_key(&1),
+            "the rail asked for an object it had not admitted"
+        );
+        // Sent in the pass that asked, the way `service` sends it, so the
+        // answer is dispatched before this rail's next advance runs.
+        secondary.drain().unwrap();
+        secondary.session_mut().flush().unwrap();
+        pump(
+            secondary.session_mut().driver(),
+            session2.driver(),
+            &mut seq2,
+        );
+        for _ in 0..ROUND_BUDGET {
+            server.service(&mut session2, &mut connection2).unwrap();
+            if !connection2.has_backlog() {
+                break;
+            }
+        }
+        pump(
+            session2.driver(),
+            secondary.session_mut().driver(),
+            &mut seq2,
+        );
+
+        let mut seq1 = 0;
+        let mut settled = false;
+        for _ in 0..ROUND_BUDGET {
+            let one = round(
+                &server,
+                &mut session1,
+                &mut connection1,
+                &mut primary,
+                &mut seq1,
+            );
+            let two = round(
+                &server,
+                &mut session2,
+                &mut connection2,
+                &mut secondary,
+                &mut seq2,
+            );
+            if one == FetchStatus::Complete && two == FetchStatus::Complete {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the answer for the handed-out object was refused");
+        assert_same_tree(&bundle, &output);
+        discard(&[&bundle, &output]);
+    }
+
+    #[test]
     pub(crate) fn an_abandoned_plan_ends_every_rail_without_its_stall_budget() {
         // A failed rail marks the plan; the others end at their next pass
         // instead of waiting out a stall budget, whatever their window

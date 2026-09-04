@@ -1834,6 +1834,16 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             let Some((at, object, offset, length)) = plan.next_span()? else {
                 return Ok(());
             };
+            // A rail admits before it asks: the handout is window-wide,
+            // admission is per rail, and another rail may have opened this
+            // index since this one last advanced. Admitted before the frame
+            // is queued, so a refused admission owes nothing.
+            if !self.rail.admitted.contains_key(&at) {
+                let active = plan.active.get(&at).ok_or(Error::InvalidBundle)?;
+                let (subject, sink) = (active.subject, Arc::clone(&active.sink));
+                self.receiver.admit(subject, Box::new(sink))?;
+                self.rail.admitted.insert(at, subject);
+            }
             let request_id = Self::request_identifier(&mut self.rail.next_request)?;
             Self::queue_request(
                 &mut self.rail.pending,

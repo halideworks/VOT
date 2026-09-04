@@ -305,7 +305,7 @@ jobs:
   platform-native:
     name: platform native (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -325,13 +325,78 @@ jobs:
 
       # vot-cli holds the per-platform file primitives and the aliases that
       # name them, and no other job compiles it off Linux, so a Windows-only
-      # name resolution break sat in main unseen. Compiling is the gap, so a
-      # check over every target rather than a test run, and without the wire
-      # feature: that one pulls quiche's BoringSSL through cmake, bindgen and
-      # nasm, which this job installs none of, and the imports that broke are
-      # outside it.
+      # name resolution break sat in main unseen. A check over every target
+      # without the wire feature first, because that is the build the
+      # imports that broke live in.
       - name: Check the CLI
         run: cargo +1.97.1 check -p vot-cli --all-targets --locked
+
+      # The wire feature off Linux: quiche builds BoringSSL through cmake and
+      # nasm, and bindgen needs libclang. macOS ships cmake and libclang with
+      # Xcode and wants nasm; Windows ships cmake and LLVM and wants nasm. The
+      # desktop clients ride this feature on both, so this is where it is
+      # proven to build and to carry a session over loopback.
+      - name: Install nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
+      # The runner image's compiler and cmake go into the key, as the
+      # quiche-live job's do: BoringSSL objects built by an older image would
+      # otherwise be restored under an unchanged lock file.
+      - name: Fingerprint native toolchain
+        id: wire-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          fingerprint="$({
+            printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" "$RUNNER_OS" "$RUNNER_ARCH"
+            rustc +1.97.1 -vV
+            cmake --version
+          } | shasum -a 256)"
+          printf 'key=%s\n' "${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the wire build
+        id: wire-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ github.workspace }}/target/platform-wire
+          key: platform-wire-v1-${{ matrix.os }}-${{ steps.wire-toolchain.outputs.key }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            platform-wire-v1-${{ matrix.os }}-${{ steps.wire-toolchain.outputs.key }}-
+
+      # Debug profile only: the release profile is measured on Linux, and
+      # macOS minutes cost ten times Linux minutes. The pump's loopback tests
+      # run on both. The engines' loopback tests run on macOS; on Windows
+      # they are built and not run, because receiving a push is Unix-only
+      # (guarded directory operations) and every push test asserts on the
+      # receiver, while the client that pushes and fetches is what Windows
+      # has to build.
+      - name: Test the pump and the engines over a real socket
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/platform-wire
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            export LIBCLANG_PATH='C:\Program Files\LLVM\bin'
+            export PATH="$PATH:/c/Program Files/NASM"
+          fi
+          cargo +1.97.1 test -p vot-transport-quiche --features live --locked
+          if [ "$RUNNER_OS" = Windows ]; then
+            cargo +1.97.1 test -p vot-cli --features wire --locked --no-run
+          else
+            cargo +1.97.1 test -p vot-cli --features wire --locked
+          fi
+
+      - name: Save the wire build
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.wire-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ github.workspace }}/target/platform-wire
+          key: ${{ steps.wire-cache.outputs.cache-primary-key }}
 
   quiche-live:
     name: quiche live (loopback)

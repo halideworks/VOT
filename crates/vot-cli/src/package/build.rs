@@ -122,6 +122,69 @@ pub fn build_bundle_with_suite(
     Ok(summary)
 }
 
+/// Builds a package's manifest under `manifest_root` from the files under
+/// `source` without copying them: every file is hashed where it sits and
+/// answered as a [`crate::ServedSource`] keyed by its root, which is what
+/// [`BundleServer::assemble`](crate::BundleServer::assemble) takes. Every
+/// entry is a direct object; nothing is packed.
+///
+/// `manifest_root` gets `manifest/` with the pages and seal, exactly as a
+/// bundle has, and nothing else. The leaves come back with each source and
+/// are the caller's to keep, with [`crate::proof_cache::write`] or however
+/// it likes.
+///
+/// # Errors
+/// Refuses a `source` that is not a directory, an empty one, and a
+/// `manifest_root` that already exists, with [`Error::InvalidArguments`];
+/// a file that changes length while it is read is [`Error::SourceMutation`].
+pub fn build_manifest(
+    source: &Path,
+    manifest_root: &Path,
+    suite: Suite,
+) -> Result<
+    (
+        PackageSummary,
+        std::collections::BTreeMap<[u8; 32], crate::ServedSource>,
+    ),
+    Error,
+> {
+    if !source.is_dir() || manifest_root.exists() {
+        return Err(Error::InvalidArguments);
+    }
+    let sources = collect_sources(source)?;
+    if sources.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    fs::create_dir(manifest_root)?;
+    let mut manifest = ManifestSpool::new(manifest_root)?;
+    let mut package = PackageBuilder::new()?;
+    let mut served = std::collections::BTreeMap::new();
+    for file in sources {
+        let mut input = File::open(&file.source)?;
+        let prepared = name_stream(&mut input, None, file.length, suite)?;
+        let root = prepared.object_id().root;
+        // Two files with the same bytes are one stored object; the first
+        // path is the one the server reads.
+        served.entry(root).or_insert_with(|| crate::ServedSource {
+            path: file.source.clone(),
+            leaves: prepared.proof_leaves(),
+        });
+        let record = EntryRecord {
+            path: file.path,
+            suite,
+            logical_root: root,
+            logical_length: file.length,
+            storage: Storage::Direct,
+        };
+        if let Some(draft) = package.push(&record)? {
+            manifest.push(&draft)?;
+        }
+    }
+    let summary = manifest.finish(package.finish()?)?;
+    sync_directory(manifest_root)?;
+    Ok((summary, served))
+}
+
 pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
     pub(crate) fn visit(
         root: &Path,
@@ -284,27 +347,7 @@ pub(crate) fn copy_and_name(
         .truncate(true)
         .write(true)
         .open(&temporary)?;
-    let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
-        .map_err(|_| Error::InvalidBundle)?;
-    let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
-    let copied = (|| -> Result<vot_object::PreparedObject, Error> {
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            output.write_all(&buffer[..read])?;
-            builder
-                .update(&buffer[..read])
-                .map_err(|_| Error::SourceMutation)?;
-        }
-        output.sync_all()?;
-        let prepared = builder.finish().map_err(|_| Error::SourceMutation)?;
-        if prepared.object_id().length != expected_length {
-            return Err(Error::SourceMutation);
-        }
-        Ok(prepared)
-    })();
+    let copied = name_stream(&mut input, Some(&mut output), expected_length, suite);
     let prepared = match copied {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -318,6 +361,45 @@ pub(crate) fn copy_and_name(
         root: prepared.object_id().root,
         leaves: prepared.proof_leaves(),
     })
+}
+
+/// One pass over `input` that names it: the root and the proof leaves of
+/// the object its bytes make, with those bytes written to `output` on the
+/// way past when a copy is wanted. A source whose length is not
+/// `expected_length` is a mutation.
+fn name_stream(
+    input: &mut File,
+    mut output: Option<&mut File>,
+    expected_length: u64,
+    suite: Suite,
+) -> Result<vot_object::PreparedObject, Error> {
+    let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
+        .map_err(|_| Error::InvalidBundle)?;
+    let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
+    // Bounded by the length the source was promised to have, never by the
+    // stream: a source that ends early or runs long is a mutation, and the
+    // builder refuses a stream that overruns its promise on the way.
+    let mut remaining = expected_length;
+    while remaining > 0 {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Err(Error::SourceMutation);
+        }
+        if let Some(output) = output.as_deref_mut() {
+            output.write_all(&buffer[..read])?;
+        }
+        builder
+            .update(&buffer[..read])
+            .map_err(|_| Error::SourceMutation)?;
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    if input.read(&mut buffer)? != 0 {
+        return Err(Error::SourceMutation);
+    }
+    if let Some(output) = output {
+        output.sync_all()?;
+    }
+    builder.finish().map_err(|_| Error::SourceMutation)
 }
 
 pub(crate) fn stream_root(

@@ -187,6 +187,156 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_built_in_place_serves_the_source_files_uncopied() {
+        // Two files share their bytes and so their root: one stored object,
+        // served from the first path. The small file is a direct object too,
+        // never packed, and the empty one is an object of length zero.
+        let source = crate::tests::temporary("manifest-source");
+        std::fs::create_dir_all(source.join("shots")).unwrap();
+        let big = crate::harness::patterned(200_000);
+        std::fs::write(source.join("shots/a.bin"), &big).unwrap();
+        std::fs::write(source.join("shots/b.bin"), &big).unwrap();
+        std::fs::write(source.join("note.txt"), b"small").unwrap();
+        std::fs::write(source.join("empty.bin"), b"").unwrap();
+        let manifest_root = crate::tests::temporary("manifest-root");
+        let (built, sources) =
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE).unwrap();
+        assert_eq!(built.entries, 4);
+        assert_eq!(built.logical_length, 400_005);
+        assert_eq!(sources.len(), 3, "one stored object per distinct root");
+        assert!(
+            !manifest_root.join("objects").exists(),
+            "a manifest build copied something"
+        );
+        let scanned = crate::scan_manifest(&manifest_root).unwrap();
+        assert_eq!(scanned, built);
+        let big_root = *sources
+            .iter()
+            .find(|(_, served)| served.path.ends_with("a.bin"))
+            .map(|(root, _)| root)
+            .expect("the first of the twins names the object");
+        assert!(
+            sources[&big_root]
+                .leaves
+                .as_ref()
+                .is_some_and(|leaves| leaves.len() == 4),
+            "four groups of leaves for 200,000 bytes"
+        );
+        let mut reader = crate::ManifestReader::open(&manifest_root).unwrap();
+        while let Some(record) = reader.next_record().unwrap() {
+            assert!(
+                matches!(record.storage, crate::Storage::Direct),
+                "an entry was packed"
+            );
+        }
+
+        let server = BundleServer::assemble(&manifest_root, sources).unwrap();
+        assert_eq!(server.package(), built);
+        assert_eq!(server.object_count(), 3);
+        let (client, serving) = crate::harness::duplex_pair();
+        let serving_thread = std::thread::spawn(move || {
+            let mut answered = Some(serving);
+            crate::drive::serve_sessions(Some(1), || {
+                let carrier = answered.take().ok_or(Error::CarrierUnavailable)?;
+                crate::drive::ServeSession::begin(
+                    &server,
+                    carrier,
+                    crate::authz::Stance::open([7; 32]),
+                )
+            })
+        });
+        let output = crate::tests::temporary("manifest-fetched");
+        let mut fetcher =
+            crate::BundleFetcher::begin(client, &output, Some(built.root)).expect("a fetch");
+        assert_eq!(
+            crate::drive::drive(&mut fetcher).expect("a driven fetch"),
+            crate::FetchStatus::Complete
+        );
+        assert_eq!(fetcher.package().expect("a package"), built);
+        drop(fetcher);
+        serving_thread
+            .join()
+            .expect("the serving thread")
+            .expect("served");
+        crate::harness::discard(&[&source, &manifest_root, &output]);
+    }
+
+    #[test]
+    fn a_manifest_build_refuses_what_a_bundle_build_refuses() {
+        let source = crate::tests::temporary("manifest-refusals-source");
+        let manifest_root = crate::tests::temporary("manifest-refusals-root");
+        // No source directory.
+        assert!(matches!(
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE),
+            Err(Error::InvalidArguments)
+        ));
+        // An empty one.
+        std::fs::create_dir_all(&source).unwrap();
+        assert!(matches!(
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(!manifest_root.exists(), "a refused build left a directory");
+        // A manifest root that already exists.
+        std::fs::write(source.join("one.bin"), b"one").unwrap();
+        std::fs::create_dir_all(&manifest_root).unwrap();
+        assert!(matches!(
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE),
+            Err(Error::InvalidArguments)
+        ));
+        crate::harness::discard(&[&source, &manifest_root]);
+    }
+
+    #[test]
+    fn a_manifest_build_keeps_leaves_a_serve_can_prepare_from() {
+        // The leaves come back with the source and go through the public
+        // cache the same way a send's do, so a later assemble reads them.
+        let source = crate::tests::temporary("manifest-leaves-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(150_000)).unwrap();
+        let manifest_root = crate::tests::temporary("manifest-leaves-root");
+        let (built, sources) =
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE).unwrap();
+        let cache = crate::tests::temporary("manifest-leaves-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let (root, served) = sources.iter().next().unwrap();
+        let leaves = served.leaves.clone().expect("leaves for three groups");
+        crate::proof_cache::write(&cache, root, crate::DEFAULT_LOGICAL_SUITE, 150_000, &leaves)
+            .unwrap();
+        assert_eq!(
+            crate::proof_cache::read(&cache, root, crate::DEFAULT_LOGICAL_SUITE, 150_000),
+            Some(leaves.clone())
+        );
+        assert_eq!(
+            crate::proof_cache::read(&cache, root, crate::DEFAULT_LOGICAL_SUITE, 150_001),
+            None,
+            "a cache for another length was believed"
+        );
+        let from_cache = std::collections::BTreeMap::from([(
+            *root,
+            crate::ServedSource {
+                path: served.path.clone(),
+                leaves: crate::proof_cache::read(
+                    &cache,
+                    root,
+                    crate::DEFAULT_LOGICAL_SUITE,
+                    150_000,
+                ),
+            },
+        )]);
+        let assembled = BundleServer::assemble(&manifest_root, from_cache).unwrap();
+        assert_eq!(assembled.package(), built);
+        assert!(
+            assembled
+                .objects
+                .values()
+                .all(|object| object.verified.is_some()),
+            "the leaves were not what the server prepared from"
+        );
+        crate::harness::discard(&[&source, &manifest_root, &cache]);
+    }
+
+    #[test]
     fn an_assembled_server_reads_a_one_group_object_whatever_its_leaves() {
         // One small file packs into one stored object of a group or less,
         // which has no tree to rebuild: it is read, and leaves handed in

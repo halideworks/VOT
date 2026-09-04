@@ -121,7 +121,9 @@ where
 }
 
 /// [`fetch_over`] offering `extensions` on every rail, reporting what the
-/// fetch measured as well as what it proved.
+/// fetch measured as well as what it proved. The capability, prover count,
+/// and stats request come from the environment, and progress goes to
+/// stderr every [`PROGRESS_QUANTUM_BYTES`] so stdout stays clean for scripts.
 pub(crate) fn fetch_over_offering<F>(
     primary: Transport,
     connect: F,
@@ -136,40 +138,152 @@ where
     // Read before the fetch runs, so a value this cannot read is refused now
     // rather than after the transfer it was meant to report on.
     let wanted = stats_wanted(std::env::var(FETCH_STATS).ok().as_deref())?;
-    let mut fetcher = BundleFetcher::begin_with(
-        primary,
-        bundle,
-        pin,
-        holder_from(
-            std::env::var(FETCH_CAPABILITY).ok().as_deref(),
-            std::env::var(FETCH_HOLDER_KEY).ok().as_deref(),
-        )?,
-        extensions,
+    let holder = holder_from(
+        std::env::var(FETCH_CAPABILITY).ok().as_deref(),
+        std::env::var(FETCH_HOLDER_KEY).ok().as_deref(),
     )?;
     let provers = std::env::var("VOT_FETCH_PROVERS")
         .ok()
         .map(|value| value.trim().parse().map_err(|_| Error::InvalidArguments))
-        .transpose()?
-        .unwrap_or_else(|| fetcher.proving_threads());
-    fetcher.set_proving_threads(provers_per_rail(provers, rails))?;
-    // Progress lines go to stderr so stdout stays clean for scripts.
-    fetcher.report_placed(
-        PROGRESS_QUANTUM_BYTES,
-        Box::new(|placed, total| match total {
-            Some(total) => eprintln!("{} / {} MiB", placed >> 20, total.div_ceil(1 << 20)),
-            None => eprintln!("{} MiB", placed >> 20),
-        }),
+        .transpose()?;
+    let progress: crate::Progress = Box::new(|placed, total| match total {
+        Some(total) => eprintln!("{} / {} MiB", placed >> 20, total.div_ceil(1 << 20)),
+        None => eprintln!("{} MiB", placed >> 20),
+    });
+    let (outcome, began) = fetch_over_configured(
+        primary,
+        connect,
+        bundle,
+        pin,
+        rails,
+        extensions,
+        holder,
+        provers,
+        Some((PROGRESS_QUANTUM_BYTES, progress)),
     )?;
-    let began = std::time::Instant::now();
-    let outcome = crate::drive::fetch_striped(fetcher, rails, connect)?;
-    let elapsed = began.elapsed();
     if wanted {
         let first = outcome
             .first_moved
             .map(|at| at.saturating_duration_since(began));
-        eprintln!("{}", stats_line(outcome.moved, elapsed, first, outcome.fec));
+        eprintln!(
+            "{}",
+            stats_line(outcome.moved, began.elapsed(), first, outcome.fec)
+        );
     }
     Ok(outcome)
+}
+
+/// The fetch every public entry point runs, with everything it needs handed
+/// in and nothing read from the environment, and the instant the transfer
+/// itself began, after the bundle and its resume store were opened.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one fetch's settings, each already narrowed by its caller"
+)]
+fn fetch_over_configured<F>(
+    primary: Transport,
+    connect: F,
+    bundle: &Path,
+    pin: Option<[u8; 32]>,
+    rails: usize,
+    extensions: std::collections::BTreeSet<u64>,
+    holder: Option<std::sync::Arc<crate::authz::Holder>>,
+    provers: Option<usize>,
+    progress: Option<(u64, crate::Progress)>,
+) -> Result<(crate::drive::Fetched, std::time::Instant), Error>
+where
+    F: Fn() -> Result<Transport, Error> + Sync,
+{
+    let mut fetcher = BundleFetcher::begin_with(primary, bundle, pin, holder, extensions)?;
+    let provers = provers.unwrap_or_else(|| fetcher.proving_threads());
+    fetcher.set_proving_threads(provers_per_rail(provers, rails))?;
+    if let Some((quantum, observer)) = progress {
+        fetcher.report_placed(quantum, observer)?;
+    }
+    let began = std::time::Instant::now();
+    let outcome = crate::drive::fetch_striped(fetcher, rails, connect)?;
+    Ok((outcome, began))
+}
+
+/// Fetches into `bundle` with everything `options` names, so a long-lived
+/// caller can run two fetches with two capabilities at once. Only the
+/// process-wide carrier tuning stays with the environment
+/// (`VOT_DATAGRAM_BYTES`, `VOT_CONGESTION`, `VOT_INITIAL_CWND`,
+/// `VOT_PREFIX_DUP`), as it does for every command.
+///
+/// The fetcher reports placed bytes at quantum crossings only; the end of
+/// the fetch is reported here, once, if the last crossing fell short of it.
+///
+/// # Errors
+/// Refuses a rail count outside one to the fetch rail limit and a zero
+/// progress quantum with [`Error::InvalidArguments`], before the bundle is
+/// opened; otherwise as [`fetch_bundle`].
+pub fn fetch_bundle_with(
+    options: crate::FetchOptions,
+    bundle: &Path,
+) -> Result<PackageSummary, Error> {
+    let crate::FetchOptions {
+        address,
+        holder,
+        serve_identity,
+        pin,
+        rails,
+        provers,
+        extensions,
+        progress,
+    } = options;
+    if !valid_fetch_rails(rails) || progress.as_ref().is_some_and(|(quantum, _)| *quantum == 0) {
+        return Err(Error::InvalidArguments);
+    }
+    let config = client_config()?;
+    let connect = || {
+        let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
+            .map_err(carrier_failure)?;
+        verify_serve_identity(&carrier, serve_identity)?;
+        Ok(carrier)
+    };
+    let shared = progress.map(|(quantum, observer)| {
+        (
+            quantum,
+            std::sync::Arc::new(std::sync::Mutex::new((0_u64, observer))),
+        )
+    });
+    let forwarded = shared.as_ref().map(|(quantum, shared)| {
+        let forward = std::sync::Arc::clone(shared);
+        let forward: crate::Progress = Box::new(move |placed, total| {
+            if let Ok(mut state) = forward.lock() {
+                state.0 = placed;
+                (state.1)(placed, total);
+            }
+        });
+        (*quantum, forward)
+    });
+    let (outcome, _) = fetch_over_configured(
+        connect()?,
+        connect,
+        bundle,
+        pin,
+        rails,
+        extensions,
+        holder,
+        provers,
+        forwarded,
+    )?;
+    if let Some((_, shared)) = &shared
+        && let Ok(mut state) = shared.lock()
+    {
+        let length = outcome.package.logical_length;
+        if state.0 < length {
+            state.0 = length;
+            (state.1)(length, Some(length));
+        }
+    }
+    Ok(outcome.package)
+}
+
+/// Whether a caller's rail count is one the serve side can seat.
+pub(super) const fn valid_fetch_rails(rails: usize) -> bool {
+    rails != 0 && rails <= super::MAX_FETCH_RAILS
 }
 
 /// Splits one fetch's proof workers across its rails without leaving a rail

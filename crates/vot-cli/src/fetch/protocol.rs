@@ -1,18 +1,18 @@
 //! Session and frame dispatch: the [`BundleFetcher`] passes.
 
 use super::{
-    ActiveObject, Arc, Authentication, BTreeMap, BTreeSet, CountingSink, CoverageMap,
-    DEFAULT_PROVING_THREADS, DecodeLimits, DurableHook, Error, Event, Fault, FetchPlan,
-    FetchStatus, MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_CONTROL_FRAME_PAYLOAD,
-    MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestReader, ManifestRequest, Mutex,
-    ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH, OUTSTANDING_COVERS, OUTSTANDING_REQUEST_BYTES,
-    PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT, PackageDescriptor, PackageSummary,
-    Path, PathBuf, PlacedReport, PlannedObject, Proving, ProvingPool, RESUME_STORE, RangeRequest,
-    ReceiveObject, ReceiveSeams, ReceiveSessionId, ReceiveSink, ReliableReceiver, ResumeStore,
-    Session, SessionReceiver, Settings, SharedPlan, Storage, SubjectId, TEST_PROVER_WAIT,
-    TransportAdapter, TypedFrame, UnitRanges, VecDeque, crossing, error_code, frames, fs,
-    is_backpressure, package_sentinel, remove_store_files, reservations_of, resume_failure,
-    resumed_extents, subject_of, total_units_of,
+    ActiveObject, Arc, Authentication, BTreeMap, BTreeSet, COMPLETION_FLUSHERS, CompletionFlusher,
+    CompletionJob, Completions, CountingSink, CoverageMap, DEFAULT_PROVING_THREADS, DecodeLimits,
+    DurableHook, Error, Event, Fault, FetchPlan, FetchStatus, MANIFEST_DIRECTORY, MANIFEST_SEAL,
+    MAX_CONTROL_FRAME_PAYLOAD, MAX_MANIFEST_REQUEST_PAGES, MAX_REQUESTED_RANGE, ManifestReader,
+    ManifestRequest, Mutex, ORPHAN_BUNDLE_BYTES, ORPHAN_BUNDLE_DEPTH, OUTSTANDING_COVERS,
+    OUTSTANDING_REQUEST_BYTES, PENDING_BUNDLE_BYTES, PENDING_BUNDLE_DEPTH, PROVER_WAIT,
+    PackageDescriptor, PackageSummary, Path, PathBuf, PlacedReport, PlannedObject, Proving,
+    ProvingPool, RESUME_STORE, RangeRequest, ReceiveObject, ReceiveSeams, ReceiveSessionId,
+    ReceiveSink, ReliableReceiver, ResumeStore, Session, SessionReceiver, Settings, SharedPlan,
+    Storage, SubjectId, TEST_PROVER_WAIT, TransportAdapter, TypedFrame, VecDeque, crossing,
+    error_code, frames, fs, is_backpressure, mpsc, package_sentinel, remove_store_files,
+    reservations_of, resume_failure, resumed_extents, subject_of,
 };
 
 pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
@@ -32,6 +32,30 @@ fn discard_open(chosen: Option<Box<dyn ReceiveSink>>) -> Result<(), Error> {
         None => Ok(()),
     }
 }
+
+/// How long a completion job may keep a rail's stall budget from running.
+///
+/// The job is this end's own work in flight that no pass can watch finish,
+/// so a pass that finds one counts as movement. This bounds that: a flusher
+/// that has wedged must not keep a fetch alive for ever. Half a minute is
+/// the stall budget's own patience, which is what the same sync had when it
+/// ran on the rail and the loop made no pass at all.
+pub(crate) const COMPLETION_GRACE: std::time::Duration = if cfg!(test) {
+    TEST_COMPLETION_GRACE
+} else {
+    std::time::Duration::from_secs(30)
+};
+
+/// What a test build graces instead, the way a test round waits its own
+/// [`TEST_PROVER_WAIT`].
+///
+/// A suite is where the flusher is made to fail on purpose, and a fetch
+/// whose object is never retired waits this out once per test before it is
+/// given up as stalled. At the live half minute a suite of them takes
+/// longer than the budget a mutation run allows a mutant, which turns a
+/// mutant that is caught into one that drags. Long enough that no test
+/// blocking a hook on purpose reaches it.
+pub(crate) const TEST_COMPLETION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Passes [`BundleFetcher::advance`] may take over `objects` objects.
 ///
@@ -116,6 +140,10 @@ pub struct BundleFetcher<A: TransportAdapter> {
     pub(crate) bundle: PathBuf,
     pub(crate) pin: Option<[u8; 32]>,
     pub(crate) manifest: ManifestPhase,
+    /// The plan's completion flusher, on the fetch that built the plan; a
+    /// rail joins a plan that already carries one. Declared before the plan
+    /// so it is joined while the plan it retires into is still there.
+    pub(crate) flusher: Option<CompletionFlusher>,
     pub(crate) plan: Option<SharedPlan>,
     /// Resume store, held until the manifest hands it to the plan.
     pub(crate) store: Option<Arc<Mutex<ResumeStore>>>,
@@ -508,6 +536,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             bundle: bundle.to_owned(),
             pin,
             manifest: ManifestPhase::default(),
+            flusher: None,
             plan: None,
             store: Some(Arc::new(Mutex::new(store))),
             resuming,
@@ -570,6 +599,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             bundle: bundle.to_owned(),
             pin: Some(root),
             manifest: ManifestPhase::default(),
+            flusher: None,
             plan: Some(plan),
             store: None,
             resuming: false,
@@ -609,6 +639,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             bundle: bundle.to_owned(),
             pin: Some(root),
             manifest: ManifestPhase::default(),
+            flusher: None,
             plan: Some(plan),
             store: None,
             resuming: false,
@@ -703,7 +734,89 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     pub fn progress(&self) -> u64 {
         self.report
             .progress
-            .saturating_add(self.locked_plan().map_or(0, |plan| settled_in(&plan)))
+            .saturating_add(self.locked_plan().map_or(0, |plan| {
+                settled_in(&plan).saturating_add(plan.completions.steps)
+            }))
+    }
+
+    /// Whether this fetch is still finishing: a completion job is queued
+    /// or running on the flusher, or a rail is sealing the bundle.
+    ///
+    /// The object a job retires is covered but not yet durable, and a seal
+    /// in flight is a bundle about to be whole, so a fetch is neither
+    /// finished nor failed while either is out. The seal belongs here as
+    /// much as the job: it runs outside the plan lock on one rail, and a
+    /// second rail passing through that window would otherwise report a
+    /// carrier that has gone over a bundle a millisecond from complete,
+    /// with its store files already removed.
+    pub(crate) fn completing(&self) -> bool {
+        self.locked_plan()
+            .is_some_and(|plan| plan.completions.outstanding > 0 || plan.sealing)
+    }
+
+    /// Counts this pass as movement for as long as a completion job is out,
+    /// and answers whether one is.
+    ///
+    /// A job on the flusher is this fetch's own work in flight that no pass
+    /// here can watch finish, so nothing a stall budget reads moves while
+    /// one runs. Counting the pass is what keeps the budget off a sync
+    /// slower than it, which before this ran on the rail and cost the loop
+    /// no pass at all.
+    ///
+    /// Bounded by [`COMPLETION_GRACE`] from the moment the job in hand was
+    /// queued or the one before it retired, because a flusher that has
+    /// wedged must not keep a fetch alive for ever: past that the budget
+    /// runs again and the fetch is stalled like any other that settles
+    /// nothing.
+    pub(crate) fn note_completing(&mut self) -> bool {
+        let (outstanding, graced) = self.locked_plan().map_or((0, false), |plan| {
+            (
+                plan.completions.outstanding,
+                plan.completions.graced_until.is_some_and(|until| {
+                    until
+                        .checked_duration_since(std::time::Instant::now())
+                        .is_some()
+                }),
+            )
+        });
+        if outstanding != 0 && graced {
+            self.report.progress = self.report.progress.saturating_add(1);
+        }
+        outstanding != 0
+    }
+
+    /// Whether the plan's cursor has reached the end with the bundle not
+    /// yet sealed: all a fetch has left to do once its carrier has gone.
+    fn sealable(&self) -> bool {
+        self.locked_plan()
+            .is_some_and(|plan| plan.low == plan.objects.len() && !plan.finished)
+    }
+
+    /// The failure a completion job parked on the plan, taken once.
+    ///
+    /// A rail that stopped because the plan was abandoned reports only its
+    /// own carrier, so the cause has to be taken before either terminal
+    /// report is made.
+    fn parked_failure(&self) -> Option<Error> {
+        self.locked_plan()
+            .and_then(|mut plan| plan.completions.parked.take())
+    }
+
+    /// Ends this fetch's flusher and reports what it or its jobs failed at.
+    ///
+    /// Called after the rails have joined, so every job any of them queued
+    /// is drained and run before this returns. A rail has no flusher of its
+    /// own; joining is the fetch that built the plan doing it.
+    #[cfg(any(test, feature = "wire"))]
+    pub(crate) fn finish_completions(&mut self) -> Result<(), Error> {
+        let joined = match &mut self.flusher {
+            Some(flusher) => flusher.finish(),
+            None => Ok(()),
+        };
+        match self.parked_failure() {
+            Some(error) => Err(error),
+            None => joined,
+        }
     }
 
     /// Bytes verified and placed into the bundle, only ever going up.
@@ -797,7 +910,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     pub fn has_backlog(&self) -> bool {
         !self.terminal.stopped
             && (!self.rail.pending.is_empty()
-                || self.proving.pool.as_ref().is_some_and(ProvingPool::busy))
+                || self.proving.pool.as_ref().is_some_and(ProvingPool::busy)
+                || self.completing())
     }
 
     /// Forgets what is owed, because nothing more will be asked or answered.
@@ -853,12 +967,41 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if self.seams.cancellation.is_cancelled() {
             return self.cancel_receive();
         }
+        // Before either terminal report: a completion job that failed
+        // parked the cause, and the carrier this end then closed is not it.
+        if let Some(error) = self.parked_failure() {
+            self.stop();
+            return Err(error);
+        }
+        // A completion job still owed holds both terminal reports back: the
+        // object it retires may be the last one, so this pass says the fetch
+        // is live and the next re-reads what the job settled.
         if self.terminal.disconnected {
+            if self.completing() {
+                self.note_completing();
+                return Ok(FetchStatus::Active);
+            }
             // Recorded, so a carrier that has gone is gone for every later
-            // pass rather than only the one that saw it go.
+            // pass rather than only the one that saw it go. The seal is the
+            // exception: the flusher retires the last object after the pass
+            // that saw the carrier go, and sealing the bundle is this
+            // thread's work and needs no carrier. The pass does nothing
+            // else, because a cursor at the end leaves the advance nothing
+            // to open.
+            if self.sealable() {
+                self.advance()?;
+                if self.complete() {
+                    self.stop();
+                    return Ok(FetchStatus::Complete);
+                }
+            }
             return Ok(FetchStatus::Disconnected);
         }
         if self.locked_plan().is_some_and(|plan| plan.abandoned) {
+            if self.completing() {
+                self.note_completing();
+                return Ok(FetchStatus::Active);
+            }
             // Another rail failed; ending now spares the rest their stall budgets.
             self.stop();
             return Ok(FetchStatus::Disconnected);
@@ -901,16 +1044,22 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         // Advanced before the carrier is judged: a pass that takes the last
         // object's bytes and the disconnect together has a whole bundle,
         // and reporting the carrier over it would throw away a finished
-        // fetch.
+        // fetch. The advance now only queues that object's sync, so the
+        // bundle is whole a pass or more later and the carrier is held
+        // (above, and again below) for as long as the job is out.
         self.advance()?;
         // After the advance, so the pass that placed the crossing bytes is
         // the pass that reports them, however the pass then ends.
         self.note_placed();
+        let completing = self.note_completing();
         if self.complete() {
             self.stop();
             return Ok(FetchStatus::Complete);
         }
         if self.terminal.disconnected {
+            if completing {
+                return Ok(FetchStatus::Active);
+            }
             self.stop();
             return Ok(FetchStatus::Disconnected);
         }
@@ -925,26 +1074,34 @@ impl<A: TransportAdapter> BundleFetcher<A> {
     fn cancel_receive(&mut self) -> Result<FetchStatus, Error> {
         // Drained under the lock and discarded outside it: a sink's gate
         // is taken before the plan lock, never after.
-        let (cursor, window, store) = if let Some(mut plan) = self.locked_plan() {
+        let drained = if let Some(mut plan) = self.locked_plan() {
             if plan.sealing || plan.active.values().any(|active| active.syncing) {
                 // Another rail is flushing, running a completion hook, or
-                // sealing. Let that reserved transition settle before
-                // deciding which cursor and objects cancellation owns.
-                return Ok(FetchStatus::Active);
+                // sealing: a reserved transition to settle before deciding
+                // which cursor and objects cancellation owns.
+                None
+            } else {
+                // The cursor is taken after the step that moves it: a rail
+                // that completed an object marks it done and only advances
+                // the cursor on its next pass, and a cancel between the two
+                // would report one object fewer than this fetch has durable.
+                plan.advance_cursor();
+                let cursor = plan.low;
+                let window: Vec<ActiveObject> =
+                    std::mem::take(&mut plan.active).into_values().collect();
+                let store = plan.store.clone();
+                plan.abandoned = true;
+                Some((cursor, window, store))
             }
-            // The cursor is taken after the step that moves it: a rail
-            // that completed an object marks it done and only advances the
-            // cursor on its next pass, and a cancel between the two would
-            // report one object fewer than this fetch has durable.
-            plan.advance_cursor();
-            let cursor = plan.low;
-            let window: Vec<ActiveObject> =
-                std::mem::take(&mut plan.active).into_values().collect();
-            let store = plan.store.clone();
-            plan.abandoned = true;
-            (cursor, window, store)
         } else {
-            (0, Vec::new(), None)
+            Some((0, Vec::new(), None))
+        };
+        let Some((cursor, window, store)) = drained else {
+            // Counted with the lock down, so a cancel that waits out a long
+            // sync on the only rail there is reads as waiting rather than
+            // as a session that settles nothing.
+            self.note_completing();
+            return Ok(FetchStatus::Active);
         };
         let frame = encoded(&TypedFrame::GoAway(frames::GoAway {
             cursor: cursor as u64,
@@ -1444,7 +1601,13 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
             }
         }
-        self.plan = Some(Arc::new(Mutex::new(FetchPlan {
+        // Bounded by the window, which is what bounds the jobs that can be
+        // out at once: an object is queued only when it is covered whole,
+        // and it stays in flight until the flusher retires it. A stalled
+        // disk therefore backs the fetch up through the window rather than
+        // through this queue.
+        let (queue, jobs) = mpsc::sync_channel(self.window);
+        let shared = Arc::new(Mutex::new(FetchPlan {
             summary,
             objects,
             active: BTreeMap::new(),
@@ -1456,8 +1619,20 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             abandoned: false,
             sealing: false,
             store: directory_resume.then(|| self.store.clone()).flatten(),
+            completions: Completions {
+                queue: Some(queue),
+                ..Completions::default()
+            },
             finished: false,
-        })));
+        }));
+        // The flusher outlives every rail and is joined by whoever drove
+        // this fetch; it holds the plan weakly, as the durable hook does.
+        self.flusher = Some(CompletionFlusher::start(
+            COMPLETION_FLUSHERS,
+            Arc::downgrade(&shared),
+            jobs,
+        ));
+        self.plan = Some(shared);
         Ok(())
     }
 
@@ -1509,6 +1684,9 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // Admit every object in the window to this rail, and take the
             // first one that is whole and nobody is syncing.
             let mut settled = None;
+            // Read once: an abandoned plan starts no new completion work
+            // below, whichever rail or job abandoned it.
+            let abandoned = plan.abandoned;
             for (index, active) in &plan.active {
                 let length = plan
                     .objects
@@ -1522,67 +1700,70 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.rail.admitted.insert(*index, active.subject);
                 }
                 // Complete when shared coverage spans the object, or this
-                // rail's receiver verified it.
+                // rail's receiver verified it. Never on an abandoned plan:
+                // what abandoned it may be this object's own completion,
+                // which cleared `syncing` after its hook had already run,
+                // and a second job would run that hook a second time.
                 let whole =
                     active.covered.is_complete(length) || self.receiver.is_verified(active.subject);
-                if whole && !active.syncing {
+                if whole && !active.syncing && !abandoned {
                     settled = Some((*index, active.subject, length));
                     break;
                 }
             }
             if let Some((at, subject, length)) = settled {
-                // Durable before the window drops it, so a completed fetch
-                // never names bytes that were only in the page cache.
-                // Synced outside the lock: the other rails keep booking and
-                // asking while the file flushes.
+                // Queued, not done here. The sync, the whole-object
+                // checkpoint and the completion hook run on the plan's
+                // flusher, so this rail goes back to its loop with its
+                // connection still fed rather than idling on an fsync.
                 //
-                // `placed_before` moves only after that flush returns, and
-                // it is what carries a finished object's bytes in the
-                // progress a stall budget reads. A multi-rail fetch whose
-                // window holds nothing else therefore idles its other rails
-                // on the fsync and reports no progress while it runs. That
-                // is what this has always done; it is the thing to watch if
-                // fsync times grow.
-                let active = plan.active.get_mut(&at).ok_or(Error::InvalidBundle)?;
-                active.syncing = true;
-                let sink = Arc::clone(&active.sink);
-                let hook = active.complete.clone();
-                let receive_session = active.receive_session;
+                // The object stays in the window with `syncing` raised
+                // until the flusher retires it: that is what keeps a second
+                // rail off it, what `cancel_receive` waits on, and what
+                // holds the disconnect and abandon reports back in
+                // `service` while the last object is still being made
+                // durable.
                 let store = plan.store.clone();
-                let completed = plan.objects.get(at).map(|planned| ReceiveObject {
+                let receive_object = plan.objects.get(at).map(|planned| ReceiveObject {
                     object: planned.object,
                     entries: planned.entries.clone(),
                 });
+                let active = plan.active.get_mut(&at).ok_or(Error::InvalidBundle)?;
+                active.syncing = true;
+                let job = CompletionJob {
+                    index: at,
+                    sink: Arc::clone(&active.sink),
+                    subject,
+                    length,
+                    hook: active.complete.clone(),
+                    receive_session: active.receive_session,
+                    receive_object,
+                    store,
+                };
+                let queue = plan.completions.queue.clone();
+                plan.completions.outstanding = plan.completions.outstanding.saturating_add(1);
+                plan.completions.steps = plan.completions.steps.saturating_add(1);
+                plan.completions.graced_until = Some(std::time::Instant::now() + COMPLETION_GRACE);
+                // Queued with the plan lock down, never under it: the
+                // flusher takes that lock to retire what it holds, so a
+                // full queue would otherwise wait on a thread waiting here.
                 drop(plan);
-                let synced = sink.flush();
-                if synced.is_ok() {
-                    // The whole object is now durable; a resume never asks
-                    // for it again.
-                    if let Some(store) = &store
-                        && let Ok(mut store) = store.lock()
-                    {
-                        let mut units = UnitRanges::new();
-                        units.extend_units(0..total_units_of(length));
-                        let _ = store.checkpoint_units(subject, total_units_of(length), &units);
+                let queued = match queue {
+                    Some(queue) => queue.send(job).is_ok(),
+                    None => false,
+                };
+                if !queued {
+                    // The flusher has been joined, so nothing will retire
+                    // this object: fail here rather than leave the plan
+                    // waiting on a job nobody holds.
+                    let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                    if let Some(active) = plan.active.get_mut(&at) {
+                        active.syncing = false;
                     }
-                }
-                let outcome = synced.and_then(|()| {
-                    if let (Some(hook), Some(completed)) = (&hook, &completed) {
-                        hook(receive_session, completed)?;
-                    }
-                    Ok(())
-                });
-                let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                if let Some(active) = plan.active.get_mut(&at) {
-                    active.syncing = false;
-                }
-                if outcome.is_err() {
+                    plan.completions.outstanding = plan.completions.outstanding.saturating_sub(1);
                     plan.abandoned = true;
+                    return Err(Error::InvalidBundle);
                 }
-                outcome?;
-                plan.placed_before = plan.placed_before.saturating_add(length);
-                plan.active.remove(&at);
-                plan.objects[at].done = true;
                 continue;
             }
             plan.advance_cursor();

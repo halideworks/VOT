@@ -1,8 +1,9 @@
 //! The shared fetch plan and its planned objects.
 
 use super::{
-    Arc, BTreeMap, CompletionHook, CountingSink, EntryRecord, Error, MAX_REQUESTED_RANGE, Mutex,
-    PackageSummary, ReceiveSessionId, ResumeStore, SubjectId, frames, range_span, total_units_of,
+    Arc, BTreeMap, CompletionHook, CompletionJob, CountingSink, EntryRecord, Error,
+    MAX_REQUESTED_RANGE, Mutex, PackageSummary, ReceiveSessionId, ResumeStore, SubjectId, frames,
+    mpsc, range_span, total_units_of,
 };
 
 /// One object in flight: its sink and the accounts that describe it.
@@ -310,6 +311,31 @@ impl CoverageMap {
     }
 }
 
+/// The completion flusher's queue, and what the jobs on it owe the plan.
+///
+/// The rail that sees an object whole queues its sync here and goes back to
+/// its loop; the flusher retires the job into the plan when the file is
+/// durable and the completion hook has returned.
+#[derive(Default)]
+pub(crate) struct Completions {
+    /// Where a rail queues a job. Cleared when the flusher is joined, which
+    /// is what closes the channel and ends its threads.
+    pub(crate) queue: Option<mpsc::SyncSender<CompletionJob>>,
+    /// Jobs queued and not yet retired.
+    pub(crate) outstanding: usize,
+    /// Jobs queued plus jobs retired, so a drain counts as movement to a
+    /// stall budget however long any one of them takes.
+    pub(crate) steps: u64,
+    /// How long the job in hand may keep a rail's stall budget from
+    /// running, set afresh whenever one is queued or retired. `None` until
+    /// this plan has queued its first.
+    pub(crate) graced_until: Option<std::time::Instant>,
+    /// The failure a job parked, which the next pass of any rail returns.
+    /// The first one is kept: a later job fails on the plan the first
+    /// abandoned, so it is the wake rather than the cause.
+    pub(crate) parked: Option<Error>,
+}
+
 /// What a [`SharedPlan`] holds.
 pub(crate) struct FetchPlan {
     pub(crate) summary: PackageSummary,
@@ -340,6 +366,8 @@ pub(crate) struct FetchPlan {
     pub(crate) sealing: bool,
     /// Resume store, shared by every rail through the plan.
     pub(crate) store: Option<Arc<Mutex<ResumeStore>>>,
+    /// The completion jobs this plan has out with its flusher.
+    pub(crate) completions: Completions,
     pub(crate) finished: bool,
 }
 

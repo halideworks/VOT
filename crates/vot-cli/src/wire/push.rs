@@ -759,7 +759,10 @@ where
             }
         }
     }
-    let status = crate::drive(&mut fetcher)?;
+    let driven = crate::drive(&mut fetcher);
+    // Joined per session, before this receive answers: what the flusher
+    // still holds is owed however this session ended.
+    let status = fetcher.finish_completions().and(driven)?;
     match status {
         crate::FetchStatus::Complete => {
             fetcher.acknowledge_completion()?;

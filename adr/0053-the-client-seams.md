@@ -3,9 +3,10 @@
 - Status: Accepted
 - Date: 2026-09-04
 - Decision owners: A00 architecture; A10 transport
-- Applies to: `crates/vot-cli` (`build_manifest`, `push_from`,
-  `fetch_bundle_with`, `PushOptions`, `FetchOptions`, `Progress`,
-  `proof_cache::{read, write}`) and the `platform-native` CI job. No
+- Applies to: `crates/vot-cli` (`build_manifest`, `build_manifest_from`,
+  `push_from`, `fetch_bundle_with`, `probe_serve`, `PushOptions`,
+  `FetchOptions`, `Progress`, `proof_cache::{read, write}`) and the
+  `platform-native` CI job. No
   change to any spec file, wire identifier, or conformance vector.
   Companion to ADR-0049 (assemble a server from what the host holds),
   whose server this ADR pushes from.
@@ -25,6 +26,14 @@ bundle, and the leaf cache the assembly reads from is written only by
 
 `push_bundle` takes a bundle directory and opens it itself, so an
 assembled server cannot be pushed from. It reports nothing while it runs.
+
+A client that offers a push has to reserve a session on the receiver
+before it can dial, and the receiver has to reserve staging and a
+capability to answer. A network that will not carry QUIC to that receiver
+(a blocked UDP port, a middlebox that drops it) is found only by the dial,
+after both ends have reserved. Nothing public dials a serve and reports
+whether the handshake completes; the connect and the identity check are
+crate-private and wait ten seconds.
 
 `fetch_bundle` reads its capability, holder key, serve identity, rail
 count, and prover count from process environment variables, which a
@@ -49,6 +58,12 @@ platform crates it rests on are tested there.
   `copy_and_name` runs, without the write; `ObjectBuilder` holds the
   promised length and refuses a stream that ends elsewhere, which is the
   `SourceMutation` a bundle build reports.
+- `build_manifest_from(sources, manifest_root, suite)` builds the same
+  manifest from a list of package path and file pairs in any order, which
+  is what a drop of loose files and folders is; `build_manifest` walks a
+  directory into that list. A source that is not a regular file and two
+  sources whose paths fold to one key are `InvalidPath`, as the walk
+  reports them.
 - `proof_cache::read` and `proof_cache::write` are public, so a caller
   keeps the leaves a manifest build returned under a directory of its
   own and hands them back to a later assembly, as `send` and `serve` do
@@ -71,6 +86,16 @@ platform crates it rests on are tested there.
   `VOT_INITIAL_CWND`, `VOT_PREFIX_DUP`) stays with the environment for
   every entry point, library or command: it describes the host's network,
   not one transfer.
+- `probe_serve(address, identity, budget)` dials `address`, waits at most
+  `budget` for the handshake, compares the certificate digest with
+  `identity`, and closes. It carries no session, so the serve sees a
+  connection come and go, which a push receiver's accept loop already
+  takes for a vanished peer. A client asks this before its preflight, so a
+  network that will not carry QUIC costs it the budget and no reserved
+  state; a receiver whose accept loop is bounded spends one session on the
+  probe, so the probe precedes the preflight, not a bounded receive. The
+  carrier's idle timeout is the budget, so the probe and the drop that
+  follows it are bounded by the budget, not the fetch's idle timeout.
 - `Progress` is `Box<dyn FnMut(u64, Option<u64>) + Send>`, called at most
   once per `quantum` bytes and once at the end if the last quantum fell
   short of it; a zero quantum is refused before anything is opened or
@@ -120,6 +145,10 @@ platform crates it rests on are tested there.
   over a duplex pair.
 - `a_manifest_build_refuses_what_a_bundle_build_refuses`: no source,
   empty source, existing manifest root; no directory left behind.
+- `a_manifest_built_from_named_sources_orders_them_and_refuses_a_collision`:
+  no source, a directory as a source, and two sources with one path
+  refused with no directory left behind; two sources handed last first
+  build the manifest a walk of the same tree builds, root for root.
 - `a_manifest_build_keeps_leaves_a_serve_can_prepare_from`: the returned
   leaves round-trip through the public cache, a cache for another length
   is not believed, and an assembly from the cache prepares without a read.
@@ -135,6 +164,11 @@ platform crates it rests on are tested there.
   package reports exactly once, the end, as the package length; a quantum
   of one byte reports strictly increasing placements whose last is the
   package length, and the end adds nothing.
+- `a_probe_confirms_the_serve_identity_within_its_budget`: a probe of a
+  live listener with its identity succeeds and with another identity is a
+  mismatch, the accept loop taking both connections and ending; a probe
+  of a bound socket that answers nothing is `CarrierUnavailable` within
+  its budget.
 - `push_progress_reports_once_per_quantum_and_once_at_the_end`: the
   quantum-crossing and report-due arithmetic as tables, and the reporter
   over two rails: a rail's own crossing pays for the lock, sums arrive in

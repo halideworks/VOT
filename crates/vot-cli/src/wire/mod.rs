@@ -21,7 +21,7 @@ mod relay;
 mod resolution;
 mod serve;
 
-pub use fetch::{fetch_bundle, fetch_bundle_with, fetch_via_rendezvous};
+pub use fetch::{fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve};
 pub use push::{
     PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from, receive_push,
     receive_push_on,
@@ -3342,6 +3342,69 @@ mod tests {
         }
         assert!(relay_limits_from(Some("many"), None, None).is_err());
         assert!(std::env::var(RELAY_SLOTS).is_err(), "the suite owns no env");
+    }
+
+    #[test]
+    fn a_probe_confirms_the_serve_identity_within_its_budget() {
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let at = listener.local_address();
+        // Two connections that carry no session: the accept loop takes
+        // them and lets them go, as a serve does with a peer that vanishes.
+        let accepting = std::thread::spawn(move || {
+            push::accept_sessions(&listener, Some(2), |carrier| {
+                let _ = carrier.connected_within(std::time::Duration::from_secs(5));
+                Ok(())
+            })
+        });
+        // The carrier's idle timeout is the budget, so each probe and its
+        // drop finish within a small multiple of it, not the fetch idle
+        // timeout; a regression to the longer one trips these bounds.
+        let budget = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        within("a probe of the right identity", 20, move || {
+            probe_serve(at, identity, budget)
+        })
+        .expect("a probe");
+        within("a probe of a wrong identity", 20, move || {
+            assert!(matches!(
+                probe_serve(at, [0; 32], budget),
+                Err(Error::ServeIdentityMismatch)
+            ));
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "two budget-bounded probes took {:?}",
+            started.elapsed()
+        );
+        joined("the accepting thread", accepting).expect("accepted");
+
+        // A port that answers nothing spends the budget and no more.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = silent.local_addr().unwrap();
+        let budget = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            within("a probe of a silent port", 30, move || probe_serve(
+                at, identity, budget
+            )),
+            Err(Error::CarrierUnavailable)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the probe outlived its budget: {:?}",
+            started.elapsed()
+        );
+        drop(silent);
     }
 
     #[test]

@@ -288,6 +288,71 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_built_from_named_sources_orders_them_and_refuses_a_collision() {
+        let source = crate::tests::temporary("manifest-named-source");
+        std::fs::create_dir_all(source.join("zz")).unwrap();
+        std::fs::write(source.join("zz").join("last.bin"), b"the last entry").unwrap();
+        std::fs::write(source.join("loose.bin"), b"a loose file at the top").unwrap();
+        let walked_root = crate::tests::temporary("manifest-named-walked");
+        let named_root = crate::tests::temporary("manifest-named-root");
+        let suite = crate::DEFAULT_LOGICAL_SUITE;
+        let named = |path: &[&str], file: &str| {
+            (
+                crate::PackagePath::portable(path.iter().map(|part| (*part).to_owned())).unwrap(),
+                source.join(file),
+            )
+        };
+
+        // No source at all.
+        assert!(matches!(
+            crate::build_manifest_from(
+                Vec::<(crate::PackagePath, std::path::PathBuf)>::new(),
+                &named_root,
+                suite
+            ),
+            Err(Error::InvalidArguments)
+        ));
+        // A source that is a directory, two sources with one path, and a
+        // source whose path is a directory ancestor of another's: a name
+        // is not both a file and a directory.
+        for refused in [
+            vec![named(&["zz"], "zz")],
+            vec![
+                named(&["loose.bin"], "loose.bin"),
+                named(&["loose.bin"], "zz/last.bin"),
+            ],
+            vec![
+                named(&["loose.bin"], "loose.bin"),
+                named(&["loose.bin", "under.bin"], "zz/last.bin"),
+            ],
+        ] {
+            assert!(matches!(
+                crate::build_manifest_from(refused, &named_root, suite),
+                Err(Error::InvalidPath)
+            ));
+            assert!(!named_root.exists(), "a refused build left a directory");
+        }
+
+        // Handed last first, the manifest is the one a walk of the same
+        // tree builds: the same entries in canonical order, the same root.
+        let (walked, _) = crate::build_manifest(&source, &walked_root, suite).unwrap();
+        let (built, sources) = crate::build_manifest_from(
+            vec![
+                named(&["zz", "last.bin"], "zz/last.bin"),
+                named(&["loose.bin"], "loose.bin"),
+            ],
+            &named_root,
+            suite,
+        )
+        .unwrap();
+        assert_eq!(built, walked);
+        assert_eq!(built.entries, 2);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(crate::scan_manifest(&named_root).unwrap(), built);
+        crate::harness::discard(&[&source, &walked_root, &named_root]);
+    }
+
+    #[test]
     fn a_manifest_build_keeps_leaves_a_serve_can_prepare_from() {
         // The leaves come back with the source and go through the public
         // cache the same way a send's do, so a later assemble reads them.

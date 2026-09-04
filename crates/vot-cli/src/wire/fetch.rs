@@ -23,10 +23,18 @@ pub(crate) fn verify_serve_identity(
     carrier: &Transport,
     pin: Option<[u8; 32]>,
 ) -> Result<(), Error> {
-    let Some(pin) = pin else {
-        return Ok(());
-    };
-    if !carrier.connected_within(IDENTITY_WAIT) {
+    match pin {
+        Some(pin) => certified_within(carrier, pin, IDENTITY_WAIT),
+        None => Ok(()),
+    }
+}
+
+fn certified_within(
+    carrier: &Transport,
+    pin: [u8; 32],
+    wait: std::time::Duration,
+) -> Result<(), Error> {
+    if !carrier.connected_within(wait) {
         return Err(Error::CarrierUnavailable);
     }
     match carrier.peer_certificate() {
@@ -35,6 +43,38 @@ pub(crate) fn verify_serve_identity(
         // way a wrong one is: the pin asked for proof this end cannot check.
         _ => Err(Error::ServeIdentityMismatch),
     }
+}
+
+/// Dials `address`, confirms the serve behind it presents `identity`, and
+/// closes, all within `budget`.
+///
+/// A client asks this before it reserves anything on a receiver: a
+/// preflight that mints a capability for a push the network will not carry
+/// leaves state behind on both ends. The connection carries no session, so
+/// the serve learns only that a connection came and went; a receiver whose
+/// accept loop is bounded spends one of its sessions on the probe and
+/// records the peer's close as a failure, so a probe belongs before a
+/// preflight, not before a bounded receive.
+///
+/// # Errors
+/// A handshake that does not complete within `budget` is
+/// [`Error::CarrierUnavailable`]; a certificate other than `identity` is
+/// [`Error::ServeIdentityMismatch`].
+pub fn probe_serve(
+    address: SocketAddr,
+    identity: [u8; 32],
+    budget: std::time::Duration,
+) -> Result<(), Error> {
+    let mut config = client_config()?;
+    // The carrier's idle timeout is the budget, not the fetch default. A
+    // handshake that has not completed by then is the probe's answer, and a
+    // carrier dropped after the answer waits at most this to end its driver,
+    // so the whole probe, the drop included, is bounded by the budget rather
+    // than the 30-second fetch idle timeout.
+    config.idle_timeout_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
+        .map_err(carrier_failure)?;
+    certified_within(&carrier, identity, budget)
 }
 
 /// Fetches a bundle from `address` into `bundle`.

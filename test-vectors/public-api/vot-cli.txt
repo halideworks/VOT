@@ -19,6 +19,7 @@ function vot_cli::bind_serve_listener
 function vot_cli::build_bundle
 function vot_cli::build_bundle_with_suite
 function vot_cli::build_manifest
+function vot_cli::build_manifest_from
 function vot_cli::decode_key
 function vot_cli::drive
 function vot_cli::fetch_bundle
@@ -33,6 +34,7 @@ function vot_cli::load_key_spec
 function vot_cli::parse_package_root
 function vot_cli::parse_rendezvous
 function vot_cli::parse_suite
+function vot_cli::probe_serve
 function vot_cli::proof_cache::read
 function vot_cli::proof_cache::write
 function vot_cli::push_bundle

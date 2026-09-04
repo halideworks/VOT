@@ -80,6 +80,15 @@ pub fn push_from(_server: &BundleServer, _options: PushOptions) -> Result<Packag
 }
 
 /// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn probe_serve(
+    _address: SocketAddr,
+    _identity: [u8; 32],
+    _budget: std::time::Duration,
+) -> Result<(), Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
 pub fn fetch_bundle_with(_options: FetchOptions, _bundle: &Path) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }

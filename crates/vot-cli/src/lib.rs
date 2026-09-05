@@ -609,6 +609,10 @@ mod tests {
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(
+            probe_serve(address, [0; 32], std::time::Duration::from_secs(1)),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
             receive_push(address, &bundle, &Credentials::Ephemeral, None, |_, _| {}),
             Err(Error::WireUnsupported)
         ));

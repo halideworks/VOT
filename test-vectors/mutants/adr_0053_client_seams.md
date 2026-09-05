@@ -8,8 +8,12 @@ answers within its budget.
 
 Passing evidence: `cargo mutants --in-diff` over the change, run twice.
 
-Featureless (`.cargo/mutants.toml`, `crates/vot-cli/src/package/build.rs`):
-24 mutants, 12 caught, 12 unviable, none missed, no timeouts. The read loop
+Featureless (`.cargo/mutants.toml`, over the whole change): 27 mutants,
+13 caught, 14 unviable, none missed, no timeouts. `probe_serve` returns
+`Result<(), Error>`, so its `nowire.rs` stub has a viable `Ok(())` body
+mutant, killed by `the_wire_commands_name_the_feature_they_need`;
+`push_from` and `fetch_bundle_with` return `Result<PackageSummary,
+Error>`, whose default-body mutant is unviable. In `build.rs`, the read loop
 in `name_stream` is bounded by the promised length; an earlier shape that
 looped until end of file hung under `replace == with != in name_stream`
 on an empty source, and was restructured rather than waived.

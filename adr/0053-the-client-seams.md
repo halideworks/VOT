@@ -149,9 +149,9 @@ platform crates it rests on are tested there.
 - `a_manifest_build_refuses_what_a_bundle_build_refuses`: no source,
   empty source, existing manifest root; no directory left behind.
 - `a_manifest_built_from_named_sources_orders_them_and_refuses_a_collision`:
-  no source, a directory as a source, and two sources with one path
-  and one source whose path is a directory ancestor of another's, each
-  refused with no directory left behind; two sources handed last first
+  no source, a directory as a source, two sources with one path, and one
+  source whose path is a directory ancestor of another's, each refused
+  with no directory left behind; two sources handed last first
   build the manifest a walk of the same tree builds, root for root.
 - `a_manifest_build_keeps_leaves_a_serve_can_prepare_from`: the returned
   leaves round-trip through the public cache, a cache for another length

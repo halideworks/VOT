@@ -46,8 +46,8 @@ fn certified_within(
 }
 
 /// The longest idle timeout a probe installs, in milliseconds. A caller
-/// passes a small budget; this only bounds an unreasonable one so it cannot
-/// overflow an `Instant` addition or QUIC's varint encoding of the timeout.
+/// passes a small budget; this only bounds an unreasonable one so the wait
+/// it becomes cannot overflow the `Instant` addition in `connected_within`.
 pub(super) const PROBE_IDLE_CEILING_MS: u64 = 300_000;
 
 /// The idle timeout, in milliseconds, a probe of this `budget` installs and

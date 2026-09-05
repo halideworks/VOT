@@ -5565,7 +5565,16 @@ mod tests {
         // lands there exactly; a ceiling the socket refuses can never be a
         // discovered size, which is what makes this an assertion and not a
         // wait. A budget of passes bounds the loop, not a clock.
-        let target = u64::try_from(super::LARGEST_DATAGRAM_SIZE).expect("a size fits");
+        //
+        // Linux loopback carries the ceiling. macOS `lo0` has a 16384-byte
+        // MTU and discovery settles just under it, so off Linux the
+        // assertion is that discovery climbed past a jumbo frame, which no
+        // default path allows without the probes working.
+        let target = if cfg!(target_os = "linux") {
+            u64::try_from(super::LARGEST_DATAGRAM_SIZE).expect("a size fits")
+        } else {
+            9_000
+        };
         let mut discovered = None;
         for _ in 0_u32..5_000 {
             let _ = client.flush();
@@ -5573,15 +5582,14 @@ mod tests {
             while client.poll().is_some() {}
             while server.poll().is_some() {}
             discovered = client.path_stats().and_then(|stats| stats.mtu_bytes);
-            if discovered == Some(target) {
+            if discovered.is_some_and(|size| size >= target) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(
-            discovered,
-            Some(target),
-            "discovery never reached the ceiling"
+        assert!(
+            discovered.is_some_and(|size| size >= target),
+            "discovery never reached the ceiling: {discovered:?} under {target}"
         );
     }
 

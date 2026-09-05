@@ -331,13 +331,62 @@ pub(super) fn push_bundle_railed(
         return Err(Error::InvalidBundle);
     }
     let holder = crate::load_capability_holder(capability, key_source)?;
+    let extensions = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
+    push_from(
+        &server,
+        crate::PushOptions {
+            address,
+            holder,
+            identity,
+            rails,
+            extensions,
+            progress: None,
+        },
+    )
+}
+
+/// Pushes what `server` holds to the receiver `options` names, over
+/// `options.rails` sessions at once.
+///
+/// The server is the caller's: opened from a bundle, or assembled from a
+/// manifest and the files where they sit ([`crate::build_manifest`] and
+/// [`crate::BundleServer::assemble`]), so nothing is copied to be sent.
+/// Only the process-wide carrier tuning stays with the environment
+/// (`VOT_DATAGRAM_BYTES`, `VOT_CONGESTION`, `VOT_INITIAL_CWND`,
+/// `VOT_PREFIX_DUP`), as it does for every command.
+///
+/// # Errors
+/// Refuses a rail count outside one to the receiver's session limit (eight)
+/// and a zero progress quantum with [`Error::InvalidArguments`], and a
+/// server with no objects with [`Error::InvalidBundle`], all before a dial;
+/// otherwise surfaces a receiver that will not open, refuses the
+/// capability, or closes before completing.
+pub fn push_from(
+    server: &crate::BundleServer,
+    options: crate::PushOptions,
+) -> Result<PackageSummary, Error> {
+    let crate::PushOptions {
+        address,
+        holder,
+        identity,
+        rails,
+        extensions,
+        progress,
+    } = options;
+    if !valid_rail_count(rails) || progress.as_ref().is_some_and(|(quantum, _)| *quantum == 0) {
+        return Err(Error::InvalidArguments);
+    }
+    if server.objects.is_empty() {
+        return Err(Error::InvalidBundle);
+    }
     let mut config = client_config()?;
     apply_datagram_bytes(&mut config)?;
     let extensions = {
-        let mut offered = extensions_from(std::env::var(DATAGRAM_FEC).ok().as_deref())?;
+        let mut offered = extensions;
         offered.insert(vot_codec::extension_id::PUSH);
         offered
     };
+    let progress = progress.map(|(quantum, observer)| Reporter::new(quantum, observer, rails));
     std::thread::scope(|scope| {
         let mut sessions = Vec::with_capacity(rails);
         for _ in 0..rails {
@@ -356,27 +405,102 @@ pub(super) fn push_bundle_railed(
                 extensions.clone(),
                 vot_session::Authentication::Presenting,
             );
-            let mut pushing = crate::ServeSession::begin_push_session(&server, session, holder)?;
+            let mut pushing = crate::ServeSession::begin_push_session(server, session, holder)?;
             pushing.negotiate_push()?;
             sessions.push(pushing);
         }
         let mut running = Vec::with_capacity(rails);
-        for mut pushing in sessions {
-            running.push(
-                scope.spawn(move || match crate::drive::drive(&mut pushing)? {
+        for (rail, mut pushing) in sessions.into_iter().enumerate() {
+            let progress = progress.as_ref();
+            running.push(scope.spawn(move || {
+                let status = crate::drive::drive_until(&mut pushing, |session| {
+                    if let Some(progress) = progress {
+                        progress.taken(rail, session.served_bytes());
+                    }
+                    false
+                })?
+                .ok_or(Error::Stalled)?;
+                if let Some(progress) = progress {
+                    progress.taken(rail, pushing.served_bytes());
+                }
+                match status {
                     crate::ServeStatus::Completed => Ok(()),
                     crate::ServeStatus::Closed(code) => Err(Error::PeerClosed(code)),
                     crate::ServeStatus::Disconnected | crate::ServeStatus::Active => {
                         Err(Error::CarrierUnavailable)
                     }
-                }),
-            );
+                }
+            }));
         }
         for rail in running {
             rail.join().map_err(|_| Error::CarrierUnavailable)??;
         }
+        if let Some(progress) = &progress {
+            progress.finish();
+        }
         Ok(server.package())
     })
+}
+
+/// Sums what every rail's carrier has taken and hands the observer the sum
+/// once per quantum, in order: the sum is read and compared under the one
+/// lock the observer is called under, so it never goes backwards.
+pub(super) struct Reporter {
+    quantum: u64,
+    rails: Vec<std::sync::atomic::AtomicU64>,
+    state: std::sync::Mutex<(u64, crate::Progress)>,
+}
+
+impl Reporter {
+    pub(super) fn new(quantum: u64, observer: crate::Progress, rails: usize) -> Self {
+        Self {
+            quantum,
+            rails: (0..rails)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            state: std::sync::Mutex::new((0, observer)),
+        }
+    }
+
+    pub(super) fn taken(&self, rail: usize, bytes: u64) {
+        let before = self.rails[rail].swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        // A rail crosses a quantum boundary of its own before it pays for
+        // the lock; the sum is what the observer hears.
+        if crossed_quantum(before, bytes, self.quantum) {
+            self.report(false);
+        }
+    }
+
+    pub(super) fn finish(&self) {
+        self.report(true);
+    }
+
+    fn report(&self, last: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let sum: u64 = self
+            .rails
+            .iter()
+            .map(|rail| rail.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        let (reported, observer) = &mut *state;
+        if report_due(*reported, sum, self.quantum, last) {
+            *reported = sum;
+            observer(sum, None);
+        }
+    }
+}
+
+/// Whether a count moved from one quantum to another.
+pub(super) const fn crossed_quantum(before: u64, after: u64, quantum: u64) -> bool {
+    before / quantum != after / quantum
+}
+
+/// Whether `sum` is worth an observer's call after `reported` was the last
+/// one: a new quantum, or the end of the transfer with anything unreported.
+pub(super) const fn report_due(reported: u64, sum: u64, quantum: u64, last: bool) -> bool {
+    sum / quantum > reported / quantum || (last && sum > reported)
 }
 
 /// Receives pushed bundles below `directory` on Unix.

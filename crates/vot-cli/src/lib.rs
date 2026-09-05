@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use vot_manifest::{
     Component, ManifestEntry, ManifestPage, PackagePath, PageCommitment, PathProfile, Seal,
-    canonical_path_key, decode_page, decode_seal,
+    canonical_path_key, decode_page, decode_seal, is_path_prefix,
 };
 #[cfg(test)]
 use vot_manifest::{EntryKind, ObjectId, StorageRef, encode_page, encode_seal};
@@ -67,23 +67,26 @@ pub use fetch::{
 };
 #[cfg(not(feature = "wire"))]
 pub use nowire::{
-    fetch_bundle, fetch_via_rendezvous, push_bundle, receive_push, relay_service,
-    rendezvous_service, serve_bundle,
+    fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve, push_bundle, push_from,
+    receive_push, relay_service, rendezvous_service, serve_bundle,
 };
 pub use serve::{BundleServer, ServeConnection, ServeStatus, ServedSource};
 #[cfg(feature = "wire")]
 pub use wire::{
     Listener, PushAdmission, PushPresentation, ServeAdmission, ServePresentation, ServeReport,
-    bind_push_listener, bind_serve_listener, fetch_bundle, fetch_via_rendezvous, push_bundle,
-    receive_push, receive_push_on, relay_service, rendezvous_service, serve_bundle, serve_on,
+    bind_push_listener, bind_serve_listener, fetch_bundle, fetch_bundle_with, fetch_via_rendezvous,
+    probe_serve, push_bundle, push_from, receive_push, receive_push_on, relay_service,
+    rendezvous_service, serve_bundle, serve_on,
 };
 
 mod keys;
+mod options;
 mod package;
 mod receipt_io;
 mod util;
 
 pub use keys::*;
+pub use options::*;
 #[cfg(test)]
 use package::scan::validate_page_envelope;
 pub(crate) use package::scan::{ManifestReader, scan_manifest, seal_page_digests};
@@ -603,6 +606,10 @@ mod tests {
         ));
         assert!(matches!(
             push_bundle(&bundle, address, &bundle, "-", [0; 32]),
+            Err(Error::WireUnsupported)
+        ));
+        assert!(matches!(
+            probe_serve(address, [0; 32], std::time::Duration::from_secs(1)),
             Err(Error::WireUnsupported)
         ));
         assert!(matches!(

@@ -39,7 +39,7 @@ const fn suite_byte(suite: Suite) -> u8 {
 /// # Errors
 /// Surfaces the write; a caller that cannot keep the cache still has a
 /// bundle that serves, so it may discard this.
-pub(crate) fn write(
+pub fn write(
     objects: &Path,
     root: &[u8; 32],
     suite: Suite,
@@ -66,12 +66,8 @@ pub(crate) fn write(
 /// count that cannot describe the object, or trailing bytes.
 ///
 /// Never an error: every one of those means reading the object instead.
-pub(crate) fn read(
-    objects: &Path,
-    root: &[u8; 32],
-    suite: Suite,
-    length: u64,
-) -> Option<Vec<[u8; 32]>> {
+#[must_use]
+pub fn read(objects: &Path, root: &[u8; 32], suite: Suite, length: u64) -> Option<Vec<[u8; 32]>> {
     let bytes = fs::read(path(objects, root)).ok()?;
     if bytes.len() < HEADER_BYTES || &bytes[..MAGIC.len()] != MAGIC {
         return None;

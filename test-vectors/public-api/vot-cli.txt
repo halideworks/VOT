@@ -18,9 +18,12 @@ function vot_cli::bind_push_listener
 function vot_cli::bind_serve_listener
 function vot_cli::build_bundle
 function vot_cli::build_bundle_with_suite
+function vot_cli::build_manifest
+function vot_cli::build_manifest_from
 function vot_cli::decode_key
 function vot_cli::drive
 function vot_cli::fetch_bundle
+function vot_cli::fetch_bundle_with
 function vot_cli::fetch_via_rendezvous
 function vot_cli::generate_keypair
 function vot_cli::hex_of
@@ -31,7 +34,11 @@ function vot_cli::load_key_spec
 function vot_cli::parse_package_root
 function vot_cli::parse_rendezvous
 function vot_cli::parse_suite
+function vot_cli::probe_serve
+function vot_cli::proof_cache::read
+function vot_cli::proof_cache::write
 function vot_cli::push_bundle
+function vot_cli::push_from
 function vot_cli::receive_bundle
 function vot_cli::receive_push
 function vot_cli::receive_push_on
@@ -41,11 +48,14 @@ function vot_cli::serve_bundle
 function vot_cli::serve_on
 function vot_cli::verify_receipt_file
 module vot_cli::authz
+module vot_cli::proof_cache
 struct vot_cli::BundleFetcher
 struct vot_cli::BundleServer
 struct vot_cli::CancellationHandle
 struct vot_cli::CountingSink
+struct vot_cli::FetchOptions
 struct vot_cli::PushAdmission
+struct vot_cli::PushOptions
 struct vot_cli::PushPresentation
 struct vot_cli::ReceiveObject
 struct vot_cli::ReceiveReport
@@ -64,6 +74,7 @@ struct vot_cli::authz::Requirement
 struct vot_cli::authz::Stance
 trait vot_cli::Engine
 trait vot_cli::ReceiveSink
+type_alias vot_cli::Progress
 use vot_cli::EntryRecord <- vot_package::EntryRecord
 use vot_cli::Listener <- wire::Listener
 use vot_cli::PackageSummary <- vot_package::PackageSummary

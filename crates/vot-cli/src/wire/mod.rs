@@ -21,9 +21,10 @@ mod relay;
 mod resolution;
 mod serve;
 
-pub use fetch::{fetch_bundle, fetch_via_rendezvous};
+pub use fetch::{fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve};
 pub use push::{
-    PushAdmission, PushPresentation, bind_push_listener, push_bundle, receive_push, receive_push_on,
+    PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from, receive_push,
+    receive_push_on,
 };
 pub use registration::rendezvous_service;
 pub use relay::relay_service;
@@ -3341,5 +3342,408 @@ mod tests {
         }
         assert!(relay_limits_from(Some("many"), None, None).is_err());
         assert!(std::env::var(RELAY_SLOTS).is_err(), "the suite owns no env");
+    }
+
+    #[test]
+    fn a_probe_clamps_its_idle_timeout_to_the_ceiling() {
+        use super::fetch::{PROBE_IDLE_CEILING_MS, probe_idle_ms};
+        use std::time::Duration;
+        for (budget, expected) in [
+            (Duration::from_millis(0), 0),
+            (Duration::from_millis(2_500), 2_500),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS + 1),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (Duration::MAX, PROBE_IDLE_CEILING_MS),
+        ] {
+            assert_eq!(probe_idle_ms(budget), expected, "budget {budget:?}");
+        }
+    }
+
+    #[test]
+    fn a_probe_confirms_the_serve_identity_within_its_budget() {
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let at = listener.local_address();
+        // Two connections that carry no session: the accept loop takes
+        // them and lets them go, as a serve does with a peer that vanishes.
+        let accepting = std::thread::spawn(move || {
+            push::accept_sessions(&listener, Some(2), |carrier| {
+                let _ = carrier.connected_within(std::time::Duration::from_secs(5));
+                Ok(())
+            })
+        });
+        // Each probe and its drop finish well under the fetch idle
+        // timeout; the bounds turn any recurrence of the rare first-run
+        // stall into a diagnosable failure rather than a mystery hang.
+        let budget = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        within("a probe of the right identity", 20, move || {
+            probe_serve(at, identity, budget)
+        })
+        .expect("a probe");
+        within("a probe of a wrong identity", 20, move || {
+            assert!(matches!(
+                probe_serve(at, [0; 32], budget),
+                Err(Error::ServeIdentityMismatch)
+            ));
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "two budget-bounded probes took {:?}",
+            started.elapsed()
+        );
+        joined("the accepting thread", accepting).expect("accepted");
+
+        // A port that answers nothing spends the budget and no more.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = silent.local_addr().unwrap();
+        let budget = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            within("a probe of a silent port", 30, move || probe_serve(
+                at, identity, budget
+            )),
+            Err(Error::CarrierUnavailable)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the probe outlived its budget: {:?}",
+            started.elapsed()
+        );
+        drop(silent);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_push_from_an_assembled_manifest_reports_what_the_carriers_took() {
+        use ed25519_dalek::SigningKey;
+
+        // Nothing under the manifest root but the manifest: the push serves
+        // the source files where they sit.
+        let source = crate::tests::temporary("push-from-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(3_000_000)).unwrap();
+        std::fs::write(source.join("note.txt"), b"a note beside the plate").unwrap();
+        let manifest_root = crate::tests::temporary("push-from-manifest");
+        let (built, sources) =
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE).unwrap();
+        let server = BundleServer::assemble(&manifest_root, sources).unwrap();
+
+        let issuer = SigningKey::from_bytes(&[61; 32]);
+        let holder_key = SigningKey::from_bytes(&[62; 32]);
+        let requirement = crate::authz::PushRequirement::new(
+            "issuer.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "receiver.example",
+        );
+        let token = crate::authz::issue_push(
+            "issuer.example",
+            "receiver.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            built.logical_length,
+            crate::authz::now_seconds().unwrap(),
+            3_600,
+        )
+        .unwrap();
+        let holder = Arc::new(crate::authz::Holder::new(token, holder_key).unwrap());
+
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let at = listener.local_address();
+        let output = crate::tests::temporary("push-from-output");
+        let receiver_output = output.to_path_buf();
+        let receiving = std::thread::spawn(move || {
+            push::receive_push_on_bounded(&listener, Some(2), |presentation| {
+                requirement
+                    .decide(
+                        presentation.challenge,
+                        presentation.open,
+                        presentation.channel_binding,
+                        presentation.now,
+                    )
+                    .map(|scope| push::PushAdmission {
+                        scope,
+                        directory: receiver_output.clone(),
+                        seams: crate::ReceiveSeams::default(),
+                    })
+            })
+        });
+
+        // A rail count the listener cannot take, and a quantum that would
+        // report every byte, are refused before a dial.
+        for (rails, progress) in [
+            (0, None),
+            (2, Some((0, Box::new(|_, _| {}) as crate::Progress))),
+        ] {
+            assert!(matches!(
+                push_from(
+                    &server,
+                    crate::PushOptions {
+                        address: at,
+                        holder: Arc::clone(&holder),
+                        identity,
+                        rails,
+                        extensions: std::collections::BTreeSet::new(),
+                        progress,
+                    },
+                ),
+                Err(Error::InvalidArguments)
+            ));
+        }
+
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |bytes, total| {
+            assert_eq!(total, None, "a push claimed to know its total");
+            recording.lock().unwrap().push(bytes);
+        });
+        let server = Arc::new(server);
+        let pushing_server = Arc::clone(&server);
+        let pushed = within("the push from an assembled server", 60, move || {
+            push_from(
+                &pushing_server,
+                crate::PushOptions {
+                    address: at,
+                    holder,
+                    identity,
+                    rails: 2,
+                    extensions: std::collections::BTreeSet::new(),
+                    progress: Some((256 * 1024, observer)),
+                },
+            )
+        })
+        .expect("a push");
+        assert_eq!(pushed, built);
+        joined("the receiving thread", receiving).expect("received");
+
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress went backwards or repeated: {heard:?}"
+        );
+        // Loopback can take the whole object in one pass, so the count is
+        // not a property; the order and the end are.
+        assert!(!heard.is_empty(), "no progress was reported");
+        let last = *heard.last().expect("a final report");
+        assert!(
+            last >= built.logical_length,
+            "the carriers took {last} bytes for {} of object",
+            built.logical_length
+        );
+        // The receiver holds a bundle it can scan: the same package.
+        assert_eq!(crate::scan_manifest(&output).unwrap(), built);
+        crate::harness::discard(&[&source, &manifest_root, &output]);
+    }
+
+    #[test]
+    fn a_fetch_through_options_reports_what_it_placed() {
+        let source = crate::tests::temporary("fetch-options-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(2_500_000)).unwrap();
+        let bundle = crate::tests::temporary("fetch-options-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        // Two fetches of two rails each, so four sessions.
+        let (listening, address) = mpsc::channel();
+        let serving_bundle = bundle.to_path_buf();
+        let serving = std::thread::spawn(move || {
+            serve_bundle(
+                &serving_bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(4),
+                |at, _, identity| {
+                    let _ = listening.send((at, identity));
+                },
+            )
+        });
+        let (at, identity) = address.recv().expect("the server reported its address");
+        let root = built.root;
+        let options = move |rails, progress| crate::FetchOptions {
+            address: at,
+            holder: None,
+            serve_identity: Some(identity),
+            pin: Some(root),
+            rails,
+            provers: Some(2),
+            extensions: std::collections::BTreeSet::new(),
+            progress,
+        };
+
+        // A rail count past the limit, and a quantum that would report every
+        // byte, are refused before the bundle is opened.
+        let fetched = crate::tests::temporary("fetch-options-fetched");
+        for (rails, progress) in [
+            (MAX_FETCH_RAILS + 1, None),
+            (2, Some((0, Box::new(|_, _| {}) as crate::Progress))),
+        ] {
+            assert!(matches!(
+                fetch_bundle_with(options(rails, progress), &fetched),
+                Err(Error::InvalidArguments)
+            ));
+            assert!(!fetched.exists(), "a refused fetch opened its bundle");
+        }
+
+        // A quantum larger than the package: no crossing ever reports, and
+        // the end is reported exactly once, as the package length.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |placed, total| {
+            recording.lock().unwrap().push((placed, total));
+        });
+        let into = fetched.to_path_buf();
+        let package = within("the fetch through options", 60, move || {
+            fetch_bundle_with(options(2, Some((4 << 20, observer))), &into)
+        })
+        .expect("a fetch");
+        assert_eq!(package, built);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![(built.logical_length, Some(built.logical_length))],
+            "the end was not reported exactly once"
+        );
+
+        // A quantum of one byte: every placement reports, the last of them
+        // is the whole package, and the end adds nothing to it.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |placed, total| {
+            recording.lock().unwrap().push((placed, total));
+        });
+        let again = crate::tests::temporary("fetch-options-fetched-again");
+        let into = again.to_path_buf();
+        let package = within("the fetch through options, every byte", 60, move || {
+            fetch_bundle_with(options(2, Some((1, observer))), &into)
+        })
+        .expect("a fetch");
+        assert_eq!(package, built);
+        let served = joined("the serving thread", serving).expect("served");
+        assert_eq!(served, built);
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "placed bytes went backwards or repeated: {heard:?}"
+        );
+        assert_eq!(
+            *heard.last().unwrap(),
+            (built.logical_length, Some(built.logical_length)),
+            "the last report is not the whole package: {heard:?}"
+        );
+        crate::harness::discard(&[&source, &bundle, &fetched, &again]);
+    }
+
+    #[test]
+    fn push_progress_reports_once_per_quantum_and_once_at_the_end() {
+        // The arithmetic behind the reporter, as a table: crossing is by
+        // quantum index, and the end reports whatever a quantum did not.
+        for (before, after, quantum, crossed) in [
+            (0, 99, 100, false),
+            (0, 100, 100, true),
+            (99, 100, 100, true),
+            (100, 199, 100, false),
+            (150, 350, 100, true),
+            (0, 0, 100, false),
+            (5, 7, 1, true),
+        ] {
+            assert_eq!(
+                push::crossed_quantum(before, after, quantum),
+                crossed,
+                "{before} to {after} by {quantum}"
+            );
+        }
+        for (reported, sum, quantum, last, due) in [
+            (0, 99, 100, false, false),
+            (0, 100, 100, false, true),
+            (100, 199, 100, false, false),
+            (100, 200, 100, false, true),
+            (250, 280, 100, false, false),
+            (250, 280, 100, true, true),
+            (280, 280, 100, true, false),
+            (300, 250, 100, true, false),
+            (0, 0, 100, true, false),
+        ] {
+            assert_eq!(
+                push::report_due(reported, sum, quantum, last),
+                due,
+                "{reported} then {sum} by {quantum}, last {last}"
+            );
+        }
+
+        // The reporter over two rails: a rail's own crossing pays for the
+        // lock, the observer hears sums in order, and finish reports the
+        // tail once.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let reporter = push::Reporter::new(
+            100,
+            Box::new(move |bytes, total| {
+                assert_eq!(total, None);
+                recording.lock().unwrap().push(bytes);
+            }),
+            2,
+        );
+        reporter.taken(0, 50);
+        reporter.taken(1, 40);
+        assert!(heard.lock().unwrap().is_empty(), "no quantum crossed yet");
+        reporter.taken(0, 120);
+        assert_eq!(*heard.lock().unwrap(), vec![160]);
+        reporter.taken(1, 90);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160],
+            "rail one stayed in its quantum"
+        );
+        reporter.taken(1, 100);
+        assert_eq!(*heard.lock().unwrap(), vec![160, 220]);
+        reporter.finish();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160, 220],
+            "nothing unreported at the end"
+        );
+        reporter.taken(0, 130);
+        reporter.finish();
+        assert_eq!(*heard.lock().unwrap(), vec![160, 220, 230]);
+        reporter.finish();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160, 220, 230],
+            "a second end reports nothing"
+        );
+    }
+
+    #[test]
+    fn fetch_rail_count_uses_the_whole_supported_range() {
+        assert!(!fetch::valid_fetch_rails(0));
+        assert!(fetch::valid_fetch_rails(1));
+        assert!(fetch::valid_fetch_rails(MAX_FETCH_RAILS));
+        assert!(!fetch::valid_fetch_rails(MAX_FETCH_RAILS + 1));
     }
 }

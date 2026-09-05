@@ -5,8 +5,8 @@ use crate::{
     MANIFEST_DIRECTORY, MANIFEST_SEAL, MAX_DATA_RECORD_BYTES, OpenOptions, Pack, PackageAssembly,
     PackageBuilder, PackagePath, PackageSummary, PageDraft, Path, PathBuf, PathProfile, Read,
     Storage, StreamVerifier, StreamingPacker, Suite, Write, canonical_path_key, file_matches_bytes,
-    fs, manifest_page_path, manifest_spool_path, object_name, read_bounded_file, sync_directory,
-    write_new_synced,
+    fs, is_path_prefix, manifest_page_path, manifest_spool_path, object_name, read_bounded_file,
+    sync_directory, write_new_synced,
 };
 
 pub(crate) struct SourceFile {
@@ -122,6 +122,149 @@ pub fn build_bundle_with_suite(
     Ok(summary)
 }
 
+/// Builds a manifest from a source tree without copying anything.
+///
+/// Walks `source` with the rules [`build_bundle`](crate::build_bundle)
+/// uses and hands what it finds to [`build_manifest_from`].
+///
+/// # Errors
+/// Refuses a `source` that is not a directory, an empty one, and a
+/// `manifest_root` that already exists, with [`Error::InvalidArguments`];
+/// a file that changes length while it is read is [`Error::SourceMutation`].
+pub fn build_manifest(
+    source: &Path,
+    manifest_root: &Path,
+    suite: Suite,
+) -> Result<
+    (
+        PackageSummary,
+        std::collections::BTreeMap<[u8; 32], crate::ServedSource>,
+    ),
+    Error,
+> {
+    if !source.is_dir() || manifest_root.exists() {
+        return Err(Error::InvalidArguments);
+    }
+    build_from(collect_sources(source)?, manifest_root, suite)
+}
+
+/// Builds a manifest from named sources, each a package path and the file
+/// that holds its bytes, without copying anything.
+///
+/// Hashes every file where it sits, writes only `manifest/` (pages and
+/// seal) under `manifest_root`, and returns the package summary and a map
+/// from stored root to the source it is served from, the argument
+/// [`BundleServer::assemble`](crate::BundleServer::assemble) takes. Every
+/// entry is a direct object; nothing is packed. The sources may arrive in
+/// any order; the manifest holds them in canonical order. Two files with
+/// the same bytes are one stored object, served from whichever sorts
+/// first. The leaves come back with each source and are the caller's to
+/// keep, with [`crate::proof_cache::write`] or however it likes.
+///
+/// # Errors
+/// Refuses no source at all and a `manifest_root` that already exists with
+/// [`Error::InvalidArguments`]; a source that is not a regular file (a
+/// directory, a symlink) and two sources whose paths fold to one key or
+/// where one is a directory ancestor of the other with
+/// [`Error::InvalidPath`]; a file that changes length while it is read is
+/// [`Error::SourceMutation`].
+pub fn build_manifest_from<I>(
+    sources: I,
+    manifest_root: &Path,
+    suite: Suite,
+) -> Result<
+    (
+        PackageSummary,
+        std::collections::BTreeMap<[u8; 32], crate::ServedSource>,
+    ),
+    Error,
+>
+where
+    I: IntoIterator<Item = (PackagePath, PathBuf)>,
+{
+    if manifest_root.exists() {
+        return Err(Error::InvalidArguments);
+    }
+    let mut collected = Vec::new();
+    for (path, source) in sources {
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidPath);
+        }
+        let key =
+            canonical_path_key(&path, PathProfile::Portable).map_err(|_| Error::InvalidPath)?;
+        collected.push(SourceFile {
+            path,
+            key,
+            source,
+            length: metadata.len(),
+        });
+    }
+    order_sources(&mut collected)?;
+    build_from(collected, manifest_root, suite)
+}
+
+/// Names `sources`, already in canonical order, into a fresh `manifest_root`.
+fn build_from(
+    sources: Vec<SourceFile>,
+    manifest_root: &Path,
+    suite: Suite,
+) -> Result<
+    (
+        PackageSummary,
+        std::collections::BTreeMap<[u8; 32], crate::ServedSource>,
+    ),
+    Error,
+> {
+    if sources.is_empty() {
+        return Err(Error::InvalidArguments);
+    }
+    fs::create_dir(manifest_root)?;
+    let mut manifest = ManifestSpool::new(manifest_root)?;
+    let mut package = PackageBuilder::new()?;
+    let mut served = std::collections::BTreeMap::new();
+    for file in sources {
+        let mut input = File::open(&file.source)?;
+        let prepared = name_stream(&mut input, None, file.length, suite)?;
+        let root = prepared.object_id().root;
+        // Two files with the same bytes are one stored object; the first
+        // path is the one the server reads.
+        served.entry(root).or_insert_with(|| crate::ServedSource {
+            path: file.source.clone(),
+            leaves: prepared.proof_leaves(),
+        });
+        let record = EntryRecord {
+            path: file.path,
+            suite,
+            logical_root: root,
+            logical_length: file.length,
+            storage: Storage::Direct,
+        };
+        if let Some(draft) = package.push(&record)? {
+            manifest.push(&draft)?;
+        }
+    }
+    let summary = manifest.finish(package.finish()?)?;
+    sync_directory(manifest_root)?;
+    Ok((summary, served))
+}
+
+/// Puts `sources` in canonical order and refuses one path that is another,
+/// or an ancestor of it: a name cannot be both a file and a directory. Keys
+/// join components with a zero byte, the smallest, so an ancestor sorts
+/// immediately before its first descendant and the pass over neighbours
+/// catches it.
+fn order_sources(sources: &mut [SourceFile]) -> Result<(), Error> {
+    sources.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+    if sources
+        .windows(2)
+        .any(|pair| pair[0].key == pair[1].key || is_path_prefix(&pair[0].key, &pair[1].key))
+    {
+        return Err(Error::InvalidPath);
+    }
+    Ok(())
+}
+
 pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
     pub(crate) fn visit(
         root: &Path,
@@ -166,10 +309,7 @@ pub(crate) fn collect_sources(root: &Path) -> Result<Vec<SourceFile>, Error> {
 
     let mut output = Vec::new();
     visit(root, root, &mut Vec::new(), &mut output)?;
-    output.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-    if output.windows(2).any(|pair| pair[0].key == pair[1].key) {
-        return Err(Error::InvalidPath);
-    }
+    order_sources(&mut output)?;
     Ok(output)
 }
 
@@ -284,27 +424,7 @@ pub(crate) fn copy_and_name(
         .truncate(true)
         .write(true)
         .open(&temporary)?;
-    let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
-        .map_err(|_| Error::InvalidBundle)?;
-    let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
-    let copied = (|| -> Result<vot_object::PreparedObject, Error> {
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            output.write_all(&buffer[..read])?;
-            builder
-                .update(&buffer[..read])
-                .map_err(|_| Error::SourceMutation)?;
-        }
-        output.sync_all()?;
-        let prepared = builder.finish().map_err(|_| Error::SourceMutation)?;
-        if prepared.object_id().length != expected_length {
-            return Err(Error::SourceMutation);
-        }
-        Ok(prepared)
-    })();
+    let copied = name_stream(&mut input, Some(&mut output), expected_length, suite);
     let prepared = match copied {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -318,6 +438,45 @@ pub(crate) fn copy_and_name(
         root: prepared.object_id().root,
         leaves: prepared.proof_leaves(),
     })
+}
+
+/// One pass over `input` that names it: the root and the proof leaves of
+/// the object its bytes make, with those bytes written to `output` on the
+/// way past when a copy is wanted. A source whose length is not
+/// `expected_length` is a mutation.
+fn name_stream(
+    input: &mut File,
+    mut output: Option<&mut File>,
+    expected_length: u64,
+    suite: Suite,
+) -> Result<vot_object::PreparedObject, Error> {
+    let mut builder = vot_object::ObjectBuilder::new(suite, Some(expected_length))
+        .map_err(|_| Error::InvalidBundle)?;
+    let mut buffer = vec![0; MAX_DATA_RECORD_BYTES];
+    // Bounded by the length the source was promised to have, never by the
+    // stream: a source that ends early or runs long is a mutation, and the
+    // builder refuses a stream that overruns its promise on the way.
+    let mut remaining = expected_length;
+    while remaining > 0 {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Err(Error::SourceMutation);
+        }
+        if let Some(output) = output.as_deref_mut() {
+            output.write_all(&buffer[..read])?;
+        }
+        builder
+            .update(&buffer[..read])
+            .map_err(|_| Error::SourceMutation)?;
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    if input.read(&mut buffer)? != 0 {
+        return Err(Error::SourceMutation);
+    }
+    if let Some(output) = output {
+        output.sync_all()?;
+    }
+    builder.finish().map_err(|_| Error::SourceMutation)
 }
 
 pub(crate) fn stream_root(

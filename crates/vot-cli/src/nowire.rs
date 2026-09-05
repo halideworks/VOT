@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use crate::{Credentials, Error, PackageSummary};
+use crate::{BundleServer, Credentials, Error, FetchOptions, PackageSummary, PushOptions};
 
 /// Returns [`Error::WireUnsupported`] unconditionally.
 pub fn serve_bundle(
@@ -71,5 +71,24 @@ pub fn fetch_via_rendezvous(
     _bundle: &Path,
     _services: &[SocketAddr],
 ) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn push_from(_server: &BundleServer, _options: PushOptions) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn probe_serve(
+    _address: SocketAddr,
+    _identity: [u8; 32],
+    _budget: std::time::Duration,
+) -> Result<(), Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn fetch_bundle_with(_options: FetchOptions, _bundle: &Path) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }

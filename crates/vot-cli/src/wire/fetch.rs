@@ -45,6 +45,20 @@ fn certified_within(
     }
 }
 
+/// The longest idle timeout a probe installs, in milliseconds. A caller
+/// passes a small budget; this only bounds an unreasonable one so it cannot
+/// overflow an `Instant` addition or QUIC's varint encoding of the timeout.
+pub(super) const PROBE_IDLE_CEILING_MS: u64 = 300_000;
+
+/// The idle timeout, in milliseconds, a probe of this `budget` installs and
+/// waits: the budget, clamped to [`PROBE_IDLE_CEILING_MS`]. Pure, so the
+/// clamp is pinned by a table test.
+pub(super) fn probe_idle_ms(budget: std::time::Duration) -> u64 {
+    u64::try_from(budget.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(PROBE_IDLE_CEILING_MS)
+}
+
 /// Dials `address`, confirms the serve behind it presents `identity`, and
 /// closes, all within `budget`.
 ///
@@ -66,15 +80,22 @@ pub fn probe_serve(
     budget: std::time::Duration,
 ) -> Result<(), Error> {
     let mut config = client_config()?;
-    // The carrier's idle timeout is the budget, not the fetch default. A
-    // handshake that has not completed by then is the probe's answer, and a
-    // carrier dropped after the answer waits at most this to end its driver,
-    // so the whole probe, the drop included, is bounded by the budget rather
-    // than the 30-second fetch idle timeout.
-    config.idle_timeout_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    // The budget, not the fetch default, is what QUIC negotiates as this
+    // carrier's idle timeout, so a probe of a peer that answers at the
+    // transport but never completes the handshake gives up at the budget
+    // rather than the 30-second fetch idle. The drop is bounded on its own
+    // by the driver's close path, not by this.
+    let idle_ms = probe_idle_ms(budget);
+    config.idle_timeout_ms = idle_ms;
     let carrier = Transport::connect(local_for(address)?, address, Some("localhost"), &config)
         .map_err(carrier_failure)?;
-    certified_within(&carrier, identity, budget)
+    // The same clamp bounds the wait, so an unreasonable budget cannot
+    // overflow the deadline `connected_within` computes.
+    certified_within(
+        &carrier,
+        identity,
+        std::time::Duration::from_millis(idle_ms),
+    )
 }
 
 /// Fetches a bundle from `address` into `bundle`.

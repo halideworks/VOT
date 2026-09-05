@@ -61,9 +61,10 @@ platform crates it rests on are tested there.
 - `build_manifest_from(sources, manifest_root, suite)` builds the same
   manifest from a list of package path and file pairs in any order, which
   is what a drop of loose files and folders is; `build_manifest` walks a
-  directory into that list. A source that is not a regular file and two
-  sources whose paths fold to one key are `InvalidPath`, as the walk
-  reports them.
+  directory into that list. A source that is not a regular file, two
+  sources whose paths fold to one key, and one source whose path is a
+  directory ancestor of another's are `InvalidPath`, as the walk reports
+  them.
 - `proof_cache::read` and `proof_cache::write` are public, so a caller
   keeps the leaves a manifest build returned under a directory of its
   own and hands them back to a later assembly, as `send` and `serve` do
@@ -94,8 +95,10 @@ platform crates it rests on are tested there.
   network that will not carry QUIC costs it the budget and no reserved
   state; a receiver whose accept loop is bounded spends one session on the
   probe, so the probe precedes the preflight, not a bounded receive. The
-  carrier's idle timeout is the budget, so the probe and the drop that
-  follows it are bounded by the budget, not the fetch's idle timeout.
+  budget is what QUIC negotiates as the carrier's idle timeout, so a peer
+  that answers at the transport but never finishes the handshake is given
+  up on at the budget, not the fetch's idle timeout; the drop that follows
+  the answer is bounded by the driver's close path.
 - `Progress` is `Box<dyn FnMut(u64, Option<u64>) + Send>`, called at most
   once per `quantum` bytes and once at the end if the last quantum fell
   short of it; a zero quantum is refused before anything is opened or
@@ -147,6 +150,7 @@ platform crates it rests on are tested there.
   empty source, existing manifest root; no directory left behind.
 - `a_manifest_built_from_named_sources_orders_them_and_refuses_a_collision`:
   no source, a directory as a source, and two sources with one path
+  and one source whose path is a directory ancestor of another's, each
   refused with no directory left behind; two sources handed last first
   build the manifest a walk of the same tree builds, root for root.
 - `a_manifest_build_keeps_leaves_a_serve_can_prepare_from`: the returned

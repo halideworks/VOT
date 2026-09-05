@@ -19,15 +19,16 @@ looped until end of file hung under `replace == with != in name_stream`
 on an empty source, and was restructured rather than waived.
 
 Wire (`--features wire --config .cargo/mutants-live.toml --timeout 300
---jobs 2`, `wire/push.rs` and `wire/fetch.rs`): 72 mutants, 54 caught,
-18 unviable, none missed, no timeouts. The probe's wait and its
-certificate comparison are `certified_within`, shared with
-`verify_serve_identity`, and killed by
-`a_probe_confirms_the_serve_identity_within_its_budget`. An earlier shape kept the quantum
+--jobs 2`, `wire/push.rs` and `wire/fetch.rs`): 74 mutants, 56 caught,
+18 unviable, none missed, no timeouts. An earlier shape kept the quantum
 arithmetic inline in `Reporter` and missed thirteen mutants a loopback
 push cannot reach (one pass takes the whole object); the arithmetic is
 now `crossed_quantum` and `report_due`, killed by
-`push_progress_reports_once_per_quantum_and_once_at_the_end`. The fetch
+`push_progress_reports_once_per_quantum_and_once_at_the_end`. The probe's
+wait and its certificate comparison are `certified_within`, shared with
+`verify_serve_identity`, and its budget clamp is `probe_idle_ms`, killed
+by `a_probe_confirms_the_serve_identity_within_its_budget` and
+`a_probe_clamps_its_idle_timeout_to_the_ceiling`. The fetch
 rail bound is `valid_fetch_rails`, killed by
 `fetch_rail_count_uses_the_whole_supported_range`; the end-report
 comparison in `fetch_bundle_with` is killed by the two fetches in

@@ -3345,6 +3345,27 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_clamps_its_idle_timeout_to_the_ceiling() {
+        use super::fetch::{PROBE_IDLE_CEILING_MS, probe_idle_ms};
+        use std::time::Duration;
+        for (budget, expected) in [
+            (Duration::from_millis(0), 0),
+            (Duration::from_millis(2_500), 2_500),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS + 1),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (Duration::MAX, PROBE_IDLE_CEILING_MS),
+        ] {
+            assert_eq!(probe_idle_ms(budget), expected, "budget {budget:?}");
+        }
+    }
+
+    #[test]
     fn a_probe_confirms_the_serve_identity_within_its_budget() {
         let credentials = Ephemeral::generate().unwrap();
         let identity = identity_digest(&credentials.certificate).unwrap();
@@ -3366,9 +3387,9 @@ mod tests {
                 Ok(())
             })
         });
-        // The carrier's idle timeout is the budget, so each probe and its
-        // drop finish within a small multiple of it, not the fetch idle
-        // timeout; a regression to the longer one trips these bounds.
+        // Each probe and its drop finish well under the fetch idle
+        // timeout; the bounds turn any recurrence of the rare first-run
+        // stall into a diagnosable failure rather than a mystery hang.
         let budget = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
         within("a probe of the right identity", 20, move || {

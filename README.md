@@ -234,6 +234,8 @@ Mounted SMB shares: see [usage, assurance limits, and share tests](docs/mounted-
 
 Windows QUIC transmit offload: see [native 10 GbE measurements and portability checks](bench/results/windows-udp-2026-09-08.md).
 
+macOS receive path: see [native checks and loopback measurements](bench/results/macos-receive-2026-09-08.md).
+
 Linux, macOS, and Windows. `receive-push` is Unix-only until guarded directory
 operations exist on Windows; all other commands, including `push`, retain the
 three-platform support. Platform-specific code is isolated in `vot-platform-fs`,

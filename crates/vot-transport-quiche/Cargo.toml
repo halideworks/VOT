@@ -25,9 +25,9 @@ getrandom = { version = "=0.4.3", optional = true }
 
 # Safe wrappers for the sendmsg control message that carries segmentation
 # offload. A kernel feature with no portable Rust surface; wrapping it here is
-# what keeps `unsafe_code = "forbid"` true of this crate. Linux only, because
-# the control message is: elsewhere the pump sends packets one at a time.
-[target.'cfg(target_os = "linux")'.dependencies]
+# what keeps `unsafe_code = "forbid"` true of this crate. macOS also uses
+# recvmsg for per-call nonblocking reads.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nix = { version = "=0.31.3", features = ["socket", "uio", "net"], optional = true }
 
 [lints]

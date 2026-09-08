@@ -2431,7 +2431,7 @@ fn enable_receive_offload(_socket: &UdpSocket) {}
 /// `recvmsg` rather than `recv_from`, because the segment size rides a control
 /// message; the socket's read timeout applies the same either way. The unsafe
 /// stays in `nix`, which is why this crate still forbids unsafe of its own.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[expect(clippy::ptr_arg, reason = "nix's recvmsg takes the Vec itself")]
 fn receive_segmented(
     socket: &UdpSocket,
@@ -2454,6 +2454,9 @@ fn receive_segmented(
         flags,
     )
     .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+    #[cfg(target_os = "macos")]
+    let segment = None;
+    #[cfg(target_os = "linux")]
     let segment = message.cmsgs().ok().and_then(|mut messages| {
         messages.find_map(|control| match control {
             nix::sys::socket::ControlMessageOwned::UdpGroSegments(size) => {
@@ -2470,8 +2473,8 @@ fn receive_segmented(
     Ok((message.bytes, from, segment))
 }
 
-/// The standard read where no coalescing exists to report.
-#[cfg(not(target_os = "linux"))]
+/// The standard read where per-call nonblocking receive is not used.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn receive_segmented(
     socket: &UdpSocket,
     buffer: &mut [u8],
@@ -2494,13 +2497,13 @@ fn receive_space() -> Vec<u8> {
 }
 
 /// The peer's address out of what `recvmsg` reports.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn address_of(storage: &nix::sys::socket::SockaddrStorage) -> Option<SocketAddr> {
     if let Some(v4) = storage.as_sockaddr_in() {
         return Some(SocketAddr::from((v4.ip(), v4.port())));
     }
     let v6 = storage.as_sockaddr_in6()?;
-    Some(SocketAddr::from((v6.ip(), v6.port())))
+    Some(SocketAddr::from(*v6))
 }
 
 /// Hands one read to the connection, split back into datagrams if the kernel
@@ -2556,10 +2559,10 @@ fn is_side_channel(lead: Option<u8>, bytes: &[u8], segment: Option<usize>) -> bo
 /// Takes what has already arrived without waiting, up to the counted budget.
 ///
 /// The wait was paid on the pass's first read; this hands the rest of the
-/// queue to the connection as one batch. Linux applies `MSG_DONTWAIT` to each
+/// queue to the connection as one batch. Linux and macOS apply `MSG_DONTWAIT` to each
 /// drain read; other systems temporarily switch the socket to non-blocking.
 #[cfg_attr(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "macos"),
     expect(
         clippy::unnecessary_wraps,
         reason = "other platforms can fail to restore blocking mode"
@@ -2572,7 +2575,7 @@ fn drain_arrivals(
     buffer: &mut [u8],
     space: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if socket.set_nonblocking(true).is_err() {
         // Still blocking, so the pass loses nothing but the batch.
         return Ok(());
@@ -2587,7 +2590,7 @@ fn drain_arrivals(
     }
     // A socket left non-blocking would turn the next pass's bounded wait into
     // a spin, so failing to restore it ends the driver instead.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     socket.set_nonblocking(false).map_err(|_| Error::Backend)?;
     Ok(())
 }
@@ -3638,6 +3641,51 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn receive_address_preserves_ipv6_scope_and_flow() {
+        let address = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1234".parse().unwrap(),
+            4433,
+            17,
+            9,
+        ));
+        let storage = nix::sys::socket::SockaddrStorage::from(address);
+        assert_eq!(address_of(&storage), Some(address));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn nonblocking_receive_preserves_blocking_reads() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let receiver = UdpSocket::bind(address).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let sender = UdpSocket::bind(address).unwrap();
+            let destination = receiver.local_addr().unwrap();
+            let source = sender.local_addr().unwrap();
+            let (done, result) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut buffer = [0; 32];
+                let mut space = receive_space();
+                let empty = receive_segmented(&receiver, &mut buffer, &mut space, true);
+                done.send(empty.map_err(|error| error.kind())).unwrap();
+                let outcome = receive_segmented(&receiver, &mut buffer, &mut space, false);
+                (outcome, buffer)
+            });
+            assert_eq!(
+                result.recv_timeout(Duration::from_secs(1)).unwrap(),
+                Err(std::io::ErrorKind::WouldBlock)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            sender.send_to(b"packet", destination).unwrap();
+            let (outcome, buffer) = reader.join().unwrap();
+            assert_eq!(outcome.unwrap(), (6, source, None));
+            assert_eq!(&buffer[..6], b"packet");
+        }
+    }
 
     #[test]
     fn retry_tokens_bind_the_peer_expiry_and_contents() {

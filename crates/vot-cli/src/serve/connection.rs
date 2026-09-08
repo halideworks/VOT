@@ -1043,7 +1043,9 @@ impl ServeConnection {
     /// Records the close and drops pending answers.
     pub(crate) fn close_with(&mut self, code: u16) {
         self.closed = Some(code);
-        self.outbound = OutboundQueue::default();
+        // Cleared, not replaced: what the carrier already took stays
+        // counted for the session's report.
+        self.outbound.clear();
         self.manifest_cursor = None;
         self.deferred.clear();
     }

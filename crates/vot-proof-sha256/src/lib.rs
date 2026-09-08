@@ -40,6 +40,37 @@ pub fn root(data: &[u8]) -> [u8; 32] {
         .expect("a bounded slice is a valid verifier stream")
 }
 
+/// Piece hashes of the pieces in `bytes`, which start at `offset` in an
+/// object of `object_length` bytes. A piece hash does not depend on its
+/// place, but only the object's last piece may be short, so a segment that
+/// does not reach the object's end must be a whole number of pieces.
+///
+/// # Errors
+/// Rejects empty input, an offset that is not a multiple of [`PIECE_SIZE`],
+/// a segment past the object's end, and a ragged segment that does not end
+/// the object.
+pub fn piece_hashes_at(
+    offset: u64,
+    bytes: &[u8],
+    object_length: u64,
+) -> Result<Vec<[u8; 32]>, Error> {
+    if bytes.is_empty() {
+        return Err(Error::EmptyRange);
+    }
+    if !offset.is_multiple_of(PIECE_SIZE) {
+        return Err(Error::OutOfBounds);
+    }
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(Error::LengthOverflow)?;
+    if end > object_length
+        || (end != object_length && !(bytes.len() as u64).is_multiple_of(PIECE_SIZE))
+    {
+        return Err(Error::OutOfBounds);
+    }
+    Ok(bytes.chunks(PIECE_SIZE as usize).map(piece_hash).collect())
+}
+
 #[must_use]
 pub fn piece_layer(data: &[u8]) -> Vec<[u8; 32]> {
     if data.is_empty() {
@@ -1136,6 +1167,37 @@ mod tests {
             Err(Error::Storage(StoreError::Unavailable))
         );
         assert!(!pieces.holds(0, &data[..PIECE_SIZE as usize]));
+    }
+
+    #[test]
+    fn segment_piece_hashes_rebuild_the_sequential_layer() {
+        let data: Vec<u8> = (0..(PIECE_SIZE as usize * 5 + 77))
+            .map(|i| (i % 241) as u8)
+            .collect();
+        let mut sequential = PieceHashes::new();
+        for piece in data.chunks(PIECE_SIZE as usize) {
+            sequential.push(piece).unwrap();
+        }
+        let cut = PIECE_SIZE as usize * 2;
+        let length = data.len() as u64;
+        let mut hashes = piece_hashes_at(0, &data[..cut], length).unwrap();
+        hashes.extend(piece_hashes_at(cut as u64, &data[cut..], length).unwrap());
+        assert_eq!(hashes, sequential.piece_hashes());
+        let rebuilt = PieceHashes::from_piece_hashes(hashes, length).unwrap();
+        assert_eq!(rebuilt.tree_root(), Some(root(&data)));
+        assert_eq!(
+            piece_hashes_at(1, &data[..cut], length),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(piece_hashes_at(0, &[], length), Err(Error::EmptyRange));
+        assert_eq!(
+            piece_hashes_at(0, &data[..cut - 1], length),
+            Err(Error::OutOfBounds)
+        );
+        assert_eq!(
+            piece_hashes_at(cut as u64, &data[cut..], length - 1),
+            Err(Error::OutOfBounds)
+        );
     }
 
     #[test]

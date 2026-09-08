@@ -6,6 +6,8 @@ enum vot_wasm::StorageKind
 enum vot_wasm::SubjectKind
 enum vot_wasm::Suite
 function vot_wasm::decode_catalog_header
+function vot_wasm::proof_leaf_size
+function vot_wasm::proof_leaves_at
 function vot_wasm::validate_catalog
 function vot_wasm::verify_range
 function vot_wasm::verify_receipt_ed25519

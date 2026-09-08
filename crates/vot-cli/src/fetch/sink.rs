@@ -2,7 +2,7 @@
 
 use super::{
     Arc, AtomicU64, Error, FetchPlan, FileSink, Mutex, Ordering, Path, PathBuf, ReceiveSink,
-    ResumeStore, SubjectId, durable_units, subject_of, total_units_of,
+    ResumeStore, SubjectId, durable_units, total_units_of,
 };
 use std::sync::{RwLock, atomic::AtomicBool};
 
@@ -79,10 +79,10 @@ impl DurableHook {
     pub(crate) fn flush(&self, sink: &dyn ReceiveSink) -> Result<(), Error> {
         let covered = self.plan.upgrade().and_then(|plan| {
             let plan = plan.lock().ok()?;
-            // Coverage is the current object's; a sink outliving its
-            // object flushes without a claim to make.
-            (plan.objects.get(plan.current).map(subject_of) == Some(self.subject))
-                .then(|| plan.covered.extents().clone())
+            // Coverage is that object's own; a sink outliving its object
+            // leaves the window and flushes without a claim to make.
+            let (_, active) = plan.in_window(self.subject)?;
+            Some(active.covered.extents().clone())
         });
         sink.flush()?;
         let Some(covered) = covered else {
@@ -282,11 +282,12 @@ pub(crate) const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use vot_scheduler::RangeSink as _;
 
-    struct FailingSink;
+    /// A sink that fails everything asked of it.
+    pub(in crate::fetch) struct FailingSink;
 
     impl vot_scheduler::RangeSink for FailingSink {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
@@ -370,6 +371,12 @@ mod tests {
         release: bool,
         discarded: bool,
         writes: usize,
+        /// Writers currently inside `write_at`, which the shared gate lets
+        /// exceed one.
+        inside: usize,
+        /// Writes that had returned when `discard_partial` reached the
+        /// inner sink.
+        writes_at_discard: usize,
     }
 
     #[derive(Default)]
@@ -390,6 +397,7 @@ mod tests {
             let mut state = self.shared.0.lock().map_err(|_| vot_scheduler::SinkError)?;
             state.started = true;
             state.entered += 1;
+            state.inside += 1;
             self.shared.1.notify_all();
             let (mut state, timeout) = self
                 .shared
@@ -400,6 +408,7 @@ mod tests {
                 .map_err(|_| vot_scheduler::SinkError)?;
             assert!(!timeout.timed_out(), "write was never released");
             state.writes += 1;
+            state.inside -= 1;
             Ok(())
         }
     }
@@ -439,11 +448,9 @@ mod tests {
         }
 
         fn discard_partial(&self) -> Result<(), Error> {
-            self.shared
-                .0
-                .lock()
-                .map_err(|_| Error::InvalidBundle)?
-                .discarded = true;
+            let mut state = self.shared.0.lock().map_err(|_| Error::InvalidBundle)?;
+            state.discarded = true;
+            state.writes_at_discard = state.writes;
             Ok(())
         }
     }
@@ -483,6 +490,53 @@ mod tests {
         let state = inner.shared.0.lock().unwrap();
         assert!(state.discarded);
         assert_eq!(state.writes, 1);
+    }
+
+    #[test]
+    fn two_writers_hold_the_gate_at_once_and_discard_waits_for_both() {
+        let inner = Arc::new(BlockingSink::default());
+        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone())));
+        let writing: Vec<_> = (0..2)
+            .map(|at| {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || sink.write_at(at, &[1]))
+            })
+            .collect();
+        {
+            // Both writers inside the sink at once. A gate held exclusively
+            // holds the second one out for as long as the first writes.
+            let mut state = inner.shared.0.lock().unwrap();
+            while state.inside < 2 {
+                let (next, timeout) = inner
+                    .shared
+                    .1
+                    .wait_timeout(state, std::time::Duration::from_secs(10))
+                    .unwrap();
+                state = next;
+                assert!(!timeout.timed_out(), "the gate let one writer in at a time");
+            }
+        }
+        let discarding = {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || sink.discard_partial())
+        };
+        {
+            let mut state = inner.shared.0.lock().unwrap();
+            state.release = true;
+            inner.shared.1.notify_all();
+        }
+        for writer in writing {
+            writer.join().unwrap().unwrap();
+        }
+        discarding.join().unwrap().unwrap();
+        assert!(sink.write_at(2, &[3]).is_err());
+        let state = inner.shared.0.lock().unwrap();
+        assert!(state.discarded);
+        assert_eq!(state.writes, 2);
+        assert_eq!(
+            state.writes_at_discard, 2,
+            "discard reached the sink before both writes returned"
+        );
     }
 
     #[test]

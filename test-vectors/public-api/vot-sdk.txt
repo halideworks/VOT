@@ -1,5 +1,6 @@
 constant vot_sdk::coverage::MAX_FRAGMENTS
 constant vot_sdk::object::MAX_OBJECT_LENGTH
+constant vot_sdk::object::PROOF_LEAF_SIZE
 constant vot_sdk::proof::HEADER_LENGTH
 constant vot_sdk::proof::INDEX_ENTRY_LENGTH
 constant vot_sdk::proof::RANGE_LENGTH
@@ -11,6 +12,7 @@ enum vot_sdk::package::EntryStorage
 enum vot_sdk::receipt::AssuranceLevel
 enum vot_sdk::receipt::CommitProfile
 enum vot_sdk::receipt::SubjectKind
+function vot_sdk::object::proof_leaves_at
 function vot_sdk::proof::decode_header
 function vot_sdk::proof::encode_in_memory
 function vot_sdk::proof::validate_catalog

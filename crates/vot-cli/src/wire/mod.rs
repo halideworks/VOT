@@ -21,13 +21,16 @@ mod relay;
 mod resolution;
 mod serve;
 
-pub use fetch::{fetch_bundle, fetch_via_rendezvous};
+pub use fetch::{fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve};
 pub use push::{
-    PushAdmission, PushPresentation, bind_push_listener, push_bundle, receive_push, receive_push_on,
+    PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from, receive_push,
+    receive_push_on,
 };
 pub use registration::rendezvous_service;
 pub use relay::relay_service;
-pub use serve::serve_bundle;
+pub use serve::{
+    ServeAdmission, ServePresentation, ServeReport, bind_serve_listener, serve_bundle, serve_on,
+};
 
 pub(crate) use certificate::*;
 pub(crate) use config::*;
@@ -97,6 +100,378 @@ mod tests {
     use std::net::UdpSocket;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// Runs `work` on a thread and waits `seconds` for its answer. A step that
+    /// never finishes fails the test naming itself, instead of hanging the run
+    /// the way a stalled fetch, or a bounded serve left waiting for a session
+    /// that never comes, otherwise would.
+    fn within<T: Send + 'static>(
+        step: &str,
+        seconds: u64,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, answer) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        match answer.recv_timeout(Duration::from_secs(seconds)) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{step} did not finish within {seconds} seconds")
+            }
+            // The sender went with a panicking thread: report its panic.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().expect_err("a panicking thread"))
+            }
+        }
+    }
+
+    /// [`within`] for a thread already running: joins it under a bound.
+    fn joined<T: Send + 'static>(step: &str, handle: std::thread::JoinHandle<T>) -> T {
+        match within(step, 30, move || handle.join()) {
+            Ok(value) => value,
+            Err(panicked) => std::panic::resume_unwind(panicked),
+        }
+    }
+
+    fn serve_token(
+        issuer: &ed25519_dalek::SigningKey,
+        holder: ed25519_dalek::SigningKey,
+        root: [u8; 32],
+    ) -> std::sync::Arc<crate::authz::Holder> {
+        let token = crate::authz::issue(
+            "issuer.example",
+            "serve.example",
+            issuer,
+            holder.verifying_key().to_bytes(),
+            root,
+            crate::authz::now_seconds().expect("a clock"),
+            3_600,
+        )
+        .expect("a token");
+        std::sync::Arc::new(crate::authz::Holder::new(token, holder).expect("a holder"))
+    }
+
+    fn fetch_holding(
+        at: SocketAddr,
+        into: &Path,
+        pin: [u8; 32],
+        holder: std::sync::Arc<crate::authz::Holder>,
+    ) -> Result<(crate::FetchStatus, Option<PackageSummary>), Error> {
+        let into = into.to_path_buf();
+        within("the fetch holding a token", 60, move || {
+            let client = client_config().expect("a client config");
+            let carrier = Transport::connect(
+                local_for(at).expect("a local address"),
+                at,
+                Some("localhost"),
+                &client,
+            )
+            .expect("a carrier");
+            let mut fetcher = BundleFetcher::begin_with(
+                carrier,
+                &into,
+                Some(pin),
+                Some(holder),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("a fetch holding the token");
+            let status = crate::drive::drive(&mut fetcher)?;
+            Ok((status, fetcher.package()))
+        })
+    }
+
+    #[test]
+    fn serve_on_admits_by_root_and_reports_each_session() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle_a, built_a) = crate::harness::built_bundle(
+            "serve-on-a",
+            &[("data.bin", crate::harness::patterned(200_000))],
+        );
+        let (bundle_b, built_b) =
+            crate::harness::built_bundle("serve-on-b", &[("other.bin", vec![7; 1_000])]);
+        let server_a = std::sync::Arc::new(BundleServer::open(&bundle_a).unwrap());
+        let server_b = std::sync::Arc::new(BundleServer::open(&bundle_b).unwrap());
+        let issuer = SigningKey::from_bytes(&[61; 32]);
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        let (reports, reported) = mpsc::channel::<ServeReport>();
+        let verifying = issuer.verifying_key();
+        let servers = [server_a, server_b];
+        let serving = std::thread::spawn(move || {
+            serve::serve_on_bounded(&listener, Some(3), |presentation| {
+                // The policy tries every package it holds; the token's own
+                // root is the one whose requirement decides.
+                let decided = servers.iter().find_map(|server| {
+                    crate::authz::Requirement::new(
+                        "issuer.example",
+                        crate::authz::key_id_of(&verifying),
+                        verifying,
+                        "serve.example",
+                        server.package().root,
+                    )
+                    .decide(
+                        presentation.challenge,
+                        presentation.open,
+                        presentation.channel_binding,
+                        presentation.now,
+                    )
+                    .map(|scope| (server, scope))
+                })?;
+                let (server, scope) = decided;
+                let root = vot_capability::decode_scope(&scope).expect("a scope").root;
+                // A policy that answers B's token from A: the seam refuses it.
+                let server = if root == servers[1].package().root {
+                    std::sync::Arc::clone(&servers[0])
+                } else {
+                    std::sync::Arc::clone(server)
+                };
+                let reports = reports.clone();
+                Some(ServeAdmission {
+                    server,
+                    scope,
+                    observer: Some(Box::new(move |report| {
+                        let _ = reports.send(report);
+                    })),
+                })
+            })
+        });
+
+        // A token for A is served from A to completion.
+        let fetched = crate::tests::temporary("serve-on-fetched");
+        let (status, package) = fetch_holding(
+            at,
+            &fetched,
+            built_a.root,
+            serve_token(&issuer, SigningKey::from_bytes(&[62; 32]), built_a.root),
+        )
+        .expect("a driven fetch");
+        assert_eq!(
+            status,
+            crate::FetchStatus::Complete,
+            "A's holder was refused"
+        );
+        assert_eq!(package.expect("a package"), built_a);
+        let report = reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the observer heard the session end");
+        assert_eq!(report.objects, 1);
+        // `fetch_holding` drives the engine raw, without the wire layer's
+        // completion handshake, so the serve sees the carrier drop rather than
+        // a final-cursor GOAWAY. The wire path is covered by
+        // `fetch_over_acknowledges_completion_on_one_session`.
+        assert_eq!(report.cursor, None, "the raw-drive path sends no GOAWAY");
+        assert!(
+            report.served_bytes >= 200_000,
+            "served {} bytes of a 200000 byte object",
+            report.served_bytes
+        );
+        assert!(report.status.is_ok(), "{:?}", report.status);
+        assert_eq!(report.peer.ip(), at.ip());
+
+        // A token for an unknown root, and a token for B answered from A,
+        // are both refused: the holder spends its presentation attempts on
+        // the one constant refusal and the session ends with no bundle.
+        for (name, root) in [("unknown", [9; 32]), ("mismatched", built_b.root)] {
+            let refused = crate::tests::temporary(&format!("serve-on-{name}"));
+            let outcome = fetch_holding(
+                at,
+                &refused,
+                root,
+                serve_token(&issuer, SigningKey::from_bytes(&[63; 32]), root),
+            );
+            assert!(
+                matches!(outcome, Err(Error::Session(_))),
+                "{name}: served, or refused for another reason: {outcome:?}"
+            );
+            let written = std::fs::read_dir(refused.join("objects")).map_or(0, Iterator::count);
+            assert_eq!(written, 0, "{name}: an object was written anyway");
+            crate::harness::discard(&[&refused]);
+        }
+        assert!(
+            reported.try_recv().is_err(),
+            "a refused session reached the observer"
+        );
+        // Bounded, so the refused sessions surface as the serve's failure.
+        assert!(joined("the serving thread", serving).is_err());
+        crate::harness::discard(&[&bundle_a, &bundle_b, &fetched]);
+    }
+
+    // A railed fetch over the wire path completes with the primary
+    // acknowledging every transfer object: exactly one serve session ends
+    // `Completed` with the final cursor, and the rails close without one.
+    #[test]
+    fn fetch_over_acknowledges_completion_on_one_session() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) = crate::harness::built_bundle(
+            "fetch-ack",
+            &[("payload.bin", crate::harness::patterned(512 * 1024))],
+        );
+        let server = std::sync::Arc::new(BundleServer::open(&bundle).unwrap());
+        let issuer = SigningKey::from_bytes(&[71; 32]);
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        let (reports, reported) = mpsc::channel::<ServeReport>();
+        let verifying = issuer.verifying_key();
+        let policy_server = std::sync::Arc::clone(&server);
+        // Two rails open two sessions; serve both, then stop.
+        let serving = std::thread::spawn(move || {
+            serve::serve_on_bounded(&listener, Some(2), |presentation| {
+                let scope = crate::authz::Requirement::new(
+                    "issuer.example",
+                    crate::authz::key_id_of(&verifying),
+                    verifying,
+                    "serve.example",
+                    policy_server.package().root,
+                )
+                .decide(
+                    presentation.challenge,
+                    presentation.open,
+                    presentation.channel_binding,
+                    presentation.now,
+                )?;
+                let reports = reports.clone();
+                Some(ServeAdmission {
+                    server: std::sync::Arc::clone(&policy_server),
+                    scope,
+                    observer: Some(Box::new(move |report| {
+                        let _ = reports.send(report);
+                    })),
+                })
+            })
+        });
+
+        let destination = crate::tests::temporary("fetch-ack-destination");
+        let holder = serve_token(&issuer, SigningKey::from_bytes(&[72; 32]), built.root);
+        let config = client_config().expect("a client config");
+        let connect = move || {
+            let carrier = Transport::connect(
+                local_for(at).expect("a local address"),
+                at,
+                Some("localhost"),
+                &config,
+            )
+            .map_err(|_| Error::CarrierUnavailable)?;
+            Ok(carrier)
+        };
+        let primary = connect().expect("a primary carrier");
+        let mut fetcher = BundleFetcher::begin_with(
+            primary,
+            &destination,
+            Some(built.root),
+            Some(holder),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("a fetch holding the token");
+        // Rails past one need proof workers to verify off the primary's thread.
+        fetcher.set_proving_threads(2).expect("proving threads");
+        let outcome = within("the railed fetch", 60, move || {
+            crate::drive::fetch_striped(fetcher, 2, connect)
+        })
+        .expect("a railed fetch");
+        assert_eq!(outcome.package, built);
+
+        // Collect what the sessions reported. Both rails were admitted, so two
+        // reports arrive; only the primary's carries the completion cursor.
+        let mut collected = Vec::new();
+        while let Ok(report) = reported.recv_timeout(Duration::from_secs(10)) {
+            collected.push(report);
+            if collected.len() == 2 {
+                break;
+            }
+        }
+        assert!(!collected.is_empty(), "no session reached the observer");
+        let completed: Vec<_> = collected
+            .iter()
+            .filter(|report| report.status.as_ref().ok() == Some(&crate::ServeStatus::Completed))
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one session completes: {collected:?}"
+        );
+        assert_eq!(completed[0].objects, 1);
+        assert_eq!(
+            completed[0].cursor,
+            Some(1),
+            "the completing session saw the final cursor"
+        );
+        // Only the completing session carried a cursor; the rails dropped.
+        let with_cursor = collected
+            .iter()
+            .filter(|report| report.cursor.is_some())
+            .count();
+        assert_eq!(
+            with_cursor, 1,
+            "only one session carried a cursor: {collected:?}"
+        );
+
+        let _ = joined("the serving thread", serving);
+        crate::harness::discard(&[&bundle, &destination]);
+    }
+
+    #[test]
+    fn serve_on_refuses_a_listener_without_retry() {
+        let written = Ephemeral::generate().expect("credentials");
+        let mut config = Config::server(
+            limits().unwrap(),
+            written.certificate.to_str().expect("a path").to_owned(),
+            written.key.to_str().expect("a path").to_owned(),
+        );
+        config.stateless_retry = false;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).expect("a bind");
+        assert!(matches!(
+            serve_on(&listener, |_| panic!("a session was accepted")),
+            Err(Error::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn serve_on_closes_a_silent_peer_at_the_deadline() {
+        let (listener, _identity) =
+            bind_serve_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .expect("a serve listener");
+        let at = listener.local_address();
+        // Announced over a channel, so a serve that never closes the peer
+        // fails this test at the bounded wait instead of hanging it.
+        let (ended, ending) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ended.send(serve::serve_on_bounded_with_timeout(
+                &listener,
+                Some(1),
+                Duration::from_millis(300),
+                |_| panic!("a silent peer presented something"),
+            ));
+        });
+        // A carrier that completes the handshake and never opens a session.
+        let client = client_config().expect("a client config");
+        let carrier = Transport::connect(
+            local_for(at).expect("a local address"),
+            at,
+            Some("localhost"),
+            &client,
+        )
+        .expect("a carrier");
+        let outcome = ending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the serve did not close the silent peer at the deadline");
+        drop(carrier);
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHENTICATION_FAILED
+                ))
+            ),
+            "{outcome:?}"
+        );
+    }
 
     #[test]
     fn a_serve_draws_a_fresh_nonce_for_every_session() {
@@ -1119,9 +1494,14 @@ mod tests {
 
         let at = address.recv().expect("the server reported its address");
         let fetched = crate::tests::temporary("railwire-fetched");
-        let package = fetch_railed(at, &fetched, Some(built.root), 2).expect("a striped fetch");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the striped fetch", 60, move || {
+            fetch_railed(at, &into, Some(root), 2)
+        })
+        .expect("a striped fetch");
         assert_eq!(package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
         // The leaves a send keeps beside an object are skipped: a cache a
         // serve rebuilds by reading the object, which a fetch does not write.
@@ -1470,7 +1850,9 @@ mod tests {
             (9, 8, 1),
             (17, 8, 2),
             (32, 8, 4),
-            (0, 8, 0),
+            // No prover books no coverage, so the split floors at one
+            // however small the ceiling an operator names.
+            (0, 8, 1),
         ] {
             assert_eq!(
                 fetch::provers_per_rail(provers, rails),
@@ -1527,9 +1909,14 @@ mod tests {
             "the serve announced a root that is not the bundle's"
         );
         let fetched = crate::tests::temporary("wire-fetched");
-        let package = fetch_railed(at, &fetched, Some(built.root), 1).expect("a fetched bundle");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch", 60, move || {
+            fetch_railed(at, &into, Some(root), 1)
+        })
+        .expect("a fetched bundle");
         assert_eq!(package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
 
         let destination = crate::tests::temporary("wire-destination");
@@ -1595,7 +1982,7 @@ mod tests {
             "any other pin refuses the carrier"
         );
         drop(carrier);
-        let _ = serving.join().expect("the serving thread");
+        let _ = joined("the serving thread", serving);
     }
 
     #[test]
@@ -1655,7 +2042,7 @@ mod tests {
         );
         drop(first);
         drop(second);
-        let _ = serving.join().expect("the serving thread");
+        let _ = joined("the serving thread", serving);
     }
 
     #[test]
@@ -1757,21 +2144,18 @@ mod tests {
         let (at, _) = address.recv().expect("the server reported its address");
         let fetched = crate::tests::temporary("fec-wire-fetched");
         let config = client_config().unwrap();
-        let connect = || {
+        let connect = move || {
             Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &config)
                 .map_err(carrier_failure)
         };
-        let outcome = fetch_over_offering(
-            connect().unwrap(),
-            connect,
-            &fetched,
-            Some(built.root),
-            1,
-            fec,
-        )
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let outcome = within("the fetch over the datagram path", 60, move || {
+            fetch_over_offering(connect().unwrap(), connect, &into, Some(root), 1, fec)
+        })
         .expect("a fetched bundle");
         assert_eq!(outcome.package, built);
-        let served = serving.join().expect("the serving thread").expect("served");
+        let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
         // 1500000 bytes of object are 23 generations, every one of them
         // offered over the datagram path; the manifest and the small tail
@@ -1881,12 +2265,16 @@ mod tests {
 
         // Fetch via rendezvous: resolve root -> connect -> transfer.
         let fetched = crate::tests::temporary("rendezvous-wire-fetched");
-        let package = fetch_via_rendezvous_railed(built.root, &fetched, &[service], &[], RAILS)
-            .expect("a fetch via rendezvous");
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch via rendezvous", 60, move || {
+            fetch_via_rendezvous_railed(root, &into, &[service], &[], RAILS)
+        })
+        .expect("a fetch via rendezvous");
         assert_eq!(package, built);
 
         drop(registration);
-        let served = serving.join().expect("the serving thread");
+        let served = joined("the serving thread", serving);
         assert_eq!(served, built);
         stop.store(true, Ordering::Relaxed);
         let mut resolvers = service_thread.join().expect("the service thread");
@@ -1998,18 +2386,22 @@ mod tests {
             .expect("the rung ran")
             .expect("a relayed carrier");
         let fetched = crate::tests::temporary("relay-rung-fetched");
-        let package = fetch_over(
-            carrier,
-            || Err(Error::RelayUnavailable),
-            &fetched,
-            Some(built.root),
-            1,
-        )
+        let into = fetched.to_path_buf();
+        let root = built.root;
+        let package = within("the fetch through the slot", 60, move || {
+            fetch_over(
+                carrier,
+                || Err(Error::RelayUnavailable),
+                &into,
+                Some(root),
+                1,
+            )
+        })
         .expect("a fetch through the slot");
         assert_eq!(package, built);
 
         drop(registration);
-        let served = serving.join().expect("the serving thread");
+        let served = joined("the serving thread", serving);
         assert_eq!(served, built);
         stop.store(true, Ordering::Relaxed);
         service_thread.join().expect("the service thread");
@@ -2100,18 +2492,19 @@ mod tests {
         .expect("a carrier");
         let mut naked = BundleFetcher::begin(carrier, &refused_into, Some(built.root))
             .expect("a fetch with no token");
-        let refusal = crate::drive::drive(&mut naked).expect("a driven fetch");
-        assert_eq!(
-            refusal,
-            crate::FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
-            "a fetch with no capability was served, or refused for another reason"
-        );
-        assert!(naked.package().is_none(), "a bundle was written anyway");
-        drop(naked);
+        within("the fetch with no token", 60, move || {
+            let refusal = crate::drive::drive(&mut naked).expect("a driven fetch");
+            assert_eq!(
+                refusal,
+                crate::FetchStatus::Closed(vot_codec::error_code::AUTHENTICATION_FAILED),
+                "a fetch with no capability was served, or refused for another reason"
+            );
+            assert!(naked.package().is_none(), "a bundle was written anyway");
+        });
         // The peer left mid-negotiation, which a bounded serve surfaces. An
         // unbounded one outlives it, which is what a real serve is.
         assert!(
-            refusing.join().expect("the refusing thread").is_err(),
+            joined("the refusing thread", refusing).is_err(),
             "a session whose peer never presented was reported as served"
         );
 
@@ -2143,18 +2536,17 @@ mod tests {
             std::collections::BTreeSet::new(),
         )
         .expect("a fetch holding the token");
-        let status = crate::drive::drive(&mut holding).expect("a driven fetch");
-        assert_eq!(
-            status,
-            crate::FetchStatus::Complete,
-            "the holder was refused"
-        );
-        assert_eq!(holding.package().expect("a package"), built);
-        drop(holding);
-        granting
-            .join()
-            .expect("the granting thread")
-            .expect("served");
+        let package = within("the fetch holding the token", 60, move || {
+            let status = crate::drive::drive(&mut holding).expect("a driven fetch");
+            assert_eq!(
+                status,
+                crate::FetchStatus::Complete,
+                "the holder was refused"
+            );
+            holding.package().expect("a package")
+        });
+        assert_eq!(package, built);
+        joined("the granting thread", granting).expect("served");
 
         crate::harness::discard(&[&source, &bundle, &refused_into, &fetched]);
     }
@@ -2205,6 +2597,17 @@ mod tests {
         )
         .unwrap();
 
+        // Every push below rides a bounded wait: a receiver that never
+        // finishes fails the test instead of hanging it.
+        let pushing = |bundle: &Path, token: &Path, at, identity, rails| {
+            let bundle = bundle.to_path_buf();
+            let token = token.to_path_buf();
+            let holder = holder_path.to_str().expect("a path").to_owned();
+            within("the push", 60, move || {
+                push::push_bundle_railed(&bundle, at, &token, &holder, identity, rails)
+            })
+        };
+
         let credentials = Ephemeral::generate().unwrap();
         let identity = identity_digest(&credentials.certificate).unwrap();
         let mut config = Config::server(
@@ -2226,17 +2629,10 @@ mod tests {
             let mut wrong = identity;
             wrong[0] ^= 1;
             assert!(matches!(
-                push::push_bundle_railed(
-                    &bundle,
-                    at,
-                    &token_path,
-                    holder_path.to_str().unwrap(),
-                    wrong,
-                    1,
-                ),
+                pushing(&bundle, &token_path, at, wrong, 1),
                 Err(Error::ServeIdentityMismatch)
             ));
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
         }
         {
             let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
@@ -2267,15 +2663,7 @@ mod tests {
                         })
                 })
             });
-            let refused = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            )
-            .unwrap_err();
+            let refused = pushing(&bundle, &token_path, at, identity, 1).unwrap_err();
             assert!(
                 matches!(
                     &refused,
@@ -2283,7 +2671,7 @@ mod tests {
                 ),
                 "wrong refusal: {refused:?}"
             );
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(
                 !refused_path.exists(),
                 "a refused push accepted a descriptor"
@@ -2331,15 +2719,7 @@ mod tests {
                         })
                 })
             });
-            let refused = push::push_bundle_railed(
-                &bundle,
-                at,
-                &null_token,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            )
-            .unwrap_err();
+            let refused = pushing(&bundle, &null_token, at, identity, 1).unwrap_err();
             assert!(
                 matches!(
                     &refused,
@@ -2347,7 +2727,7 @@ mod tests {
                 ),
                 "wrong refusal: {refused:?}"
             );
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(
                 !output.exists(),
                 "a null-length scope accepted a descriptor"
@@ -2381,16 +2761,9 @@ mod tests {
                         })
                 })
             });
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             assert!(pushed.is_err(), "a failed receiver acknowledged the push");
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             crate::harness::discard(&[&output]);
         }
         {
@@ -2421,16 +2794,9 @@ mod tests {
                     },
                 )
             });
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             assert!(pushed.is_err(), "a late admission was granted");
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             assert!(!output.exists(), "a late admission accepted a descriptor");
         }
         for rails in [1, 4] {
@@ -2457,15 +2823,8 @@ mod tests {
                 })
             });
 
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                rails as usize,
-            );
-            let received = receiving.join().unwrap();
+            let pushed = pushing(&bundle, &token_path, at, identity, rails as usize);
+            let received = joined("the receiving thread", receiving);
             assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
             assert_eq!(pushed.unwrap(), built);
             crate::fetch::tests::assert_same_tree(&bundle, &output);
@@ -2527,15 +2886,8 @@ mod tests {
                         })
                 })
             });
-            let pushed = push::push_bundle_railed(
-                &empty_bundle,
-                at,
-                &empty_token,
-                holder_path.to_str().unwrap(),
-                identity,
-                4,
-            );
-            let received = receiving.join().unwrap();
+            let pushed = pushing(&empty_bundle, &empty_token, at, identity, 4);
+            let received = joined("the receiving thread", receiving);
             assert!(received.is_ok(), "receiver {received:?}; holder {pushed:?}");
             assert_eq!(pushed.unwrap(), empty);
             crate::fetch::tests::assert_same_tree(&empty_bundle, &output);
@@ -2681,14 +3033,7 @@ mod tests {
             for _ in 1..crate::drive::CONCURRENT_SESSIONS {
                 started.recv_timeout(Duration::from_secs(10)).unwrap();
             }
-            let pushed = push::push_bundle_railed(
-                &bundle,
-                at,
-                &token_path,
-                holder_path.to_str().unwrap(),
-                identity,
-                1,
-            );
+            let pushed = pushing(&bundle, &token_path, at, identity, 1);
             for attacker in attackers {
                 assert!(attacker.join().unwrap() > 1, "the attacker sent no drip");
             }
@@ -2697,7 +3042,7 @@ mod tests {
                 "finished later slots behind an active first starved {pushed:?}"
             );
             drop(holding);
-            assert!(receiving.join().unwrap().is_err());
+            assert!(joined("the receiving thread", receiving).is_err());
             crate::harness::discard(&[&output, &holding_output, &holding_token_path]);
         }
         crate::harness::discard(&[&source, &bundle, &token_path, &holder_path]);
@@ -3008,5 +3353,408 @@ mod tests {
         }
         assert!(relay_limits_from(Some("many"), None, None).is_err());
         assert!(std::env::var(RELAY_SLOTS).is_err(), "the suite owns no env");
+    }
+
+    #[test]
+    fn a_probe_clamps_its_idle_timeout_to_the_ceiling() {
+        use super::fetch::{PROBE_IDLE_CEILING_MS, probe_idle_ms};
+        use std::time::Duration;
+        for (budget, expected) in [
+            (Duration::from_millis(0), 0),
+            (Duration::from_millis(2_500), 2_500),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (
+                Duration::from_millis(PROBE_IDLE_CEILING_MS + 1),
+                PROBE_IDLE_CEILING_MS,
+            ),
+            (Duration::MAX, PROBE_IDLE_CEILING_MS),
+        ] {
+            assert_eq!(probe_idle_ms(budget), expected, "budget {budget:?}");
+        }
+    }
+
+    #[test]
+    fn a_probe_confirms_the_serve_identity_within_its_budget() {
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let at = listener.local_address();
+        // Two connections that carry no session: the accept loop takes
+        // them and lets them go, as a serve does with a peer that vanishes.
+        let accepting = std::thread::spawn(move || {
+            push::accept_sessions(&listener, Some(2), |carrier| {
+                let _ = carrier.connected_within(std::time::Duration::from_secs(5));
+                Ok(())
+            })
+        });
+        // Each probe and its drop finish well under the fetch idle
+        // timeout; the bounds turn any recurrence of the rare first-run
+        // stall into a diagnosable failure rather than a mystery hang.
+        let budget = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        within("a probe of the right identity", 20, move || {
+            probe_serve(at, identity, budget)
+        })
+        .expect("a probe");
+        within("a probe of a wrong identity", 20, move || {
+            assert!(matches!(
+                probe_serve(at, [0; 32], budget),
+                Err(Error::ServeIdentityMismatch)
+            ));
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "two budget-bounded probes took {:?}",
+            started.elapsed()
+        );
+        joined("the accepting thread", accepting).expect("accepted");
+
+        // A port that answers nothing spends the budget and no more.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = silent.local_addr().unwrap();
+        let budget = std::time::Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            within("a probe of a silent port", 30, move || probe_serve(
+                at, identity, budget
+            )),
+            Err(Error::CarrierUnavailable)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the probe outlived its budget: {:?}",
+            started.elapsed()
+        );
+        drop(silent);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_push_from_an_assembled_manifest_reports_what_the_carriers_took() {
+        use ed25519_dalek::SigningKey;
+
+        // Nothing under the manifest root but the manifest: the push serves
+        // the source files where they sit.
+        let source = crate::tests::temporary("push-from-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(3_000_000)).unwrap();
+        std::fs::write(source.join("note.txt"), b"a note beside the plate").unwrap();
+        let manifest_root = crate::tests::temporary("push-from-manifest");
+        let (built, sources) =
+            crate::build_manifest(&source, &manifest_root, crate::DEFAULT_LOGICAL_SUITE).unwrap();
+        let server = BundleServer::assemble(&manifest_root, sources).unwrap();
+
+        let issuer = SigningKey::from_bytes(&[61; 32]);
+        let holder_key = SigningKey::from_bytes(&[62; 32]);
+        let requirement = crate::authz::PushRequirement::new(
+            "issuer.example",
+            crate::authz::key_id_of(&issuer.verifying_key()),
+            issuer.verifying_key(),
+            "receiver.example",
+        );
+        let token = crate::authz::issue_push(
+            "issuer.example",
+            "receiver.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            built.logical_length,
+            crate::authz::now_seconds().unwrap(),
+            3_600,
+        )
+        .unwrap();
+        let holder = Arc::new(crate::authz::Holder::new(token, holder_key).unwrap());
+
+        let credentials = Ephemeral::generate().unwrap();
+        let identity = identity_digest(&credentials.certificate).unwrap();
+        let mut config = Config::server(
+            limits().unwrap(),
+            credentials.certificate.to_str().unwrap().to_owned(),
+            credentials.key.to_str().unwrap().to_owned(),
+        );
+        config.congestion = congestion_from(None).unwrap();
+        apply_datagram_bytes(&mut config).unwrap();
+        config.stateless_retry = true;
+        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
+        let at = listener.local_address();
+        let output = crate::tests::temporary("push-from-output");
+        let receiver_output = output.to_path_buf();
+        let receiving = std::thread::spawn(move || {
+            push::receive_push_on_bounded(&listener, Some(2), |presentation| {
+                requirement
+                    .decide(
+                        presentation.challenge,
+                        presentation.open,
+                        presentation.channel_binding,
+                        presentation.now,
+                    )
+                    .map(|scope| push::PushAdmission {
+                        scope,
+                        directory: receiver_output.clone(),
+                        seams: crate::ReceiveSeams::default(),
+                    })
+            })
+        });
+
+        // A rail count the listener cannot take, and a quantum that would
+        // report every byte, are refused before a dial.
+        for (rails, progress) in [
+            (0, None),
+            (2, Some((0, Box::new(|_, _| {}) as crate::Progress))),
+        ] {
+            assert!(matches!(
+                push_from(
+                    &server,
+                    crate::PushOptions {
+                        address: at,
+                        holder: Arc::clone(&holder),
+                        identity,
+                        rails,
+                        extensions: std::collections::BTreeSet::new(),
+                        progress,
+                    },
+                ),
+                Err(Error::InvalidArguments)
+            ));
+        }
+
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |bytes, total| {
+            assert_eq!(total, None, "a push claimed to know its total");
+            recording.lock().unwrap().push(bytes);
+        });
+        let server = Arc::new(server);
+        let pushing_server = Arc::clone(&server);
+        let pushed = within("the push from an assembled server", 60, move || {
+            push_from(
+                &pushing_server,
+                crate::PushOptions {
+                    address: at,
+                    holder,
+                    identity,
+                    rails: 2,
+                    extensions: std::collections::BTreeSet::new(),
+                    progress: Some((256 * 1024, observer)),
+                },
+            )
+        })
+        .expect("a push");
+        assert_eq!(pushed, built);
+        joined("the receiving thread", receiving).expect("received");
+
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress went backwards or repeated: {heard:?}"
+        );
+        // Loopback can take the whole object in one pass, so the count is
+        // not a property; the order and the end are.
+        assert!(!heard.is_empty(), "no progress was reported");
+        let last = *heard.last().expect("a final report");
+        assert!(
+            last >= built.logical_length,
+            "the carriers took {last} bytes for {} of object",
+            built.logical_length
+        );
+        // The receiver holds a bundle it can scan: the same package.
+        assert_eq!(crate::scan_manifest(&output).unwrap(), built);
+        crate::harness::discard(&[&source, &manifest_root, &output]);
+    }
+
+    #[test]
+    fn a_fetch_through_options_reports_what_it_placed() {
+        let source = crate::tests::temporary("fetch-options-source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("big.bin"), crate::harness::patterned(2_500_000)).unwrap();
+        let bundle = crate::tests::temporary("fetch-options-bundle");
+        let built = crate::build_bundle(&source, &bundle).unwrap();
+
+        // Two fetches of two rails each, so four sessions.
+        let (listening, address) = mpsc::channel();
+        let serving_bundle = bundle.to_path_buf();
+        let serving = std::thread::spawn(move || {
+            serve_bundle(
+                &serving_bundle,
+                "127.0.0.1:0".parse().unwrap(),
+                &Credentials::Ephemeral,
+                Some(4),
+                |at, _, identity| {
+                    let _ = listening.send((at, identity));
+                },
+            )
+        });
+        let (at, identity) = address.recv().expect("the server reported its address");
+        let root = built.root;
+        let options = move |rails, progress| crate::FetchOptions {
+            address: at,
+            holder: None,
+            serve_identity: Some(identity),
+            pin: Some(root),
+            rails,
+            provers: Some(2),
+            extensions: std::collections::BTreeSet::new(),
+            progress,
+        };
+
+        // A rail count past the limit, and a quantum that would report every
+        // byte, are refused before the bundle is opened.
+        let fetched = crate::tests::temporary("fetch-options-fetched");
+        for (rails, progress) in [
+            (MAX_FETCH_RAILS + 1, None),
+            (2, Some((0, Box::new(|_, _| {}) as crate::Progress))),
+        ] {
+            assert!(matches!(
+                fetch_bundle_with(options(rails, progress), &fetched),
+                Err(Error::InvalidArguments)
+            ));
+            assert!(!fetched.exists(), "a refused fetch opened its bundle");
+        }
+
+        // A quantum larger than the package: no crossing ever reports, and
+        // the end is reported exactly once, as the package length.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |placed, total| {
+            recording.lock().unwrap().push((placed, total));
+        });
+        let into = fetched.to_path_buf();
+        let package = within("the fetch through options", 60, move || {
+            fetch_bundle_with(options(2, Some((4 << 20, observer))), &into)
+        })
+        .expect("a fetch");
+        assert_eq!(package, built);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![(built.logical_length, Some(built.logical_length))],
+            "the end was not reported exactly once"
+        );
+
+        // A quantum of one byte: every placement reports, the last of them
+        // is the whole package, and the end adds nothing to it.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let observer: crate::Progress = Box::new(move |placed, total| {
+            recording.lock().unwrap().push((placed, total));
+        });
+        let again = crate::tests::temporary("fetch-options-fetched-again");
+        let into = again.to_path_buf();
+        let package = within("the fetch through options, every byte", 60, move || {
+            fetch_bundle_with(options(2, Some((1, observer))), &into)
+        })
+        .expect("a fetch");
+        assert_eq!(package, built);
+        let served = joined("the serving thread", serving).expect("served");
+        assert_eq!(served, built);
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "placed bytes went backwards or repeated: {heard:?}"
+        );
+        assert_eq!(
+            *heard.last().unwrap(),
+            (built.logical_length, Some(built.logical_length)),
+            "the last report is not the whole package: {heard:?}"
+        );
+        crate::harness::discard(&[&source, &bundle, &fetched, &again]);
+    }
+
+    #[test]
+    fn push_progress_reports_once_per_quantum_and_once_at_the_end() {
+        // The arithmetic behind the reporter, as a table: crossing is by
+        // quantum index, and the end reports whatever a quantum did not.
+        for (before, after, quantum, crossed) in [
+            (0, 99, 100, false),
+            (0, 100, 100, true),
+            (99, 100, 100, true),
+            (100, 199, 100, false),
+            (150, 350, 100, true),
+            (0, 0, 100, false),
+            (5, 7, 1, true),
+        ] {
+            assert_eq!(
+                push::crossed_quantum(before, after, quantum),
+                crossed,
+                "{before} to {after} by {quantum}"
+            );
+        }
+        for (reported, sum, quantum, last, due) in [
+            (0, 99, 100, false, false),
+            (0, 100, 100, false, true),
+            (100, 199, 100, false, false),
+            (100, 200, 100, false, true),
+            (250, 280, 100, false, false),
+            (250, 280, 100, true, true),
+            (280, 280, 100, true, false),
+            (300, 250, 100, true, false),
+            (0, 0, 100, true, false),
+        ] {
+            assert_eq!(
+                push::report_due(reported, sum, quantum, last),
+                due,
+                "{reported} then {sum} by {quantum}, last {last}"
+            );
+        }
+
+        // The reporter over two rails: a rail's own crossing pays for the
+        // lock, the observer hears sums in order, and finish reports the
+        // tail once.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&heard);
+        let reporter = push::Reporter::new(
+            100,
+            Box::new(move |bytes, total| {
+                assert_eq!(total, None);
+                recording.lock().unwrap().push(bytes);
+            }),
+            2,
+        );
+        reporter.taken(0, 50);
+        reporter.taken(1, 40);
+        assert!(heard.lock().unwrap().is_empty(), "no quantum crossed yet");
+        reporter.taken(0, 120);
+        assert_eq!(*heard.lock().unwrap(), vec![160]);
+        reporter.taken(1, 90);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160],
+            "rail one stayed in its quantum"
+        );
+        reporter.taken(1, 100);
+        assert_eq!(*heard.lock().unwrap(), vec![160, 220]);
+        reporter.finish();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160, 220],
+            "nothing unreported at the end"
+        );
+        reporter.taken(0, 130);
+        reporter.finish();
+        assert_eq!(*heard.lock().unwrap(), vec![160, 220, 230]);
+        reporter.finish();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![160, 220, 230],
+            "a second end reports nothing"
+        );
+    }
+
+    #[test]
+    fn fetch_rail_count_uses_the_whole_supported_range() {
+        assert!(!fetch::valid_fetch_rails(0));
+        assert!(fetch::valid_fetch_rails(1));
+        assert!(fetch::valid_fetch_rails(MAX_FETCH_RAILS));
+        assert!(!fetch::valid_fetch_rails(MAX_FETCH_RAILS + 1));
     }
 }

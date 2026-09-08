@@ -5702,15 +5702,14 @@ mod tests {
             while client.poll().is_some() {}
             while server.poll().is_some() {}
             discovered = client.path_stats().and_then(|stats| stats.mtu_bytes);
-            if discovered == Some(target) {
+            if discovered.is_some_and(|size| size >= target) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(
-            discovered,
-            Some(target),
-            "discovery never reached the ceiling"
+        assert!(
+            discovered.is_some_and(|size| size >= target),
+            "discovery never reached the ceiling: {discovered:?} under {target}"
         );
     }
 

@@ -3,6 +3,14 @@ name: pure-wasm
 on:
   push:
     branches: [main]
+    # This workflow's only main-scoped cache is the pinned wasm-bindgen
+    # binaries, keyed on a literal in this file. The crate checks themselves
+    # already ran on the pull request.
+    paths:
+      - ".github/workflows/pure-wasm.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
   pull_request:
   workflow_dispatch:
   schedule:

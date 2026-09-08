@@ -3,6 +3,14 @@ name: ci
 on:
   push:
     branches: [main]
+    # Only the inputs to a cache key or to the mutation plan. Everything else
+    # a merge can touch was already checked by the pull request run.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/**"
+      - "tools/*ci_*"
   pull_request:
   workflow_dispatch:
   schedule:
@@ -12,12 +20,15 @@ permissions:
   contents: read
 
 # One run per ref. A pull request's older run is cancelled when a new commit
-# arrives, because it measures code that no longer exists. A push to main is
-# not cancelled once it is running, since its checks are the record for that
-# commit, but a newer push supersedes any run still pending, which is what
-# keeps a run of merges from queueing checks for each and starving the pull
-# requests behind them. Scheduled and manual sweeps have their own group, so a
-# long full sweep cannot hold routine main checks behind it.
+# arrives, because it measures code that no longer exists. The pull request run
+# is the record for a commit, since a squash merge lands the tree it just
+# checked. A push to main runs only when the paths filter above admits it,
+# meaning an input to a cache key or to the mutation plan changed, and it is not
+# cancelled once it is running, because its job is to save the main-scoped
+# caches every branch restores from. A newer push still supersedes any run left
+# pending, which keeps a run of merges from queueing checks for each and
+# starving the pull requests behind them. Scheduled and manual sweeps have their
+# own group, so a long full sweep cannot hold routine main checks behind it.
 #
 # A cancelled run is therefore two things now: a superseded one, and the
 # killed runner that an unbounded loop or a leaked temp file produces. Check
@@ -257,7 +268,9 @@ jobs:
         run: cargo +1.97.1 build --manifest-path fuzz/cargo-fuzz/Cargo.toml --locked
 
       - name: Save cargo registry and build directory
-        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.validate-cache.outputs.cache-hit != 'true' }}
+        # The weekly sweep saves too, so a runner image bump that misses the
+        # key is repopulated without waiting for a lockfile change.
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.validate-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: |
@@ -292,7 +305,7 @@ jobs:
   platform-native:
     name: platform native (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -312,13 +325,78 @@ jobs:
 
       # vot-cli holds the per-platform file primitives and the aliases that
       # name them, and no other job compiles it off Linux, so a Windows-only
-      # name resolution break sat in main unseen. Compiling is the gap, so a
-      # check over every target rather than a test run, and without the wire
-      # feature: that one pulls quiche's BoringSSL through cmake, bindgen and
-      # nasm, which this job installs none of, and the imports that broke are
-      # outside it.
+      # name resolution break sat in main unseen. A check over every target
+      # without the wire feature first, because that is the build the
+      # imports that broke live in.
       - name: Check the CLI
         run: cargo +1.97.1 check -p vot-cli --all-targets --locked
+
+      # The wire feature off Linux: quiche builds BoringSSL through cmake and
+      # nasm, and bindgen needs libclang. macOS ships cmake and libclang with
+      # Xcode and wants nasm; Windows ships cmake and LLVM and wants nasm. The
+      # desktop clients ride this feature on both, so this is where it is
+      # proven to build and to carry a session over loopback.
+      - name: Install nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
+      # The runner image's compiler and cmake go into the key, as the
+      # quiche-live job's do: BoringSSL objects built by an older image would
+      # otherwise be restored under an unchanged lock file.
+      - name: Fingerprint native toolchain
+        id: wire-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          fingerprint="$({
+            printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" "$RUNNER_OS" "$RUNNER_ARCH"
+            rustc +1.97.1 -vV
+            cmake --version
+          } | { command -v shasum >/dev/null && shasum -a 256 || sha256sum; })"
+          printf 'key=%s\n' "${fingerprint%% *}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the wire build
+        id: wire-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ github.workspace }}/target/platform-wire
+          key: platform-wire-v1-${{ matrix.os }}-${{ steps.wire-toolchain.outputs.key }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            platform-wire-v1-${{ matrix.os }}-${{ steps.wire-toolchain.outputs.key }}-
+
+      # Debug profile only: the release profile is measured on Linux, and
+      # macOS minutes cost ten times Linux minutes. The pump's loopback tests
+      # run on both. The engines' loopback tests run on macOS; on Windows
+      # they are built and not run, because receiving a push is Unix-only
+      # (guarded directory operations) and every push test asserts on the
+      # receiver, while the client that pushes and fetches is what Windows
+      # has to build.
+      - name: Test the pump and the engines over a real socket
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/platform-wire
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            export LIBCLANG_PATH='C:\Program Files\LLVM\bin'
+            export PATH="$PATH:/c/Program Files/NASM"
+          fi
+          cargo +1.97.1 test -p vot-transport-quiche --features live --locked
+          if [ "$RUNNER_OS" = Windows ]; then
+            cargo +1.97.1 test -p vot-cli --features wire --locked --no-run
+          else
+            cargo +1.97.1 test -p vot-cli --features wire --locked
+          fi
+
+      - name: Save the wire build
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.wire-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ github.workspace }}/target/platform-wire
+          key: ${{ steps.wire-cache.outputs.cache-primary-key }}
 
   quiche-live:
     name: quiche live (loopback)
@@ -379,7 +457,9 @@ jobs:
       - name: Save quiche native build
         # Both profiles compiled successfully. Preserve that work even when a
         # later live gate fails so its same-commit rerun does not rebuild it.
-        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.quiche-cache.outputs.cache-hit != 'true' }}
+        # The weekly sweep saves too, because the key covers the runner image's
+        # native toolchain and no repository path can catch that drifting.
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && steps.quiche-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ env.CARGO_TARGET_DIR }}
@@ -394,7 +474,7 @@ jobs:
 
       # The engines over a real socket. The loopback tests run everywhere on a
       # fake carrier; this is the one job that carries them for real, and it is
-      # the only place the wire feature is compiled at all.
+      # the only place the wire feature is compiled at all, in either profile.
       - name: Test serve and fetch over a real socket
         run: |
           cargo +1.97.1 clippy -p vot-cli --features wire --all-targets --locked -- -D warnings
@@ -402,17 +482,19 @@ jobs:
           cargo +1.97.1 test -p vot-cli --features wire --release --locked
 
       # The benchmark driver's quiche carrier compiles only under this feature,
-      # so this job is the only one that sees it. Both profiles for the same
-      # reason the pump runs in both: a threaded carrier fails differently
-      # under a debug assertion and under an optimisation.
+      # so this job is the only one that sees it.
       #
-      # One test at a time, because each of these tests is a full transfer with
-      # a counted delivery budget sized for a machine to itself. Run in
-      # parallel on a loaded runner they contend, and two of them stalled
-      # together on a shared runner while every one passes alone.
+      # Release only: each of these tests is a full transfer against a counted
+      # delivery budget sized for a machine to itself, which is a throughput
+      # contract, and release is the profile that budget was set against. The
+      # debug run measured the same contract in the profile it does not
+      # describe.
+      #
+      # One test at a time, because a full transfer under that budget contends
+      # with another: two of them stalled together on a shared runner while
+      # every one passes alone.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.97.1 test -p vot-bench-driver --features quiche --locked -- --test-threads=1
           cargo +1.97.1 test -p vot-bench-driver --features quiche --release --locked -- --test-threads=1
 
       - name: Lint the pump
@@ -561,10 +643,10 @@ jobs:
 
       # One test at a time, for the reason the quiche job gives: every driver
       # test is a full transfer under a counted budget, and parallel transfers
-      # on a loaded runner stall each other.
+      # on a loaded runner stall each other. Release only for that job's other
+      # reason: the budget is a throughput contract stated in that profile.
       - name: Test the benchmark driver over that carrier
         run: |
-          cargo +1.97.1 test -p vot-bench-driver --features msquic --locked -- --test-threads=1
           cargo +1.97.1 test -p vot-bench-driver --features msquic --release --locked -- --test-threads=1
 
       - name: Lint the driver's carrier
@@ -800,9 +882,15 @@ jobs:
           #
           # The ceiling covers contention, not hangs: two mutants' suites
           # share four cores, and the worst stall-heavy mutant measured 68s
-          # on two dedicated cores with the budget override in force.
+          # on two dedicated cores with the budget override above in force.
+          # Run 33795839349 measured the unmutated fetch shards at 26 to 28s
+          # of test, so 300 is over ten times the baseline and over four
+          # times that worst mutant. It bounds the test phase only: no
+          # build_timeout is set, and the same run spent 102 to 108s
+          # building, which this flag does not cap. A mutant that hangs past
+          # the ceiling reds the job the way 900 did, ten minutes sooner.
           cargo +1.97.1 mutants --package vot-cli --features wire \
-            --config .cargo/mutants-live.toml --timeout 900 --jobs 2 \
+            --config .cargo/mutants-live.toml --timeout 300 --jobs 2 \
             ${{ matrix.args }} "${scope[@]}"
 
   mutation:

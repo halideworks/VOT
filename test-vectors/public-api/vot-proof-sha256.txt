@@ -1,6 +1,7 @@
 constant vot_proof_sha256::LEAF_SIZE
 constant vot_proof_sha256::PIECE_SIZE
 enum vot_proof_sha256::Error
+function vot_proof_sha256::piece_hashes_at
 function vot_proof_sha256::piece_layer
 function vot_proof_sha256::prove
 function vot_proof_sha256::prove_with

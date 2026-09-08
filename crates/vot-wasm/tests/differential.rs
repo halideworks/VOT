@@ -137,3 +137,93 @@ fn package_outputs_match_the_sdk_and_pages_unlock_only_after_final_authenticatio
     assert_eq!(ingest.finish().unwrap(), wasm.summary());
     assert_eq!(page.entry(0).unwrap(), entry);
 }
+
+#[test]
+fn an_object_prepared_from_segment_leaves_matches_the_sequential_builder() {
+    let leaf = usize::try_from(vot_wasm::proof_leaf_size()).unwrap();
+    // Eleven leaves and a short tail, cut at odd leaf counts so no segment is
+    // a whole subtree on its own.
+    let data: Vec<u8> = (0..(leaf * 11 + 4321))
+        .map(|i| u8::try_from(i % 239).unwrap())
+        .collect();
+    let cuts = [0, leaf * 3, leaf * 8, data.len()];
+    for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+        let mut sequential =
+            ObjectBuilder::new(suite, Some(data.len() as u64), data.len() as u64).unwrap();
+        for piece in data.chunks(leaf * 2 + 100) {
+            sequential.update(piece).unwrap();
+        }
+        let sequential = sequential.finish().unwrap();
+
+        let mut leaves = Vec::new();
+        for window in cuts.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            leaves.extend(
+                vot_wasm::proof_leaves_at(
+                    suite,
+                    start as u64,
+                    &data[start..end],
+                    data.len() as u64,
+                )
+                .unwrap(),
+            );
+        }
+        let assembled = vot_wasm::PreparedObject::from_proof_leaves(
+            suite,
+            data.len() as u64,
+            &leaves,
+            data.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(assembled.object_id().root(), sequential.object_id().root());
+        assert_eq!(
+            assembled.object_id().length(),
+            sequential.object_id().length()
+        );
+        for (offset, length) in [
+            (0, leaf as u64 * 2 + 7),
+            (leaf as u64 * 7, 5000),
+            (0, data.len() as u64),
+        ] {
+            let a = assembled.prove(offset, length).unwrap();
+            let b = sequential.prove(offset, length).unwrap();
+            assert_eq!(a.covered_offset(), b.covered_offset());
+            assert_eq!(a.bytes(), b.bytes());
+        }
+        assert_eq!(
+            assembled.encode_catalog(u64::MAX).unwrap(),
+            sequential.encode_catalog(u64::MAX).unwrap()
+        );
+        // A blake3 segment hashed at the wrong place names a different object;
+        // a sha256 piece hash does not depend on its place, so only blake3 is
+        // asserted.
+        let mut wrong =
+            vot_wasm::proof_leaves_at(suite, leaf as u64, &data[..leaf * 3], data.len() as u64)
+                .unwrap();
+        wrong.extend_from_slice(&leaves[32 * 3..]);
+        let other = vot_wasm::PreparedObject::from_proof_leaves(
+            suite,
+            data.len() as u64,
+            &wrong,
+            data.len() as u64,
+        );
+        if suite == Suite::Blake3Bao64 {
+            assert_ne!(
+                other.unwrap().object_id().root(),
+                sequential.object_id().root()
+            );
+        }
+        assert!(vot_wasm::proof_leaves_at(suite, 1, &data[..leaf], data.len() as u64).is_err());
+        // A short read that does not end the object is refused.
+        assert!(vot_wasm::proof_leaves_at(suite, 0, &data[..leaf - 1], data.len() as u64).is_err());
+        assert!(
+            vot_wasm::PreparedObject::from_proof_leaves(
+                suite,
+                data.len() as u64,
+                &leaves[..31],
+                u64::MAX
+            )
+            .is_err()
+        );
+    }
+}

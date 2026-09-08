@@ -260,12 +260,33 @@ fn earliest_observation(first: Option<Instant>, second: Option<Instant>) -> Opti
     [first, second].into_iter().flatten().min()
 }
 
+/// Concludes a completed fetch: the primary tells the serve so with a
+/// final-cursor `GOAWAY` and waits for the serve's clean close, matching the
+/// push receiver. The package is already proven, so a failed courtesy never
+/// fails the fetch, and the rails close abruptly.
+#[cfg(feature = "wire")]
+fn conclude_fetch<A: TransportAdapter>(
+    primary: &mut crate::BundleFetcher<A>,
+    status: crate::FetchStatus,
+) {
+    if matches!(status, crate::FetchStatus::Complete) && primary.acknowledge_completion().is_ok() {
+        let _ = primary.await_peer_close();
+    }
+}
+
+#[cfg(all(test, not(feature = "wire")))]
+fn conclude_fetch<A: TransportAdapter>(
+    _primary: &mut crate::BundleFetcher<A>,
+    _status: crate::FetchStatus,
+) {
+}
+
 /// Fetches at `rails` width. The primary builds the plan; rails join it
 /// on fresh connections. A rail failure abandons the plan.
 ///
 /// # Errors
-/// Rejects zero width or width past one with inline proving. Surfaces the
-/// primary's failure, or the rail failure that explains a stalled primary.
+/// Rejects zero rails. Surfaces the primary's failure, or the rail failure
+/// that explains a stalled primary.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn fetch_striped<A, F>(
     mut primary: crate::BundleFetcher<A>,
@@ -276,12 +297,19 @@ where
     A: TransportAdapter + Send,
     F: Fn() -> Result<A, Error> + Sync,
 {
-    if rails == 0 || (rails > 1 && primary.proving_threads() == 0) {
+    if rails == 0 {
         return Err(Error::InvalidArguments);
     }
+    // Set before the plan is built, which is what `drive_until` below
+    // drives to: the plan reads the window once, when the manifest names
+    // the objects.
+    primary.set_object_window(crate::fetch::object_window(rails));
     if let Some(status) = drive_until(&mut primary, |fetcher| fetcher.package().is_some())? {
+        conclude_fetch(&mut primary, status);
+        let package = fetched(&primary, status);
+        primary.finish_completions()?;
         return Ok(Fetched {
-            package: fetched(&primary, status)?,
+            package: package?,
             moved: primary.moved_bytes(),
             first_moved: primary.first_moved(),
             fec: primary.fec_counts(),
@@ -296,6 +324,10 @@ where
     // the token the primary was given.
     let holder = primary.holder();
     let extensions = primary.extensions();
+    // The rails run the caller's hooks too. A rail opens objects of its own,
+    // and default seams would give those the directory behavior the caller
+    // asked this fetch not to take.
+    let seams = primary.seams.clone();
     std::thread::scope(|scope| {
         let mut spawned = Vec::new();
         for _ in 1..rails {
@@ -304,6 +336,7 @@ where
             let bundle = bundle.clone();
             let holder = holder.clone();
             let extensions = extensions.clone();
+            let seams = seams.clone();
             spawned.push(scope.spawn(move || {
                 let outcome = (|| {
                     let carrier = connect()?;
@@ -314,6 +347,7 @@ where
                         holder,
                         extensions,
                     )?;
+                    rail.set_receive_seams(seams);
                     rail.set_proving_threads(provers)?;
                     fetch_verdict(drive(&mut rail)?)?;
                     Ok((rail.fec_counts(), rail.first_moved()))
@@ -324,7 +358,13 @@ where
                 outcome
             }));
         }
-        let outcome = drive(&mut primary).and_then(|status| fetched(&primary, status));
+        let outcome = match drive(&mut primary) {
+            Ok(status) => {
+                conclude_fetch(&mut primary, status);
+                fetched(&primary, status)
+            }
+            Err(error) => Err(error),
+        };
         if outcome.is_err() {
             crate::fetch::abandon_plan(&plan);
         }
@@ -340,17 +380,23 @@ where
                 Err(error) => rail_failure = Some(named_failure(rail_failure, error)),
             }
         }
+        // After the rails and before returning, on either outcome: a
+        // completion job one of them queued is still owed, and the object
+        // it retires is durable only once the flusher says so.
+        let flushed = primary.finish_completions();
         match outcome {
-            Ok(package) => Ok(Fetched {
+            Ok(package) => flushed.map(|()| Fetched {
                 package,
                 moved: primary.moved_bytes(),
                 first_moved,
                 fec,
             }),
-            // Report the rail's failure as the cause of a stalled primary.
-            Err(Error::Stalled | Error::CarrierUnavailable) => {
-                Err(rail_failure.unwrap_or(Error::CarrierUnavailable))
-            }
+            // Report the rail's failure, or the completion that failed on
+            // the flusher, as the cause of a stalled primary.
+            Err(Error::Stalled | Error::CarrierUnavailable) => Err(named_failure(
+                rail_failure,
+                flushed.err().unwrap_or(Error::CarrierUnavailable),
+            )),
             Err(error) => Err(error),
         }
     })
@@ -392,8 +438,12 @@ pub struct ServeSession<'server, A: TransportAdapter> {
     holder: Option<std::sync::Arc<crate::authz::Holder>>,
 }
 
-#[cfg(feature = "wire")]
-fn push_completion(cursor: Option<u64>, objects: usize) -> bool {
+/// Whether a receiver's `GOAWAY` cursor acknowledges every transfer object.
+///
+/// A push receiver and a fetch client conclude the same way: the final cursor
+/// equals the object count. Zero objects never acknowledges, keeping a final
+/// cursor of zero distinct from a plan that never formed.
+pub(crate) fn completion_acknowledged(cursor: Option<u64>, objects: usize) -> bool {
     objects != 0 && cursor == Some(objects as u64)
 }
 
@@ -437,6 +487,35 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
             requirement,
             holder: None,
         })
+    }
+
+    /// Serves through a session whose handshake has started and whose
+    /// authorization the caller already answered, so no requirement is
+    /// consulted here.
+    pub fn from_started_session(
+        server: &'server crate::BundleServer,
+        session: vot_session::Session<A>,
+    ) -> Self {
+        Self {
+            server,
+            session,
+            connection: crate::ServeConnection::new(),
+            requirement: None,
+            holder: None,
+        }
+    }
+
+    /// The highest transfer-object index the receiver still permits, from
+    /// its `GOAWAY`; `None` while it has sent none.
+    #[must_use]
+    pub fn goaway_cursor(&self) -> Option<u64> {
+        self.connection.goaway_cursor
+    }
+
+    /// Bytes of answers the carrier has taken this session.
+    #[must_use]
+    pub fn served_bytes(&self) -> u64 {
+        self.connection.outbound.taken()
     }
 
     /// Begins pushing through a caller-constructed client session.
@@ -501,12 +580,6 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
     #[cfg(all(test, feature = "wire"))]
     pub(crate) fn push_ready(&self) -> bool {
         self.session.is_ready()
-    }
-
-    /// Whether the push receiver acknowledged every transfer object.
-    #[cfg(feature = "wire")]
-    pub(crate) fn push_completed(&self) -> bool {
-        push_completion(self.connection.goaway_cursor, self.server.objects.len())
     }
 
     /// Grants or refuses a capability the peer presented.
@@ -904,6 +977,47 @@ mod tests {
     const BUSY_PASSES: u64 = TEST_STALL_MS / BUSY_BOUND_MS;
 
     #[test]
+    fn a_serve_session_reports_what_its_host_reads() {
+        let (bundle, _built) = crate::harness::built_bundle(
+            "report-accessors",
+            &[("one.bin", vec![1; 300_000]), ("two.bin", vec![2; 400_000])],
+        );
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        assert_eq!(
+            server.object_count(),
+            2,
+            "two entries, two transfer objects"
+        );
+        let mut serving = ServeSession::begin(
+            &server,
+            crate::harness::Loopback::default(),
+            crate::harness::not_required(),
+        )
+        .unwrap();
+        assert_eq!(serving.goaway_cursor(), None, "no GOAWAY has been read");
+        assert_eq!(serving.served_bytes(), 0, "nothing has been taken");
+        serving.connection.goaway_cursor = Some(2);
+        assert_eq!(serving.goaway_cursor(), Some(2));
+        // Two answers queued and taken: the count is their bytes, not their
+        // number.
+        let frame = crate::serve::encoded(&vot_codec::frames::TypedFrame::GoAway(
+            vot_codec::frames::GoAway { cursor: 1 },
+        ))
+        .unwrap();
+        let each = frame.len() as u64;
+        serving.connection.queue_control(frame.clone());
+        serving.connection.queue_control(frame);
+        serving.connection.outbound.pop_sent();
+        serving.connection.outbound.pop_sent();
+        assert_eq!(serving.served_bytes(), 2 * each);
+        assert!(
+            each > 1,
+            "a frame of one byte would not tell bytes from count"
+        );
+        crate::harness::discard(&[&bundle]);
+    }
+
+    #[test]
     fn the_stall_budget_override_is_bounded_below() {
         assert_eq!(stalled_wait_from(None), STALLED_WAIT);
         assert_eq!(stalled_wait_from(Some("nonsense")), STALLED_WAIT);
@@ -1123,20 +1237,16 @@ mod tests {
         let outcome = fetch_striped(fetcher, 0, || Err::<Loopback, _>(Error::CarrierUnavailable));
         assert!(matches!(outcome, Err(Error::InvalidArguments)));
         crate::harness::discard(&[&output]);
-
-        let output = crate::tests::temporary("widthguard-inline");
-        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
-        fetcher.set_proving_threads(0).unwrap();
-        let outcome = fetch_striped(fetcher, 2, || Err::<Loopback, _>(Error::CarrierUnavailable));
-        assert!(matches!(outcome, Err(Error::InvalidArguments)));
-        crate::harness::discard(&[&output]);
     }
 
+    /// One rail with the narrowest pool a fetch may run is still a whole
+    /// fetch: what a rail count of one skips is the striping, not the
+    /// proving.
     #[test]
-    fn one_rail_proving_inline_is_still_a_fetch() {
+    fn one_rail_at_the_narrowest_width_is_still_a_fetch() {
         use crate::harness::{built_bundle, duplex_pair, not_required, patterned};
 
-        let (bundle, built) = built_bundle("inlinewidth", &[("a.txt", patterned(1000))]);
+        let (bundle, built) = built_bundle("onerail", &[("a.txt", patterned(1000))]);
         let (client, half) = duplex_pair();
         let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
@@ -1153,13 +1263,13 @@ mod tests {
                     })
             })
         });
-        let output = crate::tests::temporary("inlinewidth-fetched");
+        let output = crate::tests::temporary("onerail-fetched");
         let mut fetcher = crate::BundleFetcher::begin(client, &output, None).unwrap();
-        fetcher.set_proving_threads(0).unwrap();
+        fetcher.set_proving_threads(1).unwrap();
         let outcome = fetch_striped(fetcher, 1, || {
             Err::<crate::harness::Duplex, _>(Error::CarrierUnavailable)
         })
-        .expect("one rail, no provers, a whole fetch");
+        .expect("one rail, one prover, a whole fetch");
         assert_eq!(outcome.package, built);
         assert_eq!(
             outcome.moved, built.logical_length,
@@ -1172,6 +1282,26 @@ mod tests {
         );
         serving.join().expect("the serving thread").expect("served");
         crate::harness::discard(&[&bundle, &output]);
+    }
+
+    /// A fetch places what it receives on its provers and nowhere else,
+    /// so a width of none is refused rather than run: it would book no
+    /// coverage, place nothing, and be called stalled.
+    #[test]
+    fn a_fetch_with_no_provers_is_refused() {
+        use crate::harness::Loopback;
+
+        let output = crate::tests::temporary("noprovers");
+        let mut fetcher = crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        assert!(matches!(
+            fetcher.set_proving_threads(0),
+            Err(Error::InvalidArguments)
+        ));
+        assert!(
+            fetcher.set_proving_threads(1).is_ok(),
+            "one prover is the minimum, not a refusal"
+        );
+        crate::harness::discard(&[&output]);
     }
 
     #[test]
@@ -1745,9 +1875,9 @@ mod tests {
 
     #[cfg(feature = "wire")]
     #[test]
-    fn cursor_zero_is_never_push_completion() {
-        assert!(!push_completion(Some(0), 0));
-        assert!(!push_completion(None, 1));
-        assert!(push_completion(Some(1), 1));
+    fn cursor_zero_is_never_completion() {
+        assert!(!completion_acknowledged(Some(0), 0));
+        assert!(!completion_acknowledged(None, 1));
+        assert!(completion_acknowledged(Some(1), 1));
     }
 }

@@ -49,3 +49,28 @@ assert.throws(
   (error) => error.code === bindings.ErrorCode.LimitExceeded,
 );
 assert.equal(invalidPath.length, 0);
+
+// Parallel preparation: leaves hashed per segment join into the same object
+// the sequential builder names.
+assert.equal(typeof bindings.proofLeavesAt, "function");
+assert.equal(bindings.proofLeafSize(), 65536n);
+const leaf = Number(bindings.proofLeafSize());
+const long = new Uint8Array(leaf * 2 + 5).map((_, i) => i % 251);
+const sequential = new bindings.ObjectBuilder(bindings.Suite.Blake3Bao64, BigInt(long.length), BigInt(long.length));
+sequential.update(long);
+const sequentialId = sequential.finish().objectId;
+const head = bindings.proofLeavesAt(bindings.Suite.Blake3Bao64, 0n, long.subarray(0, leaf), BigInt(long.length));
+const tail = bindings.proofLeavesAt(bindings.Suite.Blake3Bao64, BigInt(leaf), long.subarray(leaf), BigInt(long.length));
+assert.ok(head instanceof Uint8Array);
+assert.equal(head.length, 32);
+assert.equal(tail.length, 64);
+const joined = new Uint8Array(head.length + tail.length);
+joined.set(head, 0);
+joined.set(tail, head.length);
+const assembled = bindings.PreparedObject.fromProofLeaves(bindings.Suite.Blake3Bao64, BigInt(long.length), joined, BigInt(long.length));
+assert.deepEqual(assembled.objectId.root, sequentialId.root);
+assert.equal(assembled.objectId.length, sequentialId.length);
+assert.throws(
+  () => bindings.proofLeavesAt(bindings.Suite.Blake3Bao64, 0n, long.subarray(0, leaf - 1), BigInt(long.length)),
+  (error) => error.code === bindings.ErrorCode.InvalidInput,
+);

@@ -1,6 +1,7 @@
 constant vot_proof_blake3::GROUP_SIZE
 enum vot_proof_blake3::Error
 function vot_proof_blake3::canonical_outboard
+function vot_proof_blake3::group_cvs_at
 function vot_proof_blake3::prove
 function vot_proof_blake3::prove_with
 function vot_proof_blake3::root

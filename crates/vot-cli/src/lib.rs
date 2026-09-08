@@ -67,16 +67,16 @@ pub use fetch::{
 };
 #[cfg(not(feature = "wire"))]
 pub use nowire::{
-    fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve, push_bundle, push_from,
-    receive_push, relay_service, rendezvous_service, serve_bundle,
+    fetch_bundle, fetch_bundle_with, fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve,
+    push_bundle, push_from, receive_push, relay_service, rendezvous_service, serve_bundle,
 };
 pub use serve::{BundleServer, ServeConnection, ServeStatus, ServedSource};
 #[cfg(feature = "wire")]
 pub use wire::{
     Listener, PushAdmission, PushPresentation, ServeAdmission, ServePresentation, ServeReport,
-    bind_push_listener, bind_serve_listener, fetch_bundle, fetch_bundle_with, fetch_via_rendezvous,
-    probe_serve, push_bundle, push_from, receive_push, receive_push_on, relay_service,
-    rendezvous_service, serve_bundle, serve_on,
+    bind_push_listener, bind_serve_listener, fetch_bundle, fetch_bundle_with,
+    fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve, push_bundle, push_from,
+    receive_push, receive_push_on, relay_service, rendezvous_service, serve_bundle, serve_on,
 };
 
 mod keys;

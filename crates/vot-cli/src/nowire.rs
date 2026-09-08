@@ -92,3 +92,15 @@ pub fn probe_serve(
 pub fn fetch_bundle_with(_options: FetchOptions, _bundle: &Path) -> Result<PackageSummary, Error> {
     Err(Error::WireUnsupported)
 }
+
+/// Fetch with receive hooks requires the `wire` feature.
+///
+/// # Errors
+/// Returns [`Error::WireUnsupported`] when built without `wire`.
+pub fn fetch_bundle_with_seams(
+    _options: FetchOptions,
+    _bundle: &Path,
+    _seams: crate::ReceiveSeams,
+) -> Result<(PackageSummary, u64), Error> {
+    Err(Error::WireUnsupported)
+}

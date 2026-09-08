@@ -1105,6 +1105,16 @@ pub(crate) mod tests {
             })),
             ..ReceiveSeams::default()
         });
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&progress);
+        primary
+            .report_placed(
+                1,
+                Box::new(move |placed, total| {
+                    observed.lock().unwrap().push((placed, total));
+                }),
+            )
+            .unwrap();
         primary.rail.window_bytes = MAX_REQUESTED_RANGE;
         let plan = planned(&server, &mut session1, &mut connection1, &mut primary);
         primary.advance().unwrap();
@@ -1117,6 +1127,7 @@ pub(crate) mod tests {
             BTreeSet::new(),
         )
         .unwrap();
+        secondary.report.placed = primary.report.placed.clone();
         let wrong = Arc::clone(&callbacks);
         secondary.set_receive_seams(ReceiveSeams {
             sink: Some(Arc::new(move |session, _| {
@@ -1165,6 +1176,12 @@ pub(crate) mod tests {
             }
         }
         assert!(settled, "the rails never finished the fetch");
+        let progress = progress.lock().unwrap();
+        assert_eq!(
+            progress.last(),
+            Some(&(built.logical_length, Some(built.logical_length)))
+        );
+        assert!(progress.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(primary.rail.taken_bytes, MAX_REQUESTED_RANGE);
         assert_eq!(secondary.rail.taken_bytes, MAX_REQUESTED_RANGE);
         // Each rail's window closed on its own arrivals: the two accounts
@@ -1629,13 +1646,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    pub(crate) fn the_object_window_is_two_a_rail_and_never_past_the_budget() {
-        // Two objects a rail, so a rail has another to take spans from
+    pub(crate) fn the_object_window_is_four_a_rail_and_never_past_the_budget() {
+        // Four objects a rail, so a rail has another to take spans from
         // while one syncs, and never more than the staging budget holds.
         for (rails, window) in [
             (0, 1),
-            (1, 2),
-            (4, 8),
+            (1, 4),
+            (4, 16),
             (8, MAX_OBJECT_WINDOW),
             (9, MAX_OBJECT_WINDOW),
             (usize::MAX, MAX_OBJECT_WINDOW),
@@ -2932,7 +2949,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_striped_fetch_runs_the_primary_seams_on_every_rail() {
-        // Six objects against a window of four: the last two are opened
+        // Ten objects against a window of eight: the last two are opened
         // after the rails are running, so a rail opens one of them.
         use std::collections::{BTreeSet, HashSet};
         use std::sync::Condvar;
@@ -2940,7 +2957,7 @@ pub(crate) mod tests {
 
         type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
 
-        let files: Vec<(String, Vec<u8>)> = (0..6)
+        let files: Vec<(String, Vec<u8>)> = (0..10)
             .map(|at| (format!("o{at}.bin"), patterned(300_000 + at)))
             .collect();
         let contents: Vec<(&str, Vec<u8>)> = files
@@ -2991,6 +3008,9 @@ pub(crate) mod tests {
         let recorded = Arc::clone(&opened);
         let railed = Arc::clone(&connects);
         let destination = custom.to_path_buf();
+        let primary_thread = std::thread::current().id();
+        let rail_progress = Arc::new((Mutex::new(false), Condvar::new()));
+        let observed_progress = Arc::clone(&rail_progress);
         let seams = ReceiveSeams {
             sink: Some(Arc::new(move |_, object: &ReceiveObject| {
                 let (threads, joined) = &*meeting;
@@ -3023,12 +3043,44 @@ pub(crate) mod tests {
             ..ReceiveSeams::default()
         };
 
-        let mut fetcher = BundleFetcher::begin(connect().unwrap(), &output, None).unwrap();
+        let mut carrier = connect().unwrap();
+        let polled_progress = Arc::clone(&rail_progress);
+        let polled_connects = Arc::clone(&connects);
+        carrier.before_poll = Some(Box::new(move || {
+            if polled_connects.load(Ordering::Relaxed) >= 2 {
+                let (reported, arrived) = &*polled_progress;
+                let (reported, _) = arrived
+                    .wait_timeout_while(
+                        reported.lock().unwrap(),
+                        std::time::Duration::from_secs(20),
+                        |reported| !*reported,
+                    )
+                    .unwrap();
+                assert!(*reported, "the secondary rail never reported progress");
+            }
+        }));
+        let mut fetcher = BundleFetcher::begin(carrier, &output, None).unwrap();
         fetcher.set_receive_seams(seams);
+        fetcher
+            .report_placed(
+                1,
+                Box::new(move |_, _| {
+                    if std::thread::current().id() != primary_thread {
+                        let (reported, arrived) = &*rail_progress;
+                        *reported.lock().unwrap() = true;
+                        arrived.notify_all();
+                    }
+                }),
+            )
+            .unwrap();
         // The primary asks for nothing, so every object completes on the rail.
         fetcher.rail.window_bytes = 0;
         let outcome = crate::drive::fetch_striped(fetcher, 2, connect).unwrap();
         assert_eq!(outcome.package, built);
+        assert!(
+            *observed_progress.0.lock().unwrap(),
+            "a secondary rail reported progress"
+        );
         assert!(
             openers.0.lock().unwrap().0.len() >= 2,
             "a rail opened an object of its own"

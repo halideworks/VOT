@@ -24,6 +24,7 @@ function vot_cli::decode_key
 function vot_cli::drive
 function vot_cli::fetch_bundle
 function vot_cli::fetch_bundle_with
+function vot_cli::fetch_bundle_with_seams
 function vot_cli::fetch_via_rendezvous
 function vot_cli::generate_keypair
 function vot_cli::hex_of

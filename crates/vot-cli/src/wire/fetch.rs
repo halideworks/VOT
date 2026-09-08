@@ -222,6 +222,7 @@ where
         holder,
         provers,
         Some((PROGRESS_QUANTUM_BYTES, progress)),
+        crate::ReceiveSeams::default(),
     )?;
     if wanted {
         let first = outcome
@@ -252,11 +253,13 @@ fn fetch_over_configured<F>(
     holder: Option<std::sync::Arc<crate::authz::Holder>>,
     provers: Option<usize>,
     progress: Option<(u64, crate::Progress)>,
+    seams: crate::ReceiveSeams,
 ) -> Result<(crate::drive::Fetched, std::time::Instant), Error>
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
     let mut fetcher = BundleFetcher::begin_with(primary, bundle, pin, holder, extensions)?;
+    fetcher.set_receive_seams(seams);
     let provers = provers.unwrap_or_else(|| fetcher.proving_threads());
     fetcher.set_proving_threads(provers_per_rail(provers, rails))?;
     if let Some((quantum, observer)) = progress {
@@ -284,6 +287,29 @@ pub fn fetch_bundle_with(
     options: crate::FetchOptions,
     bundle: &Path,
 ) -> Result<PackageSummary, Error> {
+    fetch_bundle_configured(options, bundle, crate::ReceiveSeams::default(), true)
+        .map(|(package, _)| package)
+}
+
+/// Fetches with receive hooks, returning the package and bytes moved in this attempt.
+/// Progress reports actual placement without a synthetic tick after finishing.
+///
+/// # Errors
+/// As [`fetch_bundle_with`], including failures returned by receive hooks.
+pub fn fetch_bundle_with_seams(
+    options: crate::FetchOptions,
+    bundle: &Path,
+    seams: crate::ReceiveSeams,
+) -> Result<(PackageSummary, u64), Error> {
+    fetch_bundle_configured(options, bundle, seams, false)
+}
+
+fn fetch_bundle_configured(
+    options: crate::FetchOptions,
+    bundle: &Path,
+    seams: crate::ReceiveSeams,
+    finish_progress: bool,
+) -> Result<(PackageSummary, u64), Error> {
     let crate::FetchOptions {
         address,
         holder,
@@ -330,8 +356,10 @@ pub fn fetch_bundle_with(
         holder,
         provers,
         forwarded,
+        seams,
     )?;
-    if let Some((_, shared)) = &shared
+    if finish_progress
+        && let Some((_, shared)) = &shared
         && let Ok(mut state) = shared.lock()
     {
         let length = outcome.package.logical_length;
@@ -340,7 +368,7 @@ pub fn fetch_bundle_with(
             (state.1)(length, Some(length));
         }
     }
-    Ok(outcome.package)
+    Ok((outcome.package, outcome.moved))
 }
 
 /// Whether a caller's rail count is one the serve side can seat.

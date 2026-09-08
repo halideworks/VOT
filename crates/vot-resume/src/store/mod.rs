@@ -215,45 +215,73 @@ impl ResumeStore {
         total_units: u64,
         checkpointed: &UnitRanges,
     ) -> Result<UnitRanges, Error> {
-        validate_total_units(total_units)?;
-        if checkpointed
-            .max()
-            .is_some_and(|highest| highest >= total_units)
-        {
-            return Err(Error::InvalidUnit);
-        }
+        self.checkpoint_batch(&[(subject, total_units, checkpointed.clone())])?;
+        Ok(self.objects[&subject].checkpointed.clone())
+    }
+
+    /// Records a batch of already-durable object ranges with one journal sync.
+    /// Every entry is validated before any record is appended. A torn append
+    /// may retain a valid prefix; each retained record describes durable data.
+    ///
+    /// # Errors
+    /// Rejects unknown subjects, inconsistent unit counts, invalid ranges,
+    /// and store I/O failures. Batch updates enter the in-memory map only after success.
+    pub fn checkpoint_batch(
+        &mut self,
+        checkpoints: &[(SubjectId, u64, UnitRanges)],
+    ) -> Result<(), Error> {
         let lock = lock_store(&self.path)?;
         self.refresh_locked()?;
-        let mut candidate = self.objects.clone();
-        let existing = candidate.get(&subject).ok_or(Error::IdentityMismatch)?;
-        if existing.total_units != total_units {
-            return Err(Error::IdentityMismatch);
-        }
-        let previous = existing.checkpointed.clone();
-        let mut merged = previous.clone();
-        merged.union(checkpointed);
-        candidate.insert(
-            subject,
-            StoredObject {
-                total_units,
-                checkpointed: merged.clone(),
-            },
-        );
-        let delta = difference(&merged, &previous);
-        if !delta.is_empty() {
-            let record = encode_checkpoint(subject, total_units, &delta)?;
-            let projected = file_len(&self.path)?
-                .saturating_add(u64::try_from(record.len()).map_err(|_| Error::TooLarge)?);
-            if should_compact(projected) {
-                Self::compact(&self.path, &candidate)?;
-            } else {
-                append_record(&self.path, &record)?;
+        let mut updates = BTreeMap::<SubjectId, StoredObject>::new();
+        let mut records = Vec::new();
+        for (subject, total_units, checkpointed) in checkpoints {
+            validate_total_units(*total_units)?;
+            if checkpointed
+                .max()
+                .is_some_and(|highest| highest >= *total_units)
+            {
+                return Err(Error::InvalidUnit);
+            }
+            let existing = updates
+                .get(subject)
+                .or_else(|| self.objects.get(subject))
+                .ok_or(Error::IdentityMismatch)?;
+            if existing.total_units != *total_units {
+                return Err(Error::IdentityMismatch);
+            }
+            let mut merged = existing.checkpointed.clone();
+            merged.union(checkpointed);
+            let delta = difference(&merged, &existing.checkpointed);
+            if !delta.is_empty() {
+                records.push(encode_checkpoint(*subject, *total_units, &delta)?);
+                updates.insert(
+                    *subject,
+                    StoredObject {
+                        total_units: *total_units,
+                        checkpointed: merged,
+                    },
+                );
             }
         }
-        self.objects = candidate;
+        if !records.is_empty() {
+            let added = records.iter().try_fold(0u64, |size, record| {
+                let framed = encode_record(record)?;
+                Ok::<_, Error>(
+                    size.saturating_add(u64::try_from(framed.len()).map_err(|_| Error::TooLarge)?),
+                )
+            })?;
+            if should_compact(file_len(&self.path)?.saturating_add(added)) {
+                let mut candidate = self.objects.clone();
+                candidate.extend(updates.clone());
+                Self::compact(&self.path, &candidate)?;
+            } else {
+                append_records(&self.path, &records)?;
+            }
+            self.objects.extend(updates);
+        }
         self.signature = file_signature(&self.path)?;
         drop(lock);
-        Ok(merged)
+        Ok(())
     }
 
     pub(crate) fn compact(

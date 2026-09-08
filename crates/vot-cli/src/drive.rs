@@ -328,6 +328,7 @@ where
     // and default seams would give those the directory behavior the caller
     // asked this fetch not to take.
     let seams = primary.seams.clone();
+    let placed = primary.report.placed.clone();
     std::thread::scope(|scope| {
         let mut spawned = Vec::new();
         for _ in 1..rails {
@@ -337,6 +338,7 @@ where
             let holder = holder.clone();
             let extensions = extensions.clone();
             let seams = seams.clone();
+            let placed = placed.clone();
             spawned.push(scope.spawn(move || {
                 let outcome = (|| {
                     let carrier = connect()?;
@@ -348,6 +350,7 @@ where
                         extensions,
                     )?;
                     rail.set_receive_seams(seams);
+                    rail.report.placed = placed;
                     rail.set_proving_threads(provers)?;
                     fetch_verdict(drive(&mut rail)?)?;
                     Ok((rail.fec_counts(), rail.first_moved()))

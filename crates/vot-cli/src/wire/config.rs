@@ -193,6 +193,21 @@ pub(crate) fn rails_from(pin: Option<&str>, cores: usize) -> Result<usize, Error
     bounded(value, 1..=MAX_FETCH_RAILS)
 }
 
+/// macOS loopback uses one rail to avoid contention in the shared UDP path.
+///
+/// # Errors
+/// Rejects invalid explicit widths through `rails_from`.
+pub(crate) fn direct_rails_from(
+    pin: Option<&str>,
+    cores: usize,
+    address: SocketAddr,
+) -> Result<usize, Error> {
+    if cfg!(target_os = "macos") && pin.is_none() && address.ip().to_canonical().is_loopback() {
+        return Ok(1);
+    }
+    rails_from(pin, cores)
+}
+
 /// The controller [`CONGESTION`] names, or bbr2 when unset.
 ///
 /// # Errors

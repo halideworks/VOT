@@ -1,6 +1,6 @@
 //! The serve-side rendezvous runtime and the rendezvous service.
 
-use super::{Arc, Duration, Error, Ordering, SideChannel, SocketAddr, for_socket, waited_out};
+use super::{Arc, Duration, Error, Ordering, SideChannel, SocketAddr, for_socket, read_retryable};
 
 /// Returns a registration only when both a service and side channel exist.
 ///
@@ -123,7 +123,7 @@ pub fn rendezvous_service(
         let (length, source) = match socket.recv_from(&mut buffer) {
             Ok(arrival) => arrival,
             Err(error) => {
-                if waited_out(&error) {
+                if read_retryable(&error) {
                     continue;
                 }
                 return Err(Error::Io(error));

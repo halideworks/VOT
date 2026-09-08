@@ -1,6 +1,6 @@
 //! The fetch-side resolution and punch.
 
-use super::{Duration, Error, SocketAddr, local_for, read_failure};
+use super::{Duration, Error, SocketAddr, local_for, read_retryable};
 
 /// How long a resolve attempt waits for the service to answer.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -181,8 +181,7 @@ fn open_toward(socket: &std::net::UdpSocket, serve: SocketAddr) {
     }
 }
 
-/// Reads datagrams until `accept` names a value, [`STRAY_READS`] have
-/// arrived, or `budget` is spent.
+/// Reads until `accept` names a value, `STRAY_READS` attempts finish, or the budget expires.
 ///
 /// The budget is the whole wait and not the wait per read. A stranger
 /// sending to this port would otherwise buy back the full timeout with
@@ -207,7 +206,8 @@ pub(crate) fn read_until<D, T>(
             .map_err(|_| Error::CarrierUnavailable)?;
         let (length, source) = match socket.recv_from(buffer) {
             Ok(arrival) => arrival,
-            Err(error) => return read_failure(&error).map_or(Ok(None), Err),
+            Err(error) if read_retryable(&error) => continue,
+            Err(_) => return Err(Error::CarrierUnavailable),
         };
         if let Some(datagram) = decode(&buffer[..length])
             && let Some(found) = accept(datagram, source)

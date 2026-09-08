@@ -308,9 +308,10 @@ pub fn push_bundle(
     key_source: &str,
     identity: [u8; 32],
 ) -> Result<PackageSummary, Error> {
-    let rails = super::rails_from(
+    let rails = super::direct_rails_from(
         std::env::var(super::FETCH_RAILS).ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+        address,
     )?;
     push_bundle_railed(bundle, address, capability, key_source, identity, rails)
 }

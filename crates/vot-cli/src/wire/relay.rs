@@ -2,7 +2,7 @@
 
 use super::{
     Duration, Error, Ordering, RELAY_BYTES, RELAY_SLOTS, RELAY_TTL_MS, SERVICE_TICK, SocketAddr,
-    elapsed_ms, relay_limits_from, waited_out,
+    elapsed_ms, read_retryable, relay_limits_from,
 };
 
 /// How long a slot thread waits on its socket before checking its deadline.
@@ -96,7 +96,7 @@ pub(crate) enum Idle {
 
 /// Which of the three a read error and the clock mean.
 pub(crate) fn idle_after(error: &std::io::Error, expired: bool) -> Idle {
-    if !waited_out(error) {
+    if !read_retryable(error) {
         Idle::Ended
     } else if expired {
         Idle::Expired
@@ -165,7 +165,7 @@ pub fn relay_service(
         let (length, source) = match socket.recv_from(&mut buffer) {
             Ok(arrival) => arrival,
             Err(error) => {
-                if waited_out(&error) {
+                if read_retryable(&error) {
                     slots.retire(elapsed_ms(began));
                     continue;
                 }

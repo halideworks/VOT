@@ -1568,7 +1568,7 @@ fn run(
                         }
                     }
                     Err(error) => {
-                        if !read_ran_out(&error) {
+                        if !read_retryable(&error) {
                             break 'drive Ok(());
                         }
                     }
@@ -1673,13 +1673,13 @@ fn install_read_timeout(
     Ok(())
 }
 
-/// Whether a socket read failed only for want of a packet within its
-/// timeout, which is the wait the deadline priced; anything else is the
-/// carrier failing.
-fn read_ran_out(error: &std::io::Error) -> bool {
+/// Reads interrupted by a signal or lacking a packet can retry on the next pass.
+fn read_retryable(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
     )
 }
 
@@ -2045,7 +2045,7 @@ fn route(
         let (len, from, segment) = match receive_segmented(socket, &mut buffer, &mut space, false) {
             Ok(read) => read,
             Err(error) => {
-                if read_ran_out(&error) {
+                if read_retryable(&error) {
                     continue;
                 }
                 return;
@@ -2363,10 +2363,22 @@ fn accept_one(
         0 => None,
         milliseconds => Some(Duration::from_millis(milliseconds)),
     };
-    socket.set_read_timeout(bound).map_err(|_| Error::Backend)?;
+    let began = Instant::now();
     loop {
-        let Ok((len, from)) = socket.recv_from(buffer) else {
-            return Ok(None);
+        let remaining = match bound {
+            Some(duration) => match duration.checked_sub(began.elapsed()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => return Ok(None),
+            },
+            None => None,
+        };
+        socket
+            .set_read_timeout(remaining)
+            .map_err(|_| Error::Backend)?;
+        let (len, from) = match socket.recv_from(buffer) {
+            Ok(packet) => packet,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(None),
         };
         let Ok(header) = quiche::Header::from_slice(&mut buffer[..len], quiche::MAX_CONN_ID_LEN)
         else {
@@ -3642,6 +3654,36 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn stray_packets_do_not_restart_the_accept_timeout() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (done, result) = mpsc::channel();
+        let accepting = std::thread::spawn(move || {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            let mut buffer = [0; 128];
+            let outcome = accept_one(&socket, local, &mut config, &mut buffer, 100);
+            done.send(outcome.unwrap().is_none()).unwrap();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&stop);
+        let strays = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                if finished.load(Ordering::Relaxed) {
+                    break;
+                }
+                sender.send_to(&[0], local).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let outcome = result.recv_timeout(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        strays.join().unwrap();
+        assert!(outcome.unwrap());
+        accepting.join().unwrap();
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn receive_address_preserves_ipv6_scope_and_flow() {
@@ -4383,14 +4425,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_timeout_is_a_read_that_ran_out() {
-        // The pump rides out a read that merely timed out and ends on
-        // anything else; this table is the whole of that decision.
+    fn timeouts_and_interrupted_reads_can_retry() {
         use std::io::ErrorKind;
-        assert!(read_ran_out(&std::io::Error::from(ErrorKind::WouldBlock)));
-        assert!(read_ran_out(&std::io::Error::from(ErrorKind::TimedOut)));
-        assert!(!read_ran_out(&std::io::Error::from(ErrorKind::BrokenPipe)));
-        assert!(!read_ran_out(&std::io::Error::from(ErrorKind::Other)));
+        assert!(read_retryable(&std::io::Error::from(ErrorKind::WouldBlock)));
+        assert!(read_retryable(&std::io::Error::from(ErrorKind::TimedOut)));
+        assert!(read_retryable(&std::io::Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(!read_retryable(&std::io::Error::from(
+            ErrorKind::BrokenPipe
+        )));
+        assert!(!read_retryable(&std::io::Error::from(ErrorKind::Other)));
     }
 
     #[test]

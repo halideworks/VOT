@@ -4,9 +4,9 @@ use super::{
     BundleFetcher, CONGESTION, Config, DATAGRAM_FEC, Error, FETCH_CAPABILITY, FETCH_HOLDER_KEY,
     FETCH_RAILS, FETCH_SERVE_IDENTITY, FETCH_STATS, INITIAL_CWND, PREFIX_DUP,
     PROGRESS_QUANTUM_BYTES, PUNCH_WAIT, PackageSummary, Path, RELAY, SocketAddr, Transport,
-    apply_datagram_bytes, carrier_failure, congestion_from, extensions_from, holder_from,
-    identity_from, initial_cwnd_from, limits, local_for, prefix_dup_from, punch, rails_from,
-    rendezvous_from, stats_wanted, take_slot,
+    apply_datagram_bytes, carrier_failure, congestion_from, direct_rails_from, extensions_from,
+    holder_from, identity_from, initial_cwnd_from, limits, local_for, prefix_dup_from, punch,
+    rails_from, rendezvous_from, stats_wanted, take_slot,
 };
 
 /// How long a pinned fetch waits for the handshake to deliver the serve's
@@ -47,9 +47,10 @@ pub fn fetch_bundle(
     bundle: &Path,
     pin: Option<[u8; 32]>,
 ) -> Result<PackageSummary, Error> {
-    let rails = rails_from(
+    let rails = direct_rails_from(
         std::env::var(FETCH_RAILS).ok().as_deref(),
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        address,
     )?;
     fetch_railed(address, bundle, pin, rails)
 }

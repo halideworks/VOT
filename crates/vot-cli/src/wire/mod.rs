@@ -81,21 +81,13 @@ fn for_socket(target: SocketAddr, local: SocketAddr) -> SocketAddr {
     }
 }
 
-/// What a failed read is worth reporting as: a wait that ran out is
-/// nothing, and any other failure is the carrier's.
-fn read_failure(error: &std::io::Error) -> Option<Error> {
-    if waited_out(error) {
-        None
-    } else {
-        Some(Error::CarrierUnavailable)
-    }
-}
-
-/// Returns true for timeout/WouldBlock, false for real errors.
-fn waited_out(error: &std::io::Error) -> bool {
+/// Signal interruptions and reads without a packet leave the socket usable.
+fn read_retryable(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
     )
 }
 
@@ -1040,25 +1032,44 @@ mod tests {
     }
 
     #[test]
-    fn only_a_read_without_a_datagram_is_waited_out() {
+    fn timeouts_and_interrupted_control_reads_can_retry() {
         use std::io::ErrorKind;
-        // What a failed read is reported as, which is the whole decision.
-        assert!(read_failure(&std::io::Error::from(ErrorKind::WouldBlock)).is_none());
-        assert!(read_failure(&std::io::Error::from(ErrorKind::TimedOut)).is_none());
-        assert!(matches!(
-            read_failure(&std::io::Error::from(ErrorKind::ConnectionRefused)),
-            Some(Error::CarrierUnavailable)
-        ));
-        assert!(matches!(
-            read_failure(&std::io::Error::from(ErrorKind::BrokenPipe)),
-            Some(Error::CarrierUnavailable)
-        ));
-        assert!(waited_out(&std::io::Error::from(ErrorKind::WouldBlock)));
-        assert!(waited_out(&std::io::Error::from(ErrorKind::TimedOut)));
-        assert!(!waited_out(&std::io::Error::from(
-            ErrorKind::ConnectionReset
-        )));
-        assert!(!waited_out(&std::io::Error::from(ErrorKind::Other)));
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(read_retryable(&std::io::Error::from(kind)));
+        }
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Other,
+        ] {
+            assert!(!read_retryable(&std::io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn direct_loopback_width_preserves_explicit_choices() {
+        for ip in [
+            "127.0.0.1:4433",
+            "[::1]:4433",
+            "[::ffff:127.0.0.1]:4433",
+            "192.0.2.1:4433",
+        ] {
+            let address: SocketAddr = ip.parse().unwrap();
+            let expected = if cfg!(target_os = "macos") && address.ip().to_canonical().is_loopback()
+            {
+                1
+            } else {
+                8
+            };
+            assert_eq!(direct_rails_from(None, 32, address).unwrap(), expected);
+            assert_eq!(direct_rails_from(Some("4"), 32, address).unwrap(), 4);
+            assert!(direct_rails_from(Some("0"), 32, address).is_err());
+        }
     }
 
     #[test]

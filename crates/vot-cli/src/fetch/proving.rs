@@ -43,7 +43,7 @@ pub(crate) struct CompletionJob {
     pub(crate) store: Option<Arc<Mutex<ResumeStore>>>,
 }
 
-/// The plan's completion flusher: the threads that run [`complete`] off the
+/// The plan's completion flusher: the threads that run [`complete_batch`] off the
 /// rails, and the plan they retire into.
 pub(crate) struct CompletionFlusher {
     /// Weak, because the plan holds the queue that feeds this.
@@ -74,14 +74,23 @@ impl CompletionFlusher {
                     let Ok(job) = queue.recv() else {
                         return;
                     };
+                    let mut batch = vec![job];
+                    batch.extend(
+                        queue
+                            .try_iter()
+                            .take(super::protocol::MAX_OBJECT_WINDOW - 1),
+                    );
                     drop(queue);
                     // A hook is a caller's code: a panic in it fails the
                     // plan the way a refusal does, rather than leaving the
                     // object it names syncing forever.
-                    let outcome =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| complete(&job)))
-                            .unwrap_or(Err(Error::InvalidBundle));
-                    retire(&plan, &job, outcome);
+                    let outcomes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        complete_batch(&batch)
+                    }))
+                    .unwrap_or_else(|_| batch.iter().map(|_| Err(Error::InvalidBundle)).collect());
+                    for (job, outcome) in batch.iter().zip(outcomes) {
+                        retire(&plan, job, outcome);
+                    }
                 }
             }));
         }
@@ -120,25 +129,57 @@ impl Drop for CompletionFlusher {
     }
 }
 
-/// One object's durability, outside every plan lock: sync what the rails
-/// placed, checkpoint the whole object, then tell the consumer.
-fn complete(job: &CompletionJob) -> Result<(), Error> {
-    job.sink.flush()?;
-    // The whole object is now durable; a resume never asks for it again.
-    if let Some(store) = &job.store
+/// Objects become durable before their checkpoint records share one journal sync.
+fn complete_batch(jobs: &[CompletionJob]) -> Vec<Result<(), Error>> {
+    // ponytail: at most the 16-object window gets short-lived flush threads;
+    // retain a pool only if thread creation becomes a measured bottleneck.
+    let flushed = if jobs.len() == 1 {
+        vec![jobs[0].sink.flush()]
+    } else {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = jobs
+                .iter()
+                .map(|job| scope.spawn(|| job.sink.flush()))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap_or(Err(Error::InvalidBundle)))
+                .collect()
+        })
+    };
+    // Every job belongs to the same plan and shares its resume store.
+    if let Some(store) = jobs.first().and_then(|job| job.store.as_ref())
         && let Ok(mut store) = store.lock()
     {
-        let mut units = UnitRanges::new();
-        units.extend_units(0..total_units_of(job.length));
-        let _ = store.checkpoint_units(job.subject, total_units_of(job.length), &units);
+        let checkpoints: Vec<_> = jobs
+            .iter()
+            .zip(&flushed)
+            .filter(|(_, result)| result.is_ok())
+            .map(|(job, _)| {
+                let mut units = UnitRanges::new();
+                units.extend_units(0..total_units_of(job.length));
+                (job.subject, total_units_of(job.length), units)
+            })
+            .collect();
+        let _ = store.checkpoint_batch(&checkpoints);
     }
-    match (&job.hook, &job.receive_object) {
-        (Some(hook), Some(object)) => hook(job.receive_session, object),
-        _ => Ok(()),
-    }
+    jobs.iter()
+        .zip(flushed)
+        .map(|(job, result)| {
+            result.and_then(|()| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match (&job.hook, &job.receive_object) {
+                        (Some(hook), Some(object)) => hook(job.receive_session, object),
+                        _ => Ok(()),
+                    }
+                }))
+                .unwrap_or(Err(Error::InvalidBundle))
+            })
+        })
+        .collect()
 }
 
-/// Books what [`complete`] answered into the plan, under its lock once.
+/// Books what [`complete_batch`] answered into the plan, under its lock once.
 fn retire(
     plan: &std::sync::Weak<Mutex<FetchPlan>>,
     job: &CompletionJob,
@@ -288,4 +329,102 @@ pub(crate) fn prove(work: Proving) -> Result<Proved, vot_scheduler::Error> {
         completed: work.completed,
         written,
     })
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlushSink(Box<dyn Fn() -> Result<(), Error> + Send + Sync>);
+
+    impl vot_scheduler::RangeSink for FlushSink {
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            Ok(())
+        }
+    }
+
+    impl super::super::ReceiveSink for FlushSink {
+        fn flush(&self) -> Result<(), Error> {
+            (self.0)()
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batch_completion_checkpoints_only_flushed_objects_before_their_hooks() {
+        for panics in [false, true] {
+            let directory = crate::tests::temporary("completion-batch");
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("resume");
+            let objects = [1, 2].map(|id| super::super::frames::ObjectId {
+                suite: 1,
+                root: [id; 32],
+                length: 1,
+            });
+            let subjects = objects.map(|object| SubjectId::try_from(object).unwrap());
+            let mut store = ResumeStore::create(&path).unwrap();
+            store
+                .reserve_many(subjects.map(|subject| (subject, 1)))
+                .unwrap();
+            let store = Arc::new(Mutex::new(store));
+            let flushed = Arc::new(AtomicUsize::new(0));
+            let hooks = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<_> = objects
+                .into_iter()
+                .enumerate()
+                .map(|(index, object)| {
+                    let sink_flushed = Arc::clone(&flushed);
+                    let sink_path = path.clone();
+                    let sink = FlushSink(Box::new(move || {
+                        let disk = ResumeStore::open(&sink_path).unwrap();
+                        for subject in subjects {
+                            assert!(disk.checkpointed(subject).unwrap().is_empty());
+                        }
+                        sink_flushed.fetch_add(1, Ordering::SeqCst);
+                        if index == 1 {
+                            assert!(!panics, "injected flush panic");
+                            return Err(Error::InvalidBundle);
+                        }
+                        Ok(())
+                    }));
+                    let hook_flushed = Arc::clone(&flushed);
+                    let hook_calls = Arc::clone(&hooks);
+                    let hook_path = path.clone();
+                    CompletionJob {
+                        index,
+                        sink: Arc::new(CountingSink::custom(Box::new(sink))),
+                        subject: subjects[index],
+                        length: 1,
+                        hook: Some(Arc::new(move |_, _| {
+                            assert_eq!(index, 0, "failed flush called its completion hook");
+                            assert_eq!(hook_flushed.load(Ordering::SeqCst), 2);
+                            let disk = ResumeStore::open(&hook_path).unwrap();
+                            assert!(!disk.checkpointed(subjects[0]).unwrap().is_empty());
+                            assert!(disk.checkpointed(subjects[1]).unwrap().is_empty());
+                            hook_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })),
+                        receive_session: ReceiveSessionId(1),
+                        receive_object: Some(ReceiveObject {
+                            object,
+                            entries: Vec::new(),
+                        }),
+                        store: Some(Arc::clone(&store)),
+                    }
+                })
+                .collect();
+            let outcomes = complete_batch(&jobs);
+            assert_eq!(outcomes.len(), 2);
+            assert!(outcomes[0].is_ok());
+            assert!(outcomes[1].is_err());
+            assert_eq!(hooks.load(Ordering::SeqCst), 1);
+            let disk = ResumeStore::open(&path).unwrap();
+            assert!(!disk.checkpointed(subjects[0]).unwrap().is_empty());
+            assert!(disk.checkpointed(subjects[1]).unwrap().is_empty());
+        }
+    }
 }

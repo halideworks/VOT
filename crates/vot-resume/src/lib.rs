@@ -920,6 +920,53 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_batches_validate_before_append_and_merge_stale_writers() {
+        let path = temp_path("checkpoint-batch");
+        let mut store = ResumeStore::open(&path).unwrap();
+        store
+            .reserve_many([(subject(1), 4), (subject(2), 4)])
+            .unwrap();
+        let mut stale = ResumeStore::open(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        for invalid in [
+            (subject(3), 4, units([0])),
+            (subject(2), 3, units([0])),
+            (subject(2), 4, units([4])),
+        ] {
+            assert!(
+                store
+                    .checkpoint_batch(&[(subject(1), 4, units([0])), invalid])
+                    .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(store.checkpointed(subject(1)).unwrap().is_empty());
+        }
+        store
+            .checkpoint_batch(&[
+                (subject(1), 4, units([0])),
+                (subject(1), 4, units([1])),
+                (subject(2), 4, units([2])),
+            ])
+            .unwrap();
+        stale
+            .checkpoint_batch(&[(subject(1), 4, units([3])), (subject(2), 4, units([0]))])
+            .unwrap();
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.checkpointed(subject(1)).unwrap(),
+            &units([0, 1, 3])
+        );
+        assert_eq!(reopened.checkpointed(subject(2)).unwrap(), &units([0, 2]));
+        let before = fs::read(&path).unwrap();
+        stale
+            .checkpoint_batch(&[(subject(1), 4, units([0, 1, 3]))])
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(lock_path(&path).unwrap()).unwrap();
+    }
+
+    #[test]
     fn checkpoint_append_keeps_unrelated_objects_in_place() {
         let path = temp_path("checkpoint-in-place");
         let mut store = ResumeStore::open(&path).unwrap();

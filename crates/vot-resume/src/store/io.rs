@@ -15,8 +15,19 @@ pub(crate) fn truncate_torn_tail(path: &Path, valid_length: usize) -> Result<(),
 }
 
 pub(crate) fn append_record(path: &Path, payload: &[u8]) -> Result<(), Error> {
-    let record = encode_record(payload)?;
-    let record_length = u64::try_from(record.len()).map_err(|_| Error::TooLarge)?;
+    append_records(path, &[payload.to_vec()])
+}
+
+pub(crate) fn append_records(path: &Path, payloads: &[Vec<u8>]) -> Result<(), Error> {
+    let records = payloads
+        .iter()
+        .map(|payload| encode_record(payload))
+        .collect::<Result<Vec<_>, _>>()?;
+    let record_length = records.iter().try_fold(0u64, |length, record| {
+        length
+            .checked_add(u64::try_from(record.len()).map_err(|_| Error::TooLarge)?)
+            .ok_or(Error::TooLarge)
+    })?;
     let current_length = file_len(path)?;
     let header_length = append_header_length(current_length);
     if !append_fits(current_length, header_length, record_length) {
@@ -27,7 +38,9 @@ pub(crate) fn append_record(path: &Path, payload: &[u8]) -> Result<(), Error> {
     if created {
         file.write_all(MAGIC)?;
     }
-    file.write_all(&record)?;
+    for record in records {
+        file.write_all(&record)?;
+    }
     file.sync_all()?;
     #[cfg(unix)]
     if created {

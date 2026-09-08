@@ -224,33 +224,31 @@ impl ResumeStore {
         }
         let lock = lock_store(&self.path)?;
         self.refresh_locked()?;
-        let mut candidate = self.objects.clone();
-        let existing = candidate.get(&subject).ok_or(Error::IdentityMismatch)?;
+        let existing = self.objects.get(&subject).ok_or(Error::IdentityMismatch)?;
         if existing.total_units != total_units {
             return Err(Error::IdentityMismatch);
         }
         let previous = existing.checkpointed.clone();
         let mut merged = previous.clone();
         merged.union(checkpointed);
-        candidate.insert(
-            subject,
-            StoredObject {
-                total_units,
-                checkpointed: merged.clone(),
-            },
-        );
+        let updated = StoredObject {
+            total_units,
+            checkpointed: merged.clone(),
+        };
         let delta = difference(&merged, &previous);
         if !delta.is_empty() {
             let record = encode_checkpoint(subject, total_units, &delta)?;
             let projected = file_len(&self.path)?
                 .saturating_add(u64::try_from(record.len()).map_err(|_| Error::TooLarge)?);
             if should_compact(projected) {
+                let mut candidate = self.objects.clone();
+                candidate.insert(subject, updated.clone());
                 Self::compact(&self.path, &candidate)?;
             } else {
                 append_record(&self.path, &record)?;
             }
         }
-        self.objects = candidate;
+        self.objects.insert(subject, updated);
         self.signature = file_signature(&self.path)?;
         drop(lock);
         Ok(merged)

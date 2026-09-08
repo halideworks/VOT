@@ -920,6 +920,57 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_append_keeps_unrelated_objects_in_place() {
+        let path = temp_path("checkpoint-in-place");
+        let mut store = ResumeStore::open(&path).unwrap();
+        store
+            .reserve_many([(subject(1), 2), (subject(2), 2)])
+            .unwrap();
+        let untouched = std::ptr::from_ref(&store.objects[&subject(2)]);
+        for completed in [units([0]), units([0, 1]), units([1])] {
+            store.checkpoint_units(subject(1), 2, &completed).unwrap();
+            assert_eq!(untouched, std::ptr::from_ref(&store.objects[&subject(2)]));
+            assert!(store.checkpointed(subject(2)).unwrap().is_empty());
+        }
+        let reopened = ResumeStore::open(&path).unwrap();
+        assert_eq!(reopened.checkpointed(subject(1)).unwrap(), &units([0, 1]));
+        assert!(reopened.checkpointed(subject(2)).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "benchmark; run explicitly with --release --nocapture"]
+    fn checkpoint_100k_subjects_benchmark() {
+        for run in 1..=3 {
+            let path = temp_path("checkpoint-100k");
+            let subjects: Vec<_> = (0_u64..100_000)
+                .map(|index| {
+                    let mut root = [0; 32];
+                    root[..8].copy_from_slice(&index.to_le_bytes());
+                    SubjectId::new(1, root, 256).unwrap()
+                })
+                .collect();
+            let mut store = ResumeStore::open(&path).unwrap();
+            store
+                .reserve_many(subjects.iter().map(|&subject| (subject, 1)))
+                .unwrap();
+            let completed = units([0]);
+            let start = std::time::Instant::now();
+            for &subject in subjects.iter().take(1000) {
+                store.checkpoint_units(subject, 1, &completed).unwrap();
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let reopened = ResumeStore::open(&path).unwrap();
+            for (index, &subject) in subjects.iter().enumerate() {
+                assert_eq!(
+                    reopened.checkpointed(subject).unwrap().count(),
+                    u64::from(index < 1000)
+                );
+            }
+            println!("run={run} subjects=100000 checkpoints=1000 elapsed_ms={elapsed:.3}");
+        }
+    }
+
+    #[test]
     fn a_large_contiguous_object_costs_one_run_in_memory() {
         let path = temp_path("run-length-memory");
         let subject = SubjectId::new(1, [0x5c; 32], MAX_UNITS_PER_OBJECT * 65_536).unwrap();

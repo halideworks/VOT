@@ -74,12 +74,10 @@ impl CompletionFlusher {
                     let Ok(job) = queue.recv() else {
                         return;
                     };
-                    let mut batch = vec![job];
-                    batch.extend(
-                        queue
-                            .try_iter()
-                            .take(super::protocol::MAX_OBJECT_WINDOW - 1),
-                    );
+                    let batch: Vec<_> = std::iter::once(job)
+                        .chain(queue.try_iter())
+                        .take(super::protocol::MAX_OBJECT_WINDOW)
+                        .collect();
                     drop(queue);
                     // A hook is a caller's code: a panic in it fails the
                     // plan the way a refusal does, rather than leaving the

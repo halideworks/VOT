@@ -75,13 +75,13 @@ pub(super) const fn advance_passes(objects: usize) -> usize {
 /// window, so no plan may hold more than this.
 pub(crate) const MAX_OBJECT_WINDOW: usize = 16;
 
-/// The window `rails` rails earn: two objects a rail, so a rail always has
+/// The window `rails` rails earn: four objects a rail, so a rail always has
 /// another object to take spans from while one of them is being synced.
 ///
 /// Only a driving loop chooses a window, and those come with the carrier.
 #[cfg(any(test, feature = "wire"))]
 pub(crate) fn object_window(rails: usize) -> usize {
-    rails.saturating_mul(2).clamp(1, MAX_OBJECT_WINDOW)
+    rails.saturating_mul(4).clamp(1, MAX_OBJECT_WINDOW)
 }
 
 /// Credit advertised to the server: the covers this end asked for.

@@ -1629,13 +1629,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    pub(crate) fn the_object_window_is_two_a_rail_and_never_past_the_budget() {
-        // Two objects a rail, so a rail has another to take spans from
+    pub(crate) fn the_object_window_is_four_a_rail_and_never_past_the_budget() {
+        // Four objects a rail, so a rail has another to take spans from
         // while one syncs, and never more than the staging budget holds.
         for (rails, window) in [
             (0, 1),
-            (1, 2),
-            (4, 8),
+            (1, 4),
+            (4, 16),
             (8, MAX_OBJECT_WINDOW),
             (9, MAX_OBJECT_WINDOW),
             (usize::MAX, MAX_OBJECT_WINDOW),
@@ -2932,7 +2932,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_striped_fetch_runs_the_primary_seams_on_every_rail() {
-        // Six objects against a window of four: the last two are opened
+        // Ten objects against a window of eight: the last two are opened
         // after the rails are running, so a rail opens one of them.
         use std::collections::{BTreeSet, HashSet};
         use std::sync::Condvar;
@@ -2940,7 +2940,7 @@ pub(crate) mod tests {
 
         type Halves = Arc<(Mutex<VecDeque<crate::harness::Duplex>>, Condvar)>;
 
-        let files: Vec<(String, Vec<u8>)> = (0..6)
+        let files: Vec<(String, Vec<u8>)> = (0..10)
             .map(|at| (format!("o{at}.bin"), patterned(300_000 + at)))
             .collect();
         let contents: Vec<(&str, Vec<u8>)> = files

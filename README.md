@@ -230,6 +230,8 @@ forge them.
 
 ## Platform support
 
+Mounted SMB shares: see [usage, assurance limits, and share tests](docs/mounted-shares.md).
+
 Linux, macOS, and Windows. `receive-push` is Unix-only until guarded directory
 operations exist on Windows; all other commands, including `push`, retain the
 three-platform support. Platform-specific code is isolated in `vot-platform-fs`,

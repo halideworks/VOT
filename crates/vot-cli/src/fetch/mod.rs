@@ -1837,6 +1837,8 @@ pub(crate) mod tests {
             )
             .unwrap();
             secondary.manifest.descriptor = primary.manifest.descriptor.clone();
+            // A resumed directory has no live writer from the previous transfer.
+            drop(primary);
             secondary.set_receive_seams(ReceiveSeams {
                 sink: Some(Arc::new(move |_, object| {
                     Ok(Some(Box::new(CountingSink::at(
@@ -2326,7 +2328,11 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
+        sink.durable
+            .as_ref()
+            .unwrap()
+            .flush(sink.sink.read().unwrap().as_deref().unwrap())
+            .unwrap();
         assert_eq!(
             store
                 .lock()
@@ -2353,7 +2359,11 @@ pub(crate) mod tests {
             plan.covered.insert(0, unit);
         }
         let before = store.lock().unwrap().checkpointed(subject).unwrap().count();
-        sink.durable.as_ref().unwrap().flush(sink.sink.as_ref());
+        sink.durable
+            .as_ref()
+            .unwrap()
+            .flush(sink.sink.read().unwrap().as_deref().unwrap())
+            .unwrap();
         assert_eq!(
             store.lock().unwrap().checkpointed(subject).unwrap().count(),
             before,

@@ -23,3 +23,6 @@ vot-scheduler = { path = "../vot-scheduler" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+vot-platform-fs = { path = "../vot-platform-fs" }

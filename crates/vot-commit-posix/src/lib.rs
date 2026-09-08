@@ -217,6 +217,11 @@ impl<F: FaultInjector> PosixCommit<F> {
             .read(true)
             .write(true)
             .open(&staging_path)?;
+        #[cfg(target_os = "linux")]
+        if let Err(error) = validate_filesystem_profile(&staging, profile) {
+            let _ = vot_platform_fs::remove_file_handle(&staging, &staging_path);
+            return Err(error);
+        }
         let journal = match Journal::create(journal_path, incarnation) {
             Ok(journal) => journal,
             Err(error) => {
@@ -291,6 +296,8 @@ impl<F: FaultInjector> PosixCommit<F> {
             .read(true)
             .write(true)
             .open(&staging_path)?;
+        #[cfg(target_os = "linux")]
+        validate_filesystem_profile(&staging, profile)?;
         let mut commit = Self {
             profile,
             incarnation,
@@ -871,6 +878,19 @@ fn same_file(left: &Path, right: &Path) -> Result<bool, Error> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn validate_filesystem_profile(file: &File, profile: Profile) -> Result<(), Error> {
+    validate_remote_profile(profile, vot_platform_fs::is_smb_or_nfs(file)?)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_remote_profile(profile: Profile, remote: bool) -> Result<(), Error> {
+    if remote && profile != Profile::Fast {
+        return Err(Error::UnsupportedProfile);
+    }
+    Ok(())
+}
+
 fn parent_of(path: &Path) -> Result<&Path, Error> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -896,6 +916,21 @@ fn remove_alias(file: &File, path: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_filesystems_admit_only_the_fast_profile() {
+        for profile in [
+            super::Profile::Fast,
+            super::Profile::Balanced,
+            super::Profile::Strict,
+        ] {
+            assert!(super::validate_remote_profile(profile, false).is_ok());
+            assert_eq!(
+                super::validate_remote_profile(profile, true).is_ok(),
+                profile == super::Profile::Fast
+            );
+        }
+    }
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use vot_commit_strict::{DirectHash, Error as StrictError};

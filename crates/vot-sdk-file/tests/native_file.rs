@@ -14,7 +14,9 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new(name: &str) -> Self {
-        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        let root = std::env::var_os("VOT_TEST_DIRECTORY")
+            .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+        let path = root.join(format!(
             "vot-sdk-file-{}-{}-{name}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -223,8 +225,14 @@ fn balanced_profile_publishes_verified_bytes() {
     let bytes = b"balanced verified bytes";
     let object = prepared(bytes);
     let range = verified(&object, bytes, 0, 1);
-    let mut file = NativeFile::create(object.object_id(), &destination, CommitProfile::Balanced)
-        .expect("balanced receiver");
+    let created = NativeFile::create(object.object_id(), &destination, CommitProfile::Balanced);
+    #[cfg(target_os = "linux")]
+    if vot_platform_fs::is_smb_or_nfs(&fs::File::open(&directory.0).unwrap()).unwrap() {
+        assert!(matches!(created, Err(error) if error.kind() == ErrorKind::UnsupportedProfile));
+        assert_eq!(directory.entry_count(), 0);
+        return;
+    }
+    let mut file = created.expect("balanced receiver");
     file.accept(&range).unwrap();
     file.publish().unwrap();
     assert_eq!(fs::read(destination).unwrap(), bytes);
@@ -238,8 +246,13 @@ fn strict_profile_publishes_one_verified_group() {
     let bytes = vec![0x5a; GROUP];
     let object = prepared(&bytes);
     let range = verified(&object, &bytes, 0, 1);
-    let mut file = NativeFile::create(object.object_id(), &destination, CommitProfile::Strict)
-        .expect("strict receiver");
+    let created = NativeFile::create(object.object_id(), &destination, CommitProfile::Strict);
+    if vot_platform_fs::is_smb_or_nfs(&fs::File::open(&directory.0).unwrap()).unwrap() {
+        assert!(matches!(created, Err(error) if error.kind() == ErrorKind::UnsupportedProfile));
+        assert_eq!(directory.entry_count(), 0);
+        return;
+    }
+    let mut file = created.expect("strict receiver");
     file.accept(&range).unwrap();
     file.publish().unwrap();
     assert_eq!(fs::read(destination).unwrap(), bytes);

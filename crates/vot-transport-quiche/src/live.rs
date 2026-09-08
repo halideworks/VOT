@@ -1571,7 +1571,6 @@ fn run(
                         if !read_ran_out(&error) {
                             break 'drive Ok(());
                         }
-                        conn.on_timeout();
                     }
                 }
             }
@@ -1600,7 +1599,7 @@ fn run(
                         );
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 // The router is gone, so nothing further can ever arrive.
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break 'drive Ok(());
@@ -1608,6 +1607,8 @@ fn run(
             },
         }
 
+        // A busy receive queue must not starve recovery or draining timers.
+        conn.on_timeout();
         read_streams(
             &mut conn,
             &mut streams,
@@ -1640,10 +1641,8 @@ fn run(
 /// release time the pacer set, and the cap that keeps a submission from
 /// waiting on the peer.
 ///
-/// A pending release time may be waited out to [`PACE_HOLD_TICK`] rather than
-/// the tick, or the held packet is flushed ahead of its release. The
-/// connection's timer stays in the minimum either way, so the wait never
-/// extends the loss timer. Pure, so the edges are pinned by a table test.
+/// A pending release time may be waited out to [`PACE_HOLD_TICK`] to avoid
+/// unnecessary wakes. The connection's timer always takes precedence.
 fn pass_deadline(timeout: Option<Duration>, pacing: Option<Duration>) -> Duration {
     timeout
         .unwrap_or(TICK)
@@ -2625,9 +2624,8 @@ const fn should_revalidate(refused: usize) -> bool {
 
 /// The longest a pass may wait on a release time the pacer set.
 ///
-/// Pacing quanta above the tick are honoured to this bound; at WAN rates a
-/// millisecond is far more than one burst, so the tick alone would flush a
-/// held packet ahead of its release.
+/// Longer pacing intervals avoid tick-frequency wakes while keeping command
+/// and close handling responsive.
 const PACE_HOLD_TICK: Duration = Duration::from_millis(5);
 
 /// How far past now a send pass will still release a packet: releases due
@@ -2654,6 +2652,7 @@ struct Sending {
     held: usize,
     /// Where that parked packet goes.
     held_to: Option<SocketAddr>,
+    held_at: Option<Instant>,
 }
 
 impl Sending {
@@ -2667,6 +2666,7 @@ impl Sending {
             duplicating: false,
             held: 0,
             held_to: None,
+            held_at: None,
         }
     }
 
@@ -2851,6 +2851,7 @@ fn note_close_request(conn: &mut Connection, close: &Arc<AtomicU64>, closing: &m
 /// # Errors
 /// Reports whatever the socket refused.
 fn flush_held(socket: &UdpSocket, out: &[u8], sending: &mut Sending) -> Result<(), Error> {
+    sending.held_at = None;
     let held = std::mem::take(&mut sending.held);
     let destination = sending.held_to.take();
     flush_burst(socket, &out[..held], held, destination, sending)
@@ -2863,6 +2864,13 @@ fn send_all(
     sending: &mut Sending,
     pass_horizon: Instant,
 ) -> Result<Option<Instant>, Error> {
+    if let Some(at) = sending.held_at
+        && at > pass_horizon
+        && at > Instant::now()
+    {
+        return Ok(Some(at));
+    }
+    sending.held_at = None;
     // Packets are gathered into one buffer and handed over together so
     // segmentation offload takes the whole burst in one call.
     let ceiling = sending.ceiling;
@@ -2926,6 +2934,7 @@ fn send_all(
                     out.copy_within(filled..filled + written, 0);
                     sending.held = written;
                     sending.held_to = Some(info.to);
+                    sending.held_at = Some(info.at);
                     return Ok(Some(info.at));
                 }
                 if filled == 0 {
@@ -3477,8 +3486,7 @@ fn read_streams(
             }
         }
     }
-    let readable: Vec<u64> = conn.readable().collect();
-    for id in readable {
+    for id in conn.readable() {
         // Which lane a stream's bytes belong to depends on who opened it, so a
         // peer's stream is never reported as a reply to this endpoint's own
         // request.
@@ -3597,17 +3605,18 @@ pub fn path_sample(conn: &quiche::Connection) -> Option<PathStats> {
 
 fn path_sample_from<F: quiche::BufFactory>(conn: &quiche::Connection<F>) -> Option<PathStats> {
     let stats = conn.path_stats().find(|path| path.active)?;
+    let connection = conn.stats();
     Some(PathStats {
         smoothed_rtt_us: u64::try_from(stats.rtt.as_micros()).ok(),
         congestion_window_bytes: u64::try_from(stats.cwnd).ok(),
         mtu_bytes: u64::try_from(stats.pmtu).ok(),
         delivery_rate_bps: Some(stats.delivery_rate.saturating_mul(8)),
-        lost_packets: u64::try_from(conn.stats().lost).ok(),
-        spurious_lost_packets: u64::try_from(conn.stats().spurious_lost).ok(),
+        lost_packets: u64::try_from(connection.lost).ok(),
+        spurious_lost_packets: u64::try_from(connection.spurious_lost).ok(),
         // Connection scope, like the loss counters above, so all four halves
         // of the ledger cover the same packets whatever paths existed.
-        packets_sent: u64::try_from(conn.stats().sent).ok(),
-        packets_received: u64::try_from(conn.stats().recv).ok(),
+        packets_sent: u64::try_from(connection.sent).ok(),
+        packets_received: u64::try_from(connection.recv).ok(),
     })
 }
 
@@ -5869,6 +5878,63 @@ mod tests {
         feed_received(&mut conn, local, &mut junk, peer, None);
     }
 
+    #[test]
+    fn queued_arrivals_do_not_starve_an_expired_draining_timer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let remote = "127.0.0.1:4434".parse().unwrap();
+        let (mut client, mut server) = sans_io_pair_at(1024, local, remote, None);
+        server.close(true, 0, b"").unwrap();
+        shuttle(&mut server, remote, &mut client, local);
+        assert!(client.is_draining());
+        assert!(client.local_error().is_none());
+        let wait = client.timeout().unwrap();
+        assert!(wait < Duration::from_secs(2));
+        std::thread::sleep(wait + Duration::from_millis(1));
+
+        // Finite input makes a missing timer call fail instead of hanging.
+        let (arrivals, packets) = mpsc::channel();
+        for _ in 0..2 * (DRAIN_BUDGET + 1) {
+            arrivals
+                .send(Arrived {
+                    bytes: vec![0],
+                    from: remote,
+                    segment: None,
+                })
+                .unwrap();
+        }
+        drop(arrivals);
+        let (_owner, commands) = mpsc::channel();
+        run(
+            &socket,
+            Intake::Routed(&packets),
+            client,
+            local,
+            Role::Client,
+            &commands,
+            &Arc::new(Mutex::new(Inbound::default())),
+            &Arc::new(AtomicU64::new(NO_CLOSE)),
+            &Arc::new(AtomicUsize::new(limits().control_payload())),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            1,
+            MAX_DATAGRAM_SIZE,
+            0,
+            vec![0; LARGEST_DATAGRAM_SIZE],
+            vec![0; LARGEST_DATAGRAM_SIZE],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            packets.try_recv().is_ok(),
+            "the timer must close the connection before its receive queue empties"
+        );
+    }
+
     /// A handshaked sans-IO pair with every stream window at `window`.
     fn sans_io_pair(window: u64) -> (Connection, Connection) {
         let local: SocketAddr = "127.0.0.1:4433".parse().expect("an address");
@@ -6004,6 +6070,43 @@ mod tests {
     const HELD_BYTES: usize = 200;
 
     #[test]
+    fn an_early_wake_keeps_a_packet_held_until_its_pacing_horizon() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = bounded_receiver();
+        let local = sender.local_addr().unwrap();
+        let remote = peer.local_addr().unwrap();
+        let (mut client, _server) = sans_io_pair_at(1024, local, remote, None);
+        let mut out = vec![0; LARGEST_DATAGRAM_SIZE];
+        let mut sending = Sending::new(MAX_DATAGRAM_SIZE, false, Role::Client, 0);
+        let parked = park(&mut out, &mut sending, HELD_BYTES, remote);
+        let release = Instant::now() + Duration::from_mins(1);
+        sending.held_at = Some(release);
+
+        for _ in 0..3 {
+            assert_eq!(
+                send_all(&sender, &mut client, &mut out, &mut sending, horizon()).unwrap(),
+                Some(release)
+            );
+            assert_eq!(&out[..sending.held], parked);
+            assert_eq!(sending.held_to, Some(remote));
+        }
+        assert!(collected(&peer).is_empty());
+        send_all(&sender, &mut client, &mut out, &mut sending, release).unwrap();
+        assert_eq!(collected(&peer).first(), Some(&parked));
+        assert_eq!(sending.held_at, None);
+
+        let parked = park(&mut out, &mut sending, HELD_BYTES, remote);
+        let due = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        sending.held_at = Some(due);
+        let stale = due.checked_sub(PACE_QUANTUM).unwrap();
+        send_all(&sender, &mut client, &mut out, &mut sending, stale).unwrap();
+        assert_eq!(collected(&peer).first(), Some(&parked));
+        assert_eq!(sending.held_at, None);
+    }
+
+    #[test]
     fn a_held_packet_opens_the_next_pass_and_leaves_once() {
         // The pass that parked it is over; the packet is owed the peer, and
         // owed it exactly once.
@@ -6099,10 +6202,12 @@ mod tests {
         );
 
         let parked = park(&mut out, &mut sending, HELD_BYTES, destination);
+        sending.held_at = Some(Instant::now() + Duration::from_mins(1));
         flush_held(&sender, &out, &mut sending).expect("the held packet");
         assert_eq!(collected(&receiver), vec![parked], "the peer got it anyway");
         assert_eq!(sending.held, 0);
         assert_eq!(sending.held_to, None);
+        assert_eq!(sending.held_at, None);
     }
 
     #[test]
@@ -6163,6 +6268,7 @@ mod tests {
         );
         assert!(sending.held > 0, "and the packet it belongs to is parked");
         assert_eq!(sending.held_to, Some(remote));
+        assert_eq!(sending.held_at, Some(paced));
         let parked = out[..sending.held].to_vec();
         assert!(
             !collected(&peer).contains(&parked),

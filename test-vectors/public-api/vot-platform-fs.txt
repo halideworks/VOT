@@ -2,6 +2,7 @@ function vot_platform_fs::allow_unordered_writes
 function vot_platform_fs::atomic_replace
 function vot_platform_fs::create_staging_file
 function vot_platform_fs::guard_staging_file
+function vot_platform_fs::is_smb_or_nfs
 function vot_platform_fs::link_file_handle
 function vot_platform_fs::remove_file_handle
 function vot_platform_fs::same_file_handle

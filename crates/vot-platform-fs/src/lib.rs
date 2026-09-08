@@ -6,6 +6,43 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+/// Identifies Linux SMB and NFS mounts through the opened file's filesystem.
+/// A false result is not a certification of other filesystems' durability.
+///
+/// # Errors
+/// Returns an error if the filesystem cannot be identified.
+pub fn is_smb_or_nfs(file: &File) -> io::Result<bool> {
+    let filesystem = rustix::fs::fstatfs(file)?;
+    Ok(smb_or_nfs_magic(i128::from(filesystem.f_type)))
+}
+
+#[cfg(target_os = "linux")]
+fn smb_or_nfs_magic(magic: i128) -> bool {
+    // Linux magic.h; mask the sign extension used by 32-bit statfs.
+    matches!(
+        magic & 0xffff_ffff,
+        0x517b | 0xff53_4d42 | 0xfe53_4d42 | 0x6969
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn identifies_smb_and_nfs_without_classifying_local_filesystems() {
+    for magic in [0x517b, 0xff53_4d42, 0xfe53_4d42, 0x6969] {
+        assert!(smb_or_nfs_magic(magic));
+        assert!(smb_or_nfs_magic(magic - (1_i128 << 32)));
+    }
+    for magic in [0, 0xef53, 0x5846_5342, 0x2fc1_2fc1, 0x9123_683e] {
+        assert!(!smb_or_nfs_magic(magic));
+    }
+    let root = File::open("/").unwrap();
+    assert_eq!(
+        is_smb_or_nfs(&root).unwrap(),
+        smb_or_nfs_magic(i128::from(rustix::fs::fstatfs(&root).unwrap().f_type))
+    );
+}
+
 #[cfg(unix)]
 /// Reports whether two paths are regular hard links to the same file.
 ///
@@ -354,7 +391,7 @@ pub fn same_file_regular_windows_link(
     let status = unsafe {
         NtSetInformationFile(
             file.as_raw_handle(),
-            &mut status_block,
+            &raw mut status_block,
             information.cast(),
             u32::try_from(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
             FileLinkInformation,
@@ -385,15 +422,20 @@ pub fn link_file_handle(_file: &File, source: &Path, destination: &Path) -> io::
 #[cfg(windows)]
 #[allow(unsafe_code)]
 /// Removes the file held by `file` without resolving its path again.
+/// SMB servers without extended disposition support defer removal until
+/// the last handle closes; callers must release their staging handles.
 ///
 /// # Errors
 /// Returns an identity mismatch or operating-system disposition failure.
 pub fn same_file_regular_windows_remove(file: &File, path: &Path) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx,
-        SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
     };
 
     if !same_file_regular_windows_handle(file, path)? {
@@ -413,11 +455,33 @@ pub fn same_file_regular_windows_remove(file: &File, path: &Path) -> io::Result<
             file.as_raw_handle(),
             FileDispositionInfoEx,
             std::ptr::from_ref(&disposition).cast(),
-            u32::try_from(std::mem::size_of_val(&disposition)).expect("small Windows structure"),
+            u32::try_from(std::mem::size_of_val(&disposition)).map_err(io::Error::other)?,
         )
     };
     if result == 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if !error.raw_os_error().is_some_and(|code| {
+            matches!(
+                u32::try_from(code),
+                Ok(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED)
+            )
+        }) {
+            return Err(error);
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the retained handle and initialized legacy disposition
+        // remain valid for this call, which never resolves a file name.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                std::ptr::from_ref(&disposition).cast(),
+                u32::try_from(std::mem::size_of_val(&disposition)).map_err(io::Error::other)?,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -490,7 +554,7 @@ pub fn allow_unordered_writes_windows(file: &std::fs::File) -> io::Result<()> {
             0,
             std::ptr::null_mut(),
             0,
-            &mut returned,
+            &raw mut returned,
             std::ptr::null_mut(),
         )
     };
@@ -547,16 +611,35 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
 /// Replaces `destination` with `source` atomically on the same filesystem.
 ///
 /// # Errors
 /// Returns an invalid-path or operating-system error when replacement fails.
 pub fn atomic_replace_windows(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
+    move_file_windows(
+        source,
+        destination,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    )
+}
+
+#[cfg(windows)]
+/// Moves a file or directory on the same volume without replacing any destination.
+///
+/// # Errors
+/// Returns an invalid-path, existing-destination, or operating-system error.
+pub fn rename_noreplace_windows(source: &Path, destination: &Path) -> io::Result<()> {
+    move_file_windows(source, destination, 0)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn move_file_windows(source: &Path, destination: &Path, flags: u32) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
         let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -571,13 +654,7 @@ pub fn atomic_replace_windows(source: &Path, destination: &Path) -> io::Result<(
     let destination = wide(destination)?;
     // SAFETY: both pointers reference live, NUL-terminated UTF-16 buffers for
     // the duration of the call. The buffers do not alias mutable Rust memory.
-    let replaced = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let replaced = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
     if replaced == 0 {
         Err(io::Error::last_os_error())
     } else {

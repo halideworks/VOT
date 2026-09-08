@@ -2678,6 +2678,7 @@ dependencies = [
  "aligned-vec",
  "rustix",
  "vot-commit-model",
+ "vot-platform-fs",
  "vot-verifier",
 ]
 

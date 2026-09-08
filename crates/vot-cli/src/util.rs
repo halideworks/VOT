@@ -259,7 +259,7 @@ pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> Resu
 
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_rename_noreplace(source: &Path, destination: &Path) -> Result<(), Error> {
-    fs::rename(source, destination)?;
+    vot_platform_fs::rename_noreplace_windows(source, destination)?;
     Ok(())
 }
 
@@ -284,13 +284,13 @@ pub(crate) fn sync_directory(directory: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Windows has no directory fsync, and asking for one is not a no-op that
-/// fails quietly: a directory cannot be opened as a file there without
-/// `FILE_FLAG_BACKUP_SEMANTICS`, so `File::open` returns `PermissionDenied`
-/// and every write path that ends in one of these failed outright. NTFS logs
-/// a directory entry with the data it names, so what the unix call makes
-/// durable is already durable here.
+/// Windows has no portable directory fsync equivalent. Fast publication
+/// relies on filesystem namespace operations without claiming crash durability.
 #[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Unix interface"
+)]
 pub(crate) fn windows_sync_directory(_directory: &Path) -> Result<(), Error> {
     Ok(())
 }

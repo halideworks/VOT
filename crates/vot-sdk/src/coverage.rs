@@ -60,7 +60,7 @@ impl ObjectCoverage {
     pub fn new(object: &ObjectId) -> Self {
         Self {
             object: object.clone(),
-            inner: vot_coverage::Coverage::new(),
+            inner: vot_coverage::Coverage::for_object(object.length),
         }
     }
 
@@ -186,6 +186,20 @@ impl ObjectCoverage {
 mod tests {
     use super::*;
     use crate::object::{InMemoryObjectBuilder, Suite};
+
+    #[test]
+    fn fresh_and_restored_coverage_use_the_object_length_for_the_limit() {
+        let mut object = prepared(b"identity").object_id().clone();
+        for length in [0, 1, 100 * 1024 * 1024 * 1024] {
+            object.length = length;
+            let fresh = ObjectCoverage::new(&object);
+            let restored = ObjectCoverage::from_runs(&object, []).unwrap();
+            assert_eq!(
+                fresh.inner.fragment_limit(),
+                restored.inner.fragment_limit()
+            );
+        }
+    }
 
     fn prepared(bytes: &[u8]) -> crate::object::InMemoryPreparedObject {
         let mut builder = InMemoryObjectBuilder::new(

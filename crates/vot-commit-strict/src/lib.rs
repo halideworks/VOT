@@ -108,6 +108,14 @@ impl LinuxDirectReader {
                 },
             };
         let file = File::from(descriptor);
+        if vot_platform_fs::is_smb_or_nfs(&file).map_err(Error::Io)? {
+            return Ok(Self {
+                backend: DirectBackend::Unsupported,
+                logical_length,
+                alignment,
+                buffer_size,
+            });
+        }
         let mut probe = AVec::<u8, RuntimeAlign>::new(alignment);
         probe.resize(alignment, 0);
         match file.read_at(&mut probe, 0) {

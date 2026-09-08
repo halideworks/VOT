@@ -81,6 +81,10 @@ cargo test -p vot-commit-platform --locked
 cargo test -p vot-platform-fs --locked
 ```
 
+Mounted-share checks and the sink benchmark are documented in
+[Mounted SMB shares](mounted-shares.md). They run against an explicitly chosen
+test directory rather than a default developer mount.
+
 ## Live MsQuic
 
 ```sh

@@ -99,7 +99,7 @@ pub struct Reservation {
 /// Disjoint accepted extents and their exact covered-byte count.
 ///
 /// Extents are stored as start to exclusive end and coalesced on commit.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Coverage {
     extents: BTreeMap<u64, u64>,
     /// Ranges reserved for in-flight writes: refused to later checks and
@@ -108,6 +108,12 @@ pub struct Coverage {
     bytes: u64,
     /// Extents this object may be covered in, from its length.
     limit: usize,
+}
+
+impl Default for Coverage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Coverage {
@@ -147,7 +153,8 @@ impl Coverage {
     ///
     /// # Errors
     /// Rejects empty ranges, arithmetic overflow, partial overlap with an
-    /// accepted extent, and a new isolated extent beyond [`MAX_FRAGMENTS`].
+    /// accepted extent, and a new isolated extent beyond the fragment limit,
+    /// counting reserved extents against that limit.
     pub fn check(&mut self, covered_offset: u64, bytes: u64) -> Result<Check<'_>, Error> {
         if bytes == 0 {
             return Err(Error::EmptyRange);
@@ -155,16 +162,14 @@ impl Coverage {
         let covered_end = covered_offset
             .checked_add(bytes)
             .ok_or(Error::LengthExceeded)?;
-        if self
-            .extents
-            .range(..=covered_offset)
-            .next_back()
-            .is_some_and(|(_, end)| *end >= covered_end)
-        {
+        let earlier = self.extents.range(..=covered_offset).next_back();
+        if earlier.is_some_and(|(_, end)| *end >= covered_end) {
             return Ok(Check::Replay);
         }
-        let earlier = self.extents.range(..covered_offset).next_back();
-        if overlaps(&self.extents, covered_offset, covered_end) {
+        let later = self.extents.range(covered_offset..).next();
+        if earlier.is_some_and(|(_, end)| *end > covered_offset)
+            || later.is_some_and(|(offset, _)| *offset < covered_end)
+        {
             return Err(Error::PartialOverlap);
         }
         if overlaps(&self.reserved, covered_offset, covered_end) {
@@ -172,8 +177,11 @@ impl Coverage {
         }
         let next_bytes = self.bytes.checked_add(bytes).ok_or(Error::LengthExceeded)?;
         let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
-        let merges_later = self.extents.contains_key(&covered_end);
-        if !merges_earlier && !merges_later && self.extents.len() >= self.limit {
+        let merges_later = later.is_some_and(|(offset, _)| *offset == covered_end);
+        if !merges_earlier
+            && !merges_later
+            && self.extents.len() + self.reserved.len() >= self.limit
+        {
             return Err(Error::FragmentsExhausted);
         }
         Ok(Check::New(Booking {
@@ -284,37 +292,14 @@ impl Coverage {
     /// or reserved extent, and a new isolated extent beyond the fragment
     /// limit, counting reserved extents against that limit.
     pub fn reserve(&mut self, covered_offset: u64, bytes: u64) -> Result<Reserve, Error> {
-        if bytes == 0 {
-            return Err(Error::EmptyRange);
-        }
-        let covered_end = covered_offset
-            .checked_add(bytes)
-            .ok_or(Error::LengthExceeded)?;
-        if self
-            .extents
-            .range(..=covered_offset)
-            .next_back()
-            .is_some_and(|(_, end)| *end >= covered_end)
-        {
+        let Check::New(booking) = self.check(covered_offset, bytes)? else {
             return Ok(Reserve::Replay);
-        }
-        if overlaps(&self.extents, covered_offset, covered_end) {
-            return Err(Error::PartialOverlap);
-        }
-        if overlaps(&self.reserved, covered_offset, covered_end) {
-            return Err(Error::ReservedOverlap);
-        }
-        self.bytes.checked_add(bytes).ok_or(Error::LengthExceeded)?;
-        let earlier = self.extents.range(..covered_offset).next_back();
-        let merges_earlier = earlier.is_some_and(|(_, end)| *end == covered_offset);
-        let merges_later = self.extents.contains_key(&covered_end);
-        if !merges_earlier
-            && !merges_later
-            && self.extents.len() + self.reserved.len() >= self.limit
-        {
-            return Err(Error::FragmentsExhausted);
-        }
-        self.reserved.insert(covered_offset, covered_end);
+        };
+        let covered_end = booking.covered_end;
+        booking
+            .coverage
+            .reserved
+            .insert(covered_offset, covered_end);
         Ok(Reserve::New(Reservation {
             covered_offset,
             covered_end,
@@ -382,6 +367,32 @@ fn overlaps(map: &BTreeMap<u64, u64>, covered_offset: u64, covered_end: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_accepts_ranges_with_the_same_limit_as_new() {
+        let mut coverage = Coverage::default();
+        assert_eq!(coverage.fragment_limit(), MAX_FRAGMENTS);
+        commit(&mut coverage, 0, 1);
+        let held = reserve_new(&mut coverage, 2, 1);
+        coverage.commit_reservation(held);
+        assert_eq!(coverage.covered_bytes(), 2);
+    }
+
+    #[test]
+    fn bookings_count_outstanding_reservations_against_the_cap() {
+        let mut coverage = Coverage::new();
+        coverage.limit = 2;
+        commit(&mut coverage, 0, 1);
+        let held = reserve_new(&mut coverage, 4, 1);
+        assert!(matches!(
+            coverage.check(8, 1),
+            Err(Error::FragmentsExhausted)
+        ));
+        commit(&mut coverage, 1, 1);
+        coverage.release_reservation(held);
+        commit(&mut coverage, 8, 1);
+        assert_eq!(coverage.fragment_count(), 2);
+    }
 
     fn commit(coverage: &mut Coverage, offset: u64, bytes: u64) {
         let Check::New(booking) = coverage.check(offset, bytes).unwrap() else {

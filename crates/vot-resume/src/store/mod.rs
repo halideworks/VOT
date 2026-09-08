@@ -1,6 +1,6 @@
 //! The append-only store: replay, install, and compaction policy.
 
-use crate::{BTreeMap, Error, File, OpenOptions, Path, PathBuf, SubjectId, UnitRanges, Write, fs};
+use crate::{BTreeMap, Error, OpenOptions, Path, PathBuf, SubjectId, UnitRanges, Write, fs};
 
 pub(crate) mod format;
 pub(crate) mod io;
@@ -281,7 +281,7 @@ impl ResumeStore {
         file.sync_all()?;
         vot_platform_fs::atomic_replace(&temporary, path)?;
         #[cfg(unix)]
-        File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
+        std::fs::File::open(path.parent().ok_or(Error::InvalidConfiguration)?)?.sync_all()?;
         Ok(())
     }
 

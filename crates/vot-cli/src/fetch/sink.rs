@@ -4,6 +4,7 @@ use super::{
     Arc, AtomicU64, Error, FetchPlan, FileSink, Mutex, Ordering, Path, PathBuf, ReceiveSink,
     ResumeStore, SubjectId, durable_units, subject_of, total_units_of,
 };
+use std::sync::{RwLock, atomic::AtomicBool};
 
 /// Bytes placed between stride flushes.
 ///
@@ -16,10 +17,11 @@ pub(crate) const FLUSH_STRIDE_BYTES: u64 = 67_108_864;
 /// The fetch cannot see answers arrive; the placed-byte count is the only
 /// signal that paces requests and reports progress.
 pub struct CountingSink {
-    pub(crate) sink: Box<dyn ReceiveSink>,
     /// Serializes placement with abandonment. Once abandoned, no prover on
     /// any rail may recreate bytes after `discard_partial` returns.
-    gate: Mutex<bool>,
+    pub(crate) sink: RwLock<Option<Box<dyn ReceiveSink>>>,
+    failed: AtomicBool,
+    stride_flush: Mutex<()>,
     pub(crate) placed: AtomicU64,
     /// Next placed-byte crossing due a flush; the exchange keeps two
     /// writers from flushing the same stride.
@@ -74,7 +76,7 @@ pub(crate) struct DurableHook {
 
 impl DurableHook {
     /// One stride's durability: snapshot, sync, checkpoint.
-    pub(crate) fn flush(&self, sink: &dyn ReceiveSink) {
+    pub(crate) fn flush(&self, sink: &dyn ReceiveSink) -> Result<(), Error> {
         let covered = self.plan.upgrade().and_then(|plan| {
             let plan = plan.lock().ok()?;
             // Coverage is the current object's; a sink outliving its
@@ -82,22 +84,19 @@ impl DurableHook {
             (plan.objects.get(plan.current).map(subject_of) == Some(self.subject))
                 .then(|| plan.covered.extents().clone())
         });
-        if sink.flush().is_err() {
-            // Nothing durable to claim; the completion sync will tell
-            // the truth loudly.
-            return;
-        }
+        sink.flush()?;
         let Some(covered) = covered else {
-            return;
+            return Ok(());
         };
         let units = durable_units(&covered, self.subject.length());
         if units.is_empty() {
-            return;
+            return Ok(());
         }
         if let Ok(mut store) = self.store.lock() {
             let _ =
                 store.checkpoint_units(self.subject, total_units_of(self.subject.length()), &units);
         }
+        Ok(())
     }
 }
 
@@ -113,8 +112,9 @@ impl CountingSink {
     /// whether the file is fresh or reopened.
     fn opened(sink: Box<dyn ReceiveSink>, placed: u64, durable: Option<DurableHook>) -> Self {
         Self {
-            sink,
-            gate: Mutex::new(false),
+            sink: RwLock::new(Some(sink)),
+            failed: AtomicBool::new(false),
+            stride_flush: Mutex::new(()),
             placed: AtomicU64::new(placed),
             flush_due: AtomicU64::new(stride_after(placed)),
             flushes: AtomicU64::new(0),
@@ -170,27 +170,38 @@ impl CountingSink {
     }
 
     pub(crate) fn flush(&self) -> Result<(), Error> {
-        let discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
-        if *discarded {
+        let held = self.sink.write().map_err(|_| Error::InvalidBundle)?;
+        let sink = held.as_deref().ok_or(Error::InvalidBundle)?;
+        if self.failed.load(Ordering::Acquire) {
             return Err(Error::InvalidBundle);
         }
-        self.sink.flush()
+        sink.flush().inspect_err(|_| {
+            self.failed.store(true, Ordering::Release);
+        })
     }
 
     pub(crate) fn discard_partial(&self) -> Result<(), Error> {
-        let mut discarded = self.gate.lock().map_err(|_| Error::InvalidBundle)?;
-        *discarded = true;
-        self.sink.discard_partial()
+        let mut held = self.sink.write().map_err(|_| Error::InvalidBundle)?;
+        self.failed.store(true, Ordering::Release);
+        if let Some(sink) = held.as_ref() {
+            sink.discard_partial()?;
+        }
+        // Legacy SMB deletion finishes when the last staging handle closes.
+        held.take();
+        Ok(())
     }
 }
 
 impl vot_scheduler::RangeSink for CountingSink {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
-        let discarded = self.gate.lock().map_err(|_| vot_scheduler::SinkError)?;
-        if *discarded {
+        let held = self.sink.read().map_err(|_| vot_scheduler::SinkError)?;
+        let sink = held.as_deref().ok_or(vot_scheduler::SinkError)?;
+        if self.failed.load(Ordering::Acquire) {
             return Err(vot_scheduler::SinkError);
         }
-        self.sink.write_at(covered_offset, data)?;
+        sink.write_at(covered_offset, data).inspect_err(|_| {
+            self.failed.store(true, Ordering::Release);
+        })?;
         let placed = self
             .placed
             .fetch_add(data.len() as u64, Ordering::Relaxed)
@@ -209,18 +220,31 @@ impl vot_scheduler::RangeSink for CountingSink {
                 )
                 .is_ok()
         {
-            // Best effort; the completion sync still runs, and a failure
-            // here costs only the tail.
+            // Serialize snapshots and checkpoints so an older one cannot
+            // complete after a newer one. Disjoint writes may continue.
+            let _flushing = self
+                .stride_flush
+                .lock()
+                .map_err(|_| vot_scheduler::SinkError)?;
+            if self.failed.load(Ordering::Acquire) {
+                return Err(vot_scheduler::SinkError);
+            }
             self.flushes.fetch_add(1, Ordering::Relaxed);
-            match &self.durable {
-                Some(hook) => hook.flush(self.sink.as_ref()),
-                None => {
-                    let _ = self.sink.flush();
-                }
+            let flushed = match &self.durable {
+                Some(hook) => hook.flush(sink),
+                None => sink.flush(),
+            };
+            if flushed.is_err() {
+                self.failed.store(true, Ordering::Release);
+                return Err(vot_scheduler::SinkError);
             }
         }
-        drop(discarded);
-        Ok(())
+        drop(held);
+        if self.failed.load(Ordering::Acquire) {
+            Err(vot_scheduler::SinkError)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -281,8 +305,68 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct OnceFailingFlush(AtomicU64);
+
+    impl vot_scheduler::RangeSink for OnceFailingFlush {
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+            Ok(())
+        }
+    }
+
+    impl ReceiveSink for OnceFailingFlush {
+        fn flush(&self) -> Result<(), Error> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(Error::Io(std::io::Error::other("writeback failed")))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn discard_partial(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_cannot_be_rehabilitated_by_a_later_success() {
+        for periodic in [false, true] {
+            let inner = Arc::new(OnceFailingFlush::default());
+            let sink = CountingSink::custom(Box::new(Arc::clone(&inner)));
+            if periodic {
+                sink.flush_due.store(1, Ordering::Relaxed);
+                assert!(sink.write_at(0, &[1]).is_err());
+            } else {
+                assert!(sink.flush().is_err());
+            }
+            assert!(sink.write_at(1, &[2]).is_err());
+            assert!(sink.flush().is_err());
+            assert_eq!(inner.0.load(Ordering::Relaxed), 1);
+            sink.discard_partial().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_hook_propagates_a_failed_data_flush() {
+        let directory = crate::tests::temporary("failed-hook");
+        crate::create_private_directory(&directory).unwrap();
+        let store = ResumeStore::create(directory.join("resume")).unwrap();
+        let hook = DurableHook {
+            plan: std::sync::Weak::new(),
+            store: Arc::new(Mutex::new(store)),
+            subject: SubjectId::new(1, [0; 32], 1).unwrap(),
+        };
+        let inner = Arc::new(OnceFailingFlush::default());
+        let sink = CountingSink::opened(Box::new(inner.clone()), 0, Some(hook));
+        sink.flush_due.store(1, Ordering::Relaxed);
+        assert!(sink.write_at(0, &[1]).is_err());
+        assert!(sink.flush().is_err());
+        assert_eq!(inner.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Default)]
     struct BlockingState {
         started: bool,
+        entered: usize,
         release: bool,
         discarded: bool,
         writes: usize,
@@ -305,17 +389,48 @@ mod tests {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
             let mut state = self.shared.0.lock().map_err(|_| vot_scheduler::SinkError)?;
             state.started = true;
+            state.entered += 1;
             self.shared.1.notify_all();
-            while !state.release {
-                state = self
-                    .shared
-                    .1
-                    .wait(state)
-                    .map_err(|_| vot_scheduler::SinkError)?;
-            }
+            let (mut state, timeout) = self
+                .shared
+                .1
+                .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+                    !state.release
+                })
+                .map_err(|_| vot_scheduler::SinkError)?;
+            assert!(!timeout.timed_out(), "write was never released");
             state.writes += 1;
             Ok(())
         }
+    }
+
+    #[test]
+    fn disjoint_writers_reach_the_sink_concurrently() {
+        let inner = BlockingSink::default();
+        let sink = Arc::new(CountingSink::custom(Box::new(inner.clone())));
+        let writers: Vec<_> = (0..2)
+            .map(|offset| {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || sink.write_at(offset, &[1]))
+            })
+            .collect();
+        let state = inner.shared.0.lock().unwrap();
+        let (mut state, timeout) = inner
+            .shared
+            .1
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                state.entered != 2
+            })
+            .unwrap();
+        state.release = true;
+        inner.shared.1.notify_all();
+        drop(state);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert!(!timeout.timed_out(), "writes were serialized");
+        sink.flush().unwrap();
+        assert_eq!(sink.placed(), 2);
     }
 
     impl ReceiveSink for BlockingSink {

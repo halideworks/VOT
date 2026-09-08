@@ -3009,7 +3009,7 @@ fn send_segmented(
 /// The control message does not exist here; the caller falls back to sending
 /// the packets one at a time. Never reached while `offload_available` says no,
 /// and honest if it somehow were.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn send_segmented(
     _socket: &UdpSocket,
     _burst: &[u8],
@@ -3017,6 +3017,17 @@ fn send_segmented(
     _destination: SocketAddr,
 ) -> Result<(), Error> {
     Err(Error::Backend)
+}
+
+#[cfg(windows)]
+fn send_segmented(
+    socket: &UdpSocket,
+    burst: &[u8],
+    segment: usize,
+    destination: SocketAddr,
+) -> Result<(), Error> {
+    vot_platform_net::send_segmented(socket, burst, segment, destination)
+        .map_err(|_| Error::Backend)
 }
 
 /// Whether to try segmentation offload on this platform.
@@ -3029,7 +3040,7 @@ fn send_segmented(
 /// beside the bytes and `feed_received` cuts the buffer back into datagrams
 /// first.
 const fn offload_available() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", windows))
 }
 
 /// Hands one burst of equally sized packets to the socket, twice while the
@@ -4688,6 +4699,20 @@ mod tests {
         assert!(!should_revalidate(0));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_segmentation_refusal_falls_back_to_individual_datagrams() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = bounded_receiver();
+        let to = receiver.local_addr().unwrap();
+        let burst = vec![0x53; 65_508];
+        assert!(vot_platform_net::send_segmented(&sender, &burst, 32_754, to).is_err());
+        let mut refused = 0;
+        send_burst(&sender, &burst, 32_754, to, true, &mut refused).unwrap();
+        assert_eq!(collected(&receiver), vec![vec![0x53; 32_754]; 2]);
+        assert_eq!(refused, 0);
+    }
+
     #[test]
     fn a_send_refused_for_any_other_reason_still_fails_the_burst() {
         // Only a size refusal is a lost probe; everything else is the
@@ -5524,18 +5549,20 @@ mod tests {
 
     #[test]
     fn a_pair_carries_records_at_a_datagram_size_the_path_allows() {
-        // Loopback carries 65536, so the ceiling itself is a real configuration
-        // here: 65507 plus the IP and UDP headers is exactly IPv4's 65535-byte
-        // total length. Sending at it is what proves the constant is a size
-        // the socket carries rather than one validation merely accepts.
+        // macOS loopback has a 16 KiB MTU; subtract IPv4 and UDP headers.
+        let ceiling = if cfg!(target_os = "macos") {
+            16_384 - 28
+        } else {
+            super::LARGEST_DATAGRAM_SIZE
+        };
         let (certificate, key) = credentials();
         let mut server_config = Config::server(limits(), certificate, key);
-        server_config.max_datagram_bytes = super::LARGEST_DATAGRAM_SIZE;
+        server_config.max_datagram_bytes = ceiling;
         let server = Transport::serve("127.0.0.1:0".parse().expect("an address"), &server_config)
             .expect("a server");
         let mut client_config = Config::client(limits());
         client_config.verify_peer = false;
-        client_config.max_datagram_bytes = super::LARGEST_DATAGRAM_SIZE;
+        client_config.max_datagram_bytes = ceiling;
         let mut client = Transport::connect(
             "127.0.0.1:0".parse().expect("an address"),
             server.local_address(),
@@ -5574,7 +5601,7 @@ mod tests {
         // lands there exactly; a ceiling the socket refuses can never be a
         // discovered size, which is what makes this an assertion and not a
         // wait. A budget of passes bounds the loop, not a clock.
-        let target = u64::try_from(super::LARGEST_DATAGRAM_SIZE).expect("a size fits");
+        let target = u64::try_from(ceiling).expect("a size fits");
         let mut discovered = None;
         for _ in 0_u32..5_000 {
             let _ = client.flush();

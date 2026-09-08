@@ -5,6 +5,11 @@
 use std::io;
 use std::net::UdpSocket;
 
+#[cfg(windows)]
+mod windows_udp;
+#[cfg(windows)]
+pub use windows_udp::send_segmented;
+
 /// Sets the don't-fragment flag for PMTU discovery. Required for sound path
 /// probing above UDP.
 ///
@@ -361,6 +366,13 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
+    #[cfg_attr(
+        windows,
+        allow(
+            clippy::useless_conversion,
+            reason = "Unix socket options return signed integers"
+        )
+    )]
     fn sized_buffers_grow_toward_what_was_asked() {
         // Kernels clamp silently; assert strict growth or adequacy.
         #[cfg(any(target_os = "linux", target_os = "macos"))]

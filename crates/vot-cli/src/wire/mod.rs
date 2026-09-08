@@ -21,7 +21,9 @@ mod relay;
 mod resolution;
 mod serve;
 
-pub use fetch::{fetch_bundle, fetch_bundle_with, fetch_via_rendezvous, probe_serve};
+pub use fetch::{
+    fetch_bundle, fetch_bundle_with, fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve,
+};
 pub use push::{
     PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from, receive_push,
     receive_push_on,

@@ -222,6 +222,7 @@ where
         holder,
         provers,
         Some((PROGRESS_QUANTUM_BYTES, progress)),
+        crate::ReceiveSeams::default(),
     )?;
     if wanted {
         let first = outcome
@@ -252,11 +253,13 @@ fn fetch_over_configured<F>(
     holder: Option<std::sync::Arc<crate::authz::Holder>>,
     provers: Option<usize>,
     progress: Option<(u64, crate::Progress)>,
+    seams: crate::ReceiveSeams,
 ) -> Result<(crate::drive::Fetched, std::time::Instant), Error>
 where
     F: Fn() -> Result<Transport, Error> + Sync,
 {
     let mut fetcher = BundleFetcher::begin_with(primary, bundle, pin, holder, extensions)?;
+    fetcher.set_receive_seams(seams);
     let provers = provers.unwrap_or_else(|| fetcher.proving_threads());
     fetcher.set_proving_threads(provers_per_rail(provers, rails))?;
     if let Some((quantum, observer)) = progress {
@@ -283,6 +286,18 @@ where
 pub fn fetch_bundle_with(
     options: crate::FetchOptions,
     bundle: &Path,
+) -> Result<PackageSummary, Error> {
+    fetch_bundle_with_seams(options, bundle, crate::ReceiveSeams::default())
+}
+
+/// Fetches with receive hooks, including completion of empty and resumed objects.
+///
+/// # Errors
+/// As [`fetch_bundle_with`], including failures returned by receive hooks.
+pub fn fetch_bundle_with_seams(
+    options: crate::FetchOptions,
+    bundle: &Path,
+    seams: crate::ReceiveSeams,
 ) -> Result<PackageSummary, Error> {
     let crate::FetchOptions {
         address,
@@ -330,6 +345,7 @@ pub fn fetch_bundle_with(
         holder,
         provers,
         forwarded,
+        seams,
     )?;
     if let Some((_, shared)) = &shared
         && let Ok(mut state) = shared.lock()

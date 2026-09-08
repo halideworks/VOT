@@ -243,7 +243,7 @@ pub(crate) struct ProgressReport {
     /// When this fetch first observed bytes it placed itself.
     pub(crate) first_moved: Option<std::time::Instant>,
     /// Where placed-byte crossings are reported, if anywhere.
-    pub(crate) placed: Option<PlacedReport>,
+    pub(crate) placed: Option<Arc<Mutex<PlacedReport>>>,
 }
 
 /// The provers this fetch may start, and how a pass waits on them.
@@ -871,11 +871,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if quantum == 0 {
             return Err(Error::InvalidArguments);
         }
-        self.report.placed = Some(PlacedReport {
+        self.report.placed = Some(Arc::new(Mutex::new(PlacedReport {
             quantum,
             next_at: quantum,
             observer,
-        });
+        })));
         Ok(())
     }
 
@@ -891,9 +891,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
         if self.report.first_moved.is_none() && moved != 0 {
             self.report.first_moved = Some(std::time::Instant::now());
         }
-        let Some(report) = &mut self.report.placed else {
+        let Some(report) = &self.report.placed else {
             return;
         };
+        let mut report = report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(next) = crossing(placed, report.next_at, report.quantum) else {
             return;
         };

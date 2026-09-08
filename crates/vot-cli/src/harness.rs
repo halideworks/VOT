@@ -183,6 +183,7 @@ pub(crate) struct Duplex {
     datagrams_sent: u64,
     /// Lose every nth datagram this end sends; zero loses none.
     pub(crate) drop_datagram_every: u64,
+    pub(crate) before_poll: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// A connected pair of [`Duplex`] ends.
@@ -203,6 +204,7 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
             closed: false,
             datagrams_sent: 0,
             drop_datagram_every: 0,
+            before_poll: None,
         },
         Duplex {
             inbox: right,
@@ -212,6 +214,7 @@ pub(crate) fn duplex_pair() -> (Duplex, Duplex) {
             closed: false,
             datagrams_sent: 0,
             drop_datagram_every: 0,
+            before_poll: None,
         },
     )
 }
@@ -284,6 +287,9 @@ impl TransportAdapter for Duplex {
     }
 
     fn poll(&mut self) -> Option<Event> {
+        if let Some(before_poll) = &mut self.before_poll {
+            before_poll();
+        }
         self.inbox.events.lock().expect("the inbox").pop_front()
     }
 

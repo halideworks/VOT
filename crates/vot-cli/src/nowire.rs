@@ -101,6 +101,6 @@ pub fn fetch_bundle_with_seams(
     _options: FetchOptions,
     _bundle: &Path,
     _seams: crate::ReceiveSeams,
-) -> Result<PackageSummary, Error> {
+) -> Result<(PackageSummary, u64), Error> {
     Err(Error::WireUnsupported)
 }

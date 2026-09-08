@@ -287,10 +287,12 @@ pub fn fetch_bundle_with(
     options: crate::FetchOptions,
     bundle: &Path,
 ) -> Result<PackageSummary, Error> {
-    fetch_bundle_with_seams(options, bundle, crate::ReceiveSeams::default())
+    fetch_bundle_configured(options, bundle, crate::ReceiveSeams::default(), true)
+        .map(|(package, _)| package)
 }
 
-/// Fetches with receive hooks, including completion of empty and resumed objects.
+/// Fetches with receive hooks, returning the package and bytes moved in this attempt.
+/// Progress reports actual placement without a synthetic tick after finishing.
 ///
 /// # Errors
 /// As [`fetch_bundle_with`], including failures returned by receive hooks.
@@ -298,7 +300,16 @@ pub fn fetch_bundle_with_seams(
     options: crate::FetchOptions,
     bundle: &Path,
     seams: crate::ReceiveSeams,
-) -> Result<PackageSummary, Error> {
+) -> Result<(PackageSummary, u64), Error> {
+    fetch_bundle_configured(options, bundle, seams, false)
+}
+
+fn fetch_bundle_configured(
+    options: crate::FetchOptions,
+    bundle: &Path,
+    seams: crate::ReceiveSeams,
+    finish_progress: bool,
+) -> Result<(PackageSummary, u64), Error> {
     let crate::FetchOptions {
         address,
         holder,
@@ -347,7 +358,8 @@ pub fn fetch_bundle_with_seams(
         forwarded,
         seams,
     )?;
-    if let Some((_, shared)) = &shared
+    if finish_progress
+        && let Some((_, shared)) = &shared
         && let Ok(mut state) = shared.lock()
     {
         let length = outcome.package.logical_length;
@@ -356,7 +368,7 @@ pub fn fetch_bundle_with_seams(
             (state.1)(length, Some(length));
         }
     }
-    Ok(outcome.package)
+    Ok((outcome.package, outcome.moved))
 }
 
 /// Whether a caller's rail count is one the serve side can seat.

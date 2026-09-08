@@ -3583,7 +3583,7 @@ mod tests {
         let bundle = crate::tests::temporary("fetch-options-bundle");
         let built = crate::build_bundle(&source, &bundle).unwrap();
 
-        // Two fetches of two rails each, so four sessions.
+        // Three fetches of two rails each.
         let (listening, address) = mpsc::channel();
         let serving_bundle = bundle.to_path_buf();
         let serving = std::thread::spawn(move || {
@@ -3591,7 +3591,7 @@ mod tests {
                 &serving_bundle,
                 "127.0.0.1:0".parse().unwrap(),
                 &Credentials::Ephemeral,
-                Some(4),
+                Some(6),
                 |at, _, identity| {
                     let _ = listening.send((at, identity));
                 },
@@ -3652,11 +3652,34 @@ mod tests {
         });
         let again = crate::tests::temporary("fetch-options-fetched-again");
         let into = again.to_path_buf();
-        let package = within("the fetch through options, every byte", 60, move || {
-            fetch_bundle_with(options(2, Some((1, observer))), &into)
+        let (package, moved) = within("the fetch through options, every byte", 60, move || {
+            fetch_bundle_with_seams(
+                options(2, Some((1, observer))),
+                &into,
+                crate::ReceiveSeams::default(),
+            )
         })
         .expect("a fetch");
         assert_eq!(package, built);
+        assert_eq!(moved, built.logical_length);
+        let actual_only = crate::tests::temporary("fetch-options-actual-only");
+        let actual_reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&actual_reports);
+        let observer: crate::Progress = Box::new(move |placed, total| {
+            recording.lock().unwrap().push((placed, total));
+        });
+        let into = actual_only.to_path_buf();
+        let (package, moved) = within("actual placement without a synthetic tick", 60, move || {
+            fetch_bundle_with_seams(
+                options(2, Some((4 << 20, observer))),
+                &into,
+                crate::ReceiveSeams::default(),
+            )
+        })
+        .expect("fetch with seams");
+        assert_eq!(package, built);
+        assert_eq!(moved, built.logical_length);
+        assert!(actual_reports.lock().unwrap().is_empty());
         let served = joined("the serving thread", serving).expect("served");
         assert_eq!(served, built);
         let heard = heard.lock().unwrap();
@@ -3669,7 +3692,7 @@ mod tests {
             (built.logical_length, Some(built.logical_length)),
             "the last report is not the whole package: {heard:?}"
         );
-        crate::harness::discard(&[&source, &bundle, &fetched, &again]);
+        crate::harness::discard(&[&source, &bundle, &fetched, &again, &actual_only]);
     }
 
     #[test]

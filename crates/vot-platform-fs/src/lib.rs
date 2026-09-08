@@ -370,6 +370,7 @@ pub fn same_file_regular_windows_link(
     let bytes = header
         .checked_add(leaf_bytes as usize)
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let bytes = bytes.max(std::mem::size_of::<FILE_LINK_INFORMATION>());
     let words = bytes.div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     let information = buffer.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
@@ -743,7 +744,7 @@ mod tests {
     fn retained_handle_removes_only_its_own_name() {
         let directory = directory("remove");
         let path = directory.join("held");
-        let published = directory.join("published");
+        let published = directory.join("p");
         let file = create_staging_file(&path).unwrap();
         assert!(same_file_handle(&file, &path).unwrap());
         link_file_handle(&file, &path, &published).unwrap();

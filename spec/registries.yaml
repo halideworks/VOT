@@ -466,6 +466,11 @@
       "value": "0x0004",
       "name": "MACOS_LOCAL",
       "status": "reserved for implementation profile"
+    },
+    {
+      "value": "0x0005",
+      "name": "POSIX_NAS",
+      "status": "draft"
     }
   ],
   "assurance": [

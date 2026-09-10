@@ -1,10 +1,14 @@
 //! Append, replay, and compaction, with the syscall ordering visible.
 
 use super::{CHECKPOINT_FLAG, Error, HEADER_LEN, Header, MAX_PAYLOAD, Record, crc32c, encode, io};
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use vot_platform_fs::FileLocation;
 
 /// Largest journal a replay will read. Replay holds the whole file, so this
 /// is the ceiling on that, not a limit the format needs.
@@ -28,11 +32,15 @@ pub struct Journal {
     /// that shrinks it is a compaction that has to read it.
     pub(super) bytes: u64,
     pub(super) path: PathBuf,
+    #[cfg(unix)]
+    location: FileLocation,
     pub(super) incarnation: [u8; 16],
     pub(super) next_sequence: u64,
     pub(super) poisoned: bool,
     #[cfg(test)]
     pub(super) fail_next_repair_sync: bool,
+    #[cfg(test)]
+    pub(super) fail_next_compaction_rename: bool,
 }
 
 /// Claims a journal for one writer, on the journal itself.
@@ -62,6 +70,72 @@ pub(super) fn claim(file: &File) -> Result<(), Error> {
 pub struct DurableWitness(());
 
 impl Journal {
+    #[cfg(unix)]
+    pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
+        Self::create_at(FileLocation::from_path(path)?, incarnation)
+    }
+
+    /// Keeps every later journal operation relative to the retained directory.
+    #[cfg(unix)]
+    pub fn create_at(location: FileLocation, incarnation: [u8; 16]) -> Result<Self, Error> {
+        location.require_removal_parent()?;
+        let file = location.create()?;
+        if let Err(error) = claim(&file).and_then(|()| location.sync_parent().map_err(Error::Io)) {
+            let _ = location.remove_owned(&file);
+            return Err(error);
+        }
+        Ok(Self {
+            file,
+            bytes: 0,
+            path: location.path(),
+            location,
+            incarnation,
+            next_sequence: 0,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_repair_sync: false,
+            #[cfg(test)]
+            fail_next_compaction_rename: false,
+        })
+    }
+
+    #[cfg(unix)]
+    pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
+        Self::open_at(FileLocation::from_path(path)?, incarnation)
+    }
+
+    /// Claims and repairs a journal through its retained parent directory.
+    #[cfg(unix)]
+    pub fn open_at(location: FileLocation, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
+        location.require_removal_parent()?;
+        let mut file = location.open_write()?;
+        claim(&file)?;
+        let replay = replay_reader(&mut file, incarnation)?;
+        let next_sequence = next_sequence_after(replay.records.last())?;
+        if replay.torn_tail {
+            file.set_len(replay.valid_bytes)?;
+            file.sync_data()?;
+        }
+        let bytes = file.seek(SeekFrom::End(0))?;
+        Ok((
+            Self {
+                file,
+                bytes,
+                path: location.path(),
+                location,
+                incarnation,
+                next_sequence,
+                poisoned: false,
+                #[cfg(test)]
+                fail_next_repair_sync: false,
+                #[cfg(test)]
+                fail_next_compaction_rename: false,
+            },
+            replay,
+        ))
+    }
+
+    #[cfg(not(unix))]
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
         vot_platform_fs::validate_removal_parent(path)?;
         let file = OpenOptions::new()
@@ -87,9 +161,12 @@ impl Journal {
             poisoned: false,
             #[cfg(test)]
             fail_next_repair_sync: false,
+            #[cfg(test)]
+            fail_next_compaction_rename: false,
         })
     }
 
+    #[cfg(not(unix))]
     pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         claim(&file)?;
@@ -113,6 +190,8 @@ impl Journal {
                 poisoned: false,
                 #[cfg(test)]
                 fail_next_repair_sync: false,
+                #[cfg(test)]
+                fail_next_compaction_rename: false,
             },
             replay,
         ))
@@ -164,9 +243,24 @@ impl Journal {
             .map(|sequence| (sequence, DurableWitness(())))
     }
 
+    /// Makes a replayed journal durable before recovery emits an observation.
+    pub fn sync_replay(&mut self) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        self.sync_repair_file()
+    }
+
     /// Repairs this writer after an ambiguous append using its held lock.
     pub fn repair_poisoned(&mut self) -> Result<Replay, Error> {
         if !self.poisoned {
+            return Err(Error::InvalidState);
+        }
+        #[cfg(unix)]
+        let same = self.location.same_file(&self.file)?;
+        #[cfg(not(unix))]
+        let same = vot_platform_fs::same_file_handle(&self.file, &self.path)?;
+        if !same {
             return Err(Error::InvalidState);
         }
         self.file.seek(SeekFrom::Start(0))?;
@@ -195,7 +289,14 @@ impl Journal {
 
     /// Removes this journal only while its retained handle still owns its name.
     pub fn remove_owned(self) -> Result<(), Error> {
-        vot_platform_fs::remove_file_handle(&self.file, &self.path).map_err(Error::Io)
+        #[cfg(unix)]
+        {
+            self.location.remove_owned(&self.file).map_err(Error::Io)
+        }
+        #[cfg(not(unix))]
+        {
+            vot_platform_fs::remove_file_handle(&self.file, &self.path).map_err(Error::Io)
+        }
     }
 
     #[must_use]
@@ -215,6 +316,9 @@ impl Journal {
     /// an inode with no name and an append into it would be a record that
     /// survives no restart.
     pub fn compact_checkpoint(&mut self, state: u8, payload: &[u8]) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
         if state & CHECKPOINT_FLAG != 0 {
             return Err(Error::InvalidState);
         }
@@ -248,6 +352,13 @@ impl Journal {
             file_name.to_string_lossy(),
             std::process::id()
         ));
+        #[cfg(unix)]
+        let temporary = self
+            .location
+            .sibling(temporary.file_name().ok_or(Error::InvalidHeader)?)?;
+        #[cfg(unix)]
+        let mut file = temporary.create()?;
+        #[cfg(not(unix))]
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -261,7 +372,21 @@ impl Journal {
         // journal itself rather than on a sibling that has to be named from
         // its path and left behind.
         claim(&file)?;
-        fs::rename(&temporary, &self.path)?;
+        #[cfg(unix)]
+        let renamed = temporary.replace_private(&self.location);
+        #[cfg(not(unix))]
+        let renamed = fs::rename(&temporary, &self.path);
+        #[cfg(test)]
+        let renamed = renamed.and_then(|()| {
+            if std::mem::take(&mut self.fail_next_compaction_rename) {
+                Err(io::Error::other("lost compaction rename acknowledgment"))
+            } else {
+                Ok(())
+            }
+        });
+        renamed.inspect_err(|_| {
+            self.poisoned = true;
+        })?;
         // Past this point the journal this handle holds is unlinked, so a
         // failure cannot leave the caller appending into it. Anything that
         // goes wrong from here poisons.
@@ -288,6 +413,9 @@ impl Journal {
         mut replacement: File,
         next_sequence: u64,
     ) -> Result<(), Error> {
+        #[cfg(unix)]
+        self.location.sync_parent()?;
+        #[cfg(not(unix))]
         File::open(parent_directory(&self.path))?.sync_all()?;
         replacement.seek(SeekFrom::Start(0))?;
         let replayed = replay_reader(&mut replacement, self.incarnation)?;
@@ -326,6 +454,7 @@ pub(super) fn next_sequence_after(last: Option<&Record>) -> Result<u64, Error> {
     last.map_or(Ok(0), |record| successor(record.sequence))
 }
 
+#[cfg(any(not(unix), test))]
 pub(super) fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -333,8 +462,20 @@ pub(super) fn parent_directory(path: &Path) -> &Path {
 }
 
 pub fn replay(path: &Path, current_incarnation: [u8; 16]) -> Result<Replay, Error> {
-    let mut file = File::open(path)?;
-    replay_reader(&mut file, current_incarnation)
+    #[cfg(unix)]
+    {
+        replay_at(&FileLocation::from_path(path)?, current_incarnation)
+    }
+    #[cfg(not(unix))]
+    {
+        replay_reader(&mut File::open(path)?, current_incarnation)
+    }
+}
+
+#[cfg(unix)]
+pub fn replay_at(location: &FileLocation, current_incarnation: [u8; 16]) -> Result<Replay, Error> {
+    location.require_removal_parent()?;
+    replay_reader(&mut location.open_read()?, current_incarnation)
 }
 
 pub(super) fn replay_reader(

@@ -4,6 +4,7 @@ function vot_journal::crc32c
 function vot_journal::crc32c_combine
 function vot_journal::crc32c_update
 function vot_journal::replay
+function vot_journal::replay_at
 struct vot_journal::DurableWitness
 struct vot_journal::Journal
 struct vot_journal::Record

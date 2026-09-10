@@ -447,6 +447,78 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn ancestor_rename_keeps_compaction_replay_and_cleanup_in_the_held_directory() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let fixture = temp_path("retained-parent");
+        let root = fixture.directory.join("selected");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let directory = vot_platform_fs::Directory::open(&root).unwrap();
+        let location = directory.entry(std::ffi::OsStr::new("journal")).unwrap();
+        let mut journal = Journal::create_at(location.clone(), [2; 16]).unwrap();
+        journal.append_durable(1, b"one").unwrap();
+        let moved = fixture.directory.join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("journal"), b"unrelated").unwrap();
+        journal.compact_checkpoint(2, b"two").unwrap();
+        journal.append_durable(3, b"three").unwrap();
+        drop(journal);
+        let replayed = replay_at(&location, [2; 16]).unwrap();
+        assert_eq!(replayed.records.len(), 2);
+        assert_eq!(replayed.records[0].payload, b"two");
+        assert_eq!(replayed.records[1].payload, b"three");
+        let (journal, _) = Journal::open_at(location, [2; 16]).unwrap();
+        journal.remove_owned().unwrap();
+        assert!(!moved.join("journal").exists());
+        assert_eq!(std::fs::read(root.join("journal")).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn a_lost_compaction_acknowledgment_never_resumes_the_retired_inode() {
+        let path = temp_path("lost-compaction-ack");
+        let mut journal = Journal::create(&path, [2; 16]).unwrap();
+        journal.append_durable(1, b"one").unwrap();
+        journal.fail_next_compaction_rename = true;
+        assert!(journal.compact_checkpoint(2, b"two").is_err());
+        assert!(journal.is_poisoned());
+        assert!(matches!(
+            journal.append_durable(3, b"lost"),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(
+            journal.compact_checkpoint(3, b"lost"),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(journal.sync_replay(), Err(Error::Poisoned)));
+        assert!(matches!(
+            journal.repair_poisoned(),
+            Err(Error::InvalidState)
+        ));
+        assert!(journal.is_poisoned());
+        drop(journal);
+        let (mut journal, replayed) = Journal::open_current(&path, [2; 16]).unwrap();
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].payload, b"two");
+        journal.sync_replay().unwrap();
+        journal.append_durable(3, b"three").unwrap();
+        drop(journal);
+        assert_eq!(
+            replay(&path, [2; 16])
+                .unwrap()
+                .records
+                .last()
+                .unwrap()
+                .payload,
+            b"three"
+        );
+    }
+
+    #[test]
     fn a_compaction_that_cannot_adopt_what_it_renamed_poisons() {
         /// A handle over bytes that stand in for what a rename put in place.
         fn landed(path: &Path, bytes: &[u8]) -> File {
@@ -490,14 +562,16 @@ mod tests {
 
         // Failing before the rename changes nothing, which is the half of the
         // contract that still holds.
-        let mut early = Journal::create(&temp_path("compaction-early"), [2; 16]).unwrap();
+        let early_path = temp_path("compaction-early");
+        let mut early = Journal::create(&early_path, [2; 16]).unwrap();
         early.append_durable(1, b"one").unwrap();
-        let vanished = early.path.with_file_name("no-such-directory/j");
-        let kept = early.path.clone();
-        early.path = vanished;
-        assert!(early.compact_checkpoint(2, b"sealed").is_err());
+        assert!(
+            early
+                .compact_checkpoint(CHECKPOINT_FLAG, b"sealed")
+                .is_err()
+        );
         assert!(!early.is_poisoned());
-        early.path = kept;
+        early.append_durable(2, b"still writable").unwrap();
 
         drop(journal);
         drop(early);

@@ -2904,6 +2904,7 @@ dependencies = [
  "vot-receipt",
  "vot-scheduler",
  "vot-sdk",
+ "vot-verifier",
 ]
 
 [[package]]

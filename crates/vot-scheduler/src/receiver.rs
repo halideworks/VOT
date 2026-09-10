@@ -146,12 +146,7 @@ impl ReliableReceiver {
             return Err(Error::UnknownObject);
         }
         let verified = check_range_proof(subject, covered_offset, data, proof)?;
-        self.insert_checked_range(
-            subject_id(verified.object()),
-            verified.covered_offset(),
-            verified.data(),
-            caller_reserved,
-        )
+        self.insert_checked_range(&verified, caller_reserved)
     }
 
     /// Books a range whose proof [`check_range_proof`] has already held:
@@ -162,11 +157,12 @@ impl ReliableReceiver {
     /// instead and will release it itself.
     fn insert_checked_range(
         &mut self,
-        subject: SubjectId,
-        covered_offset: u64,
-        data: &[u8],
+        verified: &vot_verified_range::VerifiedSlice<'_>,
         caller_reserved: bool,
     ) -> Result<(), Error> {
+        let subject = subject_id(verified.object());
+        let covered_offset = verified.covered_offset();
+        let data = verified.data();
         if self.verified.contains(&subject) {
             return Ok(());
         }
@@ -188,7 +184,7 @@ impl ReliableReceiver {
             Some(self.staging.reserve(bytes)?)
         };
         self.peak_staging = self.peak_staging.max(self.staging.used());
-        active.sink.write_at(covered_offset, data)?;
+        active.sink.write_verified(verified)?;
         drop(hold);
         booking.commit();
         Ok(())
@@ -249,12 +245,7 @@ impl ReliableReceiver {
         reason = "admission spends the witness; handing it back would invite re-admitting it"
     )]
     pub fn admit_verified_range(&mut self, range: VerifiedRange) -> Result<(), Error> {
-        self.insert_checked_range(
-            subject_id(range.inner.object()),
-            range.inner.covered_offset(),
-            range.inner.data(),
-            false,
-        )
+        self.insert_checked_range(&range.inner.as_slice(), false)
     }
 
     /// Accepts a decoded proof bundle whose records may arrive out of order.
@@ -452,7 +443,7 @@ impl VerifiedRange {
     /// # Errors
     /// Surfaces the sink's refusal; this witness stays usable for a retry.
     pub fn write_to(&self, sink: &dyn RangeSink) -> Result<WrittenRange, SinkError> {
-        sink.write_at(self.inner.covered_offset(), self.inner.data())?;
+        sink.write_verified(&self.inner.as_slice())?;
         Ok(WrittenRange {
             subject: subject_id(self.inner.object()),
             covered_offset: self.inner.covered_offset(),

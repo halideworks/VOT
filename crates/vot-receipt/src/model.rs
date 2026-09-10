@@ -57,7 +57,7 @@ impl Receipt {
         if !(1..=2).contains(&self.suite_id) {
             return Err(Error::InvalidSuite);
         }
-        if !(1..=4).contains(&self.provider) {
+        if !(1..=5).contains(&self.provider) {
             return Err(Error::InvalidProvider);
         }
         if self.subject_length > i64::MAX as u64 {

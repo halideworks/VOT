@@ -24,6 +24,13 @@ use vot_sdk::coverage::ObjectCoverage;
 use vot_sdk::object::ObjectId;
 use vot_sdk::verify::VerifiedSlice;
 
+#[cfg(unix)]
+mod directory;
+#[cfg(unix)]
+pub use directory::{ReceiveDirectory, ResumeState};
+#[cfg(unix)]
+pub use vot_platform_fs::NasContract;
+
 const CREATE_ATTEMPTS: usize = 32;
 static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
 
@@ -172,15 +179,18 @@ struct Shared {
 /// in-flight accept.
 pub struct NativeFile {
     object: ObjectId,
+    #[cfg(not(unix))]
     destination: PathBuf,
     #[cfg_attr(not(windows), allow(dead_code))]
     staging: PathBuf,
     /// Writable staging handle for accepts, held outside the state lock so
     /// disjoint positional writes proceed concurrently.
     #[cfg(unix)]
-    write_handle: File,
+    write_handle: Option<File>,
     #[cfg(unix)]
     profile: CommitProfile,
+    #[cfg(unix)]
+    nas_contract: NasContract,
     /// Journal path and journal identity, exposed so a consumer can persist
     /// them at admission and hand them back to [`Self::resume`] (ADR-0047).
     #[cfg(unix)]
@@ -227,33 +237,61 @@ impl NativeFile {
         #[cfg(unix)]
         let (backend, staging, journal) = create_unix(object, parent, &destination, profile)?;
         #[cfg(windows)]
-        let (backend, staging, _journal) = write_all_at_windows_create(object, parent)?;
+        let (backend, staging, journal) = write_all_at_windows_create(object, parent)?;
         #[cfg(not(any(unix, windows)))]
-        let (backend, staging, _journal) = {
+        let (backend, staging, journal) = {
             let _ = (object, parent);
             return Err(Error::plain(ErrorKind::UnsupportedPlatform));
         };
 
+        Self::from_backend(
+            object,
+            &destination,
+            profile,
+            backend,
+            staging,
+            journal,
+            false,
+        )
+    }
+
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn from_backend(
+        object: &ObjectId,
+        destination: &Path,
+        profile: CommitProfile,
+        backend: Backend,
+        staging: PathBuf,
+        journal: Option<PathBuf>,
+        preserve_on_error: bool,
+    ) -> Result<Self, Error> {
+        #[cfg(unix)]
+        let _ = destination;
         #[cfg(unix)]
         let write_handle = match backend.commit.try_clone_staging() {
             Ok(handle) => handle,
             Err(error) => {
-                let _ = backend.commit.cancel();
+                if !preserve_on_error {
+                    let _ = backend.commit.cancel();
+                }
                 return Err(map_posix(error));
             }
         };
         Ok(Self {
             object: object.clone(),
-            destination,
+            #[cfg(not(unix))]
+            destination: destination.to_path_buf(),
             #[cfg(unix)]
             journal: journal.unwrap_or_default(),
             #[cfg(unix)]
             incarnation: backend_incarnation(&backend),
             staging,
             #[cfg(unix)]
-            write_handle,
+            write_handle: Some(write_handle),
             #[cfg(unix)]
             profile,
+            #[cfg(unix)]
+            nas_contract: NasContract::Unqualified,
             shared: std::sync::Mutex::new(Shared {
                 coverage: ObjectCoverage::new(object),
                 backend: Some(backend),
@@ -303,9 +341,9 @@ impl NativeFile {
     /// the same trust domain as the session record itself, or take one of
     /// the conservative outs the ADR names, a prefix-only run list, the
     /// Strict profile's read-back, or an external rehash before publish.
-    /// The staging path carries the same trust: the journal's incarnation
-    /// binds the journal alone, and nothing verifies the staging file
-    /// belongs to it beyond the caller pairing them honestly.
+    /// The admission binds staging and parent identities, the destination
+    /// name, profile and NAS contract. Coverage still belongs to the caller's
+    /// trusted checkpoint; admission identity does not verify stored bytes.
     ///
     /// Refuses before any write: a journal past admission, a different
     /// incarnation, an existing destination, invalid runs, and a staging
@@ -351,12 +389,14 @@ impl NativeFile {
         let write_handle = backend.commit.try_clone_staging().map_err(map_posix)?;
         Ok(Self {
             object: object.clone(),
-            destination,
+            #[cfg(not(unix))]
+            destination: destination.to_path_buf(),
             journal: journal_path,
             incarnation,
             staging: staging_path,
-            write_handle,
+            write_handle: Some(write_handle),
             profile,
+            nas_contract: NasContract::Unqualified,
             shared: std::sync::Mutex::new(Shared {
                 coverage,
                 backend: Some(backend),
@@ -372,6 +412,42 @@ impl NativeFile {
             #[cfg(test)]
             write_park: None,
         })
+    }
+
+    /// Captures the names and admitted contract for a shared-directory resume.
+    /// Persist in the same trust domain as the authenticated object and coverage.
+    #[cfg(unix)]
+    pub fn resume_state(&self) -> Result<ResumeState, Error> {
+        let shared = self.lock();
+        Self::ensure_accepting(&shared)?;
+        Ok(ResumeState {
+            staging_name: self
+                .staging
+                .file_name()
+                .ok_or_else(|| Error::plain(ErrorKind::InvalidDestination))?
+                .to_owned(),
+            journal_name: self
+                .journal
+                .file_name()
+                .ok_or_else(|| Error::plain(ErrorKind::InvalidDestination))?
+                .to_owned(),
+            incarnation: self.incarnation,
+            profile: self.profile,
+            nas_contract: self.nas_contract,
+            runs: shared.coverage.runs().collect(),
+        })
+    }
+
+    /// Opens retained staging read only for conservative resume verification.
+    #[cfg(unix)]
+    pub fn read_staging(&self) -> Result<File, Error> {
+        self.lock()
+            .backend
+            .as_ref()
+            .ok_or_else(|| Error::plain(ErrorKind::StateConflict))?
+            .commit
+            .read_staging()
+            .map_err(map_posix)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
@@ -441,7 +517,11 @@ impl NativeFile {
         if self.write_fault.swap(false, Ordering::Relaxed) {
             return Err(io::Error::other("injected write fault"));
         }
-        let written = self.write_handle.write_all_at(data, offset);
+        let written = self
+            .write_handle
+            .as_ref()
+            .ok_or_else(|| io::Error::other("staging writes are sealed"))?
+            .write_all_at(data, offset);
         #[cfg(test)]
         if written.is_ok()
             && let Some(park) = &self.write_park
@@ -566,6 +646,19 @@ impl NativeFile {
     /// in-flight accept: an incomplete coverage, which any outstanding
     /// reservation implies, is refused before sealing.
     pub fn publish(&mut self) -> Result<(), Error> {
+        self.publish_inner()?;
+        Self::cleanup_backend(self.state_mut());
+        Ok(())
+    }
+
+    /// Keeps the publication journal until the caller checkpoints its own metadata.
+    /// A dropped or abandoned receiver leaves that journal available for recovery.
+    #[cfg(unix)]
+    pub fn publish_retaining_journal(&mut self) -> Result<(), Error> {
+        self.publish_inner()
+    }
+
+    fn publish_inner(&mut self) -> Result<(), Error> {
         let shared = self.state_mut();
         if shared.published {
             return Err(Error::plain(ErrorKind::StateConflict));
@@ -573,6 +666,7 @@ impl NativeFile {
         if !shared.coverage.is_complete() {
             return Err(Error::plain(ErrorKind::Incomplete));
         }
+        #[cfg(not(unix))]
         if !shared.sealed {
             reject_existing(&self.destination)?;
         }
@@ -582,7 +676,10 @@ impl NativeFile {
         }
 
         #[cfg(unix)]
-        self.publish_unix()?;
+        {
+            self.write_handle.take();
+            self.publish_unix()?;
+        }
         #[cfg(windows)]
         self.write_all_at_windows_publish()?;
         #[cfg(not(any(unix, windows)))]
@@ -590,7 +687,6 @@ impl NativeFile {
 
         let shared = self.state_mut();
         shared.published = true;
-        Self::cleanup_backend(shared);
         Ok(())
     }
 
@@ -781,7 +877,7 @@ fn create_unix(
             map_profile(profile),
             incarnation,
             staging.clone(),
-            destination.to_path_buf(),
+            destination,
             &journal,
             vot_commit_posix::NoFaults,
         ) {
@@ -919,7 +1015,8 @@ fn map_posix(error: vot_commit_posix::Error) -> Error {
         | vot_commit_posix::Error::StagingIdentityMismatch
         | vot_commit_posix::Error::StrictIdentityMismatch
         | vot_commit_posix::Error::Poisoned
-        | vot_commit_posix::Error::NotAdmitted => Error::plain(ErrorKind::StateConflict),
+        | vot_commit_posix::Error::NotAdmitted
+        | vot_commit_posix::Error::AdmissionMismatch => Error::plain(ErrorKind::StateConflict),
         // A Strict read-back that finds the wrong bytes is the caller's
         // data problem, not a provider bug; resume's trust stance makes it
         // reachable (ADR-0047).
@@ -994,6 +1091,51 @@ mod tests {
         #[cfg(not(unix))]
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resumed_backend_setup_failure_preserves_existing_bytes_and_journal() {
+        for preserve in [true, false] {
+            let directory = directory(if preserve {
+                "adopt-resumed"
+            } else {
+                "adopt-new"
+            });
+            let prepared = object(b"verified prefix");
+            let (mut backend, staging, journal) = create_unix(
+                prepared.object_id(),
+                &directory,
+                &directory.join("object"),
+                CommitProfile::Fast,
+            )
+            .unwrap();
+            backend
+                .commit
+                .write_transit_verified(b"verified prefix")
+                .unwrap();
+            fs::write(directory.join("object"), b"unrelated").unwrap();
+            assert!(backend.commit.publish().is_err());
+            assert!(
+                NativeFile::from_backend(
+                    prepared.object_id(),
+                    &directory.join("object"),
+                    CommitProfile::Fast,
+                    backend,
+                    staging.clone(),
+                    journal.clone(),
+                    preserve
+                )
+                .is_err()
+            );
+            assert_eq!(staging.exists(), preserve);
+            assert_eq!(journal.unwrap().exists(), preserve);
+            if preserve {
+                assert_eq!(fs::read(staging).unwrap(), b"verified prefix");
+            }
+            assert_eq!(fs::read(directory.join("object")).unwrap(), b"unrelated");
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

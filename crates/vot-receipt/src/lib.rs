@@ -234,6 +234,23 @@ mod tests {
     }
 
     #[test]
+    fn nas_provider_is_registered_and_authenticated() {
+        for provider in 0..=6 {
+            let mut receipt = receipt();
+            receipt.provider = provider;
+            if (1..=5).contains(&provider) {
+                let envelope = authenticate_hmac_sha256(receipt.clone(), b"nas", &[7; 32]).unwrap();
+                let bytes = encode_authenticated(&envelope).unwrap();
+                let decoded = decode_authenticated(&bytes).unwrap();
+                let verified = verify_hmac_sha256(&decoded, &[7; 32]).unwrap();
+                assert_eq!(verified.receipt(), &receipt);
+            } else {
+                assert_eq!(receipt.validate(), Err(Error::InvalidProvider));
+            }
+        }
+    }
+
+    #[test]
     fn timestamps_require_rfc3339_syntax_and_ranges() {
         let mut receipt = receipt();
         for valid in [

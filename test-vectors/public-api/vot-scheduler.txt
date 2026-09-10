@@ -24,3 +24,4 @@ struct vot_scheduler::WrittenRange
 struct vot_scheduler::session::CompletedBundle
 struct vot_scheduler::session::SessionReceiver
 trait vot_scheduler::RangeSink
+use vot_scheduler::VerifiedSlice <- vot_verified_range::VerifiedSlice

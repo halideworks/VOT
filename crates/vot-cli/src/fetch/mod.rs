@@ -3652,6 +3652,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn public_cancellation_during_custom_callbacks_prevents_sealing() {
+        struct CancelSink {
+            phase: &'static str,
+            length: u64,
+            cancellation: CancellationHandle,
+            discarded: Arc<AtomicBool>,
+        }
+        impl vot_scheduler::RangeSink for CancelSink {
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+                Err(vot_scheduler::SinkError)
+            }
+        }
+        impl ReceiveSink for CancelSink {
+            fn resumed_prefix(&self) -> Result<u64, Error> {
+                assert!(
+                    !self.cancellation.is_cancelled(),
+                    "cancelled factory invoked its checkpoint"
+                );
+                if self.phase == "prefix" {
+                    self.cancellation.cancel();
+                }
+                Ok(self.length)
+            }
+            fn flush(&self) -> Result<(), Error> {
+                assert!(
+                    !self.cancellation.is_cancelled(),
+                    "cancelled checkpoint was flushed"
+                );
+                if self.phase == "flush" {
+                    self.cancellation.cancel();
+                }
+                Ok(())
+            }
+            fn discard_partial(&self) -> Result<(), Error> {
+                self.discarded.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        for length in [0, 8] {
+            let (bundle, _) =
+                built_bundle("cancel-custom-callback", &[("file.bin", patterned(length))]);
+            for phase in ["factory", "prefix", "flush", "complete"] {
+                let output = temporary(&format!("cancel-custom-{phase}"));
+                let (server, mut session, mut connection) = serving(&bundle);
+                let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+                let cancellation = CancellationHandle::default();
+                let cancelled = cancellation.clone();
+                let discarded = Arc::new(AtomicBool::new(false));
+                let removed = Arc::clone(&discarded);
+                let completed = Arc::new(AtomicU64::new(0));
+                let counted = Arc::clone(&completed);
+                let completing = cancellation.clone();
+                fetcher.set_receive_seams(ReceiveSeams {
+                    sink: Some(Arc::new(move |_, object| {
+                        if phase == "factory" {
+                            cancelled.cancel();
+                        }
+                        Ok(Some(Box::new(CancelSink {
+                            phase,
+                            length: object.object.length,
+                            cancellation: cancelled.clone(),
+                            discarded: Arc::clone(&removed),
+                        })))
+                    })),
+                    complete: Some(Arc::new(move |_, _| {
+                        assert!(
+                            !completing.is_cancelled(),
+                            "cancelled flush completed its object"
+                        );
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        if phase == "complete" {
+                            completing.cancel();
+                        }
+                        Ok(())
+                    })),
+                    ..ReceiveSeams::new(cancellation)
+                });
+                let completed_count = u64::from(phase == "complete");
+                assert_eq!(
+                    run_to_end(&server, &mut session, &mut connection, &mut fetcher, false)
+                        .unwrap(),
+                    FetchStatus::Cancelled(usize::from(phase == "complete"))
+                );
+                assert_eq!(completed.load(Ordering::Relaxed), completed_count);
+                assert_eq!(discarded.load(Ordering::Relaxed), phase != "complete");
+                assert!(!fetcher.complete());
+                assert_eq!(fetcher.rail.taken_bytes, 0);
+                drop(fetcher);
+                discard(&[&output]);
+            }
+            discard(&[&bundle]);
+        }
+    }
+
+    #[test]
     fn custom_prefix_callback_can_abandon_without_opening_a_sink() {
         struct CancellingSink {
             plan: SharedPlan,

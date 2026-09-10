@@ -1842,6 +1842,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 drop(plan);
                 let chosen = factory(self.receive_session, &receive_object);
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if chosen.is_err() {
                     plan.abandoned = true;
                 }
@@ -1879,6 +1880,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .resumed_prefix()
                     .and_then(|prefix| custom_prefix(prefix, object.length));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 let resumed = match resumed {
                     Ok(resumed) if !plan.abandoned => resumed,
                     result => {
@@ -1904,6 +1906,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 drop(plan);
                 let synced = sink.flush();
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if synced.is_err() {
                     plan.abandoned = true;
                 }
@@ -1927,6 +1930,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if completed.is_err() {
                     plan.abandoned = true;
                 }
@@ -1949,6 +1953,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if completed.is_err() {
                     plan.abandoned = true;
                 }

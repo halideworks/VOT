@@ -88,7 +88,11 @@ mode/UID presentation and successful probes do not prove these properties.
 Linux CIFS also requires server-enforced protection of the private receiving
 namespace and all its ancestors against replacement; client directory handles
 alone do not supply this guarantee. Unqualified mounts MUST NOT implicitly
-acquire the qualified NAS contract. See ADR-0054 for admission and recovery.
+acquire the qualified NAS contract. See ADR-0054 for admission and recovery. Custom
+sink prefixes are consumer-owned trusted state, bound to the announced object.
+The fetch checks bounds and alignment; uncertain stored content still requires
+verification before the consumer reports success. A transport directory's
+checkpoint cannot authorize skipping bytes in a custom sink.
 
 Shared receiving uses a private same-filesystem child without changing the
 selected directory's permissions. Unlink is allowed only in protected parents

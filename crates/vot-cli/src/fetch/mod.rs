@@ -68,11 +68,22 @@ pub struct ReceiveObject {
 
 /// A verified-range destination with explicit completion and abandonment.
 pub trait ReceiveSink: vot_scheduler::RangeSink {
+    /// Bytes retained from this object's trusted checkpoint. A non-final prefix
+    /// must end on a range-unit boundary. The consumer verifies uncertain stored
+    /// bytes before reporting successful completion; directory resume is separate.
+    fn resumed_prefix(&self) -> Result<u64, Error> {
+        Ok(0)
+    }
+
     fn flush(&self) -> Result<(), Error>;
     fn discard_partial(&self) -> Result<(), Error>;
 }
 
 impl<S: ReceiveSink + ?Sized> ReceiveSink for Arc<S> {
+    fn resumed_prefix(&self) -> Result<u64, Error> {
+        (**self).resumed_prefix()
+    }
+
     fn flush(&self) -> Result<(), Error> {
         (**self).flush()
     }
@@ -168,11 +179,14 @@ pub(crate) mod tests {
 
     /// A sink of `length` bytes that keeps what it is given and nothing else.
     fn seam_sink(length: u64) -> Arc<CountingSink> {
-        Arc::new(CountingSink::custom(Box::new(Arc::new(SeamSink {
-            bytes: Mutex::new(vec![0; usize::try_from(length).unwrap()]),
-            flushed: AtomicBool::new(false),
-            discarded: AtomicBool::new(false),
-        }))))
+        Arc::new(CountingSink::custom(
+            Box::new(Arc::new(SeamSink {
+                bytes: Mutex::new(vec![0; usize::try_from(length).unwrap()]),
+                flushed: AtomicBool::new(false),
+                discarded: AtomicBool::new(false),
+            })),
+            0,
+        ))
     }
 
     /// `count` planned objects of `length`, each with its own root.
@@ -2307,13 +2321,16 @@ pub(crate) mod tests {
         let first = subject_of(&plan.objects[0]);
         plan.active.insert(
             0,
-            active(first, Arc::new(CountingSink::custom(Box::new(FailingSink)))),
+            active(
+                first,
+                Arc::new(CountingSink::custom(Box::new(FailingSink), 0)),
+            ),
         );
         plan.active.insert(
             1,
             active(
                 subject_of(&second),
-                Arc::new(CountingSink::custom(Box::new(Arc::clone(&watched)))),
+                Arc::new(CountingSink::custom(Box::new(Arc::clone(&watched)), 0)),
             ),
         );
         plan.objects.push(second);
@@ -3524,6 +3541,165 @@ pub(crate) mod tests {
         );
         assert_same_tree(&bundle, &output);
         discard(&[&bundle, &output]);
+    }
+
+    #[test]
+    fn custom_sink_prefixes_seed_only_their_own_authenticated_object() {
+        use std::io::Write as _;
+        use vot_scheduler::{RangeSink, SinkError};
+        struct PrefixSink {
+            file: vot_scheduler::FileSink,
+            prefix: Option<u64>,
+            discarded: Arc<AtomicBool>,
+            flushed: Arc<AtomicBool>,
+        }
+        impl RangeSink for PrefixSink {
+            fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), SinkError> {
+                self.file.write_at(offset, bytes)
+            }
+        }
+        impl ReceiveSink for PrefixSink {
+            fn resumed_prefix(&self) -> Result<u64, Error> {
+                self.prefix.ok_or(Error::InvalidBundle)
+            }
+            fn flush(&self) -> Result<(), Error> {
+                self.flushed.store(true, Ordering::Relaxed);
+                self.file.file().sync_all().map_err(Into::into)
+            }
+            fn discard_partial(&self) -> Result<(), Error> {
+                self.discarded.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let bytes = patterned(900_001);
+        let length = bytes.len() as u64;
+        let (bundle, _) = built_bundle("custom-prefix", &[("file.bin", bytes.clone())]);
+        for (index, prefix) in [
+            Some(0),
+            Some(65_536),
+            Some(length),
+            Some(1),
+            Some(length + 1),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = temporary(&format!("custom-prefix-output-{index}"));
+            let custom = temporary(&format!("custom-prefix-data-{index}"));
+            crate::create_private_directory(&custom).unwrap();
+            let path = custom.join("payload");
+            let mut payload = fs::File::create(&path).unwrap();
+            payload
+                .write_all(&bytes[..usize::try_from(prefix.unwrap_or(0).min(length)).unwrap()])
+                .unwrap();
+            payload.set_len(length).unwrap();
+            drop(payload);
+            let discarded = Arc::new(AtomicBool::new(false));
+            let flushed = Arc::new(AtomicBool::new(false));
+            let sink = Arc::new(PrefixSink {
+                file: vot_scheduler::FileSink::resume(&path, length).unwrap(),
+                prefix,
+                discarded: Arc::clone(&discarded),
+                flushed: Arc::clone(&flushed),
+            });
+            let counted = CountingSink::custom(Box::new(Arc::clone(&sink)), prefix.unwrap_or(0));
+            assert_eq!(counted.placed.load(Ordering::Relaxed), prefix.unwrap_or(0));
+            assert!(counted.flush_due.load(Ordering::Relaxed) > prefix.unwrap_or(0));
+            drop(counted);
+            let seams = ReceiveSeams {
+                sink: Some(Arc::new(move |_, object| {
+                    assert_eq!(object.object.length, length);
+                    Ok(Some(Box::new(Arc::clone(&sink))))
+                })),
+                ..ReceiveSeams::default()
+            };
+            let (server, mut session, mut connection) = serving(&bundle);
+            let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            fetcher.set_receive_seams(seams);
+            let result = run_to_end(&server, &mut session, &mut connection, &mut fetcher, false);
+            if let Some(prefix) = prefix.filter(|prefix| {
+                *prefix <= length && (*prefix == length || prefix.is_multiple_of(65_536))
+            }) {
+                assert_eq!(result.unwrap(), FetchStatus::Complete);
+                assert_eq!(fetcher.rail.taken_bytes, length - prefix);
+                assert_eq!(fetcher.moved_bytes(), length - prefix);
+                assert_eq!(fetcher.placed_bytes(), length);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert!(!discarded.load(Ordering::Relaxed));
+                assert!(flushed.load(Ordering::Relaxed));
+            } else {
+                assert!(result.is_err());
+                assert!(discarded.load(Ordering::Relaxed));
+                assert_eq!(fetcher.rail.taken_bytes, 0);
+            }
+            drop(fetcher);
+            discard(&[&output, &custom]);
+        }
+        for (prefix, length, expected) in [
+            (0, 0, true),
+            (1, 0, false),
+            (65_536, 0, false),
+            (65_536, 65_535, false),
+            (0, u64::MAX, true),
+            (u64::MAX, u64::MAX, true),
+            (65_536, 65_537, true),
+            (65_535, 65_537, false),
+        ] {
+            assert_eq!(protocol::custom_prefix(prefix, length).is_ok(), expected);
+        }
+        discard(&[&bundle]);
+    }
+
+    #[test]
+    fn custom_prefix_callback_can_abandon_without_opening_a_sink() {
+        struct CancellingSink {
+            plan: SharedPlan,
+            discarded: Arc<AtomicBool>,
+        }
+        impl vot_scheduler::RangeSink for CancellingSink {
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+                panic!("abandoned sink accepted a write")
+            }
+        }
+        impl ReceiveSink for CancellingSink {
+            fn resumed_prefix(&self) -> Result<u64, Error> {
+                self.plan
+                    .try_lock()
+                    .expect("prefix callback holds the plan lock")
+                    .abandoned = true;
+                Ok(0)
+            }
+            fn flush(&self) -> Result<(), Error> {
+                panic!("abandoned sink was flushed")
+            }
+            fn discard_partial(&self) -> Result<(), Error> {
+                self.discarded.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let output = temporary("custom-prefix-abandoned");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.active.clear();
+        plan.next_open = 0;
+        let plan = Arc::new(Mutex::new(plan));
+        fetcher.plan = Some(Arc::clone(&plan));
+        let discarded = Arc::new(AtomicBool::new(false));
+        let sink = Arc::new(CancellingSink {
+            plan: Arc::clone(&plan),
+            discarded: Arc::clone(&discarded),
+        });
+        fetcher.set_receive_seams(ReceiveSeams {
+            sink: Some(Arc::new(move |_, _| Ok(Some(Box::new(Arc::clone(&sink)))))),
+            ..ReceiveSeams::default()
+        });
+        fetcher.advance().unwrap();
+        assert!(plan.lock().unwrap().abandoned);
+        assert!(plan.lock().unwrap().active.is_empty());
+        assert!(discarded.load(Ordering::Relaxed));
+        drop(fetcher);
+        discard(&[&output]);
     }
 
     #[test]

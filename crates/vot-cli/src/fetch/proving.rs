@@ -394,7 +394,7 @@ mod completion_tests {
                     let hook_path = path.clone();
                     CompletionJob {
                         index,
-                        sink: Arc::new(CountingSink::custom(Box::new(sink))),
+                        sink: Arc::new(CountingSink::custom(Box::new(sink), 0)),
                         subject: subjects[index],
                         length: 1,
                         hook: Some(Arc::new(move |_, _| {

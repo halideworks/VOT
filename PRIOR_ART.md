@@ -42,6 +42,8 @@ existing ingredients and are not individually claimed inventions.
 
 ADR-0054 uses these public interfaces and observed fixture behavior. It does not
 copy kernel or server implementation code. No proprietary storage code was used.
+Custom-sink checkpoint handoff extends the existing VOT receive hooks and range
+coverage machinery; it uses no external implementation source.
 
 ## Congestion control and multipath
 

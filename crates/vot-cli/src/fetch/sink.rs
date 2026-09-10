@@ -156,8 +156,8 @@ impl CountingSink {
         ))
     }
 
-    pub(crate) fn custom(sink: Box<dyn ReceiveSink>) -> Self {
-        Self::opened(sink, 0, None)
+    pub(crate) fn custom(sink: Box<dyn ReceiveSink>, placed: u64) -> Self {
+        Self::opened(sink, placed, None)
     }
 
     /// Creates the directory-backed sink used by a normal fetch.
@@ -360,7 +360,7 @@ pub(super) mod tests {
                 writes: AtomicU64::new(0),
                 flushes: AtomicU64::new(0),
             });
-            let sink = Arc::new(CountingSink::custom(Box::new(Arc::clone(&inner))));
+            let sink = Arc::new(CountingSink::custom(Box::new(Arc::clone(&inner)), 0));
             sink.flush_due.store(1, Ordering::Relaxed);
             let mut receiver =
                 vot_scheduler::ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
@@ -431,7 +431,7 @@ pub(super) mod tests {
     fn a_failed_flush_cannot_be_rehabilitated_by_a_later_success() {
         for periodic in [false, true] {
             let inner = Arc::new(OnceFailingFlush::default());
-            let sink = CountingSink::custom(Box::new(Arc::clone(&inner)));
+            let sink = CountingSink::custom(Box::new(Arc::clone(&inner)), 0);
             if periodic {
                 sink.flush_due.store(1, Ordering::Relaxed);
                 assert!(sink.write_at(0, &[1]).is_err());
@@ -515,7 +515,7 @@ pub(super) mod tests {
     #[test]
     fn disjoint_writers_reach_the_sink_concurrently() {
         let inner = BlockingSink::default();
-        let sink = Arc::new(CountingSink::custom(Box::new(inner.clone())));
+        let sink = Arc::new(CountingSink::custom(Box::new(inner.clone()), 0));
         let writers: Vec<_> = (0..2)
             .map(|offset| {
                 let sink = Arc::clone(&sink);
@@ -557,7 +557,7 @@ pub(super) mod tests {
     #[test]
     fn discard_waits_for_a_writer_and_refuses_every_later_write() {
         let inner = Arc::new(BlockingSink::default());
-        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone())));
+        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone()), 0));
         let writing = {
             let sink = Arc::clone(&sink);
             std::thread::spawn(move || sink.write_at(0, &[1]))
@@ -594,7 +594,7 @@ pub(super) mod tests {
     #[test]
     fn two_writers_hold_the_gate_at_once_and_discard_waits_for_both() {
         let inner = Arc::new(BlockingSink::default());
-        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone())));
+        let sink = Arc::new(CountingSink::custom(Box::new((*inner).clone()), 0));
         let writing: Vec<_> = (0..2)
             .map(|at| {
                 let sink = Arc::clone(&sink);
@@ -640,7 +640,7 @@ pub(super) mod tests {
 
     #[test]
     fn counting_sink_propagates_inner_failures() {
-        let sink = CountingSink::custom(Box::new(FailingSink));
+        let sink = CountingSink::custom(Box::new(FailingSink), 0);
         assert!(sink.write_at(0, &[1]).is_err());
         assert!(<CountingSink as ReceiveSink>::flush(&sink).is_err());
         assert!(<CountingSink as ReceiveSink>::discard_partial(&sink).is_err());

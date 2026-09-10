@@ -15,6 +15,15 @@ use super::{
     reservations_of, resume_failure, resumed_extents, subject_of,
 };
 
+pub(super) fn custom_prefix(prefix: u64, length: u64) -> Result<BTreeMap<u64, u64>, Error> {
+    if prefix > length
+        || (prefix != length && !prefix.is_multiple_of(vot_scheduler::RANGE_UNIT_BYTES))
+    {
+        return Err(Error::InvalidBundle);
+    }
+    Ok((prefix != 0).then_some((0, prefix)).into_iter().collect())
+}
+
 pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
     length == 0 || fully_resumed && stored
 }
@@ -1865,12 +1874,32 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.objects[at].done = true;
                     continue;
                 };
+                drop(plan);
+                let resumed = chosen
+                    .resumed_prefix()
+                    .and_then(|prefix| custom_prefix(prefix, object.length));
+                plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                let resumed = match resumed {
+                    Ok(resumed) if !plan.abandoned => resumed,
+                    result => {
+                        plan.abandoned = true;
+                        drop(plan);
+                        chosen.discard_partial()?;
+                        return result.map(|_| ());
+                    }
+                };
+                whole_from_before = resumed.get(&0).copied() == Some(object.length);
+                planned_resumed = resumed;
+                plan.objects[at].resumed.clone_from(&planned_resumed);
                 Some(chosen)
             } else {
                 None
             };
-            if custom_flush_due(object.length, whole_from_before, path.exists())
-                && let Some(sink) = &custom
+            if custom_flush_due(
+                object.length,
+                whole_from_before,
+                custom.is_some() || path.exists(),
+            ) && let Some(sink) = &custom
             {
                 drop(plan);
                 let synced = sink.flush();
@@ -1910,7 +1939,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 continue;
             }
-            if whole_from_before && path.exists() {
+            if whole_from_before && (custom.is_some() || path.exists()) {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
                 drop(plan);
@@ -1935,7 +1964,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 continue;
             }
             let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
-            let resumed = if path.exists() {
+            let resumed = if custom.is_some() || path.exists() {
                 planned_resumed
             } else {
                 // The checkpoint outlived its file; clear the store too,
@@ -1958,7 +1987,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 subject,
             });
             let sink = Arc::new(if let Some(custom) = custom {
-                CountingSink::custom(custom)
+                CountingSink::custom(custom, seeded)
             } else if path.exists() {
                 CountingSink::resume(&path, object.length, seeded, durable)?
             } else {

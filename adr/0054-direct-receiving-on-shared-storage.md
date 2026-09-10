@@ -86,6 +86,16 @@ the bytes or verifying the same proof twice. Native receive hooks can write
 directly into their final receiver instead of a transport object followed by
 a second payload copy. Plain file sinks keep their existing placement method.
 
+A custom `ReceiveSink` can report its own trusted contiguous checkpoint prefix.
+The fetch validates its length and range-unit alignment, seeds request coverage
+and placed-byte accounting, and invokes the completion flush even when the whole
+object was retained. The callback runs outside the plan lock; abandonment or a
+callback failure discards the chosen sink before any request can use it. Custom
+sinks never inherit the transport directory's checkpoint map. The consumer still
+verifies uncertain stored bytes before reporting successful completion. The
+prefix adds no payload allocation or hashing; retries avoid retransmitting that
+prefix. No wire format, object identity or assurance level changes.
+
 Applications can retain a successful publication journal until their own
 metadata checkpoint is committed. Dropping or parking the receiver releases
 handles while keeping that journal. Forgetting it requires the bound final
@@ -149,3 +159,10 @@ The NFS fixture exposed a retained SDK writable descriptor after publication,
 which left a `.nfs` temporary alias until the receiver was dropped. The SDK now
 closes that capability before sealing and publication. The mounted NFS tests
 then passed while retaining the completed receiver object.
+
+The 32 GiB Samba fixture exposed stale client allocation accounting: `st_blocks`
+reported 16 GiB before publication and 32 GiB afterward for the same inode. An
+independent server stat found one link and 32 GiB plus one allocation block;
+SHA-256 verified the complete payload. The component harness now asserts inode
+continuity on NAS and leaves physical allocation measurement to the server.
+Client block-count equality is retained only for the local fixture.

@@ -120,6 +120,89 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn sinks_receive_the_verified_witness_on_every_placement_path() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct WitnessSink {
+            expected: SubjectId,
+            fail: AtomicBool,
+            writes: AtomicUsize,
+        }
+        impl RangeSink for WitnessSink {
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), SinkError> {
+                panic!("verification witness was discarded");
+            }
+            fn write_verified(&self, verified: &VerifiedSlice<'_>) -> Result<(), SinkError> {
+                assert_eq!(subject_id(verified.object()), self.expected);
+                assert_eq!(verified.covered_offset(), 0);
+                assert_eq!(verified.data(), b"verified range");
+                if self.fail.swap(false, Ordering::Relaxed) {
+                    return Err(SinkError);
+                }
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let data = b"verified range";
+        let subject = subject(data);
+        let proof = vot_proof_blake3::prove(data, 0, data.len() as u64).unwrap();
+        let sink = Arc::new(WitnessSink {
+            expected: subject,
+            fail: AtomicBool::new(true),
+            writes: AtomicUsize::new(0),
+        });
+        let mut receiver = ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(Arc::clone(&sink)))
+            .unwrap();
+        assert_eq!(
+            receiver.receive_range(subject, 0, data, &proof.proof),
+            Err(Error::Sink)
+        );
+        assert_eq!(sink.writes.load(Ordering::Relaxed), 0);
+        assert!(
+            receiver
+                .receive_range(subject, 0, b"corrupt! range", &proof.proof)
+                .is_err()
+        );
+        receiver
+            .receive_range(subject, 0, data, &proof.proof)
+            .unwrap();
+        receiver.finish_ranges(subject).unwrap();
+        assert_eq!(sink.writes.load(Ordering::Relaxed), 1);
+        let bundle = vot_codec::frames::ProofBundle {
+            request_id: [1; 16],
+            bundle_id: [2; 16],
+            object: vot_codec::frames::ObjectId::try_from(subject).unwrap(),
+            requested_offset: 0,
+            requested_length: subject.length(),
+            covered_offset: 0,
+            covered_length: subject.length(),
+            data_record_count: 1,
+            total_plaintext_length: subject.length(),
+            proof: proof.proof,
+        };
+        let records = [vot_codec::frames::DataRecord {
+            bundle_id: [2; 16],
+            record_index: 0,
+            plaintext_offset: 0,
+            plaintext_length: subject.length(),
+            compression: 0,
+            encoded: data.to_vec(),
+        }];
+        let range =
+            ReliableReceiver::verify_typed_bundle(subject, &bundle, &refs(&records)).unwrap();
+        range.write_to(&sink).unwrap();
+        let mut receiver = ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
+        receiver
+            .begin_ranges(subject, Box::new(Arc::clone(&sink)))
+            .unwrap();
+        receiver.admit_verified_range(range).unwrap();
+        receiver.finish_ranges(subject).unwrap();
+        assert_eq!(sink.writes.load(Ordering::Relaxed), 3);
+    }
+
     /// Retains what it is written, for test assertions.
     #[derive(Default)]
     struct MemorySink(std::sync::Mutex<BTreeMap<u64, Vec<u8>>>);

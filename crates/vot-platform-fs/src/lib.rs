@@ -6,6 +6,17 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(unix)]
+mod directory;
+#[cfg(unix)]
+mod nas;
+#[cfg(unix)]
+pub use directory::{Directory, FileLocation};
+#[cfg(unix)]
+pub use nas::NasContract;
+#[cfg(target_os = "linux")]
+pub use nas::validate_nas_mount;
+
 #[cfg(target_os = "linux")]
 /// Identifies Linux SMB and NFS mounts through the opened file's filesystem.
 /// A false result is not a certification of other filesystems' durability.

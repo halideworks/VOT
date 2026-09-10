@@ -3,6 +3,7 @@ enum vot_commit_posix::FaultPoint
 enum vot_commit_posix::RecoveryDisposition
 enum vot_commit_posix::TraceEvent
 function vot_commit_posix::recover
+function vot_commit_posix::recover_at
 struct vot_commit_posix::NoFaults
 struct vot_commit_posix::PosixCommit
 struct vot_commit_posix::Receipt

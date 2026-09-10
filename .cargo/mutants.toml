@@ -32,7 +32,8 @@ timeout_multiplier = 4.0
 # behind the platform-common accept delegate; like write_all_at_windows it
 # never compiles here, so its mutants would be measured against a build that
 # does not contain them.
-exclude_re = ["live::","NativeFile::accept_serial","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "crates/vot-scheduler/src/receiver.rs:.*VerifiedRange::is_empty", "remove_lock_file_other", "(prepare|canonical)_push_destination_unsupported"]
+# These journal bodies do not compile on the Linux mutation runner.
+exclude_re = ["Journal::(create|open_current)_nonunix","live::","NativeFile::accept_serial","(windows|unsupported)_rename_noreplace", "NativeOperations.*sync_(file|parent)", "atomic_replace_windows", "same_file_regular_(windows|unsupported)", "allow_unordered_writes_windows", "refuse_fragmentation_(macos|windows)", "size_buffers_windows", "peak_resident_bytes_(macos|windows)", "write_all_at_(windows|unsupported)", "crates/vot-scheduler/src/receiver.rs:.*VerifiedRange::is_empty", "remove_lock_file_other", "(prepare|canonical)_push_destination_unsupported"]
 # Binaries whose correctness a different check establishes. vot-capability's
 # oracle exists to be compared against an independent Python implementation of
 # spec/capability.cddl, which validate_capability_vectors.py does on every run and

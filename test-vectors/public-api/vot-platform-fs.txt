@@ -1,3 +1,4 @@
+enum vot_platform_fs::NasContract
 function vot_platform_fs::allow_unordered_writes
 function vot_platform_fs::atomic_replace
 function vot_platform_fs::create_staging_file
@@ -7,4 +8,7 @@ function vot_platform_fs::link_file_handle
 function vot_platform_fs::remove_file_handle
 function vot_platform_fs::same_file_handle
 function vot_platform_fs::same_file_regular
+function vot_platform_fs::validate_nas_mount
 function vot_platform_fs::validate_removal_parent
+struct vot_platform_fs::Directory
+struct vot_platform_fs::FileLocation

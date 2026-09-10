@@ -1,4 +1,82 @@
-# Mounted SMB shares
+# Mounted SMB and NFS storage
+
+## Qualified Linux receiving
+
+`vot_sdk_file::ReceiveDirectory` receives directly onto the selected filesystem.
+It creates a private `.vot-stage` child automatically. Payload bytes are written
+once. Publication hard-links the verified inode to its final name, waits for
+the required storage acknowledgments, then removes its temporary name. It does
+not reserve or copy a second payload. The selected folder's permissions remain
+unchanged. Final filenames become visible after verification.
+
+Use `NasContract::ServerAcknowledged` only after the administrator qualifies:
+
+- stable SMB FLUSH or NFS WRITE/COMMIT acknowledgments and synchronous namespace
+  operations on the actual server/export;
+- actual receiving-account ownership and owner-only temporary data and metadata,
+  including named ACL entries and private access at directory creation;
+- for Linux CIFS, server ACLs that prevent other principals from renaming or
+  replacing the private child and every ancestor while receiving.
+
+Same-account namespace mutations must be serialized. Displayed CIFS mode bits
+and mapped UIDs alone cannot prove the server ACL or ownership. A retained Linux
+CIFS directory descriptor does not provide remote directory-identity continuity.
+POSIX directory creation or a qualified server creation policy must establish
+private access immediately; VOT does not repair permissions with a later chmod.
+
+The library additionally requires SMB3 with `serverino` and `cifsacl` or POSIX
+permissions, or hard-mounted NFS4. It refuses disabled flushes, loose caching,
+synthetic permissions, read-only storage and a vanished NAS mount. These client
+checks do not establish server power-loss behavior. Qualification applies to the
+tested configuration, not to every server bearing the same product name.
+
+Qualified NAS can use Balanced: authenticated ranges, stable file acknowledgment
+and durable publication. Strict remains unsupported because client direct I/O
+does not establish independent server-side readback. Default Linux pathname
+constructors refuse detected NAS; they cannot implicitly assert this contract.
+
+Reuse a `ReceiveDirectory` for a sequence. `resume_state()` plus `abandon()` parks
+each file without retaining its descriptors. Persist the object identity, final
+name, contract and resume state together in trusted local control storage.
+After an uncertain restart, verify covered bytes before publishing. When the
+final name exists and the journal remains, `recover_publication()` rechecks the
+bound journal, exact object contents and storage acknowledgments without copying.
+Use `publish_retaining_journal()` when completion also needs an application
+database checkpoint. Both that operation and recovery retain the journal;
+call `forget_publication()` only after the checkpoint succeeds. It checks the
+bound final identity and Published state without another payload read.
+Preserve unresolved journals and files. A consumer must reconcile completion
+that outlives its own checkpoint before collecting recovery metadata.
+
+Qualified NAS receipts use provider `POSIX_NAS` (`0x0005`), with the actual
+selected profile. This separates server-acknowledged durability from local
+storage and does not assert independent NAS readback.
+
+Run both mounted suites with an explicitly qualified disposable test location:
+
+```sh
+VOT_TEST_DIRECTORY=/mnt/smb/vot-validation cargo +1.97.1 test -p vot-sdk-file --test shared_directory --locked
+VOT_TEST_DIRECTORY=/mnt/nfs/vot-validation VOT_TEST_RENAME_DIRECTORY=/mnt/nfs/vot-validation cargo +1.97.1 test -p vot-sdk-file --test shared_directory --locked
+```
+
+The rename case defaults to local storage and can explicitly target NFS. CIFS
+requires server-enforced ancestor protection instead of this rename guarantee.
+The mounted cases fail on missing or unqualified storage; they do not skip.
+
+For separately generated large fixtures, the component harness admits and parks
+every file, verifies ranges, resumes large files halfway, and asserts publication
+preserves inode and allocated blocks:
+
+```sh
+cargo +1.97.1 run --release -p vot-sdk-file --example receive_directory -- /test/source /mnt/nfs/new-destination nas balanced
+```
+
+Use a fresh destination. Keep fixture source and receive capacity separate.
+Independently hash all outputs after the timed run. This harness includes sender
+preparation and storage publication, but does not measure network transport.
+See [ADR-0054](../adr/0054-direct-receiving-on-shared-storage.md).
+
+## Windows and existing CLI sinks
 
 VOT can write through the operating system's existing SMB mount. On Windows,
 use a mapped drive such as `X:\` or its UNC path. Authentication and the SMB
@@ -27,10 +105,10 @@ not establish exclusion of other SMB clients.
 - Publication still requires atomic no-overwrite operations and file identity
   checks. There is no copy-and-delete fallback for a server without hard links.
   Windows package publication uses `MoveFileExW` without replacement enabled.
-- Linux POSIX commits refuse Balanced and Strict on detected kernel SMB/NFS
-  filesystems at creation and reattachment. Standalone Strict readback also
-  refuses them. Other filesystem types are not certified by this detection;
-  macOS SMB mounts have not been qualified.
+- Linux default POSIX pathname commits refuse detected kernel SMB/NFS. The
+  qualified directory API above admits Balanced under its explicit contract.
+  Standalone Strict readback refuses NAS. Other filesystem types are not
+  certified by this detection; macOS SMB mounts have not been qualified.
 - Any CLI sink write or data-flush failure remains fatal for that sink. A
   later successful flush cannot clear it. Disjoint writes run concurrently;
   final flush and cancellation wait for in-flight writes, and stride
@@ -59,8 +137,8 @@ cargo +1.97.1 test -p vot-cli --test mounted_share --locked -- --ignored
 
 The first suite checks out-of-order verified writes, duplicate ranges,
 completeness, conflicting destinations, cancellation, and competing publishers.
-On Linux it also checks that remote filesystems refuse stronger profiles
-without leaving staging files. The opt-in CLI test publishes a bundle with
+For qualified Linux SDK receiving use the `shared_directory` suite above.
+The opt-in CLI test publishes a bundle with
 both packed and direct objects, checks its receipt and contents, retries
 receipt recovery, and checks cancellation while retaining the sink.
 

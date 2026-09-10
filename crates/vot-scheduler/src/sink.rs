@@ -1,6 +1,7 @@
 //! Where verified ranges go.
 
 use super::Error;
+pub use vot_verified_range::VerifiedSlice;
 
 #[cfg(feature = "file-sink")]
 mod file_sink;
@@ -24,6 +25,14 @@ pub trait RangeSink: Send + Sync {
     /// # Errors
     /// Refuses a write it cannot take; the receiver keeps the range retryable.
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError>;
+
+    /// Carries the proof witness through to a consumer that tracks verified coverage.
+    ///
+    /// # Errors
+    /// Refuses placement without admitting the range into receiver coverage.
+    fn write_verified(&self, verified: &VerifiedSlice<'_>) -> Result<(), SinkError> {
+        self.write_at(verified.covered_offset(), verified.data())
+    }
 }
 
 /// A sink that drops what it is given, for measurements and tests whose
@@ -41,5 +50,9 @@ impl RangeSink for DiscardSink {
 impl<S: RangeSink + ?Sized> RangeSink for std::sync::Arc<S> {
     fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), SinkError> {
         (**self).write_at(covered_offset, data)
+    }
+
+    fn write_verified(&self, verified: &VerifiedSlice<'_>) -> Result<(), SinkError> {
+        (**self).write_verified(verified)
     }
 }

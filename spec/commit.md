@@ -194,6 +194,17 @@ synchronization and parent-directory synchronization before a receipt names
 ordinary buffered reads and cache-control hints are not independent at-rest
 verification.
 
+### 8.2 Qualified POSIX NAS provider
+
+`POSIX_NAS` identifies receiving through a qualified Linux SMB3 or NFS4 mount.
+Its server contract includes stable file and namespace acknowledgments and
+service-owned private temporary state protected by actual server ACLs. CIFS
+also requires protection against ancestor and temporary-directory replacement;
+client directory handles and mapped mode bits do not establish that protection.
+The provider supports Fast and Balanced. Balanced waits for server durability
+acknowledgments. It does not advertise Strict or independent server readback.
+See ADR-0054 for qualification, same-allocation publication and recovery.
+
 ## 9. Receipts
 
 The deterministic data model is `spec/receipt.cddl`. `PUBLISH_RECEIPT` binds:

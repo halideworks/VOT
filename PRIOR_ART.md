@@ -27,6 +27,22 @@ existing ingredients and are not individually claimed inventions.
   DATAGRAM, RFC 8382 shared bottleneck detection, and RFC 9959 Careful Resume.
 - Established parallel HTTP/TCP and reliable QUIC transfer systems.
 
+## Mounted storage semantics
+
+- NFSv4.1 stable WRITE, COMMIT, server restart verifiers and namespace operations:
+  <https://www.rfc-editor.org/rfc/rfc8881.html>
+- Microsoft SMB2 FLUSH server behavior:
+  <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/026984f6-38af-4408-8200-50557eb0a286>
+- Linux CIFS mount options, directory operations and ACL presentation:
+  <https://kernel.org/doc/html/latest/admin-guide/cifs/usage.html>,
+  <https://github.com/torvalds/linux/blob/master/fs/smb/client/dir.c>,
+  <https://github.com/torvalds/linux/blob/master/fs/smb/client/cifsacl.c>.
+- SMB3 POSIX directory creation:
+  <https://smb3posix.org/spec/latest/smb3_posix_extensions.html>
+
+ADR-0054 uses these public interfaces and observed fixture behavior. It does not
+copy kernel or server implementation code. No proprietary storage code was used.
+
 ## Congestion control and multipath
 
 - CUBIC, Reno-family controllers, BBR, Copa, PCC/Vivace, Veno, Westwood, and

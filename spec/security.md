@@ -80,6 +80,23 @@ analysis resistance are not v0.3 guarantees. TLS protects content and metadata
 in transit between adjacent VOT peers; authorized relays may see the data their
 capabilities permit.
 
+### Qualified mounted storage
+
+For qualified mounted NAS receiving, the storage trust boundary includes the
+server's stable-write and namespace contract and actual server ACLs. Client
+mode/UID presentation and successful probes do not prove these properties.
+Linux CIFS also requires server-enforced protection of the private receiving
+namespace and all its ancestors against replacement; client directory handles
+alone do not supply this guarantee. Unqualified mounts MUST NOT implicitly
+acquire the qualified NAS contract. See ADR-0054 for admission and recovery.
+
+Shared receiving uses a private same-filesystem child without changing the
+selected directory's permissions. Unlink is allowed only in protected parents
+with ownership and identity checks. A shared final name MUST NOT be removed by
+check-then-unlink rollback. Ambiguous publication and journal replacement MUST
+preserve recovery evidence and MUST NOT report a successful observation from a
+retired inode. Restart verification is bounded by the authenticated object size.
+
 ## 5. Authentication and authorization
 
 All live carriers MUST provide TLS 1.3 or a security profile with equivalent

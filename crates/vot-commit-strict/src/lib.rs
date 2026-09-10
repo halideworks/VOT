@@ -75,6 +75,32 @@ impl LinuxDirectReader {
     pub fn open(path: &Path, logical_length: u64, alignment: usize) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
         {
+            Self::open_at(
+                &vot_platform_fs::FileLocation::from_path(path).map_err(Error::Io)?,
+                logical_length,
+                alignment,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Ok(Self {
+                backend: DirectBackend::Unsupported,
+                logical_length,
+                alignment,
+                buffer_size: checked_buffer_size(alignment)?,
+            })
+        }
+    }
+
+    /// Opens direct read-back through a retained directory, without following symlinks.
+    pub fn open_at(
+        path: &vot_platform_fs::FileLocation,
+        logical_length: u64,
+        alignment: usize,
+    ) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
             Self::open_linux(path, logical_length, alignment)
         }
         #[cfg(not(target_os = "linux"))]
@@ -90,24 +116,37 @@ impl LinuxDirectReader {
     }
 
     #[cfg(target_os = "linux")]
-    fn open_linux(path: &Path, logical_length: u64, alignment: usize) -> Result<Self, Error> {
+    fn open_linux(
+        path: &vot_platform_fs::FileLocation,
+        logical_length: u64,
+        alignment: usize,
+    ) -> Result<Self, Error> {
         let buffer_size = checked_buffer_size(alignment)?;
-        let descriptor =
-            match rustix::fs::open(path, direct_open_flags(), rustix::fs::Mode::empty()) {
-                Ok(descriptor) => descriptor,
-                Err(error) => match classify_open_failure(error) {
-                    CapabilityFailure::Unsupported => {
-                        return Ok(Self {
-                            backend: DirectBackend::Unsupported,
-                            logical_length,
-                            alignment,
-                            buffer_size,
-                        });
-                    }
-                    CapabilityFailure::Hard(error) => return Err(error),
-                },
-            };
+        let descriptor = match rustix::fs::openat(
+            path.directory().file(),
+            path.name(),
+            direct_open_flags(),
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => match classify_open_failure(error) {
+                CapabilityFailure::Unsupported => {
+                    return Ok(Self {
+                        backend: DirectBackend::Unsupported,
+                        logical_length,
+                        alignment,
+                        buffer_size,
+                    });
+                }
+                CapabilityFailure::Hard(error) => return Err(error),
+            },
+        };
         let file = File::from(descriptor);
+        if !file.metadata().map_err(Error::Io)?.is_file() {
+            return Err(Error::Io(std::io::Error::other(
+                "direct reader requires a regular file",
+            )));
+        }
         if vot_platform_fs::is_smb_or_nfs(&file).map_err(Error::Io)? {
             return Ok(Self {
                 backend: DirectBackend::Unsupported,
@@ -196,7 +235,11 @@ fn io_error(error: rustix::io::Errno) -> Error {
 fn direct_open_flags() -> rustix::fs::OFlags {
     let mut flags = rustix::fs::OFlags::RDONLY;
     flags.insert(rustix::fs::OFlags::DIRECT);
-    flags.insert(rustix::fs::OFlags::CLOEXEC);
+    flags.insert(
+        rustix::fs::OFlags::CLOEXEC
+            .union(rustix::fs::OFlags::NOFOLLOW)
+            .union(rustix::fs::OFlags::NONBLOCK),
+    );
     flags
 }
 

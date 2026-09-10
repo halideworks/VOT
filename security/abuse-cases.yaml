@@ -4,6 +4,40 @@
   "default_telemetry_level": "pseudonymous",
   "cases": [
     {
+      "id": "SEC-NAS-001",
+      "title": "Unqualified NAS or replaced receiving namespace",
+      "actor": "misconfigured storage or another filesystem principal",
+      "attack": "Disable stable acknowledgments, substitute directory or file names, change recovery profile, or lose a journal replacement reply.",
+      "assets": [
+        "unpublished bytes",
+        "journal continuity",
+        "receipt assurance",
+        "received objects"
+      ],
+      "controls": [
+        "explicit persisted server durability and ACL contract",
+        "held mount identity and effective client option checks",
+        "private same-filesystem temporary namespace",
+        "no replacement publication and no shared-parent rollback unlink",
+        "journal admission binds profile, contract, directories and staging identity",
+        "ambiguous journal replacement poisons the retired writer",
+        "bounded content verification during publication recovery"
+      ],
+      "tests": [
+        "qualification_requires_every_client_guarantee",
+        "shared_receiving_resumes_and_publishes_the_same_allocation",
+        "local_and_nfs_ancestor_rename_preserves_publication_and_journal_cleanup",
+        "reattach_binds_staging_and_both_parent_identities",
+        "a_lost_compaction_acknowledgment_never_resumes_the_retired_inode",
+        "interrupted_publication_rechecks_content_and_preserves_conflicts"
+      ],
+      "telemetry": [
+        "vot.session.closed"
+      ],
+      "residual_risk": "Server durability and actual ACL behavior require administrator qualification. Linux CIFS directory descriptors do not protect ancestor renames; server ACLs must exclude them. No independent NAS readback is claimed.",
+      "gate": "ADR-0054"
+    },
+    {
       "id": "SEC-AMP-001",
       "title": "Unauthenticated reflection and response amplification",
       "actor": "unauthenticated network client",

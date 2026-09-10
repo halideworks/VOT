@@ -93,6 +93,16 @@ pub struct VerifiedRange {
 }
 
 impl VerifiedRange {
+    /// Borrows the authenticated bytes without copying or repeating verification.
+    #[must_use]
+    pub fn as_slice(&self) -> VerifiedSlice<'_> {
+        VerifiedSlice {
+            object: self.object,
+            covered_offset: self.covered_offset,
+            data: &self.data,
+        }
+    }
+
     /// Object identity that authenticated the range.
     #[must_use]
     pub const fn object(&self) -> ObjectId {
@@ -417,6 +427,10 @@ mod tests {
 
         let range = verify_typed_bundle(fixture.object, &bundle, &records).unwrap();
         assert_eq!(range.covered_offset(), RANGE_UNIT_BYTES);
+        let borrowed = range.as_slice();
+        assert_eq!(borrowed.object(), range.object());
+        assert_eq!(borrowed.covered_offset(), RANGE_UNIT_BYTES);
+        assert!(std::ptr::eq(borrowed.data(), range.data()));
         assert_eq!(
             range.data(),
             &fixture.bytes[usize::try_from(RANGE_UNIT_BYTES).unwrap()..]

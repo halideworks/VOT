@@ -192,20 +192,24 @@ impl CountingSink {
     }
 }
 
-impl vot_scheduler::RangeSink for CountingSink {
-    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+impl CountingSink {
+    fn place(
+        &self,
+        bytes: u64,
+        write: impl FnOnce(&dyn ReceiveSink) -> Result<(), vot_scheduler::SinkError>,
+    ) -> Result<(), vot_scheduler::SinkError> {
         let held = self.sink.read().map_err(|_| vot_scheduler::SinkError)?;
         let sink = held.as_deref().ok_or(vot_scheduler::SinkError)?;
         if self.failed.load(Ordering::Acquire) {
             return Err(vot_scheduler::SinkError);
         }
-        sink.write_at(covered_offset, data).inspect_err(|_| {
+        write(sink).inspect_err(|_| {
             self.failed.store(true, Ordering::Release);
         })?;
         let placed = self
             .placed
-            .fetch_add(data.len() as u64, Ordering::Relaxed)
-            .saturating_add(data.len() as u64);
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
         let due = self.flush_due.load(Ordering::Relaxed);
         if placed >= due
             && self
@@ -248,6 +252,23 @@ impl vot_scheduler::RangeSink for CountingSink {
     }
 }
 
+impl vot_scheduler::RangeSink for CountingSink {
+    fn write_at(&self, covered_offset: u64, data: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+        self.place(data.len() as u64, |sink| {
+            sink.write_at(covered_offset, data)
+        })
+    }
+
+    fn write_verified(
+        &self,
+        verified: &vot_scheduler::VerifiedSlice<'_>,
+    ) -> Result<(), vot_scheduler::SinkError> {
+        self.place(verified.data().len() as u64, |sink| {
+            sink.write_verified(verified)
+        })
+    }
+}
+
 impl ReceiveSink for CountingSink {
     fn flush(&self) -> Result<(), Error> {
         CountingSink::flush(self)
@@ -285,6 +306,84 @@ pub(crate) const fn crossing(placed: u64, next_at: u64, quantum: u64) -> Option<
 pub(super) mod tests {
     use super::*;
     use vot_scheduler::RangeSink as _;
+
+    #[test]
+    fn counted_placement_preserves_the_witness_and_its_flush_failure() {
+        struct WitnessSink {
+            subject: SubjectId,
+            fail_flush: bool,
+            writes: AtomicU64,
+            flushes: AtomicU64,
+        }
+        impl vot_scheduler::RangeSink for WitnessSink {
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), vot_scheduler::SinkError> {
+                panic!("counting sink discarded the verification witness");
+            }
+            fn write_verified(
+                &self,
+                verified: &vot_scheduler::VerifiedSlice<'_>,
+            ) -> Result<(), vot_scheduler::SinkError> {
+                assert_eq!(
+                    SubjectId::try_from(verified.object()).unwrap(),
+                    self.subject
+                );
+                assert_eq!(verified.covered_offset(), 0);
+                assert_eq!(verified.data(), b"verified");
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        impl ReceiveSink for WitnessSink {
+            fn flush(&self) -> Result<(), Error> {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                if self.fail_flush {
+                    Err(Error::InvalidBundle)
+                } else {
+                    Ok(())
+                }
+            }
+            fn discard_partial(&self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        let mut builder =
+            vot_object::ObjectBuilder::new(vot_object::Suite::Blake3Bao64, Some(8)).unwrap();
+        builder.update(b"verified").unwrap();
+        let prepared = builder.finish().unwrap();
+        let object = prepared.object_id();
+        let subject = SubjectId::new(object.suite, object.root, object.length).unwrap();
+        let proof = prepared.prove(0, 8).unwrap();
+        for fail_flush in [false, true] {
+            let inner = Arc::new(WitnessSink {
+                subject,
+                fail_flush,
+                writes: AtomicU64::new(0),
+                flushes: AtomicU64::new(0),
+            });
+            let sink = Arc::new(CountingSink::custom(Box::new(Arc::clone(&inner))));
+            sink.flush_due.store(1, Ordering::Relaxed);
+            let mut receiver =
+                vot_scheduler::ReliableReceiver::new(1 << 20, 1 << 20, 1 << 20).unwrap();
+            receiver
+                .begin_ranges(subject, Box::new(Arc::clone(&sink)))
+                .unwrap();
+            let result = receiver.receive_range(subject, 0, b"verified", proof.proof());
+            assert_eq!(result.is_err(), fail_flush);
+            assert_eq!(sink.placed(), 8);
+            assert_eq!(inner.writes.load(Ordering::Relaxed), 1);
+            assert_eq!(inner.flushes.load(Ordering::Relaxed), 1);
+            if fail_flush {
+                assert!(
+                    receiver
+                        .receive_range(subject, 0, b"verified", proof.proof())
+                        .is_err()
+                );
+                assert_eq!(inner.writes.load(Ordering::Relaxed), 1);
+            } else {
+                receiver.finish_ranges(subject).unwrap();
+            }
+        }
+    }
 
     /// A sink that fails everything asked of it.
     pub(in crate::fetch) struct FailingSink;

@@ -140,6 +140,7 @@ changes plaintext object identity.
 | `0x0002` | `OBJECT_STORE` | draft |
 | `0x0003` | `WINDOWS_LOCAL` | reserved for implementation profile |
 | `0x0004` | `MACOS_LOCAL` | reserved for implementation profile |
+| `0x0005` | `POSIX_NAS` | draft |
 
 Provider versions are carried separately and do not alter the identifier.
 

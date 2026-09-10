@@ -1923,7 +1923,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if completed.is_err() {
                     plan.abandoned = true;
                 }
@@ -1946,7 +1945,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if completed.is_err() {
                     plan.abandoned = true;
                 }

@@ -179,6 +179,22 @@ fn local_and_nfs_ancestor_rename_preserves_publication_and_journal_cleanup() {
     fs::create_dir(&selected).unwrap();
     fs::write(selected.join("frame.exr"), b"unrelated").unwrap();
     file.publish().unwrap();
+    let payload = namespace.destination(OsStr::new("frame.exr")).unwrap();
+    assert_eq!(
+        payload.identity().unwrap().1,
+        fs::metadata(moved.join("frame.exr")).unwrap().ino()
+    );
+    let mut sidecar = namespace
+        .destination(OsStr::new("frame.exr.vot-receipt"))
+        .unwrap()
+        .create()
+        .unwrap();
+    sidecar.write_all(b"attestation").unwrap();
+    assert_eq!(
+        fs::read(moved.join("frame.exr.vot-receipt")).unwrap(),
+        b"attestation"
+    );
+    assert!(!selected.join("frame.exr.vot-receipt").exists());
     assert_eq!(fs::read(moved.join("frame.exr")).unwrap(), bytes);
     assert_eq!(fs::read(selected.join("frame.exr")).unwrap(), b"unrelated");
     assert_eq!(fs::read_dir(moved.join(".vot-stage")).unwrap().count(), 0);

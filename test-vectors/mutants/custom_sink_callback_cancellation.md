@@ -1,3 +1,8 @@
+The five callback mutations below were captured before the shared advance guard
+was added. The final implementation checks cancellation after factory, prefix
+and flush callbacks. Completion callbacks return to the shared advance guard,
+which rejects cancellation before another callback or sealing work can start.
+The last two mutations verify that shared guard, including a late second rail.
 
 ## public callback cancellation 0
 

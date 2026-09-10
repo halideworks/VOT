@@ -70,9 +70,15 @@ pub(super) fn claim(file: &File) -> Result<(), Error> {
 pub struct DurableWitness(());
 
 impl Journal {
-    #[cfg(unix)]
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
-        Self::create_at(FileLocation::from_path(path)?, incarnation)
+        #[cfg(unix)]
+        {
+            Self::create_at(FileLocation::from_path(path)?, incarnation)
+        }
+        #[cfg(not(unix))]
+        {
+            Self::create_nonunix(path, incarnation)
+        }
     }
 
     /// Keeps every later journal operation relative to the retained directory.
@@ -99,9 +105,15 @@ impl Journal {
         })
     }
 
-    #[cfg(unix)]
     pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
-        Self::open_at(FileLocation::from_path(path)?, incarnation)
+        #[cfg(unix)]
+        {
+            Self::open_at(FileLocation::from_path(path)?, incarnation)
+        }
+        #[cfg(not(unix))]
+        {
+            Self::open_current_nonunix(path, incarnation)
+        }
     }
 
     /// Claims and repairs a journal through its retained parent directory.
@@ -136,7 +148,7 @@ impl Journal {
     }
 
     #[cfg(not(unix))]
-    pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
+    fn create_nonunix(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
         vot_platform_fs::validate_removal_parent(path)?;
         let file = OpenOptions::new()
             .create_new(true)
@@ -167,7 +179,7 @@ impl Journal {
     }
 
     #[cfg(not(unix))]
-    pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
+    fn open_current_nonunix(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         claim(&file)?;
         let replay = replay_reader(&mut file, incarnation)?;

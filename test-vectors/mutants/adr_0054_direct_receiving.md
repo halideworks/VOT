@@ -280,3 +280,88 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 28 filtered out;
 
 error: test failed, to rerun pass `-p vot-receipt --lib`
 ```
+
+## mount identity error routing
+
+File: `crates/vot-platform-fs/src/nas.rs`
+
+```diff
+-    if !mount_id_available(stat.stx_mask, StatxFlags::MNT_ID.bits()) {
++    if mount_id_available(stat.stx_mask, StatxFlags::MNT_ID.bits()) {
+```
+
+```text
+running 1 test
+
+thread 'nas::tests::mount_lookup_binds_options_to_the_held_mount' (177) panicked at crates/vot-platform-fs/src/nas.rs:171:9:
+filesystem mount identity is unavailable
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test nas::tests::mount_lookup_binds_options_to_the_held_mount ... FAILED
+
+failures:
+
+failures:
+    nas::tests::mount_lookup_binds_options_to_the_held_mount
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p vot-platform-fs --lib`
+```
+
+## publication cleanup state
+
+File: `crates/vot-commit-posix/src/lib.rs`
+
+```diff
+-pub fn cleanup_published(self) -> Result<(), Error> {
+-        if self.machine.state() != State::Published {
++pub fn cleanup_published(self) -> Result<(), Error> {
++        if self.machine.state() == State::Published {
+```
+
+```text
+running 1 test
+
+thread 'tests::readback_cleanup_and_recovery_refuse_replaced_or_unpublished_names' (496) panicked at crates/vot-commit-posix/src/lib.rs:1342:9:
+assertion failed: matches!(commit.cleanup_published(), Err(Error::MissingObservation))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::readback_cleanup_and_recovery_refuse_replaced_or_unpublished_names ... FAILED
+
+failures:
+
+failures:
+    tests::readback_cleanup_and_recovery_refuse_replaced_or_unpublished_names
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p vot-commit-posix --lib`
+```
+
+## multi-buffer recovery
+
+File: `crates/vot-sdk-file/src/directory.rs`
+
+```diff
+-            remaining -= count as u64;
++            remaining += count as u64;
+```
+
+```text
+running 1 test
+
+thread 'interrupted_publication_rechecks_content_and_preserves_conflicts' (692) panicked at crates/vot-sdk-file/tests/shared_directory.rs:262:9:
+assertion failed: matches!(namespace.recover_publication(wrong.object_id(),
+    OsStr::new("frame.exr"), &state), Err(error) if error.kind() ==
+    ErrorKind::IdentityMismatch)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test interrupted_publication_rechecks_content_and_preserves_conflicts ... FAILED
+
+failures:
+
+failures:
+    interrupted_publication_rechecks_content_and_preserves_conflicts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p vot-sdk-file --test shared_directory`
+```

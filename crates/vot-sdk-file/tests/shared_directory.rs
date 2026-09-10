@@ -227,7 +227,8 @@ fn interrupted_publication_rechecks_content_and_preserves_conflicts() {
         let selected = fixture.selected();
         let contract = fixture.contract();
         let namespace = ReceiveDirectory::open(&selected, contract).unwrap();
-        let bytes = b"verified recovery payload";
+        let storage = vec![0x51; (1 << 20) + 17];
+        let bytes = storage.as_slice();
         let object = prepared(bytes);
         let proof = object.prove(0, bytes.len() as u64).unwrap();
         let verified = verify_range(object.object_id(), 0, bytes, proof.proof()).unwrap();
@@ -362,4 +363,36 @@ fn publication_journal_survives_until_the_application_checkpoint() {
     assert!(!journal.exists());
     assert_eq!(observation.incarnation, state.incarnation);
     assert_eq!(fs::read(fixture.0.join(name)).unwrap(), b"checkpoint");
+}
+
+#[test]
+fn resume_checks_the_end_of_non_prefix_coverage_against_staging_length() {
+    let fixture = Fixture::new();
+    let namespace = ReceiveDirectory::open(&fixture.0, fixture.contract()).unwrap();
+    let bytes = vec![42; 131_072];
+    let object = prepared(&bytes);
+    let proof = object.prove(65_536, 65_536).unwrap();
+    let verified =
+        verify_range(object.object_id(), 65_536, &bytes[65_536..], proof.proof()).unwrap();
+    let name = OsStr::new("frame.exr");
+    let file = namespace
+        .create(object.object_id(), name, CommitProfile::Balanced)
+        .unwrap();
+    file.accept(&verified).unwrap();
+    let state = file.resume_state().unwrap();
+    let path = file.staging_path().to_owned();
+    file.abandon();
+    namespace
+        .resume(object.object_id(), name, &state)
+        .unwrap()
+        .abandon();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(131_071)
+        .unwrap();
+    assert!(
+        matches!(namespace.resume(object.object_id(), name, &state), Err(error) if error.kind() == ErrorKind::Incomplete)
+    );
 }

@@ -68,11 +68,7 @@ impl ReceiveDirectory {
         #[cfg(not(target_os = "linux"))]
         super::validate_profile(profile)?;
         let destination = self.destination(name)?;
-        match destination.identity() {
-            Ok(_) => return Err(Error::plain(ErrorKind::AlreadyExists)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::io(error)),
-        }
+        require_absent(destination.identity())?;
         for _ in 0..CREATE_ATTEMPTS {
             let (temporary_name, incarnation) = next_name();
             let staging = self
@@ -129,11 +125,7 @@ impl ReceiveDirectory {
             return Err(Error::plain(ErrorKind::StateConflict));
         }
         let destination = self.destination(name)?;
-        match destination.identity() {
-            Ok(_) => return Err(Error::plain(ErrorKind::AlreadyExists)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::io(error)),
-        }
+        require_absent(destination.identity())?;
         let staging = self
             .temporary
             .entry(&state.staging_name)
@@ -260,5 +252,37 @@ impl ReceiveDirectory {
             vot_commit_posix::NoFaults,
         )
         .map_err(map_posix)
+    }
+}
+
+fn require_absent(identity: std::io::Result<(u64, u64)>) -> Result<(), Error> {
+    match identity {
+        Ok(_) => Err(Error::plain(ErrorKind::AlreadyExists)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::io(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_requires_absence_without_suppressing_other_errors() {
+        assert_eq!(
+            require_absent(Ok((1, 2))).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                require_absent(Err(kind.into())).is_ok(),
+                kind == std::io::ErrorKind::NotFound
+            );
+        }
     }
 }

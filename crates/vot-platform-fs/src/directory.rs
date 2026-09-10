@@ -50,13 +50,7 @@ impl Directory {
             (_, crate::NasContract::ServerAcknowledged) => crate::validate_nas_mount(&file)?,
             (false, crate::NasContract::Unqualified) => {}
         }
-        #[cfg(not(target_os = "linux"))]
-        if contract != crate::NasContract::Unqualified {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "NAS qualification is Linux-only",
-            ));
-        }
+        validate_platform_contract(contract, cfg!(target_os = "linux"))?;
         Ok(Self {
             file: Arc::new(file),
             path: path.to_path_buf(),
@@ -153,10 +147,13 @@ impl Directory {
     /// Returns an error unless the held directory is owner-matched and owner-only.
     pub fn require_private(&self) -> io::Result<()> {
         let metadata = self.file.metadata()?;
-        if !metadata.is_dir()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.mode() & 0o077 != 0
-        {
+        if !protected_directory(
+            metadata.is_dir(),
+            metadata.uid(),
+            rustix::process::geteuid().as_raw(),
+            metadata.mode(),
+            0o077,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "temporary directory requires owner-only access enforced by the filesystem",
@@ -167,10 +164,13 @@ impl Directory {
 
     fn require_removal_parent(&self) -> io::Result<()> {
         let metadata = self.file.metadata()?;
-        if !metadata.is_dir()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.mode() & 0o022 != 0
-        {
+        if !protected_directory(
+            metadata.is_dir(),
+            metadata.uid(),
+            rustix::process::geteuid().as_raw(),
+            metadata.mode(),
+            0o022,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "file removal requires an owner-matched, non-writable parent",
@@ -227,7 +227,10 @@ impl FileLocation {
         let descriptor = rustix::fs::openat(
             &*self.directory.file,
             &self.name,
-            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            flags
+                .union(OFlags::NOFOLLOW)
+                .union(OFlags::CLOEXEC)
+                .union(OFlags::NONBLOCK),
             mode,
         )?;
         let file = File::from(descriptor);
@@ -259,7 +262,7 @@ impl FileLocation {
     /// Returns an error if exclusive creation fails.
     pub fn create(&self) -> io::Result<File> {
         self.open(
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+            OFlags::RDWR.union(OFlags::CREATE).union(OFlags::EXCL),
             Mode::from_raw_mode(0o666),
         )
     }
@@ -359,8 +362,31 @@ impl FileLocation {
     }
 }
 
+fn validate_platform_contract(contract: crate::NasContract, supported: bool) -> io::Result<()> {
+    if !supported && contract != crate::NasContract::Unqualified {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "NAS qualification is Linux-only",
+        ));
+    }
+    Ok(())
+}
+
+fn protected_directory(
+    is_directory: bool,
+    owner: u32,
+    service: u32,
+    mode: u32,
+    forbidden: u32,
+) -> bool {
+    is_directory && owner == service && mode & forbidden == 0
+}
+
 fn directory_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+    OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::CLOEXEC)
+        .union(OFlags::NOFOLLOW)
 }
 
 fn validate_leaf(name: &OsStr) -> io::Result<()> {
@@ -393,6 +419,84 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn protection_and_platform_contracts_cover_each_boundary() {
+        for supported in [false, true] {
+            for contract in [
+                crate::NasContract::Unqualified,
+                crate::NasContract::ServerAcknowledged,
+            ] {
+                assert_eq!(
+                    validate_platform_contract(contract, supported).is_ok(),
+                    supported || contract == crate::NasContract::Unqualified
+                );
+            }
+        }
+        for forbidden in [0o022, 0o077] {
+            for mode in 0..0o1000 {
+                for is_directory in [false, true] {
+                    for owner in [10, 11] {
+                        let expected = is_directory && owner == 10 && mode & forbidden == 0;
+                        assert_eq!(
+                            protected_directory(is_directory, owner, 10, mode, forbidden),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locations_propagate_errors_and_replace_only_private_names() {
+        let root = std::env::temp_dir().join(format!(
+            "vot-dir-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let directory = Directory::open(&root).unwrap();
+        let source = directory.entry(OsStr::new("source")).unwrap();
+        assert_eq!(source.path(), root.join("source"));
+        let mut file = source.create().unwrap();
+        file.write_all(b"retained").unwrap();
+        assert!(source.create().is_err());
+        let destination = source.sibling(OsStr::new("destination")).unwrap();
+        assert!(!destination.same_file(&file).unwrap());
+        source.replace_private(&destination).unwrap();
+        assert!(!source.path().exists());
+        assert!(destination.same_file(&file).unwrap());
+        assert_eq!(std::fs::read(destination.path()).unwrap(), b"retained");
+        std::fs::create_dir(source.path()).unwrap();
+        assert!(source.same_file(&file).is_err());
+        let shared = directory.create_child(OsStr::new("shared")).unwrap();
+        std::fs::set_permissions(root.join("shared"), std::fs::Permissions::from_mode(0o770))
+            .unwrap();
+        let entry = shared.entry(OsStr::new("blocked")).unwrap();
+        assert!(entry.require_removal_parent().is_err());
+        assert!(destination.replace_private(&entry).is_err());
+        // /dev/null supplies a deterministic rejected fsync without a filesystem fault.
+        let invalid = Directory {
+            file: Arc::new(File::open("/dev/null").unwrap()),
+            path: root,
+            nas_contract: crate::NasContract::Unqualified,
+        };
+        assert!(invalid.sync().is_err());
+        assert!(
+            invalid
+                .entry(OsStr::new("unused"))
+                .unwrap()
+                .sync_parent()
+                .is_err()
+        );
+        assert!(invalid.require_private().is_err());
+        assert!(invalid.require_removal_parent().is_err());
     }
 
     #[test]
@@ -429,7 +533,7 @@ mod tests {
         let location = private.entry(OsStr::new("payload")).unwrap();
         let mut file = location
             .open(
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+                OFlags::RDWR.union(OFlags::CREATE).union(OFlags::EXCL),
                 Mode::from_raw_mode(0o600),
             )
             .unwrap();
@@ -437,7 +541,10 @@ mod tests {
         let original = file.metadata().unwrap();
         assert!(
             location
-                .open(OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, Mode::empty())
+                .open(
+                    OFlags::RDWR.union(OFlags::CREATE).union(OFlags::EXCL),
+                    Mode::empty()
+                )
                 .is_err()
         );
         let moved = root.join("moved");
@@ -492,7 +599,7 @@ mod tests {
         let location = directory.entry(OsStr::new("a")).unwrap();
         let file = location
             .open(
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+                OFlags::RDWR.union(OFlags::CREATE).union(OFlags::EXCL),
                 Mode::from_raw_mode(0o600),
             )
             .unwrap();

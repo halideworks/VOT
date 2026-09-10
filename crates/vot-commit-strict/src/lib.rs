@@ -236,7 +236,9 @@ fn direct_open_flags() -> rustix::fs::OFlags {
     let mut flags = rustix::fs::OFlags::RDONLY;
     flags.insert(rustix::fs::OFlags::DIRECT);
     flags.insert(
-        rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::OFlags::CLOEXEC
+            .union(rustix::fs::OFlags::NOFOLLOW)
+            .union(rustix::fs::OFlags::NONBLOCK),
     );
     flags
 }

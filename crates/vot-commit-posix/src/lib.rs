@@ -245,10 +245,7 @@ impl<F: FaultInjector> PosixCommit<F> {
         nas_contract: NasContract,
         faults: F,
     ) -> Result<Self, Error> {
-        #[cfg(not(target_os = "linux"))]
-        if nas_contract != NasContract::Unqualified {
-            return Err(Error::UnsupportedProfile);
-        }
+        validate_contract_platform(nas_contract, cfg!(target_os = "linux"))?;
         staging_path.require_removal_parent()?;
         journal_path.require_removal_parent()?;
         let staging = staging_path.create()?;
@@ -335,10 +332,7 @@ impl<F: FaultInjector> PosixCommit<F> {
         nas_contract: NasContract,
         faults: F,
     ) -> Result<Self, Error> {
-        #[cfg(not(target_os = "linux"))]
-        if nas_contract != NasContract::Unqualified {
-            return Err(Error::UnsupportedProfile);
-        }
+        validate_contract_platform(nas_contract, cfg!(target_os = "linux"))?;
         staging_path.require_removal_parent()?;
         journal_path.require_removal_parent()?;
         // The journal is read before staging is opened: a published or
@@ -408,21 +402,16 @@ impl<F: FaultInjector> PosixCommit<F> {
         let file = destination.open_read()?;
         #[cfg(target_os = "linux")]
         validate_filesystem_profile(&file, profile, nas_contract)?;
-        #[cfg(not(target_os = "linux"))]
-        if nas_contract != NasContract::Unqualified {
-            return Err(Error::UnsupportedProfile);
-        }
+        validate_contract_platform(nas_contract, cfg!(target_os = "linux"))?;
         let expected =
             admission_payload(profile, nas_contract, &file, &staging_path, &destination)?;
         let identity = Identity::of_file(&file)?;
         let machine = replay_publication(profile, &replay.records, &expected, identity)?;
-        match staging_path.identity() {
-            Ok(_) if Identity::of_location(&staging_path)? == identity => {}
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    && matches!(machine.state(), State::NamespaceLinked | State::Published) => {}
-            _ => return Err(Error::StagingIdentityMismatch),
-        }
+        validate_publication_alias(
+            Identity::of_location(&staging_path),
+            identity,
+            machine.state(),
+        )?;
         Ok(Self {
             profile,
             incarnation,
@@ -915,6 +904,30 @@ impl<F: FaultInjector> PosixCommit<F> {
     }
 }
 
+fn validate_contract_platform(contract: NasContract, supported: bool) -> Result<(), Error> {
+    if !supported && contract != NasContract::Unqualified {
+        return Err(Error::UnsupportedProfile);
+    }
+    Ok(())
+}
+
+fn validate_publication_alias(
+    found: Result<Identity, Error>,
+    expected: Identity,
+    state: State,
+) -> Result<(), Error> {
+    match found {
+        Ok(identity) if identity == expected => Ok(()),
+        Err(Error::Io(error))
+            if error.kind() == io::ErrorKind::NotFound
+                && matches!(state, State::NamespaceLinked | State::Published) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::StagingIdentityMismatch),
+    }
+}
+
 fn replay_publication(
     profile: Profile,
     records: &[vot_journal::Record],
@@ -1225,6 +1238,138 @@ mod tests {
             OneFault(fault),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn recovery_alias_and_platform_contract_refusals_cover_all_states() {
+        for supported in [false, true] {
+            for contract in [NasContract::Unqualified, NasContract::ServerAcknowledged] {
+                assert_eq!(
+                    validate_contract_platform(contract, supported).is_ok(),
+                    supported || contract == NasContract::Unqualified
+                );
+            }
+        }
+        for state in [
+            State::New,
+            State::Admitted,
+            State::TransitVerified,
+            State::DataFlushed,
+            State::Durable,
+            State::AtRestVerified,
+            State::NamespaceLinked,
+            State::Published,
+            State::RecoveryRequired,
+            State::Poisoned,
+            State::Aborted,
+        ] {
+            let expected = Identity([7; 16]);
+            assert!(validate_publication_alias(Ok(expected), expected, state).is_ok());
+            assert!(validate_publication_alias(Ok(Identity([8; 16])), expected, state).is_err());
+            for kind in [
+                io::ErrorKind::NotFound,
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::AlreadyExists,
+            ] {
+                assert_eq!(
+                    validate_publication_alias(Err(Error::Io(kind.into())), expected, state)
+                        .is_ok(),
+                    kind == io::ErrorKind::NotFound
+                        && matches!(state, State::NamespaceLinked | State::Published)
+                );
+            }
+            assert!(
+                validate_publication_alias(Err(Error::AdmissionMismatch), expected, state).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_publication_renews_required_barriers_and_retains_the_journal() {
+        for profile in [Profile::Fast, Profile::Balanced] {
+            for fault in [
+                Some(FaultPoint::NamespaceLink),
+                Some(FaultPoint::DirectoryFlush),
+                None,
+            ] {
+                let root = directory("recover-publication");
+                let mut commit = provider(&root, profile, fault);
+                assert!(matches!(
+                    commit.finish_recovered_publication(),
+                    Err(Error::NotAdmitted)
+                ));
+                commit.write_transit_verified(b"verified bytes").unwrap();
+                assert_eq!(commit.publish().is_err(), fault.is_some());
+                drop(commit);
+                let mut recovered = PosixCommit::reopen_publication_at(
+                    profile,
+                    [4; 16],
+                    location(&root.join("stage")),
+                    location(&root.join("object")),
+                    location(&root.join("journal")),
+                    NasContract::Unqualified,
+                    OneFault(Some(FaultPoint::DataFlush)),
+                )
+                .unwrap();
+                assert_eq!(recovered.recovery_file().metadata().unwrap().len(), 14);
+                if profile == Profile::Balanced {
+                    assert!(recovered.finish_recovered_publication().is_err());
+                }
+                let receipt = recovered.finish_recovered_publication().unwrap();
+                let again = recovered.finish_recovered_publication().unwrap();
+                assert_eq!(receipt.sequence, again.sequence);
+                assert_eq!(receipt.level, Assurance::Published);
+                assert!(root.join("journal").exists());
+                recovered.cleanup_published().unwrap();
+                assert!(!root.join("journal").exists());
+                assert_eq!(fs::read(root.join("object")).unwrap(), b"verified bytes");
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn readback_cleanup_and_recovery_refuse_replaced_or_unpublished_names() {
+        let root = directory("recovery-refusals");
+        let commit = provider(&root, Profile::Balanced, None);
+        assert!(commit.read_staging().is_ok());
+        fs::rename(root.join("stage"), root.join("held")).unwrap();
+        fs::write(root.join("stage"), b"unrelated").unwrap();
+        assert!(matches!(
+            commit.read_staging(),
+            Err(Error::StagingIdentityMismatch)
+        ));
+        assert!(matches!(
+            commit.cleanup_published(),
+            Err(Error::MissingObservation)
+        ));
+        fs::create_dir(root.join("object")).unwrap();
+        assert!(
+            recover(
+                &root.join("journal"),
+                [4; 16],
+                &root.join("stage"),
+                &root.join("object")
+            )
+            .is_err()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let file = File::open(root.join("stage")).unwrap();
+            assert!(
+                validate_filesystem_profile(&file, Profile::Balanced, NasContract::Unqualified)
+                    .is_ok()
+            );
+            assert!(
+                validate_filesystem_profile(
+                    &file,
+                    Profile::Balanced,
+                    NasContract::ServerAcknowledged
+                )
+                .is_err()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

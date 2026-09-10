@@ -29,11 +29,16 @@ pub enum NasContract {
 pub fn validate_nas_mount(file: &File) -> io::Result<()> {
     use rustix::fs::{AtFlags, StatxFlags};
     let stat = rustix::fs::statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+    if !mount_id_available(stat.stx_mask, StatxFlags::MNT_ID.bits()) {
         return Err(io::Error::other("filesystem mount identity is unavailable"));
     }
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
     validate_mount_info(&mounts, stat.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id_available(mask: u32, requested: u32) -> bool {
+    mask & requested == requested
 }
 
 #[cfg(target_os = "linux")]
@@ -100,6 +105,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mount_identity_requires_the_requested_statx_bit() {
+        for (mask, requested, expected) in
+            [(0, 8, false), (8, 8, true), (9, 8, true), (1, 8, false)]
+        {
+            assert_eq!(mount_id_available(mask, requested), expected);
+        }
+    }
+
+    #[test]
     fn qualification_requires_every_client_guarantee() {
         for (filesystem, required) in [
             ("cifs", vec!["vers=3.1.1", "serverino", "cifsacl"]),
@@ -153,6 +167,7 @@ mod tests {
             assert!(validate_mount_info(text, id).is_err());
         }
         assert!(validate_mount_info(&valid.replace("rw,relatime", "ro,relatime"), 15).is_err());
-        assert!(validate_nas_mount(&File::open("/").unwrap()).is_err());
+        let error = validate_nas_mount(&File::open("/").unwrap()).unwrap_err();
+        assert!(error.to_string().contains("NAS requires SMB3"), "{error}");
     }
 }

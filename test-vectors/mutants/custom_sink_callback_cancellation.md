@@ -320,3 +320,32 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out
 
 error: test failed, to rerun pass `-p vot-cli --lib`
 ```
+
+## Shared storage presence after the second CI survivor
+
+The inline storage-presence check used only for completion survived replacement of `||` with `&&` in the complete vot-cli suite. Partial and complete resume now use one `stored` value. The existing custom-prefix test rejects that mutation because the 65536-byte prefix must not be requested again.
+
+```diff
+-let stored = custom.is_some() || path.exists();
++let stored = custom.is_some() && path.exists();
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::custom_sink_prefixes_seed_only_their_own_authenticated_object' (299) panicked at crates/vot-cli/src/fetch/mod.rs:3625:17:
+assertion `left == right` failed
+  left: 900001
+ right: 834465
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::custom_sink_prefixes_seed_only_their_own_authenticated_object ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::custom_sink_prefixes_seed_only_their_own_authenticated_object
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```

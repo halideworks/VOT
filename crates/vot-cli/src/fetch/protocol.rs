@@ -1903,11 +1903,8 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             } else {
                 None
             };
-            let already_complete = completion_due(
-                object.length,
-                whole_from_before,
-                custom.is_some() || path.exists(),
-            );
+            let stored = custom.is_some() || path.exists();
+            let already_complete = completion_due(object.length, whole_from_before, stored);
             if already_complete && let Some(sink) = &custom {
                 drop(plan);
                 let synced = sink.flush();
@@ -1975,7 +1972,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 continue;
             }
             let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
-            let resumed = if custom.is_some() || path.exists() {
+            let resumed = if stored {
                 planned_resumed
             } else {
                 // The checkpoint outlived its file; clear the store too,

@@ -2,8 +2,9 @@ The first five callback mutations were captured before the shared advance guard
 was added. The final implementation checks factory, prefix and flush callbacks
 in place and uses one completion transition to publish cancellation before the
 object becomes done. This prevents a rail with a different cancellation handle
-from sealing between the callback owner's advance iterations. The final two
-mutations verify the shared completion transition.
+from sealing between the callback owner's advance iterations. The completion
+mutations verify that transition. The final section covers the shared predicate
+for resumed completion and flushing.
 
 ## public callback cancellation 0
 
@@ -258,6 +259,64 @@ failures:
     fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance
 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 337 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```
+
+## Shared completion predicate after the CI survivor
+
+The original inline `custom.is_some() || path.exists()` mutation to `&&` passed the complete vot-cli test suite. It selected the asynchronous completion path with the same outcome. The code now computes one completion predicate for synchronous completion and custom flushing; its truth table covers every boolean combination.
+
+### requires empty and resumed
+
+```diff
+-length == 0 || fully_resumed && stored
++length == 0 && fully_resumed && stored
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole' (2385635) panicked at crates/vot-cli/src/fetch/mod.rs:4354:13:
+assertion `left == right` failed
+  left: false
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```
+
+### accepts resumed or stored
+
+```diff
+-length == 0 || fully_resumed && stored
++length == 0 || fully_resumed || stored
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole' (2385935) panicked at crates/vot-cli/src/fetch/mod.rs:4354:13:
+assertion `left == right` failed
+  left: true
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::only_whole_nonempty_objects_reserve_and_resume_whole
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 410 filtered out; finished in 0.00s
 
 error: test failed, to rerun pass `-p vot-cli --lib`
 ```

@@ -4344,15 +4344,14 @@ pub(crate) mod tests {
         for (length, resumed, stored, expected) in [
             (0, false, false, true),
             (0, false, true, true),
+            (0, true, false, true),
+            (0, true, true, true),
             (1, false, false, false),
             (1, false, true, false),
             (1, true, false, false),
             (1, true, true, true),
         ] {
-            assert_eq!(
-                protocol::custom_flush_due(length, resumed, stored),
-                expected
-            );
+            assert_eq!(protocol::completion_due(length, resumed, stored), expected);
         }
     }
 

@@ -24,7 +24,7 @@ pub(super) fn custom_prefix(prefix: u64, length: u64) -> Result<BTreeMap<u64, u6
     Ok((prefix != 0).then_some((0, prefix)).into_iter().collect())
 }
 
-pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
+pub(super) const fn completion_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
     length == 0 || fully_resumed && stored
 }
 
@@ -1903,12 +1903,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             } else {
                 None
             };
-            if custom_flush_due(
+            let already_complete = completion_due(
                 object.length,
                 whole_from_before,
                 custom.is_some() || path.exists(),
-            ) && let Some(sink) = &custom
-            {
+            );
+            if already_complete && let Some(sink) = &custom {
                 drop(plan);
                 let synced = sink.flush();
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
@@ -1949,7 +1949,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 continue;
             }
-            if whole_from_before && (custom.is_some() || path.exists()) {
+            if already_complete {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
                 drop(plan);

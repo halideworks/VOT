@@ -39,7 +39,7 @@ Reuse a `ReceiveDirectory` for a sequence. `resume_state()` plus `abandon()` par
 each file without retaining its descriptors. Persist the object identity, final
 name, contract and resume state together in trusted local control storage.
 After an uncertain restart, verify covered bytes before publishing. When the
-final name exists and the journal remains, `recover_publication()` rechecks the
+final name exists and the journal remains, `recover_publication(..., active)` rechecks the
 bound journal, exact object contents and storage acknowledgments without copying.
 Use `publish_retaining_journal()` when completion also needs an application
 database checkpoint. Both that operation and recovery retain the journal;
@@ -165,3 +165,8 @@ missing credentials.
 
 The initial [Windows-to-Samba results](../bench/results/mounted-share-2026-09-07.md)
 record the reproduced failure, passing share tests, and before/after timings.
+
+The recovery callback must report whether the application still owns receiving
+storage and permits recovery. It is checked before each bounded read and before
+changing publication state. Cancellation returns an interrupted I/O error,
+retains recovery files, and produces no publication observation.

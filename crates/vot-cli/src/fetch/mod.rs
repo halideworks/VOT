@@ -3774,6 +3774,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn completion_publishes_cancellation_before_another_rail_can_advance() {
+        for abandoned in [false, true] {
+            for cancelled in [false, true] {
+                for failed in [false, true] {
+                    let mut plan = windowed(8);
+                    plan.active.clear();
+                    plan.abandoned = abandoned;
+                    let result = protocol::complete_callback(
+                        &mut plan,
+                        0,
+                        if failed {
+                            Err(Error::InvalidBundle)
+                        } else {
+                            Ok(())
+                        },
+                        cancelled,
+                    );
+                    assert_eq!(result.is_err(), failed);
+                    assert_eq!(plan.objects[0].done, !failed);
+                    assert_eq!(plan.abandoned, abandoned || cancelled || failed);
+                    if abandoned || cancelled || failed {
+                        let output = temporary("callback-other-rail");
+                        let mut other =
+                            BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+                        assert!(!other.seams.cancellation.is_cancelled());
+                        other.plan = Some(Arc::new(Mutex::new(plan)));
+                        other.advance().unwrap();
+                        assert!(!other.complete());
+                        drop(other);
+                        discard(&[&output]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn custom_prefix_callback_can_abandon_without_opening_a_sink() {
         struct CancellingSink {
             plan: SharedPlan,

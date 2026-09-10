@@ -28,6 +28,19 @@ pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: b
     length == 0 || fully_resumed && stored
 }
 
+pub(super) fn complete_callback(
+    plan: &mut FetchPlan,
+    index: usize,
+    completed: Result<(), Error>,
+    cancelled: bool,
+) -> Result<(), Error> {
+    // Rails may have different cancellation handles; publish cancellation before releasing done.
+    plan.abandoned |= cancelled || completed.is_err();
+    completed?;
+    plan.objects[index].done = true;
+    Ok(())
+}
+
 /// Ends an open the plan no longer wants, discarding the sink it chose.
 ///
 /// Cancellation drains the window under the plan lock, and an object being
@@ -1923,11 +1936,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                if completed.is_err() {
-                    plan.abandoned = true;
-                }
-                completed?;
-                plan.objects[at].done = true;
+                complete_callback(
+                    &mut plan,
+                    at,
+                    completed,
+                    self.seams.cancellation.is_cancelled(),
+                )?;
                 if plan.abandoned {
                     // Durable and told to its consumer, so it counts
                     // toward the cursor and is never discarded.
@@ -1945,13 +1959,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                if completed.is_err() {
-                    plan.abandoned = true;
-                }
-                completed?;
+                complete_callback(
+                    &mut plan,
+                    at,
+                    completed,
+                    self.seams.cancellation.is_cancelled(),
+                )?;
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.carried_before = plan.carried_before.saturating_add(object.length);
-                plan.objects[at].done = true;
                 if plan.abandoned {
                     // Durable and told to its consumer, so it counts
                     // toward the cursor and is never discarded.

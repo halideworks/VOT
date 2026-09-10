@@ -1,8 +1,9 @@
-The five callback mutations below were captured before the shared advance guard
-was added. The final implementation checks cancellation after factory, prefix
-and flush callbacks. Completion callbacks return to the shared advance guard,
-which rejects cancellation before another callback or sealing work can start.
-The last two mutations verify that shared guard, including a late second rail.
+The first five callback mutations were captured before the shared advance guard
+was added. The final implementation checks factory, prefix and flush callbacks
+in place and uses one completion transition to publish cancellation before the
+object becomes done. This prevents a rail with a different cancellation handle
+from sealing between the callback owner's advance iterations. The final two
+mutations verify the shared completion transition.
 
 ## public callback cancellation 0
 
@@ -199,6 +200,64 @@ failures:
     fetch::tests::public_cancellation_before_advance_preserves_an_unsealed_plan
 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 336 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```
+
+## completion omits cancelled rail
+
+File: `crates/vot-cli/src/fetch/protocol.rs`
+
+```diff
+-plan.abandoned |= cancelled || completed.is_err();
++plan.abandoned |= completed.is_err();
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance' (2248391) panicked at crates/vot-cli/src/fetch/mod.rs:3794:17:
+assertion `left == right` failed
+  left: false
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 337 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```
+
+## completion ignores failed callback
+
+File: `crates/vot-cli/src/fetch/protocol.rs`
+
+```diff
+-plan.abandoned |= cancelled || completed.is_err();
++plan.abandoned |= cancelled;
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance' (2248763) panicked at crates/vot-cli/src/fetch/mod.rs:3794:17:
+assertion `left == right` failed
+  left: false
+ right: true
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::completion_publishes_cancellation_before_another_rail_can_advance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 337 filtered out; finished in 0.00s
 
 error: test failed, to rerun pass `-p vot-cli --lib`
 ```

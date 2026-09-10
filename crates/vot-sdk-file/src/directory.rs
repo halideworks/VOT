@@ -51,7 +51,8 @@ impl ReceiveDirectory {
         })
     }
 
-    fn destination(&self, name: &OsStr) -> Result<FileLocation, Error> {
+    /// Resolves a payload or sidecar name through the retained publication directory.
+    pub fn destination(&self, name: &OsStr) -> Result<FileLocation, Error> {
         if name.to_string_lossy().eq_ignore_ascii_case(".vot-stage") {
             return Err(Error::plain(ErrorKind::InvalidDestination));
         }

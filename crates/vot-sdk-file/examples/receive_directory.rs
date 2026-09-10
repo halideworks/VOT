@@ -75,7 +75,6 @@ fn main() {
         4,
         "SOURCE NEW_DESTINATION local|nas fast|balanced"
     );
-    let source = PathBuf::from(&args[0]);
     let destination = PathBuf::from(&args[1]);
     let contract = match args[2].to_str().unwrap() {
         "local" => NasContract::Unqualified,
@@ -88,7 +87,7 @@ fn main() {
         _ => panic!("expected fast or balanced"),
     };
     assert!(!destination.exists(), "destination must be new");
-    let paths = sources(&source);
+    let paths = sources(std::path::Path::new(&args[0]));
     fs::create_dir(&destination).unwrap();
     let started = Instant::now();
     let namespace = ReceiveDirectory::open(&destination, contract).unwrap();
@@ -148,9 +147,13 @@ fn main() {
         receiver.publish().unwrap();
         let published = fs::metadata(destination.join(path.file_name().unwrap())).unwrap();
         assert_eq!(
-            (original.dev(), original.ino(), staged.blocks()),
-            (published.dev(), published.ino(), published.blocks())
+            (original.dev(), original.ino()),
+            (published.dev(), published.ino())
         );
+        // CIFS may cache allocation counts across buffered writes and publication.
+        if contract == NasContract::Unqualified {
+            assert_eq!(staged.blocks(), published.blocks());
+        }
         if (index + 1) % 10_000 == 0 {
             println!("published={}", index + 1);
         }

@@ -15,8 +15,30 @@ use super::{
     reservations_of, resume_failure, resumed_extents, subject_of,
 };
 
-pub(super) const fn custom_flush_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
+pub(super) fn custom_prefix(prefix: u64, length: u64) -> Result<BTreeMap<u64, u64>, Error> {
+    if prefix > length
+        || (prefix != length && !prefix.is_multiple_of(vot_scheduler::RANGE_UNIT_BYTES))
+    {
+        return Err(Error::InvalidBundle);
+    }
+    Ok((prefix != 0).then_some((0, prefix)).into_iter().collect())
+}
+
+pub(super) const fn completion_due(length: u64, fully_resumed: bool, stored: bool) -> bool {
     length == 0 || fully_resumed && stored
+}
+
+pub(super) fn complete_callback(
+    plan: &mut FetchPlan,
+    index: usize,
+    completed: Result<(), Error>,
+    cancelled: bool,
+) -> Result<(), Error> {
+    // Rails may have different cancellation handles; publish cancellation before releasing done.
+    plan.abandoned |= cancelled || completed.is_err();
+    completed?;
+    plan.objects[index].done = true;
+    Ok(())
 }
 
 /// Ends an open the plan no longer wants, discarding the sink it chose.
@@ -1667,6 +1689,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .len();
         for _ in 0..advance_passes(objects) {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+            plan.abandoned |= self.seams.cancellation.is_cancelled();
+            if plan.abandoned {
+                return Ok(());
+            }
             // Forget partial accounts for objects the window no longer
             // holds, so the receiver is bounded by what is in flight, not
             // by everything this rail touched. An index below the cursor
@@ -1687,9 +1713,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // Admit every object in the window to this rail, and take the
             // first one that is whole and nobody is syncing.
             let mut settled = None;
-            // Read once: an abandoned plan starts no new completion work
-            // below, whichever rail or job abandoned it.
-            let abandoned = plan.abandoned;
             for (index, active) in &plan.active {
                 let length = plan
                     .objects
@@ -1703,13 +1726,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.rail.admitted.insert(*index, active.subject);
                 }
                 // Complete when shared coverage spans the object, or this
-                // rail's receiver verified it. Never on an abandoned plan:
-                // what abandoned it may be this object's own completion,
-                // which cleared `syncing` after its hook had already run,
-                // and a second job would run that hook a second time.
+                // rail's receiver verified it. Abandonment was checked under
+                // the same lock, so a failed hook cannot be queued again.
                 let whole =
                     active.covered.is_complete(length) || self.receiver.is_verified(active.subject);
-                if whole && !active.syncing && !abandoned {
+                if whole && !active.syncing {
                     settled = Some((*index, active.subject, length));
                     break;
                 }
@@ -1793,12 +1814,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 plan.finished = true;
                 return Ok(());
             }
-            if plan.abandoned {
-                // Cancellation drains the window under this lock and
-                // discards what it drained; an object opened after it
-                // would be a sink nothing owns.
-                return Ok(());
-            }
             if plan.in_flight() >= plan.window || plan.next_open == plan.objects.len() {
                 return Ok(());
             }
@@ -1833,6 +1848,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 drop(plan);
                 let chosen = factory(self.receive_session, &receive_object);
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if chosen.is_err() {
                     plan.abandoned = true;
                 }
@@ -1865,16 +1881,35 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     plan.objects[at].done = true;
                     continue;
                 };
+                drop(plan);
+                let resumed = chosen
+                    .resumed_prefix()
+                    .and_then(|prefix| custom_prefix(prefix, object.length));
+                plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
+                let resumed = match resumed {
+                    Ok(resumed) if !plan.abandoned => resumed,
+                    result => {
+                        plan.abandoned = true;
+                        drop(plan);
+                        chosen.discard_partial()?;
+                        return result.map(|_| ());
+                    }
+                };
+                whole_from_before = resumed.get(&0).copied() == Some(object.length);
+                planned_resumed = resumed;
+                plan.objects[at].resumed.clone_from(&planned_resumed);
                 Some(chosen)
             } else {
                 None
             };
-            if custom_flush_due(object.length, whole_from_before, path.exists())
-                && let Some(sink) = &custom
-            {
+            let stored = custom.is_some() || path.exists();
+            let already_complete = completion_due(object.length, whole_from_before, stored);
+            if already_complete && let Some(sink) = &custom {
                 drop(plan);
                 let synced = sink.flush();
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+                plan.abandoned |= self.seams.cancellation.is_cancelled();
                 if synced.is_err() {
                     plan.abandoned = true;
                 }
@@ -1898,11 +1933,12 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                if completed.is_err() {
-                    plan.abandoned = true;
-                }
-                completed?;
-                plan.objects[at].done = true;
+                complete_callback(
+                    &mut plan,
+                    at,
+                    completed,
+                    self.seams.cancellation.is_cancelled(),
+                )?;
                 if plan.abandoned {
                     // Durable and told to its consumer, so it counts
                     // toward the cursor and is never discarded.
@@ -1910,7 +1946,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 }
                 continue;
             }
-            if whole_from_before && path.exists() {
+            if already_complete {
                 // Durable whole from a previous fetch: nothing to admit
                 // or ask for, and the store already says so.
                 drop(plan);
@@ -1920,13 +1956,14 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     .as_ref()
                     .map_or(Ok(()), |hook| hook(self.receive_session, &receive_object));
                 plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
-                if completed.is_err() {
-                    plan.abandoned = true;
-                }
-                completed?;
+                complete_callback(
+                    &mut plan,
+                    at,
+                    completed,
+                    self.seams.cancellation.is_cancelled(),
+                )?;
                 plan.placed_before = plan.placed_before.saturating_add(object.length);
                 plan.carried_before = plan.carried_before.saturating_add(object.length);
-                plan.objects[at].done = true;
                 if plan.abandoned {
                     // Durable and told to its consumer, so it counts
                     // toward the cursor and is never discarded.
@@ -1935,7 +1972,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 continue;
             }
             let subject = SubjectId::try_from(object).map_err(|_| Error::InvalidBundle)?;
-            let resumed = if path.exists() {
+            let resumed = if stored {
                 planned_resumed
             } else {
                 // The checkpoint outlived its file; clear the store too,
@@ -1958,7 +1995,7 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 subject,
             });
             let sink = Arc::new(if let Some(custom) = custom {
-                CountingSink::custom(custom)
+                CountingSink::custom(custom, seeded)
             } else if path.exists() {
                 CountingSink::resume(&path, object.length, seeded, durable)?
             } else {

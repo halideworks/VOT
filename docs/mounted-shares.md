@@ -48,6 +48,12 @@ bound final identity and Published state without another payload read.
 Preserve unresolved journals and files. A consumer must reconcile completion
 that outlives its own checkpoint before collecting recovery metadata.
 
+Native custom sinks can implement `ReceiveSink::resumed_prefix()` to skip an
+object's trusted contiguous checkpoint. Return zero for a fresh object. Non-final
+prefixes must be range-unit aligned and no prefix may exceed the object length.
+Keep the checkpoint bound to the exact object and verify uncertain stored bytes
+before completion. A directory resume map never seeds a custom sink.
+
 Qualified NAS receipts use provider `POSIX_NAS` (`0x0005`), with the actual
 selected profile. This separates server-acknowledged durability from local
 storage and does not assert independent NAS readback.
@@ -65,14 +71,15 @@ The mounted cases fail on missing or unqualified storage; they do not skip.
 
 For separately generated large fixtures, the component harness admits and parks
 every file, verifies ranges, resumes large files halfway, and asserts publication
-preserves inode and allocated blocks:
+preserves inode identity (and allocated blocks on local storage):
 
 ```sh
 cargo +1.97.1 run --release -p vot-sdk-file --example receive_directory -- /test/source /mnt/nfs/new-destination nas balanced
 ```
 
 Use a fresh destination. Keep fixture source and receive capacity separate.
-Independently hash all outputs after the timed run. This harness includes sender
+Independently hash all outputs after the timed run. Measure NAS allocation on
+the server; CIFS client block counts can be cached or synthetic. This harness includes sender
 preparation and storage publication, but does not measure network transport.
 See [ADR-0054](../adr/0054-direct-receiving-on-shared-storage.md).
 

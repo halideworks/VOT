@@ -1676,6 +1676,10 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             .len();
         for _ in 0..advance_passes(objects) {
             let mut plan = shared.lock().map_err(|_| Error::InvalidBundle)?;
+            plan.abandoned |= self.seams.cancellation.is_cancelled();
+            if plan.abandoned {
+                return Ok(());
+            }
             // Forget partial accounts for objects the window no longer
             // holds, so the receiver is bounded by what is in flight, not
             // by everything this rail touched. An index below the cursor
@@ -1696,9 +1700,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
             // Admit every object in the window to this rail, and take the
             // first one that is whole and nobody is syncing.
             let mut settled = None;
-            // Read once: an abandoned plan starts no new completion work
-            // below, whichever rail or job abandoned it.
-            let abandoned = plan.abandoned;
             for (index, active) in &plan.active {
                 let length = plan
                     .objects
@@ -1712,13 +1713,11 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                     self.rail.admitted.insert(*index, active.subject);
                 }
                 // Complete when shared coverage spans the object, or this
-                // rail's receiver verified it. Never on an abandoned plan:
-                // what abandoned it may be this object's own completion,
-                // which cleared `syncing` after its hook had already run,
-                // and a second job would run that hook a second time.
+                // rail's receiver verified it. Abandonment was checked under
+                // the same lock, so a failed hook cannot be queued again.
                 let whole =
                     active.covered.is_complete(length) || self.receiver.is_verified(active.subject);
-                if whole && !active.syncing && !abandoned {
+                if whole && !active.syncing {
                     settled = Some((*index, active.subject, length));
                     break;
                 }
@@ -1800,12 +1799,6 @@ impl<A: TransportAdapter> BundleFetcher<A> {
                 synced?;
                 plan.store = None;
                 plan.finished = true;
-                return Ok(());
-            }
-            if plan.abandoned {
-                // Cancellation drains the window under this lock and
-                // discards what it drained; an object opened after it
-                // would be a sink nothing owns.
                 return Ok(());
             }
             if plan.in_flight() >= plan.window || plan.next_open == plan.objects.len() {

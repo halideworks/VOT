@@ -137,3 +137,63 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 335 filtered out
 
 error: test failed, to rerun pass `-p vot-cli --lib`
 ```
+
+## cancelled plan re-enters sealing
+
+File: `crates/vot-cli/src/fetch/protocol.rs`
+
+```diff
+-            if plan.abandoned {
+-                return Ok(());
+-            }
++            if false {
++                return Ok(());
++            }
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::public_cancellation_during_custom_callbacks_prevents_sealing' (299) panicked at crates/vot-cli/src/fetch/mod.rs:3746:17:
+another rail sealed the cancelled plan
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::public_cancellation_during_custom_callbacks_prevents_sealing ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::public_cancellation_during_custom_callbacks_prevents_sealing
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 336 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```
+
+## public cancellation before sealing
+
+File: `crates/vot-cli/src/fetch/protocol.rs`
+
+```diff
+-
+-            plan.abandoned |= self.seams.cancellation.is_cancelled();
++
++            plan.abandoned |= false;
+```
+
+```text
+running 1 test
+
+thread 'fetch::tests::public_cancellation_before_advance_preserves_an_unsealed_plan' (615) panicked at crates/vot-cli/src/fetch/mod.rs:3767:9:
+assertion failed: !fetcher.complete()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fetch::tests::public_cancellation_before_advance_preserves_an_unsealed_plan ... FAILED
+
+failures:
+
+failures:
+    fetch::tests::public_cancellation_before_advance_preserves_an_unsealed_plan
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 336 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p vot-cli --lib`
+```

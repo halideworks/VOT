@@ -3739,11 +3739,38 @@ pub(crate) mod tests {
                 assert_eq!(discarded.load(Ordering::Relaxed), phase != "complete");
                 assert!(!fetcher.complete());
                 assert_eq!(fetcher.rail.taken_bytes, 0);
+                let mut late_rail =
+                    BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+                late_rail.plan = fetcher.plan.clone();
+                late_rail.advance().unwrap();
+                assert!(
+                    !late_rail.complete(),
+                    "another rail sealed the cancelled plan"
+                );
+                drop(late_rail);
                 drop(fetcher);
                 discard(&[&output]);
             }
             discard(&[&bundle]);
         }
+    }
+
+    #[test]
+    fn public_cancellation_before_advance_preserves_an_unsealed_plan() {
+        let output = temporary("cancel-before-seal");
+        let mut fetcher = BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+        let mut plan = windowed(8);
+        plan.active.clear();
+        for object in &mut plan.objects {
+            object.done = true;
+        }
+        fetcher.plan = Some(Arc::new(Mutex::new(plan)));
+        fetcher.seams.cancellation.cancel();
+        fetcher.advance().unwrap();
+        assert!(!fetcher.complete());
+        assert!(fetcher.plan.as_ref().unwrap().lock().unwrap().abandoned);
+        drop(fetcher);
+        discard(&[&output]);
     }
 
     #[test]

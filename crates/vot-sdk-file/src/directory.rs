@@ -179,12 +179,25 @@ impl ReceiveDirectory {
     /// Rehashing is confined to uncertain restart recovery and makes no Strict
     /// readback claim. Normal receiving does not need this additional read.
     /// Retains the journal until the caller checkpoints and calls `forget_publication`.
+    /// Checks `active` before each bounded read and before changing publication state.
     pub fn recover_publication(
         &self,
         object: &ObjectId,
         name: &OsStr,
         state: &ResumeState,
+        active: impl Fn() -> bool,
     ) -> Result<super::PublishObservation, Error> {
+        let check_active = || {
+            if active() {
+                Ok(())
+            } else {
+                Err(Error::io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "publication recovery cancelled",
+                )))
+            }
+        };
+        check_active()?;
         let mut commit = self.reopen_publication(name, state)?;
         let suite = vot_verifier::Suite::try_from(object.suite)
             .map_err(|_| Error::plain(ErrorKind::IdentityMismatch))?;
@@ -196,6 +209,7 @@ impl ReceiveDirectory {
         let mut buffer = vec![0; 1 << 20];
         let mut remaining = object.length;
         for _ in 0..object.length.div_ceil(buffer.len() as u64) {
+            check_active()?;
             let count = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| Error::plain(ErrorKind::Internal))?;
             file.read_exact(&mut buffer[..count]).map_err(Error::io)?;
@@ -214,6 +228,7 @@ impl ReceiveDirectory {
                 object.length,
             ))
             .map_err(|_| Error::plain(ErrorKind::IdentityMismatch))?;
+        check_active()?;
         let receipt = commit.finish_recovered_publication().map_err(map_posix)?;
         Ok(super::PublishObservation {
             incarnation: receipt.incarnation,

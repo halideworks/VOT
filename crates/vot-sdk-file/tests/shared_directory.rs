@@ -234,87 +234,142 @@ impl vot_commit_posix::FaultInjector for LostReply {
 #[test]
 fn interrupted_publication_rechecks_content_and_preserves_conflicts() {
     use vot_commit_posix::{FaultPoint, PosixCommit};
-    for fault in [
-        Some(FaultPoint::NamespaceLink),
-        Some(FaultPoint::DirectoryFlush),
-        None,
-    ] {
-        let fixture = Fixture::new();
-        let selected = fixture.selected();
-        let contract = fixture.contract();
-        let namespace = ReceiveDirectory::open(&selected, contract).unwrap();
-        let storage = vec![0x51; (1 << 20) + 17];
-        let bytes = storage.as_slice();
-        let object = prepared(bytes);
-        let proof = object.prove(0, bytes.len() as u64).unwrap();
-        let verified = verify_range(object.object_id(), 0, bytes, proof.proof()).unwrap();
-        let file = namespace
-            .create(
-                object.object_id(),
-                OsStr::new("frame.exr"),
-                CommitProfile::Balanced,
+    for length in [0usize, (1 << 20) + 17] {
+        for fault in [
+            Some(FaultPoint::NamespaceLink),
+            Some(FaultPoint::DirectoryFlush),
+            None,
+        ] {
+            let fixture = Fixture::new();
+            let selected = fixture.selected();
+            let contract = fixture.contract();
+            let namespace = ReceiveDirectory::open(&selected, contract).unwrap();
+            let storage = vec![0x51; length];
+            let bytes = storage.as_slice();
+            let object = prepared(bytes);
+            let file = namespace
+                .create(
+                    object.object_id(),
+                    OsStr::new("frame.exr"),
+                    CommitProfile::Balanced,
+                )
+                .unwrap();
+            if !bytes.is_empty() {
+                let proof = object.prove(0, bytes.len() as u64).unwrap();
+                let verified = verify_range(object.object_id(), 0, bytes, proof.proof()).unwrap();
+                file.accept(&verified).unwrap();
+            }
+            let state = file.resume_state().unwrap();
+            file.abandon();
+            let directory = vot_platform_fs::Directory::open_with_nas(&selected, contract).unwrap();
+            let temporary = directory.private_child(OsStr::new(".vot-stage")).unwrap();
+            let mut commit = PosixCommit::reattach_at(
+                vot_commit_model::Profile::Balanced,
+                state.incarnation,
+                temporary.entry(&state.staging_name).unwrap(),
+                directory.entry(OsStr::new("frame.exr")).unwrap(),
+                temporary.entry(&state.journal_name).unwrap(),
+                contract,
+                LostReply(fault),
             )
             .unwrap();
-        file.accept(&verified).unwrap();
-        let state = file.resume_state().unwrap();
-        file.abandon();
-        let directory = vot_platform_fs::Directory::open_with_nas(&selected, contract).unwrap();
-        let temporary = directory.private_child(OsStr::new(".vot-stage")).unwrap();
-        let mut commit = PosixCommit::reattach_at(
-            vot_commit_model::Profile::Balanced,
-            state.incarnation,
-            temporary.entry(&state.staging_name).unwrap(),
-            directory.entry(OsStr::new("frame.exr")).unwrap(),
-            temporary.entry(&state.journal_name).unwrap(),
-            contract,
-            LostReply(fault),
-        )
-        .unwrap();
-        commit.finish_transit_verified().unwrap();
-        assert_eq!(commit.publish().is_err(), fault.is_some());
-        drop(commit);
-        let identity = fs::metadata(selected.join("frame.exr")).unwrap();
-        let wrong = prepared(&vec![0; bytes.len()]);
-        assert!(
-            matches!(namespace.recover_publication(wrong.object_id(), OsStr::new("frame.exr"), &state),
+            commit.finish_transit_verified().unwrap();
+            assert_eq!(commit.publish().is_err(), fault.is_some());
+            drop(commit);
+            let identity = fs::metadata(selected.join("frame.exr")).unwrap();
+            assert_recovery_cancellation(&namespace, &selected, object.object_id(), &state);
+            let mut wrong = object.object_id().clone();
+            wrong.root[0] ^= 1;
+            assert!(
+                matches!(namespace.recover_publication(&wrong, OsStr::new("frame.exr"), &state, || true),
             Err(error) if error.kind() == ErrorKind::IdentityMismatch)
-        );
-        assert!(
-            selected
-                .join(".vot-stage")
-                .join(&state.journal_name)
-                .exists()
-        );
-        let mut wrong = state.clone();
-        wrong.profile = CommitProfile::Fast;
-        assert!(
+            );
+            assert!(
+                selected
+                    .join(".vot-stage")
+                    .join(&state.journal_name)
+                    .exists()
+            );
+            let mut wrong = state.clone();
+            wrong.profile = CommitProfile::Fast;
+            assert!(
+                namespace
+                    .recover_publication(
+                        object.object_id(),
+                        OsStr::new("frame.exr"),
+                        &wrong,
+                        || true
+                    )
+                    .is_err()
+            );
+            let observation = namespace
+                .recover_publication(object.object_id(), OsStr::new("frame.exr"), &state, || true)
+                .unwrap();
+            assert_eq!(observation.incarnation, state.incarnation);
+            assert!(observation.sequence > 0);
+            assert_eq!(fs::read(selected.join("frame.exr")).unwrap(), bytes);
+            let recovered = fs::metadata(selected.join("frame.exr")).unwrap();
+            // CIFS refreshes allocated blocks after recovery flushes delayed writes.
+            assert_eq!(
+                (identity.dev(), identity.ino()),
+                (recovered.dev(), recovered.ino())
+            );
+            let again = namespace
+                .recover_publication(object.object_id(), OsStr::new("frame.exr"), &state, || true)
+                .unwrap();
+            assert_eq!(again.incarnation, observation.incarnation);
+            assert_eq!(again.sequence, observation.sequence);
             namespace
-                .recover_publication(object.object_id(), OsStr::new("frame.exr"), &wrong)
-                .is_err()
-        );
-        let observation = namespace
-            .recover_publication(object.object_id(), OsStr::new("frame.exr"), &state)
-            .unwrap();
-        assert_eq!(observation.incarnation, state.incarnation);
-        assert!(observation.sequence > 0);
-        assert_eq!(fs::read(selected.join("frame.exr")).unwrap(), bytes);
-        let recovered = fs::metadata(selected.join("frame.exr")).unwrap();
-        // CIFS refreshes allocated blocks after recovery flushes delayed writes.
-        assert_eq!(
-            (identity.dev(), identity.ino()),
-            (recovered.dev(), recovered.ino())
-        );
-        let again = namespace
-            .recover_publication(object.object_id(), OsStr::new("frame.exr"), &state)
-            .unwrap();
-        assert_eq!(again.incarnation, observation.incarnation);
-        assert_eq!(again.sequence, observation.sequence);
+                .forget_publication(OsStr::new("frame.exr"), &state)
+                .unwrap();
+            assert_eq!(
+                fs::read_dir(selected.join(".vot-stage")).unwrap().count(),
+                0
+            );
+        }
+    }
+}
+
+fn assert_recovery_cancellation(
+    namespace: &ReceiveDirectory,
+    selected: &std::path::Path,
+    object: &vot_sdk::object::ObjectId,
+    state: &vot_sdk_file::ResumeState,
+) {
+    let identity = fs::metadata(selected.join("frame.exr")).unwrap();
+    let journal_path = selected.join(".vot-stage").join(&state.journal_name);
+    let staging_path = selected.join(".vot-stage").join(&state.staging_name);
+    let journal_before = fs::read(&journal_path).unwrap();
+    let staging_before = staging_path.exists();
+    let mut torn = journal_before.clone();
+    torn.push(0x80);
+    fs::write(&journal_path, &torn).unwrap();
+    assert!(
         namespace
-            .forget_publication(OsStr::new("frame.exr"), &state)
-            .unwrap();
+            .recover_publication(object, OsStr::new("frame.exr"), state, || false)
+            .is_err()
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), torn);
+    fs::write(&journal_path, &journal_before).unwrap();
+    for stop_after in 0..(2 + object.length.div_ceil(1 << 20)) {
+        let checks = std::cell::Cell::new(0);
+        let error = namespace
+            .recover_publication(object, OsStr::new("frame.exr"), state, || {
+                let count = checks.get();
+                checks.set(count + 1);
+                count < stop_after
+            })
+            .unwrap_err();
         assert_eq!(
-            fs::read_dir(selected.join(".vot-stage")).unwrap().count(),
-            0
+            error.io_error().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(checks.get(), stop_after + 1);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(staging_path.exists(), staging_before);
+        assert_eq!(
+            fs::metadata(selected.join("frame.exr")).unwrap().ino(),
+            identity.ino()
         );
     }
 }

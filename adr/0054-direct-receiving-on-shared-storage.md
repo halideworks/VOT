@@ -101,7 +101,12 @@ metadata checkpoint is committed. Dropping or parking the receiver releases
 handles while keeping that journal. Forgetting it requires the bound final
 identity and a Published journal state; it does not hash an ordinary completed
 file again. A restart before that checkpoint uses the bounded content-verifying
-recovery operation. An unresolved or conflicting publication stays preserved.
+recovery operation. The application supplies an ownership/cancellation check,
+which runs before each bounded recovery read and before publication-state
+changes. Cancellation preserves the existing payload names and journal without
+returning publication evidence. A filesystem call already running in the kernel
+remains a cancellation boundary; failover still requires fencing the old writer.
+An unresolved or conflicting publication stays preserved.
 
 The final filename becomes visible after verification. Exposing it from the
 first byte would let unrelated editors and watch folders consume incomplete

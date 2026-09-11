@@ -225,7 +225,13 @@ fn build_from(
     let mut served = std::collections::BTreeMap::new();
     for file in sources {
         let mut input = File::open(&file.source)?;
-        let prepared = name_stream(&mut input, None, file.length, suite)?;
+        let prepared = if super::prepare::parallel_preparation(file.length) {
+            let leaves = super::file_proof_leaves(&mut input, suite, file.length)?;
+            vot_object::PreparedObject::from_proof_leaves(suite, file.length, leaves)
+                .map_err(|_| Error::InvalidBundle)?
+        } else {
+            name_stream(&mut input, None, file.length, suite)?
+        };
         let root = prepared.object_id().root;
         // Two files with the same bytes are one stored object; the first
         // path is the one the server reads.

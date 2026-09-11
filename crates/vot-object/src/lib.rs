@@ -578,8 +578,9 @@ impl PreparedObject {
     ///
     /// The leaves are not an authority: what comes back names the object
     /// they describe, and a caller that already knows the root compares the
-    /// two before serving anything. A caller that does not know the root has
-    /// no business calling this.
+    /// two before serving anything. A caller establishing a new identity
+    /// must have computed every leaf from the source bytes during this
+    /// preparation; untrusted or cached leaves cannot establish that identity.
     ///
     /// # Errors
     /// Rejects leaves that cannot describe an object of this length, and an

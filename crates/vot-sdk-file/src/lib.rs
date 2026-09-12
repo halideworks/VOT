@@ -25,6 +25,8 @@ use vot_sdk::object::ObjectId;
 use vot_sdk::verify::VerifiedSlice;
 
 #[cfg(unix)]
+pub mod capture;
+#[cfg(unix)]
 mod directory;
 #[cfg(unix)]
 pub use directory::{ReceiveDirectory, ResumeState};

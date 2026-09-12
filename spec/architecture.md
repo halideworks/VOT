@@ -121,6 +121,14 @@ does not own this storage, so callers must retain the owners or complete and
 preserve destination writes. This establishes no persistent coverage or new
 assurance observation.
 
+`vot-sdk-file::capture::CaptureFile` adds bounded mutable disk staging on Unix
+(ADR-0059). It invalidates coverage durably before overwriting bytes, flushes data
+before recording verified groups, and rehashes cached groups on recovery. A new
+canonical target retires old coverage; unchanged cached groups need fresh proofs
+before reuse. The private directory and serialized writer bind commitments to
+owned storage. The current journal snapshot caps tracking at 8,192 groups, or
+512 MiB of complete coverage. This is separate from immutable file publication.
+
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated
 manifest pages containing verification-group commitments; `SEAL` commits the

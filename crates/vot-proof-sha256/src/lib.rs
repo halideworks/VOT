@@ -575,10 +575,47 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if !covered_offset.is_multiple_of(PIECE_SIZE) || data.is_empty() {
+    let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
+    let (first, end) = check_cover(object_len, covered_offset, data_len)?;
+    let covered_hashes: Vec<_> = if object_len <= PIECE_SIZE {
+        vec![root(data)]
+    } else {
+        data.chunks(PIECE_SIZE as usize).map(piece_hash).collect()
+    };
+    verify_hashes(
+        expected_root,
+        object_len,
+        first,
+        end,
+        &covered_hashes,
+        proof,
+    )
+}
+
+/// Authenticates piece hashes for a multi-piece object.
+///
+/// This proves the supplied commitments, not possession of their bytes. The
+/// caller must bind each value to its exact piece offset and byte length.
+/// Single-piece objects require a standalone root and are rejected here.
+pub fn verify_piece_hashes(
+    expected_root: &[u8; 32],
+    object_len: u64,
+    covered_offset: u64,
+    covered_length: u64,
+    hashes: &[[u8; 32]],
+    proof: &[u8],
+) -> Result<(), Error> {
+    let (first, end) = check_cover(object_len, covered_offset, covered_length)?;
+    if object_len <= PIECE_SIZE {
         return Err(Error::OutOfBounds);
     }
-    let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
+    verify_hashes(expected_root, object_len, first, end, hashes, proof)
+}
+
+fn check_cover(object_len: u64, covered_offset: u64, data_len: u64) -> Result<(u64, u64), Error> {
+    if !covered_offset.is_multiple_of(PIECE_SIZE) || data_len == 0 {
+        return Err(Error::OutOfBounds);
+    }
     let covered_end = covered_offset
         .checked_add(data_len)
         .ok_or(Error::LengthOverflow)?;
@@ -587,18 +624,21 @@ pub fn verify(
     {
         return Err(Error::OutOfBounds);
     }
-    let piece_count = object_len.div_ceil(PIECE_SIZE);
-    let first = covered_offset / PIECE_SIZE;
-    let end = covered_end.div_ceil(PIECE_SIZE);
-    if end > piece_count {
-        return Err(Error::OutOfBounds);
-    }
-    let covered_hashes: Vec<_> = if object_len <= PIECE_SIZE {
-        vec![root(data)]
-    } else {
-        data.chunks(PIECE_SIZE as usize).map(piece_hash).collect()
-    };
-    let actual = decode_root(piece_count, first, end, &covered_hashes, proof)?;
+    Ok((
+        covered_offset / PIECE_SIZE,
+        covered_end.div_ceil(PIECE_SIZE),
+    ))
+}
+
+fn verify_hashes(
+    expected_root: &[u8; 32],
+    object_len: u64,
+    first: u64,
+    end: u64,
+    hashes: &[[u8; 32]],
+    proof: &[u8],
+) -> Result<(), Error> {
+    let actual = decode_root(object_len.div_ceil(PIECE_SIZE), first, end, hashes, proof)?;
     if actual == *expected_root {
         Ok(())
     } else {
@@ -764,8 +804,15 @@ fn decode_root(
     }
     let tree_width = piece_count.next_power_of_two();
     let (window_start, window_width) = proof_window(first, end, tree_width);
+    let capacity = window_capacity(
+        piece_count,
+        window_start,
+        window_width,
+        covered.len(),
+        proof.len(),
+    )?;
     let mut cursor = 0;
-    let mut nodes = Vec::with_capacity(window_width as usize);
+    let mut nodes = Vec::with_capacity(capacity);
     for index in window_start..window_start + window_width {
         let value = if index >= first && index < end {
             covered[(index - first) as usize]
@@ -806,8 +853,147 @@ fn decode_root(
     Ok(value)
 }
 
+fn window_capacity(
+    piece_count: u64,
+    window_start: u64,
+    window_width: u64,
+    covered: usize,
+    proof_bytes: usize,
+) -> Result<usize, Error> {
+    let supplied = window_width.min(piece_count - window_start) - covered as u64;
+    if supplied > (proof_bytes / 32) as u64 {
+        return Err(Error::MalformedProof);
+    }
+    usize::try_from(window_width).map_err(|_| Error::OutOfBounds)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cached_commitments_share_byte_verification_and_validate_their_cover() {
+        let bytes: Vec<u8> = (0..(3 * PIECE_SIZE as usize + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let expected = root(&bytes);
+        let length = bytes.len() as u64;
+        for first in 0..4 {
+            let offset = first * PIECE_SIZE;
+            let data = &bytes[offset as usize..];
+            let leaves = piece_hashes_at(offset, data, length).unwrap();
+            let proof = prove(&bytes, offset, data.len() as u64).unwrap().proof;
+            verify_piece_hashes(
+                &expected,
+                length,
+                offset,
+                data.len() as u64,
+                &leaves,
+                &proof,
+            )
+            .unwrap();
+            let mut changed = leaves.clone();
+            changed[0][0] ^= 1;
+            assert_eq!(
+                verify_piece_hashes(
+                    &expected,
+                    length,
+                    offset,
+                    data.len() as u64,
+                    &changed,
+                    &proof
+                ),
+                Err(Error::HashMismatch)
+            );
+            for count in [0, leaves.len() + 1] {
+                let wrong = vec![[0; 32]; count];
+                assert!(
+                    verify_piece_hashes(
+                        &expected,
+                        length,
+                        offset,
+                        data.len() as u64,
+                        &wrong,
+                        &proof
+                    )
+                    .is_err()
+                );
+            }
+            let mut trailing = proof;
+            trailing.push(0);
+            assert!(
+                verify_piece_hashes(
+                    &expected,
+                    length,
+                    offset,
+                    data.len() as u64,
+                    &leaves,
+                    &trailing
+                )
+                .is_err()
+            );
+        }
+        for (object, offset, count) in [
+            (0, 0, 0),
+            (PIECE_SIZE, 0, PIECE_SIZE),
+            (length, 1, PIECE_SIZE),
+            (length, 0, 0),
+            (length, 0, PIECE_SIZE - 1),
+            (length, 3 * PIECE_SIZE, 18),
+            (u64::MAX, u64::MAX - PIECE_SIZE + 1, PIECE_SIZE),
+        ] {
+            assert!(
+                verify_piece_hashes(&expected, object, offset, count, &[[0; 32]], &[]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn proof_input_bounds_window_allocation_before_decoding() {
+        for (pieces, start, width, covered, needed) in [
+            (8, 0, 8, 2, 6),
+            (8, 4, 4, 2, 2),
+            (5, 4, 4, 1, 0),
+            (5, 0, 8, 2, 3),
+            (9, 8, 2, 1, 0),
+        ] {
+            assert_eq!(
+                window_capacity(pieces, start, width, covered, needed * 32),
+                Ok(width as usize)
+            );
+            if needed > 0 {
+                assert_eq!(
+                    window_capacity(pieces, start, width, covered, needed * 32 - 1),
+                    Err(Error::MalformedProof)
+                );
+            }
+        }
+        let middle = 1_u64 << 40;
+        assert_eq!(
+            window_capacity(middle + 1, 0, middle * 2, 2, 0),
+            Err(Error::MalformedProof)
+        );
+        assert_eq!(
+            decode_root(middle + 1, middle - 1, middle + 1, &[[0; 32]; 2], &[]),
+            Err(Error::MalformedProof)
+        );
+        let offset = (middle - 1) * PIECE_SIZE;
+        let length = (middle + 1) * PIECE_SIZE;
+        assert_eq!(
+            verify(
+                &[0; 32],
+                length,
+                offset,
+                &vec![0; 2 * PIECE_SIZE as usize],
+                &[]
+            ),
+            Err(Error::MalformedProof)
+        );
+        assert_eq!(
+            verify_piece_hashes(&[0; 32], length, offset, 2 * PIECE_SIZE, &[[0; 32]; 2], &[]),
+            Err(Error::MalformedProof)
+        );
+    }
+
     #[test]
     fn stored_leaves_rebuild_the_object_they_came_from() {
         // What a serve does with a cache it kept: rebuild, ask what object

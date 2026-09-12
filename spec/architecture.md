@@ -113,6 +113,14 @@ no payload and establishes no source snapshot, producer completion, receiver
 coverage, or durability. Each result uses the existing canonical identity and
 proof formats and can be exposed as an ordinary `PreparedObject`.
 
+`RetainedRange` keeps immutable verified bytes and their group commitments
+(ADR-0058). A new canonical proof can authenticate an unchanged retained
+subrange without hashing its bytes again. Returned witnesses borrow the owner;
+cached groups cannot be shortened or rebound across suites. Coverage bookkeeping
+does not own this storage, so callers must retain the owners or complete and
+preserve destination writes. This establishes no persistent coverage or new
+assurance observation.
+
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated
 manifest pages containing verification-group commitments; `SEAL` commits the

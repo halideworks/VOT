@@ -117,10 +117,10 @@ do not compile; no variant survives or times out. A separate deliberate deep-cop
 variant preserves hashes but fails the shared-allocation test. Captured diffs and
 failures are in [the mutation evidence](../test-vectors/mutants/adr_0057_incremental_checkpoints.md).
 
-The next capture boundary remains authenticated retained-coverage binding to
-owned storage, followed by the real-provider invalidation journal and crash/failure
-injection. This increment adds no capture wire protocol, mutable receiver,
-filesystem watcher, completion heuristic, or VOTPort integration.
+ADR-0058 implements authentication of retained immutable owned range bytes.
+Disk staging and retained coverage still need the real-provider invalidation
+journal and crash/failure injection. This increment adds no capture wire protocol,
+mutable receiver, filesystem watcher, completion heuristic, or VOTPort integration.
 
 ## Reproduction
 

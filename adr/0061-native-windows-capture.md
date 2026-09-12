@@ -1,6 +1,6 @@
 # ADR-0061: Native Windows capture
 
-- Status: Accepted design; native validation pending.
+- Status: Accepted design for local NTFS.
 - Date: 2026-09-12
 - Applies to: `vot-sdk-file::capture`, `vot-journal`, and `vot-platform-fs`.
 - Extends ADR-0059 and ADR-0060 to local NTFS.
@@ -76,8 +76,8 @@ these medians are not evidence of a reliable speedup. The runs found no
 shared-engine recovery or process-memory regression. They
 measure local recovery, including rehashing payload, rather than transfer speed.
 Raw samples and the method are in
-`test-vectors/experiments/adr_0061_capture_recovery.json`. Native Windows execution
-results remain pending. Mutation evidence is in
+`test-vectors/experiments/adr_0061_capture_recovery.json`. Native execution results
+are recorded by the required CI jobs on the implementation PR. Mutation evidence is in
 `test-vectors/mutants/adr_0061_windows_capture.md`.
 
 Source lifecycle, render completion, live capture transport and publication

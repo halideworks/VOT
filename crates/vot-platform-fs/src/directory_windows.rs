@@ -528,6 +528,7 @@ mod tests {
         assert!(new.identity().is_err());
         assert!(old.remove_owned(&old_file).is_err());
         old.remove_owned(&new_file).unwrap();
+        drop(new_file);
         directory.sync().unwrap();
         assert!(!old.path().exists());
     }

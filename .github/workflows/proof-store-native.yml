@@ -79,7 +79,7 @@ jobs:
         run: cargo +1.97.1 clippy -p vot-platform-fs -p vot-journal -p vot-sdk-file --all-targets --locked -- -D warnings
 
       - name: Test native storage adapters
-        run: cargo +1.97.1 test -p vot-proof-store-file -p vot-sdk-file -p vot-journal --locked
+        run: cargo +1.97.1 test -p vot-proof-store-file -p vot-sdk-file -p vot-journal --locked --no-fail-fast
 
       - name: Test strict unsupported path
         if: runner.os == 'macOS'
@@ -88,3 +88,36 @@ jobs:
       - name: Test Windows platform file handles
         if: runner.os == 'Windows'
         run: cargo +1.97.1 test -p vot-platform-fs --locked
+
+      - name: Exercise bounded Windows capture at 128 MiB
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo +1.97.1 build --release --locked -p vot-sdk-file --example capture_memory
+          if ($LASTEXITCODE -ne 0) { throw "capture example build failed" }
+          $captureRoot = Join-Path $env:RUNNER_TEMP "vot-native-capture"
+          $captureExample = ".\target\release\examples\capture_memory.exe"
+          try {
+            $prepare = Measure-Command {
+              & $captureExample prepare $captureRoot 2048 | Out-Host
+              if ($LASTEXITCODE -ne 0) { throw "capture preparation failed" }
+            }
+            $recover = Measure-Command {
+              & $captureExample recover $captureRoot | Out-Host
+              if ($LASTEXITCODE -ne 0) { throw "capture recovery failed" }
+            }
+            & $captureExample compact $captureRoot | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "capture compaction failed" }
+            $compacted = Measure-Command {
+              & $captureExample recover $captureRoot | Out-Host
+              if ($LASTEXITCODE -ne 0) { throw "compacted recovery failed" }
+            }
+            @{
+              payload_bytes = 134217728
+              prepare_seconds = $prepare.TotalSeconds
+              recover_seconds = $recover.TotalSeconds
+              compacted_recover_seconds = $compacted.TotalSeconds
+            } | ConvertTo-Json
+          } finally {
+            if (Test-Path $captureRoot) { Remove-Item -Recurse -Force $captureRoot }
+          }

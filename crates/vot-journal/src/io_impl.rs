@@ -1,6 +1,8 @@
 //! Append, replay, and compaction, with the syscall ordering visible.
 
 use super::{CHECKPOINT_FLAG, Error, HEADER_LEN, Header, MAX_PAYLOAD, Record, crc32c, encode, io};
+#[cfg(not(windows))]
+use Error::Io as open_error;
 use std::fs::File;
 #[cfg(not(any(unix, windows)))]
 use std::fs::{self, OpenOptions};
@@ -9,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(unix, windows))]
 use vot_platform_fs::FileLocation;
+#[cfg(windows)]
+use windows_open_error as open_error;
 
 /// Largest journal a replay will read. Replay holds the whole file, so this
 /// is the ceiling on that, not a limit the format needs.
@@ -74,12 +78,31 @@ pub(super) fn claim(file: &File) -> Result<(), Error> {
     }
 }
 
-fn open_error(error: io::Error) -> Error {
-    #[cfg(windows)]
+#[cfg(any(windows, test))]
+fn windows_open_error(error: io::Error) -> Error {
     if error.raw_os_error() == Some(32) {
         return Error::Locked;
     }
     Error::Io(error)
+}
+
+#[cfg(test)]
+#[test]
+fn windows_sharing_errors_alone_mean_a_locked_journal() {
+    assert!(matches!(
+        windows_open_error(io::Error::from_raw_os_error(32)),
+        Error::Locked
+    ));
+    for code in [2, 5, 33] {
+        let Error::Io(error) = windows_open_error(io::Error::from_raw_os_error(code)) else {
+            panic!("non-sharing error was reported as a writer conflict");
+        };
+        assert_eq!(error.raw_os_error(), Some(code));
+    }
+    let Error::Io(error) = windows_open_error(io::ErrorKind::PermissionDenied.into()) else {
+        panic!("error without an OS code was reported as a writer conflict");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 }
 
 #[derive(Debug)]

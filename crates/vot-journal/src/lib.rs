@@ -345,6 +345,7 @@ mod tests {
     #[test]
     fn the_last_sequence_is_refused_before_anything_is_written() {
         let path = temp_path("last-sequence");
+        drop(Journal::create(&path, [2; 16]).unwrap());
         // A checkpoint is the one record that may open a journal at a
         // sequence other than zero.
         std::fs::write(
@@ -352,10 +353,10 @@ mod tests {
             encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap(),
         )
         .unwrap();
-        assert!(matches!(
-            Journal::open_current(&path, [2; 16]),
-            Err(Error::SequenceGap)
-        ));
+        let error = Journal::open_current(&path, [2; 16])
+            .err()
+            .expect("last sequence was admitted");
+        assert!(matches!(error, Error::SequenceGap), "{error:?}");
 
         // And a record after it is a gap, not an overflow.
         let mut bytes = encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap();

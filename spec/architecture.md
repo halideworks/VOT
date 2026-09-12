@@ -122,16 +122,17 @@ preserve destination writes. This establishes no persistent coverage or new
 assurance observation.
 
 `vot-sdk-file::capture::CaptureFile` adds bounded mutable disk staging on Unix
-(ADR-0059). It invalidates coverage durably before overwriting bytes, flushes data
-before recording verified groups, and rehashes cached groups on recovery. A new
-canonical target retires old coverage; unchanged cached groups need fresh proofs
+and local NTFS on Windows (ADRs 0059 through 0061). It invalidates coverage
+durably before overwriting bytes, flushes data before recording verified groups,
+and rehashes cached groups on recovery. A new canonical target retires old coverage; unchanged cached groups need fresh proofs
 before reuse. The private directory and serialized writer bind commitments to
 owned storage. ADR-0060 moves group records into a checksummed positional table
 with one 48 KiB metadata page in memory. Complete journal afterimages repair
 metadata writes; compaction flushes the table before discarding redo history.
 Coverage is bounded by the caller's group budget and canonical object length,
 with a separate bounded journal replay allocation. This remains separate from
-immutable file publication.
+immutable file publication. Source lifecycle, producer completion, and live
+capture transport are not implemented; see [capture integration](../docs/capture.md).
 
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated

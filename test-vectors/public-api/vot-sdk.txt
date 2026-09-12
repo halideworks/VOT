@@ -53,6 +53,7 @@ struct vot_sdk::resume::CheckpointPlan
 struct vot_sdk::resume::ResumeIdentity
 struct vot_sdk::resume::ResumeState
 struct vot_sdk::resume::UnitRanges
+struct vot_sdk::verify::RetainedRange
 struct vot_sdk::verify::VerifiedSlice
 use vot_sdk::object::ObjectId <- vot_object::ObjectId
 use vot_sdk::object::Suite <- vot_object::Suite

@@ -6,6 +6,7 @@ function vot_verified_range::validate_typed_bundle_ref
 function vot_verified_range::verify_range
 function vot_verified_range::verify_typed_bundle
 function vot_verified_range::verify_typed_bundle_ref
+struct vot_verified_range::RetainedRange
 struct vot_verified_range::ValidatedBundle
 struct vot_verified_range::VerifiedRange
 struct vot_verified_range::VerifiedSlice

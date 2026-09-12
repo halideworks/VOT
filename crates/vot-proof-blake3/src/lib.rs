@@ -686,25 +686,9 @@ pub fn verify(
     data: &[u8],
     proof: &[u8],
 ) -> Result<(), Error> {
-    if !covered_offset.is_multiple_of(GROUP_SIZE) || data.is_empty() {
-        return Err(Error::OutOfBounds);
-    }
     let data_len = u64::try_from(data.len()).map_err(|_| Error::OutOfBounds)?;
-    let covered_end = covered_offset
-        .checked_add(data_len)
-        .ok_or(Error::LengthOverflow)?;
-    if covered_end > object_len
-        || (covered_end < object_len && !covered_end.is_multiple_of(GROUP_SIZE))
-    {
-        return Err(Error::OutOfBounds);
-    }
-    let first = covered_offset / GROUP_SIZE;
-    let end = covered_end.div_ceil(GROUP_SIZE);
-    let groups = group_count(object_len);
-    if end > groups {
-        return Err(Error::OutOfBounds);
-    }
-    if groups == 1 {
+    let (first, end) = check_cover(object_len, covered_offset, data_len)?;
+    if object_len <= GROUP_SIZE {
         if !proof.is_empty() {
             return Err(Error::MalformedProof);
         }
@@ -714,34 +698,73 @@ pub fn verify(
             Err(Error::HashMismatch)
         };
     }
+    verify_tree(expected_root, object_len, first, end, proof, &mut |index| {
+        let start = ((index - first) * GROUP_SIZE) as usize;
+        let remaining = &data[start..];
+        let mut hasher = blake3::Hasher::new();
+        hasher.set_input_offset(index * GROUP_SIZE);
+        hasher.update(&remaining[..remaining.len().min(GROUP_SIZE as usize)]);
+        hasher.finalize_non_root()
+    })
+}
 
+/// Authenticates positioned group chaining values for a multi-group object.
+///
+/// This proves the supplied commitments, not possession of their bytes. The
+/// caller must bind each value to its exact group offset and byte length.
+/// Single-group objects require a standalone root and are rejected here.
+pub fn verify_group_cvs(
+    expected_root: &[u8; 32],
+    object_len: u64,
+    covered_offset: u64,
+    covered_length: u64,
+    cvs: &[[u8; 32]],
+    proof: &[u8],
+) -> Result<(), Error> {
+    let (first, end) = check_cover(object_len, covered_offset, covered_length)?;
+    if object_len <= GROUP_SIZE || cvs.len() as u64 != end - first {
+        return Err(Error::OutOfBounds);
+    }
+    verify_tree(expected_root, object_len, first, end, proof, &mut |index| {
+        cvs[(index - first) as usize]
+    })
+}
+
+fn check_cover(object_len: u64, covered_offset: u64, data_len: u64) -> Result<(u64, u64), Error> {
+    if !covered_offset.is_multiple_of(GROUP_SIZE) || data_len == 0 {
+        return Err(Error::OutOfBounds);
+    }
+    let covered_end = covered_offset
+        .checked_add(data_len)
+        .ok_or(Error::LengthOverflow)?;
+    if covered_end > object_len
+        || (covered_end < object_len && !covered_end.is_multiple_of(GROUP_SIZE))
+    {
+        return Err(Error::OutOfBounds);
+    }
+    Ok((
+        covered_offset / GROUP_SIZE,
+        covered_end.div_ceil(GROUP_SIZE),
+    ))
+}
+
+fn verify_tree(
+    expected_root: &[u8; 32],
+    object_len: u64,
+    first: u64,
+    end: u64,
+    proof: &[u8],
+    leaf: &mut impl FnMut(u64) -> [u8; 32],
+) -> Result<(), Error> {
     let root_node = Node {
         start: 0,
-        count: groups,
+        count: group_count(object_len),
     };
     let (left_node, right_node) = root_node.split();
     let mut cursor = 0;
     let (left, right) = read_parent(proof, &mut cursor)?;
-    verify_child(
-        left_node,
-        first,
-        end,
-        covered_offset,
-        data,
-        proof,
-        &mut cursor,
-        &left,
-    )?;
-    verify_child(
-        right_node,
-        first,
-        end,
-        covered_offset,
-        data,
-        proof,
-        &mut cursor,
-        &right,
-    )?;
+    verify_child(left_node, first, end, leaf, proof, &mut cursor, &left)?;
+    verify_child(right_node, first, end, leaf, proof, &mut cursor, &right)?;
     if cursor != proof.len() {
         return Err(Error::MalformedProof);
     }
@@ -886,13 +909,11 @@ fn read_parent(proof: &[u8], cursor: &mut usize) -> Result<([u8; 32], [u8; 32]),
     Ok((left, right))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn verify_child(
     node: Node,
     first: u64,
     end: u64,
-    covered_offset: u64,
-    data: &[u8],
+    leaf: &mut impl FnMut(u64) -> [u8; 32],
     proof: &[u8],
     cursor: &mut usize,
     expected: &[u8; 32],
@@ -901,42 +922,12 @@ fn verify_child(
         return Ok(());
     }
     let actual = if node.count == 1 {
-        let absolute = node.start * GROUP_SIZE;
-        let relative = absolute
-            .checked_sub(covered_offset)
-            .ok_or(Error::OutOfBounds)?;
-        let start = usize::try_from(relative).map_err(|_| Error::OutOfBounds)?;
-        let stop = (start + GROUP_SIZE as usize).min(data.len());
-        if start >= stop {
-            return Err(Error::OutOfBounds);
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.set_input_offset(absolute);
-        hasher.update(&data[start..stop]);
-        hasher.finalize_non_root()
+        leaf(node.start)
     } else {
         let (left_node, right_node) = node.split();
         let (left, right) = read_parent(proof, cursor)?;
-        verify_child(
-            left_node,
-            first,
-            end,
-            covered_offset,
-            data,
-            proof,
-            cursor,
-            &left,
-        )?;
-        verify_child(
-            right_node,
-            first,
-            end,
-            covered_offset,
-            data,
-            proof,
-            cursor,
-            &right,
-        )?;
+        verify_child(left_node, first, end, leaf, proof, cursor, &left)?;
+        verify_child(right_node, first, end, leaf, proof, cursor, &right)?;
         merge_subtrees_non_root(&left, &right, Mode::Hash)
     };
     if actual == *expected {
@@ -948,6 +939,75 @@ fn verify_child(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cached_commitments_share_byte_verification_and_validate_their_cover() {
+        let bytes: Vec<u8> = (0..(3 * GROUP_SIZE as usize + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let expected = root(&bytes);
+        let length = bytes.len() as u64;
+        for first in 0..4 {
+            let offset = first * GROUP_SIZE;
+            let data = &bytes[offset as usize..];
+            let leaves = group_cvs_at(offset, data, length).unwrap();
+            let proof = prove(&bytes, offset, data.len() as u64).unwrap().proof;
+            verify_group_cvs(
+                &expected,
+                length,
+                offset,
+                data.len() as u64,
+                &leaves,
+                &proof,
+            )
+            .unwrap();
+            let mut changed = leaves.clone();
+            changed[0][0] ^= 1;
+            assert_eq!(
+                verify_group_cvs(
+                    &expected,
+                    length,
+                    offset,
+                    data.len() as u64,
+                    &changed,
+                    &proof
+                ),
+                Err(Error::HashMismatch)
+            );
+            for count in [0, leaves.len() + 1] {
+                let wrong = vec![[0; 32]; count];
+                assert!(
+                    verify_group_cvs(&expected, length, offset, data.len() as u64, &wrong, &proof)
+                        .is_err()
+                );
+            }
+            let mut trailing = proof;
+            trailing.push(0);
+            assert!(
+                verify_group_cvs(
+                    &expected,
+                    length,
+                    offset,
+                    data.len() as u64,
+                    &leaves,
+                    &trailing
+                )
+                .is_err()
+            );
+        }
+        for (object, offset, count) in [
+            (0, 0, 0),
+            (GROUP_SIZE, 0, GROUP_SIZE),
+            (length, 1, GROUP_SIZE),
+            (length, 0, 0),
+            (length, 0, GROUP_SIZE - 1),
+            (length, 3 * GROUP_SIZE, 18),
+            (u64::MAX, u64::MAX - GROUP_SIZE + 1, GROUP_SIZE),
+        ] {
+            assert!(verify_group_cvs(&expected, object, offset, count, &[[0; 32]], &[]).is_err());
+        }
+    }
+
     #[test]
     fn stored_leaves_rebuild_the_object_they_came_from() {
         // What a serve does with a cache it kept: rebuild, ask what object

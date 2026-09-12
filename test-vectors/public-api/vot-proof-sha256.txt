@@ -7,6 +7,7 @@ function vot_proof_sha256::prove
 function vot_proof_sha256::prove_with
 function vot_proof_sha256::root
 function vot_proof_sha256::verify
+function vot_proof_sha256::verify_piece_hashes
 struct vot_proof_sha256::PieceHashes
 struct vot_proof_sha256::ProofCheckpoint
 struct vot_proof_sha256::RangeCover

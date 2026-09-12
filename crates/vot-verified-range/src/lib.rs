@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use vot_codec::frames::{DataRecord, DataRecordRef, ObjectId, ProofBundle};
 use vot_verifier::Suite;
 
+mod retained;
+pub use retained::RetainedRange;
+
 /// Range granularity covered by both frozen proof suites.
 pub const RANGE_UNIT_BYTES: u64 = 65_536;
 /// Maximum covered bytes for an 8 MiB request plus one unaligned edge group.
@@ -63,6 +66,18 @@ pub struct VerifiedSlice<'data> {
 }
 
 impl<'data> VerifiedSlice<'data> {
+    /// Copies the authenticated bytes into immutable owned storage and caches
+    /// their commitments for verification against later object checkpoints.
+    #[must_use]
+    pub fn retain(self) -> RetainedRange {
+        VerifiedRange {
+            object: self.object,
+            covered_offset: self.covered_offset,
+            data: self.data.to_vec(),
+        }
+        .retain()
+    }
+
     /// Object identity that authenticated the range.
     #[must_use]
     pub const fn object(&self) -> ObjectId {
@@ -93,6 +108,13 @@ pub struct VerifiedRange {
 }
 
 impl VerifiedRange {
+    /// Retains the existing byte allocation and caches its commitments for
+    /// verification against later object checkpoints.
+    #[must_use]
+    pub fn retain(self) -> RetainedRange {
+        RetainedRange::new(self)
+    }
+
     /// Borrows the authenticated bytes without copying or repeating verification.
     #[must_use]
     pub fn as_slice(&self) -> VerifiedSlice<'_> {
@@ -284,6 +306,26 @@ fn check_range_geometry(object_length: u64, covered_offset: u64, bytes: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_retention_keeps_the_allocation_and_borrowed_retention_copies_it() {
+        for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+            let fixture = make_fixture(suite);
+            let owned =
+                crate::verify_typed_bundle(fixture.object, &fixture.bundle, &fixture.records)
+                    .unwrap();
+            let original = owned.data().as_ptr();
+            let retained = owned.retain();
+            assert_eq!(retained.as_slice().data().as_ptr(), original);
+            let mut borrowed = fixture.bytes.clone();
+            let copied = verify_range(fixture.object, 0, &borrowed, &fixture.bundle.proof)
+                .unwrap()
+                .retain();
+            assert_ne!(copied.as_slice().data().as_ptr(), borrowed.as_ptr());
+            borrowed.fill(0);
+            assert_eq!(copied.as_slice().data(), fixture.bytes);
+        }
+    }
 
     struct Fixture {
         bytes: Vec<u8>,

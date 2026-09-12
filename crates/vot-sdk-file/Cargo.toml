@@ -10,23 +10,21 @@ publish = false
 vot-commit-model = { path = "../vot-commit-model" }
 vot-sdk = { path = "../vot-sdk" }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-verifier = { path = "../vot-verifier" }
 vot-platform-fs = { path = "../vot-platform-fs" }
+vot-journal = { path = "../vot-journal" }
+
+[target.'cfg(unix)'.dependencies]
 vot-commit-posix = { path = "../vot-commit-posix" }
 vot-commit-strict = { path = "../vot-commit-strict" }
-vot-journal = { path = "../vot-journal" }
 
 [target.'cfg(windows)'.dependencies]
 vot-commit-platform = { path = "../vot-commit-platform" }
-vot-platform-fs = { path = "../vot-platform-fs" }
 vot-receipt = { path = "../vot-receipt" }
 vot-scheduler = { path = "../vot-scheduler" }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-vot-platform-fs = { path = "../vot-platform-fs" }

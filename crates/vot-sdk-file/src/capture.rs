@@ -1,16 +1,19 @@
 //! Bounded mutable disk staging for canonical object checkpoints.
 //!
 //! The containing directory and all same-user access must remain exclusive to
-//! this owner. Advisory locks do not prevent unrelated code from writing bytes.
+//! this owner. Unix advisory locks cannot prevent writes by unrelated code.
 
 use std::ffi::OsStr;
-use std::fs::{File, TryLockError};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::TryLockError;
 use std::io;
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::Path;
 
 use vot_journal::Journal;
-use vot_platform_fs::{Directory, FileLocation};
+use vot_platform_fs::{
+    Directory, FileLocation, file_identity, identity_and_links, read_exact_at, write_all_at,
+};
 use vot_sdk::object::{ObjectId, Suite};
 use vot_sdk::verify::{RetainedRange, VerifiedSlice};
 
@@ -39,7 +42,7 @@ pub struct CaptureProgress {
     pub cached_groups: u64,
 }
 
-/// One serial writer of a private payload and checksummed journal on Unix.
+/// One serial writer of private payload, metadata and journal files on Unix or local NTFS.
 ///
 /// Dropping preserves the files for recovery. No writable handle escapes.
 /// Recovery reads and checks every surviving cached group before reporting
@@ -85,8 +88,8 @@ impl CaptureFile {
         let metadata_location = directory
             .entry(OsStr::new("capture.groups"))
             .map_err(Error::io)?;
-        let file = data_location.create().map_err(Error::io)?;
-        let table = match metadata_location.create() {
+        let file = data_location.create_owned().map_err(Error::io)?;
+        let table = match metadata_location.create_owned() {
             Ok(metadata) => Table::new(metadata, metadata_location),
             Err(error) => {
                 let _ = data_location.remove_owned(&file);
@@ -94,6 +97,7 @@ impl CaptureFile {
             }
         };
         let prepared = (|| {
+            #[cfg(unix)]
             claim(&file)?;
             state.binding = binding(&file, &data_location, &table.file)?;
             file.set_len(object.length).map_err(Error::io)?;
@@ -146,13 +150,14 @@ impl CaptureFile {
         let journal_location = directory
             .entry(OsStr::new("capture.journal"))
             .map_err(Error::io)?;
-        let file = data_location.open_write().map_err(Error::io)?;
+        let file = data_location.open_owned().map_err(Error::io)?;
+        #[cfg(unix)]
         claim(&file)?;
         let metadata_location = directory
             .entry(OsStr::new("capture.groups"))
             .map_err(Error::io)?;
         let table = Table::new(
-            metadata_location.open_write().map_err(Error::io)?,
+            metadata_location.open_owned().map_err(Error::io)?,
             metadata_location,
         );
         let actual_binding = binding(&file, &data_location, &table.file)?;
@@ -195,12 +200,13 @@ impl CaptureFile {
             .extent(capture.state.object.length.div_ceil(GROUP))?;
         let suite = validate_object(&capture.state.object)?;
         let mut cursor = 0;
+        let mut buffer = vec![0; usize::try_from(GROUP).map_err(|_| invalid())?];
         while let Some(group) = capture.table.next(&mut cursor)? {
             group.validate(&capture.state)?;
             capture.tally(&group, true)?;
-            let mut bytes = vec![0; usize::try_from(group.length).map_err(|_| invalid())?];
-            if !complete_read(capture.file.read_exact_at(&mut bytes, group.offset))?
-                || Group::from_bytes(suite, group.offset, &bytes, group.generation)? != group
+            let bytes = &mut buffer[..usize::try_from(group.length).map_err(|_| invalid())?];
+            if !complete_read(read_exact_at(&capture.file, bytes, group.offset))?
+                || Group::from_bytes(suite, group.offset, bytes, group.generation)? != group
             {
                 capture.record(INVALIDATE, &group.offset.to_le_bytes())?;
             }
@@ -254,19 +260,17 @@ impl CaptureFile {
         self.record(INVALIDATE, &offset.to_le_bytes())?;
         #[cfg(test)]
         if self.fault == Some(Boundary::PartialWrite) {
-            self.file
-                .write_all_at(
-                    &verified.data()[..verified.data().len().div_ceil(2)],
-                    offset,
-                )
-                .map_err(Error::io)?;
+            write_all_at(
+                &self.file,
+                &verified.data()[..verified.data().len().div_ceil(2)],
+                offset,
+            )
+            .map_err(Error::io)?;
             return Err(Error::io(io::Error::other(
                 "injected partial capture write",
             )));
         }
-        self.file
-            .write_all_at(verified.data(), offset)
-            .map_err(Error::io)?;
+        write_all_at(&self.file, verified.data(), offset).map_err(Error::io)?;
         #[cfg(test)]
         self.boundary(Boundary::Written)?;
         self.sync_data()?;
@@ -304,7 +308,7 @@ impl CaptureFile {
         self.ready()?;
         let group = self.table.get(offset)?.ok_or_else(invalid)?;
         let mut bytes = vec![0; usize::try_from(group.length).map_err(|_| invalid())?];
-        match self.file.read_exact_at(&mut bytes, offset) {
+        match read_exact_at(&self.file, &mut bytes, offset) {
             Ok(()) => {}
             Err(error) => {
                 if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -494,6 +498,7 @@ impl CaptureFile {
     }
 }
 
+#[cfg(unix)]
 fn claim(file: &File) -> Result<(), Error> {
     match file.try_lock() {
         Ok(()) => Ok(()),
@@ -503,20 +508,13 @@ fn claim(file: &File) -> Result<(), Error> {
 }
 
 fn binding(file: &File, location: &FileLocation, metadata: &File) -> Result<[u64; 6], Error> {
-    let data = file.metadata().map_err(Error::io)?;
-    let parent = location.directory().file().metadata().map_err(Error::io)?;
-    let metadata = metadata.metadata().map_err(Error::io)?;
-    if data.nlink() != 1 || metadata.nlink() != 1 {
+    let (data, data_links) = identity_and_links(file).map_err(Error::io)?;
+    let parent = file_identity(location.directory().file()).map_err(Error::io)?;
+    let (metadata, metadata_links) = identity_and_links(metadata).map_err(Error::io)?;
+    if data_links != 1 || metadata_links != 1 {
         return Err(invalid());
     }
-    Ok([
-        data.dev(),
-        data.ino(),
-        parent.dev(),
-        parent.ino(),
-        metadata.dev(),
-        metadata.ino(),
-    ])
+    Ok([data.0, data.1, parent.0, parent.1, metadata.0, metadata.1])
 }
 
 fn complete_read(result: io::Result<()>) -> Result<bool, Error> {

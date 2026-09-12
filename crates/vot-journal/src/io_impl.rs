@@ -2,12 +2,12 @@
 
 use super::{CHECKPOINT_FLAG, Error, HEADER_LEN, Header, MAX_PAYLOAD, Record, crc32c, encode, io};
 use std::fs::File;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use vot_platform_fs::FileLocation;
 
 /// Largest journal a replay will read. Replay holds the whole file, so this
@@ -32,7 +32,7 @@ pub struct Journal {
     /// that shrinks it is a compaction that has to read it.
     pub(super) bytes: u64,
     pub(super) path: PathBuf,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     location: FileLocation,
     pub(super) incarnation: [u8; 16],
     pub(super) next_sequence: u64,
@@ -44,6 +44,7 @@ pub struct Journal {
 }
 
 /// Claims a journal for one writer, on the journal itself.
+/// Windows opens deny write sharing; other platforms retain a file lock.
 ///
 /// Not on a sibling lock file. A sibling has to be named from the journal's
 /// path, which makes the claim lexical: two names for one journal, a hardlink
@@ -58,7 +59,14 @@ pub struct Journal {
 ///
 /// # Errors
 /// Reports [`Error::Locked`] when another writer holds the journal.
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 pub(super) fn claim(file: &File) -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let _ = file;
+        Ok(())
+    }
+    #[cfg(not(windows))]
     match fs4::FileExt::try_lock(file) {
         Ok(()) => Ok(()),
         Err(fs4::TryLockError::WouldBlock) => Err(Error::Locked),
@@ -66,23 +74,31 @@ pub(super) fn claim(file: &File) -> Result<(), Error> {
     }
 }
 
+fn open_error(error: io::Error) -> Error {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(32) {
+        return Error::Locked;
+    }
+    Error::Io(error)
+}
+
 #[derive(Debug)]
 pub struct DurableWitness(());
 
 impl Journal {
     pub fn create(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             Self::create_at(FileLocation::from_path(path)?, incarnation)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Self::create_nonunix(path, incarnation)
         }
     }
 
     /// Keeps every later journal operation relative to the retained directory.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn create_at(location: FileLocation, incarnation: [u8; 16]) -> Result<Self, Error> {
         location.require_removal_parent()?;
         let file = location.create()?;
@@ -106,21 +122,21 @@ impl Journal {
     }
 
     pub fn open_current(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             Self::open_at(FileLocation::from_path(path)?, incarnation)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Self::open_current_nonunix(path, incarnation)
         }
     }
 
     /// Claims and repairs a journal through its retained parent directory.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn open_at(location: FileLocation, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
         location.require_removal_parent()?;
-        let mut file = location.open_write()?;
+        let mut file = location.open_write().map_err(open_error)?;
         claim(&file)?;
         let replay = replay_reader(&mut file, incarnation)?;
         let next_sequence = next_sequence_after(replay.records.last())?;
@@ -147,7 +163,7 @@ impl Journal {
         ))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn create_nonunix(path: &Path, incarnation: [u8; 16]) -> Result<Self, Error> {
         vot_platform_fs::validate_removal_parent(path)?;
         let file = OpenOptions::new()
@@ -178,7 +194,7 @@ impl Journal {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn open_current_nonunix(path: &Path, incarnation: [u8; 16]) -> Result<(Self, Replay), Error> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         claim(&file)?;
@@ -268,9 +284,9 @@ impl Journal {
         if !self.poisoned {
             return Err(Error::InvalidState);
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let same = self.location.same_file(&self.file)?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let same = vot_platform_fs::same_file_handle(&self.file, &self.path)?;
         if !same {
             return Err(Error::InvalidState);
@@ -301,11 +317,11 @@ impl Journal {
 
     /// Removes this journal only while its retained handle still owns its name.
     pub fn remove_owned(self) -> Result<(), Error> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.location.remove_owned(&self.file).map_err(Error::Io)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             vot_platform_fs::remove_file_handle(&self.file, &self.path).map_err(Error::Io)
         }
@@ -364,13 +380,13 @@ impl Journal {
             file_name.to_string_lossy(),
             std::process::id()
         ));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let temporary = self
             .location
             .sibling(temporary.file_name().ok_or(Error::InvalidHeader)?)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut file = temporary.create()?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -384,9 +400,9 @@ impl Journal {
         // journal itself rather than on a sibling that has to be named from
         // its path and left behind.
         claim(&file)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let renamed = temporary.replace_private(&self.location);
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let renamed = fs::rename(&temporary, &self.path);
         #[cfg(test)]
         let renamed = renamed.and_then(|()| {
@@ -425,9 +441,9 @@ impl Journal {
         mut replacement: File,
         next_sequence: u64,
     ) -> Result<(), Error> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.location.sync_parent()?;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         File::open(parent_directory(&self.path))?.sync_all()?;
         replacement.seek(SeekFrom::Start(0))?;
         let replayed = replay_reader(&mut replacement, self.incarnation)?;
@@ -466,7 +482,7 @@ pub(super) fn next_sequence_after(last: Option<&Record>) -> Result<u64, Error> {
     last.map_or(Ok(0), |record| successor(record.sequence))
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 pub(super) fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -474,17 +490,17 @@ pub(super) fn parent_directory(path: &Path) -> &Path {
 }
 
 pub fn replay(path: &Path, current_incarnation: [u8; 16]) -> Result<Replay, Error> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         replay_at(&FileLocation::from_path(path)?, current_incarnation)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         replay_reader(&mut File::open(path)?, current_incarnation)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn replay_at(location: &FileLocation, current_incarnation: [u8; 16]) -> Result<Replay, Error> {
     location.require_removal_parent()?;
     replay_reader(&mut location.open_read()?, current_incarnation)

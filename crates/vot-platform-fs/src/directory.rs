@@ -267,6 +267,22 @@ impl FileLocation {
         )
     }
 
+    /// Creates a new capture file; the caller must acquire its writer lock.
+    ///
+    /// # Errors
+    /// Propagates exclusive creation errors.
+    pub fn create_owned(&self) -> io::Result<File> {
+        self.create()
+    }
+
+    /// Opens a capture file; the caller must acquire its writer lock.
+    ///
+    /// # Errors
+    /// Propagates open errors.
+    pub fn open_owned(&self) -> io::Result<File> {
+        self.open_write()
+    }
+
     ///
     /// # Errors
     /// Returns an error if lookup fails or the name is not a regular file.

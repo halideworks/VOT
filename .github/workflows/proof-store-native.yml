@@ -72,10 +72,14 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy
+
+      - name: Check Windows storage lints
+        if: runner.os == 'Windows'
+        run: cargo +1.97.1 clippy -p vot-platform-fs -p vot-journal -p vot-sdk-file --all-targets --locked -- -D warnings
 
       - name: Test native storage adapters
-        run: cargo +1.97.1 test -p vot-proof-store-file -p vot-sdk-file --locked
+        run: cargo +1.97.1 test -p vot-proof-store-file -p vot-sdk-file -p vot-journal --locked
 
       - name: Test strict unsupported path
         if: runner.os == 'macOS'

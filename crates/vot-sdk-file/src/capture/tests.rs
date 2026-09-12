@@ -1,7 +1,8 @@
 use super::*;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use vot_sdk::object::{InMemoryObjectBuilder, InMemoryPreparedObject};
@@ -18,7 +19,7 @@ impl Temp {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        vot_platform_fs::create_private_directory(&path).unwrap();
         Self(path)
     }
 }
@@ -324,7 +325,7 @@ fn recovery_invalidates_corrupt_or_missing_bytes_but_preserves_other_groups() {
         if truncate {
             data.set_len(GROUP).unwrap();
         } else {
-            data.write_all_at(&[99], GROUP).unwrap();
+            write_all_at(&data, &[99], GROUP).unwrap();
         }
         drop(data);
         let mut reopened = CaptureFile::open(&dir.0, INCARNATION).unwrap();
@@ -355,7 +356,7 @@ fn reading_detected_corruption_retires_its_persisted_coverage() {
         if truncate {
             capture.file.set_len(1).unwrap();
         } else {
-            capture.file.write_all_at(&[9], 0).unwrap();
+            write_all_at(&capture.file, &[9], 0).unwrap();
         }
         assert!(
             capture
@@ -375,6 +376,7 @@ fn reading_detected_corruption_retires_its_persisted_coverage() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn ownership_refuses_aliases_substitution_and_second_writers() {
     let dir = Temp::new();
@@ -399,6 +401,7 @@ fn ownership_refuses_aliases_substitution_and_second_writers() {
     assert_eq!(fs::read(data).unwrap(), b"unrelated");
 }
 
+#[cfg(unix)]
 #[test]
 fn journal_substitution_and_insecure_directories_are_refused() {
     let dir = Temp::new();
@@ -448,6 +451,7 @@ fn torn_commit_and_complete_unsynced_invalidation_recover_conservatively() {
         .unwrap();
     file.set_len(before).unwrap();
     file.sync_all().unwrap();
+    drop(file);
     fs::OpenOptions::new()
         .append(true)
         .open(&journal_path)
@@ -670,6 +674,7 @@ fn recovery_parent_sync_failure_cannot_admit_coverage() {
     assert_eq!(capture.progress().unwrap().covered_bytes, 17);
 }
 
+#[cfg(unix)]
 #[test]
 fn payload_lock_remains_held_across_journal_replacement() {
     let dir = Temp::new();
@@ -707,11 +712,7 @@ fn repeated_replay_restores_newer_metadata_after_historical_shrink() {
             capture.table.file.sync_all().unwrap();
             let journal = fs::read(dir.0.join("capture.journal")).unwrap();
             if torn {
-                capture
-                    .table
-                    .file
-                    .write_all_at(&[0xff; 80], 96 + 8)
-                    .unwrap();
+                write_all_at(&capture.table.file, &[0xff; 80], 96 + 8).unwrap();
             }
             drop(capture);
             let directory = Directory::open(&dir.0).unwrap();
@@ -755,7 +756,7 @@ fn durable_afterimages_repair_torn_commit_and_reuse_slots() {
         assert!(result.is_err());
         assert!(capture.progress().is_err());
         capture.table.file.set_len(91).unwrap();
-        capture.table.file.write_all_at(&[0xff; 19], 8).unwrap();
+        write_all_at(&capture.table.file, &[0xff; 19], 8).unwrap();
         drop(capture);
         let capture = CaptureFile::open(&dir.0, INCARNATION).unwrap();
         assert_eq!(capture.progress().unwrap().covered_bytes, 17);
@@ -797,6 +798,19 @@ fn metadata_identity_corruption_and_reserved_names_are_refused() {
         let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &[7; 17]);
         capture.checkpoint().unwrap();
         let path = dir.0.join("capture.groups");
+        #[cfg(windows)]
+        if action < 2 {
+            let result = if action == 0 {
+                fs::rename(&path, dir.0.join("old-groups"))
+            } else {
+                fs::hard_link(&path, dir.0.join("alias"))
+            };
+            assert!(result.is_err());
+            capture.progress().unwrap();
+            drop(capture);
+            CaptureFile::open(&dir.0, INCARNATION).unwrap();
+            continue;
+        }
         match action {
             0 => {
                 fs::rename(&path, dir.0.join("old-groups")).unwrap();
@@ -808,7 +822,7 @@ fn metadata_identity_corruption_and_reserved_names_are_refused() {
                 assert!(capture.progress().is_err());
             }
             2 => {
-                capture.table.file.write_all_at(&[19], 32).unwrap();
+                write_all_at(&capture.table.file, &[19], 32).unwrap();
             }
             _ => {
                 capture.table.file.set_len(95).unwrap();
@@ -837,9 +851,57 @@ fn interrupted_tail_clear_is_repaired_from_the_durable_selection() {
     let before = fs::read(dir.0.join("capture.groups")).unwrap();
     let short = object(Suite::Blake3Bao64, &bytes[..G + 17]);
     let expected = capture.select(short.object_id()).unwrap();
-    capture.table.file.write_all_at(&before[96..], 96).unwrap();
-    capture.table.file.write_all_at(&[0; 16], 96).unwrap();
+    write_all_at(&capture.table.file, &before[96..], 96).unwrap();
+    write_all_at(&capture.table.file, &[0; 16], 96).unwrap();
     drop(capture);
     let recovered = CaptureFile::open(&dir.0, INCARNATION).unwrap();
     assert_eq!(recovered.progress().unwrap(), expected);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_writer_exclusion_survives_compaction_and_rejects_existing_aliases() {
+    let dir = Temp::new();
+    let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &[8; 17]);
+    for compact in [false, true] {
+        if compact {
+            capture.checkpoint().unwrap();
+        }
+        assert!(CaptureFile::open(&dir.0, INCARNATION).is_err());
+        for leaf in ["capture.data", "capture.groups", "capture.journal"] {
+            assert!(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.0.join(leaf))
+                    .is_err()
+            );
+        }
+        for leaf in ["capture.data", "capture.groups"] {
+            let path = dir.0.join(leaf);
+            assert!(fs::rename(&path, dir.0.join("substitution")).is_err());
+            assert!(fs::remove_file(&path).is_err());
+        }
+        capture.progress().unwrap();
+    }
+    drop(capture);
+    let alias = dir.0.join("alias");
+    fs::hard_link(dir.0.join("capture.data"), &alias).unwrap();
+    assert!(CaptureFile::open(&dir.0, INCARNATION).is_err());
+    fs::remove_file(alias).unwrap();
+    assert!(CaptureFile::open(&dir.0, [0; 16]).is_err());
+    CaptureFile::open(&dir.0, INCARNATION).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_journal_substitution_is_detected_before_payload_mutation() {
+    let dir = Temp::new();
+    let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &[8; 17]);
+    let journal = dir.0.join("capture.journal");
+    fs::rename(&journal, dir.0.join("old-journal")).unwrap();
+    fs::write(&journal, b"unrelated").unwrap();
+    assert!(capture.invalidate(0).is_err());
+    assert_eq!(fs::read(&journal).unwrap(), b"unrelated");
+    drop(capture);
+    assert!(CaptureFile::open(&dir.0, INCARNATION).is_err());
 }

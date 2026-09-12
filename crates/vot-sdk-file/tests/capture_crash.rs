@@ -1,7 +1,6 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::fs;
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -67,7 +66,7 @@ fn killed_writer_reopens_without_claiming_unverified_bytes() {
     for index in 0..4 {
         let path =
             std::env::temp_dir().join(format!("vot-capture-crash-{}-{index}", std::process::id()));
-        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        vot_platform_fs::create_private_directory(&path).unwrap();
         let (initial, bytes) = prepared(7);
         let mut capture = CaptureFile::create(&path, INCARNATION, initial.object_id(), 2).unwrap();
         accept(&mut capture, &initial, &bytes, 0);

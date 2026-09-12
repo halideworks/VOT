@@ -86,14 +86,9 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700).create(&directory).unwrap();
-        }
-        #[cfg(not(unix))]
+        #[cfg(any(unix, windows))]
+        vot_platform_fs::create_private_directory(&directory).unwrap();
+        #[cfg(not(any(unix, windows)))]
         std::fs::create_dir(&directory).unwrap();
         TempJournal {
             path: directory.join("journal"),

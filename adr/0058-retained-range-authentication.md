@@ -87,9 +87,8 @@ receives that 64 KiB group, and authenticates the other 131,089 bytes from the
 retained owner. It reconstructs and freshly hashes the result, requires complete
 coverage under the new identity, and rejects the original identity's witness.
 
-The next boundary is owned disk staging with authenticated retained-coverage
-metadata, followed by the invalidation journal and crash/failure injection
-through real storage providers. Source lifecycle, capture orchestration,
+ADR-0059 adds bounded Unix disk staging, persisted retained-group metadata,
+and an invalidation journal with crash/failure injection through local storage. Source lifecycle, capture orchestration,
 filesystem watchers, and VOTPort integration remain outside this increment.
 
 ## Reproduction

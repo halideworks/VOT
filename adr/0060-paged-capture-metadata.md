@@ -93,9 +93,9 @@ not transfer throughput claims. Raw samples are recorded in
 ## Validation and next boundary
 
 Tests cover more than 16,384 metadata entries with fixed page allocation,
-sparse gaps, split-slot hints, checksum corruption, inode substitution, budget
-refusal, constant-size compaction, metadata flush errors, complete afterimage
-repair, repeated replay over newer metadata, and all 97 partial-tail clear
+sparse gaps, allocated empty pages, split-slot hints, checksum corruption, inode
+substitution, budget refusal, constant-size compaction, metadata flush errors,
+complete afterimage repair, repeated replay over newer metadata, and all 97 partial-tail clear
 prefixes. The existing payload-write and subprocess-termination tests remain.
 A standalone example prepares and recovers a fully authenticated 2 GiB capture
 using one payload buffer; it also separates preparation from memory measurement.

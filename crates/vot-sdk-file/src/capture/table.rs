@@ -80,7 +80,9 @@ impl Table {
 
     pub fn next(&mut self, cursor: &mut u64) -> Result<Option<Group>, Error> {
         let length = self.extent(MAX_CAPTURE_GROUPS)?;
+        let mut remaining = length;
         while let Some(mut at) = scan_offset(*cursor, length) {
+            remaining = remaining.checked_sub(SLOT as u64).ok_or_else(invalid)?;
             let page_at = page_offset(at);
             if self.page_at != Some(page_at) {
                 let data =
@@ -236,6 +238,19 @@ mod tests {
         assert_eq!(table.file.metadata().unwrap().len(), 43 * SLOT as u64);
         table.select(0).unwrap();
         assert!(table.next(&mut 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_allocated_pages_finish_scanning() {
+        let dir = Temp::new();
+        let mut table = table(&dir);
+        table.file.write_all_at(&[0; SLOT], 0).unwrap();
+        assert!(table.get(0).unwrap().is_none());
+        let mut cursor = 0;
+        assert!(table.next(&mut cursor).unwrap().is_none());
+        assert_eq!(cursor, 1);
+        assert!(table.next(&mut cursor).unwrap().is_none());
+        assert_eq!(cursor, 1);
     }
 
     #[test]

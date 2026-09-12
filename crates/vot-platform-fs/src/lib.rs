@@ -6,9 +6,23 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+mod positioned;
+#[cfg(any(unix, windows))]
+pub use positioned::{read_exact_at, write_all_at};
+#[cfg(windows)]
+#[path = "directory_windows.rs"]
+mod directory;
+#[cfg(windows)]
+pub use directory::{
+    Directory, FileLocation, create_private_directory, file_identity, identity_and_links,
+};
+#[cfg(windows)]
+#[path = "sparse_windows.rs"]
 mod sparse;
 #[cfg(unix)]
+mod sparse;
+#[cfg(any(unix, windows))]
 pub use sparse::next_file_data_offset;
 #[cfg(unix)]
 mod directory;
@@ -18,6 +32,36 @@ mod nas;
 pub use directory::{Directory, FileLocation};
 #[cfg(unix)]
 pub use nas::NasContract;
+
+#[cfg(unix)]
+/// Creates a new owner-only directory without changing any existing entry.
+///
+/// # Errors
+/// Returns the filesystem creation error.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(unix)]
+/// Returns the filesystem and file identifiers of the retained handle.
+///
+/// # Errors
+/// Returns the metadata query error.
+pub fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    Ok(identity_and_links(file)?.0)
+}
+
+#[cfg(unix)]
+/// Returns the retained identity and link count from one metadata query.
+///
+/// # Errors
+/// Returns the metadata query error.
+pub fn identity_and_links(file: &File) -> io::Result<((u64, u64), u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok(((metadata.dev(), metadata.ino()), metadata.nlink()))
+}
 #[cfg(target_os = "linux")]
 pub use nas::validate_nas_mount;
 
@@ -444,6 +488,17 @@ pub fn link_file_handle(_file: &File, source: &Path, destination: &Path) -> io::
 /// # Errors
 /// Returns an identity mismatch or operating-system disposition failure.
 pub fn same_file_regular_windows_remove(file: &File, path: &Path) -> io::Result<()> {
+    if !same_file_regular_windows_handle(file, path)? {
+        return Err(io::Error::other(
+            "file name no longer identifies the held file",
+        ));
+    }
+    remove_owned_handle_windows(file)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn remove_owned_handle_windows(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
@@ -454,11 +509,6 @@ pub fn same_file_regular_windows_remove(file: &File, path: &Path) -> io::Result<
         FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
     };
 
-    if !same_file_regular_windows_handle(file, path)? {
-        return Err(io::Error::other(
-            "file name no longer identifies the held file",
-        ));
-    }
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS

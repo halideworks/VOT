@@ -1,0 +1,150 @@
+{
+  "base_commit": "9eb500d401183930d0848c8436fef5c65048f227",
+  "date": "2026-09-12",
+  "host": "Linux x86_64, same ZFS volume as ADR0060",
+  "profile": "Rust 1.97.1 release",
+  "payload_bytes": 536870912,
+  "method": "One warm recovery per binary and journal state, then seven alternating runs; perf_counter_ns wall time includes process launch and /usr/bin/time; maximum RSS from /usr/bin/time. Each recovery verifies all payload.",
+  "results": {
+    "journal": {
+      "base": {
+        "samples": [
+          {
+            "seconds": 0.484432101,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 2.017502137,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.746676329,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.85126907,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 0.903128612,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 2.54695438,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.594445015,
+            "rss_kib": 5120
+          }
+        ],
+        "median_seconds": 1.746676329,
+        "median_rss_kib": 5120
+      },
+      "windows_capture": {
+        "samples": [
+          {
+            "seconds": 2.277201271,
+            "rss_kib": 4960
+          },
+          {
+            "seconds": 0.823586689,
+            "rss_kib": 4960
+          },
+          {
+            "seconds": 1.546702239,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.646941457,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.746861987,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 2.642895722,
+            "rss_kib": 5120
+          },
+          {
+            "seconds": 1.280406315,
+            "rss_kib": 5120
+          }
+        ],
+        "median_seconds": 1.646941457,
+        "median_rss_kib": 5120
+      }
+    },
+    "compacted": {
+      "base": {
+        "samples": [
+          {
+            "seconds": 0.225413342,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.254966468,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.235361998,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.230183813,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.23509035,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.235016666,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.235104103,
+            "rss_kib": 2080
+          }
+        ],
+        "median_seconds": 0.23509035,
+        "median_rss_kib": 2240
+      },
+      "windows_capture": {
+        "samples": [
+          {
+            "seconds": 0.224883349,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.230450252,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.224947574,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.225404398,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.225378859,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.230224461,
+            "rss_kib": 2240
+          },
+          {
+            "seconds": 0.225474629,
+            "rss_kib": 2240
+          }
+        ],
+        "median_seconds": 0.225404398,
+        "median_rss_kib": 2240
+      }
+    }
+  }
+}

@@ -86,14 +86,9 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700).create(&directory).unwrap();
-        }
-        #[cfg(not(unix))]
+        #[cfg(any(unix, windows))]
+        vot_platform_fs::create_private_directory(&directory).unwrap();
+        #[cfg(not(any(unix, windows)))]
         std::fs::create_dir(&directory).unwrap();
         TempJournal {
             path: directory.join("journal"),
@@ -350,6 +345,7 @@ mod tests {
     #[test]
     fn the_last_sequence_is_refused_before_anything_is_written() {
         let path = temp_path("last-sequence");
+        drop(Journal::create(&path, [2; 16]).unwrap());
         // A checkpoint is the one record that may open a journal at a
         // sequence other than zero.
         std::fs::write(
@@ -357,10 +353,10 @@ mod tests {
             encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap(),
         )
         .unwrap();
-        assert!(matches!(
-            Journal::open_current(&path, [2; 16]),
-            Err(Error::SequenceGap)
-        ));
+        let error = Journal::open_current(&path, [2; 16])
+            .err()
+            .expect("last sequence was admitted");
+        assert!(matches!(error, Error::SequenceGap), "{error:?}");
 
         // And a record after it is a gap, not an overflow.
         let mut bytes = encode(&record(u64::MAX, 2, Vec::new(), true)).unwrap();

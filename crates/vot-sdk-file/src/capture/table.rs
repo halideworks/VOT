@@ -1,5 +1,5 @@
 use super::{Error, File, FileLocation, GROUP, Group, MAX_CAPTURE_GROUPS, invalid};
-use std::os::unix::fs::FileExt as _;
+use super::{read_exact_at, write_all_at};
 use vot_journal::{CRC32C_EMPTY, crc32c_update};
 
 const SLOT: usize = 96;
@@ -45,7 +45,7 @@ impl Table {
             return Ok(());
         }
         let bytes = encode(offset, group)?;
-        self.file.write_all_at(&bytes, at).map_err(Error::io)
+        write_all_at(&self.file, &bytes, at).map_err(Error::io)
     }
 
     pub fn select(&mut self, length: u64) -> Result<(), Error> {
@@ -56,9 +56,7 @@ impl Table {
         if !length.is_multiple_of(GROUP) && current >= end {
             let offset = length / GROUP * GROUP;
             let mut bytes = [0; SLOT];
-            self.file
-                .read_exact_at(&mut bytes, slot_offset(offset)?)
-                .map_err(Error::io)?;
+            read_exact_at(&self.file, &mut bytes, slot_offset(offset)?).map_err(Error::io)?;
             // A torn tail clear must be redone. SELECT retires its coverage;
             // later full afterimages restore any newer slot it removes.
             let stored_length =
@@ -108,9 +106,7 @@ impl Table {
         if self.page_at != Some(at) {
             self.page.fill(0);
             let count = usize::try_from((length - at).min(PAGE as u64)).map_err(|_| invalid())?;
-            self.file
-                .read_exact_at(&mut self.page[..count], at)
-                .map_err(Error::io)?;
+            read_exact_at(&self.file, &mut self.page[..count], at).map_err(Error::io)?;
             self.page_at = Some(at);
         }
         Ok(())
@@ -205,10 +201,7 @@ mod tests {
                 page[index * SLOT..(index + 1) * SLOT]
                     .copy_from_slice(&encode(group.offset, Some(&group)).unwrap());
             }
-            table
-                .file
-                .write_all_at(&page[..count * SLOT], first * SLOT as u64)
-                .unwrap();
+            write_all_at(&table.file, &page[..count * SLOT], first * SLOT as u64).unwrap();
         }
         let mut cursor = 0;
         for index in 0..16_385 {
@@ -244,7 +237,7 @@ mod tests {
     fn empty_allocated_pages_finish_scanning() {
         let dir = Temp::new();
         let mut table = table(&dir);
-        table.file.write_all_at(&[0; SLOT], 0).unwrap();
+        write_all_at(&table.file, &[0; SLOT], 0).unwrap();
         assert!(table.get(0).unwrap().is_none());
         let mut cursor = 0;
         assert!(table.next(&mut cursor).unwrap().is_none());
@@ -266,8 +259,8 @@ mod tests {
         .unwrap();
         let original = encode(0, Some(&group)).unwrap();
         for prefix in 0..=SLOT {
-            table.file.write_all_at(&original, 0).unwrap();
-            table.file.write_all_at(&vec![0; prefix], 0).unwrap();
+            write_all_at(&table.file, &original, 0).unwrap();
+            write_all_at(&table.file, &vec![0; prefix], 0).unwrap();
             table.select(17).unwrap();
             assert!(table.get(0).unwrap().is_none(), "prefix={prefix}");
         }

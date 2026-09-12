@@ -24,7 +24,7 @@ use vot_sdk::coverage::ObjectCoverage;
 use vot_sdk::object::ObjectId;
 use vot_sdk::verify::VerifiedSlice;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod capture;
 #[cfg(unix)]
 mod directory;
@@ -257,7 +257,14 @@ impl NativeFile {
         )
     }
 
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            unused_variables,
+            clippy::needless_pass_by_value,
+            clippy::unnecessary_wraps
+        )
+    )]
     fn from_backend(
         object: &ObjectId,
         destination: &Path,
@@ -1032,7 +1039,7 @@ fn map_posix(error: vot_commit_posix::Error) -> Error {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn map_journal(error: vot_journal::Error) -> Error {
     match error {
         vot_journal::Error::Io(error) => Error::io(error),

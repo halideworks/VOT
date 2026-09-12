@@ -1,11 +1,11 @@
 //! Run the built executable under a process-memory meter; preparation is separate from recovery.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::fs;
-    use std::os::unix::fs::DirBuilderExt as _;
     use vot_sdk::object::{InMemoryObjectBuilder, Suite};
     use vot_sdk_file::capture::CaptureFile;
+
+    use std::path::Path;
 
     const GROUP: u64 = 65_536;
     const INCARNATION: [u8; 16] = [59; 16];
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder.update(&bytes)?;
         }
         let target = builder.finish()?;
-        fs::DirBuilder::new().mode(0o700).create(path)?;
+        vot_platform_fs::create_private_directory(Path::new(path))?;
         let mut capture = CaptureFile::create(path, INCARNATION, target.object_id(), groups)?;
         for index in 0..groups {
             let offset = index * GROUP;
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!("capture staging currently requires Unix");
+    eprintln!("capture staging requires Unix or Windows");
 }

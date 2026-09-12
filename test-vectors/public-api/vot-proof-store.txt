@@ -1,4 +1,6 @@
 enum vot_proof_store::StoreError
 struct vot_proof_store::MemoryNodeStorage
+struct vot_proof_store::ProofSubtree
+struct vot_proof_store::ProofTree
 trait vot_proof_store::ProofNodeStorage
 type_alias vot_proof_store::ProofNode

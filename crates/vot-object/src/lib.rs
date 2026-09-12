@@ -10,6 +10,9 @@ pub use vot_proof_store::{ProofNodeStorage, StoreError};
 pub use vot_verifier::Suite;
 use vot_verifier::{GROUP_SIZE, StreamVerifier, VerifyError};
 
+mod checkpoint;
+pub use checkpoint::ObjectCheckpoint;
+
 /// Largest object length representable by the VOT object model.
 pub const MAX_OBJECT_LENGTH: u64 = i64::MAX as u64;
 

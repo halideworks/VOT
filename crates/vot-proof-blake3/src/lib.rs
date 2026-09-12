@@ -5,6 +5,9 @@
 use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root};
 use vot_proof_store::{ProofNodeStorage, StoreError};
 
+mod checkpoint;
+pub use checkpoint::ProofCheckpoint;
+
 pub const GROUP_SIZE: u64 = 65_536;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

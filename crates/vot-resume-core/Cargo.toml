@@ -6,5 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[example]]
+name = "capture_overwrite"
+test = true
+
 [lints]
 workspace = true

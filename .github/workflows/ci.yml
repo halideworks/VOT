@@ -530,12 +530,12 @@ jobs:
           docker run -d --name vot-wave2-minio --network vot-wave2-s3 -p 19000:9000 \
             -e MINIO_ROOT_USER=votwave2admin \
             -e MINIO_ROOT_PASSWORD=vot-wave2-secret-key-2026 \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
             server /data
           ready=0
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             if docker run --rm --network vot-wave2-s3 --entrypoint /bin/sh \
-              minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+              quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
               -c 'mc alias set local http://vot-wave2-minio:9000 votwave2admin vot-wave2-secret-key-2026 &&
                 mc mb --ignore-existing local/vot-wave2'; then
               ready=1

@@ -4,6 +4,9 @@
 
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
+mod tree;
+pub use tree::{ProofSubtree, ProofTree};
+
 /// One retained suite proof node.
 pub type ProofNode = [u8; 32];
 

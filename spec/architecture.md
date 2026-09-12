@@ -106,6 +106,13 @@ capped at 65,536 bytes.
 The `vot-proof-catalog` crate encodes and validates the optional random-access
 catalog profile without making the catalog part of object or package identity.
 
+The opt-in `ObjectCheckpoint` preparation path shares immutable proof subtrees
+across controlled-source edits (ADR-0057). Callers supply every changed complete
+verification group, including affected tails on growth or truncation. It retains
+no payload and establishes no source snapshot, producer completion, receiver
+coverage, or durability. Each result uses the existing canonical identity and
+proof formats and can be exposed as an ordinary `PreparedObject`.
+
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated
 manifest pages containing verification-group commitments; `SEAL` commits the

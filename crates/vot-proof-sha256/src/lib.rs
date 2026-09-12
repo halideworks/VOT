@@ -5,6 +5,9 @@
 use sha2::{Digest, Sha256};
 use vot_proof_store::{ProofNodeStorage, StoreError};
 
+mod checkpoint;
+pub use checkpoint::ProofCheckpoint;
+
 pub const LEAF_SIZE: usize = 16_384;
 pub const PIECE_SIZE: u64 = 65_536;
 
@@ -687,31 +690,40 @@ fn encode_proof_from(
     first: u64,
     end: u64,
 ) -> Vec<u8> {
+    encode_proof_by(piece_count, first, end, |start, width| {
+        layers[width.trailing_zeros() as usize][(start / width) as usize]
+    })
+}
+
+fn encode_proof_by(
+    piece_count: usize,
+    first: u64,
+    end: u64,
+    hash: impl Fn(u64, u64) -> [u8; 32],
+) -> Vec<u8> {
     if piece_count <= 1 {
         return Vec::new();
     }
     let pieces_len = piece_count;
-    let tree_width = layers[0].len() as u64;
+    let tree_width = piece_count.next_power_of_two() as u64;
     let (window_start, window_width) = proof_window(first, end, tree_width);
     let mut output = Vec::new();
     for index in window_start..window_start + window_width {
         if (index < first || index >= end) && index < pieces_len as u64 {
-            output.extend_from_slice(&layers[0][index as usize]);
+            output.extend_from_slice(&hash(index, 1));
         }
     }
     let mut start = window_start;
     let mut width = window_width;
-    let mut level = width.trailing_zeros() as usize;
     while width != tree_width {
         let node_index = start / width;
         let sibling = node_index ^ 1;
         let sibling_start = sibling * width;
         if sibling_start < pieces_len as u64 {
-            output.extend_from_slice(&layers[level][sibling as usize]);
+            output.extend_from_slice(&hash(sibling_start, width));
         }
         start = start.min(sibling_start);
         width *= 2;
-        level += 1;
     }
     output
 }

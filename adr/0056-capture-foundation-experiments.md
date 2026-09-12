@@ -118,8 +118,9 @@ Continue the canonical-root candidate first. The experiments show no need to
 change file identity for append, replacement, truncation, or verified range reuse.
 They do not establish acceptable performance for large production captures.
 
-The next implementation must bound checkpoint metadata work, bind retained
-coverage to exact content and its owned storage lifetime, and execute the
+ADR-0057 implements incremental canonical checkpoint metadata. The remaining
+capture implementation must bind retained coverage to exact content and its
+owned storage lifetime, and execute the
 invalidation sequence through a real provider with crash and failure injection.
 Keep capture recovery evidence separate from immutable object assurance. A new
 capture must not turn an existing object's monotonic assurance state backward.

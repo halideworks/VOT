@@ -7,6 +7,7 @@ function vot_proof_blake3::prove_with
 function vot_proof_blake3::root
 function vot_proof_blake3::verify
 struct vot_proof_blake3::GroupCvs
+struct vot_proof_blake3::ProofCheckpoint
 struct vot_proof_blake3::RangeCover
 struct vot_proof_blake3::RangeProof
 struct vot_proof_blake3::SealedGroupCvs

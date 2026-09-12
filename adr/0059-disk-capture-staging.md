@@ -1,6 +1,6 @@
 # ADR-0059: Bounded disk capture staging
 
-- Status: Accepted for the Unix local-storage prototype.
+- Status: Accepted; group storage and its capacity ceiling superseded by ADR-0060.
 - Date: 2026-09-12
 - Applies to: `vot-sdk-file::capture`.
 

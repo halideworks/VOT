@@ -7,6 +7,10 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
+mod sparse;
+#[cfg(unix)]
+pub use sparse::next_file_data_offset;
+#[cfg(unix)]
 mod directory;
 #[cfg(unix)]
 mod nas;

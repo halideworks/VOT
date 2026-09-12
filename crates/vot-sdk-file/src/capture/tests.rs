@@ -10,9 +10,9 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 const INCARNATION: [u8; 16] = [23; 16];
 const G: usize = 65_536;
 
-struct Temp(PathBuf);
+pub(super) struct Temp(pub(super) PathBuf);
 impl Temp {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "vot-capture-{}-{}",
             std::process::id(),
@@ -255,11 +255,17 @@ fn replacement_failures_retire_coverage_and_acknowledgments_follow_both_barriers
                 reopened.trace,
                 [
                     Boundary::BeforeRecord(INVALIDATE),
+                    Boundary::JournalAppended(INVALIDATE),
+                    Boundary::BeforeMetadataWrite,
+                    Boundary::MetadataWritten,
                     Boundary::Recorded(INVALIDATE),
                     Boundary::Written,
                     Boundary::BeforeDataSync,
                     Boundary::DataSynced,
                     Boundary::BeforeRecord(COMMIT),
+                    Boundary::JournalAppended(COMMIT),
+                    Boundary::BeforeMetadataWrite,
+                    Boundary::MetadataWritten,
                     Boundary::Recorded(COMMIT)
                 ]
             );
@@ -463,7 +469,7 @@ fn torn_commit_and_complete_unsynced_invalidation_recover_conservatively() {
 #[test]
 fn snapshots_preserve_pending_operations_and_reject_malformed_records() {
     let target = object(Suite::Blake3Bao64, &vec![7; 2 * G]);
-    let mut state = State::new([2, 3, 5, 7], 2, target.object_id().clone()).unwrap();
+    let mut state = State::new([2, 3, 5, 7, 11, 13], 2, target.object_id().clone()).unwrap();
     state.apply(1, INVALIDATE, &0_u64.to_le_bytes()).unwrap();
     let group = Group::from_bytes(Suite::Blake3Bao64, 0, &vec![7; G], 0).unwrap();
     state.apply(2, COMMIT, &group.encode()).unwrap();
@@ -481,10 +487,15 @@ fn snapshots_preserve_pending_operations_and_reject_malformed_records() {
     let mut restored = State::restore(&record).unwrap();
     assert_eq!(restored.snapshot(), state.snapshot());
     assert_eq!(restored.sequence, 4);
-    assert_eq!(restored.covered_bytes(), 0);
+    assert_eq!(restored.generation, 3);
     let group = Group::from_bytes(Suite::Blake3Bao64, GROUP, &vec![7; G], 3).unwrap();
-    restored.apply(5, COMMIT, &group.encode()).unwrap();
-    assert_eq!(restored.covered_bytes(), GROUP);
+    assert!(matches!(
+        restored.apply(5, COMMIT, &group.encode()).unwrap(),
+        Effect::Store {
+            offset: GROUP,
+            group: Some(_)
+        }
+    ));
     for (sequence, kind, payload) in [
         (6, COMMIT, group.encode()),
         (7, INVALIDATE, 0_u64.to_le_bytes().to_vec()),
@@ -523,21 +534,8 @@ fn snapshot_budget_has_a_fixed_upper_bound_and_invalid_admission_creates_nothing
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
     }
     let mut id = prepared.object_id().clone();
-    id.length = MAX_CAPTURE_GROUPS as u64 * GROUP;
-    let mut state = State::new([2, 3, 5, 7], MAX_CAPTURE_GROUPS, id).unwrap();
-    for index in 0..MAX_CAPTURE_GROUPS {
-        let offset = index as u64 * GROUP;
-        state.groups.insert(
-            offset,
-            Group {
-                offset,
-                length: GROUP,
-                hash: [2; 32],
-                small_root: [0; 32],
-                generation: 0,
-            },
-        );
-    }
+    id.length = vot_sdk::object::MAX_OBJECT_LENGTH;
+    let state = State::new([2, 3, 5, 7, 11, 13], MAX_CAPTURE_GROUPS, id).unwrap();
     let record = vot_journal::Record {
         incarnation: INCARNATION,
         sequence: 0,
@@ -545,11 +543,8 @@ fn snapshot_budget_has_a_fixed_upper_bound_and_invalid_admission_creates_nothing
         payload: state.snapshot(),
         checkpoint: true,
     };
-    assert!(record.payload.len() < 1_048_576);
-    assert_eq!(
-        State::restore(&record).unwrap().groups.len(),
-        MAX_CAPTURE_GROUPS
-    );
+    assert_eq!(record.payload.len(), 122);
+    assert_eq!(State::restore(&record).unwrap().limit, MAX_CAPTURE_GROUPS);
     for (suite, length) in [(0, 17), (1, u64::MAX), (1, 0)] {
         let dir = Temp::new();
         let id = ObjectId {
@@ -609,7 +604,7 @@ fn cached_group_shapes_and_small_proofs_are_strict() {
         assert!(group.verify(wrong.object_id(), &[]).is_err());
     }
     let target = object(Suite::Blake3Bao64, &vec![7; 2 * G]);
-    let mut state = State::new([2, 3, 5, 7], 2, target.object_id().clone()).unwrap();
+    let mut state = State::new([2, 3, 5, 7, 11, 13], 2, target.object_id().clone()).unwrap();
     state.generation = 2;
     state.sequence = 2;
     let valid = Group::from_bytes(Suite::Blake3Bao64, GROUP, &vec![7; G], 2).unwrap();
@@ -625,20 +620,12 @@ fn cached_group_shapes_and_small_proofs_are_strict() {
         group.length = length;
         group.generation = generation;
         group.small_root = small_root;
-        state.groups.insert(GROUP, group);
-        let record = vot_journal::Record {
-            incarnation: INCARNATION,
-            sequence: 2,
-            state: SNAPSHOT,
-            payload: state.snapshot(),
-            checkpoint: true,
-        };
         assert_eq!(
-            State::restore(&record).is_ok(),
+            group.validate(&state).is_ok(),
             length == GROUP && generation == 1
         );
     }
-    let mut state = State::new([2, 3, 5, 7], 1, target.object_id().clone()).unwrap();
+    let mut state = State::new([2, 3, 5, 7, 11, 13], 1, target.object_id().clone()).unwrap();
     state
         .apply(1, SELECT, &encode_object(target.object_id()))
         .unwrap();
@@ -648,12 +635,6 @@ fn cached_group_shapes_and_small_proofs_are_strict() {
     assert!(state.apply(3, COMMIT, &old.encode()).is_err());
     let mut current = valid;
     current.generation = 1;
-    state.groups.insert(
-        0,
-        Group::from_bytes(Suite::Blake3Bao64, 0, &vec![7; G], 1).unwrap(),
-    );
-    assert!(state.apply(3, COMMIT, &current.encode()).is_err());
-    state.groups.clear();
     state.apply(3, COMMIT, &current.encode()).unwrap();
     let mut maximum = target.object_id().clone();
     maximum.length = vot_sdk::object::MAX_OBJECT_LENGTH;
@@ -703,4 +684,162 @@ fn payload_lock_remains_held_across_journal_replacement() {
     assert!(matches!(second.try_lock(), Err(TryLockError::WouldBlock)));
     drop(capture);
     second.try_lock().unwrap();
+}
+
+#[test]
+fn repeated_replay_restores_newer_metadata_after_historical_shrink() {
+    for suite in [Suite::Blake3Bao64, Suite::Sha256Bep52] {
+        for torn in [false, true] {
+            let dir = Temp::new();
+            let bytes = vec![7; 3 * G + 17];
+            let (mut capture, original) = filled(&dir.0, suite, &bytes);
+            capture.checkpoint().unwrap();
+            let short = object(suite, &bytes[..G + 3]);
+            capture.select(short.object_id()).unwrap();
+            capture.select(original.object_id()).unwrap();
+            capture
+                .reuse(0, original.prove(0, 1).unwrap().proof())
+                .unwrap();
+            for offset in [G, 2 * G, 3 * G] {
+                accept(&mut capture, &original, &bytes, offset).unwrap();
+            }
+            let expected = capture.progress().unwrap();
+            capture.table.file.sync_all().unwrap();
+            let journal = fs::read(dir.0.join("capture.journal")).unwrap();
+            if torn {
+                capture
+                    .table
+                    .file
+                    .write_all_at(&[0xff; 80], 96 + 8)
+                    .unwrap();
+            }
+            drop(capture);
+            let directory = Directory::open(&dir.0).unwrap();
+            let location = directory.entry(OsStr::new("capture.groups")).unwrap();
+            let mut table = Table::new(location.open_write().unwrap(), location);
+            table.select(short.object_id().length).unwrap();
+            table.file.sync_all().unwrap();
+            drop(table);
+            assert_eq!(fs::read(dir.0.join("capture.journal")).unwrap(), journal);
+            let mut reopened = CaptureFile::open(&dir.0, INCARNATION).unwrap();
+            assert_eq!(reopened.progress().unwrap(), expected);
+            for offset in [0, G, 2 * G, 3 * G] {
+                let proof = original.prove(offset as u64, 1).unwrap();
+                assert!(reopened.read(offset as u64, proof.proof()).is_ok());
+            }
+            drop(reopened);
+            assert_eq!(
+                CaptureFile::open(&dir.0, INCARNATION)
+                    .unwrap()
+                    .progress()
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn durable_afterimages_repair_torn_commit_and_reuse_slots() {
+    for kind in [COMMIT, REUSE] {
+        let dir = Temp::new();
+        let (mut capture, target) = filled(&dir.0, Suite::Blake3Bao64, &[7; 17]);
+        capture.checkpoint().unwrap();
+        capture.select(target.object_id()).unwrap();
+        capture.fault = Some(Boundary::JournalAppended(kind));
+        let result = if kind == COMMIT {
+            accept(&mut capture, &target, &[7; 17], 0)
+        } else {
+            capture.reuse(0, &[])
+        };
+        assert!(result.is_err());
+        assert!(capture.progress().is_err());
+        capture.table.file.set_len(91).unwrap();
+        capture.table.file.write_all_at(&[0xff; 19], 8).unwrap();
+        drop(capture);
+        let capture = CaptureFile::open(&dir.0, INCARNATION).unwrap();
+        assert_eq!(capture.progress().unwrap().covered_bytes, 17);
+        assert_eq!(capture.progress().unwrap().cached_groups, 1);
+    }
+}
+
+#[test]
+fn metadata_flush_precedes_compaction_and_failed_flush_preserves_redo() {
+    for fault in [Boundary::BeforeMetadataSync, Boundary::MetadataSynced] {
+        let dir = Temp::new();
+        let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &[7; 17]);
+        let expected = capture.progress().unwrap();
+        let journal = fs::read(dir.0.join("capture.journal")).unwrap();
+        capture.trace.clear();
+        capture.fault = Some(fault);
+        assert!(capture.checkpoint().is_err());
+        assert!(capture.progress().is_err());
+        assert_eq!(fs::read(dir.0.join("capture.journal")).unwrap(), journal);
+        drop(capture);
+        let mut reopened = CaptureFile::open(&dir.0, INCARNATION).unwrap();
+        assert_eq!(reopened.progress().unwrap(), expected);
+        reopened.trace.clear();
+        reopened.checkpoint().unwrap();
+        assert_eq!(
+            reopened.trace,
+            [Boundary::BeforeMetadataSync, Boundary::MetadataSynced]
+        );
+        let replay = vot_journal::replay(&dir.0.join("capture.journal"), INCARNATION).unwrap();
+        assert_eq!(replay.records.len(), 1);
+        assert_eq!(replay.records[0].payload.len(), 122);
+    }
+}
+
+#[test]
+fn metadata_identity_corruption_and_reserved_names_are_refused() {
+    for action in [0, 1, 2, 3] {
+        let dir = Temp::new();
+        let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &[7; 17]);
+        capture.checkpoint().unwrap();
+        let path = dir.0.join("capture.groups");
+        match action {
+            0 => {
+                fs::rename(&path, dir.0.join("old-groups")).unwrap();
+                fs::write(&path, []).unwrap();
+                assert!(capture.progress().is_err());
+            }
+            1 => {
+                fs::hard_link(&path, dir.0.join("alias")).unwrap();
+                assert!(capture.progress().is_err());
+            }
+            2 => {
+                capture.table.file.write_all_at(&[19], 32).unwrap();
+            }
+            _ => {
+                capture.table.file.set_len(95).unwrap();
+            }
+        }
+        drop(capture);
+        assert!(CaptureFile::open(&dir.0, INCARNATION).is_err());
+    }
+    let dir = Temp::new();
+    fs::write(dir.0.join("capture.groups"), b"unrelated").unwrap();
+    let target = object(Suite::Blake3Bao64, &[7; 17]);
+    assert!(CaptureFile::create(&dir.0, INCARNATION, target.object_id(), 1).is_err());
+    assert_eq!(
+        fs::read(dir.0.join("capture.groups")).unwrap(),
+        b"unrelated"
+    );
+    assert!(!dir.0.join("capture.data").exists());
+}
+
+#[test]
+fn interrupted_tail_clear_is_repaired_from_the_durable_selection() {
+    let dir = Temp::new();
+    let bytes = vec![7; 2 * G];
+    let (mut capture, _) = filled(&dir.0, Suite::Blake3Bao64, &bytes);
+    capture.checkpoint().unwrap();
+    let before = fs::read(dir.0.join("capture.groups")).unwrap();
+    let short = object(Suite::Blake3Bao64, &bytes[..G + 17]);
+    let expected = capture.select(short.object_id()).unwrap();
+    capture.table.file.write_all_at(&before[96..], 96).unwrap();
+    capture.table.file.write_all_at(&[0; 16], 96).unwrap();
+    drop(capture);
+    let recovered = CaptureFile::open(&dir.0, INCARNATION).unwrap();
+    assert_eq!(recovered.progress().unwrap(), expected);
 }

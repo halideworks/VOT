@@ -1,0 +1,199 @@
+{
+  "baseline_commit": "84a24029f2c64a2851ece58cb79b85d04032fd80",
+  "candidate": "ADR-0060 paged capture metadata",
+  "rust": "1.97.1 release",
+  "host": {
+    "os": "Linux 6.8.0-138-generic",
+    "cpu": "Intel Core i5-13500",
+    "filesystem": "ZFS"
+  },
+  "method": "GNU time maximum resident set size; one warm recovery then five measured processes. Preparation uses the same example against each revision, adapting only the baseline usize group-count arguments. Compaction separates group storage memory from journal replay. Zero-filled authenticated payloads, one 64 KiB preparation buffer.",
+  "results": [
+    {
+      "case": "before_512mib",
+      "phase": "journal",
+      "groups": 8192,
+      "payload_bytes": 536870912,
+      "journal_bytes": 1409176,
+      "samples": [
+        {
+          "peak_rss_kib": 5280,
+          "elapsed_seconds": 0.18
+        },
+        {
+          "peak_rss_kib": 5452,
+          "elapsed_seconds": 0.18
+        },
+        {
+          "peak_rss_kib": 5420,
+          "elapsed_seconds": 0.18
+        },
+        {
+          "peak_rss_kib": 5284,
+          "elapsed_seconds": 0.18
+        },
+        {
+          "peak_rss_kib": 5296,
+          "elapsed_seconds": 0.17
+        }
+      ],
+      "median_peak_rss_kib": 5296,
+      "median_elapsed_seconds": 0.18
+    },
+    {
+      "case": "before_512mib",
+      "phase": "compacted",
+      "groups": 8192,
+      "payload_bytes": 536870912,
+      "journal_bytes": 721048,
+      "samples": [
+        {
+          "peak_rss_kib": 4244,
+          "elapsed_seconds": 0.17
+        },
+        {
+          "peak_rss_kib": 4432,
+          "elapsed_seconds": 0.17
+        },
+        {
+          "peak_rss_kib": 4320,
+          "elapsed_seconds": 0.17
+        },
+        {
+          "peak_rss_kib": 4188,
+          "elapsed_seconds": 0.17
+        },
+        {
+          "peak_rss_kib": 4320,
+          "elapsed_seconds": 0.2
+        }
+      ],
+      "median_peak_rss_kib": 4320,
+      "median_elapsed_seconds": 0.17
+    },
+    {
+      "case": "after_512mib",
+      "phase": "journal",
+      "groups": 8192,
+      "payload_bytes": 536870912,
+      "journal_bytes": 1409184,
+      "samples": [
+        {
+          "peak_rss_kib": 4960,
+          "elapsed_seconds": 0.31
+        },
+        {
+          "peak_rss_kib": 5120,
+          "elapsed_seconds": 0.28
+        },
+        {
+          "peak_rss_kib": 5120,
+          "elapsed_seconds": 0.89
+        },
+        {
+          "peak_rss_kib": 5120,
+          "elapsed_seconds": 0.28
+        },
+        {
+          "peak_rss_kib": 5120,
+          "elapsed_seconds": 0.35
+        }
+      ],
+      "median_peak_rss_kib": 5120,
+      "median_elapsed_seconds": 0.31
+    },
+    {
+      "case": "after_512mib",
+      "phase": "compacted",
+      "groups": 8192,
+      "payload_bytes": 536870912,
+      "journal_bytes": 160,
+      "samples": [
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.22
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.22
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.25
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.23
+        },
+        {
+          "peak_rss_kib": 2080,
+          "elapsed_seconds": 0.22
+        }
+      ],
+      "median_peak_rss_kib": 2240,
+      "median_elapsed_seconds": 0.22
+    },
+    {
+      "case": "after_2gib",
+      "phase": "journal",
+      "groups": 32768,
+      "payload_bytes": 2147483648,
+      "journal_bytes": 5636256,
+      "samples": [
+        {
+          "peak_rss_kib": 15040,
+          "elapsed_seconds": 1.1
+        },
+        {
+          "peak_rss_kib": 15040,
+          "elapsed_seconds": 2.12
+        },
+        {
+          "peak_rss_kib": 15040,
+          "elapsed_seconds": 1.09
+        },
+        {
+          "peak_rss_kib": 15040,
+          "elapsed_seconds": 1.14
+        },
+        {
+          "peak_rss_kib": 14880,
+          "elapsed_seconds": 1.13
+        }
+      ],
+      "median_peak_rss_kib": 15040,
+      "median_elapsed_seconds": 1.13
+    },
+    {
+      "case": "after_2gib",
+      "phase": "compacted",
+      "groups": 32768,
+      "payload_bytes": 2147483648,
+      "journal_bytes": 160,
+      "samples": [
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.88
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.88
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.86
+        },
+        {
+          "peak_rss_kib": 2080,
+          "elapsed_seconds": 0.87
+        },
+        {
+          "peak_rss_kib": 2240,
+          "elapsed_seconds": 0.96
+        }
+      ],
+      "median_peak_rss_kib": 2240,
+      "median_elapsed_seconds": 0.88
+    }
+  ]
+}

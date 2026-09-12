@@ -71,14 +71,15 @@ The mounted cases fail on missing or unqualified storage; they do not skip.
 
 For separately generated large fixtures, the component harness admits and parks
 every file, verifies ranges, resumes large files halfway, and asserts publication
-preserves inode identity (and allocated blocks on local storage):
+preserves device and inode identity:
 
 ```sh
 cargo +1.97.1 run --release -p vot-sdk-file --example receive_directory -- /test/source /mnt/nfs/new-destination nas balanced
 ```
 
 Use a fresh destination. Keep fixture source and receive capacity separate.
-Independently hash all outputs after the timed run. Measure NAS allocation on
+Independently hash all outputs after the timed run. Allocated block counts can
+change as buffered writes are flushed. Measure NAS allocation on
 the server; CIFS client block counts can be cached or synthetic. This harness includes sender
 preparation and storage publication, but does not measure network transport.
 See [ADR-0054](../adr/0054-direct-receiving-on-shared-storage.md).

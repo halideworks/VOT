@@ -207,3 +207,21 @@ cargo +1.97.1 test --locked --offline -p vot-resume-core --example capture_overw
 test tests::lost_acknowledgment_can_query_the_completed_operation ... FAILED
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 ```
+
+## Completion refuses a previous operation
+
+File: `crates/vot-resume-core/examples/capture_overwrite.rs`.
+
+```diff
+-self.record.sequence == 1 && self.record.coverage == all_units()
++self.record.coverage == all_units()
+```
+
+```sh
+cargo +1.97.1 test --locked --offline -p vot-resume-core --example capture_overwrite tests::lost_acknowledgment_can_query_the_completed_operation -- --exact
+```
+
+```text
+test tests::lost_acknowledgment_can_query_the_completed_operation ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+```

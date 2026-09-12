@@ -202,6 +202,7 @@ mod tests {
     #[test]
     fn lost_acknowledgment_can_query_the_completed_operation() {
         let mut store = Store::new();
+        assert!(store.crashes().iter().all(|state| !state.complete()));
         for step in &STEPS[..STEPS.len() - 1] {
             store.step(*step);
         }

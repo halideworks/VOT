@@ -44,7 +44,9 @@ or path-based copy fallback is introduced.
 
 NTFS's volume serial number and 64-bit file index fit the existing `VOTCAP02`
 binding fields. Link counts and identities still gate capture admission and
-operations. No format bump or compatibility reader is needed.
+operations. Read sharing can permit a new hard-link alias; the alias cannot open
+a second writer, and the changed link count refuses further capture use and
+recovery until the alias is removed. No format bump or compatibility reader is needed.
 
 ## Resource boundary
 

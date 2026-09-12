@@ -173,7 +173,7 @@ impl FileLocation {
         )
     }
 
-    /// Creates a capture file while excluding other writers and namespace mutation.
+    /// Creates a capture file while excluding other writers, renames, and deletion.
     ///
     /// # Errors
     /// Refuses an existing name or a failed sparse-file setup.
@@ -186,7 +186,7 @@ impl FileLocation {
         Ok(file)
     }
 
-    /// Opens a capture file while excluding other writers and namespace mutation.
+    /// Opens a capture file while excluding other writers, renames, and deletion.
     ///
     /// # Errors
     /// Propagates native open errors.

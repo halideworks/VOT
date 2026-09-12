@@ -799,13 +799,8 @@ fn metadata_identity_corruption_and_reserved_names_are_refused() {
         capture.checkpoint().unwrap();
         let path = dir.0.join("capture.groups");
         #[cfg(windows)]
-        if action < 2 {
-            let result = if action == 0 {
-                fs::rename(&path, dir.0.join("old-groups"))
-            } else {
-                fs::hard_link(&path, dir.0.join("alias"))
-            };
-            assert!(result.is_err());
+        if action == 0 {
+            assert!(fs::rename(&path, dir.0.join("old-groups")).is_err());
             capture.progress().unwrap();
             drop(capture);
             CaptureFile::open(&dir.0, INCARNATION).unwrap();
@@ -883,9 +878,11 @@ fn windows_writer_exclusion_survives_compaction_and_rejects_existing_aliases() {
         }
         capture.progress().unwrap();
     }
-    drop(capture);
     let alias = dir.0.join("alias");
     fs::hard_link(dir.0.join("capture.data"), &alias).unwrap();
+    assert!(fs::OpenOptions::new().write(true).open(&alias).is_err());
+    assert!(capture.progress().is_err());
+    drop(capture);
     assert!(CaptureFile::open(&dir.0, INCARNATION).is_err());
     fs::remove_file(alias).unwrap();
     assert!(CaptureFile::open(&dir.0, [0; 16]).is_err());

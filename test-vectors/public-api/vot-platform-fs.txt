@@ -5,6 +5,7 @@ function vot_platform_fs::create_staging_file
 function vot_platform_fs::guard_staging_file
 function vot_platform_fs::is_smb_or_nfs
 function vot_platform_fs::link_file_handle
+function vot_platform_fs::next_file_data_offset
 function vot_platform_fs::remove_file_handle
 function vot_platform_fs::same_file_handle
 function vot_platform_fs::same_file_regular

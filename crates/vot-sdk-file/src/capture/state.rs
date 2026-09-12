@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use super::{Error, ErrorKind, GROUP, MAX_CAPTURE_GROUPS, ObjectId, Suite, invalid};
 
 pub(super) const SNAPSHOT: u8 = 1;
@@ -7,8 +5,8 @@ pub(super) const SELECT: u8 = 2;
 pub(super) const INVALIDATE: u8 = 3;
 pub(super) const COMMIT: u8 = 4;
 pub(super) const REUSE: u8 = 5;
-const MAGIC: &[u8; 8] = b"VOTCAP01";
-const GROUP_BYTES: usize = 88;
+const MAGIC: &[u8; 8] = b"VOTCAP02";
+pub(super) const GROUP_BYTES: usize = 88;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Group {
@@ -91,7 +89,7 @@ impl Group {
         bytes
     }
 
-    fn decode(bytes: &mut &[u8]) -> Result<Self, Error> {
+    pub fn decode(bytes: &mut &[u8]) -> Result<Self, Error> {
         Ok(Self {
             offset: u64::from_le_bytes(take(bytes)?),
             length: u64::from_le_bytes(take(bytes)?),
@@ -101,7 +99,7 @@ impl Group {
         })
     }
 
-    fn validate(&self, state: &State) -> Result<(), Error> {
+    pub fn validate(&self, state: &State) -> Result<(), Error> {
         let maximum = group_length(state.object.length, self.offset)?;
         if self.length == 0
             || self.length > maximum
@@ -115,18 +113,22 @@ impl Group {
     }
 }
 
+pub(super) enum Effect {
+    Select,
+    Store { offset: u64, group: Option<Group> },
+}
+
 pub(super) struct State {
-    pub binding: [u64; 4],
-    pub limit: usize,
+    pub binding: [u64; 6],
+    pub limit: u64,
     pub object: ObjectId,
     pub generation: u64,
     pub sequence: u64,
-    pub groups: BTreeMap<u64, Group>,
     pending: Option<u64>,
 }
 
 impl State {
-    pub fn new(binding: [u64; 4], limit: usize, object: ObjectId) -> Result<Self, Error> {
+    pub fn new(binding: [u64; 6], limit: u64, object: ObjectId) -> Result<Self, Error> {
         validate_object(&object)?;
         if limit == 0 || limit > MAX_CAPTURE_GROUPS {
             return Err(invalid());
@@ -137,7 +139,6 @@ impl State {
             object,
             generation: 0,
             sequence: 0,
-            groups: BTreeMap::new(),
             pending: None,
         })
     }
@@ -147,14 +148,10 @@ impl State {
         for value in self.binding {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        bytes.extend_from_slice(&(self.limit as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.limit.to_le_bytes());
         bytes.extend_from_slice(&encode_object(&self.object));
         bytes.extend_from_slice(&self.generation.to_le_bytes());
         bytes.extend_from_slice(&self.pending.unwrap_or(u64::MAX).to_le_bytes());
-        bytes.extend_from_slice(&(self.groups.len() as u64).to_le_bytes());
-        for group in self.groups.values() {
-            bytes.extend_from_slice(&group.encode());
-        }
         bytes
     }
 
@@ -166,12 +163,11 @@ impl State {
         if take::<8>(&mut bytes)? != *MAGIC {
             return Err(invalid());
         }
-        let mut binding = [0; 4];
+        let mut binding = [0; 6];
         for value in &mut binding {
             *value = u64::from_le_bytes(take(&mut bytes)?);
         }
-        let limit =
-            usize::try_from(u64::from_le_bytes(take(&mut bytes)?)).map_err(|_| invalid())?;
+        let limit = u64::from_le_bytes(take(&mut bytes)?);
         let object = decode_object(&mut bytes)?;
         let mut state = Self::new(binding, limit, object)?;
         state.sequence = record.sequence;
@@ -184,86 +180,55 @@ impl State {
             group_length(state.object.length, pending)?;
             state.pending = Some(pending);
         }
-        let count =
-            usize::try_from(u64::from_le_bytes(take(&mut bytes)?)).map_err(|_| invalid())?;
-        if count > state.limit || bytes.len() != count * GROUP_BYTES {
-            return Err(invalid());
-        }
-        for _ in 0..count {
-            let group = Group::decode(&mut bytes)?;
-            group.validate(&state)?;
-            if state.pending == Some(group.offset)
-                || state.groups.insert(group.offset, group).is_some()
-            {
-                return Err(invalid());
-            }
-        }
+        exhausted(bytes)?;
         Ok(state)
     }
 
-    pub fn apply(&mut self, sequence: u64, kind: u8, mut payload: &[u8]) -> Result<(), Error> {
+    pub fn apply(&mut self, sequence: u64, kind: u8, mut payload: &[u8]) -> Result<Effect, Error> {
         if self.sequence.checked_add(1) != Some(sequence) {
             return Err(invalid());
         }
-        match kind {
+        let effect = match kind {
             SELECT => {
                 let object = decode_object(&mut payload)?;
                 exhausted(payload)?;
                 if object.suite != self.object.suite {
                     return Err(invalid());
                 }
-                drop(self.groups.split_off(&object.length));
-                if let Some((&offset, group)) = self.groups.last_key_value()
-                    && group.length > object.length - offset
-                {
-                    self.groups.remove(&offset);
-                }
                 self.object = object;
                 self.generation = sequence;
                 self.pending = None;
+                Effect::Select
             }
-            INVALIDATE | REUSE => {
+            INVALIDATE => {
                 let offset = u64::from_le_bytes(take(&mut payload)?);
                 exhausted(payload)?;
-                let length = group_length(self.object.length, offset)?;
-                if kind == INVALIDATE {
-                    self.groups.remove(&offset);
-                    self.pending = Some(offset);
-                } else {
-                    let group = self.groups.get_mut(&offset).ok_or_else(invalid)?;
-                    if group.length != length {
-                        return Err(invalid());
-                    }
-                    group.generation = self.generation;
-                    self.pending = None;
+                group_length(self.object.length, offset)?;
+                self.pending = Some(offset);
+                Effect::Store {
+                    offset,
+                    group: None,
                 }
             }
-            COMMIT => {
+            COMMIT | REUSE => {
                 let group = Group::decode(&mut payload)?;
                 exhausted(payload)?;
                 group.validate(self)?;
-                if self.pending != Some(group.offset)
-                    || group.generation != self.generation
-                    || self.groups.len() >= self.limit
+                if group.generation != self.generation
+                    || (kind == COMMIT && self.pending != Some(group.offset))
                 {
                     return Err(invalid());
                 }
-                self.groups.insert(group.offset, group);
                 self.pending = None;
+                Effect::Store {
+                    offset: group.offset,
+                    group: Some(group),
+                }
             }
             _ => return Err(invalid()),
-        }
+        };
         self.sequence = sequence;
-        Ok(())
-    }
-
-    pub fn covered_bytes(&self) -> u64 {
-        // ponytail: progress scans at most 8,192 entries; keep a counter if polling dominates.
-        self.groups
-            .values()
-            .filter(|group| group.generation == self.generation)
-            .map(|group| group.length)
-            .sum()
+        Ok(effect)
     }
 }
 

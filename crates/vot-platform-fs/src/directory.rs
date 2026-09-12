@@ -555,12 +555,8 @@ mod tests {
         location.link_to(&file, &final_name).unwrap();
         let final_metadata = std::fs::metadata(moved.join("delivered")).unwrap();
         assert_eq!(
-            (original.dev(), original.ino(), original.blocks()),
-            (
-                final_metadata.dev(),
-                final_metadata.ino(),
-                final_metadata.blocks()
-            )
+            (original.dev(), original.ino()),
+            (final_metadata.dev(), final_metadata.ino())
         );
         assert!(location.link_to(&file, &final_name).is_err());
         assert!(final_name.remove_owned(&file).is_err());

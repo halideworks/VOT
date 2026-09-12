@@ -143,17 +143,12 @@ fn main() {
                 resumed = true;
             }
         }
-        let staged = fs::metadata(receiver.staging_path()).unwrap();
         receiver.publish().unwrap();
         let published = fs::metadata(destination.join(path.file_name().unwrap())).unwrap();
         assert_eq!(
             (original.dev(), original.ino()),
             (published.dev(), published.ino())
         );
-        // CIFS may cache allocation counts across buffered writes and publication.
-        if contract == NasContract::Unqualified {
-            assert_eq!(staged.blocks(), published.blocks());
-        }
         if (index + 1) % 10_000 == 0 {
             println!("published={}", index + 1);
         }

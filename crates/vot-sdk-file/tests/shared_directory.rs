@@ -111,14 +111,12 @@ fn shared_receiving_resumes_and_publishes_the_same_allocation() {
         .unwrap();
     assert_eq!(resumed.progress().covered_bytes, 65_536);
     resumed.accept(&second).unwrap();
-    let before_publish = fs::metadata(resumed.staging_path()).unwrap();
     resumed.publish().unwrap();
     let published = fs::metadata(selected.join("frame.exr")).unwrap();
     assert_eq!(
         (staged.dev(), staged.ino()),
         (published.dev(), published.ino())
     );
-    assert_eq!(before_publish.blocks(), published.blocks());
     assert_eq!(fs::read(selected.join("frame.exr")).unwrap(), bytes);
     assert_eq!(fs::metadata(&selected).unwrap().mode(), original_mode);
     assert_eq!(

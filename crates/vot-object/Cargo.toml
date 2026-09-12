@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[example]]
+name = "capture_checkpoints"
+test = true
+
 [dependencies]
 vot-manifest = { path = "../vot-manifest" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }

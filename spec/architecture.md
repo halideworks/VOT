@@ -123,16 +123,23 @@ assurance observation.
 
 `vot-sdk-file::capture::CaptureFile` adds bounded mutable disk staging on Unix
 and local NTFS on Windows (ADRs 0059 through 0061). It invalidates coverage
-durably before overwriting bytes, flushes data before recording verified groups,
-and rehashes cached groups on recovery. A new canonical target retires old coverage; unchanged cached groups need fresh proofs
-before reuse. The private directory and serialized writer bind commitments to
-owned storage. ADR-0060 moves group records into a checksummed positional table
-with one 48 KiB metadata page in memory. Complete journal afterimages repair
-metadata writes; compaction flushes the table before discarding redo history.
-Coverage is bounded by the caller's group budget and canonical object length,
-with a separate bounded journal replay allocation. This remains separate from
-immutable file publication. Source lifecycle, producer completion, and live
-capture transport are not implemented; see [capture integration](../docs/capture.md).
+durably before overwriting bytes, flushes data before recording verified
+groups, and rehashes cached groups on recovery. A new canonical target retires
+old coverage; unchanged cached groups need fresh proofs before reuse. The
+private directory and serialized writer bind commitments to owned storage.
+ADR-0060 moves group records into a checksummed positional table with one 48
+KiB metadata page in memory. Complete journal afterimages repair metadata
+writes; compaction flushes the table before discarding redo history. Coverage
+is bounded by the caller's group budget and canonical object length, with a
+separate bounded journal replay allocation. This remains separate from
+immutable file publication.
+
+`CaptureSource` composes that storage with incremental proof preparation
+(ADR-0063). It refreshes dirty source groups, handles length changes and explicit
+handle replacement, and verifies the full source at host-declared completion.
+The host must keep the producer stopped during completion verification; a draft
+root describes captured bytes, not an atomic external-file snapshot. Live capture
+transport is not implemented; see [capture integration](../docs/capture.md).
 
 Relays MAY keep canonical proof sidecars. A sidecar is local supporting data,
 not a mandatory network bootstrap object. Progressive ingest uses authenticated

@@ -1,0 +1,81 @@
+{
+  "adr": "0063",
+  "method": "Three alternating full-hint then incremental-hint runs; 128 MiB BLAKE3 source; 8 header edits; release Rust 1.97.1; Linux ext4 /tmp; unisolated host; no concurrent VOT validation processes; peak RSS from /usr/bin/time includes preparation and finish.",
+  "kernel": "6.8.0-138-generic",
+  "runs": [
+    {
+      "mode": "full",
+      "groups": 2048,
+      "initial_ms": 850.504887,
+      "refresh_ms": 414.75517599999995,
+      "finish_ms": 190.519295,
+      "run": 1,
+      "peak_rss_kib": 2560
+    },
+    {
+      "mode": "incremental",
+      "groups": 2048,
+      "initial_ms": 791.024647,
+      "refresh_ms": 17.929466,
+      "finish_ms": 198.308967,
+      "run": 1,
+      "peak_rss_kib": 2400
+    },
+    {
+      "mode": "full",
+      "groups": 2048,
+      "initial_ms": 814.240505,
+      "refresh_ms": 412.64849100000004,
+      "finish_ms": 200.708745,
+      "run": 2,
+      "peak_rss_kib": 2400
+    },
+    {
+      "mode": "incremental",
+      "groups": 2048,
+      "initial_ms": 799.863788,
+      "refresh_ms": 24.199047999999998,
+      "finish_ms": 185.35209999999998,
+      "run": 2,
+      "peak_rss_kib": 2560
+    },
+    {
+      "mode": "full",
+      "groups": 2048,
+      "initial_ms": 770.842738,
+      "refresh_ms": 397.2302630000001,
+      "finish_ms": 190.81511700000001,
+      "run": 3,
+      "peak_rss_kib": 2720
+    },
+    {
+      "mode": "incremental",
+      "groups": 2048,
+      "initial_ms": 793.277074,
+      "refresh_ms": 20.495935,
+      "finish_ms": 203.50622199999998,
+      "run": 3,
+      "peak_rss_kib": 2560
+    }
+  ],
+  "medians": {
+    "full": {
+      "initial_ms": 814.240505,
+      "refresh_ms": 412.64849100000004,
+      "finish_ms": 190.81511700000001,
+      "peak_rss_kib": 2560
+    },
+    "incremental": {
+      "initial_ms": 793.277074,
+      "refresh_ms": 20.495935,
+      "finish_ms": 198.308967,
+      "peak_rss_kib": 2560
+    }
+  },
+  "limits": [
+    "No network throughput or power-loss qualification.",
+    "Refresh includes metadata scan and durable admission; finish includes one full source verification and durable reuse records.",
+    "Earlier 128 MiB tests on shared ZFS had unstable flush timings; no reliable speedup concluded there."
+  ],
+  "source_sha256_at_measurement": "2d49be7d195e31339911cc91441a18d7b1ef8352f4cce8b2aebdffe4d422dc14"
+}

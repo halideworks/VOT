@@ -11,6 +11,7 @@ vot-commit-model = { path = "../vot-commit-model" }
 vot-sdk = { path = "../vot-sdk" }
 
 [target.'cfg(any(unix, windows))'.dependencies]
+vot-object = { path = "../vot-object" }
 vot-proof-blake3 = { path = "../vot-proof-blake3" }
 vot-proof-sha256 = { path = "../vot-proof-sha256" }
 vot-verifier = { path = "../vot-verifier" }

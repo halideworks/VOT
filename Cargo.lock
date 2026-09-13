@@ -2900,6 +2900,7 @@ dependencies = [
  "vot-commit-posix",
  "vot-commit-strict",
  "vot-journal",
+ "vot-object",
  "vot-platform-fs",
  "vot-proof-blake3",
  "vot-proof-sha256",

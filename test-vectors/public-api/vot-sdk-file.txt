@@ -12,4 +12,5 @@ struct vot_sdk_file::ReceiveDirectory
 struct vot_sdk_file::ResumeState
 struct vot_sdk_file::capture::CaptureFile
 struct vot_sdk_file::capture::CaptureProgress
+struct vot_sdk_file::capture::CaptureSource
 use vot_sdk_file::NasContract <- vot_platform_fs::NasContract

@@ -23,6 +23,8 @@ use state::{
     validate_object,
 };
 
+mod source;
+pub use source::CaptureSource;
 mod state;
 mod table;
 use table::Table;

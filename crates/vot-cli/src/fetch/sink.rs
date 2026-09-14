@@ -583,12 +583,19 @@ pub(super) mod tests {
             state.release = true;
             inner.shared.1.notify_all();
         }
-        writing.join().unwrap().unwrap();
+        // The inner write may complete before discard wins the exclusive
+        // gate, so its final cancellation check may legitimately fail.
+        let _ = writing.join().unwrap();
         discarding.join().unwrap().unwrap();
         assert!(sink.write_at(1, &[2]).is_err());
+        assert_eq!(sink.placed(), 1);
         let state = inner.shared.0.lock().unwrap();
         assert!(state.discarded);
         assert_eq!(state.writes, 1);
+        assert_eq!(
+            state.writes_at_discard, 1,
+            "discard reached the sink before the write completed"
+        );
     }
 
     #[test]
@@ -625,10 +632,13 @@ pub(super) mod tests {
             inner.shared.1.notify_all();
         }
         for writer in writing {
-            writer.join().unwrap().unwrap();
+            // The inner write may complete before discard wins the exclusive
+            // gate, so its final cancellation check may legitimately fail.
+            let _ = writer.join().unwrap();
         }
         discarding.join().unwrap().unwrap();
         assert!(sink.write_at(2, &[3]).is_err());
+        assert_eq!(sink.placed(), 2);
         let state = inner.shared.0.lock().unwrap();
         assert!(state.discarded);
         assert_eq!(state.writes, 2);

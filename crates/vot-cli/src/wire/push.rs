@@ -1183,8 +1183,8 @@ mod tests {
                 let _ = tx.send(slots.admitted().is_ok());
             });
             assert!(
-                !rx.recv_timeout(std::time::Duration::from_millis(50))
-                    .is_ok(),
+                rx.recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
                 "the pool's width already holds"
             );
             drop(driving);

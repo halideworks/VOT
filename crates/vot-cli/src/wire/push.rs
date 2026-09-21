@@ -1155,7 +1155,7 @@ mod tests {
         let mut held: Vec<_> = (0..PRE_AUTH_SESSIONS)
             .map(|i| {
                 slots
-                    .admit_pre_auth(address(i as u8 + 100))
+                    .admit_pre_auth(address(100 + u8::try_from(i).expect("fits u8")))
                     .expect("budget")
             })
             .collect();

@@ -3077,6 +3077,253 @@ mod tests {
         assert!(connecting.join().unwrap().is_ok());
     }
 
+    /// Connects a raw carrier to a live push listener at `at`.
+    fn raw_carrier(at: SocketAddr) -> Transport {
+        let mut client = fetch::client_config().unwrap();
+        apply_datagram_bytes(&mut client).unwrap();
+        Transport::connect(local_for(at).unwrap(), at, Some("localhost"), &client).unwrap()
+    }
+
+    /// Runs an accept loop whose sessions hold their gate slot until
+    /// `holding` clears, and reports through `spawned` how many carriers
+    /// became sessions. Leaked with the test's other serve threads.
+    fn accepting_held(
+        listener: Listener,
+        slots: push::SessionSlots,
+        spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        std::thread::spawn(move || {
+            let _ = push::accept_sessions(&listener, None, &slots, move |_carrier, _pre| {
+                spawned.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                while !holding.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            });
+        });
+    }
+
+    /// Waits for the accept loop to spawn its `count`-th session, so an
+    /// acceptor that never turns fails the test by name instead of hanging.
+    fn wait_spawned(step: &str, spawned: &std::sync::atomic::AtomicUsize, count: usize) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while spawned.load(std::sync::atomic::Ordering::Acquire) < count {
+            assert!(
+                std::time::Instant::now() < until,
+                "{step}: the acceptor never ran {count} sessions"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn carriers_past_the_pre_auth_bound_take_no_thread_and_the_acceptor_keeps_turning() {
+        let (listener, _identity) =
+            push::bind_push_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .unwrap();
+        let at = listener.local_address();
+        // One pre-authentication slot overall, with room per peer: the
+        // budget is its own, separate from the transfer pool it once
+        // starved.
+        let slots = push::SessionSlots::new(1, 2);
+        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        accepting_held(
+            listener,
+            slots,
+            std::sync::Arc::clone(&spawned),
+            std::sync::Arc::clone(&holding),
+        );
+        // A peer that completes its handshake and sends no session takes
+        // the only slot.
+        let holding_carrier = raw_carrier(at);
+        wait_spawned("the held carrier", &spawned, 1);
+        // Carriers behind it find the gate shut, and the gate runs before
+        // the spawn: none of the storm of a refused client's retransmits
+        // becomes a session thread. (A refused carrier is closed
+        // before its handshake completes, so its client learns of the
+        // refusal from its own retransmits, not from a close.)
+        let refused = raw_carrier(at);
+        let next = raw_carrier(at);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a refused carrier took a session thread"
+        );
+        // The held session ends, its slot returns, and the acceptor - which
+        // never stalled behind the shut gate - runs the next carrier.
+        holding.store(true, std::sync::atomic::Ordering::Release);
+        let admitted = raw_carrier(at);
+        wait_spawned("the carrier after the gate reopened", &spawned, 2);
+        drop(holding_carrier);
+        drop(refused);
+        drop(next);
+        drop(admitted);
+    }
+
+    #[test]
+    fn a_peer_past_its_pre_auth_gate_takes_no_thread_even_with_budget_left() {
+        let (listener, _identity) =
+            push::bind_push_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .unwrap();
+        let at = listener.local_address();
+        // Two slots overall, one per peer: the budget has room, but a host
+        // cannot hold it all by opening connections.
+        let slots = push::SessionSlots::new(2, 1);
+        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        accepting_held(
+            listener,
+            slots,
+            std::sync::Arc::clone(&spawned),
+            std::sync::Arc::clone(&holding),
+        );
+        let holding_carrier = raw_carrier(at);
+        wait_spawned("the held carrier", &spawned, 1);
+        let refused = raw_carrier(at);
+        let next = raw_carrier(at);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a carrier past its peer's gate took a session thread"
+        );
+        holding.store(true, std::sync::atomic::Ordering::Release);
+        let admitted = raw_carrier(at);
+        wait_spawned("the carrier after the gate reopened", &spawned, 2);
+        drop(holding_carrier);
+        drop(refused);
+        drop(next);
+        drop(admitted);
+    }
+
+    #[test]
+    fn a_refused_push_capability_closes_at_once_instead_of_looping_to_the_deadline() {
+        use ed25519_dalek::SigningKey;
+
+        let (bundle, built) =
+            crate::harness::built_bundle("refuse-close-push", &[("data.bin", vec![3; 64])]);
+        let issuer = SigningKey::from_bytes(&[73; 32]);
+        let holder_key = SigningKey::from_bytes(&[74; 32]);
+        let token = crate::authz::issue_push(
+            "issuer.example",
+            "receiver.example",
+            &issuer,
+            holder_key.verifying_key().to_bytes(),
+            built.root,
+            built.logical_length,
+            crate::authz::now_seconds().unwrap(),
+            3_600,
+        )
+        .unwrap();
+        let token_path = crate::tests::temporary("refuse-close-token.cbor");
+        std::fs::write(&token_path, token).unwrap();
+        let holder_path = crate::tests::temporary("refuse-close-holder.key");
+        std::fs::write(
+            &holder_path,
+            format!("ed25519-secret:{}", crate::hex_of(&holder_key.to_bytes())),
+        )
+        .unwrap();
+        let holder =
+            crate::load_capability_holder(&token_path, holder_path.to_str().unwrap()).unwrap();
+
+        let (listener, _identity) =
+            push::bind_push_listener("127.0.0.1:0".parse().unwrap(), &Credentials::Ephemeral)
+                .unwrap();
+        let at = listener.local_address();
+        // A receiver whose policy refuses every presentation, under a
+        // deadline far past the bounds this test waits under: the old
+        // behavior held the session to that deadline.
+        let (ended, ending) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = ended.send(push::receive_push_on_bounded_with_timeout(
+                &listener,
+                Some(1),
+                Duration::from_secs(30),
+                |_| None,
+            ));
+        });
+
+        // A raw push presentation: connect, take the challenge, present
+        // the token the receiver is about to refuse.
+        let mut extensions = extensions_from(None).unwrap();
+        extensions.insert(vot_codec::extension_id::PUSH);
+        let mut session = vot_session::Session::client(
+            raw_carrier(at),
+            vot_codec::Settings::default(),
+            extensions,
+            vot_session::Authentication::Presenting,
+        );
+        session.require_extension(vot_codec::extension_id::PUSH);
+        session.require_granted_scope(holder.scope_bytes().unwrap());
+        session.begin().unwrap();
+        while session.pending_presentation().is_none() {
+            let _ = session.poll().unwrap();
+            session.flush().unwrap();
+            vot_transport_api::TransportAdapter::wait_for_event(
+                session.driver(),
+                Duration::from_millis(10),
+            );
+        }
+        let request = {
+            let binding = session.channel_binding().unwrap();
+            let challenge = session.pending_presentation().unwrap();
+            holder.answer(challenge, binding).unwrap()
+        };
+        session.present(request).unwrap();
+
+        // The refusal surfaces the documented way: `poll` gives the caller
+        // a turn at `last_refusal` and the carrier closes under the
+        // refusal's own code, well inside the 30 second deadline the
+        // receiver holds - the session ends instead of riding to it.
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let refusal = loop {
+            if let Some(refusal) = session.last_refusal() {
+                break refusal;
+            }
+            match session.poll() {
+                Err(error) => {
+                    panic!("a refused session ended under {error:?} before its refusal")
+                }
+                Ok(Some(vot_transport_api::Event::Disconnected(_))) => {
+                    panic!("the receiver closed a refused session without answering it")
+                }
+                Ok(_) => {}
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the receiver never answered a refused session"
+            );
+            let _ = session.flush();
+            vot_transport_api::TransportAdapter::wait_for_event(
+                session.driver(),
+                Duration::from_millis(10),
+            );
+        };
+        assert_eq!(
+            refusal.reason,
+            u64::from(vot_codec::error_code::AUTHORIZATION_FAILED),
+            "{refusal:?}"
+        );
+        drop(session);
+        // And the receiver itself is done, not parked until its deadline.
+        let outcome = ending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receiver held a refused session to its deadline");
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHORIZATION_FAILED
+                ))
+            ),
+            "{outcome:?}"
+        );
+        crate::harness::discard(&[&bundle, &token_path, &holder_path]);
+    }
+
     #[test]
     fn push_rail_count_uses_the_whole_supported_range() {
         let missing = Path::new("/vot-missing-push-bundle");
@@ -3395,7 +3642,8 @@ mod tests {
         // Two connections that carry no session: the accept loop takes
         // them and lets them go, as a serve does with a peer that vanishes.
         let accepting = std::thread::spawn(move || {
-            push::accept_sessions(&listener, Some(2), |carrier| {
+            let slots = push::SessionSlots::production();
+            push::accept_sessions(&listener, Some(2), &slots, |carrier, _pre| {
                 let _ = carrier.connected_within(std::time::Duration::from_secs(5));
                 Ok(())
             })

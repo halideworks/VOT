@@ -49,6 +49,48 @@ type ReceivePlans = std::sync::Arc<
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PLAN_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Sessions one accept loop may hold between its handshake and a grant,
+/// bounded separately from the transfer pool so unauthenticated peers can
+/// crowd out nothing that drives. Twice the pool: a full-width fetch joins
+/// its rails under one address while another full transfer runs.
+const PRE_AUTH_SESSIONS: usize = 2 * crate::drive::CONCURRENT_SESSIONS;
+
+/// Pre-authentication sessions one peer may hold at once. A full-width
+/// fetch presents on every rail under one address, so the cap is the pool
+/// itself; one peer still holds only half the pre-auth budget.
+const PRE_AUTH_PER_PEER: usize = crate::drive::CONCURRENT_SESSIONS;
+
+/// The pre-authentication gate and the transfer pool one accept loop
+/// serves, shared with every session it spawns.
+///
+/// A freshly accepted carrier passes [`SessionSlots::admit_pre_auth`] before
+/// its thread is spawned; a carrier refused there is dropped unopened, so a
+/// peer that handshakes and goes silent holds a bounded slot instead of a
+/// thread the pool needs, and the accept loop never stalls. A granted
+/// session releases its pre-auth slot and joins the pool through
+/// [`SessionSlots::admitted`]; the returned guard holds its slot until the
+/// session ends.
+pub(super) struct SessionSlots {
+    pre_auth: usize,
+    per_peer: usize,
+    state: std::sync::Mutex<SlotState>,
+    released: std::sync::Condvar,
+}
+
+/// The gate and pool counts: pre-authentication sessions overall and per
+/// peer address, and the sessions now driving in the pool.
+#[derive(Default)]
+struct SlotState {
+    pending: std::collections::HashMap<std::net::IpAddr, usize>,
+    pending_total: usize,
+    driving: usize,
+}
+
+/// A granted session's pool slot, held until the session ends.
+pub(super) struct AdmittedSession<'a> {
+    slots: &'a SessionSlots,
+}
+
 const fn valid_rail_count(rails: usize) -> bool {
     rails != 0 && rails <= crate::drive::CONCURRENT_SESSIONS
 }
@@ -633,25 +675,128 @@ where
     P: Fn(PushPresentation<'_>) -> Option<PushAdmission> + Sync,
 {
     let plans = ReceivePlans::default();
-    accept_sessions(listener, sessions, |carrier| {
-        receive_one(carrier, &policy, &plans, authentication_timeout).map(|_| ())
+    let slots = SessionSlots::production();
+    accept_sessions(listener, sessions, &slots, |carrier, pre| {
+        receive_one(
+            carrier,
+            &policy,
+            &plans,
+            authentication_timeout,
+            &slots,
+            pre,
+        )
+        .map(|_| ())
     })
 }
 
+/// A freshly accepted carrier's pre-authentication slot, held by its
+/// session thread. Dropped by a session that never reaches its grant, so
+/// refused, timed-out, and vanished sessions all give the slot back.
+pub(super) struct PreAuthSession<'a> {
+    slots: &'a SessionSlots,
+    peer: SocketAddr,
+}
+
+impl Drop for PreAuthSession<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.slots.state.lock() {
+            state.pending_total = state.pending_total.saturating_sub(1);
+            if let Some(held) = state.pending.get_mut(&self.peer.ip()) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    state.pending.remove(&self.peer.ip());
+                }
+            }
+        }
+    }
+}
+
+impl SessionSlots {
+    /// The production budgets.
+    pub(super) fn production() -> Self {
+        Self::new(PRE_AUTH_SESSIONS, PRE_AUTH_PER_PEER)
+    }
+
+    /// Named budgets, so a test can reach the gate in a few carriers.
+    pub(super) fn new(pre_auth: usize, per_peer: usize) -> Self {
+        Self {
+            pre_auth,
+            per_peer,
+            state: std::sync::Mutex::new(SlotState::default()),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Whether a freshly accepted carrier from `peer` may take a
+    /// pre-authentication thread. The gate runs before the spawn, so a
+    /// refused carrier costs no thread and no slot, and one peer cannot
+    /// hold the whole pre-auth budget. The slot travels with the session
+    /// and is released when the session ends or takes its pool slot.
+    pub(super) fn admit_pre_auth(&self, peer: SocketAddr) -> Option<PreAuthSession<'_>> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        let held = state.pending.get(&peer.ip()).copied().unwrap_or(0);
+        if state.pending_total >= self.pre_auth || held >= self.per_peer {
+            return None;
+        }
+        *state.pending.entry(peer.ip()).or_default() += 1;
+        state.pending_total += 1;
+        Some(PreAuthSession { slots: self, peer })
+    }
+
+    /// A granted session: releases its pre-authentication slot and joins
+    /// the transfer pool, waiting while the pool drives its full width.
+    /// Backpressure, not refusal: the session was admitted by the policy.
+    ///
+    /// # Errors
+    /// Reports [`Error::CarrierUnavailable`] when the counts are lost to a
+    /// poisoned lock.
+    pub(super) fn admitted(&self) -> Result<AdmittedSession<'_>, Error> {
+        let mut state = self.state.lock().map_err(|_| Error::CarrierUnavailable)?;
+        while state.driving >= crate::drive::CONCURRENT_SESSIONS {
+            state = self
+                .released
+                .wait(state)
+                .map_err(|_| Error::CarrierUnavailable)?;
+        }
+        state.driving += 1;
+        Ok(AdmittedSession { slots: self })
+    }
+}
+
+impl Drop for AdmittedSession<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.slots.state.lock() {
+            state.driving = state.driving.saturating_sub(1);
+            self.slots.released.notify_all();
+        }
+    }
+}
+
 /// Accepts carriers from a Retry-protected listener and runs `session` on
-/// each in its own thread, at most [`crate::drive::CONCURRENT_SESSIONS`] at
-/// once, until `sessions` are answered or the listener fails. A session's
-/// own failure surfaces only under a bound; an unbounded loop outlives it.
+/// each in its own thread, at most [`crate::drive::CONCURRENT_SESSIONS`]
+/// driving at once through `slots`, until `sessions` are answered or the
+/// listener fails.
+///
+/// Before a thread is spawned the carrier passes the pre-authentication
+/// gate; a carrier refused there is dropped at once, unopened, so a peer
+/// that handshakes and sends no session holds a bounded gate slot rather
+/// than a thread, and the accept loop keeps turning. Each session carries
+/// its [`PreAuthSession`] slot and gives it back when it ends or is
+/// granted. A session's own failure surfaces only under a bound; an
+/// unbounded loop outlives it.
 ///
 /// # Errors
 /// Refuses a listener without Retry with [`Error::InvalidArguments`].
 pub(super) fn accept_sessions<S>(
     listener: &Listener,
     sessions: Option<u32>,
+    slots: &SessionSlots,
     session: S,
 ) -> Result<(), Error>
 where
-    S: Fn(Transport) -> Result<(), Error> + Sync,
+    S: Fn(Transport, PreAuthSession<'_>) -> Result<(), Error> + Sync,
 {
     if !listener.stateless_retry_enabled() {
         return Err(Error::InvalidArguments);
@@ -661,30 +806,35 @@ where
             std::thread::ScopedJoinHandle<'_, Result<(), Error>>,
         > = std::collections::VecDeque::new();
         let mut failed = Ok(());
-        for _ in 0..sessions.unwrap_or(u32::MAX) {
-            while running
-                .len()
-                .checked_sub(crate::drive::CONCURRENT_SESSIONS)
-                .is_some()
+        let mut answered = sessions.unwrap_or(u32::MAX);
+        while answered > 0 {
+            let carrier = listener.accept().map_err(carrier_failure)?;
+            let Some(peer) = carrier.peer_address() else {
+                drop(carrier);
+                continue;
+            };
+            // The gate runs before the spawn: a refused carrier is dropped
+            // unopened, costing no thread and no slot, and the accept loop
+            // keeps turning.
+            let Some(pre) = slots.admit_pre_auth(peer) else {
+                drop(carrier);
+                continue;
+            };
+            answered -= 1;
+            let session = &session;
+            running.push_back(scope.spawn(move || session(carrier, pre)));
+            // Reap only what finished; the accept waits for nothing, since
+            // the gate and the pool bound what the threads hold.
+            while let Some(finished) = running
+                .iter()
+                .position(std::thread::ScopedJoinHandle::is_finished)
             {
-                let finished = loop {
-                    if let Some(finished) = running
-                        .iter()
-                        .position(std::thread::ScopedJoinHandle::is_finished)
-                    {
-                        break finished;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                };
                 let done = running.remove(finished).ok_or(Error::CarrierUnavailable)?;
                 let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
                 if should_record_failure(sessions.is_some(), failed.is_ok()) {
                     failed = result;
                 }
             }
-            let carrier = listener.accept().map_err(carrier_failure)?;
-            let session = &session;
-            running.push_back(scope.spawn(move || session(carrier)));
         }
         while let Some(done) = running.pop_front() {
             let result = done.join().map_err(|_| Error::CarrierUnavailable)?;
@@ -701,6 +851,8 @@ fn receive_one<P>(
     policy: &P,
     plans: &ReceivePlans,
     authentication_timeout: std::time::Duration,
+    slots: &SessionSlots,
+    pre: PreAuthSession<'_>,
 ) -> Result<PackageSummary, Error>
 where
     P: Fn(PushPresentation<'_>) -> Option<PushAdmission>,
@@ -725,6 +877,9 @@ where
     session.require_extension(vot_codec::extension_id::PUSH);
     session.begin()?;
     let authentication_deadline = std::time::Instant::now() + authentication_timeout;
+    // Bound before the loop so the guard the grant takes lives to the
+    // session's end, not the end of the loop body.
+    let _driving;
     let (admission, group, primary, mut primary_plan) = loop {
         if std::time::Instant::now() >= authentication_deadline {
             let _ = session
@@ -750,7 +905,20 @@ where
                     crate::authz::REFUSAL_DETAIL.to_owned(),
                 )?;
                 session.flush()?;
-                continue;
+                // The session's last word is the reject, and the carrier
+                // closes under its code: that closing is what a presenting
+                // peer waits for, so this end gives the driver one pass to
+                // take the reject to the wire before closing, and keeps no
+                // thread for a session it has already answered.
+                session
+                    .driver()
+                    .wait_for_event(std::time::Duration::from_millis(50));
+                let _ = session
+                    .driver()
+                    .close(vot_codec::error_code::AUTHORIZATION_FAILED);
+                return Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHORIZATION_FAILED,
+                ));
             };
             if std::time::Instant::now() >= authentication_deadline {
                 let _ = session
@@ -766,7 +934,20 @@ where
                     crate::authz::REFUSAL_DETAIL.to_owned(),
                 )?;
                 session.flush()?;
-                continue;
+                // The session's last word is the reject, and the carrier
+                // closes under its code: that closing is what a presenting
+                // peer waits for, so this end gives the driver one pass to
+                // take the reject to the wire before closing, and keeps no
+                // thread for a session it has already answered.
+                session
+                    .driver()
+                    .wait_for_event(std::time::Duration::from_millis(50));
+                let _ = session
+                    .driver()
+                    .close(vot_codec::error_code::AUTHORIZATION_FAILED);
+                return Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHORIZATION_FAILED,
+                ));
             }
             let Some(directory) =
                 canonical_push_destination_before(&admission.directory, authentication_deadline)?
@@ -790,7 +971,20 @@ where
                     crate::authz::REFUSAL_DETAIL.to_owned(),
                 )?;
                 session.flush()?;
-                continue;
+                // The session's last word is the reject, and the carrier
+                // closes under its code: that closing is what a presenting
+                // peer waits for, so this end gives the driver one pass to
+                // take the reject to the wire before closing, and keeps no
+                // thread for a session it has already answered.
+                session
+                    .driver()
+                    .wait_for_event(std::time::Duration::from_millis(50));
+                let _ = session
+                    .driver()
+                    .close(vot_codec::error_code::AUTHORIZATION_FAILED);
+                return Err(Error::PeerClosed(
+                    vot_codec::error_code::AUTHORIZATION_FAILED,
+                ));
             };
             let primary_plan = primary.then(|| PrimaryPlan {
                 group: std::sync::Arc::clone(&group),
@@ -801,6 +995,11 @@ where
                     .map_err(|_| Error::InvalidArguments)?,
             )?;
             session.flush()?;
+            // The grant answers the challenge: the pre-authentication slot
+            // goes back to the gate and the session takes its pool slot,
+            // waiting while the pool drives its full width.
+            drop(pre);
+            _driving = slots.admitted()?;
             break (admission, group, primary, primary_plan);
         }
         if let Some(vot_transport_api::Event::Disconnected(_)) = session.poll()? {
@@ -912,6 +1111,187 @@ mod tests {
             index.to_string().into(),
             ([index; 32], u64::from(index.wrapping_add(1))),
         )
+    }
+
+    fn address(octet: u8) -> SocketAddr {
+        format!("127.0.0.{octet}:40000")
+            .parse()
+            .expect("an address")
+    }
+
+    #[test]
+    fn the_pre_auth_gate_bounds_the_budget_and_each_peer() {
+        let slots = SessionSlots::new(2, 1);
+        let here = address(1);
+        let there = address(2);
+        let first = slots.admit_pre_auth(here).expect("the first carrier");
+        // One peer past its cap, with budget still open: refused, so a host
+        // cannot hold the whole pre-auth budget by opening connections.
+        assert!(slots.admit_pre_auth(here).is_none());
+        let second = slots.admit_pre_auth(there).expect("another peer's carrier");
+        // The budget itself, not just the peer, now refuses.
+        assert!(slots.admit_pre_auth(address(3)).is_none());
+        // A grant sends the session's gate slot back and takes a pool slot.
+        drop(second);
+        let driving = slots.admitted().expect("a pool slot");
+        assert!(
+            slots.admit_pre_auth(there).is_some(),
+            "the granted session's gate slot never came back"
+        );
+        // A session that ends ungranted gives its slot back too.
+        drop(first);
+        let third = slots
+            .admit_pre_auth(address(3))
+            .expect("the ended session's gate slot never came back");
+        drop(third);
+        drop(driving);
+    }
+
+    #[test]
+    fn an_admitted_session_takes_a_free_slot_without_waiting() {
+        // Bounded: with the pool empty the grant must resolve at once. A
+        // mutant that inverts the wait condition hangs here instead of
+        // stalling the runner until the mutation timeout.
+        let slots = SessionSlots::production();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = tx.send(slots.admitted().is_ok());
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a free pool slot resolves without waiting"),
+                "the grant took its slot"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_an_admitted_session_frees_the_pool_slot_promptly() {
+        // Bounded: the drop must notify the pool, so a waiting grant
+        // proceeds. A mutant that drops the notification stalls here
+        // instead of stalling the runner until the mutation timeout.
+        let slots = SessionSlots::new(PRE_AUTH_SESSIONS, PRE_AUTH_PER_PEER);
+        let width = crate::drive::CONCURRENT_SESSIONS;
+        let driving: Vec<_> = (0..width)
+            .map(|_| slots.admitted().expect("the pool's width"))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let slots = &slots;
+            scope.spawn(move || {
+                let _ = tx.send(slots.admitted().is_ok());
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "the pool's width already holds"
+            );
+            drop(driving);
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a released slot lets the next grant through"),
+                "the waiting grant took the freed slot"
+            );
+        });
+        drop(slots.admitted().expect("space after the releases"));
+    }
+
+    #[test]
+    fn the_default_gate_uses_the_documented_budgets() {
+        // The budgets the PR names, pinned by literals so the arithmetic
+        // that derives them cannot drift: twice the pool overall (the pool
+        // is eight), the pool per peer.
+        assert_eq!(PRE_AUTH_SESSIONS, 16);
+        assert_eq!(PRE_AUTH_PER_PEER, 8);
+        // Distinct peers so only the overall bound is exercised.
+        let slots = SessionSlots::production();
+        let mut held: Vec<_> = (0..PRE_AUTH_SESSIONS)
+            .map(|i| {
+                slots
+                    .admit_pre_auth(address(100 + u8::try_from(i).expect("fits u8")))
+                    .expect("budget")
+            })
+            .collect();
+        assert!(
+            slots.admit_pre_auth(address(200)).is_none(),
+            "the overall budget is exactly PRE_AUTH_SESSIONS"
+        );
+        // A peer that releases everything leaves no pending entry behind.
+        drop(held.pop().expect("a held slot"));
+        let peer = address(201);
+        let gate = slots.admit_pre_auth(peer).expect("a slot");
+        drop(gate);
+        {
+            let state = slots.state.lock().unwrap();
+            assert!(
+                !state.pending.contains_key(&peer.ip()),
+                "a fully released peer leaves no pending map entry"
+            );
+            assert_eq!(state.pending_total, PRE_AUTH_SESSIONS - 1);
+        }
+        drop(held);
+        assert_eq!(slots.state.lock().unwrap().pending_total, 0);
+        assert!(slots.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn a_granted_session_waits_for_a_pool_slot_and_releases_it_on_end() {
+        let slots = SessionSlots::new(8, 8);
+        let here = address(1);
+        let pool = crate::drive::CONCURRENT_SESSIONS;
+        let deadline = std::time::Duration::from_secs(10);
+        // Every wait is bounded: a mutant that inverts the pool's wait
+        // condition or drops the release notification fails here at the
+        // deadline instead of stalling the mutation runner for its whole
+        // timeout.
+        let take = || -> AdmittedSession<'_> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _ = tx.send(slots.admitted());
+                });
+                rx.recv_timeout(deadline)
+                    .expect("the pool slot resolves within the deadline")
+                    .expect("a pool slot")
+            })
+        };
+        // Drive the pool to its width, each grant giving its gate slot back.
+        let mut driving = Vec::new();
+        for _ in 0..pool {
+            let pre = slots.admit_pre_auth(here).expect("a gate slot");
+            driving.push(take());
+            drop(pre);
+        }
+        let progressing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waited = std::sync::Arc::clone(&progressing);
+        let (took_slot, slot_taken) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let pre = slots.admit_pre_auth(address(2)).expect("a gate slot");
+                let guard = slots.admitted().expect("the freed slot");
+                drop(pre);
+                waited.store(true, std::sync::atomic::Ordering::Release);
+                let _ = took_slot.send(());
+                let _ = release_rx.lock().unwrap().recv();
+                drop(guard);
+            });
+            // The pool is full: the grant waits instead of taking a slot.
+            std::thread::sleep(PLAN_WAIT_POLL);
+            assert!(
+                !progressing.load(std::sync::atomic::Ordering::Acquire),
+                "a grant drove past the pool's width"
+            );
+            drop(driving.pop());
+            slot_taken
+                .recv_timeout(deadline)
+                .expect("the released slot lets the waiting grant through");
+            assert!(progressing.load(std::sync::atomic::Ordering::Acquire));
+            let _ = release_tx.send(());
+        });
+        drop(take());
     }
 
     #[test]

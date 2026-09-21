@@ -114,8 +114,9 @@ pub(super) fn serve_on_bounded_with_timeout<P>(
 where
     P: Fn(ServePresentation<'_>) -> Option<ServeAdmission> + Sync,
 {
-    accept_sessions(listener, sessions, |carrier| {
-        serve_one(carrier, &policy, authentication_timeout)
+    let slots = super::push::SessionSlots::production();
+    accept_sessions(listener, sessions, &slots, |carrier, pre| {
+        serve_one(carrier, &policy, authentication_timeout, &slots, pre)
     })
 }
 
@@ -125,6 +126,8 @@ fn serve_one<P>(
     carrier: super::Transport,
     policy: &P,
     authentication_timeout: std::time::Duration,
+    slots: &super::push::SessionSlots,
+    pre: super::push::PreAuthSession<'_>,
 ) -> Result<(), Error>
 where
     P: Fn(ServePresentation<'_>) -> Option<ServeAdmission>,
@@ -146,6 +149,9 @@ where
     );
     session.begin()?;
     let authentication_deadline = std::time::Instant::now() + authentication_timeout;
+    // Bound before the loop so the guard the grant takes lives to the
+    // session's end, not the end of the loop body.
+    let _driving;
     let admission = loop {
         if std::time::Instant::now() >= authentication_deadline {
             let _ = session
@@ -179,6 +185,10 @@ where
                     crate::authz::REFUSAL_DETAIL.to_owned(),
                 )?;
                 session.flush()?;
+                // The refusing answer stays: a presenting fetch spends its
+                // holder's attempts on it and closes, which this loop hears
+                // as the carrier ending, so the slot turns over without
+                // riding to the deadline.
                 continue;
             };
             if std::time::Instant::now() >= authentication_deadline {
@@ -191,6 +201,11 @@ where
             }
             session.grant(admission.scope.clone())?;
             session.flush()?;
+            // The grant answers the challenge: the pre-authentication slot
+            // goes back to the gate and the session takes its pool slot,
+            // waiting while the pool drives its full width.
+            drop(pre);
+            _driving = slots.admitted()?;
             break admission;
         }
         if let Some(vot_transport_api::Event::Disconnected(_)) = session.poll()? {

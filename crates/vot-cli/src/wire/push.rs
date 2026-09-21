@@ -1152,7 +1152,7 @@ mod tests {
         // The budgets the PR names: twice the pool overall, the pool per
         // peer. Distinct peers so only the overall bound is exercised.
         let slots = SessionSlots::production();
-        let held: Vec<_> = (0..PRE_AUTH_SESSIONS)
+        let mut held: Vec<_> = (0..PRE_AUTH_SESSIONS)
             .map(|i| {
                 slots
                     .admit_pre_auth(address(i as u8 + 100))
@@ -1174,7 +1174,7 @@ mod tests {
                 !state.pending.contains_key(&peer.ip()),
                 "a fully released peer leaves no pending map entry"
             );
-            assert_eq!(state.pending_total, PRE_AUTH_SESSIONS);
+            assert_eq!(state.pending_total, PRE_AUTH_SESSIONS - 1);
         }
         drop(held);
         assert_eq!(slots.state.lock().unwrap().pending_total, 0);

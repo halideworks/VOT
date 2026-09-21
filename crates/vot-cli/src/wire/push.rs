@@ -1148,6 +1148,40 @@ mod tests {
     }
 
     #[test]
+    fn the_default_gate_uses_the_documented_budgets() {
+        // The budgets the PR names: twice the pool overall, the pool per
+        // peer. Distinct peers so only the overall bound is exercised.
+        let slots = SessionSlots::production();
+        let held: Vec<_> = (0..PRE_AUTH_SESSIONS)
+            .map(|i| {
+                slots
+                    .admit_pre_auth(address(i as u8 + 100))
+                    .expect("budget")
+            })
+            .collect();
+        assert!(
+            slots.admit_pre_auth(address(200)).is_none(),
+            "the overall budget is exactly PRE_AUTH_SESSIONS"
+        );
+        // A peer that releases everything leaves no pending entry behind.
+        drop(held.pop().expect("a held slot"));
+        let peer = address(201);
+        let gate = slots.admit_pre_auth(peer).expect("a slot");
+        drop(gate);
+        {
+            let state = slots.state.lock().unwrap();
+            assert!(
+                !state.pending.contains_key(&peer.ip()),
+                "a fully released peer leaves no pending map entry"
+            );
+            assert_eq!(state.pending_total, PRE_AUTH_SESSIONS);
+        }
+        drop(held);
+        assert_eq!(slots.state.lock().unwrap().pending_total, 0);
+        assert!(slots.state.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
     fn a_granted_session_waits_for_a_pool_slot_and_releases_it_on_end() {
         let slots = SessionSlots::new(8, 8);
         let here = address(1);

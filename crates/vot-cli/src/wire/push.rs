@@ -1149,8 +1149,12 @@ mod tests {
 
     #[test]
     fn the_default_gate_uses_the_documented_budgets() {
-        // The budgets the PR names: twice the pool overall, the pool per
-        // peer. Distinct peers so only the overall bound is exercised.
+        // The budgets the PR names, pinned by literals so the arithmetic
+        // that derives them cannot drift: twice the pool overall (the pool
+        // is eight), the pool per peer.
+        assert_eq!(PRE_AUTH_SESSIONS, 16);
+        assert_eq!(PRE_AUTH_PER_PEER, 8);
+        // Distinct peers so only the overall bound is exercised.
         let slots = SessionSlots::production();
         let mut held: Vec<_> = (0..PRE_AUTH_SESSIONS)
             .map(|i| {

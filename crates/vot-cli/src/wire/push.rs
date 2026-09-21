@@ -1148,6 +1148,56 @@ mod tests {
     }
 
     #[test]
+    fn an_admitted_session_takes_a_free_slot_without_waiting() {
+        // Bounded: with the pool empty the grant must resolve at once. A
+        // mutant that inverts the wait condition hangs here instead of
+        // stalling the runner until the mutation timeout.
+        let slots = SessionSlots::production();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = tx.send(slots.admitted().is_ok());
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a free pool slot resolves without waiting"),
+                "the grant took its slot"
+            );
+        });
+    }
+
+    #[test]
+    fn dropping_an_admitted_session_frees_the_pool_slot_promptly() {
+        // Bounded: the drop must notify the pool, so a waiting grant
+        // proceeds. A mutant that drops the notification stalls here
+        // instead of stalling the runner until the mutation timeout.
+        let slots = SessionSlots::new(PRE_AUTH_SESSIONS, PRE_AUTH_PER_PEER);
+        let width = crate::drive::CONCURRENT_SESSIONS;
+        let driving: Vec<_> = (0..width)
+            .map(|_| slots.admitted().expect("the pool's width"))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let slots = &slots;
+            scope.spawn(move || {
+                let _ = tx.send(slots.admitted().is_ok());
+            });
+            assert!(
+                !rx.recv_timeout(std::time::Duration::from_millis(50))
+                    .is_ok(),
+                "the pool's width already holds"
+            );
+            drop(driving);
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a released slot lets the next grant through"),
+                "the waiting grant took the freed slot"
+            );
+        });
+        drop(slots.admitted().expect("space after the releases"));
+    }
+
+    #[test]
     fn the_default_gate_uses_the_documented_budgets() {
         // The budgets the PR names, pinned by literals so the arithmetic
         // that derives them cannot drift: twice the pool overall (the pool

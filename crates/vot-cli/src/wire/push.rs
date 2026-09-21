@@ -1240,22 +1240,43 @@ mod tests {
         let slots = SessionSlots::new(8, 8);
         let here = address(1);
         let pool = crate::drive::CONCURRENT_SESSIONS;
+        let deadline = std::time::Duration::from_secs(10);
+        // Every wait is bounded: a mutant that inverts the pool's wait
+        // condition or drops the release notification fails here at the
+        // deadline instead of stalling the mutation runner for its whole
+        // timeout.
+        let take = || -> AdmittedSession<'_> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _ = tx.send(slots.admitted());
+                });
+                rx.recv_timeout(deadline)
+                    .expect("the pool slot resolves within the deadline")
+                    .expect("a pool slot")
+            })
+        };
         // Drive the pool to its width, each grant giving its gate slot back.
         let mut driving = Vec::new();
         for _ in 0..pool {
             let pre = slots.admit_pre_auth(here).expect("a gate slot");
-            driving.push(slots.admitted().expect("a pool slot"));
+            driving.push(take());
             drop(pre);
         }
         let progressing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waited = std::sync::Arc::clone(&progressing);
+        let (took_slot, slot_taken) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| {
+            scope.spawn(|| {
                 let pre = slots.admit_pre_auth(address(2)).expect("a gate slot");
                 let guard = slots.admitted().expect("the freed slot");
                 drop(pre);
                 waited.store(true, std::sync::atomic::Ordering::Release);
-                guard
+                let _ = took_slot.send(());
+                let _ = release_rx.lock().unwrap().recv();
+                drop(guard);
             });
             // The pool is full: the grant waits instead of taking a slot.
             std::thread::sleep(PLAN_WAIT_POLL);
@@ -1264,10 +1285,13 @@ mod tests {
                 "a grant drove past the pool's width"
             );
             drop(driving.pop());
-            let guard = waiting.join().expect("the waiting grant");
+            slot_taken
+                .recv_timeout(deadline)
+                .expect("the released slot lets the waiting grant through");
             assert!(progressing.load(std::sync::atomic::Ordering::Acquire));
-            drop(guard);
+            let _ = release_tx.send(());
         });
+        drop(take());
     }
 
     #[test]

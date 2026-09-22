@@ -80,6 +80,15 @@ pub fn push_from(_server: &BundleServer, _options: PushOptions) -> Result<Packag
 }
 
 /// Returns [`Error::WireUnsupported`] unconditionally.
+pub fn push_from_with_cancellation(
+    _server: &BundleServer,
+    _options: PushOptions,
+    _cancellation: &crate::CancellationHandle,
+) -> Result<PackageSummary, Error> {
+    Err(Error::WireUnsupported)
+}
+
+/// Returns [`Error::WireUnsupported`] unconditionally.
 pub fn probe_serve(
     _address: SocketAddr,
     _identity: [u8; 32],

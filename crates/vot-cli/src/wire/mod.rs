@@ -25,8 +25,8 @@ pub use fetch::{
     fetch_bundle, fetch_bundle_with, fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve,
 };
 pub use push::{
-    PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from, receive_push,
-    receive_push_on,
+    PushAdmission, PushPresentation, bind_push_listener, push_bundle, push_from,
+    push_from_with_cancellation, receive_push, receive_push_on,
 };
 pub use registration::rendezvous_service;
 pub use relay::relay_service;
@@ -2965,7 +2965,9 @@ mod tests {
             let mut holding =
                 crate::ServeSession::begin_push_session(&opened, session, holding_holder).unwrap();
             assert!(!holding.push_ready());
-            holding.negotiate_push().unwrap();
+            holding
+                .negotiate_push(&crate::CancellationHandle::default())
+                .unwrap();
             assert!(holding.push_ready());
             let (ready, started) = mpsc::channel();
             let attackers: Vec<_> = (1..crate::drive::CONCURRENT_SESSIONS)
@@ -3690,8 +3692,43 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_push_handshake_can_be_cancelled() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = peer.local_addr().unwrap();
+        let carrier = Transport::connect(
+            local_for(address).unwrap(),
+            address,
+            Some("localhost"),
+            &client_config().unwrap(),
+        )
+        .unwrap();
+        let cancellation = crate::CancellationHandle::default();
+        let stop = cancellation.clone();
+        let cancelling = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stop.cancel();
+        });
+        assert!(matches!(
+            fetch::verify_serve_identity_cancellable(&carrier, [0; 32], &cancellation),
+            Err(Error::Cancelled)
+        ));
+        cancelling.join().unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn a_push_from_an_assembled_manifest_reports_what_the_carriers_took() {
+        exercise_assembled_push(false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_assembled_push_can_cancel_after_serving_starts() {
+        exercise_assembled_push(true);
+    }
+
+    #[cfg(unix)]
+    fn exercise_assembled_push(cancel: bool) {
         use ed25519_dalek::SigningKey;
 
         // Nothing under the manifest root but the manifest: the push serves
@@ -3740,6 +3777,17 @@ mod tests {
         let at = listener.local_address();
         let output = crate::tests::temporary("push-from-output");
         let receiver_output = output.to_path_buf();
+        let (release, held) = mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let seams = crate::ReceiveSeams {
+            complete: cancel.then(|| {
+                Arc::new(move |_, _: &crate::ReceiveObject| {
+                    let _ = held.lock().unwrap().recv_timeout(Duration::from_mins(1));
+                    Ok(())
+                }) as crate::fetch::CompletionHook
+            }),
+            ..crate::ReceiveSeams::default()
+        };
         let receiving = std::thread::spawn(move || {
             push::receive_push_on_bounded(&listener, Some(2), |presentation| {
                 requirement
@@ -3752,7 +3800,7 @@ mod tests {
                     .map(|scope| push::PushAdmission {
                         scope,
                         directory: receiver_output.clone(),
-                        seams: crate::ReceiveSeams::default(),
+                        seams: seams.clone(),
                     })
             })
         });
@@ -3779,30 +3827,62 @@ mod tests {
             ));
         }
 
+        let cancelled = crate::CancellationHandle::default();
+        cancelled.cancel();
+        assert!(matches!(
+            push_from_with_cancellation(
+                &server,
+                crate::PushOptions {
+                    address: at,
+                    holder: Arc::clone(&holder),
+                    identity,
+                    rails: 2,
+                    extensions: std::collections::BTreeSet::new(),
+                    progress: None,
+                },
+                &cancelled
+            ),
+            Err(Error::Cancelled)
+        ));
+        let cancellation = crate::CancellationHandle::default();
+        let stop = cancellation.clone();
         let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recording = Arc::clone(&heard);
         let observer: crate::Progress = Box::new(move |bytes, total| {
             assert_eq!(total, None, "a push claimed to know its total");
             recording.lock().unwrap().push(bytes);
+            if cancel {
+                stop.cancel();
+            }
         });
         let server = Arc::new(server);
         let pushing_server = Arc::clone(&server);
-        let pushed = within("the push from an assembled server", 60, move || {
-            push_from(
-                &pushing_server,
-                crate::PushOptions {
-                    address: at,
-                    holder,
-                    identity,
-                    rails: 2,
-                    extensions: std::collections::BTreeSet::new(),
-                    progress: Some((256 * 1024, observer)),
-                },
-            )
-        })
-        .expect("a push");
-        assert_eq!(pushed, built);
-        joined("the receiving thread", receiving).expect("received");
+        let pushed = within(
+            "the push from an assembled server",
+            if cancel { 10 } else { 60 },
+            move || {
+                push_from_with_cancellation(
+                    &pushing_server,
+                    crate::PushOptions {
+                        address: at,
+                        holder,
+                        identity,
+                        rails: 2,
+                        extensions: std::collections::BTreeSet::new(),
+                        progress: Some((1, observer)),
+                    },
+                    &cancellation,
+                )
+            },
+        );
+        drop(release);
+        let received = joined("the receiving thread", receiving);
+        if cancel {
+            assert!(matches!(pushed, Err(Error::Cancelled)), "{pushed:?}");
+        } else {
+            assert_eq!(pushed.expect("a push"), built);
+            received.expect("received");
+        }
 
         let heard = heard.lock().unwrap();
         assert!(
@@ -3813,13 +3893,15 @@ mod tests {
         // not a property; the order and the end are.
         assert!(!heard.is_empty(), "no progress was reported");
         let last = *heard.last().expect("a final report");
-        assert!(
-            last >= built.logical_length,
-            "the carriers took {last} bytes for {} of object",
-            built.logical_length
-        );
-        // The receiver holds a bundle it can scan: the same package.
-        assert_eq!(crate::scan_manifest(&output).unwrap(), built);
+        if !cancel {
+            assert!(
+                last >= built.logical_length,
+                "the carriers took {last} bytes for {} of object",
+                built.logical_length
+            );
+            // The receiver holds a bundle it can scan: the same package.
+            assert_eq!(crate::scan_manifest(&output).unwrap(), built);
+        }
         crate::harness::discard(&[&source, &manifest_root, &output]);
     }
 

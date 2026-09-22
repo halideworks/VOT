@@ -564,9 +564,13 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
 
     /// Completes push authentication before any rail begins serving data.
     #[cfg(feature = "wire")]
-    pub(crate) fn negotiate_push(&mut self) -> Result<(), Error> {
+    pub(crate) fn negotiate_push(
+        &mut self,
+        cancellation: &crate::CancellationHandle,
+    ) -> Result<(), Error> {
         let began = Instant::now();
         while !self.session.is_ready() {
+            cancellation.check()?;
             self.present_capability()?;
             if let Some(vot_transport_api::Event::Disconnected(_)) = self.session.poll()? {
                 return Err(Error::CarrierUnavailable);

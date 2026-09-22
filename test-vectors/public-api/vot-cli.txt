@@ -41,6 +41,7 @@ function vot_cli::proof_cache::read
 function vot_cli::proof_cache::write
 function vot_cli::push_bundle
 function vot_cli::push_from
+function vot_cli::push_from_with_cancellation
 function vot_cli::receive_bundle
 function vot_cli::receive_push
 function vot_cli::receive_push_on

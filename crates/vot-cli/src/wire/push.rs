@@ -1,6 +1,6 @@
 //! Push and receive-push over a live socket.
 
-use super::fetch::{client_config, verify_serve_identity};
+use super::fetch::client_config;
 use super::serve::identity_digest;
 use super::{
     Config, Credentials, DATAGRAM_FEC, Error, Listener, PackageSummary, Path, SocketAddr,
@@ -408,6 +408,18 @@ pub fn push_from(
     server: &crate::BundleServer,
     options: crate::PushOptions,
 ) -> Result<PackageSummary, Error> {
+    push_from_with_cancellation(server, options, &crate::CancellationHandle::default())
+}
+
+/// Pushes from an assembled server, polling cancellation during negotiation and serving.
+///
+/// # Errors
+/// As [`push_from`], or [`Error::Cancelled`] when cancellation is requested.
+pub fn push_from_with_cancellation(
+    server: &crate::BundleServer,
+    options: crate::PushOptions,
+    cancellation: &crate::CancellationHandle,
+) -> Result<PackageSummary, Error> {
     let crate::PushOptions {
         address,
         holder,
@@ -433,6 +445,7 @@ pub fn push_from(
     std::thread::scope(|scope| {
         let mut sessions = Vec::with_capacity(rails);
         for _ in 0..rails {
+            cancellation.check()?;
             let holder = std::sync::Arc::clone(&holder);
             let carrier = Transport::connect(
                 super::local_for(address)?,
@@ -441,7 +454,7 @@ pub fn push_from(
                 &config,
             )
             .map_err(carrier_failure)?;
-            verify_serve_identity(&carrier, Some(identity))?;
+            super::fetch::verify_serve_identity_cancellable(&carrier, identity, cancellation)?;
             let session = vot_session::Session::client(
                 carrier,
                 vot_codec::Settings::default(),
@@ -449,7 +462,7 @@ pub fn push_from(
                 vot_session::Authentication::Presenting,
             );
             let mut pushing = crate::ServeSession::begin_push_session(server, session, holder)?;
-            pushing.negotiate_push()?;
+            pushing.negotiate_push(cancellation)?;
             sessions.push(pushing);
         }
         let mut running = Vec::with_capacity(rails);
@@ -460,9 +473,10 @@ pub fn push_from(
                     if let Some(progress) = progress {
                         progress.taken(rail, session.served_bytes());
                     }
-                    false
-                })?
-                .ok_or(Error::Stalled)?;
+                    cancellation.is_cancelled()
+                });
+                cancellation.check()?;
+                let status = status?.ok_or(Error::Stalled)?;
                 if let Some(progress) = progress {
                     progress.taken(rail, pushing.served_bytes());
                 }
@@ -475,14 +489,30 @@ pub fn push_from(
                 }
             }));
         }
-        for rail in running {
-            rail.join().map_err(|_| Error::CarrierUnavailable)??;
-        }
+        join_push_rails(running, cancellation)?;
         if let Some(progress) = &progress {
             progress.finish();
         }
         Ok(server.package())
     })
+}
+
+fn join_push_rails(
+    rails: Vec<std::thread::ScopedJoinHandle<'_, Result<(), Error>>>,
+    cancellation: &crate::CancellationHandle,
+) -> Result<(), Error> {
+    let mut result = Ok(());
+    for rail in rails {
+        let outcome = rail
+            .join()
+            .map_err(|_| Error::CarrierUnavailable)
+            .and_then(std::convert::identity);
+        if result.is_ok() {
+            result = outcome;
+        }
+    }
+    cancellation.check()?;
+    result
 }
 
 /// Sums what every rail's carrier has taken and hands the observer the sum
@@ -1117,6 +1147,36 @@ mod tests {
         format!("127.0.0.{octet}:40000")
             .parse()
             .expect("an address")
+    }
+
+    #[test]
+    fn cancellation_wins_over_an_earlier_rail_error_after_all_rails_join() {
+        for cancel in [false, true] {
+            let cancellation = crate::CancellationHandle::default();
+            let result = std::thread::scope(|scope| {
+                let (failed, failure) = std::sync::mpsc::channel();
+                let first = scope.spawn(move || {
+                    failed.send(()).unwrap();
+                    Err(Error::CarrierUnavailable)
+                });
+                let stop = &cancellation;
+                let second = scope.spawn(move || {
+                    failure
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                    if cancel {
+                        stop.cancel();
+                    }
+                    Ok(())
+                });
+                join_push_rails(vec![first, second], &cancellation)
+            });
+            if cancel {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::CarrierUnavailable)));
+            }
+        }
     }
 
     #[test]

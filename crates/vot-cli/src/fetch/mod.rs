@@ -106,6 +106,15 @@ impl CancellationHandle {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    #[cfg(feature = "wire")]
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        if self.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub type ManifestHook = Arc<

@@ -29,6 +29,21 @@ pub(crate) fn verify_serve_identity(
     }
 }
 
+pub(crate) fn verify_serve_identity_cancellable(
+    carrier: &Transport,
+    pin: [u8; 32],
+    cancellation: &crate::CancellationHandle,
+) -> Result<(), Error> {
+    for _ in 0..200 {
+        cancellation.check()?;
+        if carrier.connected_within(std::time::Duration::from_millis(50)) {
+            cancellation.check()?;
+            return certified_within(carrier, pin, std::time::Duration::ZERO);
+        }
+    }
+    Err(Error::CarrierUnavailable)
+}
+
 fn certified_within(
     carrier: &Transport,
     pin: [u8; 32],

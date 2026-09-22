@@ -68,7 +68,8 @@ pub use fetch::{
 #[cfg(not(feature = "wire"))]
 pub use nowire::{
     fetch_bundle, fetch_bundle_with, fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve,
-    push_bundle, push_from, receive_push, relay_service, rendezvous_service, serve_bundle,
+    push_bundle, push_from, push_from_with_cancellation, receive_push, relay_service,
+    rendezvous_service, serve_bundle,
 };
 pub use serve::{BundleServer, ServeConnection, ServeStatus, ServedSource};
 #[cfg(feature = "wire")]
@@ -76,7 +77,8 @@ pub use wire::{
     Listener, PushAdmission, PushPresentation, ServeAdmission, ServePresentation, ServeReport,
     bind_push_listener, bind_serve_listener, fetch_bundle, fetch_bundle_with,
     fetch_bundle_with_seams, fetch_via_rendezvous, probe_serve, push_bundle, push_from,
-    receive_push, receive_push_on, relay_service, rendezvous_service, serve_bundle, serve_on,
+    push_from_with_cancellation, receive_push, receive_push_on, relay_service, rendezvous_service,
+    serve_bundle, serve_on,
 };
 
 mod keys;
@@ -115,6 +117,8 @@ pub enum Error {
     WireUnsupported,
     /// A session where nothing happened for as long as this end will wait.
     Stalled,
+    /// The caller requested cancellation of an active transfer.
+    Cancelled,
     /// A carrier that would not bind or connect.
     CarrierUnavailable,
     /// A capability session whose carrier cannot bind possession to its channel.

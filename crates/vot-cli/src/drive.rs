@@ -439,6 +439,7 @@ pub struct ServeSession<'server, A: TransportAdapter> {
     connection: crate::ServeConnection,
     requirement: Option<&'server crate::authz::Requirement>,
     holder: Option<std::sync::Arc<crate::authz::Holder>>,
+    access: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
 /// Whether a receiver's `GOAWAY` cursor acknowledges every transfer object.
@@ -489,6 +490,7 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
             connection: crate::ServeConnection::new(),
             requirement,
             holder: None,
+            access: None,
         })
     }
 
@@ -505,7 +507,13 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
             connection: crate::ServeConnection::new(),
             requirement: None,
             holder: None,
+            access: None,
         }
+    }
+
+    /// Sets the host's ongoing authorization check for this session.
+    pub fn set_access_guard(&mut self, access: Option<Box<dyn Fn() -> bool + Send>>) {
+        self.access = access;
     }
 
     /// The highest transfer-object index the receiver still permits, from
@@ -536,6 +544,7 @@ impl<'server, A: TransportAdapter> ServeSession<'server, A> {
             connection: crate::ServeConnection::new(),
             requirement: None,
             holder: Some(holder),
+            access: None,
         })
     }
 
@@ -910,6 +919,13 @@ impl<A: TransportAdapter> Engine for ServeSession<'_, A> {
     type Status = crate::ServeStatus;
 
     fn service(&mut self) -> Result<Self::Status, Error> {
+        if self.access.as_ref().is_some_and(|access| !access()) {
+            let _ = self
+                .session
+                .driver()
+                .close(vot_codec::error_code::AUTHENTICATION_FAILED);
+            return Err(Error::Cancelled);
+        }
         self.answer_authorization()?;
         self.present_capability()?;
         self.server.service(&mut self.session, &mut self.connection)
@@ -973,6 +989,51 @@ fn carrier_progress(stats: Option<vot_transport_api::PathStats>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_access_stops_before_the_next_service_pass() {
+        use crate::harness::{Loopback, built_bundle, not_required, patterned, pump};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let (bundle, _) = built_bundle("revoked-access", &[("a.txt", patterned(1000))]);
+        let server = crate::BundleServer::open(&bundle).unwrap();
+        for allowed_pass in [false, true] {
+            let output = crate::tests::temporary("revoked-access-fetch");
+            let mut fetcher =
+                crate::BundleFetcher::begin(Loopback::default(), &output, None).unwrap();
+            let mut serving =
+                ServeSession::begin(&server, Loopback::default(), not_required()).unwrap();
+            let allowed = Arc::new(AtomicBool::new(allowed_pass));
+            let access = Arc::clone(&allowed);
+            serving.set_access_guard(Some(Box::new(move || access.load(Ordering::Acquire))));
+            Engine::service(&mut fetcher).unwrap();
+            pump(
+                fetcher.session_mut().driver(),
+                serving.session.driver(),
+                &mut 0,
+            );
+            if allowed_pass {
+                Engine::service(&mut serving).unwrap();
+                assert!(Engine::progress(&serving) > 0);
+            }
+            let progress = Engine::progress(&serving);
+            let queued = serving.session.driver().events.len();
+            allowed.store(false, Ordering::Release);
+            assert!(matches!(
+                Engine::service(&mut serving),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(Engine::progress(&serving), progress);
+            assert_eq!(serving.session.driver().events.len(), queued);
+            assert_eq!(
+                serving.session.driver().closed,
+                Some(vot_codec::error_code::AUTHENTICATION_FAILED)
+            );
+        }
+    }
 
     /// Passes the budget allows at each bound.
     /// A budget the suite can spend in real time. The production one is a

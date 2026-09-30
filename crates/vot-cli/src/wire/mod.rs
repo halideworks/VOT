@@ -203,8 +203,10 @@ mod tests {
         let (reports, reported) = mpsc::channel::<ServeReport>();
         let verifying = issuer.verifying_key();
         let servers = [server_a, server_b];
+        let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let access = std::sync::Arc::clone(&allowed);
         let serving = std::thread::spawn(move || {
-            serve::serve_on_bounded(&listener, Some(3), |presentation| {
+            serve::serve_on_bounded(&listener, Some(4), |presentation| {
                 // The policy tries every package it holds; the token's own
                 // root is the one whose requirement decides.
                 let decided = servers.iter().find_map(|server| {
@@ -235,6 +237,10 @@ mod tests {
                 Some(ServeAdmission {
                     server,
                     scope,
+                    access: Some(Box::new({
+                        let access = std::sync::Arc::clone(&access);
+                        move || access.load(std::sync::atomic::Ordering::Acquire)
+                    })),
                     observer: Some(Box::new(move |report| {
                         let _ = reports.send(report);
                     })),
@@ -273,6 +279,24 @@ mod tests {
         );
         assert!(report.status.is_ok(), "{:?}", report.status);
         assert_eq!(report.peer.ip(), at.ip());
+
+        allowed.store(false, std::sync::atomic::Ordering::Release);
+        let cancelled = crate::tests::temporary("serve-on-revoked");
+        assert!(
+            fetch_holding(
+                at,
+                &cancelled,
+                built_a.root,
+                serve_token(&issuer, SigningKey::from_bytes(&[64; 32]), built_a.root),
+            )
+            .is_err()
+        );
+        let report = reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("revoked observer report");
+        assert!(matches!(report.status, Err(Error::Cancelled)));
+        assert_eq!(report.served_bytes, 0);
+        crate::harness::discard(&[&cancelled]);
 
         // A token for an unknown root, and a token for B answered from A,
         // are both refused: the holder spends its presentation attempts on
@@ -342,6 +366,7 @@ mod tests {
                 Some(ServeAdmission {
                     server: std::sync::Arc::clone(&policy_server),
                     scope,
+                    access: None,
                     observer: Some(Box::new(move |report| {
                         let _ = reports.send(report);
                     })),

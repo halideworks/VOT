@@ -32,6 +32,8 @@ pub struct ServePresentation<'a> {
 pub struct ServeAdmission {
     pub server: std::sync::Arc<BundleServer>,
     pub scope: Vec<u8>,
+    /// Rechecked before each service pass; false stops an admitted session.
+    pub access: Option<Box<dyn Fn() -> bool + Send>>,
     /// Runs on the session's own thread once it ends, holding that
     /// session's slot while it runs; a panic in it takes the accept loop
     /// down, as a panic in any session thread does.
@@ -217,9 +219,13 @@ where
             .wait_for_event(std::time::Duration::from_millis(10));
     };
     let ServeAdmission {
-        server, observer, ..
+        server,
+        observer,
+        access,
+        ..
     } = admission;
     let mut serving = ServeSession::from_started_session(&server, session);
+    serving.set_access_guard(access);
     let status = crate::drive::drive(&mut serving);
     let outcome = status
         .as_ref()
